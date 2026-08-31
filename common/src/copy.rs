@@ -3074,6 +3074,10 @@ mod copy_tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot set special permission bits"
+    )]
     #[traced_test]
     async fn check_default_mode() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;

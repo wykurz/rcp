@@ -39,6 +39,27 @@ Parallel in-process libtest is unsupported for these fixtures. The standard `jus
 `just ci` paths use nextest; the Nix libtest check phase keeps `--test-threads=1` for the same
 contract. Do not add broad serialization for unrelated tests.
 
+### Nix sandbox test selection
+
+Nix source builds set `rcp_nix_sandbox`; normal and CI test runs do not. Put an individual skip
+immediately before its existing test attribute, and name the exact unavailable prerequisite:
+
+```rust
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot write POSIX ACL xattrs"
+)]
+#[test]
+```
+
+Use a whole-target gate only when every test in that target has the same prerequisite. nixpkgs only
+sets this cfg and `--test-threads=1`; it does not select tests by name. Verify the sandbox contract
+with:
+
+```bash
+nix build --no-update-lock-file -L .#rcp-all
+```
+
 ```bash
 # Default profile (debug tests)
 cargo nextest run
@@ -82,7 +103,8 @@ dev shell. See [POSIX ACLs](acls.md).
 
 ### Remote Integration Tests
 
-Tests using localhost SSH (`rcp/tests/remote_tests.rs`):
+Tests using localhost SSH (`rcp/tests/remote_tests.rs` and the real-session tests in
+`remote/src/lib.rs`):
 
 - Single file and directory copy
 - Symlink handling

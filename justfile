@@ -10,7 +10,7 @@ set positional-arguments
 default:
     @just --list
 
-# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity, TLS handshake timeouts, TCP socket configuration)
+# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, package metadata, walk-driver usage, source-read fidelity, TLS handshake timeouts, TCP socket configuration)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
@@ -28,8 +28,6 @@ lint:
     ./scripts/check-anyhow-error-msg.sh
     @echo "🔍 Checking rust version consistency..."
     ./scripts/check-rust-version.sh
-    @echo "🔍 Checking remote test naming..."
-    ./scripts/check-remote-test-naming.sh
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
     @echo "🔍 Checking walk-driver usage..."

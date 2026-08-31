@@ -3963,6 +3963,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot change ownership or set-id modes"
+    )]
     #[tokio::test]
     async fn secure_as_copier_takes_ownership_restricts_mode_and_preserves_gid()
     -> anyhow::Result<()> {
@@ -4812,6 +4816,10 @@ mod tests {
     // set_file_metadata_fd: chown before chmod must preserve a setuid bit.
     // An unprivileged fchown (even to the current uid) clears setuid/setgid; doing
     // chown FIRST and chmod AFTER restores it. This test proves that ordering.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot change ownership or set-id modes"
+    )]
     #[tokio::test]
     async fn set_file_metadata_fd_ordering_preserves_setuid() -> anyhow::Result<()> {
         use std::io::Write;
@@ -4933,6 +4941,10 @@ mod tests {
 
     // set_dir_metadata_fd: applying mode/time to a freshly made directory via its
     // Dir fd must reflect on the directory.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot change ownership or set-id modes"
+    )]
     #[tokio::test]
     async fn set_dir_metadata_fd_applies() -> anyhow::Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -5334,6 +5346,7 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
     #[tokio::test]
     async fn read_acls_fd_round_trips_an_access_acl() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5354,6 +5367,10 @@ mod tests {
     // padded past 256 bytes with `user.*` attributes, and the blob past 512 by entry count (a blob
     // is `4 + 8n` bytes, so 64 entries fill the buffer exactly and 80 overflow it). Without the
     // retry paths this fails rather than silently truncating — `fgetxattr` refuses a short buffer.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox filesystem cannot provide the user xattrs this test requires"
+    )]
     #[tokio::test]
     async fn read_acls_fd_reads_an_acl_larger_than_the_stack_buffers() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5393,6 +5410,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
     #[tokio::test]
     async fn read_acls_fd_reads_a_directorys_default_acl_only_when_asked() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5413,6 +5431,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
     #[tokio::test]
     async fn apply_acls_fd_installs_the_source_acl_and_clears_what_the_source_lacked()
     -> anyhow::Result<()> {
@@ -5489,6 +5508,10 @@ mod tests {
 
     // ORDERING, branch 1 (the source HAS an access ACL): the narrowed chmod carries the special
     // bits, the `fsetxattr` lands the rwx bits, and both survive together.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_file_metadata_fd_applies_a_setuid_source_mode_and_its_acl() -> anyhow::Result<()> {
         use std::io::Write;
@@ -5540,6 +5563,10 @@ mod tests {
     // file must be left unreachable by anyone but the copier. This is what pins the preceding chmod
     // to `(mode & 0o7000) | DST_FILE_CREATE_MODE`: widening there and failing here would publish a
     // setuid-root file whose copy is about to be reported as failed (PR #287's regression).
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_file_metadata_fd_keeps_the_file_owner_only_when_the_acl_fails()
     -> anyhow::Result<()> {
@@ -5579,6 +5606,10 @@ mod tests {
     // ORDERING, branch 2 (the source has NO access ACL): the chmod is the widening step and stays
     // last, and the clear that precedes it is mode-neutral. Inverting the branch condition sends
     // this case down the narrowed-chmod path and leaves the file at 0o4600.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_file_metadata_fd_clears_an_inherited_acl_and_still_applies_the_full_mode()
     -> anyhow::Result<()> {
@@ -5623,6 +5654,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_dir_metadata_fd_installs_access_and_default_acls() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5665,6 +5700,10 @@ mod tests {
     // The access ACL is applied LAST inside `apply_acls_fd` for the same reason it is applied last
     // in the file applier: it is the step that WIDENS. A default ACL the kernel rejects must
     // therefore fail while the directory is still at its owner-only create mode.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_dir_metadata_fd_keeps_the_dir_owner_only_when_the_default_acl_fails()
     -> anyhow::Result<()> {
@@ -5706,6 +5745,10 @@ mod tests {
     // rwx bits and its ACL are the same fact — worth a test rather than a comment, and worth doing
     // it on a SETGID directory, where the special bit comes from the chmod and the rwx bits from
     // the ACL.
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
+    )]
     #[tokio::test]
     async fn set_reused_dir_metadata_fd_verifies_a_setgid_source_with_an_acl() -> anyhow::Result<()>
     {
@@ -5799,6 +5842,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
     #[tokio::test]
     async fn guarded_default_acl_write_is_skipped_once_disarmed() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;

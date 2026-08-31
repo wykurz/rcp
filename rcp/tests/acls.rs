@@ -33,6 +33,7 @@ fn rcp(args: &[&str]) -> std::process::Output {
     output
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn preserves_a_source_access_acl_on_a_file() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -59,6 +60,7 @@ fn preserves_a_source_access_acl_on_a_file() {
     assert_eq!(get_file_content(&dst_file), "secret");
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn preserves_both_acls_on_a_directory() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -90,6 +92,7 @@ fn preserves_both_acls_on_a_directory() {
     assert_eq!(get_file_mode(&dst_sub), get_file_mode(&src_sub));
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn clears_an_acl_the_destination_tree_would_have_imposed() {
     // §1.2: nothing unusual on the source — just a destination tree with a default ACL, which is
@@ -130,6 +133,7 @@ fn clears_an_acl_the_destination_tree_would_have_imposed() {
     assert_eq!(get_file_mode(&dst_sub.join("private.txt")), 0o640);
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn all_without_acl_drops_the_source_acl() {
     // The documented state of the default path, pinned so a change to it is deliberate: `all`
@@ -183,6 +187,10 @@ fn count_xattr_syscalls(args: &[&str]) -> Vec<String> {
         .collect()
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot provide strace or POSIX ACL xattrs"
+)]
 #[test]
 fn all_does_not_pay_the_acl_probe() {
     // Detecting an ACL costs a syscall per entry — there is no bit in `stat` for it — which is the
@@ -238,6 +246,7 @@ fn all_does_not_pay_the_acl_probe() {
     assert_eq!(get_acl(&plain_dst.join("f0.txt"), ACL_ACCESS), None);
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn preserves_an_acl_alongside_a_setuid_mode() {
     // The ordering case: the special bits come from the chmod, the rwx bits from the ACL, and the
@@ -263,6 +272,7 @@ fn preserves_an_acl_alongside_a_setuid_mode() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn per_type_acl_applies_only_to_the_type_that_asked_for_it() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -367,6 +377,7 @@ fn assert_no_inherited_acls(dst_tree: &std::path::Path) {
 /// differ only in what the finalize chmod does to its mask — but keep them unequal: equal modes make
 /// the twin comparison pass for the wrong reason, since a destination whose ACL already agrees with
 /// the source's mode survives almost any mishandling unchanged.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn strict_mode_contains_and_restores_a_reused_directorys_acls() {
     if strict_mode_unusable() {
@@ -488,6 +499,7 @@ fn strict_mode_contains_and_restores_a_reused_directorys_acls() {
 /// This is a data-destruction regression test, so it asserts the copy actually FAILED first: a run
 /// with enough privilege to read the unreadable source directory would copy it successfully and
 /// prove nothing.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn an_aborted_strict_copy_does_not_destroy_the_reused_directorys_acl() {
     if strict_mode_unusable() {
@@ -597,6 +609,7 @@ fn an_aborted_strict_copy_does_not_destroy_the_reused_directorys_acl() {
 /// directory created under a parent with a default ACL inherits BOTH an access and a default ACL,
 /// and its children then inherit in turn, so this walks the whole subtree rather than one level:
 /// without the post-`mkdirat` strip every entry listed carries an entry its source never had.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn strict_mode_prevents_inheritance_in_every_directory_it_creates() {
     if strict_mode_unusable() {
@@ -632,6 +645,7 @@ fn strict_mode_prevents_inheritance_in_every_directory_it_creates() {
 /// deliberate hole, not an oversight — containing it costs either the per-entry probe or the
 /// per-directory strip, and neither is worth imposing on ordinary data movement for what is a
 /// privileged-copy concern. Pinned so that changing it has to be a decision.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn default_leaves_the_destination_trees_inherited_acl() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -652,6 +666,7 @@ fn default_leaves_the_destination_trees_inherited_acl() {
 
 /// Row 2: `acl` clears the inherited entry, at finalize — the applier's clear step runs on every
 /// entry, which is what the per-entry probe buys.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn acl_clears_the_destination_trees_inherited_acl() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -669,6 +684,7 @@ fn acl_clears_the_destination_trees_inherited_acl() {
 /// Row 3: `--require-toctou-safe` prevents the inherited entry at creation, without `acl` and
 /// without its per-entry cost. Same fixture and same end state as row 2, reached a different way —
 /// which `strict_mode_does_not_enable_acl_preservation` below distinguishes on syscall count.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn strict_mode_prevents_the_destination_trees_inherited_acl() {
     if strict_mode_unusable() {
@@ -695,6 +711,10 @@ fn strict_mode_prevents_the_destination_trees_inherited_acl() {
 /// (§1.3) on a flag people reach for a different reason, and would silently override an explicit
 /// `--preserve-settings`. So this asserts on syscall count as well as outcome: an outcome-only
 /// check cannot see the cost creep in.
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot provide strace or POSIX ACL xattrs"
+)]
 #[test]
 fn strict_mode_does_not_enable_acl_preservation() {
     if strict_mode_unusable() {
@@ -792,6 +812,10 @@ fn count_removexattr_syscalls(args: &[&str]) -> Vec<String> {
 /// `default_leaves_the_destination_trees_inherited_acl` catches the same mutation on BEHAVIOUR,
 /// because containment leaking into the default path also silently moves that row of the §1.2.1
 /// table. Two tests, two different reasons the gate matters.
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot provide strace or POSIX ACL xattrs"
+)]
 #[test]
 fn strict_mode_strips_once_per_directory_not_per_file() {
     if strict_mode_unusable() {
@@ -878,6 +902,7 @@ fn rcp_log(args: &[&str]) -> String {
 /// tests assert nothing.
 const ROOT_WARNING: &str = "carries a POSIX ACL that this copy will NOT preserve";
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn warns_when_the_source_root_carries_an_acl_that_is_not_preserved() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -904,6 +929,7 @@ fn warns_when_the_source_root_carries_an_acl_that_is_not_preserved() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn stays_silent_when_the_copy_asks_for_no_preservation() {
     // a copy left at the shipped default already drops uid, gid, timestamps and the
@@ -946,6 +972,7 @@ fn stays_silent_when_the_copy_asks_for_no_preservation() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn any_attribute_worth_preserving_arms_the_root_notice() {
     // the gate is "did this run ask for metadata fidelity at all", not "did it ask for the mode".
@@ -966,6 +993,7 @@ fn any_attribute_worth_preserving_arms_the_root_notice() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn strict_mode_arms_the_root_notice_without_any_preserve_flag() {
     // the two flags do not imply each other (§10.2). `--require-toctou-safe` is a request ABOUT
@@ -995,6 +1023,7 @@ fn strict_mode_arms_the_root_notice_without_any_preserve_flag() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn quiet_suppresses_the_root_notice() {
     // `--quiet` installs no tracing subscriber at all, so it silences the notice like everything
@@ -1053,6 +1082,7 @@ fn the_notice_target_does_not_unmute_ordinary_warnings() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn stays_silent_when_the_source_root_acl_is_preserved() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -1069,6 +1099,7 @@ fn stays_silent_when_the_source_root_acl_is_preserved() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn the_root_warning_consults_the_setting_for_the_roots_own_kind() {
     // `f:acl` and `d:acl` are independent, so the warning must ask about the kind the ROOT actually
@@ -1097,6 +1128,7 @@ fn the_root_warning_consults_the_setting_for_the_roots_own_kind() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn a_root_that_cannot_warn_does_not_spend_the_probe_budget() {
     // The one probe per process is claimed AFTER the root's kind and the per-kind settings are
@@ -1122,6 +1154,7 @@ fn a_root_that_cannot_warn_does_not_spend_the_probe_budget() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn stays_silent_when_the_source_root_has_no_acl() {
     // the heuristic's own boundary: the root is what is probed, so a tree whose ACLs live BELOW the
@@ -1141,6 +1174,7 @@ fn stays_silent_when_the_source_root_has_no_acl() {
     );
 }
 
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[test]
 fn the_strict_mode_warning_says_the_flag_does_not_preserve_source_acls() {
     // §10.2: a user reaching for --require-toctou-safe may reasonably assume it covers both bugs.
@@ -1175,6 +1209,10 @@ fn the_strict_mode_warning_says_the_flag_does_not_preserve_source_acls() {
     );
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot provide strace or POSIX ACL xattrs"
+)]
 #[test]
 fn the_root_warning_costs_one_syscall_whatever_the_tree_size() {
     // The warning is only affordable on the default path because it is a CONSTANT. Hold the root

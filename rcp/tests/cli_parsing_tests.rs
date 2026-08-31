@@ -389,6 +389,7 @@ fn test_version_runs() {
 }
 
 /// Test --protocol-version flag works and returns valid JSON with git info
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix source build has no Git metadata")]
 #[test]
 fn test_protocol_version_has_git_info() {
     let output = Command::cargo_bin("rcp")
@@ -426,6 +427,7 @@ fn test_protocol_version_has_git_info() {
 }
 
 /// Test that rcpd also has --protocol-version with git info
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix source build has no Git metadata")]
 #[test]
 fn test_rcpd_protocol_version_has_git_info() {
     let output = Command::cargo_bin("rcpd")

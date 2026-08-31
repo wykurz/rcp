@@ -6,12 +6,12 @@
 test-threads = 32
 
 [test-groups]
-# serial execution for remote tests that use SSH to localhost
+# serial execution for localhost-SSH integration and remote-library tests
 serial = { max-threads = 1 }
 
-# remote tests that use localhost SSH must run serially to avoid connection conflicts
+# localhost-SSH integration and remote-library tests must run serially to avoid connection conflicts
 [[profile.default.overrides]]
-filter = 'test(remote)'
+filter = 'binary(=remote_tests) | (package(=rcp-tools-remote) & test(/^tests::test_remote_/))'
 test-group = 'serial'
 
 # docker tests must run serially to avoid port/connection conflicts.

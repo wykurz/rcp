@@ -3686,6 +3686,10 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_failed_rcpd_reap_timeout_releases_child_session() {
         let directory = tempfile::tempdir().unwrap();
@@ -3715,6 +3719,10 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_cancelled_failed_rcpd_reap_releases_child_session() {
         let directory = tempfile::tempdir().unwrap();
@@ -3854,6 +3862,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_command_output_uses_required_bootstrap_deadline() {
         let cleanup = RemoteCleanup::new().unwrap();
@@ -3886,6 +3898,10 @@ mod tests {
         cleanup.finish();
     }
 
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_home_lookup_uses_required_bootstrap_deadline() {
         let cleanup = RemoteCleanup::new().unwrap();
@@ -3918,6 +3934,10 @@ mod tests {
         cleanup.finish();
     }
 
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_cancelled_command_output_is_bounded() {
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -3959,6 +3979,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_start_rcpd_uses_configured_version_probe_timeout() {
         use std::os::unix::fs::PermissionsExt;
@@ -4008,6 +4032,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_prepared_rcpd_readiness_uses_configured_timeout() {
         use std::os::unix::fs::PermissionsExt;
@@ -4054,6 +4082,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_prepared_rcpd_rejects_an_oversized_readiness_record() {
         use std::os::unix::fs::PermissionsExt;
@@ -4099,6 +4131,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_prepared_rcpd_spawns_both_roles_after_one_preparation() {
         use std::os::unix::fs::PermissionsExt;
@@ -4148,6 +4184,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_wait_for_rcpd_process_retains_daemon_diagnostics() {
         use std::os::unix::fs::PermissionsExt;
@@ -4198,6 +4238,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+    )]
     #[tokio::test]
     async fn test_remote_failed_rcpd_bootstrap_reaps_child_before_returning() {
         use std::os::unix::fs::PermissionsExt;

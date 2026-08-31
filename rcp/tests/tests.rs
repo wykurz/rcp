@@ -77,6 +77,10 @@ fn test_no_preserve_permissions() {
     assert_eq!(get_file_content(&dst_file), "test content");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox does not provide the overwrite semantics this test requires"
+)]
 #[test]
 fn test_overwrite_behavior() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -111,6 +115,10 @@ fn test_overwrite_fail_without_flag() {
         .failure();
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_weird_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -967,6 +975,10 @@ fn test_path_with_colons_is_local() {
     assert_eq!(get_file_content(&dst_file), "timestamp path content");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_all_preserves_special_bits_on_directories() {
     let test_cases: &[(u32, &str)] = &[
@@ -998,6 +1010,10 @@ fn test_preserve_all_preserves_special_bits_on_directories() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_default_strips_special_bits_on_directories() {
     let test_cases: &[(u32, &str)] = &[
@@ -1025,6 +1041,10 @@ fn test_default_strips_special_bits_on_directories() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_settings_dir_gid_time_7777() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -1064,6 +1084,10 @@ fn test_preserve_settings_dir_gid_time_7777() {
     );
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_all_preserves_special_bits_on_files() {
     let test_cases: &[(u32, &str)] = &[
@@ -1095,6 +1119,10 @@ fn test_preserve_all_preserves_special_bits_on_files() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_settings_file_7777_preserves_special_bits() {
     let test_cases: &[(u32, &str)] = &[
@@ -1127,6 +1155,10 @@ fn test_preserve_settings_file_7777_preserves_special_bits() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_default_strips_special_bits_on_files() {
     let test_cases: &[(u32, u32, &str)] = &[
