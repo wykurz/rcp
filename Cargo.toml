@@ -38,6 +38,9 @@ remote = { package = "rcp-tools-remote", version = "0.40.0", path = "remote" }
 # Deny all warnings to enforce code quality
 all = { level = "deny", priority = -1 }
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rcp_nix_sandbox)'] }
+
 [workspace.lints.rustdoc]
 # Deny documentation warnings
 all = { level = "deny", priority = -1 }

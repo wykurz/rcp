@@ -1540,6 +1540,10 @@ mod tests {
             "got: {err:#}"
         );
     }
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox has no getent/NSS lookup service"
+    )]
     #[test]
     fn getent_real_resolves_root() {
         // root exists in /etc/passwd and /etc/group on every supported host; this
@@ -1553,6 +1557,10 @@ mod tests {
             0
         );
     }
+    #[cfg_attr(
+        rcp_nix_sandbox,
+        ignore = "Nix sandbox has no getent/NSS lookup service"
+    )]
     #[test]
     fn getent_real_option_like_name_fails_closed_no_injection() {
         // a name starting with `-` must NOT be parsed as a getent option. Without the `--`

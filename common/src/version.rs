@@ -172,6 +172,7 @@ impl std::fmt::Display for ProtocolVersion {
 mod tests {
     use super::*;
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix source build has no Git metadata")]
     #[test]
     fn test_current_version() {
         let version = ProtocolVersion::current();

@@ -67,6 +67,10 @@ fn rejects_symlink_mode_section() {
         .stdout(predicates::str::contains("symlink mode (l:)"));
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox has no getent/NSS lookup service"
+)]
 #[test]
 fn rejects_unknown_group() {
     // the common harness routes runtime errors to stdout (see common::run)

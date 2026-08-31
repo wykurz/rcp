@@ -8,6 +8,10 @@ fn mode_of(p: &std::path::Path) -> u32 {
     std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn applies_per_type_modes_recursively() {
     let d = tempfile::tempdir().unwrap();
@@ -120,6 +124,10 @@ fn mode_on_symlink_operand_does_not_follow_to_target() {
     );
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn preserves_setgid_through_mode_change() {
     // a mode change must not disturb the setgid bit. (the chown-clears-setgid
@@ -160,6 +168,10 @@ fn no_setid_masks_explicit_symbolic_and_octal_modes() {
     assert_eq!(mode_of(&octal), 0o755, "octal set-ID bits masked");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn no_setid_clears_existing_bits_for_unrelated_mode() {
     let d = tempfile::tempdir().unwrap();
@@ -174,6 +186,10 @@ fn no_setid_clears_existing_bits_for_unrelated_mode() {
     assert_eq!(mode_of(&f), 0o755, "both existing set-ID bits cleared");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn no_setid_retains_sticky_and_clears_setgid_on_directory() {
     let d = tempfile::tempdir().unwrap();
@@ -189,6 +205,10 @@ fn no_setid_retains_sticky_and_clears_setgid_on_directory() {
     assert_eq!(mode_of(&dir), 0o1775, "sticky retained and setgid cleared");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn no_setid_dry_run_reports_but_does_not_clear_bits() {
     let d = tempfile::tempdir().unwrap();
@@ -204,6 +224,10 @@ fn no_setid_dry_run_reports_but_does_not_clear_bits() {
     assert_eq!(mode_of(&f), 0o6755, "dry-run must retain set-ID bits");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn no_setid_respects_filter_and_per_type_scope() {
     let d = tempfile::tempdir().unwrap();
@@ -226,6 +250,10 @@ fn no_setid_respects_filter_and_per_type_scope() {
     assert_eq!(mode_of(&dir), 0o2775, "directory has no applicable rule");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn no_setid_clears_bits_for_unchanged_owner_rule() {
     let d = tempfile::tempdir().unwrap();
@@ -465,6 +493,10 @@ fn owner_change_to_current_uid_is_accepted_and_unchanged() {
     assert!(stdout.contains("files changed: 0"), "stdout was: {stdout}");
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot change ownership or set-id modes"
+)]
 #[test]
 fn group_change_preserves_setgid_across_chgrp() {
     // changing a setgid file's group to another group the user belongs to needs no privilege; the

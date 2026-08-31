@@ -62,6 +62,10 @@ fn wait_for_creation(child: &mut std::process::Child, path: &Path) {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn copy_creates_file_owner_only_until_contents_are_written() {
     /// The source mode, and so the mode the destination must end at.
@@ -111,6 +115,10 @@ fn copy_creates_file_owner_only_until_contents_are_written() {
     assert_eq!(get_file_mode(&dst_file), SRC_MODE);
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn preserves_setuid_file_mode_when_created_owner_only() {
     // a zero-length source is covered too: `copy_file_range` moves no bytes for it, so the final
@@ -146,6 +154,10 @@ fn preserves_setuid_file_mode_when_created_owner_only() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn interrupted_copy_leaves_partial_file_owner_only() {
     let (src_dir, dst_dir) = setup_test_env();

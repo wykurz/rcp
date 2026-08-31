@@ -5,6 +5,12 @@
 //! silently changing a tree the user did not ask to modify. `f:acl` therefore applies only on
 //! rlink's real copy path (changed files under `--update`), and the hard-link path applies no
 //! metadata at all.
+//!
+//! These tests require POSIX ACL xattrs, which the Nix build sandbox cannot write. The complete
+//! target is therefore excluded when `rcp_nix_sandbox` is active; ordinary and CI test runs still
+//! exercise it.
+
+#![cfg(not(rcp_nix_sandbox))]
 
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

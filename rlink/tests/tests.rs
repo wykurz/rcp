@@ -186,6 +186,10 @@ fn test_update_exclusive_mode() {
     );
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox does not provide the overwrite semantics this test requires"
+)]
 #[test]
 fn test_overwrite_behavior() {
     let (src_dir, dst_dir, _) = setup_test_env();
@@ -392,6 +396,10 @@ fn test_edge_case_empty_directories() {
     assert!(dst_subdir.is_dir());
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_edge_case_special_permissions() {
     let (src_dir, dst_dir, _) = setup_test_env();
@@ -536,6 +544,10 @@ fn test_update_preserve_none_succeeds_with_allow_lossy() {
     assert!(are_files_hardlinked(&src_file, &dst_file));
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_default_preserves_special_bits_on_directories() {
     let test_cases: &[(u32, &str)] = &[
@@ -567,6 +579,10 @@ fn test_default_preserves_special_bits_on_directories() {
     }
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_settings_none_strips_special_bits_on_directories() {
     let (src_dir, dst_dir, _) = setup_test_env();
@@ -595,6 +611,10 @@ fn test_preserve_settings_none_strips_special_bits_on_directories() {
     ));
 }
 
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot set special permission bits"
+)]
 #[test]
 fn test_preserve_settings_dir_7777_preserves_special_bits() {
     let test_cases: &[(u32, &str)] = &[(0o2755, "setgid"), (0o1755, "sticky")];

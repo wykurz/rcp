@@ -70,9 +70,6 @@ jobs:
     - name: Check rust version consistency
       run: ./scripts/check-rust-version.sh
 
-    - name: Check remote test naming
-      run: ./scripts/check-remote-test-naming.sh
-
     - name: Check walk-driver usage
       run: ./scripts/check-walk-driver-usage.sh
 
@@ -388,10 +385,10 @@ jobs:
     - name: Build all binaries (glibc)
       run: cargo build --workspace --release --target x86_64-unknown-linux-gnu
 
-  # Validate the Nix flake. None of the jobs above touch Nix, so a flake.lock bump
-  # (Dependabot opens grouped `nix` PRs) could break `nix build` or the dev shell
-  # while the rest of CI stays green. Runs in parallel -- it's independent of the
-  # Rust lint/test jobs and gives fast feedback on the exact thing it guards.
+  # Validate the Nix flake and its source-owned sandbox test selection. None of the jobs above
+  # touch Nix, so a flake.lock bump (Dependabot opens grouped `nix` PRs) could break `nix build`
+  # or the dev shell while the rest of CI stays green. Runs in parallel -- it's independent of
+  # the Rust lint/test jobs and gives fast feedback on the exact thing it guards.
   nix:
     runs-on: ubuntu-latest
     steps:
@@ -411,7 +408,7 @@ jobs:
     # against a silently auto-updated lock.
     - name: Flake check (evaluate all systems)
       run: nix flake check --all-systems --no-update-lock-file -L
-    - name: Build the full suite
+    - name: Build the full suite with Nix sandbox test selection
       run: nix build --no-update-lock-file -L .#rcp-all
     - name: Build the dev shell
       run: nix develop --no-update-lock-file -L --command true

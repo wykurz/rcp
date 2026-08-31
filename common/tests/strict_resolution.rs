@@ -453,6 +453,7 @@ fn get_acl(path: &std::path::Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
 /// rlink's restore site: strict reuse of a directory carrying a default ACL neither lets the
 /// hard links it materializes inherit it nor loses it — with `d:acl` off, so what comes back is
 /// the DESTINATION's own ACL rather than anything from the source.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn strict_reuse_rlink_restores_a_reused_dirs_acls() -> anyhow::Result<()> {
     if !common::safedir::openat2_available() {
@@ -534,6 +535,7 @@ async fn strict_reuse_rlink_restores_a_reused_dirs_acls() -> anyhow::Result<()> 
 /// Every iteration must end with the ACL present, whichever of the three outcomes it lands in: the
 /// lockdown never got that far, it completed and the guard was dropped, or it was cancelled between
 /// removing the ACL and completing lockdown while the guard remained armed.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> anyhow::Result<()> {
     if !common::safedir::openat2_available() {
@@ -601,6 +603,7 @@ async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> any
 /// at `0o600`, and the final chmod to the source mode re-derived `ACL_MASK` from the group bits
 /// and ACTIVATED them — a named user gained effective read access the `0o640` source never
 /// granted.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn strict_direct_file_into_default_acl_parent_carries_no_acl() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -657,6 +660,7 @@ async fn strict_direct_file_into_default_acl_parent_carries_no_acl() -> anyhow::
 /// directory that originally had NONE. This is the state a bare `Option`-as-guard could not
 /// represent — its `None` doubled as "disarmed", so the partially-applied ACL survived the
 /// abort and the originally ACL-less destination kept an ACL the source run never completed.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn aborted_strict_finalize_removes_the_default_acl_it_installed() -> anyhow::Result<()> {
     if !common::safedir::openat2_available() {
@@ -691,6 +695,7 @@ async fn aborted_strict_finalize_removes_the_default_acl_it_installed() -> anyho
 /// The successful counterpart: with `d:acl` on, a strict finalize installs the SOURCE's default
 /// ACL on an originally ACL-less reused directory, and it stays installed (the guard disarms
 /// instead of rolling it back).
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn strict_finalize_installs_source_default_acl_and_keeps_it() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -757,6 +762,7 @@ async fn strict_finalize_installs_source_default_acl_and_keeps_it() -> anyhow::R
 /// deterministically schedulable from a test; this pins the reachable end state that decides both
 /// (create_file consults the flag after its openat, so an openat that sees the restored ACL also
 /// sees the re-armed flag).
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Result<()> {
     if !common::safedir::openat2_available() {
@@ -805,6 +811,7 @@ async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Resu
 /// EVERY budget the directory must end in one of the two legal states (cancelled → the original
 /// ACL, completed → the source's) — so the sweep stays sound even if the poll↔await mapping
 /// shifts; the `completed > 0` backstop proves it reached the latest windows.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_strict_finalize_restores_the_destinations_default_acl() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -912,6 +919,7 @@ async fn cancelled_strict_finalize_restores_the_destinations_default_acl() -> an
 /// A directory rcp CREATES under a default-ACL parent is sanitized inside the creation call
 /// itself: both inherited ACLs are stripped, so nothing created beneath it inherits anything —
 /// files beneath it pay no per-file strip.
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
 #[tokio::test]
 async fn strict_make_dir_under_default_acl_parent_strips_both_inherited_acls() -> anyhow::Result<()>
 {
