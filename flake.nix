@@ -94,10 +94,12 @@
             muslTools.binutils
           ];
 
-        # Cargo uses matching target rustflags instead of build.rustflags. Repeat the required
-        # global cfg here so every native Nix target keeps tokio_unstable; matching per-target
-        # entries still contribute target-specific flags such as musl's crt-static feature.
+        # nixpkgs adds exact-target rustflags such as frame pointers, so Cargo ignores
+        # build.rustflags. A matching cfg target joins these required cfgs with the exact-target
+        # flags instead of replacing them. Pass the same config to build and test so rustflags do
+        # not invalidate otherwise reusable release units between the two phases.
         nixSandboxRustflags = ''target.'cfg(all())'.rustflags=["--cfg","tokio_unstable","--cfg","rcp_nix_sandbox"]'';
+        nixSandboxCargoFlags = [ "--config" nixSandboxRustflags ];
 
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
@@ -112,8 +114,8 @@
           inherit buildInputs nativeBuildInputs;
 
           # Build and test only the specific package
-          cargoBuildFlags = [ "-p" packageName ];
-          cargoTestFlags = [ "-p" packageName "--config" nixSandboxRustflags ];
+          cargoBuildFlags = [ "-p" packageName ] ++ nixSandboxCargoFlags;
+          cargoTestFlags = [ "-p" packageName ] ++ nixSandboxCargoFlags;
 
           checkFlags = [ "--test-threads=1" ];
 
@@ -174,7 +176,8 @@
 
             inherit buildInputs nativeBuildInputs;
 
-            cargoTestFlags = [ "--config" nixSandboxRustflags ];
+            cargoBuildFlags = nixSandboxCargoFlags;
+            cargoTestFlags = nixSandboxCargoFlags;
             checkFlags = [ "--test-threads=1" ];
 
             meta = with pkgs.lib; {

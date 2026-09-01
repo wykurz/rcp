@@ -11,106 +11,19 @@ use std::os::unix::fs::PermissionsExt;
 mod acl;
 #[path = "support/fixtures.rs"]
 mod fixtures;
+#[path = "support/remote_command.rs"]
+mod remote_command;
 #[path = "support/remote_log.rs"]
 mod remote_log;
 use fixtures::{
     create_test_file, describe_samples, get_file_content, get_file_mode, sample_while_running,
     setup_test_env,
 };
+use remote_command::{
+    assert_not_timeout, interpret_exit_code, print_command_output, run_rcp_with_args,
+    run_rcp_with_args_at_default_verbosity, run_rcp_with_args_home_and_env, shell_quote_for_test,
+};
 use remote_log::{rcpd_logs_contain, rcpd_role_hellos_received};
-
-fn interpret_exit_code(code: i32) -> String {
-    match code {
-        0 => "Success".to_string(),
-        1 => "General error".to_string(),
-        2 => "Misuse of shell command".to_string(),
-        124 => "Timeout (command exceeded time limit)".to_string(),
-        125 => "Command not found".to_string(),
-        126 => "Command found but not executable".to_string(),
-        127 => "Command not found (PATH issue)".to_string(),
-        128 => "Invalid exit argument".to_string(),
-        130 => "Terminated by Ctrl+C (SIGINT)".to_string(),
-        137 => "Killed by SIGKILL".to_string(),
-        143 => "Terminated by SIGTERM".to_string(),
-        code if code >= 128 => format!("Terminated by signal {}", code - 128),
-        code => format!("Exit code {code}"),
-    }
-}
-
-/// Exit code 124 indicates the timeout wrapper killed rcp.
-/// This usually means rcp hung and should be treated as a test failure,
-/// not as an "expected failure" in tests that expect rcp to fail.
-const TIMEOUT_EXIT_CODE: i32 = 124;
-
-fn assert_not_timeout(output: &std::process::Output) {
-    if let Some(code) = output.status.code()
-        && code == TIMEOUT_EXIT_CODE
-    {
-        panic!(
-            "rcp was killed by timeout wrapper (exit code 124). \
-             This indicates rcp hung and did not complete within the time limit. \
-             This is NOT the same as an expected failure from rcp."
-        );
-    }
-}
-
-fn run_rcp_with_args_internal(
-    args: &[&str],
-    home: Option<&std::path::Path>,
-    extra_env: &[(&str, &str)],
-) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new("timeout");
-    // 90 second timeout - SSH connection setup + auto-deployment can take ~40-50s total
-    // for 2 connections (src + dst) with binary transfer, checksum verification, cleanup,
-    // plus TCP connection establishment and actual copy operations
-    cmd.args(["90", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv"); // always use maximum verbosity
-    cmd.arg("--force-remote"); // force remote copy mode for localhost tests
-    cmd.args(args);
-    if let Some(home) = home {
-        cmd.env("HOME", home);
-    }
-    for (key, value) in extra_env {
-        // An empty value REMOVES the variable rather than setting it to "". Some behaviour differs
-        // between "unset" and "set but empty" -- notably which SSH control directory gets picked --
-        // and a test that could only ever set variables would silently exercise the wrong branch.
-        if value.is_empty() {
-            cmd.env_remove(key);
-        } else {
-            cmd.env(key, value);
-        }
-    }
-    let output = cmd.output().expect("Failed to execute rcp command");
-    // CRITICAL: check for timeout immediately. this ensures tests that expect failure
-    // don't incorrectly pass when rcp actually hung (timeout exit code 124).
-    // this check happens before returning to any test, so all tests automatically
-    // detect and fail on timeout.
-    assert_not_timeout(&output);
-    output
-}
-
-fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
-    run_rcp_with_args_internal(args, None, &[])
-}
-
-fn run_rcp_with_args_at_default_verbosity(args: &[&str]) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.args(["90", rcp_path.to_str().unwrap(), "--force-remote"]);
-    cmd.args(args);
-    let output = cmd.output().expect("Failed to execute rcp command");
-    assert_not_timeout(&output);
-    output
-}
-
-fn run_rcp_with_args_home_and_env(
-    args: &[&str],
-    home: &std::path::Path,
-    envs: &[(&str, &str)],
-) -> std::process::Output {
-    run_rcp_with_args_internal(args, Some(home), envs)
-}
 
 fn cache_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".cache/rcp/bin")
@@ -131,10 +44,6 @@ fn make_test_home() -> tempfile::TempDir {
     let temp_home = tempfile::tempdir().unwrap();
     link_real_ssh_dir(temp_home.path());
     temp_home
-}
-
-fn shell_quote_for_test(value: &std::path::Path) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 /// A test HOME deliberately longer than the ~48 bytes that the SSH control socket path used to
@@ -180,28 +89,6 @@ fn require_local_ssh() {
         local_ssh_available(),
         "localhost SSH is required for remote tests. Please ensure sshd is running and accessible."
     );
-}
-
-fn print_command_output(output: &std::process::Output) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    eprintln!("=== RCP COMMAND OUTPUT ===");
-    if let Some(code) = output.status.code() {
-        eprintln!("Exit status: {} ({})", code, interpret_exit_code(code));
-    } else {
-        eprintln!("Exit status: terminated by signal");
-    }
-
-    if !stdout.is_empty() {
-        eprintln!("--- STDOUT ---");
-        eprintln!("{stdout}");
-    }
-    if !stderr.is_empty() {
-        eprintln!("--- STDERR ---");
-        eprintln!("{stderr}");
-    }
-    eprintln!("=== END RCP OUTPUT ===");
 }
 
 fn assert_two_rcpd_logs_report_connection_count(
@@ -2375,6 +2262,7 @@ fn test_remote_copy_directory_permissions_preserved_despite_file_errors() {
 // ============================================================================
 
 /// find rcpd processes running on the system
+#[cfg(target_os = "linux")]
 fn find_rcpd_processes() -> Vec<u32> {
     let output = std::process::Command::new("pgrep")
         .arg("-x") // exact match
@@ -2391,9 +2279,35 @@ fn find_rcpd_processes() -> Vec<u32> {
         .collect()
 }
 
-/// Read a process's raw argv from `/proc`. `None` if it has already exited.
-fn read_proc_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+/// Read a file through a held `/proc/<pid>` directory descriptor.
+#[cfg(target_os = "linux")]
+fn read_held_proc_file(proc_dir: &std::fs::File, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: `proc_dir` is a live directory descriptor, `name` is NUL-terminated, and the
+    // returned descriptor is immediately wrapped in `File` to give it exactly one owner.
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `openat` returned a new owned descriptor on the success path above.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).ok()?;
+    Some(raw)
+}
+
+/// Read a process's raw argv through its held proc descriptor.
+#[cfg(target_os = "linux")]
+fn read_proc_argv(proc_dir: &std::fs::File) -> Option<Vec<Vec<u8>>> {
+    let raw = read_held_proc_file(proc_dir, c"cmdline")?;
     Some(
         raw.split(|byte| *byte == 0)
             .filter(|arg| !arg.is_empty())
@@ -2402,31 +2316,128 @@ fn read_proc_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     )
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+/// Read the state and kernel start time through a held proc descriptor.
+#[cfg(target_os = "linux")]
+fn read_process_state_and_start_time(proc_dir: &std::fs::File) -> Option<(char, u64)> {
+    let stat = String::from_utf8(read_held_proc_file(proc_dir, c"stat")?).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let fields = fields.split_whitespace().collect::<Vec<_>>();
+    let state = fields.first()?.chars().next()?;
+    let start_time_ticks = fields.get(19)?.parse().ok()?;
+    Some((state, start_time_ticks))
+}
+
+/// A process reference whose proc data and signals stay bound across pid reuse.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ProcessHandle {
+    identity: ProcessIdentity,
+    pidfd: std::sync::Arc<std::fs::File>,
+    proc_dir: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ProcessHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.identity.fmt(formatter)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessHandle {
+    /// Open the pidfd before validating argv, then prove that process is still live afterward.
+    /// If the pid is reused anywhere in between, the pidfd still names the exited predecessor and
+    /// the final signal-zero probe rejects the candidate.
+    fn open_marked(pid: u32, marker_arg: &[u8], role: Option<&str>) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: `pidfd_open` has no pointer arguments. Its successful return is a new owned fd.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            return None;
+        }
+        // SAFETY: the successful syscall returned a new owned descriptor.
+        let pidfd = unsafe { std::fs::File::from_raw_fd(pidfd as std::os::fd::RawFd) };
+        let proc_dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
+        let argv = read_proc_argv(&proc_dir)?;
+        if !argv.iter().any(|arg| arg == marker_arg)
+            || !role.is_none_or(|role| {
+                argv.windows(2).any(|pair| {
+                    pair[0].as_slice() == b"--role" && pair[1].as_slice() == role.as_bytes()
+                })
+            })
+        {
+            return None;
+        }
+        let (_, start_time_ticks) = read_process_state_and_start_time(&proc_dir)?;
+        let handle = Self {
+            identity: ProcessIdentity {
+                pid,
+                start_time_ticks,
+            },
+            pidfd: std::sync::Arc::new(pidfd),
+            proc_dir: std::sync::Arc::new(proc_dir),
+        };
+        handle.signal(0).ok()?;
+        Some(handle)
+    }
+
+    fn pid(&self) -> u32 {
+        self.identity.pid
+    }
+
+    fn state(&self) -> Option<char> {
+        let (state, start_time_ticks) = read_process_state_and_start_time(&self.proc_dir)?;
+        (start_time_ticks == self.identity.start_time_ticks).then_some(state)
+    }
+
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the pidfd is owned and live, the siginfo pointer is null, and flags must be zero.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
 /// Find only rcpd processes carrying one test run's unique debug-log marker, optionally restricted
-/// to a role.
-fn find_marked_rcpd_processes(marker: &str, role: Option<&str>) -> Vec<u32> {
+/// to a role, and bind every result to held pidfd and proc descriptors.
+#[cfg(target_os = "linux")]
+fn find_marked_rcpd_processes(marker: &str, role: Option<&str>) -> Vec<ProcessHandle> {
     let marker_arg = format!("--debug-log-prefix={marker}").into_bytes();
     find_rcpd_processes()
         .into_iter()
-        .filter(|pid| {
-            read_proc_argv(*pid).is_some_and(|argv| {
-                argv.iter().any(|arg| arg == &marker_arg)
-                    && role.is_none_or(|role| {
-                        argv.windows(2).any(|pair| {
-                            pair[0].as_slice() == b"--role" && pair[1].as_slice() == role.as_bytes()
-                        })
-                    })
-            })
-        })
+        .filter_map(|pid| ProcessHandle::open_marked(pid, &marker_arg, role))
         .collect()
 }
 
 /// Own the actual rcp master and clean up every marked daemon on any test exit, including panic.
+#[cfg(target_os = "linux")]
 struct MarkedRemoteRun {
     master: Option<std::process::Child>,
     marker: String,
 }
 
+#[cfg(target_os = "linux")]
 impl MarkedRemoteRun {
     fn new(master: std::process::Child, marker: String) -> Self {
         Self {
@@ -2456,6 +2467,7 @@ impl MarkedRemoteRun {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for MarkedRemoteRun {
     fn drop(&mut self) {
         if let Some(mut master) = self.master.take()
@@ -2464,10 +2476,8 @@ impl Drop for MarkedRemoteRun {
             let _ = master.kill();
             let _ = master.wait();
         }
-        for pid in find_marked_rcpd_processes(&self.marker, None) {
-            // SAFETY: `kill` has no memory-safety preconditions; an already-exited pid returns
-            // ESRCH, which is harmless during best-effort panic cleanup.
-            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        for process in find_marked_rcpd_processes(&self.marker, None) {
+            let _ = process.signal(libc::SIGKILL);
         }
     }
 }
@@ -2483,6 +2493,7 @@ fn create_large_test_file(path: &std::path::Path, size_mb: usize) {
     file.flush().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_remote_rcpd_exits_when_master_killed() {
     require_local_ssh();
@@ -2533,14 +2544,15 @@ fn test_remote_rcpd_exits_when_master_killed() {
     let scenario_start = std::time::Instant::now();
     let master = command.spawn().expect("Failed to spawn rcp master");
     let mut run = MarkedRemoteRun::new(master, rcpd_marker.clone());
-    let marked_pids = loop {
-        let source_pids = find_marked_rcpd_processes(&rcpd_marker, Some("source"));
-        let destination_pids = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
+    let marked_processes = loop {
+        let source_processes = find_marked_rcpd_processes(&rcpd_marker, Some("source"));
+        let destination_processes = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
         let role_hellos_received = rcpd_role_hellos_received(rcpd_log_dir.path());
-        if !source_pids.is_empty() && !destination_pids.is_empty() && role_hellos_received {
-            break source_pids
+        if !source_processes.is_empty() && !destination_processes.is_empty() && role_hellos_received
+        {
+            break source_processes
                 .into_iter()
-                .chain(destination_pids)
+                .chain(destination_processes)
                 .collect::<Vec<_>>();
         }
         if let Some(status) = run.try_wait().expect("Failed to poll rcp master") {
@@ -2559,8 +2571,8 @@ fn test_remote_rcpd_exits_when_master_killed() {
                 "the master-kill scenario was never reached within {:?}: found source {:?}, \
                  destination {:?}, both master hellos received: {role_hellos_received}",
                 scenario_start.elapsed(),
-                source_pids,
-                destination_pids
+                source_processes,
+                destination_processes
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2570,7 +2582,7 @@ fn test_remote_rcpd_exits_when_master_killed() {
         panic!("rcp master exited before it could be killed");
     }
     let master_pid = run.master_pid();
-    eprintln!("Killing rcp master {master_pid}; marked rcpd processes: {marked_pids:?}");
+    eprintln!("Killing rcp master {master_pid}; marked rcpd processes: {marked_processes:?}");
     let status = run.kill_master().expect("Failed to SIGKILL rcp master");
     let output = read_captured_output(status);
     assert_eq!(
@@ -2580,7 +2592,10 @@ fn test_remote_rcpd_exits_when_master_killed() {
     );
     let exit_start = std::time::Instant::now();
     loop {
-        let remaining = find_marked_rcpd_processes(&rcpd_marker, None);
+        let remaining = marked_processes
+            .iter()
+            .filter_map(|process| process.state().map(|state| (process.identity, state)))
+            .collect::<Vec<_>>();
         if remaining.is_empty() {
             break;
         }
@@ -2600,6 +2615,7 @@ fn test_remote_rcpd_exits_when_master_killed() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // regression test: the master used to `.expect()` a clean EOF when a peer's control
@@ -2769,27 +2785,24 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // matching process on the host - a developer's live remote copy, or another test's daemon on a
     // shared CI runner. nextest's serial group orders tests within one run; it says nothing about
     // what else is running on the machine.
-    let destination_pids = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
+    let destination_processes = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
     eprintln!(
         "Destination rcpd consumed the master's hello after {:?} (control queue drained), killing \
-         it {destination_pids:?}",
+         it {destination_processes:?}",
         spawn_start.elapsed()
     );
     assert!(
-        !destination_pids.is_empty(),
+        !destination_processes.is_empty(),
         "found no destination rcpd of ours to kill (it must have already exited - copy finished \
          too quickly after the control connection came up)"
     );
-    for pid in &destination_pids {
-        // SAFETY: `kill` has no memory-safety preconditions; a pid that has already exited just
-        // yields ESRCH, which the assert below reports.
-        let killed = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
-        assert_eq!(
-            killed,
-            0,
-            "failed to SIGKILL destination rcpd {pid}: {}",
-            std::io::Error::last_os_error()
-        );
+    for process in &destination_processes {
+        process.signal(libc::SIGKILL).unwrap_or_else(|error| {
+            panic!(
+                "failed to SIGKILL destination rcpd {}: {error}",
+                process.pid()
+            )
+        });
     }
     let status = child.wait().expect("Failed to wait for rcp master");
     eprintln!(
@@ -2980,94 +2993,136 @@ fn test_remote_overwrite_recovers_when_destination_appears_after_classification(
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_remote_rcpd_no_zombie_processes() {
-    // verify that rcpd processes don't become zombies after master exits
     require_local_ssh();
+    const IOPS_THROTTLE: usize = 5;
+    const FILE_SIZE_MIB: usize = 10;
     let (src_dir, dst_dir) = setup_test_env();
-    // create a small file for quick copy
-    let src_file = src_dir.path().join("test.txt");
-    create_test_file(&src_file, "test content", 0o644);
-    let dst_file = dst_dir.path().join("test.txt");
+    let src_file = src_dir.path().join("throttled-file.dat");
+    create_large_test_file(&src_file, FILE_SIZE_MIB);
+    let dst_file = dst_dir.path().join("copied-file.dat");
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    // get initial rcpd processes before starting our test
-    let initial_pids = find_rcpd_processes();
-    eprintln!("Initial rcpd PIDs: {initial_pids:?}");
-    // run a successful copy
-    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
-    assert!(output.status.success(), "Copy should succeed");
-    // get rcpd processes spawned during copy (right after completion)
-    let during_pids = find_rcpd_processes();
-    let test_spawned_pids: Vec<_> = during_pids
-        .iter()
-        .filter(|pid| !initial_pids.contains(pid))
-        .copied()
-        .collect();
-    eprintln!("PIDs spawned by this test: {test_spawned_pids:?}");
-    // wait for cleanup of the processes spawned by THIS test
-    // rcpd processes need time to cleanly shutdown: send result, close connections, etc.
-    if !test_spawned_pids.is_empty() {
-        // wait up to 5 seconds for rcpd processes to exit
-        let cleanup_timeout = std::time::Duration::from_secs(5);
-        let start = std::time::Instant::now();
-        let mut exited = false;
-        while start.elapsed() < cleanup_timeout {
-            let final_pids = find_rcpd_processes();
-            let remaining: Vec<_> = test_spawned_pids
-                .iter()
-                .filter(|pid| final_pids.contains(pid))
-                .copied()
-                .collect();
-            if remaining.is_empty() {
-                exited = true;
-                eprintln!("✓ All test rcpd processes exited in {:?}", start.elapsed());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let rcpd_log_dir = tempfile::TempDir::new().expect("Failed to create rcpd debug log dir");
+    let rcpd_marker = rcpd_log_dir.path().join("rcpd-debug").display().to_string();
+    let rcpd_log_arg = format!("--rcpd-debug-log-prefix={rcpd_marker}");
+    let iops_arg = format!("--iops-throttle={IOPS_THROTTLE}");
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
+    let mut command = std::process::Command::new(rcp_path);
+    command.args([
+        "-vv",
+        "--force-remote",
+        "--chunk-size=1MiB",
+        &iops_arg,
+        &rcpd_log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    command.stdout(
+        stdout_file
+            .reopen()
+            .expect("Failed to reopen stdout capture file"),
+    );
+    command.stderr(
+        stderr_file
+            .reopen()
+            .expect("Failed to reopen stderr capture file"),
+    );
+    let read_captured_output = |status: std::process::ExitStatus| -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
+            stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
         }
-        if !exited {
-            let final_pids = find_rcpd_processes();
-            let remaining: Vec<_> = test_spawned_pids
-                .iter()
-                .filter(|pid| final_pids.contains(pid))
-                .copied()
-                .collect();
-            assert!(
-                remaining.is_empty(),
-                "No rcpd processes from this test should remain after successful copy. Found: {remaining:?}"
+    };
+    let scenario_start = std::time::Instant::now();
+    let master = command.spawn().expect("Failed to spawn rcp master");
+    let mut run = MarkedRemoteRun::new(master, rcpd_marker.clone());
+    let daemon_processes = loop {
+        let source_processes = find_marked_rcpd_processes(&rcpd_marker, Some("source"));
+        let destination_processes = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
+        let marked_processes = source_processes
+            .iter()
+            .chain(&destination_processes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let role_hellos_received = rcpd_role_hellos_received(rcpd_log_dir.path());
+        if !source_processes.is_empty() && !destination_processes.is_empty() && role_hellos_received
+        {
+            break marked_processes;
+        }
+        if let Some(status) = run.try_wait().expect("Failed to poll rcp master") {
+            print_command_output(&read_captured_output(status));
+            panic!(
+                "the daemon-reaping scenario was never reached: rcp exited before both marked \
+                 rcpd roles were running and had consumed their master hellos"
             );
         }
+        if scenario_start.elapsed() >= std::time::Duration::from_secs(20) {
+            let status = run
+                .kill_master()
+                .expect("Failed to stop rcp master after scenario timeout");
+            print_command_output(&read_captured_output(status));
+            panic!(
+                "the daemon-reaping scenario was never reached within {:?}: found source {:?}, \
+                 destination {:?}, both master hellos received: {role_hellos_received}",
+                scenario_start.elapsed(),
+                source_processes,
+                destination_processes
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let status = loop {
+        if let Some(status) = run.try_wait().expect("Failed to poll rcp master") {
+            break status;
+        }
+        if scenario_start.elapsed() >= std::time::Duration::from_secs(90) {
+            let status = run
+                .kill_master()
+                .expect("Failed to stop timed-out rcp master");
+            print_command_output(&read_captured_output(status));
+            panic!("rcp did not complete within 90 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let output = read_captured_output(status);
+    print_command_output(&output);
+    assert_not_timeout(&output);
+    assert!(output.status.success(), "Copy should succeed");
+    assert_eq!(
+        std::fs::metadata(&dst_file)
+            .expect("destination should exist")
+            .len(),
+        (FILE_SIZE_MIB * 1024 * 1024) as u64,
+        "destination should hold the complete source"
+    );
+
+    let cleanup_start = std::time::Instant::now();
+    loop {
+        let remaining = daemon_processes
+            .iter()
+            .filter_map(|process| process.state().map(|state| (process.identity, state)))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            break;
+        }
+        if cleanup_start.elapsed() >= std::time::Duration::from_secs(5) {
+            panic!(
+                "rcpd processes owned by this test did not disappear within {:?}: {remaining:?}",
+                cleanup_start.elapsed()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // check for zombie processes spawned by this test
-    if !test_spawned_pids.is_empty() {
-        let ps_output = std::process::Command::new("ps")
-            .args(["aux"])
-            .output()
-            .expect("Failed to run ps");
-        let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
-        let zombie_lines: Vec<_> = ps_stdout
-            .lines()
-            .filter(|line| {
-                line.contains("rcpd") && line.contains(" Z ") && {
-                    // only check for zombies matching our test's PIDs
-                    test_spawned_pids.iter().any(|pid| {
-                        line.split_whitespace()
-                            .nth(1)
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .map(|line_pid| line_pid == *pid)
-                            .unwrap_or(false)
-                    })
-                }
-            })
-            .collect();
-        assert!(
-            zombie_lines.is_empty(),
-            "No zombie rcpd processes should exist from this test. Found:\n{}",
-            zombie_lines.join("\n")
-        );
-    }
-    eprintln!("✓ No zombie processes found");
+    eprintln!(
+        "All owned rcpd processes were reaped in {:?}",
+        cleanup_start.elapsed()
+    );
 }
 
 #[test]

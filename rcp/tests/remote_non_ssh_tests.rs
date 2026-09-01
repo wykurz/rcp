@@ -7,44 +7,16 @@ use std::os::unix::fs::PermissionsExt;
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
+#[path = "support/remote_command.rs"]
+mod remote_command;
 #[path = "support/remote_log.rs"]
 mod remote_log;
 
 use fixtures::{create_test_file, get_file_content, setup_test_env};
+use remote_command::{
+    print_command_output, run_rcp_with_args, run_rcp_without_force_remote, shell_quote_for_test,
+};
 use remote_log::rcpd_role_hellos_received;
-
-fn assert_not_timeout(output: &std::process::Output) {
-    assert_ne!(
-        output.status.code(),
-        Some(124),
-        "rcp was killed by the 90-second timeout wrapper"
-    );
-}
-
-fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.args(["90", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv");
-    cmd.arg("--force-remote");
-    cmd.args(args);
-    let output = cmd.output().expect("Failed to execute rcp command");
-    assert_not_timeout(&output);
-    output
-}
-
-fn run_rcp_without_force_remote(args: &[&str]) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.args(["30", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv");
-    cmd.args(args);
-    cmd.output().expect("Failed to execute rcp command")
-}
-
-fn shell_quote_for_test(value: &std::path::Path) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
-}
 
 fn marking_rcpd_wrapper(directory: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let wrapper = directory.join("marking-rcpd");
@@ -61,44 +33,6 @@ fn marking_rcpd_wrapper(directory: &std::path::Path) -> (std::path::PathBuf, std
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     (wrapper, marker)
-}
-
-fn interpret_exit_code(code: i32) -> String {
-    match code {
-        0 => "Success".to_string(),
-        1 => "General error".to_string(),
-        2 => "Misuse of shell command".to_string(),
-        124 => "Timeout (command exceeded time limit)".to_string(),
-        125 => "Command not found".to_string(),
-        126 => "Command found but not executable".to_string(),
-        127 => "Command not found (PATH issue)".to_string(),
-        128 => "Invalid exit argument".to_string(),
-        130 => "Terminated by Ctrl+C (SIGINT)".to_string(),
-        137 => "Killed by SIGKILL".to_string(),
-        143 => "Terminated by SIGTERM".to_string(),
-        code if code >= 128 => format!("Terminated by signal {}", code - 128),
-        code => format!("Exit code {code}"),
-    }
-}
-
-fn print_command_output(output: &std::process::Output) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("=== RCP COMMAND OUTPUT ===");
-    if let Some(code) = output.status.code() {
-        eprintln!("Exit status: {} ({})", code, interpret_exit_code(code));
-    } else {
-        eprintln!("Exit status: terminated by signal");
-    }
-    if !stdout.is_empty() {
-        eprintln!("--- STDOUT ---");
-        eprintln!("{stdout}");
-    }
-    if !stderr.is_empty() {
-        eprintln!("--- STDERR ---");
-        eprintln!("{stderr}");
-    }
-    eprintln!("=== END RCP OUTPUT ===");
 }
 
 #[test]
@@ -120,7 +54,7 @@ fn rcpd_role_hello_readiness_requires_both_roles() {
 }
 
 #[test]
-fn test_remote_automatic_capacity_failure_precedes_remote_side_effects() {
+fn automatic_capacity_failure_precedes_remote_side_effects() {
     let scratch = tempfile::tempdir().unwrap();
     let destination = scratch.path().join("destination");
     let multiplier = format!("--pending-writes-multiplier={}", usize::MAX);
@@ -129,6 +63,7 @@ fn test_remote_automatic_capacity_failure_precedes_remote_side_effects() {
         "unreachable.invalid:~/source",
         destination.to_str().unwrap(),
     ]);
+    print_command_output(&output);
     assert!(
         !output.status.success(),
         "invalid automatic capacity must fail"
@@ -153,7 +88,7 @@ fn test_remote_automatic_capacity_failure_precedes_remote_side_effects() {
 }
 
 #[test]
-fn test_remote_localhost_without_force_remote_is_local() {
+fn localhost_without_force_remote_is_local() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -176,7 +111,7 @@ fn test_remote_localhost_without_force_remote_is_local() {
 }
 
 #[test]
-fn test_remote_pure_local_invalid_glob_precedes_home_and_probe() {
+fn pure_local_invalid_glob_precedes_home_and_probe() {
     let scratch = tempfile::tempdir().unwrap();
     let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
     let rcpd_path = format!("--rcpd-path={}", wrapper.display());
@@ -200,7 +135,7 @@ fn test_remote_pure_local_invalid_glob_precedes_home_and_probe() {
 }
 
 #[test]
-fn test_remote_pure_local_unreadable_filter_file_precedes_home_and_probe() {
+fn pure_local_unreadable_filter_file_precedes_home_and_probe() {
     let scratch = tempfile::tempdir().unwrap();
     let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
     let unreadable = scratch.path().join("filter-is-a-directory");

@@ -6,12 +6,13 @@
 test-threads = 32
 
 [test-groups]
-# serial execution for localhost-SSH integration and remote-library tests
+# serialize the homogeneous rcp SSH target and the remote crate's real-session SSH module
 serial = { max-threads = 1 }
 
-# localhost-SSH integration and remote-library tests must run serially to avoid connection conflicts
+# select the homogeneous integration target and remote-library module structurally; test names do
+# not control serial membership
 [[profile.default.overrides]]
-filter = 'binary(=remote_tests) | (package(=rcp-tools-remote) & test(/^tests::test_remote_/))'
+filter = 'binary(=remote_tests) | (package(=rcp-tools-remote) & test(/^tests::localhost_ssh_tests::/))'
 test-group = 'serial'
 
 # docker tests must run serially to avoid port/connection conflicts.

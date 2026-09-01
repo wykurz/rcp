@@ -176,25 +176,10 @@ still guide filtering, planning, dispatch, and accounting when they are document
 
 ### Nix sandbox test selection
 
-Nix source builds set `rcp_nix_sandbox`; normal and CI test runs do not. Mark an individual test
-whose concrete prerequisite is unavailable in the Nix sandbox immediately before its existing test
-attribute, for example:
-
-```rust
-#[cfg_attr(
-    rcp_nix_sandbox,
-    ignore = "Nix sandbox cannot write POSIX ACL xattrs"
-)]
-#[test]
-```
-
-Every reason must name the missing prerequisite. Gate a whole target only when every test in that
-target has the same prerequisite; nixpkgs itself only sets this cfg and `--test-threads=1`. Verify
-the sandbox contract with:
-
-```bash
-nix build --no-update-lock-file -L .#rcp-all
-```
+Follow the canonical
+[Nix sandbox test selection guidance](docs/testing.md#nix-sandbox-test-selection). Keep sandbox
+selection source-owned through `rcp_nix_sandbox`; do not add name-based skip lists to the flake or
+claim that downstream packaging has adopted this contract without verifying it.
 
 Name tests after observed behavior (e.g., `copies_directory_tree`, `fails_on_permission_denied`).
 Use the `filegen` crate for repeatable fixtures.

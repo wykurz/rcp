@@ -3554,113 +3554,116 @@ mod tests {
         std::num::NonZeroUsize::new(value).unwrap()
     }
 
-    fn test_rcpd_config() -> protocol::RcpdConfig {
-        protocol::RcpdConfig {
-            verbose: 0,
-            fail_early: false,
-            max_workers: 0,
-            max_blocking_threads: 0,
-            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
-                common::ConcurrencyLimit::Limited(nonzero(4)),
-            ),
-            ops_throttle: 0,
-            iops_throttle: 0,
-            chunk_size: 0,
-            auto_meta: None,
-            auto_meta_histogram: false,
-            auto_meta_histogram_log: None,
-            auto_meta_histogram_interval: std::time::Duration::from_secs(1),
-            dereference: false,
-            require_toctou_safe: false,
-            overwrite: false,
-            overwrite_compare: "size,mtime".to_string(),
-            overwrite_manifest_max_entries: protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
-            overwrite_filter: None,
-            ignore_existing: false,
-            skip_specials: false,
-            debug_log_prefix: None,
-            port_ranges: None,
-            progress: false,
-            progress_delay: None,
-            remote_copy_conn_timeout_sec: 1,
-            remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
-            network_profile: NetworkProfile::default(),
-            buffer_size: None,
-            max_connections: 4,
-            pending_writes_multiplier: 1,
-            chrome_trace_prefix: None,
-            flamegraph_prefix: None,
-            profile_level: None,
-            tokio_console: false,
-            tokio_console_port: None,
-            encryption: false,
-            master_cert_fingerprint: None,
-        }
-    }
+    mod localhost_ssh_tests {
+        use super::*;
 
-    async fn prepare_test_rcpd(
-        session: &SshSession,
-        explicit_rcpd_path: Option<&str>,
-        auto_deploy_rcpd: bool,
-        cleanup: &RemoteCleanup,
-    ) -> anyhow::Result<PreparedRcpd> {
-        prepare_rcpd_with_context(
-            session,
-            explicit_rcpd_path,
-            auto_deploy_rcpd,
-            PreparationContext::uncancelled(cleanup.clone()),
-            DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
-        )
-        .await
-    }
-
-    #[cfg(target_os = "linux")]
-    struct KillTestProcessOnDrop {
-        pid: String,
-        process: std::path::PathBuf,
-        start_time: String,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl KillTestProcessOnDrop {
-        fn new(pid: String) -> Self {
-            let process = std::path::PathBuf::from(format!("/proc/{pid}"));
-            let start_time = linux_process_start_time(&process)
-                .expect("failed-rcpd test process must expose a stable identity");
-            Self {
-                pid,
-                process,
-                start_time,
+        fn test_rcpd_config() -> protocol::RcpdConfig {
+            protocol::RcpdConfig {
+                verbose: 0,
+                fail_early: false,
+                max_workers: 0,
+                max_blocking_threads: 0,
+                files_in_flight: protocol::RcpdFilesInFlight::Explicit(
+                    common::ConcurrencyLimit::Limited(nonzero(4)),
+                ),
+                ops_throttle: 0,
+                iops_throttle: 0,
+                chunk_size: 0,
+                auto_meta: None,
+                auto_meta_histogram: false,
+                auto_meta_histogram_log: None,
+                auto_meta_histogram_interval: std::time::Duration::from_secs(1),
+                dereference: false,
+                require_toctou_safe: false,
+                overwrite: false,
+                overwrite_compare: "size,mtime".to_string(),
+                overwrite_manifest_max_entries: protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
+                overwrite_filter: None,
+                ignore_existing: false,
+                skip_specials: false,
+                debug_log_prefix: None,
+                port_ranges: None,
+                progress: false,
+                progress_delay: None,
+                remote_copy_conn_timeout_sec: 1,
+                remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+                network_profile: NetworkProfile::default(),
+                buffer_size: None,
+                max_connections: 4,
+                pending_writes_multiplier: 1,
+                chrome_trace_prefix: None,
+                flamegraph_prefix: None,
+                profile_level: None,
+                tokio_console: false,
+                tokio_console_port: None,
+                encryption: false,
+                master_cert_fingerprint: None,
             }
         }
-    }
 
-    #[cfg(target_os = "linux")]
-    impl Drop for KillTestProcessOnDrop {
-        fn drop(&mut self) {
-            if linux_process_start_time(&self.process).as_ref() == Some(&self.start_time) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", self.pid.as_str()])
-                    .status();
+        async fn prepare_test_rcpd(
+            session: &SshSession,
+            explicit_rcpd_path: Option<&str>,
+            auto_deploy_rcpd: bool,
+            cleanup: &RemoteCleanup,
+        ) -> anyhow::Result<PreparedRcpd> {
+            prepare_rcpd_with_context(
+                session,
+                explicit_rcpd_path,
+                auto_deploy_rcpd,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+            )
+            .await
+        }
+
+        #[cfg(target_os = "linux")]
+        struct KillTestProcessOnDrop {
+            pid: String,
+            process: std::path::PathBuf,
+            start_time: String,
+        }
+
+        #[cfg(target_os = "linux")]
+        impl KillTestProcessOnDrop {
+            fn new(pid: String) -> Self {
+                let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+                let start_time = linux_process_start_time(&process)
+                    .expect("failed-rcpd test process must expose a stable identity");
+                Self {
+                    pid,
+                    process,
+                    start_time,
+                }
             }
         }
-    }
 
-    #[cfg(target_os = "linux")]
-    async fn spawn_failed_rcpd_that_never_exits(
-        session: &ManagedSshSession,
-        directory: &std::path::Path,
-    ) -> (
-        openssh::Child<ManagedSshSession>,
-        tokio::io::BufReader<openssh::ChildStderr>,
-        KillTestProcessOnDrop,
-    ) {
-        use std::os::unix::fs::PermissionsExt;
-        use tokio::io::AsyncBufReadExt;
+        #[cfg(target_os = "linux")]
+        impl Drop for KillTestProcessOnDrop {
+            fn drop(&mut self) {
+                if linux_process_start_time(&self.process).as_ref() == Some(&self.start_time) {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", self.pid.as_str()])
+                        .status();
+                }
+            }
+        }
 
-        let script = directory.join("failed-rcpd");
-        let process_pid = directory.join("process-pid");
-        std::fs::write(
+        #[cfg(target_os = "linux")]
+        async fn spawn_failed_rcpd_that_never_exits(
+            session: &ManagedSshSession,
+            directory: &std::path::Path,
+        ) -> (
+            openssh::Child<ManagedSshSession>,
+            tokio::io::BufReader<openssh::ChildStderr>,
+            KillTestProcessOnDrop,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+            use tokio::io::AsyncBufReadExt;
+
+            let script = directory.join("failed-rcpd");
+            let process_pid = directory.join("process-pid");
+            std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nprintf '%s\\n' 'not a readiness record' >&2\nexec sleep 30\n",
@@ -3668,102 +3671,559 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = openssh::Session::to_command(session.clone(), script.to_str().unwrap());
-        command
-            .stdin(openssh::Stdio::piped())
-            .stdout(openssh::Stdio::piped())
-            .stderr(openssh::Stdio::piped());
-        let mut child = command.spawn().await.unwrap();
-        let stderr = child.stderr().take().unwrap();
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
-        let mut readiness = String::new();
-        stderr_reader.read_line(&mut readiness).await.unwrap();
-        assert_eq!(readiness, "not a readiness record\n");
-        let pid = std::fs::read_to_string(process_pid).unwrap();
-        let guard = KillTestProcessOnDrop::new(pid.trim().to_string());
-        (child, stderr_reader, guard)
-    }
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command =
+                openssh::Session::to_command(session.clone(), script.to_str().unwrap());
+            command
+                .stdin(openssh::Stdio::piped())
+                .stdout(openssh::Stdio::piped())
+                .stderr(openssh::Stdio::piped());
+            let mut child = command.spawn().await.unwrap();
+            let stderr = child.stderr().take().unwrap();
+            let mut stderr_reader = tokio::io::BufReader::new(stderr);
+            let mut readiness = String::new();
+            stderr_reader.read_line(&mut readiness).await.unwrap();
+            assert_eq!(readiness, "not a readiness record\n");
+            let pid = std::fs::read_to_string(process_pid).unwrap();
+            let guard = KillTestProcessOnDrop::new(pid.trim().to_string());
+            (child, stderr_reader, guard)
+        }
 
-    #[cfg(target_os = "linux")]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_failed_rcpd_reap_timeout_releases_child_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let preparation = PreparationContext::uncancelled(cleanup.clone());
-        let session = setup_ssh_session(
-            &SshSession::local(),
-            &preparation,
-            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_failed_rcpd_reap_timeout_releases_child_session() {
+            let directory = tempfile::tempdir().unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let preparation = PreparationContext::uncancelled(cleanup.clone());
+            let session = setup_ssh_session(
+                &SshSession::local(),
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .expect("localhost SSH must be available");
+            let weak_session = std::sync::Arc::downgrade(&session.0);
+            let (child, stderr_reader, _process) =
+                spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
+
+            let diagnostic = reap_failed_rcpd(child, "localhost", Some(stderr_reader)).await;
+            assert!(diagnostic.is_none());
+            drop(session);
+            drop(preparation);
+
+            assert!(
+                weak_session.upgrade().is_none(),
+                "an expired failed-rcpd reap must release its child and managed SSH session"
+            );
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_cancelled_failed_rcpd_reap_releases_child_session() {
+            let directory = tempfile::tempdir().unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let preparation = PreparationContext::uncancelled(cleanup.clone());
+            let session = setup_ssh_session(
+                &SshSession::local(),
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .expect("localhost SSH must be available");
+            let weak_session = std::sync::Arc::downgrade(&session.0);
+            let (child, stderr_reader, _process) =
+                spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
+            let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+            let reaper = tokio::spawn(async move {
+                let mut reaper =
+                    Box::pin(reap_failed_rcpd(child, "localhost", Some(stderr_reader)));
+                let mut first_poll_tx = Some(first_poll_tx);
+                std::future::poll_fn(move |context| {
+                    let result = std::future::Future::poll(reaper.as_mut(), context);
+                    if let Some(first_poll_tx) = first_poll_tx.take() {
+                        let _ = first_poll_tx.send(());
+                    }
+                    result
+                })
+                .await
+            });
+            first_poll_rx.await.unwrap();
+
+            reaper.abort();
+            let error = reaper.await.unwrap_err();
+            assert!(error.is_cancelled());
+            drop(session);
+            drop(preparation);
+
+            assert!(
+                weak_session.upgrade().is_none(),
+                "cancelling a failed-rcpd reap must release its child and managed SSH session"
+            );
+            cleanup.finish();
+        }
+
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_command_output_uses_required_bootstrap_deadline() {
+            let cleanup = RemoteCleanup::new().unwrap();
+            let preparation = PreparationContext::uncancelled(cleanup.clone());
+            let session = setup_ssh_session(
+                &SshSession::local(),
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .expect("localhost SSH must be available");
+            let mut command = openssh::Session::to_command(session, "sh");
+            command.arg("-c").arg("sleep 30");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                preparation.remote_output(
+                    command,
+                    "remote discovery probe",
+                    BootstrapDeadline::new(std::time::Duration::from_millis(100)),
+                ),
+            )
+            .await
+            .expect("the shared remote-command helper did not enforce its deadline");
+            let error = result.expect_err("the hanging remote command unexpectedly completed");
+            assert!(
+                format!("{error:#}").contains("remote discovery probe timed out after 100ms"),
+                "configured deadline missing from remote-command error: {error:#}"
+            );
+            drop(preparation);
+            cleanup.finish();
+        }
+
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_home_lookup_uses_required_bootstrap_deadline() {
+            let cleanup = RemoteCleanup::new().unwrap();
+            let preparation = PreparationContext::uncancelled(cleanup.clone());
+            let session = setup_ssh_session(
+                &SshSession::local(),
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .expect("localhost SSH must be available");
+            let mut command = openssh::Session::to_command(session, "sh");
+            command.arg("-c").arg("sleep 30");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                run_remote_home_probe(
+                    command,
+                    &preparation,
+                    BootstrapDeadline::new(std::time::Duration::from_millis(100)),
+                ),
+            )
+            .await
+            .expect("the HOME lookup ignored its configured deadline");
+            let error = result.expect_err("the hanging HOME lookup unexpectedly completed");
+            assert!(
+                format!("{error:#}").contains("remote HOME lookup timed out after 100ms"),
+                "configured deadline missing from HOME lookup error: {error:#}"
+            );
+            drop(preparation);
+            cleanup.finish();
+        }
+
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_cancelled_command_output_is_bounded() {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
+            let session = setup_ssh_session(
+                &SshSession::local(),
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .expect("localhost SSH must be available");
+            let mut command = openssh::Session::to_command(session, "sh");
+            command.arg("-c").arg("sleep 30");
+            let cancel = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel();
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                preparation.remote_output(
+                    command,
+                    "remote cancellation probe",
+                    BootstrapDeadline::new(std::time::Duration::from_secs(30)),
+                ),
+            )
+            .await
+            .expect("peer cancellation did not bound the remote command");
+            cancel.await.unwrap();
+            drop(preparation);
+            cleanup.finish();
+            let error = result.expect_err("the cancelled remote command unexpectedly completed");
+            assert!(
+                format!("{error:#}")
+                    .contains("rcpd preparation cancelled because peer preparation failed"),
+                "peer cancellation missing from remote-command error: {error:#}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_start_rcpd_uses_configured_version_probe_timeout() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = std::env::temp_dir().join(format!(
+                "rcp-configured-probe-timeout-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let script = directory.join("rcpd");
+            std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  exec sleep 30\nfi\nexit 99\n",
         )
-        .await
-        .expect("localhost SSH must be available");
-        let weak_session = std::sync::Arc::downgrade(&session.0);
-        let (child, stderr_reader, _process) =
-            spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
+        .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
 
-        let diagnostic = reap_failed_rcpd(child, "localhost", Some(stderr_reader)).await;
-        assert!(diagnostic.is_none());
-        drop(session);
-        drop(preparation);
-
-        assert!(
-            weak_session.upgrade().is_none(),
-            "an expired failed-rcpd reap must release its child and managed SSH session"
-        );
-        cleanup.finish();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_cancelled_failed_rcpd_reap_releases_child_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let preparation = PreparationContext::uncancelled(cleanup.clone());
-        let session = setup_ssh_session(
-            &SshSession::local(),
-            &preparation,
-            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
-        )
-        .await
-        .expect("localhost SSH must be available");
-        let weak_session = std::sync::Arc::downgrade(&session.0);
-        let (child, stderr_reader, _process) =
-            spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
-        let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
-        let reaper = tokio::spawn(async move {
-            let mut reaper = Box::pin(reap_failed_rcpd(child, "localhost", Some(stderr_reader)));
-            let mut first_poll_tx = Some(first_poll_tx);
-            std::future::poll_fn(move |context| {
-                let result = std::future::Future::poll(reaper.as_mut(), context);
-                if let Some(first_poll_tx) = first_poll_tx.take() {
-                    let _ = first_poll_tx.send(());
-                }
-                result
+            let config = test_rcpd_config();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                prepare_rcpd_with_context(
+                    &SshSession::local(),
+                    Some(script.to_str().unwrap()),
+                    false,
+                    PreparationContext::uncancelled(cleanup.clone()),
+                    std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
+                )
+                .await?
+                .spawn(&config, None, protocol::RcpdRole::Source)
+                .await
             })
             .await
-        });
-        first_poll_rx.await.unwrap();
+            .expect("the configured one-second probe deadline was not honored");
+            let error = match result {
+                Ok(_) => panic!("the hanging version probe unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("timed out after 1s"),
+                "configured deadline missing from probe error: {error}"
+            );
 
-        reaper.abort();
-        let error = reaper.await.unwrap_err();
-        assert!(error.is_cancelled());
-        drop(session);
-        drop(preparation);
+            cleanup.finish();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
 
-        assert!(
-            weak_session.upgrade().is_none(),
-            "cancelling a failed-rcpd reap must release its child and managed SSH session"
-        );
-        cleanup.finish();
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_prepared_rcpd_readiness_uses_configured_timeout() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("rcpd");
+            let daemon_exit = directory.path().join("daemon-exit");
+            let version = common::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ncat >/dev/null\nprintf 'exited\\n' > {}\n",
+                shell_escape(&version),
+                shell_escape(daemon_exit.to_str().unwrap()),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_test_rcpd(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
+            )
+            .await
+            .expect("the configured one-second readiness deadline was not honored");
+            let error = match result {
+                Ok(_) => panic!("rcpd without a readiness record unexpectedly started"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("timed out after 1s"),
+                "configured deadline missing from readiness error: {error}"
+            );
+            assert_eq!(std::fs::read_to_string(daemon_exit).unwrap(), "exited\n");
+            drop(prepared);
+            cleanup.finish();
+        }
+
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_prepared_rcpd_rejects_an_oversized_readiness_record() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("rcpd");
+            let version = common::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ndd if=/dev/zero bs=71680 count=1 2>/dev/null | tr '\\000' x >&2\ncat >/dev/null\n",
+                shell_escape(&version),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_test_rcpd(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let mut config = test_rcpd_config();
+            config.remote_copy_conn_timeout_sec = 5;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                prepared.spawn(&config, None, protocol::RcpdRole::Source),
+            )
+            .await
+            .expect("an oversized readiness record must fail before the connection deadline");
+            let error = match result {
+                Ok(_) => panic!("an oversized readiness record unexpectedly started rcpd"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("readiness record exceeds"),
+                "oversized readiness error omitted the size limit: {error}"
+            );
+            drop(prepared);
+            cleanup.finish();
+        }
+
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_prepared_rcpd_spawns_both_roles_after_one_preparation() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = std::env::temp_dir().join(format!(
+                "rcp-prepared-rcpd-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let script = directory.join("rcpd");
+            let marker = directory.join("version-probes");
+            let version = common::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf 'probe\\n' >> {}\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\ncat >/dev/null\n",
+                shell_escape(marker.to_str().unwrap()),
+                shell_escape(&version),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = test_rcpd_config();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_test_rcpd(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let source = prepared
+                .spawn(&config, None, protocol::RcpdRole::Source)
+                .await
+                .unwrap();
+            let destination = prepared
+                .spawn(&config, None, protocol::RcpdRole::Destination)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
+            wait_for_rcpd_process(source).await.unwrap();
+            wait_for_rcpd_process(destination).await.unwrap();
+            drop(prepared);
+            cleanup.finish();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_wait_for_rcpd_process_retains_daemon_diagnostics() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = std::env::temp_dir().join(format!(
+                "rcp-rcpd-diagnostics-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let script = directory.join("rcpd");
+            let version = common::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\nprintf '%s\\n' 'daemon stdout detail'\nprintf '%s\\n' 'daemon stderr detail' >&2\nexit 42\n",
+                shell_escape(&version),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_test_rcpd(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let process = prepared
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source)
+                .await
+                .unwrap();
+            let error = wait_for_rcpd_process(process).await.unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("daemon stdout detail"),
+                "stdout diagnostic missing: {error}"
+            );
+            assert!(
+                error.contains("daemon stderr detail"),
+                "stderr diagnostic missing: {error}"
+            );
+            drop(prepared);
+            cleanup.finish();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_failed_rcpd_bootstrap_reaps_child_before_returning() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = std::env::temp_dir().join(format!(
+                "rcp-failed-bootstrap-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let script = directory.join("rcpd");
+            let source_exit = directory.join("source-exit");
+            let destination_exit = directory.join("destination-exit");
+            let version = common::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nif [ \"$2\" = source ]; then\n  printf '%s\\n' 'RCP_ERROR pending file capacity test refusal' >&2\n  marker={}\nelse\n  printf '%s\\n' 'not a readiness record' >&2\n  printf '%s\\n' 'destination listener bind failed'\n  marker={}\nfi\ncat >/dev/null\nprintf 'exited\\n' > \"$marker\"\n",
+                shell_escape(&version),
+                shell_escape(source_exit.to_str().unwrap()),
+                shell_escape(destination_exit.to_str().unwrap()),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_test_rcpd(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let config = test_rcpd_config();
+
+            let refusal = match prepared
+                .spawn(&config, None, protocol::RcpdRole::Source)
+                .await
+            {
+                Ok(_) => panic!("startup refusal unexpectedly produced an rcpd process"),
+                Err(error) => error,
+            };
+            assert!(refusal.to_string().contains("rcpd refused startup"));
+            assert!(refusal.chain().any(|cause| {
+                cause
+                    .to_string()
+                    .contains("pending file capacity test refusal")
+            }));
+            assert_eq!(std::fs::read_to_string(&source_exit).unwrap(), "exited\n");
+
+            let malformed = match prepared
+                .spawn(&config, None, protocol::RcpdRole::Destination)
+                .await
+            {
+                Ok(_) => panic!("malformed readiness unexpectedly produced an rcpd process"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{malformed:#}").contains("unexpected output from rcpd"),
+                "unexpected startup error: {malformed:#}"
+            );
+            assert!(
+                format!("{malformed:#}").contains("destination listener bind failed"),
+                "startup output must retain the daemon's failure: {malformed:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&destination_exit).unwrap(),
+                "exited\n"
+            );
+            drop(prepared);
+            cleanup.finish();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -3860,460 +4320,6 @@ mod tests {
             !format!("{error:#}").contains("rcpd refused startup"),
             "a prefix collision was treated as a typed refusal: {error:#}"
         );
-    }
-
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_command_output_uses_required_bootstrap_deadline() {
-        let cleanup = RemoteCleanup::new().unwrap();
-        let preparation = PreparationContext::uncancelled(cleanup.clone());
-        let session = setup_ssh_session(
-            &SshSession::local(),
-            &preparation,
-            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
-        )
-        .await
-        .expect("localhost SSH must be available");
-        let mut command = openssh::Session::to_command(session, "sh");
-        command.arg("-c").arg("sleep 30");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            preparation.remote_output(
-                command,
-                "remote discovery probe",
-                BootstrapDeadline::new(std::time::Duration::from_millis(100)),
-            ),
-        )
-        .await
-        .expect("the shared remote-command helper did not enforce its deadline");
-        let error = result.expect_err("the hanging remote command unexpectedly completed");
-        assert!(
-            format!("{error:#}").contains("remote discovery probe timed out after 100ms"),
-            "configured deadline missing from remote-command error: {error:#}"
-        );
-        drop(preparation);
-        cleanup.finish();
-    }
-
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_home_lookup_uses_required_bootstrap_deadline() {
-        let cleanup = RemoteCleanup::new().unwrap();
-        let preparation = PreparationContext::uncancelled(cleanup.clone());
-        let session = setup_ssh_session(
-            &SshSession::local(),
-            &preparation,
-            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
-        )
-        .await
-        .expect("localhost SSH must be available");
-        let mut command = openssh::Session::to_command(session, "sh");
-        command.arg("-c").arg("sleep 30");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            run_remote_home_probe(
-                command,
-                &preparation,
-                BootstrapDeadline::new(std::time::Duration::from_millis(100)),
-            ),
-        )
-        .await
-        .expect("the HOME lookup ignored its configured deadline");
-        let error = result.expect_err("the hanging HOME lookup unexpectedly completed");
-        assert!(
-            format!("{error:#}").contains("remote HOME lookup timed out after 100ms"),
-            "configured deadline missing from HOME lookup error: {error:#}"
-        );
-        drop(preparation);
-        cleanup.finish();
-    }
-
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_cancelled_command_output_is_bounded() {
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
-        let session = setup_ssh_session(
-            &SshSession::local(),
-            &preparation,
-            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
-        )
-        .await
-        .expect("localhost SSH must be available");
-        let mut command = openssh::Session::to_command(session, "sh");
-        command.arg("-c").arg("sleep 30");
-        let cancel = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            cancellation.cancel();
-        });
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            preparation.remote_output(
-                command,
-                "remote cancellation probe",
-                BootstrapDeadline::new(std::time::Duration::from_secs(30)),
-            ),
-        )
-        .await
-        .expect("peer cancellation did not bound the remote command");
-        cancel.await.unwrap();
-        drop(preparation);
-        cleanup.finish();
-        let error = result.expect_err("the cancelled remote command unexpectedly completed");
-        assert!(
-            format!("{error:#}")
-                .contains("rcpd preparation cancelled because peer preparation failed"),
-            "peer cancellation missing from remote-command error: {error:#}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_start_rcpd_uses_configured_version_probe_timeout() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = std::env::temp_dir().join(format!(
-            "rcp-configured-probe-timeout-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let script = directory.join("rcpd");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  exec sleep 30\nfi\nexit 99\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-
-        let config = test_rcpd_config();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            prepare_rcpd_with_context(
-                &SshSession::local(),
-                Some(script.to_str().unwrap()),
-                false,
-                PreparationContext::uncancelled(cleanup.clone()),
-                std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
-            )
-            .await?
-            .spawn(&config, None, protocol::RcpdRole::Source)
-            .await
-        })
-        .await
-        .expect("the configured one-second probe deadline was not honored");
-        let error = match result {
-            Ok(_) => panic!("the hanging version probe unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("timed out after 1s"),
-            "configured deadline missing from probe error: {error}"
-        );
-
-        cleanup.finish();
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_prepared_rcpd_readiness_uses_configured_timeout() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("rcpd");
-        let daemon_exit = directory.path().join("daemon-exit");
-        let version = common::version::ProtocolVersion::current()
-            .to_json()
-            .unwrap();
-        let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ncat >/dev/null\nprintf 'exited\\n' > {}\n",
-            shell_escape(&version),
-            shell_escape(daemon_exit.to_str().unwrap()),
-        );
-        std::fs::write(&script, contents).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_test_rcpd(
-            &SshSession::local(),
-            Some(script.to_str().unwrap()),
-            false,
-            &cleanup,
-        )
-        .await
-        .unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
-        )
-        .await
-        .expect("the configured one-second readiness deadline was not honored");
-        let error = match result {
-            Ok(_) => panic!("rcpd without a readiness record unexpectedly started"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert!(
-            error.contains("timed out after 1s"),
-            "configured deadline missing from readiness error: {error}"
-        );
-        assert_eq!(std::fs::read_to_string(daemon_exit).unwrap(), "exited\n");
-        drop(prepared);
-        cleanup.finish();
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_prepared_rcpd_rejects_an_oversized_readiness_record() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("rcpd");
-        let version = common::version::ProtocolVersion::current()
-            .to_json()
-            .unwrap();
-        let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ndd if=/dev/zero bs=71680 count=1 2>/dev/null | tr '\\000' x >&2\ncat >/dev/null\n",
-            shell_escape(&version),
-        );
-        std::fs::write(&script, contents).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_test_rcpd(
-            &SshSession::local(),
-            Some(script.to_str().unwrap()),
-            false,
-            &cleanup,
-        )
-        .await
-        .unwrap();
-        let mut config = test_rcpd_config();
-        config.remote_copy_conn_timeout_sec = 5;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            prepared.spawn(&config, None, protocol::RcpdRole::Source),
-        )
-        .await
-        .expect("an oversized readiness record must fail before the connection deadline");
-        let error = match result {
-            Ok(_) => panic!("an oversized readiness record unexpectedly started rcpd"),
-            Err(error) => format!("{error:#}"),
-        };
-        assert!(
-            error.contains("readiness record exceeds"),
-            "oversized readiness error omitted the size limit: {error}"
-        );
-        drop(prepared);
-        cleanup.finish();
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_prepared_rcpd_spawns_both_roles_after_one_preparation() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = std::env::temp_dir().join(format!(
-            "rcp-prepared-rcpd-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let script = directory.join("rcpd");
-        let marker = directory.join("version-probes");
-        let version = common::version::ProtocolVersion::current()
-            .to_json()
-            .unwrap();
-        let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf 'probe\\n' >> {}\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\ncat >/dev/null\n",
-            shell_escape(marker.to_str().unwrap()),
-            shell_escape(&version),
-        );
-        std::fs::write(&script, contents).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config = test_rcpd_config();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_test_rcpd(
-            &SshSession::local(),
-            Some(script.to_str().unwrap()),
-            false,
-            &cleanup,
-        )
-        .await
-        .unwrap();
-        let source = prepared
-            .spawn(&config, None, protocol::RcpdRole::Source)
-            .await
-            .unwrap();
-        let destination = prepared
-            .spawn(&config, None, protocol::RcpdRole::Destination)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
-        wait_for_rcpd_process(source).await.unwrap();
-        wait_for_rcpd_process(destination).await.unwrap();
-        drop(prepared);
-        cleanup.finish();
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_wait_for_rcpd_process_retains_daemon_diagnostics() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = std::env::temp_dir().join(format!(
-            "rcp-rcpd-diagnostics-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let script = directory.join("rcpd");
-        let version = common::version::ProtocolVersion::current()
-            .to_json()
-            .unwrap();
-        let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\nprintf '%s\\n' 'daemon stdout detail'\nprintf '%s\\n' 'daemon stderr detail' >&2\nexit 42\n",
-            shell_escape(&version),
-        );
-        std::fs::write(&script, contents).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_test_rcpd(
-            &SshSession::local(),
-            Some(script.to_str().unwrap()),
-            false,
-            &cleanup,
-        )
-        .await
-        .unwrap();
-        let process = prepared
-            .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source)
-            .await
-            .unwrap();
-        let error = wait_for_rcpd_process(process).await.unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("daemon stdout detail"),
-            "stdout diagnostic missing: {error}"
-        );
-        assert!(
-            error.contains("daemon stderr detail"),
-            "stderr diagnostic missing: {error}"
-        );
-        drop(prepared);
-        cleanup.finish();
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[cfg_attr(
-        rcp_nix_sandbox,
-        ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
-    )]
-    #[tokio::test]
-    async fn test_remote_failed_rcpd_bootstrap_reaps_child_before_returning() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = std::env::temp_dir().join(format!(
-            "rcp-failed-bootstrap-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let script = directory.join("rcpd");
-        let source_exit = directory.join("source-exit");
-        let destination_exit = directory.join("destination-exit");
-        let version = common::version::ProtocolVersion::current()
-            .to_json()
-            .unwrap();
-        let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nif [ \"$2\" = source ]; then\n  printf '%s\\n' 'RCP_ERROR pending file capacity test refusal' >&2\n  marker={}\nelse\n  printf '%s\\n' 'not a readiness record' >&2\n  printf '%s\\n' 'destination listener bind failed'\n  marker={}\nfi\ncat >/dev/null\nprintf 'exited\\n' > \"$marker\"\n",
-            shell_escape(&version),
-            shell_escape(source_exit.to_str().unwrap()),
-            shell_escape(destination_exit.to_str().unwrap()),
-        );
-        std::fs::write(&script, contents).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_test_rcpd(
-            &SshSession::local(),
-            Some(script.to_str().unwrap()),
-            false,
-            &cleanup,
-        )
-        .await
-        .unwrap();
-        let config = test_rcpd_config();
-
-        let refusal = match prepared
-            .spawn(&config, None, protocol::RcpdRole::Source)
-            .await
-        {
-            Ok(_) => panic!("startup refusal unexpectedly produced an rcpd process"),
-            Err(error) => error,
-        };
-        assert!(refusal.to_string().contains("rcpd refused startup"));
-        assert!(refusal.chain().any(|cause| {
-            cause
-                .to_string()
-                .contains("pending file capacity test refusal")
-        }));
-        assert_eq!(std::fs::read_to_string(&source_exit).unwrap(), "exited\n");
-
-        let malformed = match prepared
-            .spawn(&config, None, protocol::RcpdRole::Destination)
-            .await
-        {
-            Ok(_) => panic!("malformed readiness unexpectedly produced an rcpd process"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{malformed:#}").contains("unexpected output from rcpd"),
-            "unexpected startup error: {malformed:#}"
-        );
-        assert!(
-            format!("{malformed:#}").contains("destination listener bind failed"),
-            "startup output must retain the daemon's failure: {malformed:#}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&destination_exit).unwrap(),
-            "exited\n"
-        );
-        drop(prepared);
-        cleanup.finish();
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]

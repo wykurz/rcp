@@ -77,20 +77,14 @@ fn test_no_preserve_permissions() {
     assert_eq!(get_file_content(&dst_file), "test content");
 }
 
-#[cfg_attr(
-    rcp_nix_sandbox,
-    ignore = "Nix sandbox does not provide the overwrite semantics this test requires"
-)]
 #[test]
 fn test_overwrite_behavior() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-    create_test_file(&src_file, "new content", 0o644);
+    // use different sizes so the default size,mtime comparison must replace the destination
+    create_test_file(&src_file, "new content with a different size", 0o644);
     create_test_file(&dst_file, "old content", 0o644);
-    // Add delay to ensure different timestamps
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    std::fs::write(&src_file, "new content").unwrap();
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--overwrite",
@@ -99,7 +93,10 @@ fn test_overwrite_behavior() {
     ])
     .assert()
     .success();
-    assert_eq!(get_file_content(&dst_file), "new content");
+    assert_eq!(
+        get_file_content(&dst_file),
+        "new content with a different size"
+    );
 }
 
 #[test]

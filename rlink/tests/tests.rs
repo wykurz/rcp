@@ -186,10 +186,6 @@ fn test_update_exclusive_mode() {
     );
 }
 
-#[cfg_attr(
-    rcp_nix_sandbox,
-    ignore = "Nix sandbox does not provide the overwrite semantics this test requires"
-)]
 #[test]
 fn test_overwrite_behavior() {
     let (src_dir, dst_dir, _) = setup_test_env();
@@ -197,7 +193,8 @@ fn test_overwrite_behavior() {
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
 
-    create_test_file(&src_file, "new content", 0o644);
+    // use different sizes so the default size,mtime comparison must replace the destination
+    create_test_file(&src_file, "new content with a different size", 0o644);
     create_test_file(&dst_file, "old content", 0o644);
 
     let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
@@ -210,7 +207,10 @@ fn test_overwrite_behavior() {
     .success();
 
     assert!(are_files_hardlinked(&src_file, &dst_file));
-    assert_eq!(get_file_content(&dst_file), "new content");
+    assert_eq!(
+        get_file_content(&dst_file),
+        "new content with a different size"
+    );
 }
 
 #[test]

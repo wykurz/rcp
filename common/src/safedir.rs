@@ -5367,9 +5367,11 @@ mod tests {
     // padded past 256 bytes with `user.*` attributes, and the blob past 512 by entry count (a blob
     // is `4 + 8n` bytes, so 64 entries fill the buffer exactly and 80 overflow it). Without the
     // retry paths this fails rather than silently truncating — `fgetxattr` refuses a short buffer.
+    // tmpfs gained user.* xattr support in Linux 6.6, so older sandbox kernels cannot construct the
+    // padded name list even apart from the POSIX ACL restriction
     #[cfg_attr(
         rcp_nix_sandbox,
-        ignore = "Nix sandbox filesystem cannot provide the user xattrs this test requires"
+        ignore = "Nix sandbox cannot provide both POSIX ACL and user xattrs this test requires"
     )]
     #[tokio::test]
     async fn read_acls_fd_reads_an_acl_larger_than_the_stack_buffers() -> anyhow::Result<()> {
