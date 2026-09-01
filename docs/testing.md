@@ -39,27 +39,6 @@ Parallel in-process libtest is unsupported for these fixtures. The standard `jus
 `just ci` paths use nextest; the Nix libtest check phase keeps `--test-threads=1` for the same
 contract. Do not add broad serialization for unrelated tests.
 
-### Nix sandbox test selection
-
-Nix source builds set `rcp_nix_sandbox`; normal and CI test runs do not. Put an individual skip
-immediately before its existing test attribute, and name the exact unavailable prerequisite:
-
-```rust
-#[cfg_attr(
-    rcp_nix_sandbox,
-    ignore = "Nix sandbox cannot write POSIX ACL xattrs"
-)]
-#[test]
-```
-
-Use a whole-target gate only when every test in that target has the same prerequisite. nixpkgs only
-sets this cfg and `--test-threads=1`; it does not select tests by name. Verify the sandbox contract
-with:
-
-```bash
-nix build --no-update-lock-file -L .#rcp-all
-```
-
 ```bash
 # Default profile (debug tests)
 cargo nextest run
@@ -69,6 +48,38 @@ cargo nextest run --release
 
 # Docker profile (for multi-host tests)
 cargo nextest run --profile docker --run-ignored only
+```
+
+### Nix sandbox test selection
+
+Builds through this repository's flake set `rcp_nix_sandbox`; ordinary Cargo and nextest runs do
+not. Put an individual skip immediately before its existing test attribute, and name the exact
+unavailable prerequisite:
+
+```rust
+#[cfg_attr(
+    rcp_nix_sandbox,
+    ignore = "Nix sandbox cannot write POSIX ACL xattrs"
+)]
+#[test]
+```
+
+Use a whole-target gate only when every test in that target has the same prerequisite. The flake
+sets this cfg and `--test-threads=1`; it does not select tests by name.
+
+The flake passes the same matching `target.'cfg(all())'.rustflags` Cargo configuration to its build
+and check phases. Cargo joins that entry with exact-target flags supplied by the Rust package hooks,
+whereas a matching target entry would suppress `build.rustflags`. Keeping the two phases identical
+also prevents a rustflag-only mismatch from invalidating otherwise reusable release units during the
+check. Do not use the `RUSTFLAGS` environment variable for this: it takes precedence over all target
+entries and would replace the packaging flags instead of joining them.
+
+This is a contract of the repository flake, not a claim that every downstream package recipe has
+adopted it. Downstream packagers opt in by carrying the same cfg and build/check configuration.
+Verify the sandbox contract with:
+
+```bash
+nix build --no-update-lock-file -L .#rcp-all
 ```
 
 ## Test Categories
@@ -114,6 +125,11 @@ Tests using localhost SSH (`rcp/tests/remote_tests.rs` and the real-session test
 
 **Requirements**: localhost SSH must be available and usable (running sshd, accessible via
 `ssh localhost`).
+
+Keep rcp's localhost-SSH integration tests in the `remote_tests` target and remote-crate
+real-session tests in `tests::localhost_ssh_tests`. Nextest selects those two structural locations
+for its serial group; test names do not control membership. Launcher fakes and socket-only protocol
+tests stay outside those locations and run in parallel.
 
 `rcp/tests/remote_non_ssh_tests.rs` instead covers localhost-as-local behavior and validation
 failures that must occur before SSH setup, so it runs without that prerequisite.
