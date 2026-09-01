@@ -7,6 +7,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-09-01
+
+### Added
+
+- Add Depot CI recipes (`just depot-ci`, `just depot-test`, `just depot-test-all`,
+  `just depot-docker-test`, and friends) that run the current worktree remotely without a commit or
+  push. The Nix dev shell now provides the pinned Depot CLI v2.102.7 and `jq`.
+
+### Changed
+
+- Move Nix sandbox test selection into the sources: builds through the repository flake set the
+  `rcp_nix_sandbox` cfg, and every test that cannot run in the sandbox carries a
+  `#[cfg_attr(rcp_nix_sandbox, ignore = "...")]` naming its missing prerequisite. This replaces the
+  flake's name-based `--skip` list and the remote-test naming check; downstream packagers opt in by
+  passing the same cfg (see `docs/testing.md`).
+- Change nextest to serialize localhost-SSH tests by binary and module rather than by test name.
+  Tests for localhost-as-local behavior and pre-SSH validation moved to a separate target that runs
+  in parallel without an SSH prerequisite.
+- Improve Docker multi-host test readiness checks and worker log capture.
+- Update Cargo dependencies.
+
 ## [0.39.0] - 2026-08-30
 
 ### Changed
@@ -1143,7 +1164,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.39.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/wykurz/rcp/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/wykurz/rcp/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/wykurz/rcp/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/wykurz/rcp/compare/v0.36.0...v0.37.0
