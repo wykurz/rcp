@@ -18,6 +18,10 @@ lint:
     ./scripts/check-doc-format.sh
     @echo "🔍 Running clippy..."
     cargo clippy --workspace --all-targets -- -D warnings
+    @echo "🔍 Testing the Depot CI helper..."
+    ./scripts/test-depot-ci.sh
+    @echo "🔍 Testing the Docker helper..."
+    ./scripts/test-docker-helpers.sh
     @echo "🔍 Testing the error logging linter..."
     ./scripts/test-check-error-logging.sh
     @echo "🔍 Checking error logging format..."
@@ -103,6 +107,46 @@ doc:
 # devShell's pinned toolchain); GitHub CI runs it as the dedicated `msrv` job.
 ci: lint doc test-all-with-docker
     @echo "✅ All CI checks passed! (run 'just msrv' for the separate MSRV check)"
+
+# Depot CI
+# ========
+
+# Run selected CI jobs remotely on Depot.
+_depot-ci-run *JOBS:
+    ./scripts/depot-ci.sh "$@"
+
+# Run debug tests remotely on Depot.
+depot-test: (_depot-ci-run "test")
+
+# Run release tests remotely on Depot.
+depot-test-release: (_depot-ci-run "test-release")
+
+# Run debug doctests remotely on Depot.
+depot-doctest: (_depot-ci-run "doctest")
+
+# Run release doctests remotely on Depot.
+depot-doctest-release: (_depot-ci-run "doctest-release")
+
+# Build and check documentation remotely on Depot.
+depot-doc: (_depot-ci-run "doc")
+
+# Run debug and release tests and doctests remotely on Depot.
+depot-test-all: (_depot-ci-run "test" "doctest" "test-release" "doctest-release")
+
+# Run Docker integration tests remotely on Depot.
+depot-docker-test: (_depot-ci-run "docker-test")
+
+# Run Docker chaos tests remotely on Depot.
+depot-docker-chaos-test: (_depot-ci-run "docker-chaos-test")
+
+# Run Docker chaos tests remotely on Depot.
+depot-chaos: (_depot-ci-run "docker-chaos-test")
+
+# Run all tests and Docker integration tests remotely on Depot.
+depot-test-all-with-docker: (_depot-ci-run "test" "doctest" "test-release" "doctest-release" "docker-test")
+
+# Run the standard CI jobs remotely on Depot.
+depot-ci: (_depot-ci-run "lint" "doc" "test" "doctest" "test-release" "doctest-release" "docker-test")
 
 # Clean build artifacts
 clean:

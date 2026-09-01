@@ -1,0 +1,115 @@
+name: RCP CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  PKG_CONFIG_ALLOW_CROSS: "1"
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+      with:
+        install-dprint: "true"
+    - run: just lint
+
+  doc:
+    name: Documentation
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+    - run: just doc
+
+  test:
+    name: Tests (debug)
+    runs-on: depot-ubuntu-24.04-16
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+      with:
+        install-nextest: "true"
+        install-test-deps: "true"
+        localhost-ssh: "true"
+    - run: just test
+
+  doctest:
+    name: Doctests (debug)
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+    - run: just doctest
+
+  test-release:
+    name: Tests (release)
+    runs-on: depot-ubuntu-24.04-16
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+      with:
+        install-nextest: "true"
+        install-test-deps: "true"
+        localhost-ssh: "true"
+    - run: just test-release
+
+  doctest-release:
+    name: Doctests (release)
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+    - run: just doctest-release
+
+  docker-test:
+    name: Docker tests
+    runs-on: depot-ubuntu-24.04-16
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+      with:
+        docker-compose-compat: "true"
+        install-nextest: "true"
+    - run: just docker-test
+    - name: Show Docker logs on failure
+      if: failure()
+      run: just docker-logs
+    - name: Stop Docker containers
+      if: always()
+      run: just docker-down
+
+  docker-chaos-test:
+    name: Docker chaos tests
+    runs-on: depot-ubuntu-24.04-16
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ./.depot/actions/rcp-rust-setup
+      with:
+        docker-compose-compat: "true"
+        install-nextest: "true"
+    - run: just docker-chaos-test
+    - name: Show Docker logs on failure
+      if: failure()
+      run: just docker-logs
+    - name: Stop Docker containers
+      if: always()
+      run: just docker-down

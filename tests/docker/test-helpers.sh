@@ -9,15 +9,10 @@ cd "$SCRIPT_DIR"
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m' # no color
 
 info() {
     echo -e "${GREEN}[INFO]${NC} $*"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
 error() {
@@ -73,21 +68,72 @@ check_binaries() {
     info "All binaries found in: $target_dir"
 }
 
+probe_ssh_until() {
+    local host="$1"
+    local deadline="$2"
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+        return 124
+    fi
+
+    docker exec -u testuser rcp-test-master \
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" hostname &>/dev/null &
+    local probe_pid=$!
+    while kill -0 "$probe_pid" 2>/dev/null; do
+        if [[ "$SECONDS" -ge "$deadline" ]]; then
+            kill "$probe_pid" 2>/dev/null || true
+            sleep 0.1
+            if kill -0 "$probe_pid" 2>/dev/null; then
+                kill -KILL "$probe_pid" 2>/dev/null || true
+            fi
+            wait "$probe_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 0.1
+    done
+    wait "$probe_pid"
+}
+
 # Start containers
 start() {
     info "Starting Docker containers..."
     docker-compose up -d
 
-    # Wait for SSH to be ready
+    # wait for SSH to be ready
     info "Waiting for SSH servers to start..."
-    sleep 3
+    local timeout_seconds="${RCP_DOCKER_SSH_READY_TIMEOUT_SECONDS:-60}"
+    local poll_seconds="${RCP_DOCKER_SSH_READY_POLL_SECONDS:-2}"
+    local deadline=$((SECONDS + timeout_seconds))
+    local pending_hosts=(host-a host-b)
+    while [[ "${#pending_hosts[@]}" -gt 0 ]]; do
+        local still_pending=()
+        local host
+        for host in "${pending_hosts[@]}"; do
+            if probe_ssh_until "$host" "$deadline"; then
+                info "SSH connectivity to $host verified"
+            else
+                still_pending+=("$host")
+            fi
+        done
+        pending_hosts=("${still_pending[@]}")
 
-    # Test SSH connectivity
-    if docker exec rcp-test-master ssh -o ConnectTimeout=5 host-a hostname &> /dev/null; then
-        info "SSH connectivity verified"
-    else
-        warn "SSH connectivity check failed, containers may still be initializing"
-    fi
+        if [[ "${#pending_hosts[@]}" -eq 0 ]]; then
+            break
+        fi
+        if [[ "$SECONDS" -ge "$deadline" ]]; then
+            error "SSH connectivity did not become ready within ${timeout_seconds}s: ${pending_hosts[*]}"
+            docker-compose logs || true
+            return 1
+        fi
+        local remaining_seconds=$((deadline - SECONDS))
+        if [[ "$remaining_seconds" -le 0 ]]; then
+            continue
+        fi
+        if [[ "$poll_seconds" -gt "$remaining_seconds" ]]; then
+            sleep "$remaining_seconds"
+        else
+            sleep "$poll_seconds"
+        fi
+    done
 
     info "Containers are ready!"
     echo ""
@@ -171,7 +217,11 @@ test_ssh() {
 
 # Show logs
 logs() {
-    docker-compose logs -f "${1:-}"
+    if [[ -n "${1:-}" ]]; then
+        docker-compose logs "$1"
+    else
+        docker-compose logs
+    fi
 }
 
 # Clean test files from containers

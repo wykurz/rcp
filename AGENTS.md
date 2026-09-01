@@ -21,6 +21,9 @@ nix develop  # automatically includes just and all dev tools
 
 **Without nix:**
 
+Install `jq` with your system package manager (it is required by `just lint` and Depot recipes),
+then install the remaining tools:
+
 ```bash
 cargo install just
 cargo install cargo-nextest  # required for `just test`, `just test-release`, `just test-all`, and `just ci`
@@ -41,8 +44,20 @@ cargo install dprint  # required for `just fmt`, `just lint`, and `just ci`
 - `just doc` — check docs build
 - `just ci` — full CI checks (lint + doc + test-all + Docker tests)
 
-**IMPORTANT**: Always run `just ci` before committing changes. CI workflows run debug and release
-tests in parallel to catch optimization-related bugs.
+### Depot CI
+
+Prefer Depot for remote verification when it is available. `nix develop` supplies the pinned Depot
+CLI v2.102.7 and jq, and remote `depot-*` recipes require configured Depot access.
+
+Before committing, prefer `just depot-ci` when Depot is available; otherwise run local `just ci`.
+Depot runs the current worktree without a commit or push, but its local patch excludes ordinary
+untracked files. Stage any ordinary untracked files needed by the check, and rerun it after later
+changes; a successful run covers only the inputs present when it started.
+
+For targeted remote verification, use `just depot-test`, `just depot-test-release`,
+`just depot-doctest`, `just depot-doctest-release`, `just depot-doc`, `just depot-test-all`,
+`just depot-docker-test`, `just depot-docker-chaos-test`, `just depot-chaos`, or
+`just depot-test-all-with-docker`. There is no `depot-lint`; `just depot-ci` includes lint.
 
 ## Critical Conventions
 
@@ -186,9 +201,10 @@ Use the `filegen` crate for repeatable fixtures.
 
 When modifying function signatures or parameters, verify:
 
-1. Tests still pass: `just test`
-2. Doc examples still compile and run: `just doctest` (and optionally `just doc` to verify generated
-   docs with warnings denied)
+1. Tests still pass: prefer `just depot-test`; otherwise run local `just test`.
+2. Doc examples still compile and run: prefer `just depot-doctest`; otherwise run local
+   `just doctest`. To verify generated docs with warnings denied, prefer `just depot-doc`; otherwise
+   run local `just doc`.
 
 For test categories, Docker multi-host tests, chaos tests, and sudo-required tests, see
 [docs/testing.md](docs/testing.md).

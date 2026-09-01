@@ -34,6 +34,38 @@
           targets = [ "x86_64-unknown-linux-musl" ];
         };
 
+        depotPlatform = {
+          "x86_64-linux" = {
+            archive = "linux_amd64";
+            hash = "sha256-V2/403jIp0Ygth2BNRPlKG8gWc3kWW46MezMIAWnRmk=";
+          };
+          "aarch64-linux" = {
+            archive = "linux_arm64";
+            hash = "sha256-q0VTWNPBgKPGAMmW3lA3J+lnCjRLSn/QvrVQ80nLvjw=";
+          };
+          "aarch64-darwin" = {
+            archive = "darwin_arm64";
+            hash = "sha256-rBNqwyK2Ch98IiDuGjvWnD6KllC2dasrLrvb+H7Lfrc=";
+          };
+        }.${system};
+
+        depot = pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
+          pname = "depot";
+          version = "2.102.7";
+
+          src = pkgs.fetchurl {
+            url = "https://github.com/depot/cli/releases/download/v${finalAttrs.version}/depot_${finalAttrs.version}_${depotPlatform.archive}.tar.gz";
+            hash = depotPlatform.hash;
+          };
+          sourceRoot = ".";
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 bin/depot "$out/bin/depot"
+            runHook postInstall
+          '';
+        });
+
         # MSRV toolchain — used only by the `msrv-check` wrapper (and CI's `msrv`
         # job) to verify the workspace still compiles on the minimum supported
         # Rust version. Kept separate from `rustToolchain` (latest stable) so
@@ -211,9 +243,11 @@
                 pkgs.cargo-udeps
                 pkgs.dprint
                 pkgs.gdb
+                pkgs.jq
                 pkgs.just
                 pkgs.llvmPackages.bintools
                 pkgs.tokio-console
+                depot
 
                 # Additional useful tools
                 pkgs.gh
