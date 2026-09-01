@@ -1,0 +1,179 @@
+name: Set up RCP Rust CI
+description: Install the Rust toolchain and tools used by RCP's Depot jobs
+
+inputs:
+  docker-compose-compat:
+    description: Provide the legacy docker-compose executable used by repository recipes
+    required: false
+    default: "false"
+  install-dprint:
+    description: Install dprint 0.54.0
+    required: false
+    default: "false"
+  install-nextest:
+    description: Install cargo-nextest 0.9.85
+    required: false
+    default: "false"
+  install-test-deps:
+    description: Install system tools required by the non-Docker test suites
+    required: false
+    default: "false"
+  localhost-ssh:
+    description: Configure passwordless localhost SSH for the workflow user
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+  - name: Setup Rust
+    uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+    with:
+      components: rustfmt, clippy
+      target: x86_64-unknown-linux-musl
+
+  - name: Install system dependencies
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      packages=(musl-tools pkg-config)
+      if [[ "${{ inputs.install-test-deps }}" == "true" ]]; then
+        packages+=(strace)
+      fi
+      if [[ "${{ inputs.localhost-ssh }}" == "true" ]]; then
+        packages+=(openssh-server)
+      fi
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+
+  - name: Set up Docker Compose compatibility
+    if: inputs.docker-compose-compat == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      compat_dir="$RUNNER_TEMP/rcp-docker-compose-compat"
+      mkdir -p "$compat_dir"
+      cat >"$compat_dir/docker-compose" <<'EOF'
+      #!/bin/sh
+      exec docker compose "$@"
+      EOF
+      chmod +x "$compat_dir/docker-compose"
+      echo "$compat_dir" >>"$GITHUB_PATH"
+
+  - name: Setup SSH for localhost
+    if: inputs.localhost-ssh == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      workflow_user="$(id -un)"
+      workflow_gid="$(id -g)"
+      account_gid="$(id -g "$workflow_user")"
+      if [[ "$account_gid" != "$workflow_gid" ]]; then
+        # depot can launch the step with a primary GID that differs from /etc/passwd.
+        if ! getent group "$workflow_gid" >/dev/null; then
+          sudo groupadd --gid "$workflow_gid" "rcp-ci-$workflow_gid"
+        fi
+        sudo usermod --gid "$workflow_gid" "$workflow_user"
+      fi
+
+      mkdir -p ~/.ssh
+      chmod 700 ~/.ssh
+      if [[ ! -f ~/.ssh/id_ed25519 ]]; then
+        ssh-keygen -q -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+      fi
+      if [[ ! -f ~/.ssh/id_ed25519.pub ]]; then
+        ssh-keygen -y -f ~/.ssh/id_ed25519 >~/.ssh/id_ed25519.pub
+      fi
+      cat ~/.ssh/id_ed25519.pub >>~/.ssh/authorized_keys
+      chmod 600 ~/.ssh/authorized_keys
+
+      sshd_dir="$RUNNER_TEMP/rcp-sshd"
+      mkdir -p "$sshd_dir"
+      sudo mkdir -p /run/sshd
+      ssh-keygen -q -t ed25519 -N '' -f "$sshd_dir/host_key"
+
+      cat >"$sshd_dir/sshd_config" <<EOF
+      Port 2222
+      ListenAddress 127.0.0.1
+      PidFile $sshd_dir/sshd.pid
+      HostKey $sshd_dir/host_key
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin no
+      AuthorizedKeysFile .ssh/authorized_keys
+      StrictModes no
+      UsePAM yes
+      PrintMotd no
+      LogLevel VERBOSE
+      Subsystem sftp internal-sftp
+      EOF
+
+      sudo /usr/sbin/sshd -t -f "$sshd_dir/sshd_config"
+      sudo /usr/sbin/sshd -E "$sshd_dir/sshd.log" -f "$sshd_dir/sshd_config"
+
+      cat >~/.ssh/config <<EOF
+      Host localhost 127.0.0.1
+        HostName 127.0.0.1
+        Port 2222
+        IdentityFile $HOME/.ssh/id_ed25519
+        IdentitiesOnly yes
+      EOF
+      chmod 600 ~/.ssh/config
+
+      host_public_key="$(<"$sshd_dir/host_key.pub")"
+      printf '[localhost]:2222 %s\n[127.0.0.1]:2222 %s\n' \
+        "$host_public_key" "$host_public_key" >>~/.ssh/known_hosts
+
+      for attempt in {1..20}; do
+        if ssh -o BatchMode=yes localhost true; then
+          break
+        fi
+        if [[ "$attempt" -eq 20 ]]; then
+          echo "user SSH to localhost did not become ready" >&2
+          sudo cat "$sshd_dir/sshd.log"
+          exit 1
+        fi
+        sleep 0.25
+      done
+      remote_uid="$(ssh -o BatchMode=yes localhost id -u)"
+      remote_gid="$(ssh -o BatchMode=yes localhost id -g)"
+      echo "Workflow identity: uid=$(id -u) gid=$(id -g) groups=$(id -G)"
+      echo "SSH identity: uid=$remote_uid gid=$remote_gid groups=$(ssh localhost id -G)"
+      test "$remote_uid" = "$(id -u)"
+      test "$remote_gid" = "$(id -g)"
+
+  - name: Install just
+    uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+    with:
+      tool: just
+
+  - name: Install cargo-nextest
+    if: inputs.install-nextest == 'true'
+    uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+    with:
+      tool: cargo-nextest@0.9.85
+
+  - name: Install dprint
+    if: inputs.install-dprint == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      curl -fsSL -o /tmp/dprint.zip \
+        https://github.com/dprint/dprint/releases/download/0.54.0/dprint-x86_64-unknown-linux-gnu.zip
+      echo "8cb5925a0d6d0d8aa74c82a00f76734577592dfa1eda9517c261a84fe06accd7  /tmp/dprint.zip" | \
+        sha256sum -c -
+      mkdir -p "$HOME/.local/bin"
+      unzip -o -q /tmp/dprint.zip -d "$HOME/.local/bin"
+      echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+
+  - name: Setup sccache
+    uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+    with:
+      version: v0.10.0

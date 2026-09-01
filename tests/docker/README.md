@@ -117,7 +117,7 @@ cd tests/docker
 ./test-helpers.sh test-copy  # Quick copy test
 ./test-helpers.sh test-ssh   # Test SSH connectivity
 ./test-helpers.sh cleanup    # Remove test files
-./test-helpers.sh logs       # View logs (follow mode)
+./test-helpers.sh logs       # View current logs
 ./test-helpers.sh shell      # Open shell in master
 
 # Maintenance

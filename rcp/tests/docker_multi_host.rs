@@ -229,15 +229,15 @@ fn test_progress_reporting_multi_host() -> Result<()> {
     // cleanup any existing directories from previous runs first (as root for permissions)
     env.exec("host-a", None, &["rm", "-rf", "/tmp/progress_test"])?;
     env.exec("host-b", None, &["rm", "-rf", "/tmp/progress_test_dst"])?;
-    // create many small files on host-a (1000 x 1KB) using shell loop
-    // this ensures copy takes long enough for progress updates to be captured
+    // create three one-chunk files. The I/O throttle below lets one file complete while later files
+    // remain gated, making a non-zero in-flight progress snapshot deterministic.
     let setup_output = env.exec(
         "host-a",
         Some("testuser"),
         &[
             "sh",
             "-c",
-            "mkdir -p /tmp/progress_test && cd /tmp/progress_test && for i in $(seq 1 1000); do dd if=/dev/zero of=file_$i.bin bs=1024 count=1 2>/dev/null; done",
+            "mkdir -p /tmp/progress_test && cd /tmp/progress_test && for i in $(seq 1 3); do dd if=/dev/zero of=file_$i.bin bs=1024 count=1 2>/dev/null; done",
         ],
     )?;
     assert!(
@@ -256,6 +256,8 @@ fn test_progress_reporting_multi_host() -> Result<()> {
         "--progress",
         "--progress-type=text-updates",
         "--progress-delay=100ms",
+        "--chunk-size=1KiB",
+        "--iops-throttle=1",
         "host-a:/tmp/progress_test/",
         "host-b:/tmp/progress_test_dst/",
     ])?;
