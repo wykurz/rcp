@@ -645,123 +645,12 @@ check_depot_action() {
     fi
 }
 
-depot_job_block() { # $1 = job id
-    local job="$1"
-    awk -v wanted="$job" '
-        $0 == "  " wanted ":" {
-            inside = 1
-        }
-        inside {
-            if (seen && $0 ~ /^  [[:alnum:]_-]+:[[:space:]]*$/) exit
-            print
-            seen = 1
-        }
-    ' "$REPO_ROOT/.depot/workflows/ci.yml"
-}
-
-depot_runner_matrix_values() {
-    awk '
-        function active_line() {
-            return $0 !~ /^[[:space:]]*($|#)/
-        }
-        $0 == "    strategy:" {
-            in_strategy = 1
-            in_matrix = 0
-            in_runner = 0
-            next
-        }
-        in_strategy && $0 == "      matrix:" {
-            in_matrix = 1
-            in_runner = 0
-            next
-        }
-        in_matrix && $0 == "        runner:" {
-            in_runner = 1
-            next
-        }
-        in_runner && active_line() {
-            value = $0
-            sub(/^[[:space:]]*-[[:space:]]*/, "", value)
-            if (value != $0) {
-                print value
-                next
-            }
-            in_runner = 0
-        }
-        active_line() {
-            indent = match($0, /[^ ]/) - 1
-            if (in_matrix && indent <= 6) {
-                in_matrix = 0
-                in_runner = 0
-            }
-            if (in_strategy && indent <= 4) {
-                in_strategy = 0
-                in_matrix = 0
-                in_runner = 0
-            }
-        }
-    '
-}
-
-check_depot_matrix_job() { # $1 = job id
-    local job="$1"
-    local block
-    block=$(depot_job_block "$job")
-    local strategy_count
-    local matrix_count
-    local runner_count
-    strategy_count=$(grep -Ec -- '^    strategy:[[:space:]]*' \
-        <<< "$block" || true)
-    matrix_count=$(grep -Ec -- '^      matrix:[[:space:]]*' \
-        <<< "$block" || true)
-    runner_count=$(grep -Ec -- '^        runner:[[:space:]]*' \
-        <<< "$block" || true)
-    if [ "$strategy_count" -ne 1 ] || [ "$matrix_count" -ne 1 ] ||
-        [ "$runner_count" -ne 1 ]; then
-        fail "Depot $job must declare exactly one strategy.matrix.runner"
-    fi
-    local runner
-    local -a runners=()
-    while IFS= read -r runner; do
-        runners[${#runners[@]}]="$runner"
-    done < <(depot_runner_matrix_values <<< "$block")
-    local -a expected=(depot-ubuntu-24.04-16 depot-ubuntu-24.04-arm-16)
-    if [ "$(describe_array "${runners[@]}")" != "$(describe_array "${expected[@]}")" ]; then
-        fail "Depot $job runner matrix is $(describe_array "${runners[@]}") (expected $(describe_array "${expected[@]}"))"
-    fi
-    local runs_on_count
-    runs_on_count=$(grep -Ec -- '^    runs-on:[[:space:]]*' \
-        <<< "$block" || true)
-    if [ "$runs_on_count" -ne 1 ]; then
-        fail "Depot $job must declare exactly one runs-on"
-    elif ! grep -Fqx -- '    runs-on: ${{ matrix.runner }}' <<< "$block"; then
-        fail "Depot $job does not run on its runner matrix"
-    fi
-}
-
-check_depot_x86_job() { # $1 = job id, $2 = expected runner
-    local job="$1"
-    local expected_runner="$2"
-    local block
-    block=$(depot_job_block "$job")
-    if grep -Eq '^[[:space:]]*[^#].*depot-ubuntu-24.04-arm-16' <<< "$block"; then
-        fail "Depot Arm64 runner appears outside test and docker-test in job $job"
-    fi
-    local runs_on_count
-    runs_on_count=$(grep -Ec -- '^    runs-on:[[:space:]]*' \
-        <<< "$block" || true)
-    if [ "$runs_on_count" -ne 1 ]; then
-        fail "Depot $job must declare exactly one runs-on"
-    elif ! grep -Fqx -- "    runs-on: $expected_runner" <<< "$block"; then
-        fail "Depot $job runner is not $expected_runner"
-    fi
-}
-
 check_depot_workflow_semantics() {
     local output
     local status
     set +e
     output=$(python3 - "$REPO_ROOT/.depot/workflows/ci.yml" 2>&1 <<'PYTHON'
+import re
 import sys
 
 import yaml
@@ -780,20 +669,63 @@ def has_run_shell_default(owner):
     return isinstance(run_defaults, dict) and "shell" in run_defaults
 
 
+def contains_value(value, expected):
+    if isinstance(value, dict):
+        return any(contains_value(child, expected) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_value(child, expected) for child in value)
+    return value == expected
+
+
 with open(sys.argv[1], encoding="utf-8") as workflow_file:
     workflow = yaml.safe_load(workflow_file)
 
 jobs = workflow.get("jobs") or {}
+arm_runner = "depot-ubuntu-24.04-arm-16"
+arm_jobs = {"test", "docker-test"}
+for job_name, job in jobs.items():
+    if not isinstance(job, dict) or job_name in arm_jobs:
+        continue
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if contains_value(job.get("runs-on"), arm_runner) or contains_value(matrix, arm_runner):
+        reject(
+            "Depot Arm64 runner appears outside test and docker-test "
+            f"in job {job_name}"
+        )
+
+expected_single_runners = {
+    "lint": "depot-ubuntu-24.04-4",
+    "doc": "depot-ubuntu-24.04-4",
+    "doctest": "depot-ubuntu-24.04-4",
+    "test-release": "depot-ubuntu-24.04-16",
+    "doctest-release": "depot-ubuntu-24.04-4",
+    "docker-chaos-test": "depot-ubuntu-24.04-16",
+}
+for job_name, expected_runner in expected_single_runners.items():
+    job = jobs.get(job_name)
+    if not isinstance(job, dict) or job.get("runs-on") != expected_runner:
+        reject(f"Depot {job_name} runner is not {expected_runner}")
+
 for matrix_job_name in ("test", "docker-test"):
     matrix_job = jobs.get(matrix_job_name)
-    if not isinstance(matrix_job, dict):
-        continue
-    strategy = matrix_job.get("strategy")
-    if not isinstance(strategy, dict):
-        continue
-    matrix = strategy.get("matrix")
+    strategy = matrix_job.get("strategy") if isinstance(matrix_job, dict) else None
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
     if isinstance(matrix, dict) and "exclude" in matrix:
         reject(f"Depot {matrix_job_name} runner matrix must not use exclude")
+    expected_runners = [
+        "depot-ubuntu-24.04-16",
+        "depot-ubuntu-24.04-arm-16",
+    ]
+    if not isinstance(matrix, dict) or "runner" not in matrix:
+        reject(f"Depot {matrix_job_name} runner matrix must declare a runner axis")
+    if matrix.get("runner") != expected_runners:
+        reject(
+            f"Depot {matrix_job_name} runner matrix is {matrix.get('runner')} "
+            f"(expected {expected_runners})"
+        )
+    if matrix_job.get("runs-on") != "${{ matrix.runner }}":
+        reject(f"Depot {matrix_job_name} does not run on its runner matrix")
 
 test_job = jobs.get("test")
 if not isinstance(test_job, dict):
@@ -811,10 +743,6 @@ if not isinstance(steps, list):
 steps = [step for step in steps if isinstance(step, dict)]
 
 installer_prefix = "DeterminateSystems/nix-installer-action@"
-installer_pin = (
-    "DeterminateSystems/nix-installer-action@"
-    "ef8a148080ab6020fd15196c2084a2eea5ff2d25"
-)
 installers = [
     (index, step)
     for index, step in enumerate(steps)
@@ -823,7 +751,10 @@ installers = [
 if len(installers) != 1:
     reject("Depot test Arm Nix smoke must have exactly one Nix installer step")
 installer_index, installer = installers[0]
-if installer.get("uses") != installer_pin:
+if not re.fullmatch(
+    r"DeterminateSystems/nix-installer-action@[0-9a-fA-F]{40}",
+    str(installer.get("uses", "")),
+):
     reject("Depot test Arm Nix smoke installer is not pinned")
 arm_condition = "runner.arch == 'ARM64'"
 if installer.get("if") != arm_condition:
@@ -875,24 +806,7 @@ PYTHON
 }
 
 check_depot_workflow() {
-    check_depot_matrix_job test
-    check_depot_matrix_job docker-test
     check_depot_workflow_semantics
-    check_depot_x86_job lint depot-ubuntu-24.04-4
-    check_depot_x86_job doc depot-ubuntu-24.04-4
-    check_depot_x86_job doctest depot-ubuntu-24.04-4
-    check_depot_x86_job test-release depot-ubuntu-24.04-16
-    check_depot_x86_job doctest-release depot-ubuntu-24.04-4
-    check_depot_x86_job docker-chaos-test depot-ubuntu-24.04-16
-
-    local arm_runner_count
-    arm_runner_count=$(awk '
-        $0 !~ /^[[:space:]]*#/ && $0 ~ /depot-ubuntu-24.04-arm-16/ { count++ }
-        END { print count + 0 }
-    ' "$REPO_ROOT/.depot/workflows/ci.yml")
-    if [ "$arm_runner_count" -ne 2 ]; then
-        fail "Depot Arm64 runner appears $arm_runner_count times (expected only test and docker-test)"
-    fi
 }
 
 check_github_nix_workflow() {

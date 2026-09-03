@@ -314,6 +314,53 @@ expect_bad_cross arm-cross-quoted-absolute-path-missing-target \
 expect_bad_cross arm-cross-quoted-relative-path-missing-target \
     "run: './cross' build --release"
 
+new_case generate-rpm-explicit-target
+write_case_file .github/workflows/release.yml <<'FIXTURE'
+jobs:
+  rpm:
+    steps:
+      - run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp
+FIXTURE
+git -C "$CASE_ROOT" add .github/workflows/release.yml
+expect_clean generate-rpm-explicit-target
+
+expect_bad_generate_rpm() { # $1 = label, $2 = run line
+    local label="$1"
+    local line="$2"
+    new_case "$label"
+    printf 'jobs:\n  rpm:\n    steps:\n      - %s\n' "$line" \
+        | write_case_file .github/workflows/release.yml
+    git -C "$CASE_ROOT" add .github/workflows/release.yml
+    expect_violation "$label" 'cargo generate-rpm requires an explicit target matching CARGO_BUILD_TARGET'
+}
+
+expect_bad_generate_rpm generate-rpm-missing-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rcp'
+expect_bad_generate_rpm generate-rpm-empty-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target= -p rcp'
+expect_bad_generate_rpm generate-rpm-wrong-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-post-separator-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -- -p rcp --target=x86_64-unknown-linux-musl'
+expect_bad_generate_rpm generate-rpm-non-prefix-target-declaration \
+    'run: ./scripts/cargo-host.sh generate-rpm CARGO_BUILD_TARGET=x86_64-unknown-linux-musl --target=x86_64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-duplicate-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl --target=x86_64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-conflicting-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl --target=aarch64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-empty-target-declaration \
+    'run: CARGO_BUILD_TARGET= ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-quoted-empty-targets \
+    'run: CARGO_BUILD_TARGET="" ./scripts/cargo-host.sh generate-rpm --target="" -p rcp'
+expect_bad_generate_rpm generate-rpm-unsupported-matching-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-gnu -p rcp'
+expect_bad_generate_rpm generate-rpm-assignment-after-command \
+    'run: command CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp'
+expect_bad_generate_rpm generate-rpm-assignment-before-command-missing-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl command ./scripts/cargo-host.sh generate-rpm -p rcp'
+expect_bad_generate_rpm generate-rpm-assignment-before-env-missing-target \
+    'run: CARGO_BUILD_TARGET=x86_64-unknown-linux-musl env ./scripts/cargo-host.sh generate-rpm -p rcp'
+
 new_case cross-build-description-is-inert
 write_case_file .github/workflows/release.yml <<'FIXTURE'
 jobs:

@@ -42,7 +42,9 @@ manager; both are required by `just lint`. Then install the remaining tools:
 - `just check` — quick check (faster than build)
 - `just build` / `just build-release` — build
 - `just doc` — check docs build
-- `just ci` — full CI checks (lint + doc + test-all + Docker tests)
+- `just nix-targets` — evaluate Nix target behavior and realize native package/dev-shell smoke
+  checks
+- `just ci` — full CI checks (lint + Nix target checks when available + doc + test-all + Docker)
 
 ### Depot CI
 

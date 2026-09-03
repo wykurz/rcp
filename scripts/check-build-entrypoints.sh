@@ -201,7 +201,12 @@ done < "$PATHS"
 
 TOOL_CROSS=cr"oss"
 TOOL_CARGO=ca"rgo"
-COMMAND_PREFIX='^(-[[:space:]]+)?(run:[[:space:]]+)?((env|command)[[:space:]]+)?'
+ENV_ASSIGNMENT='[[:alpha:]_][[:alnum:]_]*=[^[:space:]]*[[:space:]]+'
+YAML_COMMAND_PREFIX='^(-[[:space:]]+)?(run:[[:space:]]+)?'
+LEADING_ASSIGNMENTS="(${ENV_ASSIGNMENT})*"
+COMMAND_WRAPPERS="(command[[:space:]]+)?(env[[:space:]]+(${ENV_ASSIGNMENT})*)?"
+COMMAND_PREFIX="${YAML_COMMAND_PREFIX}${LEADING_ASSIGNMENTS}${COMMAND_WRAPPERS}"
+MALFORMED_COMMAND_PREFIX="${YAML_COMMAND_PREFIX}${LEADING_ASSIGNMENTS}command[[:space:]]+(${ENV_ASSIGNMENT})+"
 CROSS_EXECUTABLE="[\"']?([^[:space:]\"']*/)?${TOOL_CROSS}[\"']?"
 CARGO_EXECUTABLE="[\"']?([^[:space:]\"']*/)?${TOOL_CARGO}(-host\\.sh)?[\"']?"
 while IFS=$'\t' read -r path line; do
@@ -214,6 +219,61 @@ while IFS=$'\t' read -r path line; do
         if [[ " $before_separator " != *' --target=aarch64-unknown-linux-musl '* ]] &&
             [[ " $before_separator " != *' --target aarch64-unknown-linux-musl '* ]]; then
             echo "ARM $TOOL_CROSS build requires a pre--- nonempty aarch64 musl target: $path: $line" \
+                >> "$POLICY_ERRORS"
+        fi
+    fi
+    if [ "$path" = .github/workflows/release.yml ] &&
+        { [[ "$line" =~ ${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]] ||
+            [[ "$line" =~ ${MALFORMED_COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]]; }; then
+        valid_rpm_command=no
+        invocation_prefix=''
+        if [[ "$line" =~ ${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]]; then
+            valid_rpm_command=yes
+            invocation_prefix="${BASH_REMATCH[0]}"
+        fi
+        declared_target=''
+        declared_target_count=0
+        if [ "$valid_rpm_command" = yes ]; then
+            read -r -a invocation_words <<< "$invocation_prefix"
+            for word in "${invocation_words[@]}"; do
+                case "$word" in
+                    CARGO_BUILD_TARGET=*)
+                        declared_target="${word#CARGO_BUILD_TARGET=}"
+                        declared_target_count=$((declared_target_count + 1))
+                        ;;
+                esac
+            done
+        fi
+        explicit_target=''
+        explicit_target_count=0
+        read -r -a command_words <<< "$before_separator"
+        for ((word_index = 0; word_index < ${#command_words[@]}; word_index++)); do
+            word="${command_words[$word_index]}"
+            case "$word" in
+                --target=*)
+                    explicit_target="${word#--target=}"
+                    explicit_target_count=$((explicit_target_count + 1))
+                    ;;
+                --target)
+                    explicit_target_count=$((explicit_target_count + 1))
+                    word_index=$((word_index + 1))
+                    if [ "$word_index" -lt "${#command_words[@]}" ]; then
+                        explicit_target="${command_words[$word_index]}"
+                    fi
+                    ;;
+            esac
+        done
+        supported_target=no
+        case "$declared_target" in
+            x86_64-unknown-linux-musl | aarch64-unknown-linux-musl)
+                supported_target=yes
+                ;;
+        esac
+        if [ "$valid_rpm_command" != yes ] || [ "$declared_target_count" -ne 1 ] ||
+            [ "$supported_target" != yes ] ||
+            [ "$explicit_target_count" -ne 1 ] ||
+            [ "$explicit_target" != "$declared_target" ]; then
+            echo "$TOOL_CARGO generate-rpm requires an explicit target matching CARGO_BUILD_TARGET: $path: $line" \
                 >> "$POLICY_ERRORS"
         fi
     fi

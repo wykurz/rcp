@@ -3,7 +3,7 @@
 set -euo pipefail
 
 root_dir=${1:-/tmp}
-dirwidth=${2:-0}
+dirwidth=${2:-1}
 num_files=${3:-1}
 file_size=${4:-10M}
 starting_dir="$PWD"
@@ -18,7 +18,11 @@ case "$target_dir" in
 esac
 binary_dir="$target_dir/$cargo_target/release"
 
-"$binary_dir/rrm" --quiet "$root_dir/filegen" "$root_dir/filegen-test"
+for cleanup_path in "$root_dir/filegen" "$root_dir/filegen-test"; do
+    if [ -e "$cleanup_path" ] || [ -L "$cleanup_path" ]; then
+        "$binary_dir/rrm" --quiet "$cleanup_path"
+    fi
+done
 "$binary_dir/filegen" -- "$root_dir" "$dirwidth" "$num_files" "$file_size"
 
 strace -fttt "$binary_dir/rcp" --progress --summary --overwrite \

@@ -158,11 +158,11 @@ jobs:
           RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: |
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh build --release
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rcp
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rlink
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rrm
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rcmp
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p filegen
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rlink
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rrm
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcmp
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p filegen
           zip rcp-rpm-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
@@ -251,11 +251,11 @@ jobs:
 
       - name: Build RPM packages
         run: |
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rcp
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rlink
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rrm
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p rcmp
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm -p filegen
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcp
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rlink
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rrm
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcmp
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p filegen
           zip rcp-rpm-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 

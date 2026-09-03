@@ -88,6 +88,11 @@ jobs:
         ./scripts/test-check-build-entrypoints.sh
         ./scripts/check-build-entrypoints.sh
 
+    - name: Check action pins
+      run: |
+        ./scripts/test-check-action-pins.sh
+        ./scripts/check-action-pins.py
+
     - name: Check walk-driver usage
       run: ./scripts/check-walk-driver-usage.sh
 

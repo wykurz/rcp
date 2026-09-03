@@ -5,8 +5,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+NIX_BIN="${NIX:-nix}"
+EVALUATE_ONLY=no
+if [ "$#" -gt 0 ]; then
+    if [ "$#" -ne 1 ] || [ "$1" != --evaluate-only ]; then
+        printf 'usage: %s [--evaluate-only]\n' "$0" >&2
+        exit 2
+    fi
+    EVALUATE_ONLY=yes
+fi
 
-RCP_NIX_TEST_ROOT="$REPO_ROOT" nix eval --impure --raw --expr '
+RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
   let
     root = builtins.toPath (builtins.getEnv "RCP_NIX_TEST_ROOT");
     flake = builtins.getFlake (builtins.getEnv "RCP_NIX_TEST_ROOT");
@@ -334,11 +343,15 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" nix eval --impure --raw --expr '
     builtins.deepSeq checks "Nix target behavior tests passed\n"
 '
 
+if [ "$EVALUATE_ONLY" = yes ]; then
+    exit 0
+fi
+
 check_realized_linux_shell() { # $1 = shell name, $2 = expected target
     local shell_name="$1"
     local expected_target="$2"
 
-    nix develop "$REPO_ROOT#$shell_name" --ignore-env --command bash -c '
+    "$NIX_BIN" develop "$REPO_ROOT#$shell_name" --ignore-env --command bash -c '
         set -euo pipefail
         label="$1"
         target="$2"
@@ -373,7 +386,7 @@ check_inherited_cargo_target() { # $1 = shell name, $2 = caller-selected target
     local selected_target="$2"
 
     CARGO_BUILD_TARGET="$selected_target" \
-        nix develop "$REPO_ROOT#$shell_name" --command bash -c '
+        "$NIX_BIN" develop "$REPO_ROOT#$shell_name" --command bash -c '
             set -euo pipefail
             expected="$1"
             if [ "$CARGO_BUILD_TARGET" != "$expected" ]; then
@@ -390,7 +403,7 @@ check_native_package_abi_smoke() { # $1 = system, $2 = expected target
     local result
 
     result="$(
-        nix build "$REPO_ROOT#checks.$system.package-abi-smoke" \
+        "$NIX_BIN" build "$REPO_ROOT#checks.$system.package-abi-smoke" \
             --no-link --print-out-paths
     )"
 
@@ -403,7 +416,7 @@ check_native_package_abi_smoke() { # $1 = system, $2 = expected target
     grep -Fqx 'binary-executed=yes' "$result/evidence"
 }
 
-current_system="$(nix eval --impure --raw --expr builtins.currentSystem)"
+current_system="$("$NIX_BIN" eval --impure --raw --expr builtins.currentSystem)"
 case "$current_system" in
     x86_64-linux)
         host_target=x86_64-unknown-linux-musl

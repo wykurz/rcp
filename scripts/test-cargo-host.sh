@@ -75,11 +75,22 @@ set -euo pipefail
 
 binary_name="$(basename "$0")"
 binary_path="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+if [ "$binary_name" = rrm ] && [ "${RUNNER_RRM_REQUIRE_EXISTING:-}" = 1 ]; then
+    for cleanup_path in "$@"; do
+        [ "$cleanup_path" = --quiet ] && continue
+        if [ ! -e "$cleanup_path" ] && [ ! -L "$cleanup_path" ]; then
+            exit 1
+        fi
+    done
+fi
 printf '%s|%s\n' "$binary_name" "$binary_path" >> "$RUNNER_CALLS"
 if [ "${RUNNER_FAIL_COMMAND:-}" = "$binary_name" ]; then
     exit 47
 fi
 if [ "$binary_name" = filegen ]; then
+    if [ "${RUNNER_FILEGEN_REQUIRE_DEFAULTS:-}" = 1 ] && [ "${3:-}" != 1 ]; then
+        exit 2
+    fi
     mkdir -p "$2"
 fi
 RUNNER_BINARY
@@ -366,11 +377,67 @@ check_just_recipe() {
     fi
 }
 
+assert_nix_realization_recipe_boundaries() {
+    local invocation_count output
+    if ! output=$(cd "$REPO_ROOT" && just --dry-run lint 2>&1); then
+        fail "could not inspect lint recipe: $output"
+    elif [[ "$output" != *'./scripts/test-nix-targets.sh --evaluate-only'* ]]; then
+        fail 'lint omits Nix target evaluation checks'
+    else
+        invocation_count=$(grep -Fo './scripts/test-nix-targets.sh' <<< "$output" | wc -l)
+        if [ "$invocation_count" -ne 1 ]; then
+            fail 'lint includes full Nix target realization checks'
+        fi
+    fi
+    if ! output=$(cd "$REPO_ROOT" && just --dry-run ci 2>&1); then
+        fail "could not inspect ci recipe: $output"
+    else
+        invocation_count=$(grep -Fo './scripts/test-nix-targets.sh' <<< "$output" | wc -l)
+        if [ "$invocation_count" -ne 2 ] ||
+            [[ "$output" != *'./scripts/test-nix-targets.sh;'* ]]; then
+            fail 'ci omits full Nix target realization checks'
+        fi
+    fi
+}
+
 assert_runner_call() { # $1 = binary name, $2 = expected executable path
     local expected="$1|$2"
     if ! grep -Fxq -- "$expected" "$RUNNER_CALLS"; then
         fail "runner did not invoke '$expected'; calls were: $(tr '\n' ';' < "$RUNNER_CALLS")"
     fi
+}
+
+run_runner_first_run() {
+    local runner_target_dir="$TEMP_DIR/runner-target-first-run"
+    local runner_root="$TEMP_DIR/runner-files-first-run"
+    local executable_dir="$runner_target_dir/x86_64-unknown-linux-musl/release"
+    local output status
+    : > "$CALLS"
+    : > "$RUNNER_CALLS"
+    set +e
+    output=$(cd "$REPO_ROOT" && env -u CARGO_BUILD_TARGET \
+        "PATH=$BIN_DIR:$PATH" \
+        "CARGO=$BIN_DIR/cargo" \
+        "CARGO_CALLS=$CALLS" \
+        "CARGO_TARGET_DIR=$runner_target_dir" \
+        "RUNNER_CALLS=$RUNNER_CALLS" \
+        FAKE_CARGO_CREATE_RUNNER_BINARIES=1 \
+        RUNNER_RRM_REQUIRE_EXISTING=1 \
+        RUNNER_FILEGEN_REQUIRE_DEFAULTS=1 \
+        FAKE_UNAME_SYSTEM=Linux \
+        FAKE_UNAME_MACHINE=x86_64 \
+        FAKE_RUSTC_HOST=x86_64-unknown-linux-gnu \
+        ./scripts/runner.sh "$runner_root" 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        fail "runner first run returned status $status: $output"
+    fi
+    if grep -q '^rrm|' "$RUNNER_CALLS"; then
+        fail "runner tried to remove absent first-run paths"
+    fi
+    assert_runner_call filegen "$executable_dir/filegen"
+    assert_runner_call rcp "$executable_dir/rcp"
 }
 
 run_runner_success() { # $1 = machine, $2 = target, $3 = target dir, $4 = test label
@@ -382,6 +449,7 @@ run_runner_success() { # $1 = machine, $2 = target, $3 = target dir, $4 = test l
     local output status
     : > "$CALLS"
     : > "$RUNNER_CALLS"
+    mkdir -p "$runner_root/filegen" "$runner_root/filegen-test"
     set +e
     output=$(cd "$REPO_ROOT" && env -u CARGO_BUILD_TARGET \
         "PATH=$BIN_DIR:$PATH" \
@@ -419,6 +487,7 @@ run_runner_command_failure() {
     local output status
     : > "$CALLS"
     : > "$RUNNER_CALLS"
+    mkdir -p "$runner_root/filegen" "$runner_root/filegen-test"
     set +e
     output=$(cd "$REPO_ROOT" && env -u CARGO_BUILD_TARGET \
         "PATH=$BIN_DIR:$PATH" \
@@ -477,6 +546,7 @@ run_runner_missing_target_binary() {
     : > "$CALLS"
     : > "$RUNNER_CALLS"
     : > "$ambient_calls"
+    mkdir -p "$runner_root/filegen" "$runner_root/filegen-test"
     set +e
     output=$(cd "$REPO_ROOT" && env -u CARGO_BUILD_TARGET \
         "PATH=$BIN_DIR:$PATH" \
@@ -527,6 +597,7 @@ BASH_ENV
     : > "$CALLS"
     : > "$RUNNER_CALLS"
     : > "$shadow_calls"
+    mkdir -p "$runner_root/filegen" "$runner_root/filegen-test"
     set +e
     output=$(cd "$REPO_ROOT" && env -u CARGO_BUILD_TARGET \
         "PATH=$BIN_DIR:$PATH" \
@@ -657,7 +728,9 @@ check_just_recipe test 'nextest run'
 check_just_recipe test-release 'nextest run --release'
 check_just_recipe doctest 'test --doc'
 check_just_recipe doctest-release 'test --doc --release'
+assert_nix_realization_recipe_boundaries
 RUNNER_CALLS="$TEMP_DIR/runner-calls"
+run_runner_first_run
 run_runner_success x86_64 x86_64-unknown-linux-musl \
     "$TEMP_DIR/runner-target-absolute" absolute
 relative_runner_target=$(python3 -c \
