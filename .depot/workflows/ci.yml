@@ -25,6 +25,7 @@ jobs:
       with:
         install-dprint: "true"
     - run: just lint
+    - run: just nix-targets
 
   doc:
     name: Documentation

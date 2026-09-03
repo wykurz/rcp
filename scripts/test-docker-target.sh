@@ -180,6 +180,9 @@ cat > "$TEMP_DIR/sleep" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
 
+if [[ -n "${SLEEP_CALLS:-}" ]]; then
+    printf '%s\n' "${1:-}" >> "$SLEEP_CALLS"
+fi
 if [[ -n "${FAIL_SLEEP_DURATION:-}" &&
     "${1:-}" == "$FAIL_SLEEP_DURATION" ]]; then
     exit 97
@@ -477,6 +480,20 @@ check_lifecycle() { # $1 = recipe, $2 = Cargo test status, $3 = expect down
     else
         assert_not_contains "$recipe intentionally keeps containers" \
             '|down' "$TEMP_DIR/compose-calls"
+    fi
+}
+
+check_lifecycle_poll_interval() {
+    local sleep_calls="$TEMP_DIR/lifecycle-sleep-calls"
+    local reduced_poll_count
+    : > "$sleep_calls"
+    run_process env \
+        "SLEEP_CALLS=$sleep_calls" \
+        "$REPO_ROOT/tests/docker/test-helpers.sh" lifecycle "$REAL_SLEEP" 0.35
+    assert_equals "reduced-poll lifecycle status" 0 "$PROCESS_STATUS"
+    reduced_poll_count=$(grep -Fxc 0.1 "$sleep_calls" || true)
+    if [[ "$reduced_poll_count" -lt 2 ]]; then
+        fail "lifecycle did not use 100ms polling while its command ran: $(tr '\n' ';' < "$sleep_calls")"
     fi
 }
 
@@ -900,6 +917,10 @@ check_bash_32_compatible_helper_path() {
     grep -En \
         '(^|[[:space:];])(mapfile|readarray|coproc)([[:space:]]|$)|(declare|typeset|local)[[:space:]]+-[[:alnum:]]*A|\$\{[^}]*((\^\^)|(,,))|wait[[:space:]]+-n|\[\[[^]]*[[:space:]]-v[[:space:]]|&>>|\|&|;;&|;&|exec[[:space:]]+\{[[:alnum:]_]+\}|\{[[:alnum:]_]+\}[<>]' \
         "$REPO_ROOT/tests/docker/test-helpers.sh" >> "$forbidden_log" || true
+    # nounset in Bash 3.2 rejects a quoted whole-array expansion when the array is empty.
+    grep -En \
+        '[[:alpha:]_][[:alnum:]_]*=\("\$\{[[:alpha:]_][[:alnum:]_]*\[@\]\}"\)' \
+        "$REPO_ROOT/tests/docker/test-helpers.sh" >> "$forbidden_log" || true
     if [[ -s "$forbidden_log" ]]; then
         fail "Docker helper uses syntax or state newer than Bash 3.2: $(cat "$forbidden_log")"
     fi
@@ -1118,6 +1139,7 @@ check_lifecycle docker-test 42 yes
 check_lifecycle docker-chaos-test 42 yes
 check_lifecycle docker-test-keep 42 no
 check_lifecycle docker-chaos-test-keep 42 no
+check_lifecycle_poll_interval
 check_setup_failure_lifecycle docker-test yes
 check_setup_failure_lifecycle docker-test-keep no
 check_discovery_failure_lifecycle docker-test yes

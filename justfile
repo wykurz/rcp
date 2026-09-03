@@ -19,15 +19,16 @@ _lint-build:
     @echo "🔍 Running clippy..."
     ./scripts/cargo-host.sh clippy --workspace --all-targets -- -D warnings
 
-# Run every target check when Nix is available, while retaining the documented non-Nix lint path.
+# Run non-realizing target checks when Nix is available, while retaining the documented non-Nix
+# lint path.
 _lint-targets:
     @set -e; if command -v "${NIX:-nix}" >/dev/null 2>&1; then \
         echo "🔍 Testing build target consistency checker..."; \
         ./scripts/test-check-build-targets.sh; \
         echo "🔍 Checking build target consistency..."; \
         ./scripts/check-build-targets.sh; \
-        echo "🔍 Testing Nix target selection..."; \
-        ./scripts/test-nix-targets.sh; \
+        echo "🔍 Evaluating Nix target selection..."; \
+        ./scripts/test-nix-targets.sh --evaluate-only; \
     else \
         echo "⚠️  Nix is unavailable; running all non-Nix target checks."; \
         RCP_BUILD_TARGET_TEST_SKIP_NIX_EVAL=1 ./scripts/test-check-build-targets.sh; \
@@ -55,6 +56,10 @@ lint: _lint-build _lint-targets
     ./scripts/test-check-build-entrypoints.sh
     @echo "🔍 Checking build entrypoint inventory..."
     ./scripts/check-build-entrypoints.sh
+    @echo "🔍 Testing action pin consistency..."
+    ./scripts/test-check-action-pins.sh
+    @echo "🔍 Checking action pin consistency..."
+    ./scripts/check-action-pins.py
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
     @echo "🔍 Checking walk-driver usage..."
@@ -112,6 +117,19 @@ check:
 msrv:
     msrv-check
 
+# Evaluate Nix target behavior and realize native package and development-shell smoke checks.
+nix-targets:
+    ./scripts/test-nix-targets.sh
+
+# Run full Nix target checks in CI when Nix is available, matching lint's non-Nix fallback.
+_ci-nix-targets:
+    @set -e; if command -v "${NIX:-nix}" >/dev/null 2>&1; then \
+        echo "🔍 Testing realized Nix target selection..."; \
+        ./scripts/test-nix-targets.sh; \
+    else \
+        echo "⚠️  Nix is unavailable; skipped Nix realization checks. CI runs them with Nix."; \
+    fi
+
 # Upgrade dependencies, staying within the MSRV. Both halves read `rust-version`:
 # `cargo upgrade` for the manifests, resolver 3 for the lockfile. Anything held
 # back is reported rather than silently skipped. The monthly `cargo-update`
@@ -134,7 +152,7 @@ doc:
 # Run the standard CI checks locally before pushing (lint, docs, tests + Docker).
 # The MSRV check is intentionally separate — run `just msrv` (it needs the nix
 # devShell's pinned toolchain); GitHub CI runs it as the dedicated `msrv` job.
-ci: lint doc test-all-with-docker
+ci: lint _ci-nix-targets doc test-all-with-docker
     @echo "✅ All CI checks passed! (run 'just msrv' for the separate MSRV check)"
 
 # Depot CI

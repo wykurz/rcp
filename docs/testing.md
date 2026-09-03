@@ -26,7 +26,8 @@ just test              # Run all tests (debug mode, uses nextest)
 just test-release      # Run tests in release mode
 just doctest           # Run documentation tests
 just test-all          # Run all tests (debug + release + doctests)
-just ci                # Full CI checks (lint + doc + test-all + Docker tests)
+just nix-targets       # Evaluate and realize Nix target smoke checks
+just ci                # Full CI checks (lint + Nix when available + doc + test-all + Docker)
 
 # Using cargo through the host wrapper
 ./scripts/cargo-host.sh nextest run
@@ -381,13 +382,13 @@ The `.github/workflows/validate.yml` workflow runs:
 ### Running CI Locally
 
 ```bash
-just ci  # lint + doc + test-all (debug + release + doctests) + Docker tests
+just ci  # lint + Nix targets when available + doc + test-all (debug + release + doctests) + Docker
 ```
 
-`just ci` is the primary local "is this ready to push?" gate — it runs the same lint, docs, and
-debug + release + doctest + Docker checks CI does, and is the one command to run before pushing.
-It's a close proxy for the CI matrix rather than a byte-for-byte match; a few CI steps live outside
-it:
+`just ci` is the primary local "is this ready to push?" gate — it runs the same lint, docs, debug +
+release + doctest + Docker checks CI does, plus full Nix target checks when Nix is available. It is
+the one command to run before pushing. It's a close proxy for the CI matrix rather than a
+byte-for-byte match; a few CI steps live outside it:
 
 - **Sudo-gated tests** (`test(~sudo)`, which need passwordless sudo). CI runs these in a separate
   step, in both debug and release. Run them yourself when a change touches sudo-only behavior:

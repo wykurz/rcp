@@ -259,7 +259,12 @@ start() { # $1 = resolved target
                 still_pending+=("$host")
             fi
         done
-        pending_hosts=("${still_pending[@]}")
+        pending_hosts=()
+        # nounset in Bash 3.2 rejects a quoted whole-array expansion when it is empty.
+        local pending_index
+        for ((pending_index = 0; pending_index < ${#still_pending[@]}; pending_index++)); do
+            pending_hosts+=("${still_pending[$pending_index]}")
+        done
 
         if [[ "${#pending_hosts[@]}" -eq 0 ]]; then
             break
@@ -593,7 +598,7 @@ run_lifecycle_child() { # $1 = working directory, remaining arguments = command
             lifecycle_clear_active_child
             return "$status"
         fi
-        "$SLEEP_BIN" 0.01
+        "$SLEEP_BIN" 0.1
     done
     status="$(<"$LIFECYCLE_ACTIVE_STATUS_FILE")"
     lifecycle_terminate_active_child TERM

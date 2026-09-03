@@ -9,6 +9,7 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKER="$SCRIPT_DIR/check-build-targets.sh"
+NIX_TARGET_TEST="$SCRIPT_DIR/test-nix-targets.sh"
 CHECKER_ARGS=()
 if [ "${RCP_BUILD_TARGET_TEST_SKIP_NIX_EVAL:-}" = 1 ]; then
     CHECKER_ARGS+=(--skip-nix-eval)
@@ -299,11 +300,68 @@ mutated_fixture() { # $1 = fixture name
     printf '%s\n' "$root"
 }
 
+check_nix_evaluate_only_mode() {
+    local fake_nix_dir="$TEMP_DIR/fake-nix-bin"
+    local fake_nix="$fake_nix_dir/nix"
+    local nix_calls="$TEMP_DIR/fake-nix-calls"
+    local output status
+    mkdir -p "$fake_nix_dir"
+    cat > "$fake_nix" <<'FAKE'
+#!/bin/bash
+set -euo pipefail
+
+printf '%s\n' "$1" >> "$FAKE_NIX_CALLS"
+case "$1" in
+    eval)
+        last_argument=''
+        for last_argument in "$@"; do :; done
+        if [ "$last_argument" = builtins.currentSystem ]; then
+            printf 'x86_64-linux'
+        else
+            printf 'Nix target behavior tests passed\n'
+        fi
+        ;;
+    build | develop)
+        exit 91
+        ;;
+    *)
+        exit 92
+        ;;
+esac
+FAKE
+    chmod +x "$fake_nix"
+
+    : > "$nix_calls"
+    set +e
+    output=$(PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" FAKE_NIX_CALLS="$nix_calls" \
+        "$NIX_TARGET_TEST" --evaluate-only 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        fail "Nix evaluate-only mode returned status $status: $output"
+    fi
+    if grep -Eq '^(build|develop)$' "$nix_calls"; then
+        fail "Nix evaluate-only mode realized a derivation: $(tr '\n' ';' < "$nix_calls")"
+    fi
+
+    : > "$nix_calls"
+    set +e
+    PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" FAKE_NIX_CALLS="$nix_calls" \
+        "$NIX_TARGET_TEST" >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 91 ] || ! grep -Fxq build "$nix_calls"; then
+        fail "default Nix target test stopped being a full realization check: status=$status calls=$(tr '\n' ';' < "$nix_calls")"
+    fi
+}
+
 echo "🔍 Testing build target consistency..."
 
 if grep -Eq '(^|[^[:alnum:]_])(mapfile|readarray)([^[:alnum:]_]|$)' "$CHECKER"; then
     fail 'build target checker uses a Bash 4-only line-reading builtin'
 fi
+
+check_nix_evaluate_only_mode
 
 create_fixture "$TEMP_DIR/coherent"
 expect_success "$TEMP_DIR/coherent"
@@ -594,6 +652,11 @@ sed -i '/  test:/a\
     continue-on-error: true' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test job must gate Arm Nix smoke failures' "$fixture"
 
+fixture=$(mutated_fixture depot-test-arm-nix-installer-alternate-sha)
+sed -i 's/ef8a148080ab6020fd15196c2084a2eea5ff2d25/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' \
+    "$fixture/.depot/workflows/ci.yml"
+expect_success_without_nix "$fixture"
+
 fixture=$(mutated_fixture depot-test-unpinned-arm-nix-installer)
 sed -i '/  test:/,/  doctest:/s#DeterminateSystems/nix-installer-action@[^[:space:]]*#DeterminateSystems/nix-installer-action@v22#' \
     "$fixture/.depot/workflows/ci.yml"
@@ -771,6 +834,44 @@ sed -i '/  docker-test:/,/  docker-chaos-test:/ {
         - runner: depot-ubuntu-24.04-16
 }' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot docker-test runner matrix must not use exclude' "$fixture"
+
+fixture=$(mutated_fixture depot-matrix-inline-comments)
+sed -i '/  test:/,/  doctest:/ {
+    s|- depot-ubuntu-24.04-16$|- depot-ubuntu-24.04-16 # native x86 runner|
+    s|runs-on: ${{ matrix.runner }}$|runs-on: ${{ matrix.runner }} # native fanout|
+}' "$fixture/.depot/workflows/ci.yml"
+expect_success_without_nix "$fixture"
+
+fixture=$(mutated_fixture depot-matrix-orthogonal-axis)
+sed -i '0,/        - depot-ubuntu-24.04-arm-16/ {
+    /        - depot-ubuntu-24.04-arm-16/a\
+        feature:\
+        - default\
+        - minimal
+}' "$fixture/.depot/workflows/ci.yml"
+expect_success_without_nix "$fixture"
+
+fixture=$(mutated_fixture depot-arm-runner-full-line-comment)
+sed -i '/  lint:/a\
+    # depot-ubuntu-24.04-arm-16 is intentionally reserved for matrix jobs' \
+    "$fixture/.depot/workflows/ci.yml"
+expect_success_without_nix "$fixture"
+
+fixture=$(mutated_fixture depot-arm-runner-inline-comment)
+sed -i '/  lint:/,/  doc:/s|runs-on: depot-ubuntu-24.04-4|runs-on: depot-ubuntu-24.04-4 # depot-ubuntu-24.04-arm-16 is reserved|' \
+    "$fixture/.depot/workflows/ci.yml"
+expect_success_without_nix "$fixture"
+
+fixture=$(mutated_fixture depot-arm-runner-alternate-matrix-axis)
+cat >> "$fixture/.depot/workflows/ci.yml" <<'FIXTURE'
+  alternate-arm:
+    strategy:
+      matrix:
+        worker:
+        - depot-ubuntu-24.04-arm-16
+    runs-on: ${{ matrix.worker }}
+FIXTURE
+expect_failure_without_nix 'Depot Arm64 runner appears outside test and docker-test' "$fixture"
 
 fixture=$(mutated_fixture depot-arm-release-duplication)
 sed -i '/  test-release:/,/  doctest-release:/s/runs-on: depot-ubuntu-24.04-16/runs-on: depot-ubuntu-24.04-arm-16/' \
