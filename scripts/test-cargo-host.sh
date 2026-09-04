@@ -658,6 +658,27 @@ assert_no_raw_host_build_guidance() {
     fi
 }
 
+assert_portable_wrapper_interpreters() {
+    local script shebang
+    for script in cargo-host.sh cargo-install-host.sh docker-target.sh; do
+        shebang="$(sed -n '1p' "$REPO_ROOT/scripts/$script")"
+        if [ "$shebang" != '#!/usr/bin/env bash' ]; then
+            fail "$script uses a non-portable interpreter: $shebang"
+        fi
+    done
+
+    if ! grep -Fq \
+        'exec ${pkgs.bash}/bin/bash ${./scripts/cargo-host.sh}' \
+        "$REPO_ROOT/flake.nix"; then
+        fail 'flake.nix does not invoke cargo-host.sh with its hermetic Bash'
+    fi
+    if ! grep -Fq \
+        'exec ${nixpkgs.bash}/bin/bash ${./scripts/cargo-host.sh}' \
+        "$REPO_ROOT/default.nix"; then
+        fail 'default.nix does not invoke cargo-host.sh with its hermetic Bash'
+    fi
+}
+
 echo "🔍 Testing musl-first host Cargo selection..."
 
 # wrong Linux target selection would compile the host against a different libc or architecture.
@@ -750,6 +771,7 @@ run_host_installer_rejects_target_override
 assert_no_retired_target_examples
 assert_release_deb_archive_paths
 assert_no_raw_host_build_guidance
+assert_portable_wrapper_interpreters
 
 : > "$CALLS"
 set +e

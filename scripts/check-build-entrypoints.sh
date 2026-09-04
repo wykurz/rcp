@@ -67,7 +67,7 @@ fi
 
 is_automation() { # $1 = relative path
     local relative_path="$1"
-    local basename lower
+    local basename lower first_line=''
     basename="${relative_path##*/}"
     lower="$(printf '%s' "$basename" | tr '[:upper:]' '[:lower:]')"
     case "$lower" in
@@ -80,7 +80,12 @@ is_automation() { # $1 = relative path
     if [ -x "$REPO_ROOT/$relative_path" ]; then
         return 0
     fi
-    IFS= read -r first_line < "$REPO_ROOT/$relative_path" || true
+    if ! exec 3< "$REPO_ROOT/$relative_path"; then
+        echo "automation source is not readable: $relative_path" >> "$POLICY_ERRORS"
+        return 1
+    fi
+    IFS= read -r -n 256 first_line <&3 || true
+    exec 3<&-
     case "$first_line" in
         '#!'*sh*) return 0 ;;
     esac
@@ -90,6 +95,8 @@ is_automation() { # $1 = relative path
 check_just_source() { # $1 = relative path
     local relative_path="$1"
     local line
+    local custom_shell_pattern='^set[[:space:]]+(shell|windows-shell)[[:space:]]*:?='
+    local module_pattern='^(mod|import)[[:space:]]'
     if [ "$relative_path" != justfile ]; then
         echo "additional Justfile is not allowed: $relative_path" >> "$POLICY_ERRORS"
     fi
@@ -106,11 +113,11 @@ check_just_source() { # $1 = relative path
                     >> "$POLICY_ERRORS"
                 ;;
         esac
-        if [[ "$line" =~ ^set[[:space:]]+(shell|windows-shell)[[:space:]]*:?= ]]; then
+        if [[ "$line" =~ $custom_shell_pattern ]]; then
             echo "custom Just shell is not allowed: $relative_path: $line" \
                 >> "$POLICY_ERRORS"
         fi
-        if [[ "$line" =~ ^(mod|import)[[:space:]] ]]; then
+        if [[ "$line" =~ $module_pattern ]]; then
             echo "Just modules are not allowed: $relative_path: $line" >> "$POLICY_ERRORS"
         fi
     done < <(
@@ -209,13 +216,17 @@ COMMAND_PREFIX="${YAML_COMMAND_PREFIX}${LEADING_ASSIGNMENTS}${COMMAND_WRAPPERS}"
 MALFORMED_COMMAND_PREFIX="${YAML_COMMAND_PREFIX}${LEADING_ASSIGNMENTS}command[[:space:]]+(${ENV_ASSIGNMENT})+"
 CROSS_EXECUTABLE="[\"']?([^[:space:]\"']*/)?${TOOL_CROSS}[\"']?"
 CARGO_EXECUTABLE="[\"']?([^[:space:]\"']*/)?${TOOL_CARGO}(-host\\.sh)?[\"']?"
+CROSS_BUILD_PATTERN="${COMMAND_PREFIX}${CROSS_EXECUTABLE}[[:space:]]+build([^[:alnum:]_./-]|$)"
+RPM_COMMAND_PATTERN="${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$)"
+MALFORMED_RPM_COMMAND_PATTERN="${MALFORMED_COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$)"
+PUBLISH_COMMAND_PATTERN="${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+workspaces[[:space:]]+publish([[:space:]]|$)"
 while IFS=$'\t' read -r path line; do
     before_separator="$line"
     case "$before_separator" in
         *' -- '*) before_separator="${before_separator%% -- *}" ;;
     esac
     if [ "$path" = .github/workflows/release.yml ] &&
-        [[ "$line" =~ ${COMMAND_PREFIX}${CROSS_EXECUTABLE}[[:space:]]+build([^[:alnum:]_./-]|$) ]]; then
+        [[ "$line" =~ $CROSS_BUILD_PATTERN ]]; then
         if [[ " $before_separator " != *' --target=aarch64-unknown-linux-musl '* ]] &&
             [[ " $before_separator " != *' --target aarch64-unknown-linux-musl '* ]]; then
             echo "ARM $TOOL_CROSS build requires a pre--- nonempty aarch64 musl target: $path: $line" \
@@ -223,11 +234,11 @@ while IFS=$'\t' read -r path line; do
         fi
     fi
     if [ "$path" = .github/workflows/release.yml ] &&
-        { [[ "$line" =~ ${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]] ||
-            [[ "$line" =~ ${MALFORMED_COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]]; }; then
+        { [[ "$line" =~ $RPM_COMMAND_PATTERN ]] ||
+            [[ "$line" =~ $MALFORMED_RPM_COMMAND_PATTERN ]]; }; then
         valid_rpm_command=no
         invocation_prefix=''
-        if [[ "$line" =~ ${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+generate-rpm([[:space:]]|$) ]]; then
+        if [[ "$line" =~ $RPM_COMMAND_PATTERN ]]; then
             valid_rpm_command=yes
             invocation_prefix="${BASH_REMATCH[0]}"
         fi
@@ -277,7 +288,7 @@ while IFS=$'\t' read -r path line; do
                 >> "$POLICY_ERRORS"
         fi
     fi
-    if [[ "$line" =~ ${COMMAND_PREFIX}${CARGO_EXECUTABLE}[[:space:]]+workspaces[[:space:]]+publish([[:space:]]|$) ]] &&
+    if [[ "$line" =~ $PUBLISH_COMMAND_PATTERN ]] &&
         [[ " $before_separator " != *' --no-verify '* ]]; then
         echo "workspace publication requires pre--- --no-verify: $path: $line" \
             >> "$POLICY_ERRORS"

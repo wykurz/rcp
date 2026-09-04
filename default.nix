@@ -37,7 +37,7 @@ let
     echo "msrv-check: using $pinned"
 
     export CARGO="${msrvToolchain}/bin/cargo"
-    exec ${./scripts/cargo-host.sh} check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
+    exec ${nixpkgs.bash}/bin/bash ${./scripts/cargo-host.sh} check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
   '';
 in
   with nixpkgs;

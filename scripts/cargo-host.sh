@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # runs Cargo with the supported, runnable target for this host.
 
 set -euo pipefail

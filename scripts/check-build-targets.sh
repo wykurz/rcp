@@ -168,7 +168,7 @@ rustflags_enable_crt_static() { # arguments are Rust flag tokens
         [ -n "$features" ] || continue
         local -a feature_list=()
         IFS=',' read -r -a feature_list <<< "$features"
-        for feature in "${feature_list[@]}"; do
+        for feature in ${feature_list[@]+"${feature_list[@]}"}; do
             case "$feature" in
                 +crt-static) state=enabled ;;
                 -crt-static) state=disabled ;;
@@ -180,7 +180,7 @@ rustflags_enable_crt_static() { # arguments are Rust flag tokens
 
 matches_policy_targets() { # arguments are actual values
     local -a actual=("$@")
-    local -a expected=("${EXPECTED_TARGETS[@]}")
+    local -a expected=(${EXPECTED_TARGETS[@]+"${EXPECTED_TARGETS[@]}"})
     [ "${#actual[@]}" -eq "${#expected[@]}" ] || return 1
     local index
     for index in "${!expected[@]}"; do
@@ -209,10 +209,11 @@ check_cargo_config() {
             's/^[[:space:]]*\[target\.([^]]*-unknown-linux-musl)\][[:space:]]*$/\1/p' \
             "$config" | sort -u
     )
-    if ! matches_policy_targets "${SUPPORTED_TARGETS[@]}"; then
-        fail "supported musl target sections are $(describe_array "${SUPPORTED_TARGETS[@]}") (expected $(describe_array "${EXPECTED_TARGETS[@]}"))"
+    if ! matches_policy_targets \
+        ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"}; then
+        fail "supported musl target sections are $(describe_array ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"}) (expected $(describe_array ${EXPECTED_TARGETS[@]+"${EXPECTED_TARGETS[@]}"}))"
     fi
-    for target in "${SUPPORTED_TARGETS[@]}"; do
+    for target in ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"}; do
         linker=$(toml_value "$config" "target.$target" linker)
         if [ "$linker" != "$target-gcc" ]; then
             fail "$target linker is '$linker' (expected '$target-gcc')"
@@ -221,7 +222,8 @@ check_cargo_config() {
         while IFS= read -r rustflag; do
             rustflags[${#rustflags[@]}]="$rustflag"
         done < <(toml_array_strings "$config" "target.$target" rustflags)
-        if ! rustflags_enable_crt_static "${rustflags[@]}"; then
+        if ! rustflags_enable_crt_static \
+            ${rustflags[@]+"${rustflags[@]}"}; then
             fail "$target rustflags do not enable crt-static"
         fi
     done
@@ -235,14 +237,15 @@ check_rust_targets() {
     done < <(
         toml_array_strings "$REPO_ROOT/rust-toolchain.toml" toolchain targets | sort -u
     )
-    if [ "$(describe_array "${rust_targets[@]}")" != "$(describe_array "${SUPPORTED_TARGETS[@]}")" ]; then
-        fail "Rust std targets are $(describe_array "${rust_targets[@]}") (expected $(describe_array "${SUPPORTED_TARGETS[@]}") from .cargo/config.toml)"
+    if [ "$(describe_array ${rust_targets[@]+"${rust_targets[@]}"})" != \
+        "$(describe_array ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"})" ]; then
+        fail "Rust std targets are $(describe_array ${rust_targets[@]+"${rust_targets[@]}"}) (expected $(describe_array ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"}) from .cargo/config.toml)"
     fi
 }
 
 declared_target_for_machine() { # $1 = machine prefix
     local target
-    for target in "${SUPPORTED_TARGETS[@]}"; do
+    for target in ${SUPPORTED_TARGETS[@]+"${SUPPORTED_TARGETS[@]}"}; do
         if [[ "$target" == "$1-unknown-linux-musl" ]]; then
             printf '%s\n' "$target"
             return 0
@@ -283,9 +286,9 @@ check_nix_mapping() { # $1 = Nix system, $2 = expected target
         exported_targets[${#exported_targets[@]}]="$exported_target"
     done <<< "$output"
     local -a expected_targets=("$expected_target" "$expected_target" "$expected_target")
-    if [ "$(describe_array "${exported_targets[@]}")" != \
-        "$(describe_array "${expected_targets[@]}")" ]; then
-        fail "Nix mapping for $system exports $(describe_array "${exported_targets[@]}") (expected cargoTarget, environment.CARGO_BUILD_TARGET, and rustTargets to all be '$expected_target')"
+    if [ "$(describe_array ${exported_targets[@]+"${exported_targets[@]}"})" != \
+        "$(describe_array ${expected_targets[@]+"${expected_targets[@]}"})" ]; then
+        fail "Nix mapping for $system exports $(describe_array ${exported_targets[@]+"${exported_targets[@]}"}) (expected cargoTarget, environment.CARGO_BUILD_TARGET, and rustTargets to all be '$expected_target')"
     fi
 }
 

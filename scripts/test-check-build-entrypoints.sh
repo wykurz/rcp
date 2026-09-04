@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKER="$SCRIPT_DIR/check-build-entrypoints.sh"
+CHECKER_SHELL="${RCP_BUILD_ENTRYPOINT_TEST_CHECKER_SHELL:-}"
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -31,10 +32,19 @@ write_case_file() { # $1 = relative path; body on stdin
     cat > "$CASE_ROOT/$relative_path"
 }
 
+invoke_checker() {
+    if [ -n "$CHECKER_SHELL" ]; then
+        "$CHECKER_SHELL" "$CHECKER" "$@"
+    else
+        "$CHECKER" "$@"
+    fi
+}
+
 run_checker() { # $1 = output path
     local output_path="$1"
     set +e
-    "$CHECKER" --root "$CASE_ROOT" --allowlist "$ALLOWLIST" > "$output_path" 2>&1
+    invoke_checker --root "$CASE_ROOT" --allowlist "$ALLOWLIST" \
+        > "$output_path" 2>&1
     local status=$?
     set -e
     return "$status"
@@ -61,6 +71,20 @@ expect_result() { # $1 = status, $2 = label, $3 = diagnostic
 expect_clean() { expect_result 0 "$1" ''; }
 expect_violation() { expect_result 1 "$1" "$2"; }
 
+expect_clean_and_quiet() { # $1 = label
+    local label="$1"
+    local output_path="$TEMP_DIR/output-$label"
+    local status
+    if run_checker "$output_path"; then
+        status=0
+    else
+        status=$?
+    fi
+    if [ "$status" -ne 0 ] || [ -s "$output_path" ]; then
+        fail "$label: expected status 0 with no diagnostic, got status $status: $(cat "$output_path")"
+    fi
+}
+
 expect_rejected_shell_line() { # $1 = label, $2 = active source line
     local label="$1"
     local line="$2"
@@ -74,7 +98,7 @@ echo "Testing lexical build-entrypoint checks..."
 
 missing_root="$TEMP_DIR/missing-root"
 set +e
-missing_root_output=$("$CHECKER" --root "$missing_root" 2>&1)
+missing_root_output=$(invoke_checker --root "$missing_root" 2>&1)
 missing_root_status=$?
 set -e
 if [ "$missing_root_status" -ne 2 ] ||
@@ -129,6 +153,27 @@ FIXTURE
 git -C "$CASE_ROOT" add removed.sh
 rm "$CASE_ROOT/removed.sh"
 expect_clean pending-deletion
+
+new_case unreadable-extensionless-source
+write_case_file ci/build <<'FIXTURE'
+#!/bin/bash
+cargo b
+FIXTURE
+git -C "$CASE_ROOT" add ci/build
+chmod 000 "$CASE_ROOT/ci/build"
+if [ -r "$CASE_ROOT/ci/build" ]; then
+    # root and capability-bearing test users can still read mode-000 files.
+    chmod 600 "$CASE_ROOT/ci/build"
+else
+    expect_violation unreadable-extensionless-source \
+        'automation source is not readable: ci/build'
+    chmod 600 "$CASE_ROOT/ci/build"
+fi
+
+new_case binary-extensionless-source
+printf '\0binary data without a newline' | write_case_file assets/demo.bin
+git -C "$CASE_ROOT" add assets/demo.bin
+expect_clean_and_quiet binary-extensionless-source
 
 expect_rejected_shell_line raw-alias 'cargo b'
 expect_rejected_shell_line env-wrapper 'env cargo b'

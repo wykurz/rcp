@@ -2,10 +2,6 @@ name: Set up RCP Rust CI
 description: Install the Rust toolchain and tools used by RCP's Depot jobs
 
 inputs:
-  docker-compose-compat:
-    description: Provide the legacy docker-compose executable used by repository recipes
-    required: false
-    default: "false"
   install-dprint:
     description: Install dprint 0.54.0
     required: false
@@ -54,21 +50,6 @@ runs:
       sudo apt-get install -y --no-install-recommends "${packages[@]}"
       sudo ln -sf /usr/bin/musl-gcc \
         "/usr/bin/${{ steps.architecture.outputs.linker_alias }}"
-
-  - name: Set up Docker Compose compatibility
-    if: inputs.docker-compose-compat == 'true'
-    shell: bash
-    run: |
-      set -euo pipefail
-
-      compat_dir="$RUNNER_TEMP/rcp-docker-compose-compat"
-      mkdir -p "$compat_dir"
-      cat >"$compat_dir/docker-compose" <<'EOF'
-      #!/bin/sh
-      exec docker compose "$@"
-      EOF
-      chmod +x "$compat_dir/docker-compose"
-      echo "$compat_dir" >>"$GITHUB_PATH"
 
   - name: Setup SSH for localhost
     if: inputs.localhost-ssh == 'true'

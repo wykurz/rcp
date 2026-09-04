@@ -92,7 +92,8 @@ if [[ "$operation" == logs && "${FAKE_COMPOSE_HANG_ON_FOLLOW:-}" == 1 &&
         sleep 1
     done
 fi
-status_name="FAKE_COMPOSE_${operation^^}_STATUS"
+operation_upper="$(printf '%s' "$operation" | tr '[:lower:]' '[:upper:]')"
+status_name="FAKE_COMPOSE_${operation_upper}_STATUS"
 exit "${!status_name:-0}"
 MOCK
 
@@ -250,6 +251,27 @@ process_is_live() { # $1 = PID
     [[ "$state" != Z* ]]
 }
 
+process_group_has_live_members() { # $1 = process group ID
+    local group="$1"
+    ps -eo pgid=,stat= 2>/dev/null | awk -v group="$group" '
+        $1 == group && $2 !~ /^Z/ { found = 1 }
+        END { exit !found }
+    '
+}
+
+wait_for_process_group_to_stop() { # $1 = process group ID, $2 = timeout in milliseconds
+    local group="$1"
+    local timeout_millis="$2"
+    local deadline
+    deadline=$(($(monotonic_millis) + timeout_millis))
+    while process_group_has_live_members "$group"; do
+        if [[ "$(monotonic_millis)" -ge "$deadline" ]]; then
+            return 1
+        fi
+        "$REAL_SLEEP" 0.05
+    done
+}
+
 assert_no_group_action_after_reap() { # $1 = event log, $2 = description
     local event_log="$1"
     local description="$2"
@@ -308,6 +330,35 @@ check_default_platform_precedes_internal_target() {
         x86_64-unknown-linux-musl "$(cat "$TEMP_DIR/stdout")"
     assert_equals "DOCKER_DEFAULT_PLATFORM avoids inspection" 0 \
         "$(wc -l < "$TEMP_DIR/docker-info-calls")"
+}
+
+check_default_platform_variant() { # $1 = Docker platform
+    local platform="$1"
+
+    : > "$TEMP_DIR/docker-info-calls"
+    run_resolver env -u RCP_DOCKER_TARGET \
+        "DOCKER_DEFAULT_PLATFORM=$platform" \
+        "DOCKER=$TEMP_DIR/docker" \
+        FAKE_DOCKER_FAIL=1 \
+        "DOCKER_INFO_CALLS=$TEMP_DIR/docker-info-calls" \
+        "$REPO_ROOT/scripts/docker-target.sh"
+    assert_equals "Docker platform $platform status" 0 "$RESOLVER_STATUS"
+    assert_equals "Docker platform $platform target" \
+        x86_64-unknown-linux-musl "$(cat "$TEMP_DIR/stdout")"
+    assert_equals "Docker platform $platform avoids inspection" 0 \
+        "$(wc -l < "$TEMP_DIR/docker-info-calls")"
+}
+
+check_unsupported_default_platform() { # $1 = Docker platform
+    local platform="$1"
+
+    run_resolver env -u RCP_DOCKER_TARGET \
+        "DOCKER_DEFAULT_PLATFORM=$platform" \
+        "DOCKER=$TEMP_DIR/docker" \
+        "$REPO_ROOT/scripts/docker-target.sh"
+    assert_equals "unsupported Docker platform $platform status" 1 "$RESOLVER_STATUS"
+    assert_contains "unsupported Docker platform $platform diagnostic" \
+        "unsupported Docker platform: $platform" "$TEMP_DIR/stderr"
 }
 
 check_crlf_architecture_is_normalized() {
@@ -415,10 +466,14 @@ check_existing_project_operation() { # $1 = helper op, $2 = Compose op, $3 = sta
     local helper_operation="$1"
     local compose_operation="$2"
     local expected_status="$3"
+    local compose_operation_upper
+    compose_operation_upper="$(
+        printf '%s' "$compose_operation" | tr '[:lower:]' '[:upper:]'
+    )"
     run_process env \
         RCP_DOCKER_TARGET=stale-internal-value \
         FAKE_DOCKER_FAIL=1 \
-        "FAKE_COMPOSE_${compose_operation^^}_STATUS=$expected_status" \
+        "FAKE_COMPOSE_${compose_operation_upper}_STATUS=$expected_status" \
         "$REPO_ROOT/tests/docker/test-helpers.sh" "$helper_operation"
     assert_equals "$helper_operation preserves Compose status" \
         "$expected_status" "$PROCESS_STATUS"
@@ -481,6 +536,21 @@ check_lifecycle() { # $1 = recipe, $2 = Cargo test status, $3 = expect down
         assert_not_contains "$recipe intentionally keeps containers" \
             '|down' "$TEMP_DIR/compose-calls"
     fi
+}
+
+check_lifecycle_requires_command() { # $1 = lifecycle command
+    local lifecycle_command="$1"
+
+    run_process "$REPO_ROOT/tests/docker/test-helpers.sh" "$lifecycle_command"
+    assert_equals "$lifecycle_command without a command status" 2 "$PROCESS_STATUS"
+    assert_contains "$lifecycle_command without a command diagnostic" \
+        'lifecycle requires a command' "$TEMP_DIR/stderr"
+    assert_equals "$lifecycle_command without a command skips Docker discovery" 0 \
+        "$(wc -l < "$TEMP_DIR/docker-info-calls")"
+    assert_equals "$lifecycle_command without a command skips Cargo" "" \
+        "$(cat "$TEMP_DIR/cargo-calls")"
+    assert_equals "$lifecycle_command without a command skips Compose" "" \
+        "$(cat "$TEMP_DIR/compose-calls")"
 }
 
 check_lifecycle_poll_interval() {
@@ -637,7 +707,7 @@ check_sigterm_lifecycle_cleanup() {
     watchdog_cleanup_deadline=$(($(monotonic_millis) + 1500))
     while process_is_live "$watchdog_timer_pid" ||
         process_is_live "$watchdog_sleep_pid" ||
-        kill -0 -- "-$watchdog_group" 2>/dev/null; do
+        process_group_has_live_members "$watchdog_group"; do
         if [[ "$(monotonic_millis)" -ge "$watchdog_cleanup_deadline" ]]; then
             kill -KILL -- "-$watchdog_group" 2>/dev/null || true
             fail "cooperative SIGTERM leaked watchdog leader $watchdog_timer_pid, sleep $watchdog_sleep_pid, or group $watchdog_group"
@@ -730,7 +800,7 @@ check_parent_only_sigterm_lifecycle_cleanup() {
     down_count="$(grep -Fc '|down' "$TEMP_DIR/compose-calls" || true)"
     assert_equals "parent-only SIGTERM lifecycle status" 143 "$signal_status"
     assert_equals "parent-only SIGTERM lifecycle cleanup count" 1 "$down_count"
-    if kill -0 -- "-$child_group" 2> /dev/null; then
+    if ! wait_for_process_group_to_stop "$child_group" 1500; then
         kill -KILL -- "-$child_group" 2> /dev/null || true
         fail "parent-only SIGTERM left the active lifecycle process group running"
     fi
@@ -777,7 +847,7 @@ MOCK
         return
     fi
     child_group="$(<"$TEMP_DIR/signal-pending-pgid")"
-    if kill -0 -- "-$child_group" 2> /dev/null; then
+    if ! wait_for_process_group_to_stop "$child_group" 1500; then
         kill -KILL -- "-$child_group" 2> /dev/null || true
         fail "SIGTERM during registration left the lifecycle process group running"
     fi
@@ -826,8 +896,7 @@ MOCK
         return
     fi
     failed_child_pid="$(<"$TEMP_DIR/failed-lifecycle-child-pid")"
-    if kill -0 "$failed_child_pid" 2>/dev/null ||
-        kill -0 -- "-$failed_child_pid" 2>/dev/null; then
+    if ! wait_for_process_group_to_stop "$failed_child_pid" 1500; then
         kill -KILL -- "-$failed_child_pid" 2>/dev/null || true
         kill -KILL "$failed_child_pid" 2>/dev/null || true
         fail "exec failure left lifecycle PID or process group $failed_child_pid running"
@@ -906,8 +975,13 @@ MOCK
 }
 
 check_bash_32_compatible_helper_path() {
+    local compatibility_shell="${RCP_DOCKER_TEST_BASH_32:-}"
     local forbidden_name='BASH''PID'
     local forbidden_log="$TEMP_DIR/bash32-forbidden.log"
+
+    if [[ -z "$compatibility_shell" && "${BASH_VERSINFO[0]}" -eq 3 ]]; then
+        compatibility_shell="$BASH"
+    fi
 
     : > "$forbidden_log"
     grep -n "$forbidden_name" \
@@ -916,7 +990,8 @@ check_bash_32_compatible_helper_path() {
         "$REPO_ROOT/scripts/test-docker-target.sh" >> "$forbidden_log" || true
     grep -En \
         '(^|[[:space:];])(mapfile|readarray|coproc)([[:space:]]|$)|(declare|typeset|local)[[:space:]]+-[[:alnum:]]*A|\$\{[^}]*((\^\^)|(,,))|wait[[:space:]]+-n|\[\[[^]]*[[:space:]]-v[[:space:]]|&>>|\|&|;;&|;&|exec[[:space:]]+\{[[:alnum:]_]+\}|\{[[:alnum:]_]+\}[<>]' \
-        "$REPO_ROOT/tests/docker/test-helpers.sh" >> "$forbidden_log" || true
+        "$REPO_ROOT/tests/docker/test-helpers.sh" \
+        "$REPO_ROOT/scripts/test-docker-helpers.sh" >> "$forbidden_log" || true
     # nounset in Bash 3.2 rejects a quoted whole-array expansion when the array is empty.
     grep -En \
         '[[:alpha:]_][[:alnum:]_]*=\("\$\{[[:alpha:]_][[:alnum:]_]*\[@\]\}"\)' \
@@ -925,8 +1000,18 @@ check_bash_32_compatible_helper_path() {
         fail "Docker helper uses syntax or state newer than Bash 3.2: $(cat "$forbidden_log")"
     fi
 
-    run_process env BASH_COMPAT=3.2 \
-        "$REPO_ROOT/tests/docker/test-helpers.sh" lifecycle /bin/true
+    if [[ -n "$compatibility_shell" ]]; then
+        if ! "$compatibility_shell" -n \
+            "$REPO_ROOT/tests/docker/test-helpers.sh" 2> "$TEMP_DIR/bash32-syntax-error"; then
+            fail "Docker helper does not parse under Bash 3.2: $(cat "$TEMP_DIR/bash32-syntax-error")"
+        fi
+        run_process env BASH_COMPAT=3.2 \
+            "$compatibility_shell" "$REPO_ROOT/tests/docker/test-helpers.sh" \
+            lifecycle /bin/true
+    else
+        run_process env BASH_COMPAT=3.2 \
+            "$REPO_ROOT/tests/docker/test-helpers.sh" lifecycle /bin/true
+    fi
     assert_equals "Bash 3.2 compatibility-mode lifecycle status" 0 "$PROCESS_STATUS"
     assert_equals "Bash 3.2 compatibility-mode cleanup count" 1 \
         "$(grep -Fc '|down' "$TEMP_DIR/compose-calls" || true)"
@@ -1106,7 +1191,7 @@ check_leader_exit_descendant_grace() { # $1 = mode, $2/$3 = elapsed bounds
 
     cleanup_deadline=$(($(monotonic_millis) + 1500))
     while process_is_live "$descendant_pid" ||
-        kill -0 -- "-$descendant_group" 2>/dev/null; do
+        process_group_has_live_members "$descendant_group"; do
         if [[ "$(monotonic_millis)" -ge "$cleanup_deadline" ]]; then
             kill -KILL -- "-$descendant_group" 2>/dev/null || true
             fail "$mode leader-exit cleanup leaked descendant $descendant_pid or group $descendant_group"
@@ -1123,6 +1208,12 @@ check_target x86_64 x86_64-unknown-linux-musl
 check_target arm64 aarch64-unknown-linux-musl
 check_target aarch64 aarch64-unknown-linux-musl
 check_default_platform_precedes_internal_target
+check_default_platform_variant linux/amd64/v1
+check_default_platform_variant linux/amd64/v2
+check_default_platform_variant linux/amd64/v3
+check_default_platform_variant linux/amd64/v4
+check_unsupported_default_platform linux/amd64/v0
+check_unsupported_default_platform linux/amd64/vnext
 check_crlf_architecture_is_normalized
 check_inspection_failure_preserves_process_result
 check_setup_resolves_once_and_threads_target
@@ -1139,6 +1230,8 @@ check_lifecycle docker-test 42 yes
 check_lifecycle docker-chaos-test 42 yes
 check_lifecycle docker-test-keep 42 no
 check_lifecycle docker-chaos-test-keep 42 no
+check_lifecycle_requires_command lifecycle
+check_lifecycle_requires_command lifecycle-keep
 check_lifecycle_poll_interval
 check_setup_failure_lifecycle docker-test yes
 check_setup_failure_lifecycle docker-test-keep no

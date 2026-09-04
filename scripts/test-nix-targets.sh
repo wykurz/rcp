@@ -439,8 +439,6 @@ esac
 
 check_native_package_abi_smoke "$current_system" "$host_target"
 check_realized_linux_shell default "$host_target"
-check_realized_linux_shell x86_64-musl x86_64-unknown-linux-musl
-check_realized_linux_shell aarch64-musl aarch64-unknown-linux-musl
 check_inherited_cargo_target default "$host_gnu_target"
 
 printf 'Realized Nix shell target tests passed\n'

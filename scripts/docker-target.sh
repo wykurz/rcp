@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # prints the Linux musl target matching the Docker payload platform.
 
 set -euo pipefail
@@ -10,6 +10,18 @@ if [ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]; then
     case "$DOCKER_DEFAULT_PLATFORM" in
         linux/amd64)
             TARGET=x86_64-unknown-linux-musl
+            ;;
+        linux/amd64/v*)
+            AMD64_VARIANT="${DOCKER_DEFAULT_PLATFORM#linux/amd64/v}"
+            case "$AMD64_VARIANT" in
+                ''|0*|*[!0-9]*)
+                    echo "unsupported Docker platform: $DOCKER_DEFAULT_PLATFORM" >&2
+                    exit 1
+                    ;;
+                *)
+                    TARGET=x86_64-unknown-linux-musl
+                    ;;
+            esac
             ;;
         linux/arm64|linux/arm64/v8)
             TARGET=aarch64-unknown-linux-musl

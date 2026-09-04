@@ -145,7 +145,8 @@ if [[ "$operation" == logs ]]; then
         done
     fi
 fi
-status_name="FAKE_COMPOSE_${operation^^}_STATUS"
+operation_upper="$(printf '%s' "$operation" | tr '[:lower:]' '[:upper:]')"
+status_name="FAKE_COMPOSE_${operation_upper}_STATUS"
 exit "${!status_name:-0}"
 FAKE
 
@@ -213,6 +214,14 @@ process_is_live() { # $1 = PID
     [[ "$state" != Z* ]]
 }
 
+process_group_has_live_members() { # $1 = process group ID
+    local group="$1"
+    ps -eo pgid=,stat= 2>/dev/null | awk -v group="$group" '
+        $1 == group && $2 !~ /^Z/ { found = 1 }
+        END { exit !found }
+    '
+}
+
 assert_no_group_action_after_reap() { # $1 = event log, $2 = description
     local event_log="$1"
     local description="$2"
@@ -267,7 +276,7 @@ assert_probe_group_stopped() { # $1 = scenario description
     cleanup_deadline=$(($(monotonic_millis) + 1500))
     while process_is_live "$probe_pid" ||
         process_is_live "$descendant_pid" ||
-        kill -0 -- "-$probe_pid" 2>/dev/null; do
+        process_group_has_live_members "$probe_pid"; do
         if [[ "$(monotonic_millis)" -ge "$cleanup_deadline" ]]; then
             kill -KILL "$descendant_pid" 2>/dev/null || true
             kill -KILL -- "-$probe_pid" 2>/dev/null || true
