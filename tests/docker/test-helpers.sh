@@ -441,6 +441,7 @@ lifecycle_terminate_active_child() { # $1 = signal to forward
     local signal="$1"
     local active_pid="$LIFECYCLE_ACTIVE_PID"
     local grace_seconds="${RCP_DOCKER_LIFECYCLE_SIGNAL_GRACE_SECONDS:-5}"
+    local grace_seconds_pattern='^[0-9]+([.][0-9]+)?$'
     local decision_claim=
     local decision_directory=
     local decision_owner=timer
@@ -451,7 +452,7 @@ lifecycle_terminate_active_child() { # $1 = signal to forward
         return 0
     fi
     LIFECYCLE_TERMINATING_CHILD=yes
-    if [[ ! "$grace_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if [[ ! "$grace_seconds" =~ $grace_seconds_pattern ]]; then
         grace_seconds=5
     fi
 
@@ -616,6 +617,11 @@ run_lifecycle_child() { # $1 = working directory, remaining arguments = command
 run_lifecycle() { # $1 = clean up (yes/no), remaining arguments = command
     LIFECYCLE_CLEAN_UP="$1"
     shift
+
+    if [[ "$#" -eq 0 ]]; then
+        error "lifecycle requires a command" >&2
+        return 2
+    fi
 
     if [[ "$LIFECYCLE_CLEAN_UP" == yes ]]; then
         trap lifecycle_exit EXIT

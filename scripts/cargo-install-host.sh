@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # installs a third-party Cargo tool for rustc's native, runnable host target.
 
 set -euo pipefail

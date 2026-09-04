@@ -76,6 +76,18 @@ def workflow_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
+def canonical_locator(locator: str) -> str:
+    """Normalize the case-insensitive repository part of an action locator."""
+
+    components = locator.split("/", maxsplit=2)
+    if len(components) < 2:
+        return locator
+    repository = f"{components[0].casefold()}/{components[1].casefold()}"
+    if len(components) == 2:
+        return repository
+    return f"{repository}/{components[2]}"
+
+
 def check(root: Path) -> list[str]:
     """Return diagnostics for mutable or divergent external action references."""
 
@@ -98,7 +110,8 @@ def check(root: Path) -> list[str]:
                 "40-character commit SHA"
             )
             continue
-        pinned.setdefault(use.locator, {}).setdefault(use.revision.lower(), []).append(use)
+        locator = canonical_locator(use.locator)
+        pinned.setdefault(locator, {}).setdefault(use.revision.lower(), []).append(use)
 
     for locator, revisions in sorted(pinned.items()):
         if len(revisions) <= 1:

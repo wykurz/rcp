@@ -68,6 +68,22 @@ PIN=3d3c42e5aac5ba805825da76410c181273ba90b1
 write_fixtures "$PIN" "$PIN" "$PIN"
 expect_success
 
+sed -i 's#actions/checkout@#Actions/Checkout@#' "$ROOT/.depot/workflows/ci.yml"
+expect_success
+
+rm -rf "$ROOT"
+write_fixtures "$PIN" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$PIN"
+sed -i 's#actions/checkout@#Actions/Checkout@#' "$ROOT/.depot/workflows/ci.yml"
+expect_failure 'uses inconsistent pins'
+
+rm -rf "$ROOT"
+write_fixtures "$PIN" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$PIN"
+sed -i 's#actions/checkout@#Example/Actions/Upper@#' \
+    "$ROOT/.github/workflows/validate.yml"
+sed -i 's#actions/checkout@#example/actions/upper@#' \
+    "$ROOT/.depot/workflows/ci.yml"
+expect_success
+
 rm -rf "$ROOT"
 write_fixtures v7 "$PIN" "$PIN"
 expect_failure 'must use a full 40-character commit SHA'

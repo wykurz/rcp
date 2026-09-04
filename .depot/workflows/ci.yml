@@ -106,7 +106,6 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
       with:
-        docker-compose-compat: "true"
         install-nextest: "true"
     - run: just docker-up
     - run: just docker-test-only -E 'not test(~chaos)'
@@ -125,7 +124,6 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
       with:
-        docker-compose-compat: "true"
         install-nextest: "true"
     - run: just docker-up
     - run: just docker-chaos-test-only

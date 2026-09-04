@@ -10,6 +10,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKER="$SCRIPT_DIR/check-build-targets.sh"
 NIX_TARGET_TEST="$SCRIPT_DIR/test-nix-targets.sh"
+CHECKER_SHELL="${RCP_BUILD_TARGET_TEST_CHECKER_SHELL:-}"
 CHECKER_ARGS=()
 if [ "${RCP_BUILD_TARGET_TEST_SKIP_NIX_EVAL:-}" = 1 ]; then
     CHECKER_ARGS+=(--skip-nix-eval)
@@ -217,9 +218,17 @@ FIXTURE
         "$root/.depot/actions/rcp-rust-setup/runner-architecture.sh"
 }
 
+run_checker() {
+    if [ -n "$CHECKER_SHELL" ]; then
+        "$CHECKER_SHELL" "$CHECKER" "$@"
+    else
+        "$CHECKER" "$@"
+    fi
+}
+
 expect_success() { # $1 = fixture root
     local output
-    if ! output=$("$CHECKER" "${CHECKER_ARGS[@]}" "$1" 2>&1); then
+    if ! output=$(run_checker ${CHECKER_ARGS[@]+"${CHECKER_ARGS[@]}"} "$1" 2>&1); then
         fail "coherent fixture was rejected: $output"
     fi
     if [[ "$output" != *'build target declarations are consistent'* ]]; then
@@ -230,7 +239,7 @@ expect_success() { # $1 = fixture root
 expect_success_without_nix() { # $1 = fixture root
     local output
     if ! output=$(NIX="$TEMP_DIR/missing-nix" \
-        "$CHECKER" --skip-nix-eval "$1" 2>&1); then
+        run_checker --skip-nix-eval "$1" 2>&1); then
         fail "coherent non-Nix fixture was rejected: $output"
     fi
     if [[ "$output" != *'build target declarations are consistent'* ]]; then
@@ -245,7 +254,7 @@ expect_failure_without_nix() { # $1 = expected diagnostic, $2 = fixture root
     local status
     set +e
     output=$(NIX="$TEMP_DIR/missing-nix" \
-        "$CHECKER" --skip-nix-eval "$root" 2>&1)
+        run_checker --skip-nix-eval "$root" 2>&1)
     status=$?
     set -e
     if [ "$status" -eq 0 ] || [[ "$output" != *"$expected"* ]]; then
@@ -259,7 +268,7 @@ expect_failure() { # $1 = expected diagnostic, $2 = fixture root
     local output
     local status
     set +e
-    output=$("$CHECKER" "${CHECKER_ARGS[@]}" "$root" 2>&1)
+    output=$(run_checker ${CHECKER_ARGS[@]+"${CHECKER_ARGS[@]}"} "$root" 2>&1)
     status=$?
     set -e
     if [ "$status" -eq 0 ] || [[ "$output" != *"$expected"* ]]; then
@@ -283,7 +292,7 @@ FAKE
     chmod +x "$ambient_docker"
     set +e
     output=$(DOCKER="$ambient_docker" RCP_AMBIENT_DOCKER_LOG="$ambient_log" \
-        "$CHECKER" "${CHECKER_ARGS[@]}" "$root" 2>&1)
+        run_checker ${CHECKER_ARGS[@]+"${CHECKER_ARGS[@]}"} "$root" 2>&1)
     status=$?
     set -e
     if [ -e "$ambient_log" ]; then
@@ -304,25 +313,39 @@ check_nix_evaluate_only_mode() {
     local fake_nix_dir="$TEMP_DIR/fake-nix-bin"
     local fake_nix="$fake_nix_dir/nix"
     local nix_calls="$TEMP_DIR/fake-nix-calls"
+    local nix_arguments="$TEMP_DIR/fake-nix-arguments"
+    local fake_nix_result="$TEMP_DIR/fake-nix-result"
+    local default_shell_realizations explicit_shell_realizations
     local output status
-    mkdir -p "$fake_nix_dir"
+    mkdir -p "$fake_nix_dir" "$fake_nix_result/markers"
     cat > "$fake_nix" <<'FAKE'
 #!/bin/bash
 set -euo pipefail
 
-printf '%s\n' "$1" >> "$FAKE_NIX_CALLS"
-case "$1" in
+command="$1"
+printf '%s\n' "$command" >> "$FAKE_NIX_CALLS"
+if [ "$command" = build ] || [ "$command" = develop ]; then
+    for argument in "$@"; do
+        printf '%q ' "$argument"
+    done >> "$FAKE_NIX_ARGUMENTS"
+    printf '\n' >> "$FAKE_NIX_ARGUMENTS"
+fi
+
+shift
+case "$command" in
     eval)
         last_argument=''
         for last_argument in "$@"; do :; done
         if [ "$last_argument" = builtins.currentSystem ]; then
-            printf 'x86_64-linux'
+            printf '%s' "${FAKE_NIX_SYSTEM:-x86_64-linux}"
         else
             printf 'Nix target behavior tests passed\n'
         fi
         ;;
-    build | develop)
-        exit 91
+    build)
+        printf '%s\n' "$FAKE_NIX_RESULT"
+        ;;
+    develop)
         ;;
     *)
         exit 92
@@ -332,8 +355,10 @@ FAKE
     chmod +x "$fake_nix"
 
     : > "$nix_calls"
+    : > "$nix_arguments"
     set +e
-    output=$(PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" FAKE_NIX_CALLS="$nix_calls" \
+    output=$(PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" \
+        FAKE_NIX_CALLS="$nix_calls" FAKE_NIX_ARGUMENTS="$nix_arguments" \
         "$NIX_TARGET_TEST" --evaluate-only 2>&1)
     status=$?
     set -e
@@ -344,14 +369,41 @@ FAKE
         fail "Nix evaluate-only mode realized a derivation: $(tr '\n' ';' < "$nix_calls")"
     fi
 
+    printf 'build-hook-ran\n' > "$fake_nix_result/markers/build"
+    printf 'check-hook-ran\n' > "$fake_nix_result/markers/check"
+    printf 'install-hook-ran\n' > "$fake_nix_result/markers/install"
+    printf 'cargo 1.95.0\n' > "$fake_nix_result/markers/cargo-version"
+    printf 'rustc 1.95.0\n' > "$fake_nix_result/markers/rustc-version"
+    printf 'target=aarch64-unknown-linux-musl\nbinary-executed=yes\n' \
+        > "$fake_nix_result/evidence"
+
     : > "$nix_calls"
+    : > "$nix_arguments"
     set +e
-    PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" FAKE_NIX_CALLS="$nix_calls" \
-        "$NIX_TARGET_TEST" >/dev/null 2>&1
+    output=$(PATH="$fake_nix_dir:$PATH" NIX="$fake_nix" \
+        FAKE_NIX_CALLS="$nix_calls" FAKE_NIX_ARGUMENTS="$nix_arguments" \
+        FAKE_NIX_RESULT="$fake_nix_result" FAKE_NIX_SYSTEM=aarch64-linux \
+        "$NIX_TARGET_TEST" 2>&1)
     status=$?
     set -e
-    if [ "$status" -ne 91 ] || ! grep -Fxq build "$nix_calls"; then
-        fail "default Nix target test stopped being a full realization check: status=$status calls=$(tr '\n' ';' < "$nix_calls")"
+    if [ "$status" -ne 0 ]; then
+        fail "default Nix target test returned status $status: $output"
+    fi
+    if ! grep -Fq '#checks.aarch64-linux.package-abi-smoke ' \
+        "$nix_arguments"; then
+        fail "default Nix target test skipped the native package ABI smoke: $(tr '\n' ';' < "$nix_arguments")"
+    fi
+
+    default_shell_realizations=$(grep -Fc '#default ' \
+        "$nix_arguments" || true)
+    if [ "$default_shell_realizations" -ne 2 ]; then
+        fail "expected the default shell and its Cargo override check to be realized; got $default_shell_realizations: $(tr '\n' ';' < "$nix_arguments")"
+    fi
+
+    explicit_shell_realizations=$(grep -Ec '#(x86_64-musl|aarch64-musl)( |$)' \
+        "$nix_arguments" || true)
+    if [ "$explicit_shell_realizations" -ne 0 ]; then
+        fail "Nix target test realized $explicit_shell_realizations cross-target shells after evaluating their behavior: $(tr '\n' ';' < "$nix_arguments")"
     fi
 }
 
@@ -400,10 +452,22 @@ sed -i 's/\[target.aarch64-unknown-linux-musl\]/[target.aarch64-unknown-linux-gn
     "$fixture/.cargo/config.toml"
 expect_failure 'supported musl target sections' "$fixture"
 
+fixture=$(mutated_fixture missing-all-targets)
+sed -i \
+    -e 's/\[target.x86_64-unknown-linux-musl\]/[target.x86_64-unknown-linux-gnu]/' \
+    -e 's/\[target.aarch64-unknown-linux-musl\]/[target.aarch64-unknown-linux-gnu]/' \
+    "$fixture/.cargo/config.toml"
+expect_failure 'supported musl target sections are []' "$fixture"
+
 fixture=$(mutated_fixture wrong-linker)
 sed -i 's/aarch64-unknown-linux-musl-gcc/aarch64-linux-musl-gcc/' \
     "$fixture/.cargo/config.toml"
 expect_failure 'aarch64-unknown-linux-musl linker' "$fixture"
+
+fixture=$(mutated_fixture empty-rustflags)
+sed -i '/\[target.x86_64-unknown-linux-musl\]/,/^$/s/^rustflags = .*/rustflags = []/' \
+    "$fixture/.cargo/config.toml"
+expect_failure 'x86_64-unknown-linux-musl rustflags do not enable crt-static' "$fixture"
 
 fixture=$(mutated_fixture x86-static-crt-substring)
 sed -i '0,/target-feature=+crt-static/s//target-feature=+crt-static-disabled/' \
@@ -428,6 +492,10 @@ expect_failure 'aarch64-unknown-linux-musl rustflags do not enable crt-static' "
 fixture=$(mutated_fixture missing-rust-target)
 sed -i 's/"aarch64-unknown-linux-musl", //' "$fixture/rust-toolchain.toml"
 expect_failure 'Rust std targets' "$fixture"
+
+fixture=$(mutated_fixture empty-rust-targets)
+sed -i 's/^targets = .*/targets = []/' "$fixture/rust-toolchain.toml"
+expect_failure 'Rust std targets are []' "$fixture"
 
 if [ "${RCP_BUILD_TARGET_TEST_SKIP_NIX_EVAL:-}" != 1 ]; then
     fixture=$(mutated_fixture wrong-nix-mapping)
