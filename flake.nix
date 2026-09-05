@@ -11,17 +11,11 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    # Systems are enumerated explicitly rather than via `eachDefaultSystem`, which would also
-    # claim x86_64-darwin: nixpkgs 26.11 dropped that platform, and merely importing nixpkgs for
-    # it now throws, turning `nix flake check --all-systems` unconditionally red. Listing the
-    # systems here makes an upstream platform removal a one-line edit instead of an eval failure
-    # from a transitive input. Linux is what CI builds and tests; the Darwin outputs only have to
-    # evaluate (the code is cfg-gated for non-Linux, with the hardened walk disabled there).
-    # See https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.11
+    # RCP supports Linux on x86_64 and AArch64. Enumerate those systems explicitly so the flake
+    # does not publish package or development-shell outputs for unsupported hosts.
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
-      "aarch64-darwin"
     ] (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -63,10 +57,6 @@
           "aarch64-linux" = {
             archive = "linux_arm64";
             hash = "sha256-q0VTWNPBgKPGAMmW3lA3J+lnCjRLSn/QvrVQ80nLvjw=";
-          };
-          "aarch64-darwin" = {
-            archive = "darwin_arm64";
-            hash = "sha256-rBNqwyK2Ch98IiDuGjvWnD6KllC2dasrLrvb+H7Lfrc=";
           };
         }.${system};
 
@@ -126,13 +116,7 @@
           exec ${pkgs.bash}/bin/bash ${./scripts/cargo-host.sh} check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
         '';
 
-        # Build inputs needed for the Rust project. Deliberately empty on every platform: nixpkgs
-        # removed the `darwin.apple_sdk.frameworks.*` compatibility stubs this used to list for
-        # Security/SystemConfiguration (evaluating them now throws, turning `nix flake check
-        # --all-systems` unconditionally red) — the Darwin stdenv ships the SDK itself and this
-        # project needs no framework beyond it. See the "Darwin legacy frameworks" section of the
-        # nixpkgs manual. Kept as a binding (rather than deleted) so the package/dev-shell
-        # definitions below keep one obvious place to add a real build input.
+        # Keep one obvious place to add shared package and development-shell inputs.
         buildInputs = [ ];
 
         nativeBuildInputs = [ targetPlatform.packagePkgs.buildPackages.pkg-config ];
@@ -152,12 +136,6 @@
             rustEnv = "musl";
             filePattern = "ELF 64-bit.*ARM aarch64";
             loader = "ld-musl-aarch64.so.1";
-          };
-          "aarch64-darwin" = {
-            rustArch = "aarch64";
-            rustEnv = "darwin";
-            filePattern = "Mach-O 64-bit.*arm64";
-            loader = null;
           };
         }.${system};
         abiSmokeCargoToml = builtins.toFile "rcp-nix-package-abi-smoke-Cargo.toml" ''
@@ -190,8 +168,6 @@
           fn target_env() -> &'static str {
               if cfg!(target_env = "musl") {
                   "musl"
-              } else if cfg!(target_os = "macos") {
-                  "darwin"
               } else {
                   "unexpected"
               }
@@ -277,9 +253,7 @@
           '';
         };
         packageAbiSmokeCheck = pkgs.runCommand "rcp-nix-package-abi-smoke-check" {
-          nativeBuildInputs =
-            [ pkgs.file ]
-            ++ pkgs.lib.optionals targetPlatform.isLinux [ pkgs.binutils ];
+          nativeBuildInputs = [ pkgs.file pkgs.binutils ];
           passthru.cargoTarget = targetPlatform.cargoTarget;
         } ''
           set -euo pipefail
@@ -298,18 +272,15 @@
           output="$("$probe")"
           test "$output" = \
             'rcp-nix-package-abi-smoke:${abiSmokePlatform.rustArch}:${abiSmokePlatform.rustEnv}'
-          interpreter=not-applicable
-          ${pkgs.lib.optionalString targetPlatform.isLinux ''
-            interpreter="$(
-              readelf -l "$probe" |
-                sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'
-            )"
-            test -n "$interpreter"
-            case "$interpreter" in
-              *musl*'/${abiSmokePlatform.loader}') ;;
-              *) echo "unexpected ELF interpreter: $interpreter" >&2; exit 1 ;;
-            esac
-          ''}
+          interpreter="$(
+            readelf -l "$probe" |
+              sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'
+          )"
+          test -n "$interpreter"
+          case "$interpreter" in
+            *musl*'/${abiSmokePlatform.loader}') ;;
+            *) echo "unexpected ELF interpreter: $interpreter" >&2; exit 1 ;;
+          esac
 
           mkdir -p "$out/markers"
           cp "$marker_dir/build" "$out/markers/build"
@@ -397,9 +368,7 @@
                 pkgs.pkg-config
               ]
               ++ buildInputs
-              # Linux-only tools: neither package evaluates on Darwin, so listing them
-              # unconditionally breaks `nix flake check --all-systems` at evaluation time.
-              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              ++ [
                 # `getfacl`/`setfacl`, for reading a POSIX ACL by hand when debugging the ACL
                 # tests. Nothing depends on it: the fixtures write the xattrs directly, precisely
                 # so the suite needs no runtime tool.
@@ -501,13 +470,10 @@
           };
         };
 
-        devShells =
-          {
-            default = mkDevShell targetPlatform;
-          }
-          // pkgs.lib.optionalAttrs targetPlatform.isLinux {
-            x86_64-musl = mkDevShell x86_64MuslPlatform;
-            aarch64-musl = mkDevShell aarch64MuslPlatform;
-          };
+        devShells = {
+          default = mkDevShell targetPlatform;
+          x86_64-musl = mkDevShell x86_64MuslPlatform;
+          aarch64-musl = mkDevShell aarch64MuslPlatform;
+        };
       });
 }

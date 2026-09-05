@@ -974,49 +974,6 @@ MOCK
         "$(cat "$TEMP_DIR/launcher-fallback-calls")"
 }
 
-check_bash_32_compatible_helper_path() {
-    local compatibility_shell="${RCP_DOCKER_TEST_BASH_32:-}"
-    local forbidden_name='BASH''PID'
-    local forbidden_log="$TEMP_DIR/bash32-forbidden.log"
-
-    if [[ -z "$compatibility_shell" && "${BASH_VERSINFO[0]}" -eq 3 ]]; then
-        compatibility_shell="$BASH"
-    fi
-
-    : > "$forbidden_log"
-    grep -n "$forbidden_name" \
-        "$REPO_ROOT/tests/docker/test-helpers.sh" \
-        "$REPO_ROOT/scripts/test-docker-helpers.sh" \
-        "$REPO_ROOT/scripts/test-docker-target.sh" >> "$forbidden_log" || true
-    grep -En \
-        '(^|[[:space:];])(mapfile|readarray|coproc)([[:space:]]|$)|(declare|typeset|local)[[:space:]]+-[[:alnum:]]*A|\$\{[^}]*((\^\^)|(,,))|wait[[:space:]]+-n|\[\[[^]]*[[:space:]]-v[[:space:]]|&>>|\|&|;;&|;&|exec[[:space:]]+\{[[:alnum:]_]+\}|\{[[:alnum:]_]+\}[<>]' \
-        "$REPO_ROOT/tests/docker/test-helpers.sh" \
-        "$REPO_ROOT/scripts/test-docker-helpers.sh" >> "$forbidden_log" || true
-    # nounset in Bash 3.2 rejects a quoted whole-array expansion when the array is empty.
-    grep -En \
-        '[[:alpha:]_][[:alnum:]_]*=\("\$\{[[:alpha:]_][[:alnum:]_]*\[@\]\}"\)' \
-        "$REPO_ROOT/tests/docker/test-helpers.sh" >> "$forbidden_log" || true
-    if [[ -s "$forbidden_log" ]]; then
-        fail "Docker helper uses syntax or state newer than Bash 3.2: $(cat "$forbidden_log")"
-    fi
-
-    if [[ -n "$compatibility_shell" ]]; then
-        if ! "$compatibility_shell" -n \
-            "$REPO_ROOT/tests/docker/test-helpers.sh" 2> "$TEMP_DIR/bash32-syntax-error"; then
-            fail "Docker helper does not parse under Bash 3.2: $(cat "$TEMP_DIR/bash32-syntax-error")"
-        fi
-        run_process env BASH_COMPAT=3.2 \
-            "$compatibility_shell" "$REPO_ROOT/tests/docker/test-helpers.sh" \
-            lifecycle /bin/true
-    else
-        run_process env BASH_COMPAT=3.2 \
-            "$REPO_ROOT/tests/docker/test-helpers.sh" lifecycle /bin/true
-    fi
-    assert_equals "Bash 3.2 compatibility-mode lifecycle status" 0 "$PROCESS_STATUS"
-    assert_equals "Bash 3.2 compatibility-mode cleanup count" 1 \
-        "$(grep -Fc '|down' "$TEMP_DIR/compose-calls" || true)"
-}
-
 clean_up_stuck_lifecycle_order_fixture() { # $1 = lifecycle PID
     local lifecycle_pid="$1"
     local group
@@ -1243,7 +1200,6 @@ check_sigterm_during_lifecycle_child_registration
 check_lifecycle_uses_no_external_launcher
 check_monitor_mode_restored off
 check_monitor_mode_restored on
-check_bash_32_compatible_helper_path
 check_lifecycle_group_actions_precede_reap
 check_leader_exit_descendant_grace cooperative 0 1500
 check_leader_exit_descendant_grace resistant 1500 4000

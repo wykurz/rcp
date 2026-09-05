@@ -153,11 +153,10 @@ assert_no_call() {
     fi
 }
 
-run_print_target() { # $1 = system, $2 = machine, $3 = rustc host, $4 = expected target
+run_print_target() { # $1 = system, $2 = machine, $3 = expected target
     local system="$1"
     local machine="$2"
-    local rustc_host="$3"
-    local expected_target="$4"
+    local expected_target="$3"
     local output status
     : > "$CALLS"
     set +e
@@ -167,7 +166,6 @@ run_print_target() { # $1 = system, $2 = machine, $3 = rustc host, $4 = expected
         "CARGO_CALLS=$CALLS" \
         "FAKE_UNAME_SYSTEM=$system" \
         "FAKE_UNAME_MACHINE=$machine" \
-        "FAKE_RUSTC_HOST=$rustc_host" \
         "$REPO_ROOT/scripts/cargo-host.sh" --print-target 2>&1)
     status=$?
     set -e
@@ -189,7 +187,6 @@ run_print_explicit_target() {
         FAKE_UNAME_FAIL=1 \
         FAKE_UNAME_SYSTEM=Linux \
         FAKE_UNAME_MACHINE=riscv64 \
-        FAKE_RUSTC_HOST=riscv64gc-unknown-linux-gnu \
         "$REPO_ROOT/scripts/cargo-host.sh" --print-target 2>&1)
     status=$?
     set -e
@@ -199,27 +196,21 @@ run_print_explicit_target() {
     assert_no_call
 }
 
-run_print_target_with_spaced_rustc_path() {
-    local rustc_dir="$TEMP_DIR/rustc tools"
-    local rustc_path="$rustc_dir/rustc test double"
+run_unsupported_system() {
     local output status
-    mkdir -p "$rustc_dir"
-    cp "$BIN_DIR/rustc" "$rustc_path"
     : > "$CALLS"
     set +e
     output=$(env -u CARGO_BUILD_TARGET \
         "PATH=$BIN_DIR:$PATH" \
         "CARGO=$BIN_DIR/cargo" \
         "CARGO_CALLS=$CALLS" \
-        "RUSTC=$rustc_path" \
         FAKE_UNAME_SYSTEM=Darwin \
         FAKE_UNAME_MACHINE=arm64 \
-        FAKE_RUSTC_HOST=aarch64-apple-darwin \
-        "$REPO_ROOT/scripts/cargo-host.sh" --print-target 2>&1)
+        "$REPO_ROOT/scripts/cargo-host.sh" check 2>&1)
     status=$?
     set -e
-    if [ "$status" -ne 0 ] || [ "$output" != aarch64-apple-darwin ]; then
-        fail "spaced RUSTC path lost host target/status: status=$status output=$output"
+    if [ "$status" -ne 1 ] || [[ "$output" != *'unsupported operating system: Darwin'* ]]; then
+        fail "unsupported operating system lost status/diagnostic: status=$status output=$output"
     fi
     assert_no_call
 }
@@ -234,7 +225,6 @@ run_print_unsupported_target() {
         "CARGO_CALLS=$CALLS" \
         FAKE_UNAME_SYSTEM=Linux \
         FAKE_UNAME_MACHINE=riscv64 \
-        FAKE_RUSTC_HOST=riscv64gc-unknown-linux-gnu \
         "$REPO_ROOT/scripts/cargo-host.sh" --print-target 2>&1)
     status=$?
     set -e
@@ -311,12 +301,11 @@ run_host_installer_rejects_target_override() {
     assert_no_call
 }
 
-run_wrapper() { # $1 = system, $2 = machine, $3 = rustc host, $4 = expected target, $5 = explicit target
+run_wrapper() { # $1 = system, $2 = machine, $3 = expected target, $4 = explicit target
     local system="$1"
     local machine="$2"
-    local rustc_host="$3"
-    local expected_target="$4"
-    local explicit_target="$5"
+    local expected_target="$3"
+    local explicit_target="$4"
     local output
     local -a environment=(
         env
@@ -326,7 +315,6 @@ run_wrapper() { # $1 = system, $2 = machine, $3 = rustc host, $4 = expected targ
         "CARGO_CALLS=$CALLS"
         "FAKE_UNAME_SYSTEM=$system"
         "FAKE_UNAME_MACHINE=$machine"
-        "FAKE_RUSTC_HOST=$rustc_host"
     )
     if [ -n "$explicit_target" ]; then
         environment+=("CARGO_BUILD_TARGET=$explicit_target")
@@ -682,16 +670,16 @@ assert_portable_wrapper_interpreters() {
 echo "🔍 Testing musl-first host Cargo selection..."
 
 # wrong Linux target selection would compile the host against a different libc or architecture.
-run_wrapper Linux x86_64 x86_64-unknown-linux-gnu x86_64-unknown-linux-musl ''
-run_wrapper Linux aarch64 aarch64-unknown-linux-gnu aarch64-unknown-linux-musl ''
-run_print_target Linux x86_64 x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
-run_print_target Linux aarch64 aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+run_wrapper Linux x86_64 x86_64-unknown-linux-musl ''
+run_wrapper Linux aarch64 aarch64-unknown-linux-musl ''
+run_print_target Linux x86_64 x86_64-unknown-linux-musl
+run_print_target Linux aarch64 aarch64-unknown-linux-musl
 run_print_explicit_target
-run_print_target_with_spaced_rustc_path
+run_unsupported_system
 run_print_unsupported_target
 
 # an explicit caller target is the documented escape hatch and must skip host discovery entirely.
-run_wrapper Linux riscv64 riscv64-unknown-linux-gnu x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu
+run_wrapper Linux riscv64 x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu
 
 : > "$CALLS"
 set +e
@@ -710,8 +698,6 @@ if [ "$unsupported_status" -ne 1 ] ||
     fail "unsupported Linux architecture lost status/diagnostic: status=$unsupported_status output=$unsupported_output"
 fi
 assert_no_call
-
-run_wrapper Darwin arm64 aarch64-apple-darwin aarch64-apple-darwin ''
 
 : > "$CALLS"
 set +e

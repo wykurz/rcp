@@ -218,6 +218,10 @@ Compare `<foo>` vs. `<bar>`:
 
 # Installation
 
+RCP supports Linux on x86_64 and AArch64. Musl is the primary build, test, and distribution target;
+CI additionally checks an x86_64 GNU/glibc release build. Native macOS, BSD, and Windows builds are
+unsupported.
+
 <img src="https://raw.githubusercontent.com/NixOS/nixos-artwork/master/logo/nix-snowflake-colours.svg" height="64" alt="Nix">
 
 ## nixpkgs
@@ -417,8 +421,8 @@ When auto-deployment is enabled:
 - Keeps the last 3 versions and cleans up older ones
 - Reuses deployed binaries for subsequent operations (cached until version changes)
 
-Auto-deployment targets Linux because fail-closed publication relies on GNU/BusyBox `mv -T`. Stock
-macOS and BSD remote hosts need a matching `rcpd` installed manually.
+Remote endpoints must run Linux. Auto-deployment additionally relies on GNU/BusyBox `mv -T`; macOS
+and BSD are not supported as `rcpd` hosts, whether deployment is automatic or manual.
 
 Manual deployment is still supported and may be preferred for:
 

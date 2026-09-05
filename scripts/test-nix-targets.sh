@@ -23,22 +23,19 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
     expectedTargets = {
       x86_64-linux = "x86_64-unknown-linux-musl";
       aarch64-linux = "aarch64-unknown-linux-musl";
-      x86_64-darwin = "x86_64-apple-darwin";
-      aarch64-darwin = "aarch64-apple-darwin";
     };
     expectedBuildPlatforms = {
       x86_64-linux = "x86_64-unknown-linux-gnu";
       aarch64-linux = "aarch64-unknown-linux-gnu";
-      aarch64-darwin = "arm64-apple-darwin";
     };
     expectedHostPlatforms = {
       x86_64-linux = "x86_64-unknown-linux-musl";
       aarch64-linux = "aarch64-unknown-linux-musl";
-      aarch64-darwin = "arm64-apple-darwin";
     };
 
     linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
-    supportedSystems = linuxSystems ++ [ "aarch64-darwin" ];
+    supportedSystems = linuxSystems;
+    unsupportedSystems = [ "x86_64-darwin" "aarch64-darwin" ];
     packageNames = [ "rcp" "rrm" "rchm" "rlink" "rcmp" "filegen" "rcp-all" ];
 
     fail = label: expected: actual:
@@ -163,24 +160,6 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
         ++ checkYamlValidatorTool label shell.buildInputs
         ++ checkNoGenericTargetTools label shell;
 
-    checkDarwinShell = system:
-      let
-        shell = flake.devShells.${system}.default;
-        label = "devShells.${system}.default";
-      in
-        [
-          (equals "${label} Cargo target default" expectedTargets.${system}
-            (shell.cargoTarget or null))
-          (isTrue "${label} does not unconditionally export Cargo target"
-            (!(builtins.hasAttr "CARGO_BUILD_TARGET" shell)))
-          (equals "${label} Linux musl tool count" 0
-            (builtins.length (muslToolsOf shell.buildInputs)))
-          (equals "${label} Linux C environment" [ ] (targetEnvNamesOf shell))
-        ]
-        ++ checkCommonDevTools label shell.buildInputs
-        ++ checkYamlValidatorTool label shell.buildInputs
-        ++ checkNoGenericTargetTools label shell;
-
     checkLinuxPackage = system: packageName:
       let
         package = flake.packages.${system}.${packageName};
@@ -224,44 +203,6 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
         ]
         ++ checkNoGenericTargetTools label package;
 
-    checkDarwinPackage = system: packageName:
-      let
-        package = flake.packages.${system}.${packageName};
-        label = "packages.${system}.${packageName}";
-        target = expectedTargets.${system};
-        buildHook = singleInputNamed label "cargo-build-hook.sh" package.nativeBuildInputs;
-        checkHook = singleInputNamed label "cargo-check-hook.sh" package.nativeBuildInputs;
-        installHook = singleInputNamed label "cargo-install-hook.sh" package.nativeBuildInputs;
-        pkgConfig = singleInputMatching label "pkg-config wrapper"
-          (input: builtins.match ".*pkg-config-wrapper-.*" (nameOf input) != null)
-          package.nativeBuildInputs;
-        compilerProviders = compilerProviderNamesOf package.nativeBuildInputs;
-      in
-        [
-          (equals "${label} build platform" expectedBuildPlatforms.${system}
-            package.stdenv.buildPlatform.config)
-          (equals "${label} host platform" expectedHostPlatforms.${system}
-            package.stdenv.hostPlatform.config)
-          (equals "${label} stdenv Rust target" target
-            package.stdenv.hostPlatform.rust.rustcTarget)
-          (equals "${label} Cargo build-hook target" target buildHook.rustcTargetSpec)
-          (equals "${label} Cargo check-hook target" target checkHook.rustcTargetSpec)
-          (equals "${label} Cargo install-hook target directory" target
-            installHook.targetSubdirectory)
-          (equals "${label} checks stay enabled" true package.doCheck)
-          (equals "${label} pkg-config target" expectedHostPlatforms.${system}
-            pkgConfig.stdenv.targetPlatform.config)
-          (equals "${label} pkg-config host is build-runnable" expectedBuildPlatforms.${system}
-            pkgConfig.stdenv.hostPlatform.config)
-          (isTrue "${label} has a pinned Rust provider" (compilerProviders != [ ]))
-          (isTrue "${label} uses only the pinned Rust provider"
-            (builtins.all isPinnedCompilerProvider compilerProviders))
-          (equals "${label} Linux musl tool count" 0
-            (builtins.length (muslToolsOf package.nativeBuildInputs)))
-          (equals "${label} Linux C environment" [ ] (targetEnvNamesOf package))
-        ]
-        ++ checkNoGenericTargetTools label package;
-
     checkMappingTarget = system:
       let mapped = import (root + "/nix/target-platform.nix") { inherit system; };
       in equals "target-platform mapping for ${system}" expectedTargets.${system}
@@ -277,22 +218,18 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
           (equals "${label} target" expectedTargets.${system} smoke.passthru.cargoTarget)
         ];
 
-    pureX86Darwin = import (root + "/nix/target-platform.nix") {
-      system = "x86_64-darwin";
-    };
-    pureX86DarwinChecks = [
-      (equals "pure x86_64-Darwin mapping is non-Linux" false pureX86Darwin.isLinux)
-      (equals "pure x86_64-Darwin mapping has no extra Rust targets"
-        [ ] pureX86Darwin.rustTargets)
-      (equals "pure x86_64-Darwin mapping has no Linux build tools"
-        [ ] pureX86Darwin.buildTools)
-      (equals "pure x86_64-Darwin mapping has only its native Cargo environment"
-        { CARGO_BUILD_TARGET = "x86_64-apple-darwin"; }
-        pureX86Darwin.environment)
-      (equals "pure x86_64-Darwin mapping has no Linux C environment"
-        { } (targetEnvironmentOf pureX86Darwin.environment))
-    ]
-    ++ checkNoGenericTargetTools "pure x86_64-Darwin mapping" pureX86Darwin.environment;
+    checkUnsupportedSystem = system:
+      let
+        mapped = builtins.tryEval (
+          (import (root + "/nix/target-platform.nix") { inherit system; }).cargoTarget
+        );
+      in
+        [
+          (equals "target-platform rejects ${system}" false mapped.success)
+          (isTrue "packages omit ${system}" (!(builtins.hasAttr system flake.packages)))
+          (isTrue "devShells omit ${system}" (!(builtins.hasAttr system flake.devShells)))
+          (isTrue "checks omit ${system}" (!(builtins.hasAttr system flake.checks)))
+        ];
 
     legacy = import (root + "/default.nix");
     legacySystem = builtins.currentSystem;
@@ -328,16 +265,12 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
       ++ builtins.concatMap
         (system: checkLinuxShell system "aarch64-musl" expectedTargets.aarch64-linux)
         linuxSystems
-      ++ builtins.concatMap checkDarwinShell [ "aarch64-darwin" ]
       ++ builtins.concatMap
         (system: builtins.concatMap (checkLinuxPackage system) packageNames)
         linuxSystems
-      ++ builtins.concatMap
-        (system: builtins.concatMap (checkDarwinPackage system) packageNames)
-        [ "aarch64-darwin" ]
       ++ map checkMappingTarget (builtins.attrNames expectedTargets)
       ++ builtins.concatMap checkPackageAbiSmoke supportedSystems
-      ++ pureX86DarwinChecks
+      ++ builtins.concatMap checkUnsupportedSystem unsupportedSystems
       ++ legacyChecks;
   in
     builtins.deepSeq checks "Nix target behavior tests passed\n"
@@ -425,11 +358,6 @@ case "$current_system" in
     aarch64-linux)
         host_target=aarch64-unknown-linux-musl
         host_gnu_target=aarch64-unknown-linux-gnu
-        ;;
-    aarch64-darwin)
-        check_native_package_abi_smoke "$current_system" aarch64-apple-darwin
-        printf 'Nix target behavior tests passed (realized Linux shells not available)\n'
-        exit 0
         ;;
     *)
         printf 'unsupported system for realized Nix shell test\n' >&2
