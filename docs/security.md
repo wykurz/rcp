@@ -194,15 +194,16 @@ local execution controls should use a trusted installation location or deploy rc
 - **Side-channel attacks**: No specific mitigations for timing attacks, etc.
 - **TOCTTOU attacks with `--dereference`/`-L`**: Following symlinks is requested behavior and cannot
   be hardened. See [TOCTTOU Vulnerabilities](tocttou.md) for details.
-- **TOCTTOU on non-Linux**: The hardened path is Linux-only; non-Linux builds use path-based
-  operations. See [TOCTTOU Vulnerabilities](tocttou.md).
+- **Unsupported non-Linux builds**: RCP supports Linux only. The sources rely on Linux-specific
+  filesystem APIs, so non-Linux builds receive no compatibility or security guarantees. See
+  [TOCTTOU Vulnerabilities](tocttou.md).
 - **Trust of the operand path's prefix**: The hardening protects everything at or below the named
   root, but by default the tools do not verify that the directories *above* it are free of
-  less-privileged control. `--require-toctou-safe` enforces the hardened walk (refusing
-  `-L`/non-Linux) and the strict operand contract: operands must be absolute and lexically normal,
-  and every operand open resolves `RESOLVE_NO_SYMLINKS`, so a symlink spliced anywhere along the
-  path fails closed. Path *policy* — and keeping prefix directories non-writable by lesser-
-  privileged actors — remains the caller's responsibility; see the
+  less-privileged control. `--require-toctou-safe` enforces the hardened walk (refusing `-L` and
+  unsupported non-Linux builds) and the strict operand contract: operands must be absolute and
+  lexically normal, and every operand open resolves `RESOLVE_NO_SYMLINKS`, so a symlink spliced
+  anywhere along the path fails closed. Path *policy* — and keeping prefix directories non-writable
+  by lesser-privileged actors — remains the caller's responsibility; see the
   [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section.
 - **POSIX ACLs, unless requested**: a copy that does not ask for `acl` reproduces the source's mode
   and drops its ACL, and a source ACL entry narrower than `other` acts as a deny in effect — so
@@ -387,12 +388,12 @@ The rcp security model provides:
 **Limitations**:
 
 - ⚠️ **TOCTTOU with `--dereference`/`-L`**: Following symlinks is requested behavior and is not
-  hardened. On Linux, all other default paths (local copy/link/chmod/rm/delete, remote copy
-  source+destination) are fully TOCTOU-hardened. Non-Linux builds are not hardened. Use
-  `--require-toctou-safe` in sudo rules to enforce the hardened walk (it refuses `-L`/non-Linux)
-  plus the strict operand contract (absolute, lexically normal operands, resolved
-  `RESOLVE_NO_SYMLINKS`; needs Linux 5.6+). Path policy is still the caller's responsibility — see
-  the [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
+  hardened. On supported Linux builds, all other default paths (local copy/link/chmod/rm/delete,
+  remote copy source+destination) are fully TOCTOU-hardened. Use `--require-toctou-safe` in sudo
+  rules to enforce the hardened walk (it refuses `-L` and unsupported non-Linux targets) plus the
+  strict operand contract (absolute, lexically normal operands, resolved `RESOLVE_NO_SYMLINKS`;
+  needs Linux 5.6+). Path policy is still the caller's responsibility — see the
+  [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
   [TOCTTOU Vulnerabilities](tocttou.md) for details.
 
 Use `--no-encryption` only on trusted networks where performance is critical.

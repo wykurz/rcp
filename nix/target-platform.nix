@@ -4,21 +4,11 @@ let
   platforms = {
     x86_64-linux = {
       cargoTarget = "x86_64-unknown-linux-musl";
-      isLinux = true;
       crossPackages = packages: packages.pkgsCross.musl64;
     };
     aarch64-linux = {
       cargoTarget = "aarch64-unknown-linux-musl";
-      isLinux = true;
       crossPackages = packages: packages.pkgsCross.aarch64-multiplatform-musl;
-    };
-    x86_64-darwin = {
-      cargoTarget = "x86_64-apple-darwin";
-      isLinux = false;
-    };
-    aarch64-darwin = {
-      cargoTarget = "aarch64-apple-darwin";
-      isLinux = false;
     };
   };
 
@@ -29,10 +19,9 @@ let
       throw "unsupported RCP Nix system: ${system}";
   packagePkgs =
     if pkgs == null then null
-    else if platform.isLinux then platform.crossPackages pkgs
-    else pkgs;
+    else platform.crossPackages pkgs;
   toolPackages =
-    if packagePkgs != null && platform.isLinux then packagePkgs.buildPackages else null;
+    if packagePkgs != null then packagePkgs.buildPackages else null;
   toolchain =
     if toolPackages != null then {
       gcc = toolPackages.gcc;
@@ -58,8 +47,8 @@ let
   '';
 in
 {
-  inherit (platform) cargoTarget isLinux;
+  inherit (platform) cargoTarget;
   inherit cargoTargetShellHook environment packagePkgs shellEnvironment;
-  rustTargets = if platform.isLinux then [ platform.cargoTarget ] else [ ];
+  rustTargets = [ platform.cargoTarget ];
   buildTools = if toolchain != null then [ toolchain.gcc toolchain.binutils ] else [ ];
 }

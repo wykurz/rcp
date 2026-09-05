@@ -449,11 +449,12 @@ are often, but not reliably, caught: finalize re-stats each reused directory and
 restored owner or mode did not take effect, which surfaces many interleavings as a loud error.
 
 The guarantees are *additionally* bounded by separately-documented exceptions: `--dereference`/`-L`
-and non-Linux builds (see [What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of
-scope), and the kernel preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind
-mounts (see [Residual Preconditions](#residual-preconditions)). A hardlink alias planted at or below
-the root, for instance, is a *non-swap* redirect covered by the `protected_hardlinks` precondition
-rather than by the Containment guarantee.
+and sources compiled for unsupported non-Linux targets (see
+[What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of scope), and the kernel
+preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind mounts (see
+[Residual Preconditions](#residual-preconditions)). A hardlink alias planted at or below the root,
+for instance, is a *non-swap* redirect covered by the `protected_hardlinks` precondition rather than
+by the Containment guarantee.
 
 ## Implemented Hardening
 
@@ -706,16 +707,15 @@ fails closed instead of being followed. See
 ## What Is Not Hardened
 
 The following are **not TOCTOU-hardened**, or — for POSIX ACLs, which are a fidelity and containment
-concern rather than a race — not covered by default. The flag- and platform-level items (`-L`,
-non-Linux) are reported as "not safe" by `--toctou-check`; the runtime filesystem-property item
-(POSIX ACLs) is NOT — `--toctou-check` inspects operand form and flags, not the runtime state of the
-filesystems involved, so it cannot detect it:
+concern rather than a race — not covered by default. The flag- and platform-level items (`-L` and a
+binary compiled for an unsupported non-Linux target) are reported as "not safe" by `--toctou-check`;
+the runtime filesystem-property item (POSIX ACLs) is NOT — `--toctou-check` inspects operand form
+and flags, not the runtime state of the filesystems involved, so it cannot detect it:
 
 - **`--dereference` / `-L`**: Following symlinks is the requested behavior. A swapped link is
   followed by design. Do not use `-L` in privileged sudo rules over attacker-writable trees.
-- **Non-Linux builds**: The hardened path (`safedir.rs` with `O_NOFOLLOW` + fd-relative ops) is
-  Linux-only. macOS and other non-Linux platforms continue to use path-based operations and are not
-  hardened.
+- **Unsupported non-Linux builds**: RCP supports Linux only. The sources rely on Linux-specific
+  filesystem APIs, so a non-Linux target receives no compatibility or hardening guarantees.
 - **`rcmp`** (read-only compare): `rcmp` cannot mis-permission or destroy files. A concurrent swap
   could cause a wrong comparison result (treating an unintended file as equal or unequal), but no
   data is written. This is accepted and `rcmp` is out of scope.
@@ -836,7 +836,8 @@ useful when preparing a wrapper or sudo rule for the strict mode.
 Refuses to run unless the invocation uses the TOCTOU-hardened walk **and** satisfies the strict
 operand contract:
 
-- refuses `--dereference`/`-L` (follows symlinks by request) and non-Linux builds;
+- refuses `--dereference`/`-L` (follows symlinks by request) and builds compiled for unsupported
+  non-Linux targets;
 - refuses any operand that is not absolute and lexically normal (no `.`/`..` components, no `//`
   segments; a single trailing slash is allowed — `realpath` output always qualifies);
 - refuses kernels without `openat2(2)` (Linux 5.6+);
@@ -1021,7 +1022,7 @@ caller-provided option string.
 | Remote copy (destination side)                  | Hardened (Linux): directory tracker fd-map                                                                                                                                                                                                                                                                                                                |
 | Remote `--delete`                               | Not supported (rejected before operation)                                                                                                                                                                                                                                                                                                                 |
 | `--dereference` / `-L`                          | **Not hardened** (follows symlinks by design)                                                                                                                                                                                                                                                                                                             |
-| Non-Linux builds                                | **Not hardened** (path-based code, documented)                                                                                                                                                                                                                                                                                                            |
+| Unsupported non-Linux builds                    | **Unsupported** (no compatibility or hardening guarantees)                                                                                                                                                                                                                                                                                                |
 | `rcmp`                                          | Out of scope (read-only; no mis-permissioning possible)                                                                                                                                                                                                                                                                                                   |
 | POSIX ACLs                                      | Source ACLs preserved only with `--preserve-settings=all+acl`; `--require-toctou-safe` contains inherited *destination* ACLs but does not preserve the *source's* — pair the two (see [acls.md](acls.md))                                                                                                                                                 |
 | *Which* in-subtree file a swap makes us read    | Out of scope — reads are not inode-pinned; a same-directory regular-file swap can change which file is read, but cannot escape the subtree or widen permissions (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                                                                                                   |

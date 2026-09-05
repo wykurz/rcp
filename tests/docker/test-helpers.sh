@@ -260,7 +260,7 @@ start() { # $1 = resolved target
             fi
         done
         pending_hosts=()
-        # nounset in Bash 3.2 rejects a quoted whole-array expansion when it is empty.
+        # copy by index so an empty array remains safe under nounset.
         local pending_index
         for ((pending_index = 0; pending_index < ${#still_pending[@]}; pending_index++)); do
             pending_hosts+=("${still_pending[$pending_index]}")

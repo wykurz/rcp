@@ -4,33 +4,27 @@
 set -euo pipefail
 
 CARGO_BIN="${CARGO:-cargo}"
-RUSTC_BIN="${RUSTC:-rustc}"
 
 if [ -z "${CARGO_BUILD_TARGET:-}" ]; then
     HOST_SYSTEM="$(uname -s)"
-    if [ "$HOST_SYSTEM" = Linux ]; then
-        HOST_ARCHITECTURE="$(uname -m)"
-        case "$HOST_ARCHITECTURE" in
-            x86_64)
-                CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
-                ;;
-            aarch64)
-                CARGO_BUILD_TARGET=aarch64-unknown-linux-musl
-                ;;
-            *)
-                echo "unsupported Linux architecture: $HOST_ARCHITECTURE" >&2
-                exit 1
-                ;;
-        esac
-    else
-        RUSTC_VERSION="$("$RUSTC_BIN" -vV)"
-        RUSTC_HOST="$(sed -n 's/^host: //p' <<< "$RUSTC_VERSION")"
-        if [ -z "$RUSTC_HOST" ] || [[ "$RUSTC_HOST" == *$'\n'* ]]; then
-            echo "could not determine the host target from '$RUSTC_BIN -vV'" >&2
-            exit 1
-        fi
-        CARGO_BUILD_TARGET="$RUSTC_HOST"
+    if [ "$HOST_SYSTEM" != Linux ]; then
+        echo "unsupported operating system: $HOST_SYSTEM" >&2
+        exit 1
     fi
+
+    HOST_ARCHITECTURE="$(uname -m)"
+    case "$HOST_ARCHITECTURE" in
+        x86_64)
+            CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
+            ;;
+        aarch64)
+            CARGO_BUILD_TARGET=aarch64-unknown-linux-musl
+            ;;
+        *)
+            echo "unsupported Linux architecture: $HOST_ARCHITECTURE" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 export CARGO_BUILD_TARGET

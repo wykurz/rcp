@@ -595,7 +595,8 @@ different model, not a different encoding of this one.
 
 ## Non-goals
 
-- **Non-Linux platforms.** The whole fd-based hardened path is Linux-only, and so is this.
+- **Unsupported non-Linux platforms.** RCP supports Linux only; the whole fd-based hardened path,
+  including this ACL handling, is Linux-only.
 - **Other extended attributes.** Only `system.posix_acl_access` and `system.posix_acl_default` are
   read or written. There is no `-X`/`--xattrs` equivalent; the `+` preset grammar leaves room for
   one.

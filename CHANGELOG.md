@@ -11,7 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl
   target on supported Linux, and make Docker, Nix, CI, and release jobs select their x86_64 or
-  AArch64 targets explicitly. Explicit overrides and non-Linux host targets remain supported.
+  AArch64 targets explicitly. Supported builds and Nix outputs are Linux-only; musl remains the
+  primary target, with an additional x86_64 GNU/glibc build in CI.
 
 ## [0.40.0] - 2026-09-01
 

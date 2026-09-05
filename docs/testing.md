@@ -398,10 +398,9 @@ byte-for-byte match; a few CI steps live outside it:
   ```
 
 - **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`. On supported
-  Linux hosts, `just ci` selects the host architecture's musl target; on non-Linux it uses rustc's
-  host target. Raw Cargo's fixed x86_64-musl distribution default does not control these wrapped
-  commands. Docker payloads independently use `DOCKER_DEFAULT_PLATFORM` first, then the daemon
-  architecture.
+  x86_64 and AArch64 Linux hosts, `just ci` selects the host architecture's musl target. Raw Cargo's
+  fixed x86_64-musl distribution default does not control these wrapped commands. Docker payloads
+  independently use `DOCKER_DEFAULT_PLATFORM` first, then the daemon architecture.
 
 - **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including* chaos (the
   compose containers are privileged, so they actually run), whereas CI excludes chaos from its main
@@ -491,7 +490,7 @@ causing hangs before the copy starts.
 
 **Why Docker over alternatives?**
 
-- **vs. Network namespaces**: More portable, works on macOS/Windows
+- **vs. Network namespaces**: Keeps the required Linux network setup inside the test containers
 - **vs. VMs**: Faster startup, easier to manage, better CI integration
 - **vs. Mock transport**: More realistic, tests actual SSH/TCP stack
 
