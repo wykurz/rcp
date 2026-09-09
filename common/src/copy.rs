@@ -8,7 +8,7 @@ use throttle::get_file_iops_tokens;
 use tracing::instrument;
 
 use crate::config::DryRunMode;
-use crate::copy_data::copy_file_range_all;
+use crate::copy_data::copy_file_data;
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
@@ -104,6 +104,8 @@ pub struct DeleteSettings {
 
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Reflink policy for local file data copies.
+    pub reflink: crate::copy_data::ReflinkMode,
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
@@ -1627,7 +1629,7 @@ async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
 }
 
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
-/// copy the bytes with `copy_file_range_all`, then apply metadata through the destination's own
+/// copy the bytes with `copy_file_data`, then apply metadata through the destination's own
 /// fd — the open is held from creation through metadata, closing the path-based re-open TOCTOU
 /// window. `--overwrite`/`--ignore-existing`/`is_fresh`/dry-run semantics mirror the path-based
 /// [`copy_file`].
@@ -1857,6 +1859,7 @@ async fn copy_current_regular(
     };
     tracing::debug!("copying data");
     let len = src_meta.size();
+    let reflink = settings.reflink;
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
@@ -1874,7 +1877,7 @@ async fn copy_current_regular(
                 dst_file.as_fd().as_raw_fd(),
             )
         };
-        let copy_result = copy_file_range_all(&src_file, &dst_file, len);
+        let copy_result = copy_file_data(&src_file, &dst_file, len, reflink);
         #[cfg(test)]
         {
             Ok((copy_result, dst_file, gate_visit))
@@ -1895,7 +1898,7 @@ async fn copy_current_regular(
         .with_context(|| format!("failed copying data to {:?}", dst_path))
         .map_err(|err| Error::new(err, copy_summary))?;
     // account for the bytes ACTUALLY copied, not `len` (the size snapshotted at open): if the source
-    // is concurrently truncated, `copy_file_range_all` returns the shorter real count, so using `len`
+    // is concurrently truncated, `copy_file_data` returns the shorter real count, so using `len`
     // would over-report. `len` still drives the copy loop and the iops-token reservation above.
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(copied);
@@ -2602,6 +2605,7 @@ mod copy_tests {
 
     fn settings_with_delete(delete: Option<DeleteSettings>) -> Settings {
         Settings {
+            reflink: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: delete.is_some(), // --delete implies --overwrite
@@ -2964,6 +2968,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3015,6 +3020,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3097,6 +3103,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3167,6 +3174,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3217,6 +3225,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -3315,6 +3324,7 @@ mod copy_tests {
         cp_compare(
             &["-r"],
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3344,6 +3354,7 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p"],
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3373,6 +3384,7 @@ mod copy_tests {
         cp_compare(
             &["-r", "-L"],
             &Settings {
+                reflink: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -3402,6 +3414,7 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p", "-L"],
             &Settings {
+                reflink: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -3433,6 +3446,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3507,6 +3521,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -3593,6 +3608,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -3678,6 +3694,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -3766,6 +3783,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -3815,6 +3833,7 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3864,6 +3883,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -3935,6 +3955,7 @@ mod copy_tests {
             &src_dir,
             &test_path.join("dst_with_deref"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4008,6 +4029,7 @@ mod copy_tests {
             &dir_symlink,
             &test_path.join("copied_dir"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4074,6 +4096,7 @@ mod copy_tests {
             &symlink1,
             &test_path.join("copied_file1.txt"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4096,6 +4119,7 @@ mod copy_tests {
             &symlink2,
             &test_path.join("copied_file2.txt"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -4150,6 +4174,7 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
             &Settings {
+                reflink: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4209,6 +4234,7 @@ mod copy_tests {
                 &tmp_dir.join("does_not_exist.txt"),
                 &tmp_dir.join("dest.txt"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4254,6 +4280,7 @@ mod copy_tests {
                 &unreadable_dir,
                 &tmp_dir.join("dest"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -4305,6 +4332,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &readonly_parent.join("copy"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -4357,6 +4385,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: true,
@@ -4514,6 +4543,7 @@ mod copy_tests {
             &src_dir,
             &dst_dir,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4576,6 +4606,7 @@ mod copy_tests {
             &src_dir,
             &dst_dir,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4638,6 +4669,7 @@ mod copy_tests {
             &src_dir,
             &dst_dir,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: true,
                 overwrite: false,
@@ -4696,6 +4728,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4753,6 +4786,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4814,6 +4848,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4852,6 +4887,7 @@ mod copy_tests {
                 &test_path.join("foo/0.txt"), // single file source
                 &test_path.join("dst.txt"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4896,6 +4932,7 @@ mod copy_tests {
                 &test_path.join("excluded_dir"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5269,6 +5306,7 @@ mod copy_tests {
                 &test_path.join("excluded_link"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5317,6 +5355,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5376,6 +5415,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5436,6 +5476,7 @@ mod copy_tests {
                 &src_path,
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5502,6 +5543,7 @@ mod copy_tests {
                 &src_path,
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5565,6 +5607,7 @@ mod copy_tests {
                 &src_path,
                 &test_path.join("dst"),
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5628,6 +5671,7 @@ mod copy_tests {
                 &src_path,
                 &dst_path,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: true, // enable overwrite mode
@@ -5693,6 +5737,7 @@ mod copy_tests {
                 &test_path.join("foo"),
                 &dst_path,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5741,6 +5786,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5787,6 +5833,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5838,6 +5885,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5908,6 +5956,7 @@ mod copy_tests {
                 &src,
                 &sealed,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5963,6 +6012,7 @@ mod copy_tests {
                 &src_path,
                 &dst_path,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6013,6 +6063,7 @@ mod copy_tests {
                 &src_path,
                 &dst_path,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6454,6 +6505,7 @@ mod copy_tests {
                         &src,
                         &dst,
                         &Settings {
+                            reflink: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -6517,6 +6569,7 @@ mod copy_tests {
                         &src,
                         &dst,
                         &Settings {
+                            reflink: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -6593,6 +6646,7 @@ mod copy_tests {
                         &src,
                         &dst,
                         &Settings {
+                            reflink: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: true,
@@ -6646,6 +6700,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6689,6 +6744,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6728,6 +6784,7 @@ mod copy_tests {
                 &src,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6768,6 +6825,7 @@ mod copy_tests {
                 &src_socket,
                 &dst,
                 &Settings {
+                    reflink: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7015,6 +7073,7 @@ mod copy_tests {
             &src_file,
             &dst_file,
             &Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- exercises the overwrite removal path
@@ -7452,6 +7511,7 @@ mod copy_tests {
     /// `overwrite` is on so a fresh destination per iteration is never required to be empty.
     fn toctou_settings() -> Settings {
         Settings {
+            reflink: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: true,

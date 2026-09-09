@@ -2124,6 +2124,7 @@ mod teardown_tests {
     // handle_file_stream fails at the first recv here, so the settings values are immaterial.
     fn test_copy_settings() -> common::copy::Settings {
         common::copy::Settings {
+            reflink: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: false,
@@ -2356,6 +2357,7 @@ mod removal_tests {
 
     fn settings() -> common::copy::Settings {
         common::copy::Settings {
+            reflink: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: true,

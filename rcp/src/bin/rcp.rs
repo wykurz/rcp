@@ -40,6 +40,21 @@ struct Args {
     #[arg(short, long, help_heading = "Copy options")]
     overwrite: bool,
 
+    /// Control reflink-capable acceleration for local file copies
+    ///
+    /// In auto mode, use filesystem acceleration when available. In never mode, use sparse-aware
+    /// read/write copying, bypassing all copy_file_range acceleration (including
+    /// non-reflink kernel and server-side copying). Remote transfers already stream
+    /// bytes, so both values have the same effect there.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        value_name = "WHEN",
+        help_heading = "Copy options"
+    )]
+    reflink: common::copy_data::ReflinkMode,
+
     /// File attributes to compare when deciding if files are identical (used with --overwrite)
     ///
     /// Comma-separated list. Available: uid, gid, mode, size, mtime, ctime
@@ -1686,6 +1701,7 @@ async fn async_main(
         None
     };
     let settings = common::copy::Settings {
+        reflink: args.reflink,
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite || args.delete,
@@ -1695,7 +1711,7 @@ async fn async_main(
         ignore_existing: args.ignore_existing,
         chunk_size: args.chunk_size.0,
         skip_specials: args.skip_specials,
-        // for local copy, buffer size is not used (bypasses user-mode buffering)
+        // local copy buffers are managed by copy_data, independently of remote buffering
         remote_copy_buffer_size: 0,
         filter,
         dry_run: args.dry_run,

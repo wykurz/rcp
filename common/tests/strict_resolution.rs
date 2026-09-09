@@ -178,6 +178,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 fn overwrite_copy_settings() -> common::copy::Settings {
     common::copy::Settings {
+        reflink: Default::default(),
         dereference: false,
         fail_early: true,
         overwrite: true,

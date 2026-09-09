@@ -56,6 +56,7 @@
 //! let dst = Path::new("/destination");
 //!
 //! let settings = common::copy::Settings {
+//!     reflink: Default::default(),
 //!     dereference: false,
 //!     fail_early: false,
 //!     overwrite: false,

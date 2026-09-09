@@ -4,7 +4,7 @@
 //! open across the data copy and the subsequent metadata operations (closing
 //! the TOCTOU window between writing bytes and setting times/owner/mode).
 //!
-//! The copy uses a three-tier fallback chain, fastest first:
+//! With [`ReflinkMode::Auto`], the copy uses a three-tier fallback chain, fastest first:
 //! 1. the in-kernel `copy_file_range` syscall, which is reflink- and
 //!    server-side-copy capable (e.g. on Btrfs/XFS/NFSv4.2);
 //! 2. when the kernel or filesystem cannot satisfy that, a sparse-aware
@@ -15,6 +15,10 @@
 //!    `lseek` whences), a plain dense read/write copy loop, which always works
 //!    on any regular file (this mirrors what `std::fs::copy` would have done
 //!    and exists purely for robustness — it does not preserve holes).
+//!
+//! [`ReflinkMode::Never`] starts at tier 2, bypassing `copy_file_range` and all
+//! of its acceleration. It still preserves holes when the filesystem supports
+//! `SEEK_DATA`/`SEEK_HOLE`.
 //!
 //! # Snapshot-size semantics
 //!
@@ -51,6 +55,36 @@ const FALLBACK_BUF_SIZE: usize = 1024 * 1024;
 /// filesystems that can't do `SEEK_DATA`/`SEEK_HOLE`, not a throughput path.
 const DENSE_BUF_SIZE: usize = 128 * 1024;
 
+/// Whether local file copies may use reflink-capable acceleration.
+///
+/// A clone-required `always` mode is intentionally deferred until there is a
+/// concrete need for its additional guarantees and failure semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReflinkMode {
+    /// Allow filesystem acceleration, falling back to read/write copying.
+    #[default]
+    Auto,
+    /// Use sparse-aware read/write copying without reflink-capable acceleration.
+    Never,
+}
+
+/// Copy up to `len` bytes between held file descriptors with the chosen policy.
+///
+/// Both paths start at offset zero and return the logical number of bytes copied.
+/// `Never` bypasses all `copy_file_range` acceleration, including non-reflink
+/// kernel and server-side copying. See the module docs for size and durability semantics.
+pub fn copy_file_data(
+    src: &File,
+    dst: &File,
+    len: u64,
+    reflink: ReflinkMode,
+) -> std::io::Result<u64> {
+    match reflink {
+        ReflinkMode::Auto => copy_file_range_all(src, dst, len),
+        ReflinkMode::Never => copy_sparse_fallback(src, dst, 0, len),
+    }
+}
+
 /// Copy up to `len` bytes from `src` to `dst` using the in-kernel
 /// `copy_file_range` (reflink/server-side capable), falling back to a
 /// sparse-aware userspace copy when the kernel/filesystem can't. Both files are
@@ -70,6 +104,8 @@ pub fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<
         let remaining = usize::try_from(len - copied).unwrap_or(usize::MAX);
         // None offsets => the kernel uses and advances each fd's own offset,
         // so successive calls naturally continue where the last left off.
+        #[cfg(test)]
+        tests::COPY_FILE_RANGE_CALLS.with(|calls| calls.set(calls.get() + 1));
         match nix::fcntl::copy_file_range(src.as_fd(), None, dst.as_fd(), None, remaining) {
             Ok(0) => {
                 // EOF: the source is shorter than `len` (a shrink). Stop here
@@ -144,7 +180,7 @@ fn classify_seek_data(result: nix::Result<libc::off_t>) -> std::io::Result<Spars
 /// Sparse-aware userspace copy of the range `[start, len)` from `src` to `dst`,
 /// with a dense read/write copy as a final fallback.
 ///
-/// Used as the fallback when `copy_file_range` is unsupported. It first probes
+/// Used for `Never` and as the fallback when `copy_file_range` is unsupported. It first probes
 /// the source with `SEEK_DATA`; if the filesystem supports it, it walks the
 /// source's data regions with `SEEK_DATA`/`SEEK_HOLE` and copies only the data
 /// extents, so holes (e.g. in a sparse VM or Lustre image) are preserved
@@ -350,6 +386,12 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt;
 
+    thread_local! {
+        pub(super) static COPY_FILE_RANGE_CALLS: std::cell::Cell<usize> = const {
+            std::cell::Cell::new(0)
+        };
+    }
+
     fn make_file(dir: &std::path::Path, name: &str) -> File {
         std::fs::OpenOptions::new()
             .read(true)
@@ -375,6 +417,32 @@ mod tests {
     }
 
     #[test]
+    fn never_copies_without_copy_file_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let contents = b"a non-empty source with an unaligned size";
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(contents).unwrap();
+        for len in [0, 7, contents.len() as u64, contents.len() as u64 + 100] {
+            let dst = make_file(tmp.path(), "never");
+            let calls_before = COPY_FILE_RANGE_CALLS.get();
+            let copied = copy_file_data(&src, &dst, len, ReflinkMode::Never).unwrap();
+            let expected_len = len.min(contents.len() as u64);
+            assert_eq!(copied, expected_len);
+            assert_eq!(
+                std::fs::read(tmp.path().join("never")).unwrap(),
+                &contents[..expected_len as usize]
+            );
+            assert_eq!(COPY_FILE_RANGE_CALLS.get(), calls_before);
+        }
+        // prove that the counter observes an attempted syscall, even without reflink support.
+        let dst = make_file(tmp.path(), "auto");
+        let calls_before = COPY_FILE_RANGE_CALLS.get();
+        copy_file_data(&src, &dst, contents.len() as u64, ReflinkMode::Auto).unwrap();
+        assert!(COPY_FILE_RANGE_CALLS.get() > calls_before);
+        assert_eq!(std::fs::read(tmp.path().join("auto")).unwrap(), contents);
+    }
+
+    #[test]
     fn copies_large_file_fully() {
         let tmp = tempfile::tempdir().unwrap();
         let len: usize = 8 * 1024 * 1024;
@@ -394,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_fallback_preserves_holes() {
+    fn never_preserves_holes() {
         let tmp = tempfile::tempdir().unwrap();
         let logical: u64 = 8 * 1024 * 1024;
         let head = b"HEAD-region-bytes";
@@ -408,8 +476,8 @@ mod tests {
         src.write_at(tail, tail_off).unwrap();
         src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
-        // call the fallback directly rather than relying on triggering EXDEV.
-        let copied = copy_sparse_fallback(&src, &dst, 0, logical).unwrap();
+        // never must preserve holes without relying on copy_file_range support.
+        let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Never).unwrap();
         assert_eq!(copied, logical);
         // (a) content byte-equal to src across the whole logical range.
         let got = std::fs::read(tmp.path().join("dst")).unwrap();
@@ -547,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_all_hole_source() {
+    fn never_copies_all_hole_source() {
         // a pure-hole source: SEEK_DATA returns ENXIO immediately, so the loop
         // does no copies and only ftruncate sizes dst. dst must be all zeros,
         // sized to `len`, and sparse.
@@ -557,7 +625,7 @@ mod tests {
         nix::unistd::ftruncate(src.as_fd(), to_off_t(logical).unwrap()).unwrap();
         src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
-        let copied = copy_sparse_fallback(&src, &dst, 0, logical).unwrap();
+        let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Never).unwrap();
         assert_eq!(copied, logical);
         let got = std::fs::read(tmp.path().join("dst")).unwrap();
         assert_eq!(got.len() as u64, logical);

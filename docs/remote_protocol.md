@@ -537,6 +537,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 - **Connection model**: Connections are pooled and reused for multiple files. The `size` field
   delimits file boundaries within a connection. Destination reads headers in a loop until EOF.
 
+Remote file data is always streamed as bytes between `rcpd` processes. Consequently,
+`--reflink=auto` and `--reflink=never` have the same remote behavior, and the option adds no field
+or other change to the wire protocol.
+
 ### 2.5 Entry Metadata and POSIX ACLs
 
 Every message that describes an entry (`Directory`, `Symlink`, `File`, and each `ExistingEntry` in a

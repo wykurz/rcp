@@ -263,6 +263,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     };
     let settings = common::link::Settings {
         copy_settings: common::copy::Settings {
+            reflink: Default::default(),
             dereference: false, // currently not supported
             fail_early: args.fail_early,
             overwrite: args.overwrite || args.delete,

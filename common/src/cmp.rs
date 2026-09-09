@@ -860,6 +860,7 @@ mod cmp_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &copy::Settings {
+                reflink: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,

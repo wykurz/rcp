@@ -4229,6 +4229,7 @@ mod tests {
 
     fn dereference_settings() -> common::copy::Settings {
         common::copy::Settings {
+            reflink: Default::default(),
             dereference: true,
             fail_early: false,
             overwrite: false,
