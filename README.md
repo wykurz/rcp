@@ -305,6 +305,27 @@ destination MUST have a trailing slash (`/`):
 - `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be
   `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
 
+### Local copy acceleration (`--reflink`)
+
+`--reflink=auto|never` controls the local regular-file data path and defaults to `auto`. In `auto`
+mode, rcp first uses `copy_file_range`, allowing the kernel and filesystem to accelerate the copy
+with a reflink, another in-kernel copy, or an NFS server-side copy. If that operation is
+unsupported, rcp falls back automatically to its userspace read/write path.
+
+`--reflink=never` bypasses `copy_file_range` and goes directly to that userspace path. This is
+useful for benchmarks that must exclude all `copy_file_range` acceleration, including non-reflink
+kernel copies and NFS offload. The fallback preserves sparse regions by walking
+`SEEK_DATA`/`SEEK_HOLE` when the filesystem supports them, and otherwise performs a dense read/write
+copy. Thus `never` still may produce a sparse destination: the option controls the data path, not
+physical disk usage, and reported bytes are logical file bytes rather than allocated disk bytes.
+
+An `always` mode is intentionally deferred. There is no demonstrated use case for requiring a clone
+to succeed, and adding it now would introduce clone-specific failure semantics without a user need.
+It can be revisited when a concrete requirement exists.
+
+Remote transfers already stream file bytes between `rcpd` processes, so `auto` and `never` have the
+same effect for remote copies. The option does not change the remote wire protocol.
+
 ## Path handling (tilde `~` support)
 
 - Local paths: leading `~` or `~/...` expands to your local `$HOME`.

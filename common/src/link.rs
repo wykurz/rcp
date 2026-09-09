@@ -2618,6 +2618,7 @@ mod link_tests {
     fn common_settings(dereference: bool, overwrite: bool) -> Settings {
         Settings {
             copy_settings: CopySettings {
+                reflink: Default::default(),
                 dereference,
                 fail_early: false,
                 overwrite,
@@ -3630,6 +3631,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -3772,6 +3774,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -4734,6 +4737,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -4790,6 +4794,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -4846,6 +4851,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -4912,6 +4918,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -4980,6 +4987,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: copy::Settings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -5054,6 +5062,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: copy::Settings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -5125,6 +5134,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: copy::Settings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -5196,6 +5206,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: copy::Settings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: true, // enable overwrite mode
@@ -5747,6 +5758,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -5798,6 +5810,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,
@@ -5854,6 +5867,7 @@ mod link_tests {
                 &None,
                 &Settings {
                     copy_settings: CopySettings {
+                        reflink: Default::default(),
                         dereference: false,
                         fail_early: false,
                         overwrite: false,

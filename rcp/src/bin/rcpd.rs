@@ -310,6 +310,7 @@ impl Args {
         tcp_config: &remote::TcpConfig,
     ) -> anyhow::Result<common::copy::Settings> {
         Ok(common::copy::Settings {
+            reflink: Default::default(),
             dereference: self.dereference,
             fail_early: self.fail_early,
             overwrite: self.overwrite,
