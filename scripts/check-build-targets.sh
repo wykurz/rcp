@@ -733,12 +733,6 @@ for matrix_job_name in ("test", "docker-test"):
 test_job = jobs.get("test")
 if not isinstance(test_job, dict):
     reject("Depot test job is missing")
-if has_run_shell_default(workflow) or has_run_shell_default(test_job):
-    reject("Depot test Arm Nix smoke build must not inherit a custom shell")
-if "if" in test_job:
-    reject("Depot test job must not be conditional")
-if test_job.get("continue-on-error") not in (None, False):
-    reject("Depot test job must gate Arm Nix smoke failures")
 
 steps = test_job.get("steps")
 if not isinstance(steps, list):
@@ -825,17 +819,21 @@ for job_name in ("test", "test-release"):
     if not isinstance(steps, list):
         steps = []
     recipe = f"just {job_name}"
-    shard_steps = [
+    just_steps = [
         step for step in steps
-        if isinstance(step, dict) and recipe in str(step.get("run", ""))
+        if isinstance(step, dict)
+        and any(
+            re.match(r"just(?:\s|$)", line.lstrip())
+            for line in str(step.get("run", "")).splitlines()
+        )
     ]
     expected_commands = [
         f"{recipe} --no-run",
-        recipe + " --partition count:${{ matrix.shard }}/2",
+        recipe + " --partition count:${{ matrix.shard }}/" + str(len(shards)),
     ]
-    if [str(step["run"]).strip() for step in shard_steps] != expected_commands:
+    if [str(step["run"]).strip() for step in just_steps] != expected_commands:
         reject(f"Depot {job_name} must build then run exactly its assigned count shard")
-    for step in shard_steps:
+    for step in just_steps:
         if "if" in step or step.get("continue-on-error") not in (None, False):
             reject(f"Depot {job_name} shard commands must run unconditionally and gate failures")
         if "shell" in step:

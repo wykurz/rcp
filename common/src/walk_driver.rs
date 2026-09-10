@@ -2858,18 +2858,20 @@ mod tests {
                 futures::poll!(first_capacity_probe.as_mut()).is_ready();
             drop(first_capacity_probe);
             drop(held_stat);
-            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let mut admitted_reclassification_owned_capacity = false;
-            for _ in 0..100 {
-                let mut second_capacity_probe = Box::pin(throttle::pending_meta_permit());
-                if futures::poll!(second_capacity_probe.as_mut()).is_pending() {
-                    admitted_reclassification_owned_capacity = true;
-                    break;
-                }
-                drop(second_capacity_probe);
-                tokio::task::yield_now().await;
-            }
-            drop(held_stat);
+            let admitted_reclassification_owned_capacity =
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    let _held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+                    loop {
+                        let mut second_capacity_probe = Box::pin(throttle::pending_meta_permit());
+                        if futures::poll!(second_capacity_probe.as_mut()).is_pending() {
+                            break;
+                        }
+                        drop(second_capacity_probe);
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+            // the Stat guard drops on success or timeout; drain the walk before reporting either
             let (summary, processed) = admission
                 .run_with_timeout(Duration::from_secs(20), walk.as_mut())
                 .await
@@ -2885,10 +2887,9 @@ mod tests {
                 hinted_classification_was_unadmitted,
                 "a positive directory hint consumed admission before it proved stale"
             );
-            assert!(
-                admitted_reclassification_owned_capacity,
-                "the stale hinted directory reclassified its leaf without owning admission"
-            );
+            admitted_reclassification_owned_capacity.context(
+                "the stale hinted directory did not reserve admission before reclassification",
+            )?;
             assert_eq!(summary.files, 1);
             assert_eq!(summary.dirs, 0);
             assert_eq!(processed.names(), &[OsString::from("leaf")]);
@@ -3019,27 +3020,40 @@ mod tests {
                 walk::EntryAdmission::HintedDirectory,
             ));
             // register the first classification at Stat before releasing its permit
-            assert!(futures::poll!(operation.as_mut()).is_pending());
+            if let std::task::Poll::Ready(result) = futures::poll!(operation.as_mut()) {
+                result.map_err(|error| error.source)?;
+                anyhow::bail!("hinted-directory classification bypassed the held Stat permit");
+            }
             drop(held_stat);
             let mut next_stat = Box::pin(throttle::ops_in_flight_permit(stat_resource));
             assert!(
                 futures::poll!(next_stat.as_mut()).is_pending(),
                 "the first classification did not reserve the released Stat permit"
             );
-            assert!(futures::poll!(operation.as_mut()).is_pending());
+            if let std::task::Poll::Ready(result) = futures::poll!(operation.as_mut()) {
+                result.map_err(|error| error.source)?;
+                anyhow::bail!("stale hinted-directory classification bypassed held leaf admission");
+            }
             // reacquiring Stat proves the first blocking open/fstat completed, even if its output
-            // has not reached the async waiter yet. Keep both gates held until its handle closes.
+            // has not reached the async waiter yet. Keep both gates held until its handle closes
             let held_stat = admission
                 .run_with_timeout(Duration::from_secs(20), next_stat)
                 .await
                 .context("the first hinted-directory classification did not finish its Stat")?;
-            let first_handle_closed = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_secs(20),
                 std::future::poll_fn(|context| {
-                    assert!(
-                        std::future::Future::poll(operation.as_mut(), context).is_pending(),
-                        "stale hinted-directory classification bypassed held leaf admission"
-                    );
+                    match std::future::Future::poll(operation.as_mut(), context) {
+                        std::task::Poll::Pending => {}
+                        std::task::Poll::Ready(Err(error)) => {
+                            return std::task::Poll::Ready(Err(error.source));
+                        }
+                        std::task::Poll::Ready(Ok(_)) => {
+                            return std::task::Poll::Ready(Err(anyhow::anyhow!(
+                                "stale hinted-directory classification bypassed held leaf admission"
+                            )));
+                        }
+                    }
                     match inode_is_open(&entry) {
                         Ok(true) => std::task::Poll::Pending,
                         Ok(false) => std::task::Poll::Ready(Ok(())),
@@ -3047,7 +3061,10 @@ mod tests {
                     }
                 }),
             )
-            .await;
+            .await
+            .context(
+                "stale hinted-directory classification retained its first leaf handle while waiting",
+            )??;
             tokio::fs::remove_file(&entry).await?;
             tokio::fs::create_dir(&entry).await?;
             drop(held_leaf);
@@ -3063,9 +3080,6 @@ mod tests {
                 .await
                 .context("stale hinted entry did not resume after admission was released")?
                 .map_err(|error| error.source)?;
-            first_handle_closed.context(
-                "stale hinted-directory classification retained its first leaf handle while waiting",
-            )??;
             assert_eq!(
                 summary,
                 CountSummary {

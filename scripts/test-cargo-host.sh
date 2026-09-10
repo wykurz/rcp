@@ -53,7 +53,12 @@ cat > "$BIN_DIR/cargo" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
 
-printf '%s|%s\n' "${CARGO_BUILD_TARGET-UNSET}" "$*" >> "$CARGO_CALLS"
+if [ "${FAKE_CARGO_QUOTE_ARGS:-}" = 1 ]; then
+    quoted_arguments=$(printf ' %q' "$@")
+    printf '%s|%s\n' "${CARGO_BUILD_TARGET-UNSET}" "${quoted_arguments:1}" >> "$CARGO_CALLS"
+else
+    printf '%s|%s\n' "${CARGO_BUILD_TARGET-UNSET}" "$*" >> "$CARGO_CALLS"
+fi
 if [ "${FAKE_CARGO_APPEND_EXTRA_CALL:-}" = 1 ]; then
     printf '%s|%s\n' "${CARGO_BUILD_TARGET-UNSET}" 'unexpected dynamic build' >> "$CARGO_CALLS"
 fi
@@ -327,9 +332,17 @@ run_wrapper() { # $1 = system, $2 = machine, $3 = expected target, $4 = explicit
     assert_call "$expected_target" 'nextest run --profile host-test'
 }
 
-run_just_recipe() { # $1 = recipe, $2... = expected Cargo arguments
+run_just_recipe() { # recipe, expected shell-escaped Cargo calls, optional -- and recipe arguments
     local recipe="$1"
     shift
+    local expected_arguments_list=()
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+        expected_arguments_list+=("$1")
+        shift
+    done
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
     local output expected_arguments
     local expected_calls="$TEMP_DIR/expected-cargo-calls"
     : > "$CALLS"
@@ -337,16 +350,17 @@ run_just_recipe() { # $1 = recipe, $2... = expected Cargo arguments
         "PATH=$BIN_DIR:$PATH" \
         "CARGO=$BIN_DIR/cargo" \
         "CARGO_CALLS=$CALLS" \
+        FAKE_CARGO_QUOTE_ARGS=1 \
         FAKE_UNAME_SYSTEM=Linux \
         FAKE_UNAME_MACHINE=x86_64 \
         FAKE_RUSTC_HOST=x86_64-unknown-linux-gnu \
         CARGO_HOST_TEST_INTEGRATION=1 \
-        just "$recipe" 2>&1); then
+        just "$recipe" "$@" 2>&1); then
         echo "just $recipe failed: $output" >&2
         return 1
     fi
     : > "$expected_calls"
-    for expected_arguments in "$@"; do
+    for expected_arguments in "${expected_arguments_list[@]}"; do
         printf '%s|%s\n' x86_64-unknown-linux-musl "$expected_arguments" \
             >> "$expected_calls"
     done
@@ -733,6 +747,13 @@ check_just_recipe build-release 'build --workspace --release'
 check_just_recipe doc 'doc --no-deps --workspace'
 check_just_recipe test 'nextest run'
 check_just_recipe test-release 'nextest run --release'
+# shard selection and spaced filters must reach Cargo as separate, intact arguments.
+check_just_recipe test \
+    'nextest run --partition count:1/2 -E test\(alpha\)\ \|\ test\(beta\)' \
+    -- --partition count:1/2 -E 'test(alpha) | test(beta)'
+check_just_recipe test-release \
+    'nextest run --release --partition count:2/2 -E test\(alpha\)\ \|\ test\(beta\)' \
+    -- --partition count:2/2 -E 'test(alpha) | test(beta)'
 check_just_recipe doctest 'test --doc'
 check_just_recipe doctest-release 'test --doc --release'
 assert_nix_realization_recipe_boundaries

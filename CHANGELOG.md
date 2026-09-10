@@ -16,6 +16,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Let `just test` and `just test-release` forward arguments to nextest. Split each Depot native test
+  configuration across two shards, with the native Arm ABI smoke check on the first Arm shard.
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl
   target on supported Linux, and make Docker, Nix, CI, and release jobs select their x86_64 or
   AArch64 targets explicitly. Supported builds and Nix outputs are Linux-only; musl remains the

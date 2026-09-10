@@ -725,16 +725,6 @@ sed -i '/  test:/,/  doctest:/{
 }' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test Arm Nix smoke must have exactly one Nix installer step' "$fixture"
 
-fixture=$(mutated_fixture depot-test-job-conditionally-skipped)
-sed -i '/  test:/a\
-    if: ${{ false }}' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test job must not be conditional' "$fixture"
-
-fixture=$(mutated_fixture depot-test-job-continues-on-error)
-sed -i '/  test:/a\
-    continue-on-error: true' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test job must gate Arm Nix smoke failures' "$fixture"
-
 fixture=$(mutated_fixture depot-test-arm-nix-installer-alternate-sha)
 sed -i 's/ef8a148080ab6020fd15196c2084a2eea5ff2d25/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' \
     "$fixture/.depot/workflows/ci.yml"
@@ -798,19 +788,12 @@ sed -i '/run: nix build --no-update-lock-file .*package-abi-smoke/a\
       shell: bash -c true {0}' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test Arm Nix smoke build must not override its shell' "$fixture"
 
-fixture=$(mutated_fixture depot-test-arm-nix-smoke-inherits-job-shell)
-sed -i '/  test:/a\
-    defaults:\
-      run:\
-        shell: true {0}' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test Arm Nix smoke build must not inherit a custom shell' "$fixture"
-
 fixture=$(mutated_fixture depot-test-arm-nix-smoke-inherits-workflow-shell)
 sed -i '/^jobs:/i\
 defaults:\
   run:\
     shell: true {0}' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test Arm Nix smoke build must not inherit a custom shell' "$fixture"
+expect_failure 'Depot test shard commands must not inherit a custom shell' "$fixture"
 
 fixture=$(mutated_fixture depot-test-arm-nix-smoke-duplicates-shell)
 sed -i '/run: nix build --no-update-lock-file .*package-abi-smoke/a\
@@ -843,12 +826,37 @@ sed -i '/  doctest:/i\
       run: ./scripts/test-nix-targets.sh' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test must not run the full Nix target suite' "$fixture"
 
+fixture=$(mutated_fixture depot-release-shard-also-runs-debug-tests)
+sed -i '/  test-release:/,/  doctest-release:/{/run: just test-release --partition/a\
+    - run: |\
+        # also run debug tests\
+        just test --partition count:${{ matrix.shard }}/2
+}' "$fixture/.depot/workflows/ci.yml"
+expect_failure 'Depot test-release must build then run exactly its assigned count shard' "$fixture"
+
 for job in test test-release; do
     if [ "$job" = test ]; then
         next_job=doctest
     else
         next_job=doctest-release
     fi
+
+    fixture=$(mutated_fixture "depot-$job-conditionally-skipped")
+    sed -i "/^  $job:/a\\
+    if: \${{ false }}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job job must not be conditional" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-continues-on-error")
+    sed -i "/^  $job:/a\\
+    continue-on-error: true" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job job must gate shard failures" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-inherits-shell-discarding-shards")
+    sed -i "/^  $job:/a\\
+    defaults:\\
+      run:\\
+        shell: true {0}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shard commands must not inherit a custom shell" "$fixture"
 
     for shards in absent '[1]' '[1, 1]' '[1, 2, 3]' '[true, 2]'; do
         fixture=$(mutated_fixture "depot-$job-shards-$shards")
@@ -931,23 +939,6 @@ for job in test test-release; do
 }" "$fixture/.depot/workflows/ci.yml"
     expect_failure "Depot $job shard commands must not override their shell" "$fixture"
 done
-
-fixture=$(mutated_fixture depot-test-release-job-conditionally-skipped)
-sed -i '/  test-release:/a\
-    if: ${{ false }}' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test-release job must not be conditional' "$fixture"
-
-fixture=$(mutated_fixture depot-test-release-job-continues-on-error)
-sed -i '/  test-release:/a\
-    continue-on-error: true' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test-release job must gate shard failures' "$fixture"
-
-fixture=$(mutated_fixture depot-test-release-inherits-shell-discarding-shards)
-sed -i '/  test-release:/a\
-    defaults:\
-      run:\
-        shell: true {0}' "$fixture/.depot/workflows/ci.yml"
-expect_failure 'Depot test-release shard commands must not inherit a custom shell' "$fixture"
 
 fixture=$(mutated_fixture depot-test-excludes-arm-runner)
 sed -i '0,/        - depot-ubuntu-24.04-arm-16/{
