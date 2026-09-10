@@ -37,6 +37,9 @@
 //!   on reflink/sparse-capable filesystems (e.g. Btrfs/XFS) — on others (e.g.
 //!   ext4) the size is still `len` but the region may be fully allocated.
 //!
+//! These size bounds do not provide a consistent content snapshot of a source
+//! that is modified during the copy.
+//!
 //! # Durability
 //!
 //! These are synchronous syscalls, so once they return the writes are in the
@@ -47,10 +50,10 @@ use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 
-/// sparse-aware userspace fallback copy buffer size (1 MiB).
+/// Sparse-aware userspace fallback copy buffer size (1 MiB).
 const FALLBACK_BUF_SIZE: usize = 1024 * 1024;
 
-/// dense read/write fallback copy buffer size (128 KiB). Smaller than the
+/// Dense read/write fallback copy buffer size (128 KiB). Smaller than the
 /// sparse buffer because this path is the last-resort robustness fallback for
 /// filesystems that can't do `SEEK_DATA`/`SEEK_HOLE`, not a throughput path.
 const DENSE_BUF_SIZE: usize = 128 * 1024;
@@ -71,6 +74,7 @@ pub enum ReflinkMode {
 /// Copy up to `len` bytes between held file descriptors with the chosen policy.
 ///
 /// Both paths start at offset zero and return the logical number of bytes copied.
+/// The destination must be empty and exclusively owned by this copy operation.
 /// `Never` bypasses all `copy_file_range` acceleration, including non-reflink
 /// kernel and server-side copying. See the module docs for size and durability semantics.
 pub fn copy_file_data(
@@ -89,6 +93,9 @@ pub fn copy_file_data(
 /// `copy_file_range` (reflink/server-side capable), falling back to a
 /// sparse-aware userspace copy when the kernel/filesystem can't. Both files are
 /// already open; offsets start at `0`. Returns the number of bytes copied.
+/// The destination must be empty and exclusively owned by this copy operation.
+/// Uses [`ReflinkMode::Auto`]; use [`copy_file_data`]
+/// to select a policy.
 ///
 /// See the module docs for snapshot-size and durability semantics.
 pub fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64> {
@@ -105,7 +112,7 @@ pub fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<
         // None offsets => the kernel uses and advances each fd's own offset,
         // so successive calls naturally continue where the last left off.
         #[cfg(test)]
-        tests::COPY_FILE_RANGE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        crate::testutils::record_copy_file_range_call();
         match nix::fcntl::copy_file_range(src.as_fd(), None, dst.as_fd(), None, remaining) {
             Ok(0) => {
                 // EOF: the source is shorter than `len` (a shrink). Stop here
@@ -147,7 +154,7 @@ enum SparseProbe {
     /// `SEEK_DATA` returned `ENXIO`: no data at or after the probe offset, i.e.
     /// the rest of the file up to its logical end is a hole.
     TrailingHole,
-    /// the filesystem does not support `SEEK_DATA`/`SEEK_HOLE` (`EINVAL` or
+    /// The filesystem does not support `SEEK_DATA`/`SEEK_HOLE` (`EINVAL` or
     /// `ENOTSUP`/`EOPNOTSUPP`): the caller must fall back to a dense copy.
     Unsupported,
 }
@@ -186,14 +193,14 @@ fn classify_seek_data(result: nix::Result<libc::off_t>) -> std::io::Result<Spars
 /// extents, so holes (e.g. in a sparse VM or Lustre image) are preserved
 /// instead of being expanded to fully-allocated zeros. If the filesystem does
 /// not support those whences (some FUSE/older/unusual filesystems return
-/// `EINVAL`/`ENOTSUP`), it degrades to [`dense_copy`], a plain read/write loop
+/// `EINVAL`/`ENOTSUP`), it degrades to a plain read/write loop
 /// that always works on a regular file (this matches what `std::fs::copy` would
 /// have done — see the module docs). A genuine I/O error during the probe (e.g.
 /// `EIO`) is propagated rather than masked as "unsupported".
 ///
 /// The final size is reconciled with the source's *actual* end so this path
 /// agrees with the primary one on a shrunk source: after the data loop it
-/// computes `final = min(len, actual_eof)` and `ftruncate`s `dst` to `final`.
+/// computes `final = min(len, actual_eof)` and sizes `dst` to `final` if needed.
 /// A legitimate trailing hole (source logical size still == `len`) leaves
 /// `actual_eof == len`, so `dst` ends at `len` with the trailing region
 /// unallocated; a source that shrank below `len` (`actual_eof < len`) sizes
@@ -201,155 +208,125 @@ fn classify_seek_data(result: nix::Result<libc::off_t>) -> std::io::Result<Spars
 ///
 /// Returns `final - start`, i.e. the number of bytes of the logical copy that
 /// the source actually provided — matching the primary path's return.
+/// The destination must contain only the already-copied prefix `[0, start)`
+/// and remain exclusively owned by this copy operation. `start` must not exceed `len`.
 pub(crate) fn copy_sparse_fallback(
     src: &File,
     dst: &File,
     start: u64,
     len: u64,
 ) -> std::io::Result<u64> {
+    copy_sparse_fallback_with_seek(src, dst, start, len, |offset, whence| {
+        nix::unistd::lseek(src.as_fd(), offset, whence)
+    })
+}
+
+fn copy_sparse_fallback_with_seek(
+    src: &File,
+    dst: &File,
+    start: u64,
+    len: u64,
+    mut seek: impl FnMut(libc::off_t, nix::unistd::Whence) -> nix::Result<libc::off_t>,
+) -> std::io::Result<u64> {
     if start >= len {
-        // only reachable with `start == len`: the primary path copied the whole
-        // logical range before erroring, so the source was at least `len` and
-        // there is nothing left to copy. `min(len, actual_eof) == len` here, so
-        // sizing `dst` to `len` is correct and can't drop already-copied bytes.
-        nix::unistd::ftruncate(dst.as_fd(), to_off_t(len)?).map_err(std::io::Error::from)?;
+        // the destination already contains the prefix; an empty source needs no work.
         return Ok(0);
     }
-    // probe the source for sparse support before committing to the sparse walk.
-    // if the filesystem can't do SEEK_DATA/SEEK_HOLE, fall back to a dense copy
-    // of the whole range; a genuine I/O error propagates from classify_seek_data.
-    let probe = classify_seek_data(nix::unistd::lseek(
-        src.as_fd(),
-        to_off_t(start)?,
-        nix::unistd::Whence::SeekData,
-    ))?;
-    let first_data = match probe {
-        SparseProbe::Unsupported => return dense_copy(src, dst, start, len),
-        // no data at all before EOF: nothing to copy, the trailing ftruncate
-        // below sizes dst (a fully-hole range).
-        SparseProbe::TrailingHole => len,
-        SparseProbe::Data(d) => d,
-    };
-    // the data loop reads/writes at explicit offsets via read_at/write_at, so we
-    // don't pre-seek the fds here; the scan starts from the probed first data
-    // offset and re-runs SEEK_DATA for subsequent regions.
-    let mut buf = vec![0u8; FALLBACK_BUF_SIZE];
     let mut off = start;
-    let mut next_data = first_data;
+    let mut written_end = start;
+    let mut buf = Vec::new();
     while off < len {
-        // `next_data` holds the next data region at or after `off` (seeded by the
-        // initial probe, then refreshed by SEEK_DATA at the bottom of the loop).
-        let data = next_data;
-        if data >= len {
-            break;
-        }
-        // find the hole that ends this data region; clamp to `len`.
-        let hole =
-            match nix::unistd::lseek(src.as_fd(), to_off_t(data)?, nix::unistd::Whence::SeekHole) {
-                Ok(h) => (h as u64).min(len),
-                // a data region with no following hole means data extends to EOF;
-                // clamp to `len`.
-                Err(nix::errno::Errno::ENXIO) => len,
-                Err(errno) => return Err(std::io::Error::from(errno)),
-            };
-        copy_data_extent(src, dst, data, hole, &mut buf)?;
-        off = hole;
-        if off >= len {
-            break;
-        }
-        // find the next data region for the following iteration. the filesystem
-        // already proved it supports SEEK_DATA on the initial probe, so an
-        // Unsupported result here would be anomalous; handle it defensively by
-        // dense-copying the remaining range (dense_copy reconciles dst's final
-        // size for the whole file, so the already-copied prefix is preserved).
-        next_data = match classify_seek_data(nix::unistd::lseek(
-            src.as_fd(),
-            to_off_t(off)?,
-            nix::unistd::Whence::SeekData,
-        ))? {
-            SparseProbe::Data(d) => d,
-            SparseProbe::TrailingHole => break, // no more data -> trailing hole
-            SparseProbe::Unsupported => return dense_copy(src, dst, off, len),
+        let (extent, buffer_limit) = match next_copy_extent(&mut seek, off, len)? {
+            CopyExtent::Sparse(extent) => (extent, FALLBACK_BUF_SIZE),
+            CopyExtent::Dense => (off..len, DENSE_BUF_SIZE),
+            CopyExtent::End => break,
         };
+        // allocate only for data, cap small extents, and reuse the buffer across the walk.
+        let capacity = (extent.end - extent.start).min(buffer_limit as u64) as usize;
+        if buf.len() < capacity {
+            buf.resize(capacity, 0);
+        }
+        let end = copy_data_extent(src, dst, extent.start, extent.end, &mut buf[..capacity])?;
+        if end > extent.start {
+            written_end = end;
+        }
+        if end < extent.end {
+            break; // the source shrank during the read loop.
+        }
+        off = extent.end;
     }
-    // reconcile the final size with the source's actual end so we agree with the
-    // primary path on a shrunk source. `min(len, actual_eof)`: a legitimate
-    // trailing hole keeps `actual_eof == len` (dst ends at `len`, trailing region
-    // unallocated); a source that shrank below `len` sizes dst to `actual_eof`
-    // rather than padding a spurious hole up to `len`.
-    let actual_eof = nix::unistd::lseek(src.as_fd(), 0, nix::unistd::Whence::SeekEnd)
-        .map_err(std::io::Error::from)? as u64;
+    // keep the post-loop EOF observation: a source can shrink even after the last write.
+    let actual_eof = seek(0, nix::unistd::Whence::SeekEnd).map_err(std::io::Error::from)? as u64;
     let final_size = len.min(actual_eof);
-    nix::unistd::ftruncate(dst.as_fd(), to_off_t(final_size)?).map_err(std::io::Error::from)?;
-    // saturating: if the source shrank below `start` between the primary copy
-    // and this check, the fallback added no bytes (final < start).
+    if written_end != final_size {
+        // extend trailing holes or remove bytes beyond a concurrently shortened source.
+        nix::unistd::ftruncate(dst.as_fd(), to_off_t(final_size)?).map_err(std::io::Error::from)?;
+    }
+    // the same finalizer accounts for the entire walk, including any dense remainder.
     Ok(final_size.saturating_sub(start))
 }
 
-/// Copy the data extent `[from, to)` from `src` to `dst` at the same offsets
-/// using explicit positioned reads/writes, handling short reads and writes.
+enum CopyExtent {
+    Sparse(std::ops::Range<u64>),
+    Dense,
+    End,
+}
+
+/// Find the next extent, degrading to a dense remainder if sparse probes cannot advance.
+fn next_copy_extent(
+    seek: &mut impl FnMut(libc::off_t, nix::unistd::Whence) -> nix::Result<libc::off_t>,
+    off: u64,
+    len: u64,
+) -> std::io::Result<CopyExtent> {
+    let data = match classify_seek_data(seek(to_off_t(off)?, nix::unistd::Whence::SeekData))? {
+        SparseProbe::Data(data) => data,
+        SparseProbe::TrailingHole => return Ok(CopyExtent::End),
+        SparseProbe::Unsupported => return Ok(CopyExtent::Dense),
+    };
+    if data < off {
+        return Ok(CopyExtent::Dense);
+    }
+    if data >= len {
+        return Ok(CopyExtent::End);
+    }
+    let hole = match seek(to_off_t(data)?, nix::unistd::Whence::SeekHole) {
+        Ok(hole) => (hole as u64).min(len),
+        Err(nix::errno::Errno::ENXIO) => len,
+        Err(nix::errno::Errno::EINVAL | nix::errno::Errno::EOPNOTSUPP) => {
+            return Ok(CopyExtent::Dense);
+        }
+        Err(errno) => return Err(std::io::Error::from(errno)),
+    };
+    if hole <= data {
+        // concurrent hole punching can invalidate the preceding SEEK_DATA result.
+        // copying the remainder densely also bounds progress on anomalous filesystems.
+        return Ok(CopyExtent::Dense);
+    }
+    Ok(CopyExtent::Sparse(data..hole))
+}
+
+/// Copy an extent with positioned I/O, retrying interruptions and handling short transfers.
+/// Returns the offset reached, which can be below `to` if the source shrank.
 fn copy_data_extent(
-    src: &File,
-    dst: &File,
+    src: &impl FileExt,
+    dst: &impl FileExt,
     from: u64,
     to: u64,
     buf: &mut [u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let mut pos = from;
     while pos < to {
-        let want = usize::try_from((to - pos).min(buf.len() as u64)).unwrap_or(buf.len());
-        let n = src.read_at(&mut buf[..want], pos)?;
-        if n == 0 {
-            // source ended earlier than SEEK_HOLE implied (e.g. a concurrent
-            // shrink) -> stop; the trailing ftruncate will fix up the size.
-            break;
-        }
-        let mut written = 0;
-        while written < n {
-            let w = dst.write_at(&buf[written..n], pos + written as u64)?;
-            if w == 0 {
-                // a zero-length write on a non-empty buffer would spin forever.
-                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-            }
-            written += w;
-        }
-        pos += n as u64;
-    }
-    Ok(())
-}
-
-/// Dense read/write copy of the range `[start, len)` from `src` to `dst`, the
-/// final robustness fallback for filesystems that don't support
-/// `SEEK_DATA`/`SEEK_HOLE`.
-///
-/// Reads fixed-size buffers from `src` and writes them to `dst` at the same
-/// offsets until the source ends or `len` is reached, retrying on `EINTR` and
-/// handling short reads/writes. Unlike the sparse path it does not preserve
-/// holes — it reads zeros out of a hole and writes them — but it always works
-/// on any regular file (this matches what `std::fs::copy` would have done).
-///
-/// Size reconciliation matches [`copy_sparse_fallback`]: it `ftruncate`s `dst`
-/// to `min(len, actual_eof)` so a source that shrank below `len` sizes `dst` to
-/// its real end (no spurious trailing padding), and a source at least `len`
-/// long sizes `dst` to exactly `len`. Returns `final - start`, the number of
-/// bytes of the logical copy the source actually provided.
-fn dense_copy(src: &File, dst: &File, start: u64, len: u64) -> std::io::Result<u64> {
-    let mut buf = vec![0u8; DENSE_BUF_SIZE];
-    let mut pos = start;
-    while pos < len {
-        let want = usize::try_from((len - pos).min(buf.len() as u64)).unwrap_or(buf.len());
+        let want = (to - pos).min(buf.len() as u64) as usize;
         let n = match src.read_at(&mut buf[..want], pos) {
-            Ok(0) => break, // EOF: source is shorter than `len` (a shrink).
+            Ok(0) => break,
             Ok(n) => n,
-            // a signal interrupted the read before any bytes moved: retry.
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         };
         let mut written = 0;
         while written < n {
             match dst.write_at(&buf[written..n], pos + written as u64) {
-                // a zero-length write on a non-empty buffer would spin forever.
-                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                 Ok(w) => written += w,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
@@ -357,19 +334,10 @@ fn dense_copy(src: &File, dst: &File, start: u64, len: u64) -> std::io::Result<u
         }
         pos += n as u64;
     }
-    // reconcile the final size with the source's actual end, matching the sparse
-    // path: `min(len, actual_eof)` sizes dst to the real source end on a shrink
-    // and to exactly `len` otherwise. this also fixes up the size when the loop
-    // stopped early on an EOF that the read loop detected before reaching `len`.
-    let actual_eof = nix::unistd::lseek(src.as_fd(), 0, nix::unistd::Whence::SeekEnd)
-        .map_err(std::io::Error::from)? as u64;
-    let final_size = len.min(actual_eof);
-    nix::unistd::ftruncate(dst.as_fd(), to_off_t(final_size)?).map_err(std::io::Error::from)?;
-    // saturating: if the source shrank below `start`, no bytes were added.
-    Ok(final_size.saturating_sub(start))
+    Ok(pos)
 }
 
-/// convert a `u64` byte offset/length to the libc `off_t` expected by nix's
+/// Convert a `u64` byte offset/length to the libc `off_t` expected by nix's
 /// lseek/ftruncate, mapping overflow to an io error rather than panicking.
 fn to_off_t(value: u64) -> std::io::Result<libc::off_t> {
     libc::off_t::try_from(value).map_err(|_| {
@@ -386,10 +354,13 @@ mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt;
 
-    thread_local! {
-        pub(super) static COPY_FILE_RANGE_CALLS: std::cell::Cell<usize> = const {
-            std::cell::Cell::new(0)
-        };
+    fn dense_copy(src: &File, dst: &File, start: u64, len: u64) -> std::io::Result<u64> {
+        copy_sparse_fallback_with_seek(src, dst, start, len, |offset, whence| match whence {
+            nix::unistd::Whence::SeekData | nix::unistd::Whence::SeekHole => {
+                Err(nix::errno::Errno::EOPNOTSUPP)
+            }
+            _ => nix::unistd::lseek(src.as_fd(), offset, whence),
+        })
     }
 
     fn make_file(dir: &std::path::Path, name: &str) -> File {
@@ -400,6 +371,131 @@ mod tests {
             .truncate(true)
             .open(dir.join(name))
             .expect("open temp file")
+    }
+
+    fn copies_with_seek_results(
+        start: u64,
+        probes: &[(nix::unistd::Whence, libc::off_t, nix::Result<libc::off_t>)],
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let contents = b"0123456789abcdef";
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(contents).unwrap();
+        let mut dst = make_file(tmp.path(), "dst");
+        dst.write_all(&contents[..start as usize]).unwrap();
+        let mut probes = probes.iter();
+        let copied = copy_sparse_fallback_with_seek(
+            &src,
+            &dst,
+            start,
+            contents.len() as u64,
+            |offset, whence| {
+                if matches!(whence, nix::unistd::Whence::SeekEnd) {
+                    return nix::unistd::lseek(src.as_fd(), offset, whence);
+                }
+                // exhausting the script fails promptly if the walker loops instead of degrading.
+                let &(expected_whence, expected_offset, result) = probes.next().unwrap();
+                assert_eq!(
+                    (whence as i32, offset),
+                    (expected_whence as i32, expected_offset)
+                );
+                result
+            },
+        )
+        .unwrap();
+        assert!(probes.next().is_none());
+        assert_eq!(copied, contents.len() as u64 - start);
+        assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+    }
+
+    #[test]
+    fn counts_the_sparse_prefix_when_later_probes_are_unsupported() {
+        use nix::unistd::Whence::{SeekData, SeekHole};
+        for errno in [nix::errno::Errno::EINVAL, nix::errno::Errno::EOPNOTSUPP] {
+            copies_with_seek_results(
+                4,
+                &[
+                    (SeekData, 4, Ok(4)),
+                    (SeekHole, 4, Ok(8)),
+                    (SeekData, 8, Err(errno)),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn copies_densely_when_hole_probes_are_unsupported() {
+        use nix::unistd::Whence::{SeekData, SeekHole};
+        for errno in [nix::errno::Errno::EINVAL, nix::errno::Errno::EOPNOTSUPP] {
+            copies_with_seek_results(4, &[(SeekData, 4, Ok(4)), (SeekHole, 4, Err(errno))]);
+        }
+    }
+
+    #[test]
+    fn copies_densely_when_sparse_probes_do_not_advance() {
+        use nix::unistd::Whence::{SeekData, SeekHole};
+        copies_with_seek_results(4, &[(SeekData, 4, Ok(0))]);
+        for hole in [0, 4] {
+            copies_with_seek_results(4, &[(SeekData, 4, Ok(4)), (SeekHole, 4, Ok(hole))]);
+        }
+    }
+
+    #[test]
+    fn propagates_io_errors_from_hole_probes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(b"data").unwrap();
+        let dst = make_file(tmp.path(), "dst");
+        let error = copy_sparse_fallback_with_seek(&src, &dst, 0, 4, |_, whence| match whence {
+            nix::unistd::Whence::SeekData => Ok(0),
+            nix::unistd::Whence::SeekHole => Err(nix::errno::Errno::EIO),
+            _ => unreachable!(),
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn retries_interrupted_extent_io_and_completes_short_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let contents = b"interrupted reads and short writes";
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(contents).unwrap();
+        let dst = make_file(tmp.path(), "dst");
+        let src = crate::testutils::InterruptedFile::new(src);
+        let dst = crate::testutils::InterruptedFile::new(dst);
+        copy_data_extent(&src, &dst, 0, contents.len() as u64, &mut [0; 8]).unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+    }
+
+    #[test]
+    fn reconciles_a_source_shrunk_after_the_last_extent() {
+        for start in [0, 4] {
+            let tmp = tempfile::tempdir().unwrap();
+            let contents = b"0123456789abcdef";
+            let mut src = make_file(tmp.path(), "src");
+            src.write_all(contents).unwrap();
+            let mut dst = make_file(tmp.path(), "dst");
+            dst.write_all(&contents[..start as usize]).unwrap();
+            let copied = copy_sparse_fallback_with_seek(
+                &src,
+                &dst,
+                start,
+                contents.len() as u64,
+                |offset, whence| match whence {
+                    nix::unistd::Whence::SeekData => Ok(start as libc::off_t),
+                    nix::unistd::Whence::SeekHole => Ok(contents.len() as libc::off_t),
+                    nix::unistd::Whence::SeekEnd => {
+                        src.set_len(3).unwrap();
+                        nix::unistd::lseek(src.as_fd(), offset, whence)
+                    }
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap();
+            assert_eq!(copied, 3_u64.saturating_sub(start));
+            assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), b"012");
+        }
     }
 
     #[test]
@@ -417,14 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn never_copies_without_copy_file_range() {
+    fn copies_without_copy_file_range_when_reflink_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let contents = b"a non-empty source with an unaligned size";
         let mut src = make_file(tmp.path(), "src");
         src.write_all(contents).unwrap();
         for len in [0, 7, contents.len() as u64, contents.len() as u64 + 100] {
             let dst = make_file(tmp.path(), "never");
-            let calls_before = COPY_FILE_RANGE_CALLS.get();
+            let calls_before = crate::testutils::copy_file_range_calls();
             let copied = copy_file_data(&src, &dst, len, ReflinkMode::Never).unwrap();
             let expected_len = len.min(contents.len() as u64);
             assert_eq!(copied, expected_len);
@@ -432,13 +528,13 @@ mod tests {
                 std::fs::read(tmp.path().join("never")).unwrap(),
                 &contents[..expected_len as usize]
             );
-            assert_eq!(COPY_FILE_RANGE_CALLS.get(), calls_before);
+            assert_eq!(crate::testutils::copy_file_range_calls(), calls_before);
         }
         // prove that the counter observes an attempted syscall, even without reflink support.
         let dst = make_file(tmp.path(), "auto");
-        let calls_before = COPY_FILE_RANGE_CALLS.get();
+        let calls_before = crate::testutils::copy_file_range_calls();
         copy_file_data(&src, &dst, contents.len() as u64, ReflinkMode::Auto).unwrap();
-        assert!(COPY_FILE_RANGE_CALLS.get() > calls_before);
+        assert!(crate::testutils::copy_file_range_calls() > calls_before);
         assert_eq!(std::fs::read(tmp.path().join("auto")).unwrap(), contents);
     }
 
@@ -462,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn never_preserves_holes() {
+    fn preserves_holes_when_reflink_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let logical: u64 = 8 * 1024 * 1024;
         let head = b"HEAD-region-bytes";
@@ -615,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn never_copies_all_hole_source() {
+    fn copies_all_hole_source_when_reflink_is_disabled() {
         // a pure-hole source: SEEK_DATA returns ENXIO immediately, so the loop
         // does no copies and only ftruncate sizes dst. dst must be all zeros,
         // sized to `len`, and sparse.
@@ -750,34 +846,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_probe_routes_to_dense_byte_exact() {
-        // exercises the fallback selection end-to-end at the seam level: an
-        // "unsupported" SEEK_DATA probe must route to `dense_copy`, which on this
-        // (tmpfs) environment we drive directly because tmpfs supports SEEK_DATA
-        // and a true EINVAL can't be simulated here (see note below). We assert
-        // both halves of the routing contract: (1) the classifier maps the
-        // unsupported errnos to `SparseProbe::Unsupported`, and (2) the
-        // `Unsupported` branch's target (`dense_copy`) yields a byte-exact copy.
-        //
-        // NOTE: a genuine end-to-end SEEK_DATA EINVAL is not simulable in this
-        // environment (tmpfs/ext4 both support SEEK_DATA/SEEK_HOLE); it would
-        // require a FUSE/older filesystem that rejects those whences. The routing
-        // is therefore validated via the testable seam rather than a forced
-        // errno, with the byte-exactness of the dense target asserted directly.
-        assert_eq!(
-            classify_seek_data(Err(nix::errno::Errno::EINVAL)).unwrap(),
-            SparseProbe::Unsupported,
-            "unsupported probe must route to the dense fallback"
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let data: Vec<u8> = (0u32..200_000).map(|i| (i % 256) as u8).collect();
-        let mut src = make_file(tmp.path(), "src");
-        src.write_all(&data).unwrap();
-        src.sync_all().unwrap();
-        let dst = make_file(tmp.path(), "dst");
-        let copied = dense_copy(&src, &dst, 0, data.len() as u64).unwrap();
-        assert_eq!(copied, data.len() as u64);
-        let got = std::fs::read(tmp.path().join("dst")).unwrap();
-        assert_eq!(got, data, "dense fallback target must be byte-exact");
+    fn copies_densely_when_the_initial_probe_is_unsupported() {
+        for errno in [nix::errno::Errno::EINVAL, nix::errno::Errno::EOPNOTSUPP] {
+            copies_with_seek_results(4, &[(nix::unistd::Whence::SeekData, 4, Err(errno))]);
+        }
     }
 }

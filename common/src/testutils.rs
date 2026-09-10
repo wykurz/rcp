@@ -7,6 +7,57 @@ use std::os::unix::fs::MetadataExt;
 
 static ADMISSION_LIMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(test)]
+thread_local! {
+    static COPY_FILE_RANGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_copy_file_range_call() {
+    COPY_FILE_RANGE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn copy_file_range_calls() -> usize {
+    COPY_FILE_RANGE_CALLS.get()
+}
+
+/// A positioned-I/O fixture that interrupts once and limits successful writes.
+#[cfg(test)]
+pub(crate) struct InterruptedFile {
+    file: std::fs::File,
+    read_interrupted: std::cell::Cell<bool>,
+    write_interrupted: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl InterruptedFile {
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            read_interrupted: std::cell::Cell::new(false),
+            write_interrupted: std::cell::Cell::new(false),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::os::unix::fs::FileExt for InterruptedFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if !self.read_interrupted.replace(true) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        self.file.read_at(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        if !self.write_interrupted.replace(true) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        self.file.write_at(&buf[..buf.len().min(3)], offset)
+    }
+}
+
 /// Exclusively configures process-global admission limits for one test.
 pub struct AdmissionLimit {
     _guard: tokio::sync::MutexGuard<'static, ()>,
