@@ -3012,37 +3012,60 @@ mod tests {
                 authoritative_filter: false,
             });
             let cx = root_cx(parent, OsStr::new("entry"), entry.clone());
-            let mut task = tokio::spawn(process_entry(
+            let mut operation = Box::pin(process_entry(
                 visitor,
                 cx,
                 (),
                 walk::EntryAdmission::HintedDirectory,
             ));
-            tokio::task::yield_now().await;
+            // register the first classification at Stat before releasing its permit
+            assert!(futures::poll!(operation.as_mut()).is_pending());
             drop(held_stat);
-            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let mut first_handle_closed = false;
-            for _ in 0..100 {
-                if !inode_is_open(&entry)? {
-                    first_handle_closed = true;
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            let mut next_stat = Box::pin(throttle::ops_in_flight_permit(stat_resource));
+            assert!(
+                futures::poll!(next_stat.as_mut()).is_pending(),
+                "the first classification did not reserve the released Stat permit"
+            );
+            assert!(futures::poll!(operation.as_mut()).is_pending());
+            // reacquiring Stat proves the first blocking open/fstat completed, even if its output
+            // has not reached the async waiter yet. Keep both gates held until its handle closes.
+            let held_stat = admission
+                .run_with_timeout(Duration::from_secs(20), next_stat)
+                .await
+                .context("the first hinted-directory classification did not finish its Stat")?;
+            let first_handle_closed = tokio::time::timeout(
+                Duration::from_secs(20),
+                std::future::poll_fn(|context| {
+                    assert!(
+                        std::future::Future::poll(operation.as_mut(), context).is_pending(),
+                        "stale hinted-directory classification bypassed held leaf admission"
+                    );
+                    match inode_is_open(&entry) {
+                        Ok(true) => std::task::Poll::Pending,
+                        Ok(false) => std::task::Poll::Ready(Ok(())),
+                        Err(error) => std::task::Poll::Ready(Err(error)),
+                    }
+                }),
+            )
+            .await;
             tokio::fs::remove_file(&entry).await?;
             tokio::fs::create_dir(&entry).await?;
             drop(held_leaf);
-            tokio::task::yield_now().await;
-            drop(held_stat);
-            let task_result = admission
-                .run_with_timeout(Duration::from_secs(20), &mut task)
-                .await
-                .context("stale hinted entry did not resume after admission was released")?;
-            let summary = task_result?.map_err(|error| error.source)?;
+            let mut next_leaf = Box::pin(throttle::pending_meta_permit());
             assert!(
-                first_handle_closed,
-                "stale hinted-directory classification retained its first leaf handle while waiting"
+                futures::poll!(next_leaf.as_mut()).is_pending(),
+                "stale hinted-directory classification did not reserve leaf admission"
             );
+            drop(next_leaf);
+            drop(held_stat);
+            let summary = admission
+                .run_with_timeout(Duration::from_secs(20), operation)
+                .await
+                .context("stale hinted entry did not resume after admission was released")?
+                .map_err(|error| error.source)?;
+            first_handle_closed.context(
+                "stale hinted-directory classification retained its first leaf handle while waiting",
+            )??;
             assert_eq!(
                 summary,
                 CountSummary {
