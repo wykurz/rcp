@@ -94,11 +94,9 @@ pub fn copy_file_data(
 /// sparse-aware userspace copy when the kernel/filesystem can't. Both files are
 /// already open; offsets start at `0`. Returns the number of bytes copied.
 /// The destination must be empty and exclusively owned by this copy operation.
-/// Uses [`ReflinkMode::Auto`]; use [`copy_file_data`]
-/// to select a policy.
 ///
 /// See the module docs for snapshot-size and durability semantics.
-pub fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64> {
+fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64> {
     // establish the documented offset-0 start on both fds. The caller may hand
     // us descriptors whose offsets were advanced by an earlier read/stat, and
     // copy_file_range with `None` offsets uses each fd's current position.

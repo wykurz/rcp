@@ -6,6 +6,14 @@ For project overview and tool descriptions, see [README.md](README.md). For codi
 [CONVENTIONS.md](CONVENTIONS.md). For design and reference documentation, see the [docs/](docs/)
 directory.
 
+## Library API Scope
+
+Workspace library crates are internal to the rcp tools, even when published. External library API
+compatibility is not a project requirement. Choose visibility and signatures for in-repository
+callers, updating those callers, tests, and documentation examples together. Remove unused public
+entry points or make them private; do not preserve them solely for hypothetical external library
+consumers.
+
 ## Build & Test Commands
 
 This project uses [`just`](https://github.com/casey/just). Always prefer `just` commands over direct

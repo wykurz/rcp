@@ -9,9 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Add `rcp --reflink=auto|never` to control acceleration for local file copies. The default `auto`
-  keeps existing behavior; `never` uses sparse-aware read/write copying for benchmarking. An
-  `always` mode is deferred until there is a clear need.
+- Add `--reflink=auto|never` to `rcp` and `rlink` to control acceleration for local file copies,
+  including files copied during `rlink --update`. The default `auto` keeps existing behavior;
+  `never` uses sparse-aware read/write copying for benchmarking. An `always` mode is deferred until
+  there is a clear need.
 
 ### Changed
 
