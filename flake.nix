@@ -370,12 +370,11 @@
               ++ buildInputs
               ++ [
                 # `getfacl`/`setfacl`, for reading a POSIX ACL by hand when debugging the ACL
-                # tests. Nothing depends on it: the fixtures write the xattrs directly, precisely
-                # so the suite needs no runtime tool.
+                # tests. The fixtures write xattrs directly and do not invoke these tools.
                 pkgs.acl
-                # `all_does_not_pay_the_acl_probe` traces an rcp run to count its ACL-probe
-                # syscalls: the point of making ACLs opt-in is that the default path costs
-                # nothing, which no outcome-only check can show. `just test` fails without it.
+                # strace tests in rcp/tests/acls.rs check opt-in ACL probe costs; those in
+                # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
+                # native `just test` runs fail without it; copied bytes cannot prove either.
                 pkgs.strace
               ]
               ++ platform.buildTools;

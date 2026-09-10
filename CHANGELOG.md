@@ -24,8 +24,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Keep local sparse copies progressing when extent probes stop advancing or become unsupported,
-  retain the full copied byte count when falling back mid-copy, and retry interrupted reads and
-  writes.
+  report the reconciled logical byte count after a partial kernel copy or a mid-copy fallback, and
+  retry interrupted kernel copies, reads, and writes.
 
 ## [0.40.0] - 2026-09-01
 

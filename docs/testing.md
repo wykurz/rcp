@@ -113,11 +113,17 @@ Local file operation tests in each tool's `tests/` directory:
 attributes. Per the repo's convention they **fail rather than skip** when it cannot, so a lost
 feature cannot pass unnoticed — a failure there means `TMPDIR` is on a filesystem without ACL
 support, not that the code is broken. Fixtures write the xattrs directly rather than shelling out to
-`setfacl`, so no runtime dependency is added; `pkgs.acl` is in the dev shell so `getfacl` is on hand
-for reading an ACL by eye while debugging, but nothing in the suite uses it. A few of these tests
-count syscalls with `strace(1)` (the whole point of `acl` being opt-in is that the default path
-costs nothing, which no outcome-only check can show), so `strace` must be installed — it is in the
-dev shell. See [POSIX ACLs](acls.md).
+`setfacl`, so they do not depend on that tool; `pkgs.acl` is in the dev shell so `getfacl` is on
+hand for reading an ACL by eye while debugging, but nothing in the suite uses it. See
+[POSIX ACLs](acls.md).
+
+**Syscall-tracing tests** in `rcp/tests/acls.rs`, `rcp/tests/reflink.rs`, and
+`rlink/tests/reflink.rs` require `strace(1)`, which is included in the dev shell. The ACL tests
+check opt-in probe costs, and the reflink tests verify that the selected policy controls
+`copy_file_range` use, including copies during `rlink --update`. Checking copied bytes alone cannot
+verify either property. Native test runs fail when `strace` is unavailable. These tests carry
+source-owned `rcp_nix_sandbox` exemptions because the Nix sandbox cannot provide tracing; native CI
+runs the syscall assertions.
 
 ### Remote Integration Tests
 
