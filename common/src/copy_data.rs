@@ -50,13 +50,8 @@ use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 
-/// Sparse-aware userspace fallback copy buffer size (1 MiB).
+/// Maximum userspace copy buffer size (1 MiB), bounded further by each extent.
 const FALLBACK_BUF_SIZE: usize = 1024 * 1024;
-
-/// Dense read/write fallback copy buffer size (128 KiB). Smaller than the
-/// sparse buffer because this path is the last-resort robustness fallback for
-/// filesystems that can't do `SEEK_DATA`/`SEEK_HOLE`, not a throughput path.
-const DENSE_BUF_SIZE: usize = 128 * 1024;
 
 /// Whether local file copies may use reflink-capable acceleration.
 ///
@@ -73,7 +68,9 @@ pub enum ReflinkMode {
 
 /// Copy up to `len` bytes between held file descriptors with the chosen policy.
 ///
-/// Both paths start at offset zero and return the logical number of bytes copied.
+/// Copies from byte zero in the source to byte zero in the destination, regardless
+/// of their current seek positions, and returns the logical number of bytes copied.
+/// File cursor positions after copying are unspecified.
 /// The destination must be empty and exclusively owned by this copy operation.
 /// `Never` bypasses all `copy_file_range` acceleration, including non-reflink
 /// kernel and server-side copying. See the module docs for size and durability semantics.
@@ -97,8 +94,21 @@ pub fn copy_file_data(
 ///
 /// See the module docs for snapshot-size and durability semantics.
 fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64> {
+    copy_file_range_all_with(src, dst, len, |remaining| {
+        #[cfg(test)]
+        crate::testutils::record_copy_file_range_call();
+        nix::fcntl::copy_file_range(src.as_fd(), None, dst.as_fd(), None, remaining)
+    })
+}
+
+fn copy_file_range_all_with(
+    src: &File,
+    dst: &File,
+    len: u64,
+    mut copy_range: impl FnMut(usize) -> nix::Result<usize>,
+) -> std::io::Result<u64> {
     // establish the documented offset-0 start on both fds. The caller may hand
-    // us descriptors whose offsets were advanced by an earlier read/stat, and
+    // us descriptors whose offsets were advanced by an earlier read, and
     // copy_file_range with `None` offsets uses each fd's current position.
     nix::unistd::lseek(src.as_fd(), 0, nix::unistd::Whence::SeekSet)
         .map_err(std::io::Error::from)?;
@@ -107,43 +117,28 @@ fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64>
     let mut copied: u64 = 0;
     while copied < len {
         let remaining = usize::try_from(len - copied).unwrap_or(usize::MAX);
-        // None offsets => the kernel uses and advances each fd's own offset,
-        // so successive calls naturally continue where the last left off.
-        #[cfg(test)]
-        crate::testutils::record_copy_file_range_call();
-        match nix::fcntl::copy_file_range(src.as_fd(), None, dst.as_fd(), None, remaining) {
-            Ok(0) => {
-                // EOF: the source is shorter than `len` (a shrink). Stop here
-                // rather than spinning forever on a zero-byte copy.
-                return Ok(copied);
+        match copy_range(remaining) {
+            Ok(0)
+            | Err(
+                nix::errno::Errno::ENOSYS
+                | nix::errno::Errno::EXDEV
+                | nix::errno::Errno::EINVAL
+                | nix::errno::Errno::EOPNOTSUPP,
+            ) => {
+                // eof or unsupported kernel copying: finish through the userspace path.
+                // it returns the reconciled total size, which can be below `copied`
+                // if the source shrank beneath the prefix already written.
+                return copy_sparse_fallback(src, dst, copied, len);
             }
             Ok(n) => copied += n as u64,
-            Err(errno) => {
-                // these errnos mean copy_file_range is unsupported for this
-                // pair (no kernel support, cross-filesystem, bad arguments,
-                // or the fs rejects it) -> fall back for the remaining range.
-                // note: ENOTSUP == EOPNOTSUPP numerically on Linux.
-                if matches!(
-                    errno,
-                    nix::errno::Errno::ENOSYS
-                        | nix::errno::Errno::EXDEV
-                        | nix::errno::Errno::EINVAL
-                        | nix::errno::Errno::EOPNOTSUPP
-                ) {
-                    // the fallback returns only the bytes IT moved ([copied, final]);
-                    // add the prefix the primary path already copied so the total is
-                    // reported correctly.
-                    return copy_sparse_fallback(src, dst, copied, len)
-                        .map(|fallback| copied + fallback);
-                }
-                return Err(std::io::Error::from(errno));
-            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(errno) => return Err(std::io::Error::from(errno)),
         }
     }
     Ok(copied)
 }
 
-/// Classification of an initial `SEEK_DATA` probe, used to decide whether the
+/// Classification of a `SEEK_DATA` probe, used to decide whether the
 /// sparse fallback can run or must degrade to a dense read/write copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SparseProbe {
@@ -204,16 +199,11 @@ fn classify_seek_data(result: nix::Result<libc::off_t>) -> std::io::Result<Spars
 /// unallocated; a source that shrank below `len` (`actual_eof < len`) sizes
 /// `dst` to `actual_eof` rather than padding a spurious hole up to `len`.
 ///
-/// Returns `final - start`, i.e. the number of bytes of the logical copy that
-/// the source actually provided — matching the primary path's return.
+/// Returns the reconciled total logical size, including the already-copied prefix.
+/// The result can be below `start` if the source shrank beneath that prefix.
 /// The destination must contain only the already-copied prefix `[0, start)`
 /// and remain exclusively owned by this copy operation. `start` must not exceed `len`.
-pub(crate) fn copy_sparse_fallback(
-    src: &File,
-    dst: &File,
-    start: u64,
-    len: u64,
-) -> std::io::Result<u64> {
+fn copy_sparse_fallback(src: &File, dst: &File, start: u64, len: u64) -> std::io::Result<u64> {
     copy_sparse_fallback_with_seek(src, dst, start, len, |offset, whence| {
         nix::unistd::lseek(src.as_fd(), offset, whence)
     })
@@ -226,21 +216,22 @@ fn copy_sparse_fallback_with_seek(
     len: u64,
     mut seek: impl FnMut(libc::off_t, nix::unistd::Whence) -> nix::Result<libc::off_t>,
 ) -> std::io::Result<u64> {
-    if start >= len {
+    debug_assert!(start <= len);
+    if start == len {
         // the destination already contains the prefix; an empty source needs no work.
-        return Ok(0);
+        return Ok(len);
     }
     let mut off = start;
     let mut written_end = start;
     let mut buf = Vec::new();
     while off < len {
-        let (extent, buffer_limit) = match next_copy_extent(&mut seek, off, len)? {
-            CopyExtent::Sparse(extent) => (extent, FALLBACK_BUF_SIZE),
-            CopyExtent::Dense => (off..len, DENSE_BUF_SIZE),
+        let extent = match next_copy_extent(&mut seek, off, len)? {
+            CopyExtent::Sparse(extent) => extent,
+            CopyExtent::Dense => off..len,
             CopyExtent::End => break,
         };
         // allocate only for data, cap small extents, and reuse the buffer across the walk.
-        let capacity = (extent.end - extent.start).min(buffer_limit as u64) as usize;
+        let capacity = (extent.end - extent.start).min(FALLBACK_BUF_SIZE as u64) as usize;
         if buf.len() < capacity {
             buf.resize(capacity, 0);
         }
@@ -261,7 +252,7 @@ fn copy_sparse_fallback_with_seek(
         nix::unistd::ftruncate(dst.as_fd(), to_off_t(final_size)?).map_err(std::io::Error::from)?;
     }
     // the same finalizer accounts for the entire walk, including any dense remainder.
-    Ok(final_size.saturating_sub(start))
+    Ok(final_size)
 }
 
 enum CopyExtent {
@@ -402,7 +393,79 @@ mod tests {
         )
         .unwrap();
         assert!(probes.next().is_none());
-        assert_eq!(copied, contents.len() as u64 - start);
+        assert_eq!(copied, contents.len() as u64);
+        assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+    }
+
+    #[test]
+    fn reports_final_size_when_source_shrinks_after_partial_kernel_copy() {
+        for outcome in [Ok(0), Err(nix::errno::Errno::EXDEV)] {
+            for final_len in [0, 3, 8, 12] {
+                let tmp = tempfile::tempdir().unwrap();
+                let contents = b"0123456789abcdef";
+                let mut src = make_file(tmp.path(), "src");
+                src.write_all(contents).unwrap();
+                let dst = make_file(tmp.path(), "dst");
+                let mut calls = 0;
+                let copied = copy_file_range_all_with(&src, &dst, 16, |remaining| {
+                    calls += 1;
+                    match calls {
+                        1 => {
+                            assert_eq!(remaining, 16);
+                            dst.write_all_at(&contents[..8], 0).unwrap();
+                            Ok(8)
+                        }
+                        2 => {
+                            assert_eq!(remaining, 8);
+                            src.set_len(final_len).unwrap();
+                            outcome
+                        }
+                        _ => panic!("kernel copying must stop after falling back"),
+                    }
+                })
+                .unwrap();
+                assert_eq!(calls, 2);
+                assert_eq!(copied, final_len);
+                assert_eq!(dst.metadata().unwrap().len(), final_len);
+                assert_eq!(
+                    std::fs::read(tmp.path().join("dst")).unwrap(),
+                    &contents[..final_len as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retries_interrupted_kernel_copies_without_restarting_the_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let contents = b"0123456789abcdef";
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(contents).unwrap();
+        let dst = make_file(tmp.path(), "dst");
+        let mut calls = 0;
+        let copied = copy_file_range_all_with(&src, &dst, 16, |remaining| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(remaining, 16);
+                    dst.write_all_at(&contents[..8], 0).unwrap();
+                    Ok(8)
+                }
+                2 => {
+                    assert_eq!(remaining, 8);
+                    Err(nix::errno::Errno::EINTR)
+                }
+                3 => {
+                    assert_eq!(remaining, 8);
+                    dst.write_all_at(&contents[8..], 8).unwrap();
+                    Ok(8)
+                }
+                _ => panic!("kernel copying must stop after completing the range"),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(copied, contents.len() as u64);
         assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
     }
 
@@ -491,7 +554,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(copied, 3_u64.saturating_sub(start));
+            assert_eq!(copied, 3);
             assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), b"012");
         }
     }
@@ -776,18 +839,18 @@ mod tests {
         // dense_copy must reproduce the source byte-for-byte, including embedded
         // zero regions (it does not preserve them as holes, just copies zeros).
         let tmp = tempfile::tempdir().unwrap();
-        let len: usize = 3 * DENSE_BUF_SIZE + 777; // multiple buffers + a tail.
+        let len: usize = 3 * FALLBACK_BUF_SIZE + 777; // multiple buffers + a tail.
         let mut data: Vec<u8> = (0..len)
             .map(|i| (i.wrapping_mul(37) ^ (i >> 5)) as u8)
             .collect();
         // carve out a couple of embedded zero regions (crossing a buffer edge).
-        for b in data.iter_mut().take(DENSE_BUF_SIZE + 4096).skip(100) {
+        for b in data.iter_mut().take(FALLBACK_BUF_SIZE + 4096).skip(100) {
             *b = 0;
         }
         for b in data
             .iter_mut()
-            .take(2 * DENSE_BUF_SIZE)
-            .skip(2 * DENSE_BUF_SIZE - 500)
+            .take(2 * FALLBACK_BUF_SIZE)
+            .skip(2 * FALLBACK_BUF_SIZE - 500)
         {
             *b = 0;
         }
