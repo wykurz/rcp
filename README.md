@@ -307,10 +307,11 @@ destination MUST have a trailing slash (`/`):
 
 ### Local copy acceleration (`--reflink`)
 
-`--reflink=auto|never` controls the local regular-file data path and defaults to `auto`. In `auto`
-mode, rcp first uses `copy_file_range`, allowing the kernel and filesystem to accelerate the copy
-with a reflink, another in-kernel copy, or an NFS server-side copy. If that operation is
-unsupported, rcp falls back automatically to its userspace read/write path.
+`--reflink=auto|never` controls the local regular-file data path in `rcp` and copies performed by
+`rlink --update`, and defaults to `auto`. It does not affect which files `rlink` chooses to
+hard-link. In `auto` mode, the copy first uses `copy_file_range`, allowing the kernel and filesystem
+to accelerate it with a reflink, another in-kernel copy, or an NFS server-side copy. If that
+operation is unsupported, it falls back automatically to the userspace read/write path.
 
 `--reflink=never` bypasses `copy_file_range` and goes directly to that userspace path. This is
 useful for benchmarks that must exclude all `copy_file_range` acceleration, including non-reflink

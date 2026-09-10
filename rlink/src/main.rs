@@ -73,6 +73,20 @@ struct Args {
     )]
     update_compare: String,
 
+    /// Control reflink-capable acceleration for files copied during --update
+    ///
+    /// In auto mode, use filesystem acceleration when available. In never mode, use sparse-aware
+    /// read/write copying, bypassing all copy_file_range acceleration (including non-reflink
+    /// kernel and server-side copying). This does not change which files are hard-linked.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        value_name = "WHEN",
+        help_heading = "Linking options"
+    )]
+    reflink: common::copy_data::ReflinkMode,
+
     /// Allow --update even when --preserve-settings does not cover all attributes
     /// used by --update-compare
     ///
@@ -263,7 +277,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     };
     let settings = common::link::Settings {
         copy_settings: common::copy::Settings {
-            reflink: Default::default(),
+            reflink: args.reflink,
             dereference: false, // currently not supported
             fail_early: args.fail_early,
             overwrite: args.overwrite || args.delete,
