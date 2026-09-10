@@ -384,7 +384,7 @@ What "wide coverage" means concretely:
   authoritative probed stat needed for the filter decision. Walks otherwise self-pace through the OS
   `getdents` cache and the global `--ops-throttle` rate gate still applies; if you need a hard cap
   on walk-side load on a fragile NAS, reach for `--ops-throttle`.
-- **Not probed by design — data path.** The local `copy_file_range_all` data move and the remote
+- **Not probed by design — data path.** The local `copy_file_data` data move and the remote
   payload-stream read/write loops. They are bandwidth-bound, not service-time-bound; a latency-ratio
   controller doesn't fit. See [Pluggability](#pluggability) for the BBR direction.
 

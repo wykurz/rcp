@@ -49,7 +49,7 @@ struct Args {
     #[arg(
         long,
         value_enum,
-        default_value = "auto",
+        default_value_t,
         value_name = "WHEN",
         help_heading = "Copy options"
     )]

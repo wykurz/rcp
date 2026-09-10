@@ -7,12 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add `rcp --reflink=auto|never` to control acceleration for local file copies. The default `auto`
+  keeps existing behavior; `never` uses sparse-aware read/write copying for benchmarking. An
+  `always` mode is deferred until there is a clear need.
+
 ### Changed
 
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl
   target on supported Linux, and make Docker, Nix, CI, and release jobs select their x86_64 or
   AArch64 targets explicitly. Supported builds and Nix outputs are Linux-only; musl remains the
   primary target, with an additional x86_64 GNU/glibc build in CI.
+
+### Fixed
+
+- Keep local sparse copies progressing when extent probes stop advancing or become unsupported,
+  retain the full copied byte count when falling back mid-copy, and retry interrupted reads and
+  writes.
 
 ## [0.40.0] - 2026-09-01
 
