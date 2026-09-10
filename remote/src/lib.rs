@@ -5389,7 +5389,8 @@ mod tests {
         let control_directory = root.path().join("control");
         std::fs::create_dir(&control_directory).unwrap();
         let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "sleep 2"]).kill_on_drop(true);
+        // exec prevents a descendant from retaining nextest's output pipes after the launcher dies
+        command.args(["-c", "exec sleep 2"]).kill_on_drop(true);
         let launcher = command.spawn().unwrap();
         let reaper = SshMasterReaper {
             launcher: Some(launcher),

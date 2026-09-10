@@ -57,6 +57,28 @@ contract. Do not add broad serialization for unrelated tests.
 ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only
 ```
 
+### Depot test shards
+
+Depot runs debug tests on x86 and Arm and release tests on x86, with two independent runners per
+configuration. Each runner executes one nextest count partition. The partitions together run the
+full suite, retaining the default ignored tests and the serial SSH test group within each runner.
+The native Arm Nix package ABI smoke check runs only on the first Arm shard.
+
+`just depot-test` and `just depot-test-release` run all shards of their selected jobs. To reproduce
+one partition locally, pass nextest arguments through the test recipes:
+
+```bash
+just test --partition count:1/2
+just test-release --partition count:2/2
+```
+
+CI builds test binaries in a separate named step with `just test --no-run` or
+`just test-release --no-run`, then runs the partition using the same build artifacts. Count
+partitioning alternates tests within each binary and gives a more even split of the measured serial
+SSH workload than hash partitioning with the pinned nextest version. Assignments can change when
+tests are added or removed, and neither method balances duration automatically. Compare the time
+spent in each shard when changing the suite or partition count.
+
 ### Nix sandbox test selection
 
 Builds through this repository's flake set `rcp_nix_sandbox`; ordinary Cargo and nextest runs do

@@ -24,8 +24,10 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-dprint: "true"
-    - run: just lint
-    - run: just nix-targets
+    - name: Run lints
+      run: just lint
+    - name: Verify Nix build targets
+      run: just nix-targets
 
   doc:
     name: Documentation
@@ -34,32 +36,37 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
-    - run: just doc
+    - name: Build documentation
+      run: just doc
 
   test:
-    name: Tests (debug, ${{ matrix.runner }})
+    name: Tests (debug, ${{ matrix.runner }}, shard ${{ matrix.shard }}/2)
     strategy:
       fail-fast: false
       matrix:
         runner:
         - depot-ubuntu-24.04-16
         - depot-ubuntu-24.04-arm-16
+        shard: [1, 2]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Install Nix for native Arm package ABI smoke
-      if: runner.arch == 'ARM64'
+      if: runner.arch == 'ARM64' && matrix.shard == 1
       uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
     - name: Verify native Arm Nix package ABI smoke
-      if: runner.arch == 'ARM64'
+      if: runner.arch == 'ARM64' && matrix.shard == 1
       run: nix build --no-update-lock-file .#checks.aarch64-linux.package-abi-smoke
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
         install-test-deps: "true"
         localhost-ssh: "true"
-    - run: just test
+    - name: Build debug test binaries
+      run: just test --no-run
+    - name: Run nextest (debug)
+      run: just test --partition count:${{ matrix.shard }}/2
 
   doctest:
     name: Doctests (debug)
@@ -68,10 +75,15 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
-    - run: just doctest
+    - name: Run debug doctests
+      run: just doctest
 
   test-release:
-    name: Tests (release)
+    name: Tests (release, shard ${{ matrix.shard }}/2)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 45
     steps:
@@ -81,7 +93,10 @@ jobs:
         install-nextest: "true"
         install-test-deps: "true"
         localhost-ssh: "true"
-    - run: just test-release
+    - name: Build release test binaries
+      run: just test-release --no-run
+    - name: Run nextest (release)
+      run: just test-release --partition count:${{ matrix.shard }}/2
 
   doctest-release:
     name: Doctests (release)
@@ -90,7 +105,8 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
-    - run: just doctest-release
+    - name: Run release doctests
+      run: just doctest-release
 
   docker-test:
     name: Docker tests (${{ matrix.runner }})
@@ -107,8 +123,10 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
-    - run: just docker-up
-    - run: just docker-test-only -E 'not test(~chaos)'
+    - name: Build binaries and start Docker containers
+      run: just docker-up
+    - name: Run Docker integration tests
+      run: just docker-test-only -E 'not test(~chaos)'
     - name: Show Docker logs on failure
       if: failure()
       run: just docker-logs-once
@@ -125,8 +143,10 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
-    - run: just docker-up
-    - run: just docker-chaos-test-only
+    - name: Build binaries and start Docker containers
+      run: just docker-up
+    - name: Run Docker chaos tests
+      run: just docker-chaos-test-only
     - name: Show Docker logs on failure
       if: failure()
       run: just docker-logs-once

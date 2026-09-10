@@ -175,22 +175,37 @@ jobs:
     runs-on: depot-ubuntu-24.04-4
   test:
     strategy:
+      fail-fast: false
       matrix:
+        shard: [1, 2]
         runner:
         - depot-ubuntu-24.04-16
         - depot-ubuntu-24.04-arm-16
     runs-on: ${{ matrix.runner }}
     steps:
     - name: Install Nix for native Arm package ABI smoke
-      if: runner.arch == 'ARM64'
+      if: runner.arch == 'ARM64' && matrix.shard == 1
       uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
     - name: Verify native Arm Nix package ABI smoke
-      if: runner.arch == 'ARM64'
+      if: runner.arch == 'ARM64' && matrix.shard == 1
       run: nix build --no-update-lock-file .#checks.aarch64-linux.package-abi-smoke
+    - name: Build debug test binaries
+      run: just test --no-run
+    - name: Run debug test shard
+      run: just test --partition count:${{ matrix.shard }}/2
   doctest:
     runs-on: depot-ubuntu-24.04-4
   test-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     runs-on: depot-ubuntu-24.04-16
+    steps:
+    - name: Build release test binaries
+      run: just test-release --no-run
+    - name: Run release test shard
+      run: just test-release --partition count:${{ matrix.shard }}/2
   doctest-release:
     runs-on: depot-ubuntu-24.04-4
   docker-test:
@@ -735,6 +750,18 @@ sed -i "/name: Install Nix for native Arm package ABI smoke/{n;/if:/d;}" \
     "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test Arm Nix smoke installer condition must be runner.arch ARM64' "$fixture"
 
+for smoke_step in Install Verify; do
+    fixture=$(mutated_fixture "depot-arm-nix-$smoke_step-runs-on-every-shard")
+    sed -i "/name: $smoke_step .*native Arm.*ABI smoke/{n;s/ \&\& matrix.shard == 1//;}" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure 'condition must be runner.arch ARM64 on shard 1' "$fixture"
+
+    fixture=$(mutated_fixture "depot-arm-nix-$smoke_step-selects-missing-shard")
+    sed -i "/name: $smoke_step .*native Arm.*ABI smoke/{n;s/matrix.shard == 1/matrix.shard == 3/;}" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure 'condition must be runner.arch ARM64 on shard 1' "$fixture"
+done
+
 fixture=$(mutated_fixture depot-test-misses-arm-nix-smoke-build)
 sed -i '/  test:/,/  doctest:/{
     /run: nix build --no-update-lock-file .*package-abi-smoke/d
@@ -815,6 +842,112 @@ sed -i '/  doctest:/i\
       if: runner.arch == '\''ARM64'\''\
       run: ./scripts/test-nix-targets.sh' "$fixture/.depot/workflows/ci.yml"
 expect_failure 'Depot test must not run the full Nix target suite' "$fixture"
+
+for job in test test-release; do
+    if [ "$job" = test ]; then
+        next_job=doctest
+    else
+        next_job=doctest-release
+    fi
+
+    for shards in absent '[1]' '[1, 1]' '[1, 2, 3]' '[true, 2]'; do
+        fixture=$(mutated_fixture "depot-$job-shards-$shards")
+        if [ "$shards" = absent ]; then
+            sed -i "/^  $job:/,/^  $next_job:/{/        shard:/d;}" \
+                "$fixture/.depot/workflows/ci.yml"
+        else
+            sed -i "/^  $job:/,/^  $next_job:/s/        shard:.*/        shard: $shards/" \
+                "$fixture/.depot/workflows/ci.yml"
+        fi
+        expect_failure "Depot $job shard matrix must contain exactly [1, 2]" "$fixture"
+    done
+
+    for matrix_key in include exclude; do
+        fixture=$(mutated_fixture "depot-$job-$matrix_key-shard")
+        sed -i "/^  $job:/,/^  $next_job:/{/        shard:/a\\
+        $matrix_key:\\
+        - shard: 1
+}" "$fixture/.depot/workflows/ci.yml"
+        expect_failure "Depot $job runner matrix must not use $matrix_key" "$fixture"
+    done
+
+    fixture=$(mutated_fixture "depot-$job-empty-extra-axis")
+    sed -i "/^  $job:/,/^  $next_job:/{/        shard:/a\\
+        omitted: []
+}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shard matrix has unexpected axes" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-cancels-other-shards")
+    sed -i "/^  $job:/,/^  $next_job:/s/fail-fast: false/fail-fast: true/" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shards must disable fail-fast" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-misses-partition")
+    sed -i "/^  $job:/,/^  $next_job:/s/ --partition count:.*//" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-misses-test-run")
+    sed -i "/^  $job:/,/^  $next_job:/{/run: just $job --partition/d;}" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-leaves-third-partition-uncovered")
+    sed -i "/^  $job:/,/^  $next_job:/s@matrix.shard }}/2@matrix.shard }}/3@" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-repeats-first-partition")
+    sed -i "/^  $job:/,/^  $next_job:/s/count:.*/count:1\/2/" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-filters-shard-tests")
+    sed -i "/^  $job:/,/^  $next_job:/s@matrix.shard }}/2@matrix.shard }}/2 -E 'test(~limited)'@" \
+        "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-repeats-shard-command")
+    sed -i "/^  $job:/,/^  $next_job:/{/run: just $job --partition/a\\
+    - run: just $job --partition count:\${{ matrix.shard }}/2
+}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job must build then run exactly its assigned count shard" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-dead-run-masks-omission")
+    sed -i "/^  $job:/,/^  $next_job:/{/run: just $job --partition/a\\
+      if: \${{ false }}
+}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shard commands must run unconditionally and gate failures" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-ignores-shard-failure")
+    sed -i "/^  $job:/,/^  $next_job:/{/run: just $job --partition/a\\
+      continue-on-error: true
+}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shard commands must run unconditionally and gate failures" "$fixture"
+
+    fixture=$(mutated_fixture "depot-$job-shell-discards-shard-command")
+    sed -i "/^  $job:/,/^  $next_job:/{/run: just $job --partition/a\\
+      shell: true {0}
+}" "$fixture/.depot/workflows/ci.yml"
+    expect_failure "Depot $job shard commands must not override their shell" "$fixture"
+done
+
+fixture=$(mutated_fixture depot-test-release-job-conditionally-skipped)
+sed -i '/  test-release:/a\
+    if: ${{ false }}' "$fixture/.depot/workflows/ci.yml"
+expect_failure 'Depot test-release job must not be conditional' "$fixture"
+
+fixture=$(mutated_fixture depot-test-release-job-continues-on-error)
+sed -i '/  test-release:/a\
+    continue-on-error: true' "$fixture/.depot/workflows/ci.yml"
+expect_failure 'Depot test-release job must gate shard failures' "$fixture"
+
+fixture=$(mutated_fixture depot-test-release-inherits-shell-discarding-shards)
+sed -i '/  test-release:/a\
+    defaults:\
+      run:\
+        shell: true {0}' "$fixture/.depot/workflows/ci.yml"
+expect_failure 'Depot test-release shard commands must not inherit a custom shell' "$fixture"
 
 fixture=$(mutated_fixture depot-test-excludes-arm-runner)
 sed -i '0,/        - depot-ubuntu-24.04-arm-16/{
@@ -910,14 +1043,14 @@ sed -i '/  test:/,/  doctest:/ {
 }' "$fixture/.depot/workflows/ci.yml"
 expect_success_without_nix "$fixture"
 
-fixture=$(mutated_fixture depot-matrix-orthogonal-axis)
+fixture=$(mutated_fixture depot-test-duplicates-shards-with-extra-axis)
 sed -i '0,/        - depot-ubuntu-24.04-arm-16/ {
     /        - depot-ubuntu-24.04-arm-16/a\
         feature:\
         - default\
         - minimal
 }' "$fixture/.depot/workflows/ci.yml"
-expect_success_without_nix "$fixture"
+expect_failure 'Depot test shard matrix has unexpected axes' "$fixture"
 
 fixture=$(mutated_fixture depot-arm-runner-full-line-comment)
 sed -i '/  lint:/a\

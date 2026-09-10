@@ -88,12 +88,12 @@ fmt:
     dprint fmt
 
 # Run tests (debug mode, using nextest by default)
-test:
-    ./scripts/cargo-host.sh nextest run
+test *ARGS:
+    ./scripts/cargo-host.sh nextest run "$@"
 
 # Run tests in release mode
-test-release:
-    ./scripts/cargo-host.sh nextest run --release
+test-release *ARGS:
+    ./scripts/cargo-host.sh nextest run --release "$@"
 
 # Run doctests (debug mode)
 doctest:
