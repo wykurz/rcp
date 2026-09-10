@@ -61,8 +61,9 @@ contract. Do not add broad serialization for unrelated tests.
 
 Depot runs debug tests on x86 and Arm and release tests on x86, with two independent runners per
 configuration. Each runner executes one nextest count partition. The partitions together run the
-full suite, retaining the default ignored tests and the serial SSH test group within each runner.
-The native Arm Nix package ABI smoke check runs only on the first Arm shard.
+full suite of non-ignored tests; ignored tests stay ignored in every shard. The serial SSH test
+group remains serial within each runner. The native Arm Nix package ABI smoke check runs only on the
+first Arm shard.
 
 `just depot-test` and `just depot-test-release` run all shards of their selected jobs. To reproduce
 one partition locally, pass nextest arguments through the test recipes:
@@ -75,9 +76,14 @@ just test-release --partition count:2/2
 CI builds test binaries in a separate named step with `just test --no-run` or
 `just test-release --no-run`, then runs the partition using the same build artifacts. Count
 partitioning alternates tests within each binary and gives a more even split of the measured serial
-SSH workload than hash partitioning with the pinned nextest version. Assignments can change when
-tests are added or removed, and neither method balances duration automatically. Compare the time
-spent in each shard when changing the suite or partition count.
+SSH workload than hash partitioning with Depot's pinned nextest 0.9.85. Count partition assignments
+can change when tests are added or removed; hash assignments stay stable for a fixed partition
+count. Neither method balances duration automatically. Compare the time spent in each shard when
+changing the suite or partition count.
+
+Upstream has [deprecated count partitioning](https://nexte.st/docs/ci-features/partitioning/) in
+favor of `slice:`, which requires nextest 0.9.127 or newer. Revisit the partition mode and measured
+balance when upgrading the pin.
 
 ### Nix sandbox test selection
 
