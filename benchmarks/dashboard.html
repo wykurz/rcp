@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Copy benchmark history</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #182d36; background: #f5f7f5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { background: #103b45; color: #f7faf7; padding: 2.25rem max(1.25rem, calc((100vw - 1160px) / 2)); }
+    header .eyebrow { color: #9ed8c5; font-size: .75rem; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+    h1 { font-size: clamp(1.8rem, 4vw, 3rem); letter-spacing: -.04em; margin: .45rem 0 .4rem; }
+    header p { color: #d1e3dd; margin: 0; max-width: 65ch; line-height: 1.5; }
+    main { max-width: 1200px; margin: auto; padding: 1.5rem 1.25rem 4rem; }
+    .topline { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 1.1rem; }
+    .stats { display: flex; flex-wrap: wrap; gap: .6rem; }
+    .stat { border: 1px solid #d8e3df; background: #fff; border-radius: 9px; padding: .6rem .9rem; min-width: 110px; }
+    .stat b { display: block; font-size: 1.3rem; line-height: 1.1; }
+    .stat span { display: block; font-size: .75rem; color: #60747a; margin-top: .25rem; }
+    a { color: #086b70; }
+    .download { font-size: .9rem; font-weight: 600; }
+    section { background: #fff; border: 1px solid #d8e3df; box-shadow: 0 8px 30px rgba(11,49,54,.04); border-radius: 12px; margin: 1rem 0; padding: 1.25rem; }
+    section h2 { font-size: 1.15rem; margin: 0 0 .25rem; }
+    .subtle { color: #60747a; font-size: .85rem; margin: .2rem 0 1rem; line-height: 1.5; }
+    .controls { display: flex; flex-wrap: wrap; gap: .8rem; padding: .8rem 0 1rem; }
+    label { display: grid; gap: .3rem; color: #435e64; font-weight: 600; font-size: .78rem; }
+    select { min-width: 155px; max-width: 270px; padding: .55rem .7rem; border: 1px solid #b7cac5; border-radius: 6px; background: #fff; color: #18313a; font: inherit; font-weight: 400; }
+    select:focus-visible, a:focus-visible { outline: 3px solid #8ac5b4; outline-offset: 2px; }
+    .chart-wrap { overflow-x: auto; }
+    svg { display: block; width: 100%; min-width: 640px; height: auto; }
+    .grid { stroke: #e3ebe8; stroke-width: 1; }
+    .axis-label { fill: #677b7d; font-size: 12px; }
+    .plot-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+    .range { stroke-width: 2; opacity: .64; }
+    .point { stroke: #fff; stroke-width: 2; cursor: crosshair; }
+    .legend { display: flex; flex-wrap: wrap; gap: .5rem 1.3rem; padding-top: .5rem; font-size: .8rem; }
+    .legend-item { display: flex; gap: .45rem; align-items: center; }
+    .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%; flex: none; }
+    .empty { padding: 3rem 1rem; text-align: center; color: #657a7b; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: .84rem; }
+    th { color: #60747a; font-size: .73rem; text-transform: uppercase; letter-spacing: .06em; }
+    th, td { padding: .75rem .65rem; border-bottom: 1px solid #e7edeb; vertical-align: top; }
+    tbody tr:last-child td { border: 0; }
+    .pill { display: inline-block; padding: .18rem .48rem; border-radius: 1rem; font-size: .7rem; font-weight: 700; text-transform: uppercase; }
+    .pill.complete { background: #dcf3e7; color: #17634c; }
+    .pill.failed { background: #fee5e0; color: #a43c31; }
+    .pill.running { background: #fff1cd; color: #815c05; }
+    code { font-size: .78rem; overflow-wrap: anywhere; }
+    details { max-width: 38rem; }
+    summary { color: #086b70; cursor: pointer; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #425b61; background: #f3f6f4; padding: .7rem; border-radius: 6px; font-size: .75rem; }
+    .footnote { color: #60747a; font-size: .78rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">rcp · performance lab</div>
+    <h1>Copy benchmark history</h1>
+    <p>Wall clock completion time across benchmark runs. Lower is faster. Each color is one compatible workload and environment series; the vertical whisker shows the fastest and slowest repeat.</p>
+  </header>
+  <main>
+    <div class="topline"><div class="stats" id="stats"></div><a class="download" href="history.json" download>Download raw history JSON ↓</a></div>
+    <section aria-labelledby="chart-heading">
+      <h2 id="chart-heading">Walltime over time</h2>
+      <p class="subtle">Select a case, variant, machine group, and exact series. Points show the median; hover for run details.</p>
+      <div class="controls">
+        <label>Case<select id="case-filter"></select></label>
+        <label>Variant<select id="variant-filter"></select></label>
+        <label>Group<select id="group-filter"></select></label>
+        <label>Series<select id="series-filter"></select></label>
+      </div>
+      <div class="chart-wrap" id="chart"></div>
+      <div class="legend" id="legend"></div>
+      <p class="footnote">Series IDs include workload, flags, cache and timing policy, topology, runner and relevant machine context. Different IDs are drawn as separate lines. A single run appears as one point.</p>
+    </section>
+    <section aria-labelledby="runs-heading">
+      <h2 id="runs-heading">Runs</h2>
+      <p class="subtle">Failures stay in this table and never contribute a zero-time chart point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
+      <div class="table-wrap"><table><thead><tr><th>Date (UTC)</th><th>Result</th><th>Revision</th><th>Machine / policy</th><th>rcp vs references</th><th>Details</th></tr></thead><tbody id="run-rows"></tbody></table></div>
+    </section>
+  </main>
+  <script type="application/json" id="history-data">__HISTORY_JSON__</script>
+  <script>
+    "use strict";
+    const history = JSON.parse(document.getElementById("history-data").textContent);
+    const runs = history.runs;
+    const colors = ["#087c83", "#ce6b39", "#7549a3", "#238151", "#ad3f6b", "#5269ba", "#9b7624", "#477b96"];
+    const svgNS = "http://www.w3.org/2000/svg";
+    const $ = id => document.getElementById(id);
+    const node = (tag, text, className) => {
+      const element = document.createElement(tag);
+      if (text !== undefined) element.textContent = String(text);
+      if (className) element.className = className;
+      return element;
+    };
+    const svgNode = (tag, attributes = {}) => {
+      const element = document.createElementNS(svgNS, tag);
+      for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+      return element;
+    };
+    const date = stamp => new Date(stamp).toLocaleDateString(undefined, {year: "numeric", month: "short", day: "numeric", timeZone: "UTC"});
+    const number = value => Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
+    const group = run => `${run.context.runner_label} · ${run.context.topology} · ${run.context.cache_policy}`;
+    const allPoints = runs.flatMap(run => run.status === "complete" ? run.summaries.map(summary => ({run, summary})) : []);
+    const options = (id, values, allLabel) => {
+      const select = $(id);
+      const previous = select.value;
+      select.replaceChildren();
+      const all = node("option", allLabel); all.value = ""; select.append(all);
+      for (const value of values) { const option = node("option", value); option.value = value; select.append(option); }
+      select.value = values.includes(previous) ? previous : "";
+    };
+    const caseName = (run, id) => run.cases.find(item => item.id === id)?.name || id;
+    const variantName = (run, id) => run.variants.find(item => item.id === id)?.name || id;
+    const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)}`;
+    const ratios = (run, summary) => {
+      if (!summary.variant_id.startsWith("rcp-") || summary.variant_id === "rcp-baseline" || !summary.median) return [];
+      return ["rsync-a", "rcp-baseline"].flatMap(reference => {
+        const peer = run.summaries.find(item => item.case_id === summary.case_id && item.variant_id === reference);
+        return peer ? [`${reference}: ${number(peer.median / summary.median)}×`] : [];
+      });
+    };
+    function draw() {
+      const caseId = $("case-filter").value, variantId = $("variant-filter").value, groupId = $("group-filter").value;
+      const matched = allPoints.filter(({run, summary}) => (!caseId || summary.case_id === caseId) && (!variantId || summary.variant_id === variantId) && (!groupId || group(run) === groupId));
+      const ids = [...new Set(matched.map(point => point.summary.series_id))].sort();
+      const seriesFilter = $("series-filter");
+      const selected = seriesFilter.value;
+      seriesFilter.replaceChildren();
+      const all = node("option", "All compatible series"); all.value = ""; seriesFilter.append(all);
+      for (const id of ids) {
+        const point = matched.find(item => item.summary.series_id === id);
+        const item = node("option", seriesLabel(point)); item.value = id; seriesFilter.append(item);
+      }
+      seriesFilter.value = ids.includes(selected) ? selected : "";
+      const points = matched.filter(point => !seriesFilter.value || point.summary.series_id === seriesFilter.value);
+      const chart = $("chart"), legend = $("legend"); chart.replaceChildren(); legend.replaceChildren();
+      if (!points.length) { chart.append(node("p", "No successful measurements match these filters. Check the run table for failures.", "empty")); return; }
+      const width = 1000, height = 390, left = 80, right = 25, top = 22, bottom = 52;
+      const times = points.map(point => Date.parse(point.run.timestamp));
+      let minTime = Math.min(...times), maxTime = Math.max(...times);
+      if (minTime === maxTime) { minTime -= 12 * 3600000; maxTime += 12 * 3600000; }
+      const maxY = Math.max(...points.map(point => point.summary.maximum)) * 1.12 || 1;
+      const x = time => left + (time - minTime) / (maxTime - minTime) * (width - left - right);
+      const y = seconds => height - bottom - seconds / maxY * (height - top - bottom);
+      const svg = svgNode("svg", {viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": "Benchmark median walltime by UTC date, with minimum to maximum repeat ranges"});
+      for (let step = 0; step <= 4; step++) {
+        const value = maxY * step / 4, yy = y(value);
+        svg.append(svgNode("line", {x1: left, y1: yy, x2: width-right, y2: yy, class: "grid"}));
+        const tick = svgNode("text", {x: left-10, y: yy+4, "text-anchor": "end", class: "axis-label"}); tick.textContent = `${number(value)} s`; svg.append(tick);
+      }
+      for (let step = 0; step <= 4; step++) {
+        const time = minTime + (maxTime-minTime)*step/4;
+        const tick = svgNode("text", {x: x(time), y: height-17, "text-anchor": "middle", class: "axis-label"}); tick.textContent = date(new Date(time).toISOString()); svg.append(tick);
+      }
+      const bySeries = new Map();
+      for (const point of points) {
+        const id = point.summary.series_id;
+        if (!bySeries.has(id)) bySeries.set(id, []);
+        bySeries.get(id).push(point);
+      }
+      let colorIndex = 0;
+      for (const [id, series] of bySeries) {
+        const color = colors[colorIndex++ % colors.length];
+        series.sort((a, b) => Date.parse(a.run.timestamp)-Date.parse(b.run.timestamp));
+        if (series.length > 1) svg.append(svgNode("polyline", {points: series.map(({run,summary}) => `${x(Date.parse(run.timestamp))},${y(summary.median)}`).join(" "), stroke: color, class: "plot-line"}));
+        for (const {run,summary} of series) {
+          const xx = x(Date.parse(run.timestamp));
+          const whisker = svgNode("line", {x1: xx, y1: y(summary.minimum), x2: xx, y2: y(summary.maximum), stroke: color, class: "range"}); svg.append(whisker);
+          for (const amount of [summary.minimum, summary.maximum]) svg.append(svgNode("line", {x1: xx-5, x2: xx+5, y1: y(amount), y2: y(amount), stroke: color, class: "range"}));
+          const dot = svgNode("circle", {cx: xx, cy: y(summary.median), r: 6, fill: color, class: "point"});
+          const title = svgNode("title"); title.textContent = `${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}\nMedian ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s\n${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}${ratios(run,summary).length ? "\nSame-run speedup vs " + ratios(run,summary).join(" · ") : ""}`;
+          dot.append(title); svg.append(dot);
+        }
+        const item = node("span", undefined, "legend-item"), swatch = node("span", undefined, "swatch"); swatch.style.background = color;
+        item.append(swatch, node("span", seriesLabel(series[0]))); legend.append(item);
+      }
+      chart.append(svg);
+    }
+    function showRuns() {
+      const rows = $("run-rows");
+      for (const run of [...runs].reverse()) {
+        const row = node("tr"), timestamp = node("td", date(run.timestamp));
+        const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge);
+        const rev = node("td"), hash = run.revision.commit || "unknown";
+        const repository = run.context.repository || run.revision.repository || run.repository;
+        const slug = typeof repository === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ? repository : null;
+        if (slug && /^[0-9a-f]{7,64}$/.test(hash)) {
+          const link = node("a", hash.slice(0, 10)); link.href = `https://github.com/${slug}/commit/${hash}`; link.rel = "noopener noreferrer"; rev.append(link);
+        } else rev.append(node("code", hash.slice(0, 10)));
+        if (run.revision.dirty) rev.append(node("span", " · dirty"));
+        const machine = node("td", group(run));
+        const comparisons = node("td");
+        const comparisonLines = run.summaries.flatMap(item => ratios(run,item).map(ratio => `${caseName(run,item.case_id)} · ${variantName(run,item.variant_id)} / ${ratio}`));
+        comparisons.textContent = comparisonLines.length ? comparisonLines.join("\n") : "—";
+        comparisons.style.whiteSpace = "pre-line";
+        const detail = node("td"), details = node("details"), summary = node("summary", "View context");
+        const data = {run_id: run.run_id, branch: run.revision.branch, context: run.context, tools: run.tools, trials: run.trials.length, error: run.error || null};
+        details.append(summary, node("pre", JSON.stringify(data, null, 2))); detail.append(details);
+        row.append(timestamp, result, rev, machine, comparisons, detail); rows.append(row);
+      }
+    }
+    function start() {
+      const complete = runs.filter(run => run.status === "complete").length;
+      const failed = runs.filter(run => run.status === "failed").length;
+      for (const [value,label] of [[runs.length,"runs"],[complete,"complete"],[failed,"failed"],[new Set(allPoints.map(point => point.summary.series_id)).size,"series"]]) {
+        const card = node("div", undefined, "stat"); card.append(node("b",value),node("span",label)); $("stats").append(card);
+      }
+      options("case-filter", [...new Set(allPoints.map(point => point.summary.case_id))].sort(), "All cases");
+      options("variant-filter", [...new Set(allPoints.map(point => point.summary.variant_id))].sort(), "All variants");
+      options("group-filter", [...new Set(runs.map(group))].sort(), "All groups");
+      for (const id of ["case-filter","variant-filter","group-filter","series-filter"]) $(id).addEventListener("change", draw);
+      showRuns(); draw();
+    }
+    start();
+  </script>
+</body>
+</html>

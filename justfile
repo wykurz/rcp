@@ -38,6 +38,8 @@ _lint-targets:
 
 # Run all lints (formatting, clippy, policy checks, and helper behavior tests)
 lint: _lint-build _lint-targets
+    @echo "🔍 Testing the benchmark harness..."
+    just benchmark-test
     @echo "🔍 Testing the Depot CI helper..."
     ./scripts/test-depot-ci.sh
     @echo "🔍 Testing the Docker helper..."
@@ -144,6 +146,26 @@ build:
 # Build release binaries
 build-release:
     ./scripts/cargo-host.sh build --workspace --release
+
+# Build release tools, then run selected copy benchmarks (requires --output).
+benchmark *ARGS: build-release
+    python3 -m benchmarks.run "$@"
+
+# Run benchmarks with already-built tools.
+benchmark-run *ARGS:
+    python3 -m benchmarks.run "$@"
+
+# Test measurement, reporting, and history publishing behavior.
+benchmark-test:
+    python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
+# Render a standalone dashboard from a result file or history directory.
+benchmark-report *ARGS:
+    python3 -m benchmarks.report "$@"
+
+# Run the benchmark job remotely without publishing history.
+depot-benchmark:
+    ./scripts/depot-ci.sh --workflow .depot/workflows/benchmarks.yml benchmark
 
 # Build and check documentation
 doc:

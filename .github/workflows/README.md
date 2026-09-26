@@ -23,6 +23,17 @@ security-sensitive change:
 
 ## Workflows
 
+### benchmark-pages.yml
+
+Publishes the benchmark trend dashboard from the dedicated `benchmark-history` branch after a
+trusted Depot run dispatches `benchmark-history-updated`, or on manual request. Rendering code comes
+from `main`; historical records are data. The deployment is enabled with the repository variable
+`RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
+[benchmarking](../../docs/benchmarking.md) for measurement, retention and setup details.
+
+The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs publish artifacts only;
+trusted main/scheduled runs may append history. No timing threshold blocks a change.
+
 ### rust.yml
 
 Runs on every push and pull request to `main`:
