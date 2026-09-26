@@ -216,18 +216,31 @@ fi
 
 run_case success test
 assert_status 0
-assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--workflow\tci.yml\t--follow'
+assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow'
 assert_call $'CALL\tci\trun\tshow\ttest-run-id\t--output\tjson'
 assert_call_before \
-    $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--workflow\tci.yml\t--follow' \
+    $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow' \
     $'CALL\tci\trun\tshow\ttest-run-id\t--output\tjson'
 
 run_case log-stream-failure test
 assert_status 0
 assert_contains "$output" "live log streaming failed"
 assert_call_before \
-    $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--workflow\tci.yml\t--follow' \
+    $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow' \
     $'CALL\tci\trun\tshow\ttest-run-id\t--output\tjson'
+
+run_case finished --workflow '.depot/workflows/benchmark suite.yml' benchmark
+assert_status 0
+assert_call $'CALL\tci\trun\t--workflow\t.depot/workflows/benchmark suite.yml\t--job\tbenchmark'
+assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\tbenchmark\t--follow'
+
+run_case finished --workflow
+assert_status 2
+assert_contains "$output" 'workflow path is required'
+
+run_case finished --workflow .depot/workflows/benchmarks.yml
+assert_status 2
+assert_contains "$output" 'at least one workflow job is required'
 
 run_case failed lint
 [[ "$status" -ne 0 ]] || fail "failed terminal status returned success"

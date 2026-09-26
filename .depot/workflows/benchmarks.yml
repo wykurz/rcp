@@ -1,0 +1,144 @@
+name: Copy benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Fileset to measure
+        type: choice
+        options: [tiny-10k, tiny-1m]
+        default: tiny-10k
+      cache:
+        description: Cache preparation procedure
+        type: choice
+        options: [source-warm, linux-drop-caches]
+        default: source-warm
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  PKG_CONFIG_ALLOW_CROSS: '1'
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  benchmark:
+    name: Tiny files (informational timing)
+    runs-on: depot-ubuntu-24.04-32
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.depot/actions/rcp-rust-setup
+        with:
+          localhost-ssh: 'true'
+      - name: Install comparison tool
+        run: sudo apt-get install -y --no-install-recommends rsync
+      - name: Test harness
+        run: just benchmark-test
+      - name: Build release tools
+        run: just build-release
+      - name: Build PR baseline
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          baseline_tree="$RUNNER_TEMP/rcp-benchmark-base"
+          git worktree add --detach "$baseline_tree" "$BASE_SHA"
+          just --working-directory "$baseline_tree" build-release
+          baseline_target="$("$baseline_tree/scripts/cargo-host.sh" --print-target)"
+          echo "RCP_BENCH_BASELINE_BIN=$baseline_tree/target/$baseline_target/release" >> "$GITHUB_ENV"
+          echo "RCP_BENCH_BASELINE_COMMIT=$BASE_SHA" >> "$GITHUB_ENV"
+      - name: Measure copies
+        env:
+          SELECTED_CASE: ${{ inputs.case || (github.event_name == 'schedule' && 'tiny-1m') || 'tiny-10k' }}
+          SELECTED_CACHE: ${{ inputs.cache || 'source-warm' }}
+        run: |
+          set -euo pipefail
+          args=(--case "$SELECTED_CASE" --mode loopback --cache "$SELECTED_CACHE"
+                --repetitions 3 --runner-label depot-ubuntu-24.04-32
+                --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
+                --output "$RUNNER_TEMP/benchmark-results")
+          if [[ -n "${RCP_BENCH_BASELINE_BIN:-}" ]]; then
+            args+=(--baseline-bin-dir "$RCP_BENCH_BASELINE_BIN")
+          fi
+          just benchmark-run "${args[@]}"
+      - name: Attach summary and standalone report
+        if: always()
+        run: |
+          set -euo pipefail
+          results="$RUNNER_TEMP/benchmark-results"
+          if [[ -f "$results/summary.md" ]]; then
+            cat "$results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f "$results/results.json" ]]; then
+            just benchmark-report "$results/results.json" --output "$results/report"
+          fi
+      - name: Upload measurements and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-results
+          path: ${{ runner.temp }}/benchmark-results
+          if-no-files-found: warn
+          retention-days: 90
+
+  history:
+    name: Save main-branch history
+    needs: benchmark
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch')
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: benchmark-history-writer
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        id: measurements
+        continue-on-error: true
+        with:
+          name: benchmark-results
+          path: downloaded-results
+      - name: Check for a recorded run
+        id: recorded
+        if: steps.measurements.outcome == 'success'
+        run: |
+          if [[ -f downloaded-results/results.json ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Append immutable run to history
+        if: steps.recorded.outputs.available == 'true'
+        run: >-
+          python3 -m benchmarks.publish
+          --result downloaded-results/results.json
+          --repository "$GITHUB_REPOSITORY"
+          --remote origin
+      - name: Request dashboard update
+        if: steps.recorded.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches"
+          -f event_type=benchmark-history-updated

@@ -57,6 +57,7 @@ API documentation for the command-line tools is available on docs.rs:
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
+- [Benchmarking](docs/benchmarking.md) - Copy performance measurements, CI and historical trends
 - [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
 - [POSIX ACLs](docs/acls.md) - what `acl` preserves, why it is opt-in, and the two ways a copy can
   widen

@@ -1,0 +1,45 @@
+name: Benchmark history
+
+on:
+  repository_dispatch:
+    types: [benchmark-history-updated]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # enable after selecting GitHub Actions as the repository's Pages source
+    if: vars.RCP_BENCHMARK_PAGES == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: benchmark-history
+          path: benchmark-history-data
+          persist-credentials: false
+      - name: Render history using trusted main-branch code
+        run: python3 -m benchmarks.report benchmark-history-data --output _site
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+      - name: Deploy dashboard
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

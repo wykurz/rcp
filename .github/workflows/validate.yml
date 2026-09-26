@@ -130,6 +130,9 @@ jobs:
     - name: Test Depot CI helper
       run: ./scripts/test-depot-ci.sh
 
+    - name: Test benchmark harness
+      run: just benchmark-test
+
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 
