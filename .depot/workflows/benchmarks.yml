@@ -61,7 +61,7 @@ jobs:
           set -euo pipefail
           baseline_tree="$RUNNER_TEMP/rcp-benchmark-base"
           git worktree add --detach "$baseline_tree" "$BASE_SHA"
-          just --working-directory "$baseline_tree" build-release
+          just --justfile "$baseline_tree/justfile" --working-directory "$baseline_tree" build-release
           baseline_target="$("$baseline_tree/scripts/cargo-host.sh" --print-target)"
           echo "RCP_BENCH_BASELINE_BIN=$baseline_tree/target/$baseline_target/release" >> "$GITHUB_ENV"
           echo "RCP_BENCH_BASELINE_COMMIT=$BASE_SHA" >> "$GITHUB_ENV"
