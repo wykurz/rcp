@@ -1,6 +1,7 @@
 """Run repeatable copy workloads and retain validated measurements."""
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -160,6 +161,33 @@ def plan_commands(variant, source, destination, tools, mode):
     return commands
 
 
+@contextmanager
+def _defer_interrupts():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+    pending = []
+    def remember(number, _frame):
+        pending.append(number)
+    for number in previous:
+        signal.signal(number, remember)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        if pending:
+            number = pending[0]
+            handler = previous[number]
+            if callable(handler):
+                handler(number, None)
+            elif handler == signal.SIG_DFL:
+                if number == signal.SIGINT:
+                    raise KeyboardInterrupt
+                raise InterruptedError("SIGTERM")
+
+
 def execute_commands(commands, log_dir, timeout):
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=False)
@@ -171,6 +199,7 @@ def execute_commands(commands, log_dir, timeout):
     started = time.monotonic()
     launch_error = None
     timed_out = False
+    cleanup_groups = False
     def terminate_groups():
         for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
             for process in children:
@@ -190,27 +219,24 @@ def execute_commands(commands, log_dir, timeout):
             stdout = stdout_path.open("wb")
             stderr = stderr_path.open("wb")
             files.extend((stdout, stderr))
-            process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
-            children.append(process)
-            def wait_child(i=index, p=process):
-                code = p.wait()
-                stamp = time.monotonic()
-                with condition:
-                    finished[i] = (code, stamp)
-                    condition.notify_all()
-            waiter = threading.Thread(target=wait_child, daemon=True)
-            waiter.start()
-            waiters.append(waiter)
-    except OSError as exc:
-        launch_error = str(exc)
-    except BaseException:
-        terminate_groups()
-        for waiter in waiters:
-            waiter.join()
-        for handle in files:
-            handle.close()
-        raise
-    try:
+            with _defer_interrupts():
+                try:
+                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+                except OSError as exc:
+                    launch_error = str(exc)
+                else:
+                    children.append(process)
+                    def wait_child(i=index, p=process):
+                        code = p.wait()
+                        stamp = time.monotonic()
+                        with condition:
+                            finished[i] = (code, stamp)
+                            condition.notify_all()
+                    waiter = threading.Thread(target=wait_child, daemon=True)
+                    waiter.start()
+                    waiters.append(waiter)
+            if launch_error:
+                break
         deadline = started + timeout
         with condition:
             while len(finished) < len(children) and not launch_error:
@@ -219,16 +245,21 @@ def execute_commands(commands, log_dir, timeout):
                     break
                 condition.wait(remaining)
             timed_out = not launch_error and len(finished) < len(children)
-        if launch_error or timed_out:
-            terminate_groups()
+        cleanup_groups = bool(launch_error or timed_out or any(code != 0 for code, _ in finished.values()))
     except BaseException:
-        terminate_groups()
+        cleanup_groups = True
         raise
     finally:
-        for waiter in waiters:
-            waiter.join()
-        for handle in files:
-            handle.close()
+        with _defer_interrupts():
+            if cleanup_groups:
+                terminate_groups()
+            for waiter in waiters:
+                waiter.join()
+            for process in children:
+                if process.returncode is None:
+                    process.wait()
+            for handle in files:
+                handle.close()
     codes = [process.returncode for process in children]
     completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
     return {"ok": not (launch_error or timed_out) and len(children) == len(commands) and all(code == 0 for code in codes), "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
@@ -269,15 +300,17 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, reference_versions):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, reference_versions, storage_ids=None):
     filesystem = endpoint_environment.get("filesystem", {})
+    storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
-    def semantic_mount(info):
+    def semantic_mount(side, info):
         options = info.get("mount_options", [])
         if info.get("filesystem_type") == "overlay":
             options = [option for option in options if option.partition("=")[0] not in ("lowerdir", "upperdir", "workdir")]
-        return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options))}
-    comparable_environment["filesystem"] = {side: semantic_mount(info) for side, info in filesystem.items()}
+        identity = {"kind": "explicit", "value": storage_ids[side]} if storage_ids.get(side) is not None else {"kind": "observed", "mount_source": info.get("mount_source"), "mountpoint": info.get("mountpoint")}
+        return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options)), "storage_identity": identity}
+    comparable_environment["filesystem"] = {side: semantic_mount(side, info) for side, info in filesystem.items()}
     stable_references = {key: version for key, version in reference_versions.items() if key not in ("filegen", "rcp", "rcpd")}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -347,6 +380,12 @@ def _select(items, selected, kind):
     return [by_id[key] for key in selected]
 
 
+def _storage_id(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("storage ID must not be blank")
+    return value.strip()
+
+
 def _arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("cases.json"))
@@ -357,6 +396,8 @@ def _arguments(argv):
     parser.add_argument("--mode", choices=("local", "loopback"), default="local")
     parser.add_argument("--source-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--destination-root", type=Path, default=Path(tempfile.gettempdir()))
+    parser.add_argument("--source-storage-id", type=_storage_id)
+    parser.add_argument("--destination-storage-id", type=_storage_id)
     parser.add_argument("--cache", choices=("source-warm", "linux-drop-caches", "uncontrolled"), default="source-warm")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600)
@@ -381,6 +422,8 @@ def main(argv=None):
     record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files; random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
     if args.baseline_bin_dir:
         record["context"]["baseline_commit"] = os.environ.get("RCP_BENCH_BASELINE_COMMIT", "")
+    storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
+    record["context"]["storage_ids"] = storage_ids
     _persist(output, record)
     source_scratch = None
     destination_scratch = None
@@ -450,8 +493,9 @@ def main(argv=None):
             for iteration in range(1, args.repetitions + 1):
                 order = variants[(iteration - 1) % len(variants):] + variants[:(iteration - 1) % len(variants)]
                 for variant in order:
-                    trial_id = f"{case['id']}-{variant['id']}-{iteration}"
-                    destination = destination_scratch / trial_id
+                    trial_path = Path(case["id"]) / variant["id"] / str(iteration)
+                    destination = destination_scratch / trial_path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
                     if variant["processes"] > 1 or variant["tool"] == "rsync":
                         destination.mkdir()
                     selected_tools = dict(tools)
@@ -470,18 +514,18 @@ def main(argv=None):
                         trial["validation"] = {"ok": False, "error": f"cache preparation failed: {exc}"}
                         _persist(output, record)
                         raise
-                    outcome = execute_commands(commands, output / "logs" / trial_id, args.timeout)
+                    outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout)
                     trial.update(outcome)
                     trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": "command failed or timed out"}
                     trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] else "failed"
                     _persist(output, record)
                     if trial["status"] != "ok":
-                        raise RuntimeError(f"trial {trial_id} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
+                        raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                     shutil.rmtree(destination)
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                record["summaries"].append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, references), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                record["summaries"].append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, references, storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             _persist(output, record)
         record["status"] = "complete"
         shutil.rmtree(source_scratch)

@@ -73,6 +73,7 @@ jobs:
           set -euo pipefail
           args=(--case "$SELECTED_CASE" --mode loopback --cache "$SELECTED_CACHE"
                 --repetitions 3 --runner-label depot-ubuntu-24.04-32
+                --source-storage-id depot-root --destination-storage-id depot-root
                 --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
                 --output "$RUNNER_TEMP/benchmark-results")
           if [[ -n "${RCP_BENCH_BASELINE_BIN:-}" ]]; then
