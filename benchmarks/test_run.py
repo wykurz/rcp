@@ -118,6 +118,34 @@ class RunnerTests(unittest.TestCase):
             time.sleep(.6)
             self.assertFalse(marker.exists())
 
+    def test_signal_during_spawn_reaps_new_child(self):
+        for signum, exception in ((signal.SIGINT, KeyboardInterrupt), (signal.SIGTERM, InterruptedError)):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory() as root:
+                child = None
+                original_popen = run.subprocess.Popen
+                previous_handler = signal.getsignal(signum)
+                def interrupt(_signum, _frame):
+                    raise exception(signum)
+                def spawn_then_signal(*args, **kwargs):
+                    nonlocal child
+                    child = original_popen(*args, **kwargs)
+                    os.kill(os.getpid(), signum)
+                    return child
+                signal.signal(signum, interrupt)
+                try:
+                    with mock.patch.object(run.subprocess, "Popen", side_effect=spawn_then_signal):
+                        with self.assertRaises(exception):
+                            run.execute_commands([[sys.executable, "-c", "import time; time.sleep(2)"]], Path(root) / "logs", 3)
+                    self.assertIsNotNone(child)
+                    self.assertIsNotNone(child.returncode, "spawned process was not reaped")
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(child.pid, 0)
+                finally:
+                    signal.signal(signum, previous_handler)
+                    if child is not None and child.poll() is None:
+                        child.kill()
+                        child.wait()
+
     def test_tree_validation_detects_changed_content_and_extra_paths(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "source"
@@ -147,13 +175,13 @@ class RunnerTests(unittest.TestCase):
         def environment(device, lower, upper):
             mount = {"filesystem_type": "overlay", "mount_source": device, "mountpoint": upper, "mount_options": ["rw", f"lowerdir={lower}", f"upperdir={upper}", f"workdir={upper}/work", "relatime"]}
             return {"kernel": "Linux", "filesystem": {"source": mount, "destination": mount}}
-        first = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop1", "/layers/a", "/tmp/job1"), {"filegen": "0.41.0", "rsync": "3.4"})
-        changed_allocation = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.4"})
+        first = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop1", "/layers/a", "/tmp/job1"), {"filegen": "0.41.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"})
+        changed_allocation = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"})
         self.assertEqual(first, changed_allocation)
         semantic_change = environment("/dev/loop77", "/layers/b", "/tmp/job2")
         semantic_change["filesystem"]["source"]["mount_options"] = ["ro", "relatime", "lowerdir=/layers/b", "upperdir=/tmp/job2", "workdir=/tmp/job2/work"]
-        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", semantic_change, {"filegen": "0.42.0", "rsync": "3.4"}))
-        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.5"}))
+        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", semantic_change, {"filegen": "0.42.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"}))
+        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.5"}, storage_ids={"source": "ci-root", "destination": "ci-root"}))
 
     def test_loopback_rsync_pulls_from_localhost(self):
         with tempfile.TemporaryDirectory() as root:
@@ -187,6 +215,27 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(copy_marker.exists())
             self.assertTrue((output / "summary.md").exists())
             self.assertTrue((output / "logs").is_dir())
+
+    def test_ambiguous_case_variant_names_have_distinct_trial_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "bin"
+            binary.mkdir()
+            filegen = binary / "filegen"
+            filegen.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nif '--version' in sys.argv: print('filegen 1'); sys.exit(0)\np=pathlib.Path(sys.argv[1])/'filegen'/'dir'; p.mkdir(parents=True); (p/'file').write_bytes(b'x')\n")
+            filegen.chmod(0o755)
+            rsync = binary / "rsync"
+            rsync.write_text("#!/usr/bin/env python3\nimport pathlib,shutil,sys\nif '--version' in sys.argv: print('rsync 1'); sys.exit(0)\nshutil.copytree(sys.argv[-2].rstrip('/'),sys.argv[-1].rstrip('/'),dirs_exist_ok=True)\n")
+            rsync.chmod(0o755)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": identifier, "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1} for identifier in ("a-b", "a")], "variants": [{"id": identifier, "tool": "rsync", "args": ["-a"], "processes": 1} for identifier in ("c", "b-c")]}))
+            output = root / "out"
+            with mock.patch.object(run.shutil, "which", return_value=str(rsync)):
+                result = run.main(["--manifest", str(manifest), "--case", "a-b", "--case", "a", "--variant", "c", "--variant", "b-c", "--bin-dir", str(binary), "--cache", "uncontrolled", "--repetitions", "1", "--source-root", str(root), "--destination-root", str(root), "--output", str(output)])
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(len(result["trials"]), 4)
+            self.assertTrue((output / "logs" / "a-b" / "c" / "1" / "0.stdout.log").is_file())
+            self.assertTrue((output / "logs" / "a" / "b-c" / "1" / "0.stdout.log").is_file())
 
     def test_detached_checkout_has_valid_revision(self):
         with mock.patch.object(run, "_git", side_effect=["abc123", "", ""]):

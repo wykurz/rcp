@@ -32,7 +32,13 @@ or binaries on two independent hosts; that requires an additional endpoint adapt
 
 Use `--source-root` and `--destination-root` to choose existing parent directories on different
 filesystems. The harness creates unique owned subdirectories and never clears the supplied parents.
-Use `--bin-dir` for a prepared release build. `--baseline-bin-dir` adds an rcp baseline using its
+By default, the observed mount source and mountpoint identify each endpoint's storage in history.
+Use `--source-storage-id` and `--destination-storage-id` to declare stable storage profiles when
+device names or mountpoints change between allocations. These IDs are your declaration that the
+underlying storage configuration is comparable; use different IDs when it changes. Filesystem type
+and semantic mount options still distinguish series. Depot sets both IDs to `depot-root` for its
+ephemeral runner root filesystem, while retaining the actual mount details in each result. Use
+`--bin-dir` for a prepared release build. `--baseline-bin-dir` adds an rcp baseline using its
 matching daemon; both versions use the same fixture and measurement procedure.
 
 ```bash
@@ -140,7 +146,7 @@ A historical series includes the workload and measurement contract, normalized f
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate
 series. Scratch paths, timestamps, random fixture bytes and the tested rcp revision do not split the
 series: rcp changes are precisely what the history should expose. Keep runner labels stable and
-descriptive; use different labels for materially different storage configurations.
+descriptive, and distinguish materially different storage configurations with endpoint storage IDs.
 
 History is one immutable JSON file per run on the `benchmark-history` branch. CI artifacts preserve
 full logs and per-run standalone reports; the history branch provides persistence independent of
