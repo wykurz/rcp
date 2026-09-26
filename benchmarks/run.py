@@ -1,7 +1,6 @@
 """Run repeatable copy workloads and retain validated measurements."""
 
 import argparse
-from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -161,31 +160,55 @@ def plan_commands(variant, source, destination, tools, mode):
     return commands
 
 
-@contextmanager
-def _defer_interrupts():
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
-    pending = []
-    def remember(number, _frame):
-        pending.append(number)
-    for number in previous:
-        signal.signal(number, remember)
-    try:
-        yield
-    finally:
-        for number, handler in previous.items():
+class _CancelledSignal(Exception):
+    pass
+
+
+class _SignalCancellation:
+    def __init__(self, condition):
+        self.condition = condition
+        self.previous = {}
+        self.pending = None
+
+    def __enter__(self):
+        if threading.current_thread() is not threading.main_thread():
+            return self
+        self.previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+        installed = []
+        try:
+            for number in self.previous:
+                signal.signal(number, self._record)
+                installed.append(number)
+        except BaseException:
+            for number in reversed(installed):
+                signal.signal(number, self.previous[number])
+            raise
+        return self
+
+    def _record(self, number, _frame):
+        if self.previous[number] == signal.SIG_IGN:
+            return
+        if self.pending is None:
+            self.pending = number
+        with self.condition:
+            self.condition.notify_all()
+
+    def checkpoint(self):
+        if self.pending is not None:
+            raise _CancelledSignal
+
+    def __exit__(self, _type, _value, _traceback):
+        for number, handler in self.previous.items():
             signal.signal(number, handler)
-        if pending:
-            number = pending[0]
-            handler = previous[number]
+        if self.pending is not None:
+            number = self.pending
+            handler = self.previous[number]
             if callable(handler):
                 handler(number, None)
-            elif handler == signal.SIG_DFL:
-                if number == signal.SIGINT:
-                    raise KeyboardInterrupt
-                raise InterruptedError("SIGTERM")
+            if number == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise InterruptedError("SIGTERM")
+        return False
 
 
 def execute_commands(commands, log_dir, timeout):
@@ -212,14 +235,15 @@ def execute_commands(commands, log_dir, timeout):
                 with condition:
                     while len(finished) < len(children) and time.monotonic() < grace:
                         condition.wait(grace - time.monotonic())
-    try:
-        for index, command in enumerate(commands):
-            stdout_path = log_dir / f"{index}.stdout.log"
-            stderr_path = log_dir / f"{index}.stderr.log"
-            stdout = stdout_path.open("wb")
-            stderr = stderr_path.open("wb")
-            files.extend((stdout, stderr))
-            with _defer_interrupts():
+    with _SignalCancellation(condition) as cancellation:
+        try:
+            for index, command in enumerate(commands):
+                cancellation.checkpoint()
+                stdout_path = log_dir / f"{index}.stdout.log"
+                stderr_path = log_dir / f"{index}.stderr.log"
+                stdout = stdout_path.open("wb")
+                stderr = stderr_path.open("wb")
+                files.extend((stdout, stderr))
                 try:
                     process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
                 except OSError as exc:
@@ -235,22 +259,24 @@ def execute_commands(commands, log_dir, timeout):
                     waiter = threading.Thread(target=wait_child, daemon=True)
                     waiter.start()
                     waiters.append(waiter)
-            if launch_error:
-                break
-        deadline = started + timeout
-        with condition:
-            while len(finished) < len(children) and not launch_error:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                cancellation.checkpoint()
+                if launch_error is not None:
                     break
-                condition.wait(remaining)
-            timed_out = not launch_error and len(finished) < len(children)
-        cleanup_groups = bool(launch_error or timed_out or any(code != 0 for code, _ in finished.values()))
-    except BaseException:
-        cleanup_groups = True
-        raise
-    finally:
-        with _defer_interrupts():
+            deadline = started + timeout
+            with condition:
+                while len(finished) < len(children) and launch_error is None:
+                    cancellation.checkpoint()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    condition.wait(min(remaining, .1))
+                cancellation.checkpoint()
+                timed_out = launch_error is None and len(finished) < len(children)
+            cleanup_groups = bool(launch_error is not None or timed_out or any(code != 0 for code, _ in finished.values()))
+        except BaseException:
+            cleanup_groups = True
+            raise
+        finally:
             if cleanup_groups:
                 terminate_groups()
             for waiter in waiters:

@@ -146,6 +146,50 @@ class RunnerTests(unittest.TestCase):
                         child.kill()
                         child.wait()
 
+    def test_signal_handlers_remain_stable_until_timed_out_child_is_reaped(self):
+        with tempfile.TemporaryDirectory() as root:
+            spawned = []
+            unsafe_transitions = []
+            original_popen = run.subprocess.Popen
+            original_signal = run.signal.signal
+            def track_spawn(*args, **kwargs):
+                child = original_popen(*args, **kwargs)
+                spawned.append(child)
+                return child
+            def track_handler(number, handler):
+                if spawned and any(child.returncode is None for child in spawned):
+                    unsafe_transitions.append(number)
+                return original_signal(number, handler)
+            with mock.patch.object(run.subprocess, "Popen", side_effect=track_spawn), mock.patch.object(run.signal, "signal", side_effect=track_handler):
+                outcome = run.execute_commands([[sys.executable, "-c", "import time; time.sleep(2)"]], Path(root) / "logs", .05)
+            self.assertTrue(outcome["timed_out"])
+            self.assertTrue(all(child.returncode is not None for child in spawned))
+            self.assertEqual(unsafe_transitions, [])
+
+    def test_spawned_child_has_unblocked_sigterm(self):
+        with tempfile.TemporaryDirectory() as root:
+            command = [sys.executable, "-c", "import signal,sys; sys.exit(signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, []))"]
+            outcome = run.execute_commands([command], Path(root) / "logs", 2)
+            self.assertTrue(outcome["ok"])
+            self.assertEqual(outcome["exit_codes"], [0])
+
+    def test_ignored_sigterm_remains_ignored_while_child_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            previous = signal.getsignal(signal.SIGTERM)
+            original_popen = run.subprocess.Popen
+            def spawn_then_signal(*args, **kwargs):
+                child = original_popen(*args, **kwargs)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return child
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                with mock.patch.object(run.subprocess, "Popen", side_effect=spawn_then_signal):
+                    outcome = run.execute_commands([[sys.executable, "-c", "pass"]], Path(root) / "logs", 2)
+                self.assertTrue(outcome["ok"])
+                self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+
     def test_tree_validation_detects_changed_content_and_extra_paths(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "source"
