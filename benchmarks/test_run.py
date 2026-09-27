@@ -15,6 +15,78 @@ from benchmarks import report, run
 
 
 class RunnerTests(unittest.TestCase):
+    def _assert_rejected_before_fixture_work(self, variants, selections, diagnostic, baseline=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin"
+            binary.mkdir()
+            marker = root / "tool-started"
+            filegen = binary / "filegen"
+            filegen.write_text(f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\nraise SystemExit(99)\n")
+            filegen.chmod(0o755)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": variants}))
+            output = root / "out"
+            arguments = ["--manifest", str(manifest), "--bin-dir", str(binary), "--source-root", str(source), "--destination-root", str(destination), "--output", str(output), *selections]
+            if baseline:
+                arguments += ["--baseline-bin-dir", str(binary)]
+            with self.assertRaisesRegex(ValueError, diagnostic):
+                run.main(arguments)
+            self.assertFalse(marker.exists())
+            self.assertEqual(list(source.iterdir()), [])
+            self.assertEqual(list(destination.iterdir()), [])
+            record = report.parse_result((output / "results.json").read_text())
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(record["trials"], [])
+
+    def test_reserved_baseline_variant_is_rejected_even_when_unselected(self):
+        for tool in ("rcp", "rsync"):
+            with self.subTest(tool=tool):
+                self._assert_rejected_before_fixture_work([
+                    {"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1},
+                    {"id": "rcp-baseline", "tool": tool, "args": [], "processes": 1},
+                ], ["--case", "tiny", "--variant", "rcp-default"], "reserved.*rcp-baseline")
+
+    def test_repeated_selections_are_rejected_before_fixture_work(self):
+        for option, value in (("--case", "tiny"), ("--variant", "rcp-default")):
+            with self.subTest(option=option):
+                self._assert_rejected_before_fixture_work(
+                    [{"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1}],
+                    ["--case", "tiny", "--variant", "rcp-default", option, value], "duplicate",
+                )
+
+    def test_selector_rejects_repeated_case_and_variant_ids(self):
+        for kind in ("case", "variant"):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "duplicate"):
+                run._select([{"id": "copy"}], ["copy", "copy"], kind)
+
+    def test_baseline_requires_rcp_tool_before_fixture_work(self):
+        self._assert_rejected_before_fixture_work(
+            [{"id": "rcp-default", "tool": "rsync", "args": ["-a"], "processes": 1}],
+            ["--case", "tiny", "--variant", "rcp-default"], "baseline.*rcp", baseline=True,
+        )
+
+    def test_blank_runner_label_is_rejected_before_creating_output(self):
+        for label in ("", "  ", "\t\n"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "out"
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(SystemExit) as failure:
+                    run.main(["--output", str(output), "--runner-label", label, "--bin-dir", str(root), "--source-root", str(root), "--destination-root", str(root)])
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn("--runner-label", diagnostic.getvalue())
+                self.assertFalse(output.exists())
+                self.assertEqual(list(root.iterdir()), [])
+
+    def test_runner_label_trims_surrounding_whitespace(self):
+        args = run._arguments(["--output", "/tmp/unused-benchmark-out", "--runner-label", "  Depot runner  "])
+        self.assertEqual(args.runner_label, "Depot runner")
+
     def test_manifest_rejects_unknown_fields_and_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as root:
             manifest = Path(root) / "cases.json"

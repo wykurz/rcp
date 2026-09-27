@@ -122,10 +122,19 @@
       return item?.description ? `${id} · ${item.description}` : id;
     };
     const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)}`;
+    const sameRcpSettings = (candidate, baseline) => candidate?.tool === "rcp" && baseline?.tool === "rcp" &&
+      Array.isArray(candidate.args) && Array.isArray(baseline.args) &&
+      candidate.args.every(arg => typeof arg === "string") && baseline.args.every(arg => typeof arg === "string") &&
+      Number.isInteger(candidate.processes) && candidate.processes > 0 && candidate.processes === baseline.processes &&
+      JSON.stringify(candidate.args) === JSON.stringify(baseline.args);
     const ratios = (run, summary) => {
-      if (!summary.variant_id.startsWith("rcp-") || summary.variant_id === "rcp-baseline" || !summary.median) return [];
+      const candidate = run.variants.find(item => item.id === summary.variant_id);
+      if (candidate?.tool !== "rcp" || summary.variant_id === "rcp-baseline" || !summary.median) return [];
       return ["rsync-a", "rcp-baseline"].flatMap(reference => {
         const peer = run.summaries.find(item => item.case_id === summary.case_id && item.variant_id === reference);
+        const referenceVariant = run.variants.find(item => item.id === reference);
+        if (reference === "rsync-a" && referenceVariant?.tool !== "rsync") return [];
+        if (reference === "rcp-baseline" && !sameRcpSettings(candidate, referenceVariant)) return [];
         return peer ? [`${reference}: ${number(peer.median / summary.median)}×`] : [];
       });
     };

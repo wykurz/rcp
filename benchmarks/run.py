@@ -57,6 +57,8 @@ def load_manifest(path):
             identifier = entry["id"]
             if not isinstance(identifier, str) or not ID_PATTERN.fullmatch(identifier):
                 raise ValueError(f"invalid {kind} id: {identifier!r}")
+            if kind == "variants" and identifier == "rcp-baseline":
+                raise ValueError("reserved variant id: rcp-baseline")
             if identifier in seen:
                 raise ValueError(f"duplicate {kind} id: {identifier}")
             seen.add(identifier)
@@ -418,6 +420,8 @@ def _prepare_cache(policy, source, timeout):
 
 
 def _select(items, selected, kind):
+    if len(selected) != len(set(selected)):
+        raise ValueError(f"duplicate {kind} selection")
     by_id = {entry["id"]: entry for entry in items}
     missing = set(selected) - by_id.keys()
     if missing:
@@ -425,9 +429,9 @@ def _select(items, selected, kind):
     return [by_id[key] for key in selected]
 
 
-def _storage_id(value):
+def _nonblank(value):
     if not value.strip():
-        raise argparse.ArgumentTypeError("storage ID must not be blank")
+        raise argparse.ArgumentTypeError("value must not be blank")
     return value.strip()
 
 
@@ -441,13 +445,13 @@ def _arguments(argv):
     parser.add_argument("--mode", choices=("local", "loopback"), default="local")
     parser.add_argument("--source-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--destination-root", type=Path, default=Path(tempfile.gettempdir()))
-    parser.add_argument("--source-storage-id", type=_storage_id)
-    parser.add_argument("--destination-storage-id", type=_storage_id)
+    parser.add_argument("--source-storage-id", type=_nonblank)
+    parser.add_argument("--destination-storage-id", type=_nonblank)
     parser.add_argument("--cache", choices=("source-warm", "linux-drop-caches", "uncontrolled"), default="source-warm")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--runner-label", default="local")
+    parser.add_argument("--runner-label", type=_nonblank, default="local")
     parser.add_argument("--files-in-flight")
     return parser.parse_args(argv)
 
@@ -485,8 +489,8 @@ def main(argv=None):
             variants += [{**variant, "id": f"{variant['id']}-f{limit}", "args": [*variant["args"], f"--max-files-in-flight={limit}"]} for variant in variants if variant["tool"] == "rcp" for limit in limits]
         if args.baseline_bin_dir:
             default = next((variant for variant in variants if variant["id"] == "rcp-default"), None)
-            if default is None:
-                raise ValueError("baseline requires rcp-default selection")
+            if default is None or default["tool"] != "rcp":
+                raise ValueError("baseline requires rcp-default selection using tool rcp")
             variants.append({**default, "id": "rcp-baseline"})
         if len({variant["id"] for variant in variants}) != len(variants):
             raise ValueError("variant expansion produced duplicate ids")
