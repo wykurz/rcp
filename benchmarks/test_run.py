@@ -207,11 +207,12 @@ class RunnerTests(unittest.TestCase):
         case = {"id": "small", "directory_widths": [2], "files_per_leaf": 1, "file_size_bytes": 1}
         variant = {"id": "copy", "tool": "rcp", "args": ["--summary"], "processes": 1}
         environment = {"kernel": "Linux", "cpu_model": "Example", "filesystem": {"source": {"filesystem_type": "ext4", "mount_options": ["rw"], "mount_source": "/dev/a"}, "destination": {"filesystem_type": "xfs", "mount_options": ["rw"], "mount_source": "/dev/b"}}}
-        first = run.series_id(case, variant, "source-warm", "local", "runner", environment, {"rsync": "3.2"})
-        self.assertEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment, {"rsync": "3.2"}))
-        self.assertNotEqual(first, run.series_id(case, {**variant, "args": ["--summary", "--preserve-settings=all"]}, "source-warm", "local", "runner", environment, {"rsync": "3.2"}))
-        self.assertNotEqual(first, run.series_id(case, variant, "linux-drop-caches", "local", "runner", environment, {"rsync": "3.2"}))
-        self.assertEqual(first, run.series_id({**case, "description": "new prose"}, {**variant, "description": "new prose"}, "source-warm", "local", "runner", environment, {"rsync": "3.2"}))
+        tools = {"rsync": {"version": "3.2", "sha256": "a" * 64}}
+        first = run.series_id(case, variant, "source-warm", "local", "runner", environment, tools)
+        self.assertEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment, tools))
+        self.assertNotEqual(first, run.series_id(case, {**variant, "args": ["--summary", "--preserve-settings=all"]}, "source-warm", "local", "runner", environment, tools))
+        self.assertNotEqual(first, run.series_id(case, variant, "linux-drop-caches", "local", "runner", environment, tools))
+        self.assertEqual(first, run.series_id({**case, "description": "new prose"}, {**variant, "description": "new prose"}, "source-warm", "local", "runner", environment, tools))
 
     def test_series_id_ignores_overlay_allocation_paths_and_filegen_release(self):
         case = {"id": "small", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}
@@ -219,13 +220,39 @@ class RunnerTests(unittest.TestCase):
         def environment(device, lower, upper):
             mount = {"filesystem_type": "overlay", "mount_source": device, "mountpoint": upper, "mount_options": ["rw", f"lowerdir={lower}", f"upperdir={upper}", f"workdir={upper}/work", "relatime"]}
             return {"kernel": "Linux", "filesystem": {"source": mount, "destination": mount}}
-        first = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop1", "/layers/a", "/tmp/job1"), {"filegen": "0.41.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"})
-        changed_allocation = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"})
+        first_tools = {"filegen": {"version": "0.41.0", "sha256": "a" * 64}, "rcp": {"version": "0.41.0", "sha256": "a" * 64}, "rcpd": {"version": "0.41.0", "sha256": "a" * 64}, "rsync": {"version": "3.4", "sha256": "b" * 64}}
+        later_tools = {"filegen": {"version": "0.42.0", "sha256": "c" * 64}, "rcp": {"version": "0.42.0", "sha256": "c" * 64}, "rcpd": {"version": "0.42.0", "sha256": "c" * 64}, "rsync": {"version": "3.4", "sha256": "b" * 64}}
+        first = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop1", "/layers/a", "/tmp/job1"), first_tools, storage_ids={"source": "ci-root", "destination": "ci-root"})
+        changed_allocation = run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), later_tools, storage_ids={"source": "ci-root", "destination": "ci-root"})
         self.assertEqual(first, changed_allocation)
         semantic_change = environment("/dev/loop77", "/layers/b", "/tmp/job2")
         semantic_change["filesystem"]["source"]["mount_options"] = ["ro", "relatime", "lowerdir=/layers/b", "upperdir=/tmp/job2", "workdir=/tmp/job2/work"]
-        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", semantic_change, {"filegen": "0.42.0", "rsync": "3.4"}, storage_ids={"source": "ci-root", "destination": "ci-root"}))
-        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {"filegen": "0.42.0", "rsync": "3.5"}, storage_ids={"source": "ci-root", "destination": "ci-root"}))
+        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", semantic_change, later_tools, storage_ids={"source": "ci-root", "destination": "ci-root"}))
+        self.assertNotEqual(first, run.series_id(case, variant, "source-warm", "local", "runner", environment("/dev/loop77", "/layers/b", "/tmp/job2"), {**later_tools, "rsync": {"version": "3.5", "sha256": "d" * 64}}, storage_ids={"source": "ci-root", "destination": "ci-root"}))
+
+    def test_series_id_uses_rsync_digest_without_executable_path(self):
+        case = {"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}
+        variant = {"id": "rsync-a", "tool": "rsync", "args": ["-a"], "processes": 1}
+        environment = {"kernel": "Linux", "filesystem": {"source": {"filesystem_type": "xfs", "mount_options": ["rw"]}, "destination": {"filesystem_type": "xfs", "mount_options": ["rw"]}}}
+        first = run.series_id(case, variant, "source-warm", "local", "runner", environment, {"rsync": {"version": "3.4", "sha256": "a" * 64, "path": "/usr/bin/rsync"}}, {"source": "disk-a", "destination": "disk-b"})
+        relocated = run.series_id(case, variant, "source-warm", "local", "runner", environment, {"rsync": {"version": "3.4", "sha256": "a" * 64, "path": "/nix/store/rsync"}}, {"source": "disk-a", "destination": "disk-b"})
+        rebuilt = run.series_id(case, variant, "source-warm", "local", "runner", environment, {"rsync": {"version": "3.4", "sha256": "b" * 64, "path": "/nix/store/rsync"}}, {"source": "disk-a", "destination": "disk-b"})
+        self.assertEqual(first, relocated)
+        self.assertNotEqual(first, rebuilt)
+
+    def test_mountinfo_decodes_nested_paths_and_literal_escapes_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root) / "space name"
+            nested = parent / "literal\\040 and tab\tname\nline"
+            nested.mkdir(parents=True)
+            def encoded(path):
+                return str(path).replace("\\", r"\134").replace(" ", r"\040").replace("\t", r"\011").replace("\n", r"\012")
+            mountinfo = f"1 0 0:1 / {encoded(parent)} rw - ext4 /dev/parent rw\n2 1 0:2 / {encoded(nested)} rw - xfs " + r"server:\134040literal\040name\012line\011tab" + " rw\n"
+            with mock.patch.object(run, "_read", return_value=mountinfo):
+                mount = run._mount(nested / "child")
+            self.assertEqual(mount["mountpoint"], str(nested))
+            self.assertEqual(mount["mount_source"], r"server:\040literal name" + "\nline\ttab")
+            self.assertEqual(mount["filesystem_type"], "xfs")
 
     def test_loopback_rsync_pulls_from_localhost(self):
         with tempfile.TemporaryDirectory() as root:
@@ -280,6 +307,28 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(result["trials"]), 4)
             self.assertTrue((output / "logs" / "a-b" / "c" / "1" / "0.stdout.log").is_file())
             self.assertTrue((output / "logs" / "a" / "b-c" / "1" / "0.stdout.log").is_file())
+
+    def test_rebuilt_rsync_with_same_version_starts_new_series(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "bin"
+            binary.mkdir()
+            filegen = binary / "filegen"
+            filegen.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nif '--version' in sys.argv: print('filegen 1'); sys.exit(0)\np=pathlib.Path(sys.argv[1])/'filegen'/'dir'; p.mkdir(parents=True); (p/'file').write_bytes(b'x')\n")
+            filegen.chmod(0o755)
+            rsync = binary / "rsync"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": [{"id": "rsync-a", "tool": "rsync", "args": ["-a"], "processes": 1}]}))
+            results = []
+            for build in (1, 2):
+                rsync.write_text("#!/usr/bin/env python3\nimport pathlib,shutil,sys\nif '--version' in sys.argv: print('rsync 1'); sys.exit(0)\nshutil.copytree(sys.argv[-2].rstrip('/'),sys.argv[-1].rstrip('/'),dirs_exist_ok=True)\n" + f"# build {build}\n")
+                rsync.chmod(0o755)
+                with mock.patch.object(run.shutil, "which", return_value=str(rsync)):
+                    results.append(run.main(["--manifest", str(manifest), "--case", "tiny", "--variant", "rsync-a", "--bin-dir", str(binary), "--cache", "uncontrolled", "--repetitions", "1", "--source-root", str(root), "--destination-root", str(root), "--source-storage-id", "test-source", "--destination-storage-id", "test-destination", "--output", str(root / f"out-{build}")]))
+            self.assertEqual([result["status"] for result in results], ["complete", "complete"])
+            self.assertEqual(results[0]["tools"]["rsync"]["version"], results[1]["tools"]["rsync"]["version"])
+            self.assertNotEqual(results[0]["tools"]["rsync"]["sha256"], results[1]["tools"]["rsync"]["sha256"])
+            self.assertNotEqual(results[0]["summaries"][0]["series_id"], results[1]["summaries"][0]["series_id"])
 
     def test_detached_checkout_has_valid_revision(self):
         with mock.patch.object(run, "_git", side_effect=["abc123", "", ""]):

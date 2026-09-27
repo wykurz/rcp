@@ -24,6 +24,7 @@ TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and 
 VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents"
 FIXTURE_CONTRACT_REVISION = 1
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+MOUNTINFO_ESCAPE = re.compile(r"\\(040|011|012|134)")
 
 
 def _fields(value, required, optional, name):
@@ -299,6 +300,8 @@ def _read(path):
 
 
 def _mount(path):
+    def decoded(field):
+        return MOUNTINFO_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), field)
     resolved = str(Path(path).resolve())
     best = {}
     for line in _read("/proc/self/mountinfo").splitlines():
@@ -309,9 +312,9 @@ def _mount(path):
         right = after.split()
         if len(left) < 6 or len(right) < 3:
             continue
-        mountpoint = left[4].replace("\\040", " ")
+        mountpoint = decoded(left[4])
         if (resolved == mountpoint or resolved.startswith(mountpoint.rstrip("/") + "/")) and len(mountpoint) > len(best.get("mountpoint", "")):
-            best = {"mountpoint": mountpoint, "filesystem_type": right[0], "mount_source": right[1], "mount_options": sorted(set(left[5].split(",") + right[2].split(",")))}
+            best = {"mountpoint": mountpoint, "filesystem_type": right[0], "mount_source": decoded(right[1]), "mount_options": sorted(set(left[5].split(",") + right[2].split(",")))}
     return best
 
 
@@ -326,7 +329,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, reference_versions, storage_ids=None):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -337,7 +340,9 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         identity = {"kind": "explicit", "value": storage_ids[side]} if storage_ids.get(side) is not None else {"kind": "observed", "mount_source": info.get("mount_source"), "mountpoint": info.get("mountpoint")}
         return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options)), "storage_identity": identity}
     comparable_environment["filesystem"] = {side: semantic_mount(side, info) for side, info in filesystem.items()}
-    stable_references = {key: version for key, version in reference_versions.items() if key not in ("filegen", "rcp", "rcpd")}
+    stable_references = {}
+    if "rsync" in tools:
+        stable_references["rsync"] = {"version": tools["rsync"]["version"], "sha256": tools["rsync"]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -499,7 +504,6 @@ def main(argv=None):
         record["context"]["environment"] = endpoints
         _persist(output, record)
         tools = {key: value["path"] for key, value in record["tools"].items()}
-        references = {key: value["version"] for key, value in record["tools"].items() if key == "rsync"}
         for case in cases:
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
@@ -551,7 +555,7 @@ def main(argv=None):
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                record["summaries"].append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, references, storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                record["summaries"].append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             _persist(output, record)
         record["status"] = "complete"
         shutil.rmtree(source_scratch)

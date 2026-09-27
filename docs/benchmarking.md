@@ -147,9 +147,11 @@ information is available, and same-run comparisons to rsync or a supplied rcp ba
 
 A historical series includes the workload and measurement contract, normalized flags, runner and
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate
-series. Scratch paths, timestamps, random fixture bytes and the tested rcp revision do not split the
-series: rcp changes are precisely what the history should expose. Keep runner labels stable and
-descriptive, and distinguish materially different storage configurations with endpoint storage IDs.
+series. The rsync executable's version and SHA-256 digest also distinguish series, so a changed
+reference binary does not share a trend with the old one. Scratch paths, timestamps, random fixture
+bytes and the tested rcp revision do not split the series: rcp changes are precisely what the
+history should expose. Keep runner labels stable and descriptive, and distinguish materially
+different storage configurations with endpoint storage IDs.
 
 History is one immutable JSON file per run on the `benchmark-history` branch. CI artifacts preserve
 full logs and per-run standalone reports; the history branch provides persistence independent of
@@ -169,8 +171,8 @@ just benchmark-report /path/to/history-checkout --output /tmp/rcp-history-site
 [Depot benchmarks](../.depot/workflows/benchmarks.yml) run `tiny-10k`, `medium-4k`, and `large-100`
 on PRs and main. Weekly runs include `tiny-1m` as well. A manual run measures only its selected
 case; all four cases are available. The fixed 32-CPU x86 runner uses a source-warm loopback pull
-with three repetitions by default. Manual runs can select Linux cache dropping. PRs also build the
-PR base revision and measure it in the same job.
+with three repetitions by default. PRs also build the PR base revision and run four repetitions so
+each of the four variants leads once in the rotation. Manual runs can select Linux cache dropping.
 
 ```bash
 just depot-benchmark

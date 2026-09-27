@@ -17,7 +17,7 @@ class StorageIdentityTests(unittest.TestCase):
         self.profiles = {"source": "source-storage", "destination": "destination-storage"}
 
     def series(self, environment=None, profiles=None):
-        arguments = (self.case, self.variant, "source-warm", "local", "runner", environment or self.environment, {"rsync": "3.4"})
+        arguments = (self.case, self.variant, "source-warm", "local", "runner", environment or self.environment, {"rsync": {"version": "3.4", "sha256": "a" * 64}})
         return run.series_id(*arguments) if profiles is None else run.series_id(*arguments, storage_ids=profiles)
 
     def test_different_devices_and_swapped_endpoints_split_series(self):
