@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(--mode loopback --cache "$SELECTED_CACHE"
-                --repetitions 3 --runner-label depot-ubuntu-24.04-32
+                --runner-label depot-ubuntu-24.04-32
                 --source-storage-id depot-root --destination-storage-id depot-root
                 --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
                 --output "$RUNNER_TEMP/benchmark-results")
@@ -84,9 +84,12 @@ jobs:
           else
             args+=(--case tiny-10k --case medium-4k --case large-100)
           fi
+          repetitions=3
           if [[ -n "${RCP_BENCH_BASELINE_BIN:-}" ]]; then
             args+=(--baseline-bin-dir "$RCP_BENCH_BASELINE_BIN")
+            repetitions=4
           fi
+          args+=(--repetitions "$repetitions")
           just benchmark-run "${args[@]}"
       - name: Attach summary and standalone report
         if: always()
