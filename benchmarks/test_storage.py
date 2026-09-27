@@ -96,6 +96,18 @@ class StorageIdentityTests(unittest.TestCase):
         candidate_changes = {**tools, **{tool: {**tools[tool], "version": "0.42.0", "sha256": "b" * 64} for tool in ("rcp", "rcpd")}}
         self.assertEqual(original, run.series_id(*arguments, candidate_changes))
 
+    def test_loopback_ssh_client_and_transport_profile_split_series(self):
+        arguments = (self.case, self.variant, "source-warm", "loopback", "runner", self.environment)
+        ssh = {"version": "OpenSSH_9.6", "sha256": "a" * 64, "path": "/usr/bin/ssh"}
+        original = run.series_id(*arguments, {"ssh": ssh}, ssh_transport_profile="ci-v1")
+        for changed in ({"version": "OpenSSH_9.7"}, {"sha256": "b" * 64}):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(original, run.series_id(*arguments, {"ssh": {**ssh, **changed}}, ssh_transport_profile="ci-v1"))
+        self.assertNotEqual(original, run.series_id(*arguments, {"ssh": ssh}, ssh_transport_profile="ci-v2"))
+        self.assertEqual(original, run.series_id(*arguments, {"ssh": {**ssh, "path": "/nix/store/ssh"}}, ssh_transport_profile="ci-v1"))
+        local = (self.case, self.variant, "source-warm", "local", "runner", self.environment)
+        self.assertEqual(run.series_id(*local, {"ssh": ssh}), run.series_id(*local, {"ssh": {**ssh, "sha256": "b" * 64}}))
+
 
 if __name__ == "__main__":
     unittest.main()

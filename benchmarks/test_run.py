@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -15,6 +16,49 @@ from benchmarks import report, run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cli_accepts_nonblank_ssh_transport_profile_for_loopback(self):
+        args = run._arguments(["--output", "/tmp/unused-benchmark-result", "--mode", "loopback", "--ssh-transport-profile", "  ci-v1  "])
+        self.assertEqual(args.ssh_transport_profile, "ci-v1")
+
+    def test_cli_rejects_ssh_transport_profile_in_local_mode(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run._arguments(["--output", "/tmp/unused-benchmark-result", "--ssh-transport-profile", "ci-v1"])
+
+    def test_cli_rejects_blank_ssh_transport_profile(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run._arguments(["--output", "/tmp/unused-benchmark-result", "--mode", "loopback", "--ssh-transport-profile", "  "])
+
+    def test_loopback_records_resolved_ssh_and_profile_in_distinct_series(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin"
+            binary.mkdir()
+            filegen = binary / "filegen"
+            filegen.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nif '--version' in sys.argv: print('filegen 1'); sys.exit(0)\np=pathlib.Path(sys.argv[1])/'filegen'/'0'; p.mkdir(parents=True); (p/'file').write_bytes(b'x')\n")
+            rcp = binary / "rcp"
+            rcp.write_text("#!/usr/bin/env python3\nimport pathlib,shutil,sys\nif '--version' in sys.argv: print('rcp 1'); sys.exit(0)\nshutil.copytree(sys.argv[-2].removeprefix('localhost:'), sys.argv[-1])\n")
+            rcpd = binary / "rcpd"
+            rcpd.write_text("#!/bin/sh\necho 'rcpd 1'\n")
+            ssh = binary / "ssh"
+            ssh.write_text("#!/bin/sh\nif [ \"$1\" = '-V' ]; then echo 'OpenSSH_test' >&2; exit 0; fi\nexit 2\n")
+            for executable in (filegen, rcp, rcpd, ssh):
+                executable.chmod(0o755)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": [{"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1}]}))
+            identities = []
+            for index, profile in enumerate(("ci-v1", "ci-v2", None)):
+                with self.subTest(profile=profile), mock.patch.object(run.shutil, "which", side_effect=lambda name: str(ssh) if name == "ssh" else None):
+                    args = ["--manifest", str(manifest), "--case", "tiny", "--variant", "rcp-default", "--mode", "loopback", "--bin-dir", str(binary), "--source-root", str(root), "--destination-root", str(root), "--cache", "uncontrolled", "--repetitions", "1", "--output", str(root / f"out-{index}")]
+                    if profile is not None:
+                        args += ["--ssh-transport-profile", profile]
+                    result = run.main(args)
+                    identities.append(result["summaries"][0]["series_id"])
+                    self.assertEqual(result["status"], "complete")
+                    self.assertEqual(result["context"]["ssh_transport_profile"], profile)
+                    self.assertEqual(result["tools"]["ssh"], {"path": str(ssh), "version": "OpenSSH_test", "sha256": hashlib.sha256(ssh.read_bytes()).hexdigest()})
+                    self.assertEqual(report.parse_result((root / f"out-{index}" / "results.json").read_text()), result)
+            self.assertEqual(len(set(identities)), 3)
+
     def test_cp_loopback_is_rejected_before_fixture_work(self):
         self._assert_rejected_before_fixture_work(
             [{"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}],
@@ -28,6 +72,12 @@ class RunnerTests(unittest.TestCase):
                     {"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1},
                     {"id": "reference", "tool": tool, "args": ["-a"], "processes": 1},
                 ], ["--case", "tiny", "--variant", "reference", "--files-in-flight", "2,4"], "files-in-flight.*selected rcp")
+
+    def test_blank_concurrency_sweep_is_rejected_before_fixture_work(self):
+        self._assert_rejected_before_fixture_work(
+            [{"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1}],
+            ["--case", "tiny", "--variant", "rcp-default", "--files-in-flight", ""], "files-in-flight.*positive",
+        )
 
     def test_planner_rejects_remote_cp_before_resolving_tools(self):
         with self.assertRaisesRegex(ValueError, "cp.*local"):
@@ -167,6 +217,15 @@ class RunnerTests(unittest.TestCase):
             manifest.write_text(json.dumps({"schema_version": True, "cases": [{"id": "small", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": [{"id": "copy", "tool": "rsync", "args": ["-a"], "processes": 1}]}))
             with self.assertRaisesRegex(ValueError, "schema_version"):
                 run.load_manifest(manifest)
+
+    def test_manifest_rejects_duplicate_keys_at_every_definition_level(self):
+        raw = json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": [{"id": "copy", "tool": "rcp", "args": [], "processes": 1}]})
+        for key, original, replacement in (("schema_version", '"schema_version": 1', '"schema_version": 2, "schema_version": 1'), ("file_size_bytes", '"file_size_bytes": 1', '"file_size_bytes": 2, "file_size_bytes": 1'), ("tool", '"tool": "rcp"', '"tool": "cp", "tool": "rcp"')):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                manifest = Path(directory) / "manifest.json"
+                manifest.write_text(raw.replace(original, replacement))
+                with self.assertRaisesRegex(ValueError, f"duplicate JSON key: {key}"):
+                    run.load_manifest(manifest)
 
     def test_partitioned_rsync_commands_cover_disjoint_top_level_directories(self):
         with tempfile.TemporaryDirectory() as root:

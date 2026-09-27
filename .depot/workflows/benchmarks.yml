@@ -82,6 +82,10 @@ jobs:
                 --source-storage-id depot-root --destination-storage-id depot-root
                 --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
                 --output "$RUNNER_TEMP/benchmark-results")
+          if [[ "$BENCHMARK_MODE" == loopback ]]; then
+            ssh_transport_profile="$(sha256sum /usr/sbin/sshd .depot/actions/rcp-rust-setup/action.yml | sha256sum | cut -d ' ' -f 1)"
+            args+=(--ssh-transport-profile "$ssh_transport_profile")
+          fi
           if [[ "$BENCHMARK_EVENT" == pull_request || "$BENCHMARK_EVENT" == push ]]; then
             args+=(--purpose smoke --cache source-warm
                    --case tiny-10k --case medium-4k --case large-100)

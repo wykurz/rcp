@@ -27,6 +27,11 @@ exercises an encrypted remote **pull**, but both endpoints share a machine, kern
 storage unless separate filesystem roots are supplied. It is not a measurement of a physical 100G
 link or two independent servers.
 
+Loopback records the SSH client version and binary digest. Use `--ssh-transport-profile` to identify
+the server and configuration when running outside CI; without it, that part of the transport is
+unknown. Depot supplies a digest of the actual daemon binary and the source-owned SSH setup action,
+so changes to either start a new series without recording keys or temporary configuration paths.
+
 `local` compares rcp, GNU `cp -a`, and both rsync variants without SSH. Both rcp and cp retain their
 default reflink policy; a reflink-capable filesystem can make these copies much faster. The Depot
 storage profile uses ext4, and sizing must be recalibrated for other storage profiles. `cp-a` is
@@ -181,11 +186,12 @@ different metadata or concurrency settings does not receive a ratio against that
 
 A historical series includes the workload and measurement contract, normalized flags, runner and
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate
-series. Versions and SHA-256 digests for cp, rsync, and any supplied baseline rcp/rcpd binaries also
-distinguish series, so a changed reference binary does not share a trend with the old one. Scratch
-paths, timestamps, random fixture bytes and the tested rcp revision do not split the series: rcp
-changes are precisely what the history should expose. Keep runner labels stable and descriptive, and
-distinguish materially different storage configurations with endpoint storage IDs.
+series. Versions and SHA-256 digests for cp, rsync, loopback SSH, and any supplied baseline rcp/rcpd
+binaries also distinguish series, as does a supplied SSH transport profile, so changed reference or
+transport binaries do not share a trend with the old ones. Scratch paths, timestamps, random fixture
+bytes and the tested rcp revision do not split the series: rcp changes are precisely what the
+history should expose. Keep runner labels stable and descriptive, and distinguish materially
+different storage configurations with endpoint storage IDs.
 
 History is one immutable JSON file per run on the `benchmark-history` branch. CI artifacts preserve
 full logs and per-run standalone reports; the history branch provides persistence independent of

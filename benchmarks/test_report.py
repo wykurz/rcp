@@ -48,6 +48,20 @@ class ReportTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_ssh_transport_profile_is_nullable_and_loopback_only(self):
+        result = sample_run()
+        result["context"]["ssh_transport_profile"] = None
+        self.assertEqual(report.validate_result(result), result)
+        result["context"]["ssh_transport_profile"] = "ci-v1"
+        self.assertEqual(report.validate_result(result), result)
+        result["context"]["ssh_transport_profile"] = "  "
+        with self.assertRaisesRegex(ValueError, "ssh_transport_profile"):
+            report.validate_result(result)
+        result["context"]["ssh_transport_profile"] = "ci-v1"
+        result["context"]["topology"] = "local"
+        with self.assertRaisesRegex(ValueError, "ssh_transport_profile.*loopback"):
+            report.validate_result(result)
+
     def render(self, input_path):
         output = self.root / "site"
         result = subprocess.run(
