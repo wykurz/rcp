@@ -72,6 +72,16 @@ class StorageIdentityTests(unittest.TestCase):
         self.assertEqual(arguments.source_storage_id, "source")
         self.assertEqual(arguments.destination_storage_id, "destination")
 
+    def test_cp_reference_version_and_digest_split_series_but_path_does_not(self):
+        arguments = (self.case, self.variant, "source-warm", "local", "runner", self.environment)
+        reference = {"version": "cp 9.11", "sha256": "a" * 64, "path": "/usr/bin/cp"}
+        original = run.series_id(*arguments, {"cp": reference})
+        relocated = run.series_id(*arguments, {"cp": {**reference, "path": "/nix/store/cp"}})
+        self.assertEqual(original, relocated)
+        for change in ({"version": "cp 9.12"}, {"sha256": "b" * 64}):
+            with self.subTest(change=change):
+                self.assertNotEqual(original, run.series_id(*arguments, {"cp": {**reference, **change}}))
+
 
 if __name__ == "__main__":
     unittest.main()

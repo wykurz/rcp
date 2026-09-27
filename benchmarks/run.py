@@ -23,7 +23,7 @@ import uuid
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
 VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents"
-FIXTURE_CONTRACT_REVISION = 1
+FIXTURE_CONTRACT_REVISION = 2
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 MOUNTINFO_ESCAPE = re.compile(r"\\(040|011|012|134)")
 
@@ -73,8 +73,8 @@ def load_manifest(path):
                 _positive(entry["files_per_leaf"], "files_per_leaf")
                 _positive(entry["file_size_bytes"], "file_size_bytes")
             else:
-                if entry["tool"] not in ("rcp", "rsync"):
-                    raise ValueError("variant tool must be rcp or rsync")
+                if entry["tool"] not in ("rcp", "rsync", "cp"):
+                    raise ValueError("variant tool must be rcp, rsync, or cp")
                 if not isinstance(entry["args"], list) or not all(isinstance(arg, str) and arg for arg in entry["args"]):
                     raise ValueError("variant args must be nonempty strings")
                 _positive(entry["processes"], "processes")
@@ -145,6 +145,8 @@ def plan_commands(variant, source, destination, tools, mode):
     source = Path(source)
     destination = Path(destination)
     tool = variant["tool"]
+    if tool == "cp" and mode != "local":
+        raise ValueError("cp variants require local mode")
     executable = str(tools[tool])
     args = list(variant["args"])
     if tool == "rcp" and mode == "loopback":
@@ -350,14 +352,16 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options)), "storage_identity": identity}
     comparable_environment["filesystem"] = {side: semantic_mount(side, info) for side, info in filesystem.items()}
     stable_references = {}
-    if "rsync" in tools:
-        stable_references["rsync"] = {"version": tools["rsync"]["version"], "sha256": tools["rsync"]["sha256"]}
+    for tool in ("rsync", "cp"):
+        if tool in tools:
+            stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _tool(path):
-    path = Path(path).resolve(strict=True)
+    # preserve the invoked basename for multicall binaries such as Nix coreutils
+    path = Path(path).absolute()
     if not os.access(path, os.X_OK):
         raise ValueError(f"not executable: {path}")
     digest = hashlib.sha256()
@@ -393,6 +397,8 @@ def _persist(output, record):
     temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     temporary.replace(output / "results.json")
     lines = [f"# Benchmark {record['run_id']}", "", f"Status: **{record['status']}**", ""]
+    if record.get("context", {}).get("purpose") == "smoke":
+        lines += ["Smoke check; excluded from performance trends.", ""]
     if record.get("error"):
         lines += [f"Error: {record['error']}", ""]
     if record["summaries"]:
@@ -400,6 +406,10 @@ def _persist(output, record):
                   "| --- | --- | ---: | ---: | ---: |"]
     for summary in record["summaries"]:
         lines.append(f"| {summary['case_id']} | {summary['variant_id']} | {summary['median']:.3f} | {summary['minimum']:.3f}–{summary['maximum']:.3f} | {len(summary['samples'])} |")
+    if record.get("context", {}).get("purpose") != "smoke":
+        short = [f"{item['case_id']}/{item['variant_id']}" for item in record["summaries"] if item["minimum"] < 10]
+        if short:
+            lines += ["", "Short samples (<10 s): " + ", ".join(short) + ". Treat small timing changes cautiously."]
     (output / "summary.md").write_text("\n".join(lines) + "\n")
 
 
@@ -443,6 +453,7 @@ def _arguments(argv):
     parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--baseline-bin-dir", type=Path)
     parser.add_argument("--mode", choices=("local", "loopback"), default="local")
+    parser.add_argument("--purpose", choices=("smoke", "performance"), default="performance")
     parser.add_argument("--source-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--destination-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--source-storage-id", type=_nonblank)
@@ -468,7 +479,7 @@ def main(argv=None):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
-    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files; random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
     if args.baseline_bin_dir:
         record["context"]["baseline_commit"] = os.environ.get("RCP_BENCH_BASELINE_COMMIT", "")
     storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
@@ -481,7 +492,10 @@ def main(argv=None):
             raise ValueError("repetitions and timeout must be positive")
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
-        variants = _select(manifest["variants"], args.variants or ["rcp-default", "rsync-a", "rsync-a-10"], "variant")
+        default_variants = ["rcp-default", "rsync-a", "rsync-a-10"] + (["cp-a"] if args.mode == "local" else [])
+        variants = _select(manifest["variants"], args.variants or default_variants, "variant")
+        if args.mode != "local" and any(variant["tool"] == "cp" for variant in variants):
+            raise ValueError("cp variants require local mode")
         if args.files_in_flight:
             limits = args.files_in_flight.split(",")
             if any(not item.isdecimal() or int(item) <= 0 for item in limits):
@@ -496,7 +510,7 @@ def main(argv=None):
             raise ValueError("variant expansion produced duplicate ids")
         record["cases"] = cases
         record["variants"] = variants
-        record["context"]["metadata_policies"] = {variant["id"]: ("rcp preserve-settings=all includes atime" if variant["tool"] == "rcp" and "--preserve-settings=all" in variant["args"] else "rcp defaults" if variant["tool"] == "rcp" else "rsync -a archive; differs from rcp preserve-all for atime") for variant in variants}
+        record["context"]["metadata_policies"] = {variant["id"]: ("rcp preserve-settings=all includes atime" if variant["tool"] == "rcp" and "--preserve-settings=all" in variant["args"] else "rcp defaults" if variant["tool"] == "rcp" else "cp -a archive; preserves all supported attributes" if variant["tool"] == "cp" else "rsync -a archive; differs from rcp preserve-all for atime") for variant in variants}
         _persist(output, record)
         for root in (args.source_root, args.destination_root):
             if not root.is_dir():
@@ -505,16 +519,16 @@ def main(argv=None):
         destination_scratch = Path(tempfile.mkdtemp(prefix="rcp-bench-destination-", dir=args.destination_root)).resolve()
         bin_dir = (args.bin_dir or _default_bin_dir()).resolve()
         needs_rcp = any(variant["tool"] == "rcp" for variant in variants)
-        needs_rsync = any(variant["tool"] == "rsync" for variant in variants)
         record["tools"]["filegen"] = _tool(bin_dir / "filegen")
         if needs_rcp:
             record["tools"]["rcp"] = _tool(bin_dir / "rcp")
             record["tools"]["rcpd"] = _tool(bin_dir / "rcpd")
-        if needs_rsync:
-            rsync = shutil.which("rsync")
-            if not rsync:
-                raise ValueError("rsync executable not found")
-            record["tools"]["rsync"] = _tool(rsync)
+        for tool in ("rsync", "cp"):
+            if any(variant["tool"] == tool for variant in variants):
+                executable = shutil.which(tool)
+                if not executable:
+                    raise ValueError(f"{tool} executable not found")
+                record["tools"][tool] = _tool(executable)
         if args.baseline_bin_dir:
             record["tools"]["rcp-baseline"] = _tool(args.baseline_bin_dir / "rcp")
             record["tools"]["rcpd-baseline"] = _tool(args.baseline_bin_dir / "rcpd")
@@ -525,7 +539,7 @@ def main(argv=None):
         for case in cases:
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
-            filegen_command = [tools["filegen"], str(fixture_root), ",".join(map(str, case["directory_widths"])), str(case["files_per_leaf"]), str(case["file_size_bytes"]), "--leaf-files"]
+            filegen_command = [tools["filegen"], str(fixture_root), ",".join(map(str, case["directory_widths"])), str(case["files_per_leaf"]), str(case["file_size_bytes"]), "--leaf-files", f"--bufsize={min(case['file_size_bytes'], 1048576)}"]
             generated = subprocess.run(filegen_command, capture_output=True, text=True, timeout=args.timeout)
             (output / "logs" / f"{case['id']}.filegen.stdout.log").write_text(generated.stdout)
             (output / "logs" / f"{case['id']}.filegen.stderr.log").write_text(generated.stderr)
@@ -577,6 +591,7 @@ def main(argv=None):
                 case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
+            shutil.rmtree(fixture_root)
         record["status"] = "complete"
         shutil.rmtree(source_scratch)
         shutil.rmtree(destination_scratch)

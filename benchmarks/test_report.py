@@ -81,7 +81,7 @@ const document = {getElementById: id => ids[id], createElement: tag => new Eleme
 vm.runInNewContext(code, {document});
 const descendants = element => [element, ...element.children.flatMap(descendants)];
 const chart = descendants(ids.chart), rows = descendants(ids["run-rows"]);
-console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), table: rows.map(item => item.textContent).join(" "), comparisons: ids["run-rows"].children.map(row => row.children[4].textContent)}));
+console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), tooltips: chart.filter(item => item.tagName === "title").map(item => item.textContent), table: rows.map(item => item.textContent).join(" "), comparisons: ids["run-rows"].children.map(row => row.children[4].textContent)}));
 '''
         process = subprocess.run(["node", "-e", script, str(output / "index.html")], capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)
@@ -347,6 +347,66 @@ console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circl
         comparisons = self.dashboard_state(output)["comparisons"][0]
         self.assertNotIn("rcp-baseline:", comparisons)
         self.assertIn("rsync-a:", comparisons)
+
+    def test_smoke_runs_stay_in_table_without_trend_points_or_ratios(self):
+        run = sample_run()
+        run["context"]["topology"] = "local"
+        run["context"]["purpose"] = "smoke"
+        run["variants"].append({"id": "cp-a", "description": "cp archive copy", "tool": "cp", "args": ["-a"], "processes": 1})
+        run["trials"].extend({"case_id": "tiny-10k", "variant_id": "cp-a", "iteration": iteration, "elapsed_seconds": 2.4, "exit_codes": [0], "status": "ok", "commands": [["cp"]], "validation": {"ok": True}, "logs": []} for iteration in (1, 2, 3))
+        run["summaries"].append({"series_id": "2" * 64, "case_id": "tiny-10k", "variant_id": "cp-a", "unit": "seconds", "median": 2.4, "minimum": 2.4, "maximum": 2.4, "stdev": 0.0, "samples": [2.4] * 3, "files_per_second": 4000.0})
+        source = self.root / "results.json"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["points"], 0)
+        self.assertIn("smoke", dashboard["table"])
+        self.assertEqual(dashboard["comparisons"], ["—"])
+        run["context"].pop("purpose")
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["points"], 2)
+        self.assertIn("cp-a: 2×", dashboard["comparisons"][0])
+        run["variants"][1]["tool"] = "rsync"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn("cp-a:", self.dashboard_state(output)["comparisons"][0])
+
+    def test_short_performance_repeat_is_warned_without_hiding_point(self):
+        run = sample_run()
+        for trial, seconds in zip(run["trials"], (9.0, 10.0, 11.0)):
+            trial["elapsed_seconds"] = seconds
+        run["summaries"][0].update({"minimum": 9.0, "median": 10.0, "maximum": 11.0, "stdev": 1.0, "samples": [9.0, 10.0, 11.0]})
+        source = self.root / "results.json"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["points"], 1)
+        self.assertIn("under 10 s", dashboard["table"])
+        self.assertIn("under 10 s", dashboard["tooltips"][0])
+        run["context"]["purpose"] = "smoke"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["points"], 0)
+        self.assertNotIn("under 10 s", dashboard["table"])
+        run["context"]["purpose"] = "performance"
+        for trial in run["trials"]:
+            trial["elapsed_seconds"] = 10.0
+        run["summaries"][0].update({"minimum": 10.0, "median": 10.0, "maximum": 10.0, "stdev": 0.0, "samples": [10.0, 10.0, 10.0]})
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["points"], 1)
+        self.assertNotIn("under 10 s", dashboard["table"])
+        self.assertNotIn("under 10 s", dashboard["tooltips"][0])
 
 
 if __name__ == "__main__":

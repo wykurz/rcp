@@ -15,6 +15,59 @@ from benchmarks import report, run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cp_loopback_is_rejected_before_fixture_work(self):
+        self._assert_rejected_before_fixture_work(
+            [{"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}],
+            ["--case", "tiny", "--variant", "cp-a", "--mode", "loopback"], "cp.*local",
+        )
+
+    def test_planner_rejects_remote_cp_before_resolving_tools(self):
+        with self.assertRaisesRegex(ValueError, "cp.*local"):
+            run.plan_commands({"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}, Path("source"), Path("destination"), {}, "loopback")
+
+    def test_default_selections_include_cp_only_locally(self):
+        for mode, expected in (("local", ["rcp-default", "rsync-a", "rsync-a-10", "cp-a"]), ("loopback", ["rcp-default", "rsync-a", "rsync-a-10"])):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = root / "manifest.json"
+                manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny-10k", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": [{"id": identifier, "tool": tool, "args": [], "processes": 1} for identifier, tool in (("rcp-default", "rcp"), ("rsync-a", "rsync"), ("rsync-a-10", "rsync"), ("cp-a", "cp"))]}))
+                output = root / "out"
+                with mock.patch.object(run, "_tool", side_effect=RuntimeError("stop before generation")), self.assertRaisesRegex(RuntimeError, "stop before generation"):
+                    run.main(["--manifest", str(manifest), "--mode", mode, "--bin-dir", str(root), "--source-root", str(root), "--destination-root", str(root), "--output", str(output)])
+                result = report.parse_result((output / "results.json").read_text())
+                self.assertEqual([variant["id"] for variant in result["variants"]], expected)
+                self.assertEqual(result["context"]["purpose"], "performance")
+
+    def test_real_cp_copies_single_and_partitioned_fixtures(self):
+        for size, buffer_size in ((7, 7), (1048577, 1048576)):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                filegen = binary / "filegen"
+                filegen.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nif '--version' in sys.argv: print('filegen 1'); sys.exit(0)\nprint(' '.join(sys.argv[2:]))\nfor index in range(2):\n p=pathlib.Path(sys.argv[1])/'filegen'/str(index); p.mkdir(parents=True); (p/'file').write_bytes(b'x'*int(sys.argv[4]))\n")
+                filegen.chmod(0o755)
+                manifest = root / "manifest.json"
+                manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [2], "files_per_leaf": 1, "file_size_bytes": size}], "variants": [{"id": identifier, "tool": "cp", "args": ["-a"], "processes": processes} for identifier, processes in (("cp-a", 1), ("cp-parallel", 2))]}))
+                output = root / "out"
+                result = run.main(["--manifest", str(manifest), "--case", "tiny", "--variant", "cp-a", "--variant", "cp-parallel", "--purpose", "smoke", "--bin-dir", str(binary), "--source-root", str(root), "--destination-root", str(root), "--cache", "uncontrolled", "--repetitions", "1", "--output", str(output)])
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual(result["context"]["purpose"], "smoke")
+                self.assertEqual(set(result["tools"]), {"filegen", "cp"})
+                self.assertEqual(len(result["tools"]["cp"]["sha256"]), 64)
+                self.assertTrue(result["tools"]["cp"]["version"])
+                self.assertEqual([trial["validation"]["ok"] for trial in result["trials"]], [True, True])
+                single, parallel = (trial["commands"] for trial in result["trials"])
+                self.assertEqual(len(single), 1)
+                self.assertEqual(len(parallel), 2)
+                for command in [*single, *parallel]:
+                    self.assertEqual(command[1:-2], ["-a"])
+                self.assertEqual(Path(single[0][-2]).name, "filegen")
+                self.assertEqual({Path(command[-2]).name for command in parallel}, {"0", "1"})
+                self.assertEqual(len({command[-1] for command in parallel}), 1)
+                self.assertEqual((output / "logs" / "tiny.filegen.stdout.log").read_text().strip(), f"2 1 {size} --leaf-files --bufsize={buffer_size}")
+                self.assertFalse(list(root.glob("rcp-bench-*")))
+
     def _assert_rejected_before_fixture_work(self, variants, selections, diagnostic, baseline=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -463,6 +516,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(record["status"], "failed")
             self.assertEqual({item["case_id"] for item in record["summaries"]}, {"first"})
             self.assertEqual(len(record["summaries"]), 2)
+            scratch = Path(record["context"]["failure_artifacts"]["source_scratch"])
+            self.assertFalse((scratch / "first").exists())
+            self.assertTrue((scratch / "later" / "filegen").is_dir())
 
     def test_detached_checkout_has_valid_revision(self):
         with mock.patch.object(run, "_git", side_effect=["abc123", "", ""]):
@@ -492,6 +548,19 @@ class RunnerTests(unittest.TestCase):
             binary.chmod(0o755)
             with self.assertRaisesRegex(ValueError, "version output"):
                 run._tool(binary)
+
+    def test_tool_preserves_symlink_name_for_multicall_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "multicall"
+            binary.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nprint(pathlib.Path(sys.argv[0]).name + ' 1')\n")
+            binary.chmod(0o755)
+            alias = root / "cp"
+            alias.symlink_to(binary)
+            tool = run._tool(alias)
+            self.assertEqual(tool["path"], str(alias))
+            self.assertEqual(tool["version"], "cp 1")
+            self.assertEqual(tool["sha256"], run._tool(binary)["sha256"])
 
     def test_log_open_failure_closes_already_open_stdout(self):
         with tempfile.TemporaryDirectory() as root:
