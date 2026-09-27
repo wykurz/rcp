@@ -541,27 +541,6 @@ Remote file data is always streamed as bytes between `rcpd` processes. Consequen
 `--reflink=auto` and `--reflink=never` have the same remote behavior, and the option adds no field
 or other change to the wire protocol.
 
-Files up to 64 KiB use bounded filesystem batching without changing framing or flush boundaries. On
-the hardened source path, one admitted blocking job opens the file, obtains its actual descriptor
-metadata, and reads exactly that size when it is at most 64 KiB. A short read fails before the
-header is sent; growth beyond the observed size is not sent. Larger files retain an unread streaming
-handle, and `--dereference` retains its path-based streaming behavior. Requested ACLs are still read
-through the same data descriptor using their existing metadata gates.
-
-The destination plans and reserves I/O budget first, then receives a small payload completely before
-removing an existing entry. One admitted blocking job creates the owner-only destination and writes
-the buffered bytes through that descriptor. A create-stage `EEXIST` permits one replan and retry,
-retaining the buffer; a skip after receive does not drain again. Final metadata still runs through
-the existing descriptor-based setter after successful writes, and completed data is counted before
-metadata errors. Larger files retain streaming writes.
-
-Each metadata operation retains its static rate token, congestion permit and latency probe. The
-probe completes and congestion permit is released before payload I/O; descriptor admission remains
-held across the blocking job and unclaimed output. Cancellation discards queued work and asks
-started small-file jobs to stop before subsequent operations or bounded chunks. It cannot interrupt
-an in-progress syscall or roll back writes. Buffers are limited to 64 KiB per active file, with
-concurrency bounded by existing file admission and connection pools.
-
 ### 2.5 Entry Metadata and POSIX ACLs
 
 Every message that describes an entry (`Directory`, `Symlink`, `File`, and each `ExistingEntry` in a
@@ -1303,10 +1282,6 @@ receiving more files:
 | **NeedsDrain**   | Error before reading data (e.g., can't create file)   | Drain `size` bytes, continue with next file            |
 | **DataConsumed** | Error after reading all data (e.g., metadata failure) | Stream at clean boundary, continue immediately         |
 | **Corrupted**    | Error during data transfer                            | Close connection (other pooled connections unaffected) |
-
-For buffered small files, receive failures are `Corrupted`. After a successful complete receive,
-filesystem failures (including creation, writing, removal and `EEXIST` replan failures) are
-`DataConsumed`. Initial planning failures remain `NeedsDrain`.
 
 This distinction matters for pool efficiency:
 
