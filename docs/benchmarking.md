@@ -143,7 +143,10 @@ Each output directory contains versioned `results.json`, a `summary.md`, and per
 Results retain the revision and dirty status, executable fingerprints and versions, exact commands,
 case definitions, cache/topology/runner context, raw repetitions, validation outcomes and summaries.
 The report shows wall time over measurement date, repeat spread, commit links when repository
-information is available, and same-run comparisons to rsync or a supplied rcp baseline.
+information is available, and same-run comparisons to rsync or a supplied rcp baseline. Completed
+cases remain in the chart when a later case fails or the run is interrupted. Their summaries are
+checked against successful trials; unfinished cases do not produce trend points. Revision fields are
+unknown when the harness runs outside a Git repository.
 
 A historical series includes the workload and measurement contract, normalized flags, runner and
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate
@@ -160,6 +163,13 @@ Publication appends with normal Git pushes and retries concurrent updates withou
 Validated terminal failures are also recorded, so a failed measurement remains visible in history.
 Failures before the harness creates a result, such as a build failure, remain in CI logs.
 
+The history job runs after the benchmark job has ended. It passes `--finalize-interrupted` to the
+publisher so a saved `running` artifact becomes a failed history record with an explicit recovery
+diagnostic. Completed trials and case summaries are retained; running trials are marked failed. The
+original artifact is unchanged. For manual recovery, use this flag only after confirming the
+producer has stopped. Without it, publication rejects a `running` record. A hard runner shutdown can
+prevent artifact upload entirely, in which case there is no result for the history job to recover.
+
 To render downloaded history locally:
 
 ```bash
@@ -173,6 +183,9 @@ on PRs and main. Weekly runs include `tiny-1m` as well. A manual run measures on
 case; all four cases are available. The fixed 32-CPU x86 runner uses a source-warm loopback pull
 with three repetitions by default. PRs also build the PR base revision and run four repetitions so
 each of the four variants leads once in the rotation. Manual runs can select Linux cache dropping.
+Weekly runs and manual `tiny-1m` runs have a 90-minute job budget; routine runs have 45 minutes. New
+PR revisions cancel superseded benchmark runs. Main-branch history runs are not cancelled by newer
+revisions.
 
 ```bash
 just depot-benchmark
@@ -213,4 +226,6 @@ One-time repository setup:
 4. After the first history run, run **Benchmark history** manually if needed.
 
 Until Pages is enabled, run artifacts and durable history remain usable. This PR prepares the
-workflow; a successful remote measurement is not proof that Pages publication has occurred.
+workflow; a successful remote measurement is not proof that Pages publication has occurred. Inspect
+the first post-merge history job to confirm both the history push and repository dispatch succeed
+with the Depot App token.

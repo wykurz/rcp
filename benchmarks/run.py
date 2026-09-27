@@ -11,6 +11,7 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -90,7 +91,11 @@ def expected_counts(case):
 
 def scan_tree(root):
     root = Path(root)
-    if not root.is_dir() or root.is_symlink():
+    try:
+        root_metadata = root.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"missing regular directory: {root}") from exc
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError(f"missing regular directory: {root}")
     entries = {}
     counts = {"directories": 0, "files": 0, "bytes": 0}
@@ -98,17 +103,18 @@ def scan_tree(root):
         for name in sorted(dirs + files):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if path.is_symlink():
+            metadata = path.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"unexpected symlink: {relative}")
-            if path.is_dir():
+            if stat.S_ISDIR(metadata.st_mode):
                 entries[relative] = {"type": "directory"}
                 counts["directories"] += 1
-            elif path.is_file():
+            elif stat.S_ISREG(metadata.st_mode):
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
                     for block in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(block)
-                size = path.stat().st_size
+                size = metadata.st_size
                 entries[relative] = {"type": "file", "size": size, "sha256": digest.hexdigest()}
                 counts["files"] += 1
                 counts["bytes"] += size
@@ -243,8 +249,9 @@ def execute_commands(commands, log_dir, timeout):
                 stdout_path = log_dir / f"{index}.stdout.log"
                 stderr_path = log_dir / f"{index}.stderr.log"
                 stdout = stdout_path.open("wb")
+                files.append(stdout)
                 stderr = stderr_path.open("wb")
-                files.extend((stdout, stderr))
+                files.append(stderr)
                 try:
                     process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
                 except OSError as exc:
@@ -358,18 +365,25 @@ def _tool(path):
     result = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10)
     if result.returncode:
         raise ValueError(f"version command failed: {path}")
-    return {"path": str(path), "version": (result.stdout or result.stderr).splitlines()[0], "sha256": digest.hexdigest()}
+    version_output = result.stdout.strip() or result.stderr.strip()
+    if not version_output:
+        raise ValueError(f"missing version output: {path}")
+    return {"path": str(path), "version": version_output.splitlines()[0], "sha256": digest.hexdigest()}
 
 
 def _git(*args):
-    result = subprocess.run(["git", *args], capture_output=True, text=True)
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
+    try:
+        result = subprocess.run(["git", *args], capture_output=True, text=True)
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def _revision():
     commit = _git("rev-parse", "HEAD")
     branch = _git("branch", "--show-current")
-    return {"commit": commit, "branch": branch or None, "dirty": bool(_git("status", "--porcelain"))}
+    status = _git("status", "--porcelain")
+    return {"commit": commit or None, "branch": branch or None, "dirty": None if status is None else bool(status)}
 
 
 def _persist(output, record):
@@ -422,7 +436,7 @@ def _arguments(argv):
     parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("cases.json"))
     parser.add_argument("--case", action="append", dest="cases")
     parser.add_argument("--variant", action="append", dest="variants")
-    parser.add_argument("--bin-dir", type=Path, default=_default_bin_dir())
+    parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--baseline-bin-dir", type=Path)
     parser.add_argument("--mode", choices=("local", "loopback"), default="local")
     parser.add_argument("--source-root", type=Path, default=Path(tempfile.gettempdir()))
@@ -485,7 +499,7 @@ def main(argv=None):
                 raise ValueError(f"scratch parent does not exist: {root}")
         source_scratch = Path(tempfile.mkdtemp(prefix="rcp-bench-source-", dir=args.source_root)).resolve()
         destination_scratch = Path(tempfile.mkdtemp(prefix="rcp-bench-destination-", dir=args.destination_root)).resolve()
-        bin_dir = args.bin_dir.resolve()
+        bin_dir = (args.bin_dir or _default_bin_dir()).resolve()
         needs_rcp = any(variant["tool"] == "rcp" for variant in variants)
         needs_rsync = any(variant["tool"] == "rsync" for variant in variants)
         record["tools"]["filegen"] = _tool(bin_dir / "filegen")
@@ -552,10 +566,12 @@ def main(argv=None):
                     if trial["status"] != "ok":
                         raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                     shutil.rmtree(destination)
+            case_summaries = []
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                record["summaries"].append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+            record["summaries"].extend(case_summaries)
             _persist(output, record)
         record["status"] = "complete"
         shutil.rmtree(source_scratch)
