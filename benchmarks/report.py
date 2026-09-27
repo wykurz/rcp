@@ -41,6 +41,13 @@ def _reject_constant(value):
     raise ValueError(f"invalid JSON number: {value}")
 
 
+def _finite_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"nonfinite JSON number: {value}")
+    return number
+
+
 def _unique_pairs(pairs):
     value = {}
     for key, item in pairs:
@@ -48,6 +55,11 @@ def _unique_pairs(pairs):
             raise ValueError(f"duplicate JSON key: {key}")
         value[key] = item
     return value
+
+
+def parse_result(text):
+    """Parse strict JSON and validate one schema-one result."""
+    return validate_result(json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float, object_pairs_hook=_unique_pairs))
 
 
 def validate_result(value):
@@ -71,8 +83,8 @@ def validate_result(value):
         _text(revision["commit"], "revision.commit")
     if revision.get("branch") is not None:
         _text(revision["branch"], "revision.branch")
-    if not isinstance(revision.get("dirty"), bool):
-        raise ValueError("revision.dirty must be a boolean")
+    if "dirty" not in revision or (revision["dirty"] is not None and not isinstance(revision["dirty"], bool)):
+        raise ValueError("revision.dirty must be a boolean or null")
     context = _object(run.get("context"), "context")
     for field in ("runner_label", "topology", "cache_policy", "timing_policy"):
         _text(context.get(field), f"context.{field}")
@@ -139,23 +151,35 @@ def validate_result(value):
             raise ValueError(f"summaries[{i}] minimum, median, maximum are inconsistent")
         if min(samples) < summary["minimum"] - 1e-9 or max(samples) > summary["maximum"] + 1e-9:
             raise ValueError(f"summaries[{i}] samples fall outside minimum/maximum")
+    summarized = set()
+    for i, summary in enumerate(run["summaries"]):
+        pair = (summary["case_id"], summary["variant_id"])
+        if pair in summarized:
+            raise ValueError(f"summaries[{i}] duplicates a case and variant")
+        summarized.add(pair)
+        matching = [trial for trial in run["trials"] if (trial["case_id"], trial["variant_id"]) == pair]
+        if not matching or any(trial["status"] != "ok" for trial in matching):
+            raise ValueError(f"summaries[{i}].samples require only successful matching trials")
+        samples = [trial["elapsed_seconds"] for trial in matching]
+        if samples != summary["samples"]:
+            raise ValueError(f"summaries[{i}].samples do not match successful trials")
+        for name, expected in (("minimum", min(samples)), ("maximum", max(samples)), ("median", statistics.median(samples)), ("stdev", statistics.stdev(samples) if len(samples) > 1 else 0.0)):
+            if not math.isclose(summary[name], expected, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError(f"summaries[{i}].{name} does not match successful trials")
+    for case_id in {case_id for case_id, _ in summarized}:
+        if any((case_id, variant_id) not in summarized for variant_id in variant_ids):
+            raise ValueError(f"summaries contain an incomplete case: {case_id}")
+        repetitions = None
+        for variant_id in variant_ids:
+            iterations = sorted(trial["iteration"] for trial in run["trials"] if (trial["case_id"], trial["variant_id"]) == (case_id, variant_id))
+            if iterations != list(range(1, len(iterations) + 1)) or (repetitions is not None and iterations != repetitions):
+                raise ValueError(f"summaries for {case_id} have incomplete repetitions")
+            repetitions = iterations
     if run["status"] == "complete":
         if not run["trials"] or not run["summaries"]:
             raise ValueError("complete run requires trials and summaries")
         if any(trial["status"] != "ok" for trial in run["trials"]):
             raise ValueError("complete run contains an unfinished or failed trial")
-        summarized = set()
-        for i, summary in enumerate(run["summaries"]):
-            pair = (summary["case_id"], summary["variant_id"])
-            if pair in summarized:
-                raise ValueError(f"summaries[{i}] duplicates a case and variant")
-            summarized.add(pair)
-            samples = [trial["elapsed_seconds"] for trial in run["trials"] if (trial["case_id"], trial["variant_id"]) == pair]
-            if not samples or samples != summary["samples"]:
-                raise ValueError(f"summaries[{i}].samples do not match successful trials")
-            for name, expected in (("minimum", min(samples)), ("maximum", max(samples)), ("median", statistics.median(samples)), ("stdev", statistics.stdev(samples) if len(samples) > 1 else 0.0)):
-                if not math.isclose(summary[name], expected, rel_tol=1e-9, abs_tol=1e-12):
-                    raise ValueError(f"summaries[{i}].{name} does not match successful trials")
         if summarized != {(case_id, variant_id) for case_id in case_ids for variant_id in variant_ids}:
             raise ValueError("summaries must cover every selected case and variant")
     if run.get("error") is not None and not isinstance(run["error"], str):
@@ -178,7 +202,7 @@ def load_results(path):
     by_id = {}
     for file in files:
         try:
-            run = validate_result(json.loads(file.read_text(encoding="utf-8"), parse_constant=_reject_constant, object_pairs_hook=_unique_pairs))
+            run = parse_result(file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError) as error:
             raise ValueError(f"{file}: {error}") from error
         earlier = by_id.get(run["run_id"])

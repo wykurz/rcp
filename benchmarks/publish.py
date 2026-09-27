@@ -1,4 +1,4 @@
-"""Append one terminal benchmark result to an immutable Git history branch."""
+"""Append a terminal result, optionally recovering an interrupted producer's artifact."""
 
 import argparse
 import json
@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 
-from benchmarks.report import validate_result
+from benchmarks.report import parse_result, validate_result
 
 
 def git(directory, *arguments, environment=None, check=True, input_text=None):
@@ -34,7 +34,10 @@ def publication_environment(directory):
     )
     if auth.returncode not in (0, 1):
         raise ValueError("cannot read Git authentication configuration")
-    entries = [entry.split("\n", 1) for entry in auth.stdout.split("\0") if entry]
+    entries = []
+    for entry in filter(None, auth.stdout.split("\0")):
+        key, separator, value = entry.partition("\n")
+        entries.append([key, value if separator else "true"])
     for variable in git(directory, "rev-parse", "--local-env-vars").stdout.splitlines():
         environment.pop(variable, None)
     environment = {
@@ -59,8 +62,21 @@ def publication_environment(directory):
     return environment
 
 
-def publish(result_path, repository, remote="origin", branch="benchmark-history", attempts=5):
-    record = validate_result(json.loads(Path(result_path).read_text(encoding="utf-8")))
+def publish(result_path, repository, remote="origin", branch="benchmark-history", attempts=5, *, finalize_interrupted=False):
+    """Append history; recovery requires the caller to assert the producer has ended."""
+    record = parse_result(Path(result_path).read_text(encoding="utf-8"))
+    if record["status"] == "running" and finalize_interrupted:
+        interrupted = "Benchmark interrupted: producer ended before recording a terminal result."
+        record["status"] = "failed"
+        record["error"] = "; ".join(filter(None, [record.get("error"), interrupted]))
+        record["context"]["publication_recovery"] = {
+            "publisher": "benchmarks.publish", "original_status": "running", "producer_ended_asserted": True,
+        }
+        for trial in record["trials"]:
+            if trial["status"] == "running":
+                trial["status"] = "failed"
+                trial["validation"].update({"ok": False, "error": interrupted})
+        validate_result(record)
     if record["status"] not in {"complete", "failed"}:
         raise ValueError("status must be complete or failed before publishing a benchmark result")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -87,12 +103,12 @@ def publish(result_path, repository, remote="origin", branch="benchmark-history"
         for _ in range(attempts):
             listed = git(directory, "ls-remote", "--heads", destination, reference, environment=environment)
             if listed.stdout.strip():
-                git(directory, "fetch", "--quiet", "--no-tags", destination, reference, environment=environment)
+                git(directory, "fetch", "--quiet", "--no-tags", "--depth", "1", destination, reference, environment=environment)
                 parent = git(directory, "rev-parse", "FETCH_HEAD", environment=environment).stdout.strip()
                 git(directory, "read-tree", parent, environment=environment)
                 existing = git(directory, "show", f"{parent}:{relative}", environment=environment, check=False)
                 if existing.returncode == 0:
-                    if json.loads(existing.stdout) != record:
+                    if parse_result(existing.stdout) != record:
                         raise ValueError(f"conflicting result already exists for run_id {record['run_id']}")
                     return record["run_id"], parent, False
             else:
@@ -120,10 +136,15 @@ def main(arguments=None):
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--branch", default="benchmark-history")
     parser.add_argument("--attempts", default=5, type=int)
+    parser.add_argument(
+        "--finalize-interrupted", action="store_true",
+        help="assert the producer has ended and publish a running artifact as an interrupted failure",
+    )
     arguments = parser.parse_args(arguments)
     try:
         run_id, commit, created = publish(
             arguments.result, arguments.repository, arguments.remote, arguments.branch, arguments.attempts,
+            finalize_interrupted=arguments.finalize_interrupted,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"benchmark publication failed: {error}", file=sys.stderr)

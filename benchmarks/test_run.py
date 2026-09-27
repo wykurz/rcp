@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import time
 import unittest
 from unittest import mock
 
-from benchmarks import run
+from benchmarks import report, run
 
 
 class RunnerTests(unittest.TestCase):
@@ -203,6 +205,36 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(validation["ok"])
             self.assertIn("extra", validation["error"])
 
+    def test_tree_scan_uses_one_nofollow_stat_per_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / "tree"
+            child = tree / "child"
+            child.mkdir(parents=True)
+            leaf = child / "leaf"
+            leaf.write_bytes(b"payload")
+            original = Path.stat
+            observations = []
+            def checked_stat(path, *args, **kwargs):
+                observations.append((Path(path), kwargs.get("follow_symlinks")))
+                return original(path, *args, **kwargs)
+            with mock.patch.object(Path, "stat", checked_stat):
+                result = run.scan_tree(tree)
+            self.assertEqual(result["counts"], {"directories": 1, "files": 1, "bytes": 7})
+            self.assertEqual(observations, [(tree, False), (child, False), (leaf, False)])
+
+    def test_tree_scan_rejects_symlink_and_special_entries(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / "tree"
+            tree.mkdir()
+            symlink = tree / "link"
+            symlink.symlink_to(Path(root))
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                run.scan_tree(tree)
+            symlink.unlink()
+            os.mkfifo(tree / "fifo")
+            with self.assertRaisesRegex(ValueError, "special"):
+                run.scan_tree(tree)
+
     def test_series_id_ignores_commit_and_scratch_but_tracks_meaningful_flags(self):
         case = {"id": "small", "directory_widths": [2], "files_per_leaf": 1, "file_size_bytes": 1}
         variant = {"id": "copy", "tool": "rcp", "args": ["--summary"], "processes": 1}
@@ -330,9 +362,81 @@ class RunnerTests(unittest.TestCase):
             self.assertNotEqual(results[0]["tools"]["rsync"]["sha256"], results[1]["tools"]["rsync"]["sha256"])
             self.assertNotEqual(results[0]["summaries"][0]["series_id"], results[1]["summaries"][0]["series_id"])
 
+    def test_later_case_summary_failure_preserves_only_complete_case(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "bin"
+            binary.mkdir()
+            filegen = binary / "filegen"
+            filegen.write_text("#!/usr/bin/env python3\nimport pathlib,sys\nif '--version' in sys.argv: print('filegen 1'); sys.exit(0)\np=pathlib.Path(sys.argv[1])/'filegen'/'dir'; p.mkdir(parents=True); (p/'file').write_bytes(b'x')\n")
+            filegen.chmod(0o755)
+            rsync = binary / "rsync"
+            rsync.write_text("#!/usr/bin/env python3\nimport shutil,sys\nif '--version' in sys.argv: print('rsync 1'); sys.exit(0)\nshutil.copytree(sys.argv[-2].rstrip('/'),sys.argv[-1].rstrip('/'),dirs_exist_ok=True)\n")
+            rsync.chmod(0o755)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": case, "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1} for case in ("first", "later")], "variants": [{"id": variant, "tool": "rsync", "args": ["-a"], "processes": 1} for variant in ("copy-a", "copy-b")]}))
+            original_series_id = run.series_id
+            calls = 0
+            def interrupt_second_later(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 4:
+                    raise RuntimeError("summary interrupted")
+                return original_series_id(*args, **kwargs)
+            output = root / "out"
+            with mock.patch.object(run.shutil, "which", return_value=str(rsync)), mock.patch.object(run, "series_id", side_effect=interrupt_second_later):
+                with self.assertRaisesRegex(RuntimeError, "summary interrupted"):
+                    run.main(["--manifest", str(manifest), "--case", "first", "--case", "later", "--variant", "copy-a", "--variant", "copy-b", "--bin-dir", str(binary), "--cache", "uncontrolled", "--repetitions", "1", "--source-root", str(root), "--destination-root", str(root), "--output", str(output)])
+            record = report.parse_result((output / "results.json").read_text())
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual({item["case_id"] for item in record["summaries"]}, {"first"})
+            self.assertEqual(len(record["summaries"]), 2)
+
     def test_detached_checkout_has_valid_revision(self):
         with mock.patch.object(run, "_git", side_effect=["abc123", "", ""]):
             self.assertEqual(run._revision(), {"commit": "abc123", "branch": None, "dirty": False})
+
+    def test_failed_git_queries_leave_revision_unknown(self):
+        failed = subprocess.CompletedProcess(["git"], 1, "", "")
+        with mock.patch.object(run.subprocess, "run", return_value=failed):
+            self.assertEqual(run._revision(), {"commit": None, "branch": None, "dirty": None})
+
+    def test_missing_git_executable_leaves_revision_unknown(self):
+        with mock.patch.object(run.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertEqual(run._revision(), {"commit": None, "branch": None, "dirty": None})
+
+    def test_help_and_explicit_binary_dir_do_not_discover_default(self):
+        with mock.patch.object(run, "_default_bin_dir", side_effect=AssertionError("eager discovery")):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as help_exit:
+                run._arguments(["--help"])
+            self.assertEqual(help_exit.exception.code, 0)
+            args = run._arguments(["--output", "/tmp/benchmark-out", "--bin-dir", "/tmp/prepared-bin"])
+            self.assertEqual(args.bin_dir, Path("/tmp/prepared-bin"))
+
+    def test_tool_without_version_output_has_clear_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "silent"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "version output"):
+                run._tool(binary)
+
+    def test_log_open_failure_closes_already_open_stdout(self):
+        with tempfile.TemporaryDirectory() as root:
+            original = Path.open
+            opened = []
+            def fail_stderr(path, *args, **kwargs):
+                if Path(path).name == "0.stderr.log":
+                    raise OSError("stderr unavailable")
+                handle = original(path, *args, **kwargs)
+                if Path(path).name == "0.stdout.log":
+                    opened.append(handle)
+                return handle
+            with mock.patch.object(Path, "open", fail_stderr):
+                with self.assertRaisesRegex(OSError, "stderr unavailable"):
+                    run.execute_commands([[sys.executable, "-c", "pass"]], Path(root) / "logs", 1)
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].closed)
 
     def test_source_warm_aborts_when_sync_times_out(self):
         with tempfile.TemporaryDirectory() as root:

@@ -78,7 +78,7 @@
     </section>
     <section aria-labelledby="runs-heading">
       <h2 id="runs-heading">Runs</h2>
-      <p class="subtle">Failures stay in this table and never contribute a zero-time chart point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
+      <p class="subtle">Failures stay in this table. A completed case from a later failed run still appears in the chart; incomplete cases have no point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
       <div class="table-wrap"><table><thead><tr><th>Date (UTC)</th><th>Result</th><th>Revision</th><th>Machine / policy</th><th>rcp vs references</th><th>Details</th></tr></thead><tbody id="run-rows"></tbody></table></div>
     </section>
   </main>
@@ -104,7 +104,7 @@
     const date = stamp => new Date(stamp).toLocaleDateString(undefined, {year: "numeric", month: "short", day: "numeric", timeZone: "UTC"});
     const number = value => Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
     const group = run => `${run.context.runner_label} · ${run.context.topology} · ${run.context.cache_policy}`;
-    const allPoints = runs.flatMap(run => run.status === "complete" ? run.summaries.map(summary => ({run, summary})) : []);
+    const allPoints = runs.flatMap(run => run.summaries.map(summary => ({run, summary})));
     const options = (id, values, allLabel) => {
       const select = $(id);
       const previous = select.value;
@@ -113,8 +113,14 @@
       for (const value of values) { const option = node("option", value); option.value = value; select.append(option); }
       select.value = values.includes(previous) ? previous : "";
     };
-    const caseName = (run, id) => run.cases.find(item => item.id === id)?.name || id;
-    const variantName = (run, id) => run.variants.find(item => item.id === id)?.name || id;
+    const caseName = (run, id) => {
+      const item = run.cases.find(item => item.id === id);
+      return item?.description ? `${id} · ${item.description}` : id;
+    };
+    const variantName = (run, id) => {
+      const item = run.variants.find(item => item.id === id);
+      return item?.description ? `${id} · ${item.description}` : id;
+    };
     const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)}`;
     const ratios = (run, summary) => {
       if (!summary.variant_id.startsWith("rcp-") || summary.variant_id === "rcp-baseline" || !summary.median) return [];
@@ -191,7 +197,8 @@
         if (slug && /^[0-9a-f]{7,64}$/.test(hash)) {
           const link = node("a", hash.slice(0, 10)); link.href = `https://github.com/${slug}/commit/${hash}`; link.rel = "noopener noreferrer"; rev.append(link);
         } else rev.append(node("code", hash.slice(0, 10)));
-        if (run.revision.dirty) rev.append(node("span", " · dirty"));
+        if (run.revision.dirty === true) rev.append(node("span", " · dirty"));
+        if (run.revision.dirty === null) rev.append(node("span", " · working tree unknown"));
         const machine = node("td", group(run));
         const comparisons = node("td");
         const comparisonLines = run.summaries.flatMap(item => ratios(run,item).map(ratio => `${caseName(run,item.case_id)} · ${variantName(run,item.variant_id)} / ${ratio}`));
