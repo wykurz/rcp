@@ -12,13 +12,13 @@ on:
       case:
         description: Fileset to measure
         type: choice
-        options: [tiny-10k, tiny-1m, medium-4k, large-100]
-        default: tiny-10k
+        options: [all, tiny-1m, medium-128k, large-120]
+        default: all
       cache:
         description: Cache preparation procedure
         type: choice
         options: [source-warm, linux-drop-caches]
-        default: source-warm
+        default: linux-drop-caches
 
 permissions:
   contents: read
@@ -36,9 +36,13 @@ env:
 
 jobs:
   benchmark:
-    name: Copy benchmarks (informational timing)
+    name: Copy benchmarks (${{ matrix.mode }}, informational timing)
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [local, loopback]
     runs-on: depot-ubuntu-24.04-32
-    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.case == 'tiny-1m') && 90 || 45 }}
+    timeout-minutes: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 45 || 120 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,26 +72,34 @@ jobs:
       - name: Measure copies
         env:
           BENCHMARK_EVENT: ${{ github.event_name }}
-          SELECTED_CASE: ${{ inputs.case || '' }}
-          SELECTED_CACHE: ${{ inputs.cache || 'source-warm' }}
+          SELECTED_CASE: ${{ inputs.case || 'all' }}
+          SELECTED_CACHE: ${{ inputs.cache || 'linux-drop-caches' }}
+          BENCHMARK_MODE: ${{ matrix.mode }}
         run: |
           set -euo pipefail
-          args=(--mode loopback --cache "$SELECTED_CACHE"
+          args=(--mode "$BENCHMARK_MODE"
                 --runner-label depot-ubuntu-24.04-32
                 --source-storage-id depot-root --destination-storage-id depot-root
                 --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
                 --output "$RUNNER_TEMP/benchmark-results")
-          if [[ "$BENCHMARK_EVENT" == schedule ]]; then
-            args+=(--case tiny-10k --case tiny-1m --case medium-4k --case large-100)
-          elif [[ "$BENCHMARK_EVENT" == workflow_dispatch && -n "$SELECTED_CASE" ]]; then
-            args+=(--case "$SELECTED_CASE")
+          if [[ "$BENCHMARK_EVENT" == pull_request || "$BENCHMARK_EVENT" == push ]]; then
+            args+=(--purpose smoke --cache source-warm
+                   --case tiny-10k --case medium-4k --case large-100)
           else
-            args+=(--case tiny-10k --case medium-4k --case large-100)
+            args+=(--purpose performance --cache "$SELECTED_CACHE" --timeout 1200)
+            if [[ "$SELECTED_CASE" == all ]]; then
+              args+=(--case tiny-1m --case medium-128k --case large-120)
+            else
+              args+=(--case "$SELECTED_CASE")
+            fi
           fi
           repetitions=3
+          if [[ "$BENCHMARK_MODE" == local ]]; then
+            repetitions=4
+          fi
           if [[ -n "${RCP_BENCH_BASELINE_BIN:-}" ]]; then
             args+=(--baseline-bin-dir "$RCP_BENCH_BASELINE_BIN")
-            repetitions=4
+            repetitions=$((repetitions + 1))
           fi
           args+=(--repetitions "$repetitions")
           just benchmark-run "${args[@]}"
@@ -106,7 +118,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: benchmark-results
+          name: benchmark-results-${{ matrix.mode }}
           path: ${{ runner.temp }}/benchmark-results
           if-no-files-found: warn
           retention-days: 90
@@ -116,8 +128,7 @@ jobs:
     needs: benchmark
     if: >-
       always() && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'schedule' ||
-       github.event_name == 'workflow_dispatch')
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -131,25 +142,38 @@ jobs:
         id: measurements
         continue-on-error: true
         with:
-          name: benchmark-results
+          pattern: benchmark-results-*
           path: downloaded-results
       - name: Check for a recorded run
         id: recorded
         if: steps.measurements.outcome == 'success'
         run: |
-          if [[ -f downloaded-results/results.json ]]; then
+          shopt -s nullglob
+          results=(downloaded-results/benchmark-results-*/results.json)
+          if (( ${#results[@]} )); then
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Append immutable run to history
+      - name: Append immutable runs to history
+        id: publish
         if: steps.recorded.outputs.available == 'true'
-        run: >-
-          python3 -m benchmarks.publish
-          --result downloaded-results/results.json
-          --repository "$GITHUB_REPOSITORY"
-          --remote origin
-          --finalize-interrupted
+        run: |
+          set -euo pipefail
+          published=false
+          failed=false
+          for result in downloaded-results/benchmark-results-*/results.json; do
+            if python3 -m benchmarks.publish --result "$result" \
+                --repository "$GITHUB_REPOSITORY" --remote origin --finalize-interrupted; then
+              published=true
+            else
+              failed=true
+            fi
+          done
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          if [[ "$failed" == true ]]; then
+            exit 1
+          fi
       - name: Request dashboard update
-        if: steps.recorded.outputs.available == 'true'
+        if: always() && steps.publish.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-

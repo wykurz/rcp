@@ -31,8 +31,9 @@ from `main`; historical records are data. The deployment is enabled with the rep
 `RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
 [benchmarking](../../docs/benchmarking.md) for measurement, retention and setup details.
 
-The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs publish artifacts only;
-trusted main/scheduled runs may append history. No timing threshold blocks a change.
+The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs and pushes run local and
+loopback smoke checks with artifacts. Scheduled and manual runs on main measure larger filesets and
+append performance history. No timing threshold blocks a change.
 
 ### rust.yml
 

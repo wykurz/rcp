@@ -48,6 +48,7 @@
     .pill.complete { background: #dcf3e7; color: #17634c; }
     .pill.failed { background: #fee5e0; color: #a43c31; }
     .pill.running { background: #fff1cd; color: #815c05; }
+    .short-warning { color: #815c05; font-size: .75rem; font-weight: 600; }
     code { font-size: .78rem; overflow-wrap: anywhere; }
     details { max-width: 38rem; }
     summary { color: #086b70; cursor: pointer; }
@@ -59,7 +60,7 @@
   <header>
     <div class="eyebrow">rcp · performance lab</div>
     <h1>Copy benchmark history</h1>
-    <p>Wall clock completion time across benchmark runs. Lower is faster. Each color is one compatible workload and environment series; the vertical whisker shows the fastest and slowest repeat.</p>
+    <p>Wall clock completion time across performance runs. Lower is faster. Each color is one compatible workload and environment series; the vertical whisker shows the fastest and slowest repeat.</p>
   </header>
   <main>
     <div class="topline"><div class="stats" id="stats"></div><a class="download" href="history.json" download>Download raw history JSON ↓</a></div>
@@ -74,11 +75,11 @@
       </div>
       <div class="chart-wrap" id="chart"></div>
       <div class="legend" id="legend"></div>
-      <p class="footnote">Series IDs include workload, flags, cache and timing policy, topology, runner and relevant machine context. Different IDs are drawn as separate lines. A single run appears as one point.</p>
+      <p class="footnote">Series IDs include workload, flags, cache and timing policy, topology, runner and relevant machine context. Different IDs are drawn as separate lines. A single run appears as one point. Repeats under 10 seconds are flagged as short samples.</p>
     </section>
     <section aria-labelledby="runs-heading">
       <h2 id="runs-heading">Runs</h2>
-      <p class="subtle">Failures stay in this table. A completed case from a later failed run still appears in the chart; incomplete cases have no point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
+      <p class="subtle">Smoke runs stay in this table and are excluded from trends and ratios. A completed case from a later failed performance run still appears in the chart; incomplete cases have no point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
       <div class="table-wrap"><table><thead><tr><th>Date (UTC)</th><th>Result</th><th>Revision</th><th>Machine / policy</th><th>rcp vs references</th><th>Details</th></tr></thead><tbody id="run-rows"></tbody></table></div>
     </section>
   </main>
@@ -104,7 +105,10 @@
     const date = stamp => new Date(stamp).toLocaleDateString(undefined, {year: "numeric", month: "short", day: "numeric", timeZone: "UTC"});
     const number = value => Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
     const group = run => `${run.context.runner_label} · ${run.context.topology} · ${run.context.cache_policy}`;
-    const allPoints = runs.flatMap(run => run.summaries.map(summary => ({run, summary})));
+    const purpose = run => run.context.purpose === undefined ? "performance" : String(run.context.purpose);
+    const isPerformance = run => purpose(run) === "performance";
+    const hasShortSample = (run, summary) => isPerformance(run) && summary.samples.some(sample => sample < 10);
+    const allPoints = runs.flatMap(run => isPerformance(run) ? run.summaries.map(summary => ({run, summary})) : []);
     const options = (id, values, allLabel) => {
       const select = $(id);
       const previous = select.value;
@@ -129,11 +133,12 @@
       JSON.stringify(candidate.args) === JSON.stringify(baseline.args);
     const ratios = (run, summary) => {
       const candidate = run.variants.find(item => item.id === summary.variant_id);
-      if (candidate?.tool !== "rcp" || summary.variant_id === "rcp-baseline" || !summary.median) return [];
-      return ["rsync-a", "rcp-baseline"].flatMap(reference => {
+      if (!isPerformance(run) || candidate?.tool !== "rcp" || summary.variant_id === "rcp-baseline" || !summary.median) return [];
+      return ["rsync-a", "cp-a", "rcp-baseline"].flatMap(reference => {
         const peer = run.summaries.find(item => item.case_id === summary.case_id && item.variant_id === reference);
         const referenceVariant = run.variants.find(item => item.id === reference);
         if (reference === "rsync-a" && referenceVariant?.tool !== "rsync") return [];
+        if (reference === "cp-a" && (referenceVariant?.tool !== "cp" || run.context.topology !== "local")) return [];
         if (reference === "rcp-baseline" && !sameRcpSettings(candidate, referenceVariant)) return [];
         return peer ? [`${reference}: ${number(peer.median / summary.median)}×`] : [];
       });
@@ -153,7 +158,7 @@
       seriesFilter.value = ids.includes(selected) ? selected : "";
       const points = matched.filter(point => !seriesFilter.value || point.summary.series_id === seriesFilter.value);
       const chart = $("chart"), legend = $("legend"); chart.replaceChildren(); legend.replaceChildren();
-      if (!points.length) { chart.append(node("p", "No successful measurements match these filters. Check the run table for failures.", "empty")); return; }
+      if (!points.length) { chart.append(node("p", "No performance measurements match these filters. Smoke runs and failures remain in the run table.", "empty")); return; }
       const width = 1000, height = 390, left = 80, right = 25, top = 22, bottom = 52;
       const times = points.map(point => Date.parse(point.run.timestamp));
       let minTime = Math.min(...times), maxTime = Math.max(...times);
@@ -187,7 +192,7 @@
           const whisker = svgNode("line", {x1: xx, y1: y(summary.minimum), x2: xx, y2: y(summary.maximum), stroke: color, class: "range"}); svg.append(whisker);
           for (const amount of [summary.minimum, summary.maximum]) svg.append(svgNode("line", {x1: xx-5, x2: xx+5, y1: y(amount), y2: y(amount), stroke: color, class: "range"}));
           const dot = svgNode("circle", {cx: xx, cy: y(summary.median), r: 6, fill: color, class: "point"});
-          const title = svgNode("title"); title.textContent = `${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}\nMedian ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s\n${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}${ratios(run,summary).length ? "\nSame-run speedup vs " + ratios(run,summary).join(" · ") : ""}`;
+          const title = svgNode("title"); title.textContent = `${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}\nMedian ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s\n${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}${ratios(run,summary).length ? "\nSame-run speedup vs " + ratios(run,summary).join(" · ") : ""}${hasShortSample(run,summary) ? "\nShort sample: at least one repeat under 10 s" : ""}`;
           dot.append(title); svg.append(dot);
         }
         const item = node("span", undefined, "legend-item"), swatch = node("span", undefined, "swatch"); swatch.style.background = color;
@@ -199,7 +204,8 @@
       const rows = $("run-rows");
       for (const run of [...runs].reverse()) {
         const row = node("tr"), timestamp = node("td", date(run.timestamp));
-        const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge);
+        const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge, node("span", ` · ${purpose(run)}`));
+        if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("span", " · Short sample: repeat under 10 s", "short-warning"));
         const rev = node("td"), hash = run.revision.commit || "unknown";
         const repository = run.context.repository || run.revision.repository || run.repository;
         const slug = typeof repository === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ? repository : null;
