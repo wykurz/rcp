@@ -22,10 +22,11 @@ Open `/tmp/rcp-bench-site/index.html` in a browser. The report is self-contained
 not require a web server or external JavaScript service.
 
 `loopback` uses SSH to read from `localhost`, forces rcp's remote protocol with `--force-remote`,
-and selects the matching `rcpd` from the build directory. `ssh localhost true` must work. The mode
-exercises an encrypted remote **pull**, but both endpoints share a machine, kernel, CPU budget and
-storage unless separate filesystem roots are supplied. It is not a measurement of a physical 100G
-link or two independent servers.
+and selects the matching `rcpd` from the build directory. It also pins the remote rsync server to
+the recorded local rsync executable; custom `--rsync-path` overrides are rejected.
+`ssh localhost true` must work. The mode exercises an encrypted remote **pull**, but both endpoints
+share a machine, kernel, CPU budget and storage unless separate filesystem roots are supplied. It is
+not a measurement of a physical 100G link or two independent servers.
 
 Loopback records the SSH client version and binary digest. Use `--ssh-transport-profile` to identify
 the server and configuration when running outside CI; without it, that part of the transport is
@@ -136,8 +137,9 @@ release version alone does not start a new performance series.
 
 Every trial prepares a fresh destination and its cache state, then measures from launching the first
 process until the last process exits. All child exit codes are checked. Full content and directory
-verification follows timing. Variant order rotates between repetitions. Logs retain rcp's own
-summary alongside the external wall time.
+verification follows timing. Before recording a completed case, the harness verifies that the source
+tree still matches its original snapshot. Variant order rotates between repetitions. Logs retain
+rcp's own summary alongside the external wall time.
 
 Full positional balance requires a repetition count divisible by the number of selected variants
 after adding baseline or concurrency variants. Fewer repetitions are allowed for exploratory runs,
