@@ -658,13 +658,20 @@ so the security-relevant invariants each live in exactly one place:
   lease while the operation returns and may still contain later filesystem calls, leaving the
   runtime's bounded shutdown able to abandon work stuck indefinitely on dead storage. With no live
   ambient admission, the runner adds no lease. Local copy's synchronous data move and filegen's
-  one-buffer synchronous chunks use this boundary. A weak scope alone is passive: admitted remote
-  source/destination payload-leaf streaming still uses `tokio::fs::File`, whose private blocking
-  jobs can retain an `Arc<StdFile>` owning the same fd after high-level cancellation without
-  inheriting admission. The fd is retained, not cloned or duplicated. Extending the boundary to that
-  payload-leaf residual requires a separate bounded remote-I/O abstraction; the guarantee does not
-  cover every Tokio filesystem operation. This boundary is local to endpoint I/O and requires no
-  wire state.
+  one-buffer synchronous chunks use this boundary. Remote files up to 64 KiB also use it for source
+  open/fstat/read and destination exclusive-create/write. The source threshold and exact read length
+  come from the opened descriptor; ACL capture uses that same descriptor. The destination buffers
+  the complete declared payload before removal, preserves restrictive creation and inherited ACL
+  sanitation, then applies metadata through the written descriptor. These jobs cooperatively check
+  cancellation before opening or creating and between bounded payload chunks; cancellation does not
+  interrupt a syscall or roll back earlier writes. Metadata probes and congestion permits finish
+  before payload I/O, while descriptor admission remains held for the complete job. A weak scope
+  alone is passive: larger remote files and the `-L` source path still stream through
+  `tokio::fs::File`, whose private blocking jobs can retain an `Arc<StdFile>` owning the same fd
+  after high-level cancellation without inheriting admission. The fd is retained, not cloned or
+  duplicated. Extending the boundary to that payload-leaf residual requires a separate bounded
+  remote-I/O abstraction; the guarantee does not cover every Tokio filesystem operation. This
+  boundary is local to endpoint I/O and requires no wire state.
 
 `rlink` is the documented exception: it walks two correlated trees (source plus `--update`) and so
 keeps its own dual-tree enumeration, but it shares the same substrate — the `TrustedDir` boundary,

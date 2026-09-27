@@ -2,8 +2,8 @@
 
 The benchmark suite measures complete command invocations on generated filesets. Timing is
 informational: a slower copy does not fail CI. Failed commands, timeouts, incorrect copies, and
-broken measurement infrastructure do fail. The suite starts with tiny files and can grow by adding
-cases and command variants to [benchmarks/cases.json](../benchmarks/cases.json).
+broken measurement infrastructure do fail. The suite covers tiny, medium, and large regular files;
+new cases and command variants belong in [benchmarks/cases.json](../benchmarks/cases.json).
 
 ## Run a benchmark
 
@@ -56,14 +56,17 @@ rcp summaries retain that distinction.
 
 ## Cases and variants
 
-| Case       | Directory widths | Files per leaf | File size   | Total files |
-| ---------- | ---------------- | -------------- | ----------- | ----------- |
-| `tiny-10k` | `10,1,1`         | 1,024          | 1,024 bytes | 10,240      |
-| `tiny-1m`  | `10,10,10`       | 1,024          | 1,024 bytes | 1,024,000   |
+| Case        | Directory widths | Files per leaf | File size | Total files | Logical data |
+| ----------- | ---------------- | -------------- | --------- | ----------- | ------------ |
+| `tiny-10k`  | `10,1,1`         | 1,024          | 1 KiB     | 10,240      | 10 MiB       |
+| `tiny-1m`   | `10,10,10`       | 1,024          | 1 KiB     | 1,024,000   | 1,000 MiB    |
+| `medium-4k` | `10,1,1`         | 400            | 256 KiB   | 4,000       | 1,000 MiB    |
+| `large-100` | `10,1,1`         | 10             | 16 MiB    | 100         | 1,600 MiB    |
 
-The smaller case preserves three directory levels, ten independent top-level partitions, and 1,024
-files per leaf. The full case contains 1,048,576,000 logical bytes and 1,111 directories, including
-its root. Filesystem allocation and inode space exceed the logical payload size.
+The three `10,1,1` cases preserve three directory levels and ten independent top-level partitions
+for the ten-process rsync variant. They compare file size and file count across tiny, medium, and
+large workloads. The million-file case has 1,111 directories, including its root. Filesystem
+allocation and inode space exceed the logical payload size.
 
 The default comparison includes rcp with `--summary`, rsync with `-a`, and ten concurrent rsync
 processes on disjoint top-level directories. The optional `rcp-preserve` variant adds
@@ -163,18 +166,20 @@ just benchmark-report /path/to/history-checkout --output /tmp/rcp-history-site
 
 ## CI and stability
 
-[Depot benchmarks](../.depot/workflows/benchmarks.yml) run the small case on PRs and main, and the
-full case weekly or by manual selection, on a fixed 32-CPU x86 runner label. The initial automated
-procedure is a source-warm loopback pull with three repetitions. Manual runs can select Linux cache
-dropping. PRs also build the PR base revision and measure it in the same job.
+[Depot benchmarks](../.depot/workflows/benchmarks.yml) run `tiny-10k`, `medium-4k`, and `large-100`
+on PRs and main. Weekly runs include `tiny-1m` as well. A manual run measures only its selected
+case; all four cases are available. The fixed 32-CPU x86 runner uses a source-warm loopback pull
+with three repetitions by default. Manual runs can select Linux cache dropping. PRs also build the
+PR base revision and measure it in the same job.
 
 ```bash
 just depot-benchmark
 ```
 
-This runs only measurement and artifacts against the current worktree. Stage ordinary untracked
-files first so Depot includes them. It does not run the history-publishing job. Benchmarking is
-separate from `just depot-ci`; harness behavior tests are included in normal lint/validation.
+This runs the normal three cases against the current worktree and produces measurements and
+artifacts. Stage ordinary untracked files first so Depot includes them. It does not run the
+history-publishing job. Benchmarking is separate from `just depot-ci`; harness behavior tests are
+included in normal lint/validation.
 
 We do not yet have evidence that this CI environment supports reliable timing gates. Fixed runner
 labels do not eliminate host contention, storage variation, cache effects or infrastructure updates.

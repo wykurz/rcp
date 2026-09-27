@@ -45,6 +45,83 @@ use crate::walk::EntryKind;
 /// the umask, which can only narrow it further.
 pub const DST_FILE_CREATE_MODE: u32 = 0o600;
 
+/// Maximum payload batched with a remote file's open or create operation.
+pub const SMALL_FILE_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// Distinguish an exclusive-create collision from a failure after creation.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateWithContentsError {
+    /// Opening or sanitizing the destination failed; an EEXIST can be replanned.
+    #[error("failed creating file: {0}")]
+    Create(#[source] std::io::Error),
+    /// The file was created, but its payload was not fully written.
+    #[error("failed writing file: {0}")]
+    Write(#[source] std::io::Error),
+}
+
+// dropping the async owner stops subsequent operations in a started job; a syscall already in
+// progress still completes. queued jobs retain the stronger synchronous reclamation below.
+#[derive(Default)]
+struct PayloadCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for PayloadCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn check_payload_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> std::io::Result<()> {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "file payload job cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_small_payload(
+    file: &mut std::fs::File,
+    size: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    if size > SMALL_FILE_BUFFER_LIMIT as u64 {
+        return Ok(None);
+    }
+    let mut bytes = vec![0; size as usize];
+    let mut remaining = bytes.as_mut_slice();
+    while !remaining.is_empty() {
+        check_payload_cancelled(cancelled)?;
+        let len = remaining.len().min(8192);
+        match file.read(&mut remaining[..len]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => remaining = &mut remaining[read..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(bytes))
+}
+
+fn write_small_payload(
+    file: &mut impl std::io::Write,
+    mut bytes: &[u8],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        check_payload_cancelled(cancelled)?;
+        match file.write(&bytes[..bytes.len().min(8192)]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// The mode a destination DIRECTORY is created with, before it has any children.
 ///
 /// Owner-only, plus the execute bit the copier needs to populate it. The source mode is applied
@@ -618,20 +695,41 @@ impl Dir {
         let side = self.side;
         let name = name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-            let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
-            let fd =
-                openat(dir.as_fd(), name.as_bytes(), flags, Mode::empty()).map_err(nix_to_io)?;
-            // fstat the open fd to confirm the entry is a regular file; this is the
-            // safety check — O_NOFOLLOW does not catch FIFOs or other special files.
-            let st = fstat(&fd).map_err(nix_to_io)?;
-            if kind_from_stat(&st) != EntryKind::File {
-                // fd is dropped here, closing it
-                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-            }
-            let meta = FileMeta::from_stat(&st);
-            let file = std::fs::File::from(fd);
-            Ok((file, meta))
+            open_file_read_at(dir.as_fd(), &name)
         })
+        .await
+    }
+
+    /// Open a regular file and buffer at most 64 KiB using its actual descriptor metadata.
+    ///
+    /// Larger files return an unread descriptor. The metadata probe and congestion permit end
+    /// before payload reads, while descriptor admission covers the entire blocking job.
+    pub async fn prepare_file_read(
+        &self,
+        name: &OsStr,
+    ) -> std::io::Result<(std::fs::File, FileMeta, Option<Vec<u8>>)> {
+        if !is_single_component(name) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let cancellation = PayloadCancellation::default();
+        let cancelled = cancellation.0.clone();
+        let before_open = cancelled.clone();
+        let dir = self.fd.clone();
+        let name = name.to_owned();
+        throttle::get_ops_token().await;
+        run_metadata_probed_blocking_then_no_rate(
+            self.side,
+            congestion::MetadataOp::Stat,
+            move || {
+                check_payload_cancelled(&before_open)?;
+                open_file_read_at(dir.as_fd(), &name)
+            },
+            move |(mut file, meta)| {
+                use crate::preserve::Metadata;
+                let bytes = read_small_payload(&mut file, meta.size(), &cancelled)?;
+                Ok((file, meta, bytes))
+            },
+        )
         .await
     }
 
@@ -1373,30 +1471,93 @@ impl Dir {
         let strict = strict_operand_resolution();
         let may_inherit = Arc::clone(&self.children_may_inherit);
         run_metadata_probed_blocking(side, congestion::MetadataOp::OpenCreate, move || {
-            let flags = OFlag::O_CREAT
-                | OFlag::O_EXCL
-                | OFlag::O_WRONLY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC;
-            let file_mode = Mode::from_bits_truncate(DST_FILE_CREATE_MODE);
-            let file = openat(dir.as_fd(), name.as_bytes(), flags, file_mode)
-                .map(std::fs::File::from)
-                .map_err(nix_to_io)?;
-            if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
-                // same-closure for the same reason as `make_dir`: queued work creates nothing,
-                // while work that starts runs to completion, so cancellation cannot abandon a
-                // created-but-unsanitized file. cleanup is a single unlink relative to the ambient
-                // operand parent; it never follows a symlink or removes a directory, and a prior
-                // identity observation would not bind the by-name removal
-                if let Err(err) = apply_one_acl(file.as_raw_fd(), ACL_ACCESS_XATTR, None) {
-                    let _ = unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir);
-                    return Err(err);
-                }
-            }
-            Ok(file)
+            create_file_at(dir.as_fd(), &name, strict, &may_inherit)
         })
         .await
     }
+
+    /// Create an owner-only file and write a bounded payload in the same admitted blocking job.
+    ///
+    /// The buffer is shared so a caller can retain it across a single exclusive-create retry.
+    /// Write failures are distinguished from create failures and must never trigger that retry.
+    pub async fn create_file_with_contents(
+        &self,
+        name: &OsStr,
+        bytes: Arc<[u8]>,
+    ) -> Result<std::fs::File, CreateWithContentsError> {
+        if !is_single_component(name) || bytes.len() > SMALL_FILE_BUFFER_LIMIT {
+            return Err(CreateWithContentsError::Create(
+                std::io::Error::from_raw_os_error(libc::EINVAL),
+            ));
+        }
+        let cancellation = PayloadCancellation::default();
+        let cancelled = cancellation.0.clone();
+        let before_create = cancelled.clone();
+        let dir = self.fd.clone();
+        let name = name.to_owned();
+        let strict = strict_operand_resolution();
+        let may_inherit = Arc::clone(&self.children_may_inherit);
+        throttle::get_ops_token().await;
+        run_metadata_probed_blocking_then_no_rate(
+            self.side,
+            congestion::MetadataOp::OpenCreate,
+            move || {
+                check_payload_cancelled(&before_create)?;
+                create_file_at(dir.as_fd(), &name, strict, &may_inherit)
+            },
+            move |mut file| {
+                Ok(write_small_payload(&mut file, &bytes, &cancelled)
+                    .map(|()| file)
+                    .map_err(CreateWithContentsError::Write))
+            },
+        )
+        .await
+        .map_err(CreateWithContentsError::Create)?
+    }
+}
+
+fn open_file_read_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+) -> std::io::Result<(std::fs::File, FileMeta)> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    let fd = openat(dir, name.as_bytes(), flags, Mode::empty()).map_err(nix_to_io)?;
+    // fstat the open fd to confirm the entry is a regular file; this is the
+    // safety check — O_NOFOLLOW does not catch FIFOs or other special files.
+    let st = fstat(&fd).map_err(nix_to_io)?;
+    if kind_from_stat(&st) != EntryKind::File {
+        // fd is dropped here, closing it
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let meta = FileMeta::from_stat(&st);
+    let file = std::fs::File::from(fd);
+    Ok((file, meta))
+}
+
+fn create_file_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    strict: bool,
+    may_inherit: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<std::fs::File> {
+    let flags =
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let file_mode = Mode::from_bits_truncate(DST_FILE_CREATE_MODE);
+    let file = openat(dir, name.as_bytes(), flags, file_mode)
+        .map(std::fs::File::from)
+        .map_err(nix_to_io)?;
+    if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
+        // same-closure for the same reason as `make_dir`: queued work creates nothing,
+        // while work that starts runs to completion, so cancellation cannot abandon a
+        // created-but-unsanitized file. cleanup is a single unlink relative to the ambient
+        // operand parent; it never follows a symlink or removes a directory, and a prior
+        // identity observation would not bind the by-name removal
+        if let Err(err) = apply_one_acl(file.as_raw_fd(), ACL_ACCESS_XATTR, None) {
+            let _ = unlinkat(dir, name.as_bytes(), UnlinkatFlags::NoRemoveDir);
+            return Err(err);
+        }
+    }
+    Ok(file)
 }
 
 // ── TrustedDir ──────────────────────────────────────────────────────────────────
@@ -3280,6 +3441,21 @@ where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    run_metadata_probed_blocking_then_no_rate(side, op, f, Ok).await
+}
+
+async fn run_metadata_probed_blocking_then_no_rate<F, T, C, U>(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    f: F,
+    continuation: C,
+) -> std::io::Result<U>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+    C: FnOnce(T) -> std::io::Result<U> + Send + 'static,
+    U: Send + 'static,
+{
     let ops_permit = throttle::ops_in_flight_permit(crate::walk::meta_resource(side, op)).await;
     let probe = congestion::Probe::start_metadata(side, op);
     run_fd_admitted_blocking(move || {
@@ -3292,7 +3468,7 @@ where
         // boundary keeps admission in the task output because `f` can return an fd that an
         // abandoned waiter never receives.
         drop(ops_permit);
-        result
+        continuation(result?)
     })
     .await
 }
@@ -4102,6 +4278,161 @@ mod tests {
         assert_eq!(
             bar.child(OsStr::new("2.txt")).await?.kind(),
             EntryKind::File
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_payload_reads_exact_observed_size_and_rejects_shrinkage() -> anyhow::Result<()> {
+        use std::io::Write;
+        let tmp = testutils::setup_test_dir().await?;
+        let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        let cancellation = PayloadCancellation::default();
+        let (mut file, meta) = root.open_file_read(OsStr::new("0.txt")).await?;
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp.join("foo/0.txt"))?;
+        writer.write_all(b"extra")?;
+        assert_eq!(
+            read_small_payload(&mut file, meta.size(), &cancellation.0)?,
+            Some(b"0".to_vec())
+        );
+        let (mut file, meta) = root.open_file_read(OsStr::new("0.txt")).await?;
+        writer.set_len(0)?;
+        let err = read_small_payload(&mut file, meta.size(), &cancellation.0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        Ok(())
+    }
+
+    #[test]
+    fn small_payload_cancellation_stops_subsequent_writes() {
+        struct CancelAfterWrite {
+            bytes: Vec<u8>,
+            guard: Option<PayloadCancellation>,
+        }
+        impl std::io::Write for CancelAfterWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                drop(self.guard.take());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let guard = PayloadCancellation::default();
+        let cancelled = guard.0.clone();
+        let mut writer = CancelAfterWrite {
+            bytes: Vec::new(),
+            guard: Some(guard),
+        };
+        let err = write_small_payload(
+            &mut writer,
+            &vec![0x5a; SMALL_FILE_BUFFER_LIMIT],
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(writer.bytes.len(), 8192);
+    }
+
+    #[test]
+    fn queued_small_file_create_is_cancelled_before_mutation() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let tmp = testutils::setup_test_dir().await?;
+            let root =
+                Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await?;
+            {
+                let mut future = Box::pin(root.create_file_with_contents(
+                    OsStr::new("cancelled"),
+                    Arc::from(&b"contents"[..]),
+                ));
+                assert!(futures::poll!(future.as_mut()).is_pending());
+            }
+            release_tx.send(())?;
+            blocker.await?;
+            // a barrier ensures even a wrongly detached queued job has had a chance to run
+            tokio::task::spawn_blocking(|| ()).await?;
+            assert!(!tmp.join("foo/cancelled").exists());
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn prepare_file_read_buffers_only_actual_small_files() -> anyhow::Result<()> {
+        let tmp = testutils::setup_test_dir().await?;
+        let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        for size in [0, 1, 65536, 65537] {
+            let bytes = vec![0x5a; size];
+            std::fs::write(tmp.join("foo/data"), &bytes)?;
+            let (mut file, meta, buffered) = root.prepare_file_read(OsStr::new("data")).await?;
+            assert_eq!(meta.size(), size as u64);
+            if size <= 65536 {
+                assert_eq!(buffered.as_deref(), Some(bytes.as_slice()));
+            } else {
+                assert!(buffered.is_none());
+                let mut actual = Vec::new();
+                file.read_to_end(&mut actual)?;
+                assert_eq!(actual, bytes, "streaming descriptor must remain unread");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_file_read_uses_replacement_metadata_and_refuses_special_files()
+    -> anyhow::Result<()> {
+        let tmp = testutils::setup_test_dir().await?;
+        let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        let classified = root.child(OsStr::new("0.txt")).await?;
+        assert_eq!(classified.meta().size(), 1);
+        std::fs::write(tmp.join("foo/replacement"), vec![0x2a; 65537])?;
+        std::fs::rename(tmp.join("foo/replacement"), tmp.join("foo/0.txt"))?;
+        let (_, meta, buffered) = root.prepare_file_read(OsStr::new("0.txt")).await?;
+        assert_eq!(meta.size(), 65537);
+        assert!(buffered.is_none());
+        std::os::unix::fs::symlink("0.txt", tmp.join("foo/link"))?;
+        nix::unistd::mkfifo(&tmp.join("foo/fifo"), Mode::S_IRUSR | Mode::S_IWUSR)?;
+        for name in ["link", "fifo"] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                root.prepare_file_read(OsStr::new(name)),
+            )
+            .await?;
+            assert!(result.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_file_with_contents_keeps_owner_only_mode() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = testutils::setup_test_dir().await?;
+        let root =
+            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+        let bytes: Arc<[u8]> = vec![0x5a; 65536].into();
+        let file = root
+            .create_file_with_contents(OsStr::new("new"), bytes.clone())
+            .await?;
+        assert_eq!(std::fs::read(tmp.join("foo/new"))?, bytes.as_ref());
+        assert_eq!(file.metadata()?.permissions().mode() & 0o177, 0);
+        let err = root
+            .create_file_with_contents(OsStr::new("new"), bytes)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CreateWithContentsError::Create(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
         );
         Ok(())
     }

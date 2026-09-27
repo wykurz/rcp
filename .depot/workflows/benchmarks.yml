@@ -12,7 +12,7 @@ on:
       case:
         description: Fileset to measure
         type: choice
-        options: [tiny-10k, tiny-1m]
+        options: [tiny-10k, tiny-1m, medium-4k, large-100]
         default: tiny-10k
       cache:
         description: Cache preparation procedure
@@ -36,7 +36,7 @@ env:
 
 jobs:
   benchmark:
-    name: Tiny files (informational timing)
+    name: Copy benchmarks (informational timing)
     runs-on: depot-ubuntu-24.04-32
     timeout-minutes: 45
     steps:
@@ -67,15 +67,23 @@ jobs:
           echo "RCP_BENCH_BASELINE_COMMIT=$BASE_SHA" >> "$GITHUB_ENV"
       - name: Measure copies
         env:
-          SELECTED_CASE: ${{ inputs.case || (github.event_name == 'schedule' && 'tiny-1m') || 'tiny-10k' }}
+          BENCHMARK_EVENT: ${{ github.event_name }}
+          SELECTED_CASE: ${{ inputs.case || '' }}
           SELECTED_CACHE: ${{ inputs.cache || 'source-warm' }}
         run: |
           set -euo pipefail
-          args=(--case "$SELECTED_CASE" --mode loopback --cache "$SELECTED_CACHE"
+          args=(--mode loopback --cache "$SELECTED_CACHE"
                 --repetitions 3 --runner-label depot-ubuntu-24.04-32
                 --source-storage-id depot-root --destination-storage-id depot-root
                 --source-root "$RUNNER_TEMP" --destination-root "$RUNNER_TEMP"
                 --output "$RUNNER_TEMP/benchmark-results")
+          if [[ "$BENCHMARK_EVENT" == schedule ]]; then
+            args+=(--case tiny-10k --case tiny-1m --case medium-4k --case large-100)
+          elif [[ "$BENCHMARK_EVENT" == workflow_dispatch && -n "$SELECTED_CASE" ]]; then
+            args+=(--case "$SELECTED_CASE")
+          else
+            args+=(--case tiny-10k --case medium-4k --case large-100)
+          fi
           if [[ -n "${RCP_BENCH_BASELINE_BIN:-}" ]]; then
             args+=(--baseline-bin-dir "$RCP_BENCH_BASELINE_BIN")
           fi
