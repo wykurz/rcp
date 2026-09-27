@@ -20,6 +20,8 @@ import threading
 import time
 import uuid
 
+from benchmarks.strict_json import parse_json
+
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
 VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents"
@@ -43,7 +45,7 @@ def _positive(value, name):
 
 
 def load_manifest(path):
-    data = json.loads(Path(path).read_text())
+    data = parse_json(Path(path).read_text())
     _fields(data, {"schema_version", "cases", "variants"}, set(), "manifest")
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         raise ValueError("unsupported manifest schema_version")
@@ -340,7 +342,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -352,14 +354,16 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options)), "storage_identity": identity}
     comparable_environment["filesystem"] = {side: semantic_mount(side, info) for side, info in filesystem.items()}
     stable_references = {}
-    for tool in ("rsync", "cp", "rcp-baseline", "rcpd-baseline"):
+    for tool in ("rsync", "cp", "rcp-baseline", "rcpd-baseline") + (("ssh",) if topology == "loopback" else ()):
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
+    if topology == "loopback":
+        value["ssh_transport_profile"] = ssh_transport_profile
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _tool(path):
+def _tool(path, version_flag="--version"):
     # preserve the invoked basename for multicall binaries such as Nix coreutils
     path = Path(path).absolute()
     if not os.access(path, os.X_OK):
@@ -368,7 +372,7 @@ def _tool(path):
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
-    result = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([str(path), version_flag], capture_output=True, text=True, timeout=10)
     if result.returncode:
         raise ValueError(f"version command failed: {path}")
     version_output = result.stdout.strip() or result.stderr.strip()
@@ -464,7 +468,11 @@ def _arguments(argv):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runner-label", type=_nonblank, default="local")
     parser.add_argument("--files-in-flight")
-    return parser.parse_args(argv)
+    parser.add_argument("--ssh-transport-profile", type=_nonblank)
+    args = parser.parse_args(argv)
+    if args.mode == "local" and args.ssh_transport_profile is not None:
+        parser.error("--ssh-transport-profile requires loopback mode")
+    return args
 
 
 def _default_bin_dir():
@@ -480,6 +488,8 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
     record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    if args.mode == "loopback":
+        record["context"]["ssh_transport_profile"] = args.ssh_transport_profile
     if args.baseline_bin_dir:
         record["context"]["baseline_commit"] = os.environ.get("RCP_BENCH_BASELINE_COMMIT", "")
     storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
@@ -496,7 +506,7 @@ def main(argv=None):
         variants = _select(manifest["variants"], args.variants or default_variants, "variant")
         if args.mode != "local" and any(variant["tool"] == "cp" for variant in variants):
             raise ValueError("cp variants require local mode")
-        if args.files_in_flight:
+        if args.files_in_flight is not None:
             if not any(variant["tool"] == "rcp" for variant in variants):
                 raise ValueError("files-in-flight requires a selected rcp variant")
             limits = args.files_in_flight.split(",")
@@ -533,6 +543,11 @@ def main(argv=None):
         if args.baseline_bin_dir:
             record["tools"]["rcp-baseline"] = _tool(args.baseline_bin_dir / "rcp")
             record["tools"]["rcpd-baseline"] = _tool(args.baseline_bin_dir / "rcpd")
+        if args.mode == "loopback":
+            ssh = shutil.which("ssh")
+            if not ssh:
+                raise ValueError("ssh executable not found")
+            record["tools"]["ssh"] = _tool(ssh, "-V")
         endpoints = environment(args.source_root, args.destination_root)
         record["context"]["environment"] = endpoints
         _persist(output, record)
@@ -589,7 +604,7 @@ def main(argv=None):
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
             shutil.rmtree(fixture_root)

@@ -13,7 +13,7 @@ class BenchmarkWorkflowTests(unittest.TestCase):
 
     def measure_arguments(self, *, event, mode="loopback", baseline="", case="all", cache="linux-drop-caches"):
         measure = next(step for step in self.workflow()["jobs"]["benchmark"]["steps"] if step.get("name") == "Measure copies")
-        script = 'just() { printf "%s\\n" "$@"; }\n' + measure["run"]
+        script = 'just() { printf "%s\\n" "$@"; }\nsha256sum() { printf "%064d  -\\n" 0; }\n' + measure["run"]
         environment = {**os.environ, "BENCHMARK_EVENT": event, "BENCHMARK_MODE": mode, "SELECTED_CASE": case, "SELECTED_CACHE": cache, "RUNNER_TEMP": "/tmp", "RCP_BENCH_BASELINE_BIN": baseline}
         result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True, check=True)
         arguments = result.stdout.splitlines()
@@ -38,6 +38,12 @@ class BenchmarkWorkflowTests(unittest.TestCase):
         self.assertEqual(self.values(arguments, "--purpose"), ["smoke"])
         self.assertEqual(self.values(arguments, "--case"), ["tiny-10k", "medium-4k", "large-100"])
         self.assertNotIn("--baseline-bin-dir", arguments)
+
+    def test_transport_profile_is_supplied_only_for_loopback(self):
+        for mode in ("local", "loopback"):
+            with self.subTest(mode=mode):
+                arguments = self.measure_arguments(event="schedule", mode=mode)
+                self.assertEqual(self.values(arguments, "--ssh-transport-profile"), ["0" * 64] if mode == "loopback" else [])
 
     def test_scheduled_performance_runs_balance_each_mode(self):
         for mode, repetitions in (("local", "4"), ("loopback", "3")):

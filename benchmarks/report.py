@@ -8,6 +8,8 @@ import re
 import statistics
 from pathlib import Path
 
+from benchmarks.strict_json import parse_json
+
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 SERIES_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -37,29 +39,9 @@ def _list(value, name):
     return value
 
 
-def _reject_constant(value):
-    raise ValueError(f"invalid JSON number: {value}")
-
-
-def _finite_float(value):
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"nonfinite JSON number: {value}")
-    return number
-
-
-def _unique_pairs(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key: {key}")
-        value[key] = item
-    return value
-
-
 def parse_result(text):
     """Parse strict JSON and validate one schema-one result."""
-    return validate_result(json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float, object_pairs_hook=_unique_pairs))
+    return validate_result(parse_json(text))
 
 
 def validate_result(value):
@@ -91,6 +73,12 @@ def validate_result(value):
     for field in ("source", "destination"):
         if field not in context or not isinstance(context[field], (str, dict)):
             raise ValueError(f"context.{field} must be a string or object")
+    if "ssh_transport_profile" in context:
+        if context["topology"] != "loopback":
+            raise ValueError("context.ssh_transport_profile requires loopback topology")
+        profile = context["ssh_transport_profile"]
+        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+            raise ValueError("context.ssh_transport_profile must be a nonblank string or null")
     _object(run.get("tools"), "tools")
     case_ids = set()
     for i, case in enumerate(_list(run.get("cases"), "cases")):
