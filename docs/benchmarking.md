@@ -47,12 +47,13 @@ just benchmark-run --case tiny-1m --mode loopback --repetitions 3 \
   --cache linux-drop-caches --output /tmp/rcp-bench-million
 
 just benchmark-run --case tiny-10k --mode loopback \
-  --files-in-flight 2,4,8,32,64,128 --output /tmp/rcp-bench-concurrency
+  --files-in-flight 2,4,8,32,64,128 --repetitions 9 --output /tmp/rcp-bench-concurrency
 ```
 
 The concurrency sweep preserves the other rcp defaults. In the current remote implementation,
 `--max-files-in-flight=128` remains limited by the default `--max-connections=100`. Raw commands and
-rcp summaries retain that distinction.
+rcp summaries retain that distinction. This example has nine variants: the three defaults plus six
+rcp limits. Nine repetitions let each variant occupy every trial position once.
 
 ## Cases and variants
 
@@ -98,7 +99,8 @@ combination requires a manifest entry rather than a runner change:
 
 Pass an alternative definition with `--manifest`. Definitions are versioned and validated; unknown
 fields and invalid counts fail instead of silently changing the workload. New operation types,
-special-file fixtures, or two-host orchestration need a runner extension and tests.
+special-file fixtures, or two-host orchestration need a runner extension and tests. The variant ID
+`rcp-baseline` is reserved for `--baseline-bin-dir`; custom manifests cannot define it.
 
 ## Measurement and cache contract
 
@@ -112,6 +114,12 @@ Every trial prepares a fresh destination and its cache state, then measures from
 process until the last process exits. All child exit codes are checked. Full content and directory
 verification follows timing. Variant order rotates between repetitions. Logs retain rcp's own
 summary alongside the external wall time.
+
+Full positional balance requires a repetition count divisible by the number of selected variants
+after adding baseline or concurrency variants. Fewer repetitions are allowed for exploratory runs,
+but some variants then occupy different parts of the order; temporal or cache drift can bias their
+ratios. Routine CI balances its three variants with three repetitions, and PR CI balances four with
+four. Choose an appropriate count explicitly when constructing a custom comparison.
 
 Cache modes are procedures, not assumptions:
 
@@ -147,6 +155,9 @@ information is available, and same-run comparisons to rsync or a supplied rcp ba
 cases remain in the chart when a later case fails or the run is interrupted. Their summaries are
 checked against successful trials; unfinished cases do not produce trend points. Revision fields are
 unknown when the harness runs outside a Git repository.
+
+Revision-baseline ratios require matching recorded tools, flags, and process counts. A variant with
+different metadata or concurrency settings does not receive a ratio against that baseline.
 
 A historical series includes the workload and measurement contract, normalized flags, runner and
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate

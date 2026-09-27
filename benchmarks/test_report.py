@@ -81,7 +81,7 @@ const document = {getElementById: id => ids[id], createElement: tag => new Eleme
 vm.runInNewContext(code, {document});
 const descendants = element => [element, ...element.children.flatMap(descendants)];
 const chart = descendants(ids.chart), rows = descendants(ids["run-rows"]);
-console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), table: rows.map(item => item.textContent).join(" ")}));
+console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), table: rows.map(item => item.textContent).join(" "), comparisons: ids["run-rows"].children.map(row => row.children[4].textContent)}));
 '''
         process = subprocess.run(["node", "-e", script, str(output / "index.html")], capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)
@@ -316,6 +316,37 @@ console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circl
         process, output = self.render(source)
         self.assertNotEqual(process.returncode, 0)
         self.assertFalse((output / "index.html").exists())
+
+    def test_baseline_ratio_requires_matching_rcp_settings(self):
+        run = sample_run()
+        variants = (
+            ("rcp-baseline", "rcp", ["--summary"], 1, 1.5),
+            ("rcp-preserve", "rcp", ["--summary", "--preserve-settings=all"], 1, 1.0),
+            ("rcp-sweep", "rcp", ["--summary", "--max-files-in-flight=16"], 1, 0.8),
+            ("rcp-parallel", "rcp", ["--summary"], 2, 0.9),
+            ("rsync-a", "rsync", ["-a"], 1, 2.4),
+        )
+        for index, (variant_id, tool, args, processes, seconds) in enumerate(variants, start=2):
+            run["variants"].append({"id": variant_id, "description": variant_id, "tool": tool, "args": args, "processes": processes})
+            run["trials"].extend({"case_id": "tiny-10k", "variant_id": variant_id, "iteration": iteration, "elapsed_seconds": seconds, "exit_codes": [0], "status": "ok", "commands": [[tool]], "validation": {"ok": True}, "logs": []} for iteration in (1, 2, 3))
+            run["summaries"].append({"series_id": str(index) * 64, "case_id": "tiny-10k", "variant_id": variant_id, "unit": "seconds", "median": seconds, "minimum": seconds, "maximum": seconds, "stdev": 0.0, "samples": [seconds] * 3, "files_per_second": 10000 / seconds})
+        source = self.root / "results.json"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        comparisons = self.dashboard_state(output)["comparisons"][0]
+        self.assertIn("rcp-default · rcp default copy / rcp-baseline: 1.25×", comparisons)
+        self.assertIn("rcp-preserve · rcp-preserve / rsync-a: 2.4×", comparisons)
+        self.assertIn("rcp-sweep · rcp-sweep / rsync-a: 3×", comparisons)
+        self.assertIn("rcp-parallel · rcp-parallel / rsync-a:", comparisons)
+        self.assertEqual(comparisons.count("rcp-baseline:"), 1)
+        run["variants"][1].pop("processes")
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        comparisons = self.dashboard_state(output)["comparisons"][0]
+        self.assertNotIn("rcp-baseline:", comparisons)
+        self.assertIn("rsync-a:", comparisons)
 
 
 if __name__ == "__main__":
