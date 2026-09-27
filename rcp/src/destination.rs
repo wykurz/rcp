@@ -344,6 +344,39 @@ async fn process_single_file(
             size = file_header.size
         ))
         .await;
+    // finish the bounded receive before any destructive removal. subsequent filesystem failures
+    // leave the stream at its next header, including failures during an EEXIST replan.
+    let bytes: Option<Arc<[u8]>> =
+        if file_header.size <= common::safedir::SMALL_FILE_BUFFER_LIMIT as u64 {
+            let mut bytes = Vec::with_capacity(file_header.size as usize);
+            file_recv_stream
+                .copy_exact_to_buffered(&mut bytes, file_header.size, 8192)
+                .await
+                .map_err(err_corrupted)?;
+            Some(bytes.into())
+        } else {
+            None
+        };
+    let err_filesystem = |e| {
+        if bytes.is_some() {
+            err_data_consumed(e)
+        } else {
+            err_needs_drain(e)
+        }
+    };
+    let create = || async {
+        match &bytes {
+            Some(bytes) => {
+                dst_parent
+                    .create_file_with_contents(dst_name, bytes.clone())
+                    .await
+            }
+            None => dst_parent
+                .create_file(dst_name)
+                .await
+                .map_err(common::safedir::CreateWithContentsError::Create),
+        }
+    };
     // the reservation is held, so the occupied entry can go through the pinned parent.
     if let DstFilePlan::Replace(dst_snapshot) = &plan {
         tracing::debug!("destination differs, removing existing entry");
@@ -355,13 +388,13 @@ async fn process_single_file(
             settings,
         )
         .await
-        .map_err(err_needs_drain)?;
+        .map_err(err_filesystem)?;
     }
     // create the destination file fresh through the parent's pinned fd (O_CREAT|O_EXCL|
     // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. it is created owner-only
     // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_fd`
     // below, after the last byte, mirroring copy.rs.
-    let std_file = match dst_parent.create_file(dst_name).await {
+    let std_file = match create().await {
         Ok(std_file) => std_file,
         // the slot is occupied: a writer filled it between the classification above — or during the
         // `--iops-throttle` wait after it, which can be seconds — and now. `create_file`'s `O_EXCL`
@@ -370,15 +403,19 @@ async fn process_single_file(
         // the local copy does (common/src/copy.rs). Planning and executing are back-to-back on this
         // route, unlike the one above: the reservation is already held, so nothing is left to wait
         // for between the removal and the retry.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(common::safedir::CreateWithContentsError::Create(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
             tracing::debug!("destination appeared after classification, re-planning");
             let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
                 .await
-                .map_err(err_needs_drain)?;
+                .map_err(err_filesystem)?;
             if matches!(plan, DstFilePlan::Skip) {
-                drain_file_data(file_recv_stream, file_header.size)
-                    .await
-                    .map_err(err_corrupted)?;
+                if bytes.is_none() {
+                    drain_file_data(file_recv_stream, file_header.size)
+                        .await
+                        .map_err(err_corrupted)?;
+                }
                 return Ok(());
             }
             if let DstFilePlan::Replace(dst_snapshot) = &plan {
@@ -390,19 +427,18 @@ async fn process_single_file(
                     settings,
                 )
                 .await
-                .map_err(err_needs_drain)?;
+                .map_err(err_filesystem)?;
             }
             // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
             // another writer refilled it — report that rather than looping, which against a live
             // competing writer would never terminate.
-            dst_parent
-                .create_file(dst_name)
+            create()
                 .await
                 .with_context(|| format!("failed creating {:?}", file_header.dst))
-                .map_err(err_needs_drain)?
+                .map_err(err_filesystem)?
         }
         Err(error) => {
-            return Err(err_needs_drain(
+            return Err(err_filesystem(
                 anyhow::Error::new(error).context(format!("failed creating {:?}", file_header.dst)),
             ));
         }
@@ -410,33 +446,35 @@ async fn process_single_file(
     // wrap the std file for async writes; the underlying fd is retained so its metadata
     // can be applied through the held fd (no path re-open).
     let mut file = tokio::fs::File::from_std(std_file);
-    // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
-    // but capped at file size to avoid over-allocation for small files
-    let file_size = file_header.size.min(usize::MAX as u64) as usize;
-    let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
-    // once we start reading from the stream, any error means the stream is corrupted
-    let copied = file_recv_stream
-        .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
-        .instrument(tracing::trace_span!(
-            "recv_data",
-            size = file_header.size,
-            buffer_size
-        ))
-        .await
-        .map_err(err_corrupted)?;
-    if copied != file_header.size {
-        return Err(err_corrupted(anyhow::anyhow!(
-            "File size mismatch: expected {} bytes, copied {} bytes",
-            file_header.size,
-            copied
-        )));
+    if bytes.is_none() {
+        // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
+        // but capped at file size to avoid over-allocation for small files
+        let file_size = file_header.size.min(usize::MAX as u64) as usize;
+        let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+        // once we start reading from the stream, any error means the stream is corrupted
+        let copied = file_recv_stream
+            .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
+            .instrument(tracing::trace_span!(
+                "recv_data",
+                size = file_header.size,
+                buffer_size
+            ))
+            .await
+            .map_err(err_corrupted)?;
+        if copied != file_header.size {
+            return Err(err_corrupted(anyhow::anyhow!(
+                "File size mismatch: expected {} bytes, copied {} bytes",
+                file_header.size,
+                copied
+            )));
+        }
+        // flush before metadata to ensure all data reaches the kernel before we set mtime.
+        // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
+        // may complete after we set mtime, causing the file to appear modified.
+        file.flush()
+            .await
+            .map_err(|e| err_data_consumed(e.into()))?;
     }
-    // flush before metadata to ensure all data reaches the kernel before we set mtime.
-    // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
-    // may complete after we set mtime, causing the file to appear modified.
-    file.flush()
-        .await
-        .map_err(|e| err_data_consumed(e.into()))?;
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
         file_header.src.display(),
@@ -2371,6 +2409,189 @@ mod removal_tests {
             dry_run: None,
             delete: None,
         }
+    }
+
+    struct CreateDuringReceive {
+        data: std::io::Cursor<Vec<u8>>,
+        path: Option<std::path::PathBuf>,
+    }
+
+    impl tokio::io::AsyncRead for CreateDuringReceive {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(path) = self.path.take() {
+                std::fs::write(path, b"competing writer")?;
+            }
+            std::pin::Pin::new(&mut self.data).poll_read(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_small_file_replans_without_consuming_next_payload() -> anyhow::Result<()> {
+        for policy in ["overwrite", "skip", "fail"] {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("file");
+            let parent =
+                Arc::new(Dir::open_root_dir(tmp.path(), false, common::Side::Destination).await?);
+            let header = remote::protocol::File {
+                src: path.clone(),
+                dst: path.clone(),
+                size: 5,
+                metadata: remote::protocol::Metadata::from(&std::fs::metadata(tmp.path())?),
+                is_root: false,
+            };
+            let reader: remote::streams::BoxedRead = Box::new(CreateDuringReceive {
+                data: std::io::Cursor::new(b"firstNEXT".to_vec()),
+                path: Some(path.clone()),
+            });
+            let mut stream = remote::streams::RecvStream::new(reader);
+            let mut options = settings();
+            options.overwrite_compare.size = true;
+            options.overwrite = policy == "overwrite";
+            options.ignore_existing = policy == "skip";
+            let result = process_single_file(
+                &options,
+                &Default::default(),
+                &mut stream,
+                &header,
+                &parent,
+                OsStr::new("file"),
+            )
+            .await;
+            if policy == "fail" {
+                assert!(matches!(
+                    result,
+                    Err(ProcessFileError {
+                        stream_state: StreamState::DataConsumed,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{}",
+                    result
+                        .err()
+                        .map(|err| format!("{:#}", err.source))
+                        .unwrap_or_default()
+                );
+            }
+            let mut next = Vec::new();
+            stream.copy_exact_to_buffered(&mut next, 4, 8192).await?;
+            assert_eq!(next, b"NEXT");
+            assert_eq!(
+                std::fs::read(path)?,
+                if policy == "overwrite" {
+                    &b"first"[..]
+                } else {
+                    &b"competing writer"[..]
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_small_file_counts_data_before_metadata_error_and_continues()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, common::Side::Destination).await?);
+        let mut metadata = remote::protocol::Metadata::from(&std::fs::metadata(tmp.path())?);
+        metadata.mode = 0o751;
+        let mut header = remote::protocol::File {
+            src: tmp.path().join("source"),
+            dst: tmp.path().join("first"),
+            size: 5,
+            metadata,
+            is_root: false,
+        };
+        let reader: remote::streams::BoxedRead = Box::new(std::io::Cursor::new(b"firstnext"));
+        let mut stream = remote::streams::RecvStream::new(reader);
+        let mut preserve = common::preserve::Settings::default();
+        preserve.file.acl = true;
+        let before = progress().files_copied.get();
+        let bytes_before = progress().bytes_copied.get();
+        let result = process_single_file(
+            &settings(),
+            &preserve,
+            &mut stream,
+            &header,
+            &parent,
+            OsStr::new("first"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProcessFileError {
+                stream_state: StreamState::DataConsumed,
+                ..
+            })
+        ));
+        assert_eq!(progress().files_copied.get(), before + 1);
+        assert_eq!(progress().bytes_copied.get(), bytes_before + 5);
+        assert_eq!(std::fs::read(tmp.path().join("first"))?, b"first");
+        header.size = 4;
+        header.dst = tmp.path().join("next");
+        process_single_file(
+            &settings(),
+            &Default::default(),
+            &mut stream,
+            &header,
+            &parent,
+            OsStr::new("next"),
+        )
+        .await
+        .map_err(|err| err.source)?;
+        assert_eq!(std::fs::read(&header.dst)?, b"next");
+        assert_eq!(
+            std::fs::metadata(&header.dst)?.permissions().mode() & 0o777,
+            0o751
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncated_small_payload_preserves_existing_destination() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("file");
+        std::fs::write(&path, b"original contents")?;
+        let parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, common::Side::Destination).await?);
+        let header = remote::protocol::File {
+            src: path.clone(),
+            dst: path.clone(),
+            size: 10,
+            metadata: remote::protocol::Metadata::from(&std::fs::metadata(&path)?),
+            is_root: false,
+        };
+        let reader: remote::streams::BoxedRead = Box::new(std::io::Cursor::new(b"short"));
+        let mut stream = remote::streams::RecvStream::new(reader);
+        let mut options = settings();
+        options.overwrite_compare.size = true;
+        options.remote_copy_buffer_size = 8192;
+        let result = process_single_file(
+            &options,
+            &Default::default(),
+            &mut stream,
+            &header,
+            &parent,
+            OsStr::new("file"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProcessFileError {
+                stream_state: StreamState::Corrupted,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&path)?, b"original contents");
+        Ok(())
     }
 
     #[tokio::test]

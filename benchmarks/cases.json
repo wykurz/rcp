@@ -2,7 +2,9 @@
   "schema_version": 1,
   "cases": [
     {"id": "tiny-10k", "description": "Ten top-level directories, each with 1024 tiny files", "directory_widths": [10, 1, 1], "files_per_leaf": 1024, "file_size_bytes": 1024},
-    {"id": "tiny-1m", "description": "One million tiny files", "directory_widths": [10, 10, 10], "files_per_leaf": 1024, "file_size_bytes": 1024}
+    {"id": "tiny-1m", "description": "One million tiny files", "directory_widths": [10, 10, 10], "files_per_leaf": 1024, "file_size_bytes": 1024},
+    {"id": "medium-4k", "description": "Ten top-level directories, each with 400 medium files", "directory_widths": [10, 1, 1], "files_per_leaf": 400, "file_size_bytes": 262144},
+    {"id": "large-100", "description": "Ten top-level directories, each with 10 large files", "directory_widths": [10, 1, 1], "files_per_leaf": 10, "file_size_bytes": 16777216}
   ],
   "variants": [
     {"id": "rcp-default", "description": "rcp default copy", "tool": "rcp", "args": ["--summary"], "processes": 1},
