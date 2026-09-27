@@ -352,7 +352,7 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         return {"filesystem_type": info.get("filesystem_type"), "mount_options": sorted(set(options)), "storage_identity": identity}
     comparable_environment["filesystem"] = {side: semantic_mount(side, info) for side, info in filesystem.items()}
     stable_references = {}
-    for tool in ("rsync", "cp"):
+    for tool in ("rsync", "cp", "rcp-baseline", "rcpd-baseline"):
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
@@ -497,6 +497,8 @@ def main(argv=None):
         if args.mode != "local" and any(variant["tool"] == "cp" for variant in variants):
             raise ValueError("cp variants require local mode")
         if args.files_in_flight:
+            if not any(variant["tool"] == "rcp" for variant in variants):
+                raise ValueError("files-in-flight requires a selected rcp variant")
             limits = args.files_in_flight.split(",")
             if any(not item.isdecimal() or int(item) <= 0 for item in limits):
                 raise ValueError("files-in-flight must be positive comma-separated integers")
@@ -510,7 +512,6 @@ def main(argv=None):
             raise ValueError("variant expansion produced duplicate ids")
         record["cases"] = cases
         record["variants"] = variants
-        record["context"]["metadata_policies"] = {variant["id"]: ("rcp preserve-settings=all includes atime" if variant["tool"] == "rcp" and "--preserve-settings=all" in variant["args"] else "rcp defaults" if variant["tool"] == "rcp" else "cp -a archive; preserves all supported attributes" if variant["tool"] == "cp" else "rsync -a archive; differs from rcp preserve-all for atime") for variant in variants}
         _persist(output, record)
         for root in (args.source_root, args.destination_root):
             if not root.is_dir():

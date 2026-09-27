@@ -82,6 +82,20 @@ class StorageIdentityTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertNotEqual(original, run.series_id(*arguments, {"cp": {**reference, **change}}))
 
+    def test_baseline_build_changes_split_series_while_candidate_changes_do_not(self):
+        arguments = (self.case, self.variant, "source-warm", "loopback", "runner", self.environment)
+        tools = {tool: {"version": "0.41.0", "sha256": "a" * 64, "path": f"/build/{tool}"} for tool in ("rcp", "rcpd", "rcp-baseline", "rcpd-baseline")}
+        original = run.series_id(*arguments, tools)
+        for tool in ("rcp-baseline", "rcpd-baseline"):
+            for change in ({"version": "0.42.0"}, {"sha256": "b" * 64}):
+                with self.subTest(tool=tool, change=change):
+                    changed = {**tools, tool: {**tools[tool], **change}}
+                    self.assertNotEqual(original, run.series_id(*arguments, changed))
+        relocated = {tool: {**identity, "path": f"/another-build/{tool}"} for tool, identity in tools.items()}
+        self.assertEqual(original, run.series_id(*arguments, relocated))
+        candidate_changes = {**tools, **{tool: {**tools[tool], "version": "0.42.0", "sha256": "b" * 64} for tool in ("rcp", "rcpd")}}
+        self.assertEqual(original, run.series_id(*arguments, candidate_changes))
+
 
 if __name__ == "__main__":
     unittest.main()
