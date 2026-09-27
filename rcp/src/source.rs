@@ -1934,10 +1934,10 @@ async fn send_file_tcp(
         // `-L`/`--dereference` walk (which follows symlinks by design).
         let open_result = match &file_read {
             FileRead::Hardened(dir, name) => dir
-                .prepare_file_read(name)
+                .open_file_read(name)
                 .instrument(tracing::trace_span!("file_open"))
                 .await
-                .map(|(file, meta, bytes)| (tokio::fs::File::from_std(file), Some(meta), bytes)),
+                .map(|(file, meta)| (tokio::fs::File::from_std(file), Some(meta))),
             FileRead::Path => {
                 let src = src.to_owned();
                 common::safedir::run_metadata_probed_blocking(
@@ -1947,7 +1947,7 @@ async fn send_file_tcp(
                 )
                 .instrument(tracing::trace_span!("file_open"))
                 .await
-                .map(|file| (tokio::fs::File::from_std(file), None, None))
+                .map(|file| (tokio::fs::File::from_std(file), None))
             }
         };
         // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
@@ -1958,15 +1958,15 @@ async fn send_file_tcp(
         // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
         // header has not been sent, so the destination is still owed exactly one entry for this file.
         let open_result = match open_result {
-            Ok((file, meta, bytes)) if capture.file_acl => {
+            Ok((file, meta)) if capture.file_acl => {
                 common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
                     .await
-                    .map(|acls| (file, meta, bytes, Some(acls)))
+                    .map(|acls| (file, meta, Some(acls)))
             }
-            Ok((file, meta, bytes)) => Ok((file, meta, bytes, None)),
+            Ok((file, meta)) => Ok((file, meta, None)),
             Err(e) => Err(e),
         };
-        let (file, read_meta, bytes, src_acls) = match open_result {
+        let (file, read_meta, src_acls) = match open_result {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("Failed to read file {src:?} for sending: {e:#}");
@@ -2026,6 +2026,7 @@ async fn send_file_tcp(
         // but capped at file size to avoid over-allocation for small files
         let file_size = size.min(usize::MAX as u64) as usize;
         let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+        let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
         let file_header = remote::protocol::File {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
@@ -2033,20 +2034,11 @@ async fn send_file_tcp(
             metadata,
             is_root,
         };
-        let send_result = if let Some(bytes) = bytes {
-            pooled_stream
-                .stream_mut()
-                .send_message_with_data_buffered(&file_header, &mut bytes.as_slice())
-                .instrument(tracing::trace_span!("send_data", size, buffer_size))
-                .await
-        } else {
-            let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
-            pooled_stream
-                .stream_mut()
-                .send_message_with_data_buffered(&file_header, &mut buffered_file)
-                .instrument(tracing::trace_span!("send_data", size, buffer_size))
-                .await
-        };
+        let send_result = pooled_stream
+            .stream_mut()
+            .send_message_with_data_buffered(&file_header, &mut buffered_file)
+            .instrument(tracing::trace_span!("send_data", size, buffer_size))
+            .await;
         match send_result {
             Ok(_bytes_sent) => {
                 // stream is returned to pool when pooled_stream is dropped

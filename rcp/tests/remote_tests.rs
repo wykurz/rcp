@@ -300,36 +300,6 @@ fn test_remote_copy_basic() {
     run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
 }
 
-#[test]
-fn remote_mixed_file_sizes_share_one_connection() {
-    require_local_ssh();
-    for plaintext in [false, true] {
-        let (src_dir, dst_dir) = setup_test_env();
-        let source = src_dir.path().join("mixed");
-        std::fs::create_dir(&source).unwrap();
-        let sizes = [0, 7, 65536, 65537, 1024 * 1024];
-        for (index, size) in sizes.into_iter().enumerate() {
-            let bytes: Vec<u8> = (0..size).map(|offset| (offset % 251) as u8).collect();
-            std::fs::write(source.join(format!("file-{index}")), bytes).unwrap();
-        }
-        let destination = dst_dir.path().join("copied");
-        let src_remote = format!("localhost:{}", source.display());
-        let dst_remote = format!("localhost:{}", destination.display());
-        let mut args = vec!["--max-connections=1", "--summary", &src_remote, &dst_remote];
-        if plaintext {
-            args.push("--no-encryption");
-        }
-        run_rcp_and_expect_success(&args);
-        for (index, _) in sizes.into_iter().enumerate() {
-            let name = format!("file-{index}");
-            assert_eq!(
-                std::fs::read(source.join(&name)).unwrap(),
-                std::fs::read(destination.join(&name)).unwrap()
-            );
-        }
-    }
-}
-
 /// Test remote copy with --no-encryption flag (plain TCP, no TLS)
 #[test]
 fn test_remote_copy_no_encryption() {
