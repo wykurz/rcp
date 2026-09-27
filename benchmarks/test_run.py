@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -82,6 +83,15 @@ class RunnerTests(unittest.TestCase):
     def test_planner_rejects_remote_cp_before_resolving_tools(self):
         with self.assertRaisesRegex(ValueError, "cp.*local"):
             run.plan_commands({"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}, Path("source"), Path("destination"), {}, "loopback")
+
+    def test_loopback_rejects_custom_rsync_server_before_fixture_work(self):
+        for args in (["-a", "--rsync-path=/opt/rsync"], ["-a", "--rsync-path", "/opt/rsync"]):
+            with self.subTest(args=args):
+                self._assert_rejected_before_fixture_work(
+                    [{"id": "rsync-custom", "tool": "rsync", "args": args, "processes": 1}],
+                    ["--case", "tiny", "--variant", "rsync-custom", "--mode", "loopback"],
+                    "rsync-path.*reserved",
+                )
 
     def test_default_selections_include_cp_only_locally(self):
         for mode, expected in (("local", ["rcp-default", "rsync-a", "rsync-a-10", "cp-a"]), ("loopback", ["rcp-default", "rsync-a", "rsync-a-10"])):
@@ -484,7 +494,25 @@ class RunnerTests(unittest.TestCase):
             source.mkdir()
             destination = Path(root) / "destination"
             command = run.plan_commands({"id": "rsync-a", "tool": "rsync", "args": ["-a"], "processes": 1}, source, destination, {"rsync": Path("/usr/bin/rsync")}, "loopback")[0]
+            self.assertEqual(command[:3], ["/usr/bin/rsync", "-a", "--rsync-path=/usr/bin/rsync"])
             self.assertEqual(command[-2], f"localhost:{source}/")
+
+    def test_loopback_parallel_rsync_quotes_recorded_server_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            for name in ("a", "b"):
+                (source / name).mkdir()
+            destination = root / "destination"
+            executable = root / "rsync with space and ' quote" / "rsync"
+            commands = run.plan_commands({"id": "rsync-two", "tool": "rsync", "args": ["-a"], "processes": 2}, source, destination, {"rsync": executable}, "loopback")
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(command[:2], [str(executable), "-a"])
+                self.assertTrue(command[2].startswith("--rsync-path="))
+                self.assertEqual(shlex.split(command[2].partition("=")[2]), [str(executable)])
+                self.assertTrue(command[-2].startswith("localhost:"))
 
     def test_failed_cache_preparation_persists_failed_result(self):
         with tempfile.TemporaryDirectory() as root:

@@ -4,11 +4,13 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import resource
+import shlex
 import shutil
 import signal
 import stat
@@ -24,7 +26,7 @@ from benchmarks.strict_json import parse_json
 
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
-VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents"
+VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents; source tree must match initial scan after all case trials"
 FIXTURE_CONTRACT_REVISION = 2
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 MOUNTINFO_ESCAPE = re.compile(r"\\(040|011|012|134)")
@@ -143,16 +145,25 @@ def validate_tree(source, destination, expected=None):
     return result
 
 
-def plan_commands(variant, source, destination, tools, mode):
-    source = Path(source)
-    destination = Path(destination)
+def _validate_variant_mode(variant, mode):
     tool = variant["tool"]
     if tool == "cp" and mode != "local":
         raise ValueError("cp variants require local mode")
+    if tool == "rsync" and mode == "loopback" and any(arg == "--rsync-path" or arg.startswith("--rsync-path=") for arg in variant["args"]):
+        raise ValueError("custom --rsync-path is reserved in loopback mode")
+
+
+def plan_commands(variant, source, destination, tools, mode):
+    _validate_variant_mode(variant, mode)
+    source = Path(source)
+    destination = Path(destination)
+    tool = variant["tool"]
     executable = str(tools[tool])
     args = list(variant["args"])
     if tool == "rcp" and mode == "loopback":
         args += ["--force-remote", f"--rcpd-path={tools['rcpd']}"]
+    if tool == "rsync" and mode == "loopback":
+        args.append(f"--rsync-path={shlex.quote(executable)}")
     processes = variant["processes"]
     if processes == 1:
         operand = f"localhost:{source}" if tool == "rcp" and mode == "loopback" else str(source)
@@ -498,14 +509,14 @@ def main(argv=None):
     source_scratch = None
     destination_scratch = None
     try:
-        if args.repetitions <= 0 or args.timeout <= 0:
-            raise ValueError("repetitions and timeout must be positive")
+        if args.repetitions <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("repetitions and timeout must be positive; timeout must be finite")
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
         default_variants = ["rcp-default", "rsync-a", "rsync-a-10"] + (["cp-a"] if args.mode == "local" else [])
         variants = _select(manifest["variants"], args.variants or default_variants, "variant")
-        if args.mode != "local" and any(variant["tool"] == "cp" for variant in variants):
-            raise ValueError("cp variants require local mode")
+        for variant in variants:
+            _validate_variant_mode(variant, args.mode)
         if args.files_in_flight is not None:
             if not any(variant["tool"] == "rcp" for variant in variants):
                 raise ValueError("files-in-flight requires a selected rcp variant")
@@ -600,6 +611,9 @@ def main(argv=None):
                     if trial["status"] != "ok":
                         raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                     shutil.rmtree(destination)
+            source_validation = validate_tree(source, source, source_scan)
+            if not source_validation["ok"]:
+                raise RuntimeError(f"source changed during case {case['id']}: {source_validation['error']}")
             case_summaries = []
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
