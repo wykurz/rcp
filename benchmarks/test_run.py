@@ -21,6 +21,14 @@ class RunnerTests(unittest.TestCase):
             ["--case", "tiny", "--variant", "cp-a", "--mode", "loopback"], "cp.*local",
         )
 
+    def test_concurrency_sweep_requires_a_selected_rcp_before_fixture_work(self):
+        for tool in ("rsync", "cp"):
+            with self.subTest(tool=tool):
+                self._assert_rejected_before_fixture_work([
+                    {"id": "rcp-default", "tool": "rcp", "args": [], "processes": 1},
+                    {"id": "reference", "tool": tool, "args": ["-a"], "processes": 1},
+                ], ["--case", "tiny", "--variant", "reference", "--files-in-flight", "2,4"], "files-in-flight.*selected rcp")
+
     def test_planner_rejects_remote_cp_before_resolving_tools(self):
         with self.assertRaisesRegex(ValueError, "cp.*local"):
             run.plan_commands({"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}, Path("source"), Path("destination"), {}, "loopback")

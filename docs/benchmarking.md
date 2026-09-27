@@ -54,10 +54,11 @@ just benchmark-run --case tiny-10k --mode loopback \
   --files-in-flight 2,4,8,32,64,128 --repetitions 9 --output /tmp/rcp-bench-concurrency
 ```
 
-The concurrency sweep preserves the other rcp defaults. In the current remote implementation,
-`--max-files-in-flight=128` remains limited by the default `--max-connections=100`. Raw commands and
-rcp summaries retain that distinction. This example has nine variants: the three defaults plus six
-rcp limits. Nine repetitions let each variant occupy every trial position once.
+The concurrency sweep requires a selected rcp variant and preserves its other defaults. In the
+current remote implementation, `--max-files-in-flight=128` remains limited by the default
+`--max-connections=100`. Raw commands and rcp summaries retain that distinction. This example has
+nine variants: the three defaults plus six rcp limits. Nine repetitions let each variant occupy
+every trial position once.
 
 ## Cases and variants
 
@@ -180,11 +181,11 @@ different metadata or concurrency settings does not receive a ratio against that
 
 A historical series includes the workload and measurement contract, normalized flags, runner and
 meaningful environment configuration. Changing the cache policy or filesystem starts a separate
-series. The comparison tools' versions and SHA-256 digests also distinguish series, so a changed
-reference binary does not share a trend with the old one. Scratch paths, timestamps, random fixture
-bytes and the tested rcp revision do not split the series: rcp changes are precisely what the
-history should expose. Keep runner labels stable and descriptive, and distinguish materially
-different storage configurations with endpoint storage IDs.
+series. Versions and SHA-256 digests for cp, rsync, and any supplied baseline rcp/rcpd binaries also
+distinguish series, so a changed reference binary does not share a trend with the old one. Scratch
+paths, timestamps, random fixture bytes and the tested rcp revision do not split the series: rcp
+changes are precisely what the history should expose. Keep runner labels stable and descriptive, and
+distinguish materially different storage configurations with endpoint storage IDs.
 
 History is one immutable JSON file per run on the `benchmark-history` branch. CI artifacts preserve
 full logs and per-run standalone reports; the history branch provides persistence independent of
