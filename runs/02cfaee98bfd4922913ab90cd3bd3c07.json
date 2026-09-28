@@ -1,0 +1,3305 @@
+{
+  "cases": [
+    {
+      "description": "One million tiny files",
+      "directory_widths": [
+        10,
+        10,
+        10
+      ],
+      "file_size_bytes": 1024,
+      "files_per_leaf": 1024,
+      "fixture_digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+      "id": "tiny-1m",
+      "realized_counts": {
+        "bytes": 1048576000,
+        "directories": 1110,
+        "files": 1024000
+      }
+    },
+    {
+      "description": "128,000 medium files, 31.25 GiB total",
+      "directory_widths": [
+        10,
+        10,
+        1
+      ],
+      "file_size_bytes": 262144,
+      "files_per_leaf": 1280,
+      "fixture_digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+      "id": "medium-128k",
+      "realized_counts": {
+        "bytes": 33554432000,
+        "directories": 210,
+        "files": 128000
+      }
+    },
+    {
+      "description": "120 files of 256 MiB, 30 GiB total",
+      "directory_widths": [
+        10,
+        1,
+        1
+      ],
+      "file_size_bytes": 268435456,
+      "files_per_leaf": 12,
+      "fixture_digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+      "id": "large-120",
+      "realized_counts": {
+        "bytes": 32212254720,
+        "directories": 30,
+        "files": 120
+      }
+    }
+  ],
+  "context": {
+    "cache_policy": "linux-drop-caches",
+    "destination": "/home/runner/work/tmp",
+    "directory_count_policy": "directories below fixture root; excludes fixture root",
+    "environment": {
+      "architecture": "x86_64",
+      "cpu_model": "AMD EPYC 9R45 96-Core Processor",
+      "cpu_quota": "",
+      "effective_parallelism": 32,
+      "fd_limit": 1048576,
+      "filesystem": {
+        "destination": {
+          "filesystem_type": "ext4",
+          "mount_options": [
+            "lazytime",
+            "noatime",
+            "nobarrier",
+            "rw"
+          ],
+          "mount_source": "/dev/mapper/root",
+          "mountpoint": "/"
+        },
+        "source": {
+          "filesystem_type": "ext4",
+          "mount_options": [
+            "lazytime",
+            "noatime",
+            "nobarrier",
+            "rw"
+          ],
+          "mount_source": "/dev/mapper/root",
+          "mountpoint": "/"
+        }
+      },
+      "kernel": "6.12.109+",
+      "memory_limit": ""
+    },
+    "fixture_contract_revision": 2,
+    "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest",
+    "purpose": "performance",
+    "repository": "wykurz/rcp",
+    "run_url": "",
+    "runner_label": "depot-ubuntu-24.04-32",
+    "source": "/home/runner/work/tmp",
+    "storage_ids": {
+      "destination": "depot-root",
+      "source": "depot-root"
+    },
+    "timing_policy": "monotonic launch-to-last-child-exit; excludes verification and cache preparation",
+    "topology": "local",
+    "verification_policy": "exact relative directory and regular-file paths, sizes, and SHA256 contents; source tree must match initial scan after all case trials"
+  },
+  "revision": {
+    "branch": "main",
+    "commit": "f33677f1405b7c45977bb20e1f0e03a36c91725e",
+    "dirty": false
+  },
+  "run_id": "02cfaee98bfd4922913ab90cd3bd3c07",
+  "schema_version": 1,
+  "status": "complete",
+  "summaries": [
+    {
+      "case_id": "tiny-1m",
+      "files_per_second": 6968.487649554081,
+      "maximum": 189.16262050799992,
+      "median": 146.9472361144999,
+      "minimum": 33.19213605099998,
+      "samples": [
+        33.19213605099998,
+        147.63384197899995,
+        146.26063024999985,
+        189.16262050799992
+      ],
+      "series_id": "25ca85b3f00749367a59c36ab9db4d7bfa1b055a27332e4686b5dcad6179d46a",
+      "stdev": 66.94231744728211,
+      "unit": "seconds",
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "tiny-1m",
+      "files_per_second": 34482.709726445995,
+      "maximum": 30.59809636099999,
+      "median": 29.69604210700004,
+      "minimum": 24.267833172999985,
+      "samples": [
+        24.267833172999985,
+        30.59809636099999,
+        29.29863410200005,
+        30.093450112000028
+      ],
+      "series_id": "6ccda5432b478756447343e82d93716f18c2925bbe6cdb2db5304cc31ef41de6",
+      "stdev": 2.9139607241903493,
+      "unit": "seconds",
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "files_per_second": 5784.192375066602,
+      "maximum": 182.520781689,
+      "median": 177.03422251550012,
+      "minimum": 142.49518909000017,
+      "samples": [
+        182.520781689,
+        175.42854396100006,
+        142.49518909000017,
+        178.63990107000018
+      ],
+      "series_id": "de0de50ad5e5273a942a9d56bbf5954460785e7a1e204558094cf67f9050bc89",
+      "stdev": 18.413690592709358,
+      "unit": "seconds",
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "tiny-1m",
+      "files_per_second": 30869.03558247682,
+      "maximum": 34.589670880000085,
+      "median": 33.172400131000074,
+      "minimum": 31.246611072000064,
+      "samples": [
+        31.246611072000064,
+        33.03285500100003,
+        33.31194526100012,
+        34.589670880000085
+      ],
+      "series_id": "1591e4f63a114d2f33984a76d5145e86d97031c810edd0a9bdc413a20baa7d98",
+      "stdev": 1.377390993200229,
+      "unit": "seconds",
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "files_per_second": 5104.973244163591,
+      "maximum": 66.01553362200002,
+      "median": 25.073588808000068,
+      "minimum": 23.558044993000294,
+      "samples": [
+        66.01553362200002,
+        25.03249985299999,
+        23.558044993000294,
+        25.114677763000145
+      ],
+      "series_id": "135ffc825b4be1c0879c0d25ba39ae39f70d7a8467ba865f97520d82b56e0950",
+      "stdev": 20.735901402147572,
+      "unit": "seconds",
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "medium-128k",
+      "files_per_second": 808.4616050010086,
+      "maximum": 179.34900021900012,
+      "median": 158.32539134600006,
+      "minimum": 150.56534858799978,
+      "samples": [
+        151.53182902800017,
+        165.11895366399995,
+        150.56534858799978,
+        179.34900021900012
+      ],
+      "series_id": "96673f7efe29d247295aafc6960d76d0bcc025910292ea31934e21f762232c42",
+      "stdev": 13.546645649584658,
+      "unit": "seconds",
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "files_per_second": 2687.1586083935404,
+      "maximum": 52.54409872500037,
+      "median": 47.63395789150013,
+      "minimum": 42.68396871899995,
+      "samples": [
+        51.20035761600002,
+        44.06755816700024,
+        42.68396871899995,
+        52.54409872500037
+      ],
+      "series_id": "0e9c4bcad1dd66f9153c9447c9c7980809bae03875221c6dcc676a817113b23c",
+      "stdev": 4.968228820212522,
+      "unit": "seconds",
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "medium-128k",
+      "files_per_second": 938.5598396874759,
+      "maximum": 145.97907021899982,
+      "median": 136.37915728700023,
+      "minimum": 115.47170259799987,
+      "samples": [
+        135.46283237199987,
+        115.47170259799987,
+        145.97907021899982,
+        137.29548220200058
+      ],
+      "series_id": "ad5655c0551bfc8cf9817c3a5acf3d90b72a3685c050861bb9bd23879b67fd81",
+      "stdev": 12.896952707619192,
+      "unit": "seconds",
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "large-120",
+      "files_per_second": 5.807123353583101,
+      "maximum": 30.72775405199991,
+      "median": 20.664276043999962,
+      "minimum": 8.603155998000148,
+      "samples": [
+        8.603155998000148,
+        23.002831523000168,
+        18.325720564999756,
+        30.72775405199991
+      ],
+      "series_id": "2afb5b93253eda8cce957caece8df933e8b0cd55650c570d4d3a6e2ff2989823",
+      "stdev": 9.2499413765754,
+      "unit": "seconds",
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "large-120",
+      "files_per_second": 4.994440407860985,
+      "maximum": 37.983945239000604,
+      "median": 24.026715747999788,
+      "minimum": 20.547303604999797,
+      "samples": [
+        25.83696171199972,
+        37.983945239000604,
+        20.547303604999797,
+        22.216469783999855
+      ],
+      "series_id": "694c378df28bde27c9be98df74efff07b6d1cef2bcc5148ab548ec4f7a9bab0f",
+      "stdev": 7.874396923599039,
+      "unit": "seconds",
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "large-120",
+      "files_per_second": 5.626022419076176,
+      "maximum": 30.78586652100057,
+      "median": 21.329456418999598,
+      "minimum": 9.39593351700023,
+      "samples": [
+        9.39593351700023,
+        20.445884763999857,
+        30.78586652100057,
+        22.21302807399934
+      ],
+      "series_id": "7fef958bd3a44f23cec19e66156df76939bb2c95c5fd517b3d90007ff3dd2657",
+      "stdev": 8.791284256823696,
+      "unit": "seconds",
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "large-120",
+      "files_per_second": 4.91148426907957,
+      "maximum": 39.54633041899979,
+      "median": 24.43253269800016,
+      "minimum": 17.88698102500075,
+      "samples": [
+        22.0766343639998,
+        26.788431032000517,
+        39.54633041899979,
+        17.88698102500075
+      ],
+      "series_id": "25fa727f4a16c53337097754f96330c8f699465e5fc42ad3e49cafccbb32c068",
+      "stdev": 9.381150108785922,
+      "unit": "seconds",
+      "variant_id": "cp-a"
+    }
+  ],
+  "timestamp": "2026-09-28T05:10:26.800177+00:00",
+  "tools": {
+    "cp": {
+      "path": "/usr/bin/cp",
+      "sha256": "95cdd604fdf0a292e349d27d1a80170ca0913bd3bbd9d2c0fcfc6c8adaebe2f0",
+      "version": "cp (GNU coreutils) 9.4"
+    },
+    "filegen": {
+      "path": "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/filegen",
+      "sha256": "92be0fb597575a56e258cae867fd40dc37ea93e62308b5e0a810fff2e46c0f40",
+      "version": "filegen 0.41.0"
+    },
+    "rcp": {
+      "path": "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+      "sha256": "9b03d6f213abdac396b9d4bf60d680bffc0d95ed870e5ab8ab48cb6d8ea2ecac",
+      "version": "rcp 0.41.0"
+    },
+    "rcpd": {
+      "path": "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcpd",
+      "sha256": "0b7e3528f7347fa00c65c036d390313137a2b1186ad123634f8f237f0c4e4f09",
+      "version": "rcpd 0.41.0"
+    },
+    "rsync": {
+      "path": "/usr/bin/rsync",
+      "sha256": "6b4fb867cb49d0332b72b234656311c807ab68b0537905fda7a3e7481a139f16",
+      "version": "rsync  version 3.2.7  protocol version 31"
+    }
+  },
+  "trials": [
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rcp-default/1"
+        ]
+      ],
+      "elapsed_seconds": 33.19213605099998,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a/1/"
+        ]
+      ],
+      "elapsed_seconds": 24.267833172999985,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/1"
+        ]
+      ],
+      "elapsed_seconds": 182.520781689,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/1/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/cp-a/1"
+        ]
+      ],
+      "elapsed_seconds": 31.246611072000064,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a/2/"
+        ]
+      ],
+      "elapsed_seconds": 30.59809636099999,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/2"
+        ]
+      ],
+      "elapsed_seconds": 175.42854396100006,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/2/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/cp-a/2"
+        ]
+      ],
+      "elapsed_seconds": 33.03285500100003,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rcp-default/2"
+        ]
+      ],
+      "elapsed_seconds": 147.63384197899995,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/3"
+        ]
+      ],
+      "elapsed_seconds": 142.49518909000017,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/3/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/cp-a/3"
+        ]
+      ],
+      "elapsed_seconds": 33.31194526100012,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rcp-default/3"
+        ]
+      ],
+      "elapsed_seconds": 146.26063024999985,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a/3/"
+        ]
+      ],
+      "elapsed_seconds": 29.29863410200005,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/cp-a/4"
+        ]
+      ],
+      "elapsed_seconds": 34.589670880000085,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/cp-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rcp-default/4"
+        ]
+      ],
+      "elapsed_seconds": 189.16262050799992,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rcp-default/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a/4/"
+        ]
+      ],
+      "elapsed_seconds": 30.093450112000028,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "tiny-1m",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/tiny-1m/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/tiny-1m/rsync-a-10/4"
+        ]
+      ],
+      "elapsed_seconds": 178.63990107000018,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/tiny-1m/rsync-a-10/4/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 1048576000,
+          "directories": 1110,
+          "files": 1024000
+        },
+        "digest": "acbc8b71b42c3d87ee9115df5af689ca7efe533f99a1c3a8a73f1ade58a209a9",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rcp-default/1"
+        ]
+      ],
+      "elapsed_seconds": 66.01553362200002,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a/1/"
+        ]
+      ],
+      "elapsed_seconds": 151.53182902800017,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/1"
+        ]
+      ],
+      "elapsed_seconds": 51.20035761600002,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/1/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/cp-a/1"
+        ]
+      ],
+      "elapsed_seconds": 135.46283237199987,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a/2/"
+        ]
+      ],
+      "elapsed_seconds": 165.11895366399995,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/2"
+        ]
+      ],
+      "elapsed_seconds": 44.06755816700024,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/2/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/cp-a/2"
+        ]
+      ],
+      "elapsed_seconds": 115.47170259799987,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rcp-default/2"
+        ]
+      ],
+      "elapsed_seconds": 25.03249985299999,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/3"
+        ]
+      ],
+      "elapsed_seconds": 42.68396871899995,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/3/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/cp-a/3"
+        ]
+      ],
+      "elapsed_seconds": 145.97907021899982,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rcp-default/3"
+        ]
+      ],
+      "elapsed_seconds": 23.558044993000294,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a/3/"
+        ]
+      ],
+      "elapsed_seconds": 150.56534858799978,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/cp-a/4"
+        ]
+      ],
+      "elapsed_seconds": 137.29548220200058,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/cp-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rcp-default/4"
+        ]
+      ],
+      "elapsed_seconds": 25.114677763000145,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rcp-default/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a/4/"
+        ]
+      ],
+      "elapsed_seconds": 179.34900021900012,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "medium-128k",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/medium-128k/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/medium-128k/rsync-a-10/4"
+        ]
+      ],
+      "elapsed_seconds": 52.54409872500037,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/medium-128k/rsync-a-10/4/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 33554432000,
+          "directories": 210,
+          "files": 128000
+        },
+        "digest": "ed720d9211dece324a17905423b35486350e2110488c0371a006318ff5eed089",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rcp-default/1"
+        ]
+      ],
+      "elapsed_seconds": 8.603155998000148,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a/1/"
+        ]
+      ],
+      "elapsed_seconds": 25.83696171199972,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/1"
+        ]
+      ],
+      "elapsed_seconds": 9.39593351700023,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/1/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/cp-a/1"
+        ]
+      ],
+      "elapsed_seconds": 22.0766343639998,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 1,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/1/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/1/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a/2/"
+        ]
+      ],
+      "elapsed_seconds": 37.983945239000604,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/2"
+        ]
+      ],
+      "elapsed_seconds": 20.445884763999857,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/2/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/cp-a/2"
+        ]
+      ],
+      "elapsed_seconds": 26.788431032000517,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rcp-default/2"
+        ]
+      ],
+      "elapsed_seconds": 23.002831523000168,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 2,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/2/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/2/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/3"
+        ]
+      ],
+      "elapsed_seconds": 30.78586652100057,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/3/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/cp-a/3"
+        ]
+      ],
+      "elapsed_seconds": 39.54633041899979,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rcp-default/3"
+        ]
+      ],
+      "elapsed_seconds": 18.325720564999756,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a/3/"
+        ]
+      ],
+      "elapsed_seconds": 20.547303604999797,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 3,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/3/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/3/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/cp",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/cp-a/4"
+        ]
+      ],
+      "elapsed_seconds": 17.88698102500075,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/cp-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "cp-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/home/runner/work/rcp/rcp/target/x86_64-unknown-linux-musl/release/rcp",
+          "--summary",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rcp-default/4"
+        ]
+      ],
+      "elapsed_seconds": 30.72775405199991,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rcp-default/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a/4/"
+        ]
+      ],
+      "elapsed_seconds": 22.216469783999855,
+      "exit_codes": [
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a/4/0.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a"
+    },
+    {
+      "case_id": "large-120",
+      "commands": [
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir0",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir1",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir2",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir3",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir4",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir5",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir6",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir7",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir8",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ],
+        [
+          "/usr/bin/rsync",
+          "-a",
+          "/home/runner/work/tmp/rcp-bench-source-8jemt4os/large-120/filegen/dir9",
+          "/home/runner/work/tmp/rcp-bench-destination-_ie2ehd1/large-120/rsync-a-10/4"
+        ]
+      ],
+      "elapsed_seconds": 22.21302807399934,
+      "exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "iteration": 4,
+      "launch_error": null,
+      "logs": [
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/0.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/0.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/1.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/1.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/2.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/2.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/3.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/3.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/4.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/4.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/5.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/5.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/6.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/6.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/7.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/7.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/8.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/8.stdout.log"
+        },
+        {
+          "stderr": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/9.stderr.log",
+          "stdout": "/home/runner/work/tmp/benchmark-results/logs/large-120/rsync-a-10/4/9.stdout.log"
+        }
+      ],
+      "ok": true,
+      "status": "ok",
+      "timed_out": false,
+      "validation": {
+        "counts": {
+          "bytes": 32212254720,
+          "directories": 30,
+          "files": 120
+        },
+        "digest": "22f8a094920505939e89e8d2b6799f84de574b7ba40fe39f9682d4356fc55427",
+        "ok": true
+      },
+      "variant_id": "rsync-a-10"
+    }
+  ],
+  "variants": [
+    {
+      "args": [
+        "--summary"
+      ],
+      "description": "rcp default copy",
+      "id": "rcp-default",
+      "processes": 1,
+      "tool": "rcp"
+    },
+    {
+      "args": [
+        "-a"
+      ],
+      "description": "rsync archive copy",
+      "id": "rsync-a",
+      "processes": 1,
+      "tool": "rsync"
+    },
+    {
+      "args": [
+        "-a"
+      ],
+      "description": "Ten rsync processes on disjoint top-level directories",
+      "id": "rsync-a-10",
+      "processes": 10,
+      "tool": "rsync"
+    },
+    {
+      "args": [
+        "-a"
+      ],
+      "description": "GNU cp archive copy (local only)",
+      "id": "cp-a",
+      "processes": 1,
+      "tool": "cp"
+    }
+  ]
+}
