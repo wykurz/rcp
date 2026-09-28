@@ -53,8 +53,8 @@ impl Scope {
         Self { span: Some(span) }
     }
 
-    /// Return the span for optional future instrumentation, without entering it.
-    pub fn span(&self) -> &tracing::Span {
+    /// Return the span without entering it.
+    fn span(&self) -> &tracing::Span {
         self.span.as_ref().expect("scope has not finished")
     }
 
@@ -248,6 +248,7 @@ impl State {
 
 pub(crate) struct TimingLayer {
     state: std::sync::Arc<std::sync::Mutex<State>>,
+    timeline_enabled: bool,
 }
 
 impl TimingLayer {
@@ -256,6 +257,7 @@ impl TimingLayer {
         summary: Option<std::fs::File>,
         timeline: Option<std::fs::File>,
     ) -> (Self, TimingGuard) {
+        let timeline_enabled = timeline.is_some();
         let state = std::sync::Arc::new(std::sync::Mutex::new(State {
             identifier,
             epoch: std::time::Instant::now(),
@@ -271,6 +273,7 @@ impl TimingLayer {
         (
             Self {
                 state: state.clone(),
+                timeline_enabled,
             },
             TimingGuard { state },
         )
@@ -309,12 +312,14 @@ where
             return;
         }
         let start = std::time::Instant::now();
-        let lane = {
+        let lane = if self.timeline_enabled {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.allocate_lane(start)
+        } else {
+            0
         };
         if let Some(span) = context.span(id) {
             span.extensions_mut().insert(ActiveScope {
@@ -335,13 +340,15 @@ where
         values.record(&mut completion);
         if let Some(finished) = completion.0
             && let Some(span) = context.span(id)
-            && let Some(scope) = span.extensions_mut().remove::<ActiveScope>()
         {
-            let end = std::time::Instant::now();
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(scope, finished, end);
+            let scope = span.extensions_mut().remove::<ActiveScope>();
+            if let Some(scope) = scope {
+                let end = std::time::Instant::now();
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(scope, finished, end);
+            }
         }
     }
 }
