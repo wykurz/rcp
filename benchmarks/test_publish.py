@@ -279,6 +279,28 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(completed.stdout.strip(), expected)
         self.assertNotIn(str(credentials), json.dumps(environment))
 
+    def test_credential_helper_can_read_workflow_token_in_publication_environment(self):
+        from benchmarks.publish import publication_environment
+        helper = self.root / "credential-helper"
+        helper.write_text(
+            '#!/bin/sh\n[ "$1" = get ] || exit 0\n'
+            'printf "username=test-user\\npassword=%s\\n" "$GH_TOKEN"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        self.git(self.checkout, "config", "credential.https://github.com.helper", "")
+        self.git(self.checkout, "config", "--add", "credential.https://github.com.helper", str(helper))
+        with mock.patch.dict(os.environ, {**self.environment, "GH_TOKEN": "test-only-token"}, clear=True):
+            environment = publication_environment(self.checkout)
+        completed = subprocess.run(
+            ["git", "-C", str(self.root), "credential", "fill"],
+            env=environment, input="protocol=https\nhost=github.com\n\n",
+            text=True, capture_output=True, check=True, timeout=10,
+        )
+        credentials = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+        self.assertEqual(credentials["username"], "test-user")
+        self.assertEqual(credentials["password"], "test-only-token")
+
     def test_git_environment_does_not_redirect_the_publishers_temporary_index(self):
         caller_index = self.checkout / ".git" / "index"
         (self.checkout / "user-file").write_text("keep this\n", encoding="utf-8")

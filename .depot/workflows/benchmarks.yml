@@ -160,13 +160,17 @@ jobs:
       - name: Append immutable runs to history
         id: publish
         if: steps.recorded.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          gh auth setup-git --hostname github.com
           published=false
           failed=false
           for result in downloaded-results/benchmark-results-*/results.json; do
             if python3 -m benchmarks.publish --result "$result" \
-                --repository "$GITHUB_REPOSITORY" --remote origin --finalize-interrupted; then
+                --repository "$GITHUB_REPOSITORY" \
+                --remote "https://github.com/$GITHUB_REPOSITORY.git" --finalize-interrupted; then
               published=true
             else
               failed=true
