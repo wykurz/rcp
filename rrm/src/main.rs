@@ -228,7 +228,7 @@ fn main() -> Result<()> {
     let throttle = args
         .common
         .throttle_config(files_in_flight, args.chunk_size);
-    let tracing = common::TracingConfig::local("rrm");
+    let tracing = args.common.tracing_config("rrm");
     let progress = if is_dry_run {
         None
     } else {

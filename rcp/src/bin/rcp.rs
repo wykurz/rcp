@@ -744,6 +744,8 @@ fn build_master_remote_request(
         max_connections: configured_connections.get(),
         pending_writes_multiplier: args.pending_writes_multiplier.get(),
         chrome_trace_prefix: args.chrome_trace.clone(),
+        timings_prefix: args.common.timings.clone(),
+        timings_detail: args.common.timings_detail,
         flamegraph_prefix: args.flamegraph.clone(),
         profile_level: Some(args.profile_level.clone()),
         tokio_console: args.tokio_console,
@@ -907,13 +909,17 @@ async fn finish_tracing_receivers(
     .await;
 }
 
-async fn wait_for_rcpd_processes(rcpd_processes: Vec<remote::RcpdProcess>, report_failures: bool) {
+async fn wait_for_rcpd_processes(
+    rcpd_processes: Vec<remote::RcpdProcess>,
+    report_failures: bool,
+) -> anyhow::Result<()> {
     let results = futures::future::join_all(
         rcpd_processes
             .into_iter()
             .map(remote::wait_for_rcpd_process),
     )
     .await;
+    let mut first_error = None;
     for result in results {
         if let Err(error) = result {
             if report_failures {
@@ -921,21 +927,28 @@ async fn wait_for_rcpd_processes(rcpd_processes: Vec<remote::RcpdProcess>, repor
             } else {
                 tracing::debug!("rcpd process failed while unwinding startup: {error:#}");
             }
+            first_error.get_or_insert(error);
         }
     }
     tracing::info!("All rcpd processes finished");
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn finish_remote_teardown<F>(
     process_wait: F,
     tracing_receivers: Vec<(remote::AbortOnDropTask<()>, remote::tracelog::RcpdType)>,
-) where
-    F: std::future::Future<Output = ()>,
+) -> F::Output
+where
+    F: std::future::Future,
 {
     // rcpd can spend several seconds flushing its tracing sender before exit. Keep receivers live
     // while every daemon finishes, then give all receiver tasks one shared final drain deadline.
-    process_wait.await;
+    let result = process_wait.await;
     finish_tracing_receivers(tracing_receivers).await;
+    result
 }
 
 #[derive(Default)]
@@ -957,12 +970,12 @@ impl RemoteTeardown {
         self.tracing_receivers.push((task, rcpd_type));
     }
 
-    async fn finish(mut self, report_process_failures: bool) {
+    async fn finish(mut self, report_process_failures: bool) -> anyhow::Result<()> {
         finish_remote_teardown(
             wait_for_rcpd_processes(std::mem::take(&mut self.processes), report_process_failures),
             std::mem::take(&mut self.tracing_receivers),
         )
-        .await;
+        .await
     }
 }
 
@@ -1158,7 +1171,7 @@ async fn run_rcpd_master(
     let (mut source_send_stream, mut source_recv_stream, source_tracing_recv) = match source_setup {
         Ok(setup) => setup,
         Err(error) => {
-            teardown.finish(false).await;
+            let _ = teardown.finish(false).await;
             return Err(error);
         }
     };
@@ -1240,7 +1253,7 @@ async fn run_rcpd_master(
             Err(error) => {
                 let _ = source_send_stream.close().await;
                 drop(source_recv_stream);
-                teardown.finish(false).await;
+                let _ = teardown.finish(false).await;
                 return Err(error);
             }
         };
@@ -1325,7 +1338,7 @@ async fn run_rcpd_master(
     let _ = dest_send_stream.close().await;
     drop(source_recv_stream);
     drop(dest_recv_stream);
-    teardown.finish(true).await;
+    let teardown_result = teardown.finish(true).await;
 
     let (source_result, dest_result) = operation_result?;
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
@@ -1410,18 +1423,20 @@ async fn run_rcpd_master(
             },
         }
     };
-    // propagate any errors from rcpd processes
+    let summary = merge_summaries(source_summary, dest_summary);
+    // preserve copy failures ahead of daemon shutdown failures
     if !errors.is_empty() {
         let combined_error = errors.join("; ");
         // rcp-error-log-allow: already-rendered messages joined into a String, not a chain
         tracing::error!("rcpd operation(s) failed: {combined_error}");
         return Err(common::copy::Error::new(
             anyhow::anyhow!("rcpd operation(s) failed: {combined_error}"),
-            merge_summaries(source_summary, dest_summary),
+            summary,
         )
         .into());
     }
-    Ok(merge_summaries(source_summary, dest_summary))
+    teardown_result.map_err(|error| common::copy::Error::new(error, summary))?;
+    Ok(summary)
 }
 
 #[instrument]
@@ -1924,6 +1939,8 @@ fn main() -> Result<(), anyhow::Error> {
         remote_layer: None,
         debug_log_file: None,
         chrome_trace_prefix: args.chrome_trace.clone(),
+        timings_prefix: args.common.timings.clone(),
+        timings_detail: args.common.timings_detail,
         flamegraph_prefix: args.flamegraph.clone(),
         trace_identifier: "rcp-master".to_string(),
         profile_level: Some(args.profile_level.clone()),
@@ -2078,6 +2095,32 @@ mod tests {
             .expect("receiver must remain live while the daemon is still finishing");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn remote_teardown_retains_process_failure_after_draining_receivers() {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let receiver = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = completed_tx.send(());
+        }));
+        let process_wait = async {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                .context("daemon could not flush timing output")
+        };
+        let error = finish_remote_teardown(
+            process_wait,
+            vec![(receiver, remote::tracelog::RcpdType::Source)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        completed_rx
+            .await
+            .expect("a daemon failure must still drain its final tracing messages");
+    }
+
     #[tokio::test]
     async fn dropping_remote_teardown_aborts_retained_receivers() {
         struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
@@ -2130,7 +2173,7 @@ mod tests {
         }));
         started_rx.await.unwrap();
         let teardown = tokio::spawn(finish_remote_teardown(
-            std::future::pending(),
+            std::future::pending::<()>(),
             vec![(receiver, remote::tracelog::RcpdType::Source)],
         ));
         tokio::task::yield_now().await;

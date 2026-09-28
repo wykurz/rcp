@@ -220,8 +220,8 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 ///
 /// Three things hold, deliberately:
 ///
-/// - `--quiet` suppresses it, along with everything else — no subscriber is installed at all. That
-///   is the supported way to turn a notice off.
+/// - `--quiet` suppresses it, along with ordinary logs. Only an explicitly requested timing
+///   summary installs a subscriber in quiet mode, and that subscriber has no notice/log layer.
 /// - `RUST_LOG` does NOT suppress it. The directive is added after `EnvFilter::from_default_env`
 ///   and replaces any directive for the same target, exactly as the `tokio` / `quinn` / `rustls` /
 ///   `h2` directives and the verbosity level itself already do. `RUST_LOG` still raises verbosity
@@ -253,6 +253,7 @@ fn build_verbose_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
         .add_directive("quinn=warn".parse().unwrap())
         .add_directive("rustls=warn".parse().unwrap())
         .add_directive("h2=warn".parse().unwrap())
+        .add_directive("rcp::timing=off".parse().unwrap())
 }
 
 /// Build the [`tracing_subscriber::EnvFilter`] used by chrome/flame profile
@@ -268,7 +269,7 @@ fn build_profile_filter_str(profile_level: Option<&str>) -> anyhow::Result<Strin
         );
     }
     Ok(format!(
-        "tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{level_str}"
+        "tokio=off,quinn=off,h2=off,hyper=off,rustls=off,rcp::timing=off,{level_str}"
     ))
 }
 
@@ -279,13 +280,34 @@ fn build_profile_filter_str(profile_level: Option<&str>) -> anyhow::Result<Strin
 pub(crate) struct TracingGuards {
     chrome: Option<tracing_chrome::FlushGuard>,
     flame: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>,
+    timing: Option<crate::timing::TimingGuard>,
+}
+
+impl TracingGuards {
+    pub(crate) fn finish(&mut self) -> anyhow::Result<()> {
+        if let Some(timing) = &mut self.timing {
+            timing.finish()?;
+        }
+        Ok(())
+    }
+}
+
+fn open_timing_output(
+    prefix: &str,
+    identifier: &str,
+    extension: &str,
+) -> anyhow::Result<(std::fs::File, String)> {
+    let filename = generate_trace_filename(prefix, identifier, extension);
+    let file = std::fs::File::create(&filename)
+        .with_context(|| format!("failed to create timing output at '{filename}'"))?;
+    Ok((file, filename))
 }
 
 /// Install the global [`tracing_subscriber`] registry from a [`TracingConfig`].
 /// Caller must hold the returned [`TracingGuards`] until the run finishes so
 /// that chrome/flame traces are flushed before the file handles close.
 ///
-/// In quiet mode this is a no-op (the subscriber is never installed).
+/// Quiet mode installs only explicitly requested timing summaries; ordinary logs stay disabled.
 pub(crate) fn install_tracing_subscriber(
     quiet: bool,
     verbose: u8,
@@ -296,15 +318,32 @@ pub(crate) fn install_tracing_subscriber(
             verbose == 0,
             "Quiet mode and verbose mode are mutually exclusive"
         );
+        let timing = if let Some(prefix) = &tracing_config.timings_prefix {
+            let (file, _) =
+                open_timing_output(prefix, &tracing_config.trace_identifier, "timings.json")?;
+            let (layer, guard) =
+                crate::timing::TimingLayer::new(tracing_config.trace_identifier, Some(file), None);
+            tracing_subscriber::registry()
+                .with(
+                    layer.with_filter(crate::timing::timing_filter(tracing_config.timings_detail)),
+                )
+                .init();
+            Some(guard)
+        } else {
+            None
+        };
         return Ok(TracingGuards {
             chrome: None,
             flame: None,
+            timing,
         });
     }
     let TracingConfig {
         remote_layer: remote_tracing_layer,
         debug_log_file,
         chrome_trace_prefix,
+        timings_prefix,
+        timings_detail,
         flamegraph_prefix,
         trace_identifier,
         profile_level,
@@ -354,6 +393,35 @@ pub(crate) fn install_tracing_subscriber(
         remote_tracing_layer.map(|layer| layer.with_filter(build_verbose_env_filter(verbose)));
     let mut startup_notices = Vec::new();
     let mut startup_errors = Vec::new();
+    let mut timing_guard = None;
+    let timing_layer = if timings_prefix.is_some() || chrome_trace_prefix.is_some() {
+        let summary = timings_prefix
+            .as_deref()
+            .map(|prefix| {
+                let (file, filename) =
+                    open_timing_output(prefix, &trace_identifier, "timings.json")?;
+                startup_notices.push(format!("Timing summary will be written to: {filename}"));
+                anyhow::Ok(file)
+            })
+            .transpose()?;
+        let timeline = chrome_trace_prefix
+            .as_deref()
+            .map(|prefix| {
+                let (file, filename) = open_timing_output(prefix, &trace_identifier, "scopes.json")
+                    .context("failed to create Chrome trace file for elapsed scopes")?;
+                startup_notices.push(format!(
+                    "Elapsed scope timeline will be written to: {filename}"
+                ));
+                anyhow::Ok(file)
+            })
+            .transpose()?;
+        let (layer, guard) =
+            crate::timing::TimingLayer::new(trace_identifier.clone(), summary, timeline);
+        timing_guard = Some(guard);
+        Some(layer.with_filter(crate::timing::timing_filter(timings_detail)))
+    } else {
+        None
+    };
     let console_layer = tokio_console.then(|| {
         let console_port = tokio_console_port.unwrap_or(6669);
         let retention_seconds: u64 =
@@ -411,6 +479,7 @@ pub(crate) fn install_tracing_subscriber(
         .with(console_layer)
         .with(chrome_layer)
         .with(flame_layer)
+        .with(timing_layer)
         .init();
     for notice in startup_notices {
         tracing::warn!(target: NOTICE_TARGET, "{notice}");
@@ -422,6 +491,7 @@ pub(crate) fn install_tracing_subscriber(
     Ok(TracingGuards {
         chrome: chrome_guard,
         flame: flame_guard,
+        timing: timing_guard,
     })
 }
 
@@ -1855,5 +1925,80 @@ mod validate_histogram_log_target_tests {
         // Victim file content is preserved (the truncating open never reached it).
         let preserved = std::fs::read(&target).unwrap();
         assert_eq!(preserved, b"do not clobber");
+    }
+}
+
+#[cfg(test)]
+mod timing_output_tests {
+    #[test]
+    fn shared_prefix_keeps_summary_and_both_chrome_artifacts_intact() {
+        const CHILD: &str = "RCP_TEST_SHARED_TIMING_PREFIX";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime_setup::timing_output_tests::shared_prefix_keeps_summary_and_both_chrome_artifacts_intact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().join("shared").to_str().unwrap().to_owned();
+        let mut guards = super::install_tracing_subscriber(
+            false,
+            0,
+            crate::TracingConfig {
+                timings_prefix: Some(prefix.clone()),
+                chrome_trace_prefix: Some(prefix),
+                trace_identifier: "collision-test".to_owned(),
+                ..crate::TracingConfig::default()
+            },
+        )
+        .unwrap();
+        crate::timing_scope!("completed").finish();
+        let span = tracing::info_span!("ordinary-poll-span");
+        span.in_scope(|| {});
+        drop(span);
+        guards.finish().unwrap();
+        drop(guards);
+        let paths: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            paths.len(),
+            3,
+            "summary, poll trace, and elapsed trace must be independent files"
+        );
+        let summary = paths
+            .iter()
+            .find(|path| path.to_str().unwrap().ends_with(".timings.json"))
+            .expect("summary suffix");
+        let timeline = paths
+            .iter()
+            .find(|path| path.to_str().unwrap().ends_with(".scopes.json"))
+            .expect("elapsed timeline suffix");
+        let poll = paths
+            .iter()
+            .find(|path| *path != summary && *path != timeline)
+            .unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(summary).unwrap()).unwrap();
+        assert_eq!(summary["scopes"][0]["name"], "completed");
+        let timeline: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(timeline).unwrap()).unwrap();
+        assert_eq!(timeline[0]["name"], "completed");
+        let poll: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(poll).unwrap()).unwrap();
+        assert!(poll.is_array() || poll["traceEvents"].is_array());
     }
 }

@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add reusable tracing-based scoped timings with `--timings=PREFIX`, optional per-file detail, and
+  elapsed Chrome timelines. Benchmark reports collect coarse stage summaries automatically when
+  supported, including remote source scanning and backpressure measurements.
 - Add `--reflink=auto|never` to `rcp` and `rlink` to control acceleration for local file copies,
   including files copied during `rlink --update`. The default `auto` keeps existing behavior;
   `never` uses sparse-aware read/write copying for benchmarking. An `always` mode is deferred until
@@ -16,6 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Advance the remote compatibility revision to 7 for the scoped-timing daemon arguments.
 - Let `just test` and `just test-release` forward arguments to nextest. Split each Depot native test
   configuration across two shards, with the native Arm ABI smoke check on the first Arm shard.
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl

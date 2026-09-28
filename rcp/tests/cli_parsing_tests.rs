@@ -18,6 +18,81 @@ fn rcpd() -> Command {
 }
 
 #[test]
+fn local_copy_writes_scoped_timings_without_verbose_logging() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    std::fs::write(&src, b"timing fixture").unwrap();
+    rcp()
+        .arg(format!(
+            "--timings={}",
+            temp.path().join("timing").display()
+        ))
+        .args([&src, &dst])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(dst).unwrap(), b"timing fixture");
+    let reports: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&reports[0]).unwrap()).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    let scope = report["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["name"] == "operation")
+        .expect("the whole copy must have a scoped measurement");
+    assert_eq!(scope["count"], 1);
+    assert_eq!(scope["finished"], 1);
+    assert_eq!(scope["interrupted"], 0);
+    assert!(scope["total_seconds"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn timings_flags_are_accepted_by_both_remote_roles() {
+    for command in [&mut rcp(), &mut rcpd()] {
+        command
+            .args([
+                "--timings=/tmp/rcp-timing-help",
+                "--timings-detail",
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn quiet_copy_still_writes_explicitly_requested_timings() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("src");
+    std::fs::write(&src, b"quiet timing fixture").unwrap();
+    rcp()
+        .arg("--quiet")
+        .arg(format!(
+            "--timings={}",
+            temp.path().join("timing").display()
+        ))
+        .args([src, temp.path().join("dst")])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    assert!(std::fs::read_dir(temp.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "json")
+    }));
+}
+
+#[test]
 fn rcp_parses_finite_and_unlimited_max_files_in_flight_before_help() {
     rcp()
         .args(["--max-files-in-flight=1", "--help"])
@@ -298,6 +373,16 @@ fn test_remote_direct_rcpd_chrome_trace_target_failure_uses_stderr_startup_recor
 }
 
 #[test]
+fn test_remote_direct_rcpd_timings_target_failure_uses_stderr_startup_record() {
+    let target = tempfile::tempdir().unwrap();
+    let prefix = target.path().join("missing").join("timings");
+    assert_direct_rcpd_tracing_target_failure(
+        &[&format!("--timings={}", prefix.display())],
+        "timing",
+    );
+}
+
+#[test]
 fn test_remote_direct_rcpd_invalid_profile_level_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
     let prefix = target.path().join("trace");
@@ -351,6 +436,13 @@ fn test_remote_direct_rcpd_chrome_trace_leaves_connection_record_on_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("trace");
     assert_direct_rcpd_readiness_first(&[format!("--chrome-trace={}", prefix.display())]);
+}
+
+#[test]
+fn test_remote_direct_rcpd_timings_leave_connection_record_on_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("timings");
+    assert_direct_rcpd_readiness_first(&[format!("--timings={}", prefix.display())]);
 }
 
 #[test]

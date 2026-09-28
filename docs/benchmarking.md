@@ -29,12 +29,33 @@ details, or expand a row for tool versions, environment, and diagnostics. Exact 
 repetitions are in `results.json`. Different measurement configurations appear as separate series,
 and completed cases remain visible if a later case fails.
 
+New reports also show scoped timing tables per case, variant, repeat, and process role. The stage
+columns include invocation count, finished and interrupted counts, cumulative elapsed seconds, mean,
+p50, p95, and maximum. A finished scope means its logical end was reached; it does not promise that
+the copy succeeded. Cumulative elapsed time sums all invocations of a scope. Different scopes and
+processes can overlap, so their totals cannot be added to reconstruct command wall time. Historical
+results made before scoped timing collection remain readable and are labeled as having no timings.
+
 ## Run a benchmark
 
 The harness requires Python 3, GNU cp for local comparisons, rsync, and release builds of the
 repository tools. `just benchmark` builds the tools first; `just benchmark-run` uses prepared
 binaries. The output directory must be new. Generation, verification, and cleanup are outside the
 timed interval.
+
+The harness probes `rcp --help` before measurement for each selected candidate and baseline. A
+binary advertising `--timings` collects coarse per-process JSON by default; an older baseline that
+does not advertise it is recorded as unsupported. `--no-timings` disables collection for overhead
+diagnostics. Non-rcp variants are marked not applicable. The effective policy and detected
+capability are part of the historical series identity, so runs made with different timing policies
+do not share a trend. Each trial has its own timing prefix under the output directory, and its
+`*.timings.json` reports are embedded in `results.json`. A supported successful trial with missing
+or malformed reports fails; partial reports from failed trials remain available. The prefix is an
+execution artifact and is not added to the manifest variant arguments.
+
+For deeper investigation, run `rcp` directly with `--timings-detail` alongside `--timings=PREFIX` to
+include hot per-file scopes, or with `--chrome-trace=PREFIX` to produce detailed trace output. These
+diagnostic runs add overhead and should be kept separate from comparable benchmark series.
 
 ```bash
 just benchmark --case tiny-1m --mode local --cache linux-drop-caches --repetitions 4 --output /tmp/rcp-bench-local

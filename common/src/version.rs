@@ -47,8 +47,9 @@ pub struct ProtocolVersion {
 /// revision 4 covers source-owned concurrency, its internal overrides, and readiness fields;
 /// revision 5 covers the final daemon CLI contract: removing its unreachable explicit-unlimited
 /// override and requiring a positive remote-copy connection timeout; revision 6 makes the public
-/// `--max-files-in-flight=unlimited` spelling part of the daemon spawn contract.
-pub const WIRE_REVISION: u32 = 6;
+/// `--max-files-in-flight=unlimited` spelling part of the daemon spawn contract; revision 7 adds
+/// `--timings` and `--timings-detail` to that contract.
+pub const WIRE_REVISION: u32 = 7;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -263,20 +264,20 @@ mod tests {
     }
 
     #[test]
-    fn current_process_contract_rejects_revision_five_daemons() {
+    fn current_process_contract_rejects_daemons_without_scoped_timings() {
         let current = ProtocolVersion::current();
-        let revision_five = ProtocolVersion {
-            semantic: format!("{}+w5", current.crate_version()),
+        let previous = ProtocolVersion {
+            semantic: format!("{}+w6", current.crate_version()),
             git_describe: None,
             git_hash: None,
         };
-        assert!(!current.is_compatible_with(&revision_five));
-        assert!(!revision_five.is_compatible_with(&current));
+        assert!(!current.is_compatible_with(&previous));
+        assert!(!previous.is_compatible_with(&current));
         assert_eq!(
             current.cache_tag(),
-            format!("{}-w6", current.crate_version())
+            format!("{}-w7", current.crate_version())
         );
-        assert_ne!(current.cache_tag(), revision_five.cache_tag());
+        assert_ne!(current.cache_tag(), previous.cache_tag());
     }
 
     #[test]

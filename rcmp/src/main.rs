@@ -178,7 +178,7 @@ fn main() -> Result<()> {
     let throttle = args
         .common
         .throttle_config(files_in_flight, args.chunk_size);
-    let tracing = common::TracingConfig::local("rcmp");
+    let tracing = args.common.tracing_config("rcmp");
     // note: rcmp historically does not treat --progress-delay alone as implying
     // --progress (unlike rrm/rlink). preserve that behavior here.
     let progress = if args.common.progress || args.common.progress_type.is_some() {

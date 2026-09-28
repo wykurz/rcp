@@ -903,6 +903,51 @@ filegen /tmp 3,2 10 1M --max-files-in-flight=64 --progress
 
 `rcp` supports several profiling and debugging options.
 
+## Scoped Timings
+
+Collect elapsed durations for named stages without enabling verbose logging:
+
+```bash
+rcp --timings=/tmp/timing /source /dest
+rcp --timings=/tmp/timing host1:/source host2:/dest
+```
+
+Each process writes `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.timings.json` on its own
+host. The parent directory must exist. Explicit timing collection also works with `--quiet`. Version
+1 summaries contain the process identifier, PID, and a `scopes` array. Each scope records `name`,
+`count`, `finished`, `interrupted`, and `total_seconds`, `mean_seconds`, `p50_seconds`,
+`p95_seconds`, `max_seconds`. Percentiles use bounded histograms with two significant figures at
+microsecond resolution; totals and maxima retain the measured duration precision.
+
+The default scopes cover the operation, local copy, and remote source traversal, scanning,
+directory-credit waits, dispatch, and drain. Add `--timings-detail` to include per-file waits,
+opening, and sending. Detailed collection costs more and is intended for diagnosis. The benchmark
+harness collects coarse summaries by default and includes stage tables in its reports; see
+[benchmarking](docs/benchmarking.md).
+
+Durations include time suspended at an async wait. Nested and concurrent scopes overlap: their
+totals are cumulative elapsed time, **not CPU time or additive command wall time**. A finished scope
+reached its explicit endpoint; it does not imply the copy succeeded. Early exits and cancellation
+before that endpoint count as interrupted, and both kinds contribute to duration statistics.
+
+To add a measurement in code, use a stable name and finish it at the intended boundary:
+
+```rust,ignore
+let scan = common::timing_scope!("source.pass2.scan");
+// scan this directory, including any async waits
+scan.finish();
+
+// measures through return (including Err); cancellation records an interruption
+let permit = common::timing_scope!(trace, "source.file.wait_open")
+    .measure(acquire_permit())
+    .await?;
+```
+
+These are tracing spans on the dedicated `rcp::timing` target. Logical completion is independent of
+span clones and child tasks. Do not hold an entered span guard across an `.await`. Keep names
+independent of paths or identifiers; aggregation is capped at 256 names, including an overflow
+bucket, and does not retain individual samples.
+
 ## Chrome Tracing
 
 Produces JSON trace files viewable in [Perfetto UI](https://ui.perfetto.dev) or `chrome://tracing`.
@@ -929,6 +974,14 @@ notices are forwarded to the master after its tracing connection is established;
 the daemon's readiness record on raw stderr.
 
 View traces by opening https://ui.perfetto.dev and dragging the JSON file into the browser.
+
+Chrome tracing also writes `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.scopes.json` with the
+elapsed timing scopes above. The existing `.json` file records span enter/exit intervals, which can
+split an async operation across polls; the `.scopes.json` file records its logical elapsed lifetime,
+including waits. Concurrent elapsed scopes use separate lanes, reused after completion. Use
+`--timings-detail` for per-file elapsed scopes. `--profile-level` controls the existing poll trace
+only; elapsed scopes use their own coarse/detail selection. Chrome output is disabled by `--quiet`,
+as before. Summaries and both trace files can safely use the same prefix.
 
 ## Flamegraph
 

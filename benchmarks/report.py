@@ -9,6 +9,7 @@ import statistics
 from pathlib import Path
 
 from benchmarks.strict_json import parse_json
+from benchmarks.timings import require_roles, validate_report
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -70,6 +71,8 @@ def validate_result(value):
     context = _object(run.get("context"), "context")
     for field in ("runner_label", "topology", "cache_policy", "timing_policy"):
         _text(context.get(field), f"context.{field}")
+    if "timing_request" in context and context["timing_request"] not in ("automatic", "disabled"):
+        raise ValueError("context.timing_request must be automatic or disabled")
     for field in ("source", "destination"):
         if field not in context or not isinstance(context[field], (str, dict)):
             raise ValueError(f"context.{field} must be a string or object")
@@ -87,11 +90,30 @@ def validate_result(value):
             raise ValueError(f"duplicate case id: {case_id}")
         case_ids.add(case_id)
     variant_ids = set()
+    variants_by_id = {}
     for i, variant in enumerate(_list(run.get("variants"), "variants")):
         variant_id = _text(_object(variant, f"variants[{i}]").get("id"), f"variants[{i}].id")
         if variant_id in variant_ids:
             raise ValueError(f"duplicate variant id: {variant_id}")
         variant_ids.add(variant_id)
+        variants_by_id[variant_id] = variant
+    policies = context.get("timing_collection")
+    if policies is not None:
+        _object(policies, "context.timing_collection")
+        if policies.keys() - variant_ids:
+            raise ValueError("context.timing_collection references unknown variants")
+        for variant_id, policy in policies.items():
+            if policy not in ("coarse", "unsupported", "disabled", "not_applicable"):
+                raise ValueError(f"context.timing_collection.{variant_id} has invalid policy")
+        if run["status"] == "complete" and policies.keys() != variant_ids:
+            raise ValueError("context.timing_collection must cover every selected variant")
+    elif context.get("timing_request") is not None and run.get("trials"):
+        raise ValueError("context.timing_collection is required for new trials")
+    capabilities = context.get("timing_capability")
+    if capabilities is not None:
+        _object(capabilities, "context.timing_capability")
+        if capabilities.keys() - variant_ids or any(type(value) is not bool for value in capabilities.values()):
+            raise ValueError("context.timing_capability must map known variants to booleans")
     if run["status"] == "complete" and (not case_ids or not variant_ids):
         raise ValueError("cases and variants must be nonempty")
     for i, trial in enumerate(_list(run.get("trials"), "trials")):
@@ -120,6 +142,40 @@ def validate_result(value):
             raise ValueError(f"trials[{i}] is ok without passing validation")
         if not isinstance(trial.get("logs"), (list, dict)):
             raise ValueError(f"trials[{i}].logs must be an array or object")
+        if policies is not None and "timings" not in trial:
+            raise ValueError(f"trials[{i}].timings is required by context.timing_collection")
+        if "timings" in trial:
+            timing = _object(trial["timings"], f"trials[{i}].timings")
+            if set(timing) != {"status", "reports"}:
+                raise ValueError(f"trials[{i}].timings has invalid fields")
+            if policies is None or timing["status"] != policies.get(trial["variant_id"]):
+                raise ValueError(f"trials[{i}].timings.status does not match collection policy")
+            reports = _list(timing["reports"], f"trials[{i}].timings.reports")
+            role_count = 3 if context["topology"] == "loopback" else 1
+            if len(reports) > len(trial["commands"]) * role_count:
+                raise ValueError(f"trials[{i}].timings.reports exceeds command role count")
+            for j, item in enumerate(reports):
+                try:
+                    validate_report(item)
+                except ValueError as error:
+                    raise ValueError(f"trials[{i}].timings.reports[{j}]: {error}") from error
+            if timing["status"] != "coarse" and reports:
+                raise ValueError(f"trials[{i}].timings.reports must be empty when timings are unavailable")
+            if timing["status"] == "coarse" and trial["status"] == "ok" and not reports:
+                raise ValueError(f"trials[{i}].timings.reports missing for successful trial")
+            if timing["status"] == "coarse" and trial["status"] == "ok" and any(not item["scopes"] or not any(scope["name"] == "operation" for scope in item["scopes"]) for item in reports):
+                raise ValueError(f"trials[{i}].timings.reports missing operation scope")
+            if timing["status"] == "coarse":
+                if variants_by_id[trial["variant_id"]].get("tool") != "rcp":
+                    raise ValueError(f"trials[{i}].timings.coarse requires rcp")
+                roles = ["rcp-master"] * len(trial["commands"])
+                if context["topology"] == "loopback":
+                    roles += ["rcpd-source"] * len(trial["commands"])
+                    roles += ["rcpd-destination"] * len(trial["commands"])
+                try:
+                    require_roles(reports, roles, successful=trial["status"] == "ok")
+                except ValueError as error:
+                    raise ValueError(f"trials[{i}].timings.reports: {error}") from error
     for i, summary in enumerate(_list(run.get("summaries"), "summaries")):
         summary = _object(summary, f"summaries[{i}]")
         if not SERIES_ID.fullmatch(_text(summary.get("series_id"), f"summaries[{i}].series_id")):

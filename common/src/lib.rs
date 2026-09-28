@@ -129,6 +129,7 @@ pub mod rm;
 mod runtime_setup;
 pub mod safedir;
 mod settings_parse;
+pub mod timing;
 pub mod version;
 
 pub mod filecmp;
@@ -661,7 +662,7 @@ where
         print_startup_configuration_error(startup_error_prefix, &error);
         return None;
     }
-    let _tracing_guards =
+    let mut tracing_guards =
         match runtime_setup::install_tracing_subscriber(quiet, verbose, tracing_config) {
             Ok(guards) => guards,
             Err(error) => {
@@ -690,7 +691,10 @@ where
                 });
                 ProgressTracker::new(settings.progress_type, delay)
             });
-            runtime.block_on(func())
+            let scope = timing_scope!("operation");
+            let result = runtime.block_on(func());
+            scope.finish();
+            result
         };
         match &res {
             Ok(summary) => {
@@ -736,6 +740,10 @@ where
     // previous auto-meta sample sink and ops-in-flight cap, and its
     // probes acquire against stale limits even when auto_meta is off.
     reset_process_throttle_state();
+    if let Err(error) = tracing_guards.finish() {
+        eprintln!("Failed to write scoped timings: {error:#}");
+        return None;
+    }
     res.ok()
 }
 

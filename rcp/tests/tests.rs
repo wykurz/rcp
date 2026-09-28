@@ -773,6 +773,26 @@ fn test_dereference_file_symlink_permissions_integration() {
 
 // Profiling tests
 
+fn read_chrome_traces(directory: &std::path::Path) -> (serde_json::Value, serde_json::Value) {
+    let paths: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(paths.len(), 2, "expected poll and elapsed trace files");
+    let elapsed = paths
+        .iter()
+        .find(|path| path.to_string_lossy().ends_with(".scopes.json"))
+        .expect("elapsed trace must have its own suffix");
+    let poll = paths.iter().find(|path| *path != elapsed).unwrap();
+    let read = |path| {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(value.is_array(), "Chrome trace must be a JSON array");
+        value
+    };
+    (read(poll), read(elapsed))
+}
+
 #[test]
 fn test_chrome_trace_output() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -795,22 +815,14 @@ fn test_chrome_trace_output() {
     ])
     .assert()
     .success();
-    // find the generated trace file
-    let entries: Vec<_> = std::fs::read_dir(trace_dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    assert_eq!(entries.len(), 1, "Expected exactly one trace file");
-    let trace_file = entries[0].path();
-    // verify the trace file is non-empty and valid JSON
-    let content = std::fs::read_to_string(&trace_file).unwrap();
-    assert!(!content.is_empty(), "Trace file should not be empty");
-    let json: serde_json::Value =
-        serde_json::from_str(&content).expect("Trace should be valid JSON");
-    assert!(json.is_array(), "Chrome trace should be a JSON array");
-    let events = json.as_array().unwrap();
-    assert!(!events.is_empty(), "Trace should contain events");
+    let (poll, elapsed) = read_chrome_traces(trace_dir.path());
+    assert!(
+        !poll.as_array().unwrap().is_empty(),
+        "poll trace must contain events"
+    );
+    let scopes = elapsed.as_array().unwrap();
+    assert!(scopes.iter().any(|event| event["name"] == "local.copy"));
+    assert!(scopes.iter().all(|event| event["ph"] == "X"));
 }
 
 #[test]
@@ -881,18 +893,19 @@ fn test_profile_level_affects_output() {
     ])
     .assert()
     .success();
-    // find and verify trace file exists (may be minimal but should be valid)
-    let entries: Vec<_> = std::fs::read_dir(trace_dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    assert_eq!(entries.len(), 1, "Expected exactly one trace file");
-    let trace_file = entries[0].path();
-    let content = std::fs::read_to_string(&trace_file).unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(&content).expect("Trace should be valid JSON");
-    assert!(json.is_array(), "Chrome trace should be a JSON array");
+    let (poll, elapsed) = read_chrome_traces(trace_dir.path());
+    assert!(
+        poll.as_array().unwrap().is_empty(),
+        "error-only poll trace excludes normal copy spans"
+    );
+    assert!(
+        elapsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["name"] == "operation"),
+        "profile-level must not suppress explicitly enabled elapsed scopes"
+    );
 }
 
 #[test]
