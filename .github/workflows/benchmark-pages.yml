@@ -37,9 +37,17 @@ jobs:
           persist-credentials: false
       - name: Render history using trusted main-branch code
         run: python3 -m benchmarks.report benchmark-history-data --output _site
-      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+      # package directly because upload-pages-artifact pins its nested action to a tag
+      - name: Package dashboard for Pages
+        run: >-
+          tar --dereference --hard-dereference --directory _site
+          -cvf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: _site
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
       - name: Deploy dashboard
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
