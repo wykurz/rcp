@@ -5,6 +5,30 @@ informational: a slower copy does not fail CI. Failed commands, timeouts, incorr
 broken measurement infrastructure do fail. The suite covers tiny, medium, and large regular files;
 new cases and command variants belong in [benchmarks/cases.json](../benchmarks/cases.json).
 
+## View results
+
+Open a **Copy benchmarks** run from its PR check or the Depot dashboard. Each local or loopback job
+has a summary of median wall time and repeat range. For the full report, download the corresponding
+`benchmark-results-local` or `benchmark-results-loopback` artifact, extract it, and open
+`report/index.html` in a browser. The report is self-contained and needs no server. The same
+artifact contains `results.json`, `summary.md`, and per-process logs; artifacts are retained for 90
+days.
+
+PR and push reports list smoke runs; their timings are in `summary.md` and `results.json`, excluded
+from performance trends and ratios. Scheduled and manual performance runs on main also save durable
+JSON records to the `benchmark-history` branch. After
+[enabling the historical site](#enable-the-historical-site), the
+[Benchmark history workflow](https://github.com/wykurz/rcp/actions/workflows/benchmark-pages.yml)
+publishes those records as a GitHub Pages dashboard. Follow its `github-pages` deployment URL, also
+shown in the repository's Settings → Pages, to open the site. Until publication is enabled, use the
+downloadable reports or render the history branch locally.
+
+The historical dashboard plots median copy wall time over date, with minimum-to-maximum repeat
+ranges. Filter by case, variant, runner/topology/cache group, and series. Hover over a point for run
+details, or expand a row for tool versions, environment, and diagnostics. Exact commands and raw
+repetitions are in `results.json`. Different measurement configurations appear as separate series,
+and completed cases remain visible if a later case fails.
+
 ## Run a benchmark
 
 The harness requires Python 3, GNU cp for local comparisons, rsync, and release builds of the
@@ -231,6 +255,21 @@ runs. Fileset generation, cache preparation, verification, and cleanup add untim
 copies overlap within a job, and each topology gets its own runner and artifact. Scheduled and
 manual main-branch results are appended to history after both producer jobs end, including valid
 partial results if one job fails.
+
+To start a performance run on a pushed revision, use **Run a workflow** in the Depot CI dashboard,
+select this repository, the branch, and **Copy benchmarks**, then choose the case and cache inputs.
+The equivalent CLI command for all cases on main is:
+
+```bash
+depot ci dispatch --repo wykurz/rcp --workflow benchmarks.yml --ref main \
+  --input case=all --input cache=linux-drop-caches
+```
+
+Use `tiny-1m`, `medium-128k`, or `large-120` instead of `all` to select one case. A dispatch on a
+branch other than main retains artifacts without publishing history. See Depot's
+[manual workflow instructions](https://depot.dev/docs/ci/how-to-guides/manage-workflow-runs#manually-trigger-workflows).
+
+To run the benchmark job against local changes without publishing history:
 
 ```bash
 just depot-benchmark

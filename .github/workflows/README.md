@@ -29,7 +29,9 @@ Publishes the benchmark trend dashboard from the dedicated `benchmark-history` b
 trusted Depot run dispatches `benchmark-history-updated`, or on manual request. Rendering code comes
 from `main`; historical records are data. The deployment is enabled with the repository variable
 `RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
-[benchmarking](../../docs/benchmarking.md) for measurement, retention and setup details.
+[Benchmark dashboard and run results](../../docs/benchmarking.md#view-results) for viewing
+instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
+publication.
 
 The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs and pushes run local and
 loopback smoke checks with artifacts. Scheduled and manual runs on main measure larger filesets and
