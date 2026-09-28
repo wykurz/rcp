@@ -33,6 +33,17 @@ across remote hosts.
 
 - `filegen` tool generates sample filesets, useful for testing.
 
+# Benchmarks
+
+[Benchmark dashboard and run results](docs/benchmarking.md#view-results) compare rcp with GNU cp and
+rsync for local and loopback remote copies. PRs and main pushes run small correctness smoke checks;
+weekly and manual runs measure larger filesets for performance history. Timing is informational and
+does not gate CI.
+
+Downloadable reports are available from each benchmark run. The hosted historical dashboard requires
+[GitHub Pages setup](docs/benchmarking.md#enable-the-historical-site). See the
+[benchmarking guide](docs/benchmarking.md) for datasets, measurement rules, and manual commands.
+
 # Documentation
 
 API documentation for the command-line tools is available on docs.rs:
