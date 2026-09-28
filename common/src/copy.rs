@@ -302,16 +302,17 @@ pub async fn copy(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
-    copy_with_filter_base(
-        prog_track,
-        src,
-        dst,
-        settings,
-        preserve,
-        is_fresh,
-        std::path::Path::new(""),
-    )
-    .await
+    crate::timing_scope!("local.copy")
+        .measure(copy_with_filter_base(
+            prog_track,
+            src,
+            dst,
+            settings,
+            preserve,
+            is_fresh,
+            std::path::Path::new(""),
+        ))
+        .await
 }
 
 /// Like [`copy`], but treats `src` as living at `filter_base` relative to the original filter

@@ -152,7 +152,7 @@ fn main() -> Result<(), anyhow::Error> {
     let throttle = args
         .common
         .throttle_config(files_in_flight, args.chunk_size);
-    let tracing = common::TracingConfig::local("filegen");
+    let tracing = args.common.tracing_config("filegen");
     // note: filegen historically does not treat --progress-delay alone as
     // implying --progress (unlike rrm/rlink). preserve that behavior here.
     let progress = if args.common.progress || args.common.progress_type.is_some() {

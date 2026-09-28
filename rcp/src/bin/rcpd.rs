@@ -943,6 +943,8 @@ fn main() -> Result<(), anyhow::Error> {
         remote_layer: Some(tracing_layer),
         debug_log_file,
         chrome_trace_prefix: args.chrome_trace.clone(),
+        timings_prefix: args.common.timings.clone(),
+        timings_detail: args.common.timings_detail,
         flamegraph_prefix: args.flamegraph.clone(),
         trace_identifier: format!("rcpd-{}", args.role),
         profile_level: Some(args.profile_level.clone()),

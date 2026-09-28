@@ -50,7 +50,7 @@
     .pill.running { background: #fff1cd; color: #815c05; }
     .short-warning { color: #815c05; font-size: .75rem; font-weight: 600; }
     code { font-size: .78rem; overflow-wrap: anywhere; }
-    details { max-width: 38rem; }
+    details { max-width: 70rem; }
     summary { color: #086b70; cursor: pointer; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #425b61; background: #f3f6f4; padding: .7rem; border-radius: 6px; font-size: .75rem; }
     .footnote { color: #60747a; font-size: .78rem; line-height: 1.5; }
@@ -221,7 +221,31 @@
         comparisons.style.whiteSpace = "pre-line";
         const detail = node("td"), details = node("details"), summary = node("summary", "View context");
         const data = {run_id: run.run_id, branch: run.revision.branch, context: run.context, tools: run.tools, trials: run.trials.length, error: run.error || null};
-        details.append(summary, node("pre", JSON.stringify(data, null, 2))); detail.append(details);
+        details.append(summary, node("pre", JSON.stringify(data, null, 2)));
+        details.append(node("h3", "Scoped timings"));
+        details.append(node("p", "Cumulative elapsed seconds sum scope invocations. Different scopes and processes can overlap, so totals are not additive wall time.", "footnote"));
+        if (!run.trials.some(trial => trial.timings)) {
+          details.append(node("p", "No scoped timings (historical result)."));
+        } else {
+          const wrap = node("div", undefined, "table-wrap"), table = node("table"), head = node("thead"), heading = node("tr"), body = node("tbody");
+          for (const label of ["Case", "Variant", "Repeat", "Role", "Scope", "Count", "Finished", "Interrupted", "Cumulative elapsed (s)", "Mean (s)", "P50 (s)", "P95 (s)", "Max (s)"]) heading.append(node("th", label));
+          head.append(heading);
+          for (const trial of run.trials) {
+            const timing = trial.timings;
+            const addRow = (role, scope) => {
+              const item = node("tr");
+              for (const cell of [trial.case_id, trial.variant_id, trial.iteration, role, scope?.name ?? "—", scope?.count ?? "—", scope?.finished ?? "—", scope?.interrupted ?? "—", scope ? scope.total_seconds.toFixed(6) : "—", scope ? scope.mean_seconds.toFixed(6) : "—", scope ? scope.p50_seconds.toFixed(6) : "—", scope ? scope.p95_seconds.toFixed(6) : "—", scope ? scope.max_seconds.toFixed(6) : "—"]) item.append(node("td", cell));
+              body.append(item);
+            };
+            if (!timing || !timing.reports.length) addRow(timing?.status ?? "No scoped timings", null);
+            else for (const timingReport of timing.reports) {
+              if (!timingReport.scopes.length) addRow(timingReport.identifier, null);
+              else for (const scope of timingReport.scopes) addRow(timingReport.identifier, scope);
+            }
+          }
+          table.append(head, body); wrap.append(table); details.append(wrap);
+        }
+        detail.append(details);
         row.append(timestamp, result, rev, machine, comparisons, detail); rows.append(row);
       }
     }

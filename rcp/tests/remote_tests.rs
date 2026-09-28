@@ -91,6 +91,114 @@ fn require_local_ssh() {
     );
 }
 
+#[tokio::test]
+async fn remote_scoped_timings_cover_both_walks_and_all_process_roles() {
+    require_local_ssh();
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    std::fs::create_dir(src.join("empty")).unwrap();
+    for name in ["root-file", "nested/child-file"] {
+        common::filegen::write_file(&PROGRESS, src.join(name), 1024, 1024, 0)
+            .await
+            .unwrap();
+    }
+    for detail in [false, true] {
+        let artifacts = tempfile::tempdir().unwrap();
+        let dst = fixture
+            .path()
+            .join(if detail { "dereferenced" } else { "hardened" });
+        let src_remote = format!("localhost:{}", src.display());
+        let dst_remote = format!("localhost:{}", dst.display());
+        let daemon = format!(
+            "--rcpd-path={}",
+            assert_cmd::cargo::cargo_bin("rcpd").display()
+        );
+        let prefix = artifacts.path().join("profile");
+        let timings = format!("--timings={}", prefix.display());
+        let chrome = format!("--chrome-trace={}", prefix.display());
+        let mut args = vec![daemon.as_str(), timings.as_str()];
+        if detail {
+            args.extend(["-L", "--timings-detail", chrome.as_str()]);
+        }
+        args.extend([src_remote.as_str(), dst_remote.as_str()]);
+        let output = run_rcp_with_args_at_default_verbosity(&args);
+        print_command_output(&output);
+        assert!(output.status.success());
+        for name in ["root-file", "nested/child-file"] {
+            assert_eq!(
+                std::fs::read(src.join(name)).unwrap(),
+                std::fs::read(dst.join(name)).unwrap()
+            );
+        }
+        let paths: Vec<_> = std::fs::read_dir(artifacts.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let reports: Vec<serde_json::Value> = paths
+            .iter()
+            .filter(|path| path.to_string_lossy().ends_with(".timings.json"))
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+            .collect();
+        assert_eq!(reports.len(), 3);
+        for role in ["rcp-master", "rcpd-source", "rcpd-destination"] {
+            let report = reports
+                .iter()
+                .find(|report| report["identifier"] == role)
+                .unwrap();
+            assert_eq!(report["schema_version"], 1);
+            let scopes = report["scopes"].as_array().unwrap();
+            let operation = scopes
+                .iter()
+                .find(|scope| scope["name"] == "operation")
+                .unwrap();
+            assert_eq!(operation["count"], 1);
+            assert_eq!(operation["finished"], 1);
+            if role == "rcpd-source" {
+                for (name, count) in [
+                    ("source.pass1", 1),
+                    ("source.pass1.scan", 3),
+                    ("source.pass2", 3),
+                    ("source.pass2.scan", 2),
+                ] {
+                    let scope = scopes.iter().find(|scope| scope["name"] == name).unwrap();
+                    assert_eq!(scope["count"], count, "{name}");
+                    assert_eq!(scope["interrupted"], 0, "{name}");
+                }
+                assert_eq!(
+                    scopes
+                        .iter()
+                        .any(|scope| scope["name"] == "source.file.send"),
+                    detail
+                );
+            }
+        }
+        if detail {
+            assert_eq!(
+                paths.len(),
+                9,
+                "each process writes summary, poll and elapsed artifacts"
+            );
+            for path in paths
+                .iter()
+                .filter(|path| path.to_string_lossy().ends_with(".scopes.json"))
+            {
+                let events: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert!(
+                    events
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event["name"] == "operation")
+                );
+            }
+        }
+    }
+}
+
 fn assert_two_rcpd_logs_report_connection_count(
     log_dir: &std::path::Path,
     expected_connections: usize,
@@ -110,6 +218,48 @@ fn assert_two_rcpd_logs_report_connection_count(
             log.display()
         );
     }
+}
+
+#[test]
+fn remote_timing_flush_failure_fails_master_after_copy_completes() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source-file");
+    let dst = fixture.path().join("destination-file");
+    create_test_file(&src, "copied before timing flush", 0o644);
+    let wrapper = fixture.path().join("limited-rcpd");
+    let real_daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    // allow artifact creation, then force writes to fail at daemon shutdown. Ignoring SIGXFSZ
+    // turns the source's zero file-size limit into EFBIG instead of killing the process.
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = source ]; then\n  trap '' XFSZ\n  ulimit -f 0\nfi\nexec {real_daemon} \"$@\"\n"
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+    let timing_arg = format!("--timings={}", fixture.path().join("timing").display());
+    let src_remote = format!("localhost:{}", src.display());
+    let dst_remote = format!("localhost:{}", dst.display());
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        &daemon_arg,
+        &timing_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert_eq!(get_file_content(&dst), "copied before timing flush");
+    assert!(
+        !output.status.success(),
+        "a late daemon timing failure must fail the master"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Failed to write scoped timings"),
+        "{combined}"
+    );
 }
 
 fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
@@ -589,6 +739,13 @@ fn test_remote_chrome_trace_dry_run_forwards_daemon_artifact_notices() {
         3,
         "the master must surface its own and both daemon artifact notices"
     );
+    assert_eq!(
+        stdout
+            .matches("Elapsed scope timeline will be written to:")
+            .count(),
+        3,
+        "elapsed timeline notices must also reach the master"
+    );
     assert!(
         stdout.contains("rcpd-source"),
         "the source daemon artifact notice must reach master output"
@@ -606,7 +763,23 @@ fn test_remote_chrome_trace_dry_run_forwards_daemon_artifact_notices() {
                 .is_some_and(|extension| extension == "json")
         })
         .collect();
-    assert_eq!(trace_files.len(), 3, "all three trace artifacts must exist");
+    assert_eq!(
+        trace_files.len(),
+        6,
+        "each process must write both trace artifacts"
+    );
+    assert_eq!(
+        trace_files
+            .iter()
+            .filter(|path| path.to_string_lossy().ends_with(".scopes.json"))
+            .count(),
+        3
+    );
+    for path in trace_files {
+        let trace: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(trace.is_array());
+    }
 }
 
 #[test]

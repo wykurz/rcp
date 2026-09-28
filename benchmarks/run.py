@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import html
 import json
 import math
 import os
@@ -23,6 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
+from benchmarks import timings
 
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
@@ -353,7 +355,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy"):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -368,7 +370,7 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
     for tool in ("rsync", "cp", "rcp-baseline", "rcpd-baseline") + (("ssh",) if topology == "loopback" else ()):
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
-    value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY}
+    value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "timing_request": timing_request, "timing_collection": timing_collection, "timing_capability": timing_capability, "verification_policy": VERIFICATION_POLICY}
     if topology == "loopback":
         value["ssh_transport_profile"] = ssh_transport_profile
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -390,6 +392,11 @@ def _tool(path, version_flag="--version"):
     if not version_output:
         raise ValueError(f"missing version output: {path}")
     return {"path": str(path), "version": version_output.splitlines()[0], "sha256": digest.hexdigest()}
+
+
+def _supports_timings(path):
+    result = subprocess.run([str(path), "--help"], capture_output=True, text=True, timeout=10)
+    return result.returncode == 0 and re.search(r"--timings(?:[=\s]|$)", result.stdout + "\n" + result.stderr) is not None
 
 
 def _git(*args):
@@ -421,6 +428,17 @@ def _persist(output, record):
                   "| --- | --- | ---: | ---: | ---: |"]
     for summary in record["summaries"]:
         lines.append(f"| {summary['case_id']} | {summary['variant_id']} | {summary['median']:.3f} | {summary['minimum']:.3f}–{summary['maximum']:.3f} | {len(summary['samples'])} |")
+    timing_trials = [trial for trial in record["trials"] if "timings" in trial]
+    if timing_trials:
+        lines += ["", "## Scoped timings", "", "Scope durations are cumulative elapsed seconds across invocations. Scopes can overlap each other and command wall time; their totals are not additive wall time.", "", "| Case | Variant | Repeat | Role | Scope | Count | Finished | Interrupted | Cumulative elapsed (s) | Mean (s) | P50 (s) | P95 (s) | Max (s) |", "| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+        for trial in timing_trials:
+            timing = trial["timings"]
+            if not timing["reports"]:
+                lines.append(f"| {trial['case_id']} | {trial['variant_id']} | {trial['iteration']} | {timing['status']} | — | — | — | — | — | — | — | — | — |")
+            for item in timing["reports"]:
+                for scope in item["scopes"]:
+                    name = html.escape(scope["name"]).replace("|", "\\|")
+                    lines.append(f"| {trial['case_id']} | {trial['variant_id']} | {trial['iteration']} | {item['identifier']} | {name} | {scope['count']} | {scope['finished']} | {scope['interrupted']} | {scope['total_seconds']:.6f} | {scope['mean_seconds']:.6f} | {scope['p50_seconds']:.6f} | {scope['p95_seconds']:.6f} | {scope['max_seconds']:.6f} |")
     if record.get("context", {}).get("purpose") != "smoke":
         short = [f"{item['case_id']}/{item['variant_id']}" for item in record["summaries"] if item["minimum"] < 10]
         if short:
@@ -480,6 +498,7 @@ def _arguments(argv):
     parser.add_argument("--runner-label", type=_nonblank, default="local")
     parser.add_argument("--files-in-flight")
     parser.add_argument("--ssh-transport-profile", type=_nonblank)
+    parser.add_argument("--no-timings", action="store_true", help="disable scoped timing collection for overhead diagnostics")
     args = parser.parse_args(argv)
     if args.mode == "local" and args.ssh_transport_profile is not None:
         parser.error("--ssh-transport-profile requires loopback mode")
@@ -505,6 +524,7 @@ def main(argv=None):
         record["context"]["baseline_commit"] = os.environ.get("RCP_BENCH_BASELINE_COMMIT", "")
     storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
     record["context"]["storage_ids"] = storage_ids
+    record["context"]["timing_request"] = "disabled" if args.no_timings else "automatic"
     _persist(output, record)
     source_scratch = None
     destination_scratch = None
@@ -563,6 +583,19 @@ def main(argv=None):
         record["context"]["environment"] = endpoints
         _persist(output, record)
         tools = {key: value["path"] for key, value in record["tools"].items()}
+        timing_capability = {}
+        timing_collection = {}
+        for variant in variants:
+            if variant["tool"] != "rcp":
+                timing_collection[variant["id"]] = "not_applicable"
+                continue
+            executable = tools["rcp-baseline"] if variant["id"] == "rcp-baseline" else tools["rcp"]
+            capable = _supports_timings(executable)
+            timing_capability[variant["id"]] = capable
+            timing_collection[variant["id"]] = "disabled" if args.no_timings else "coarse" if capable else "unsupported"
+        record["context"]["timing_capability"] = timing_capability
+        record["context"]["timing_collection"] = timing_collection
+        _persist(output, record)
         for case in cases:
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
@@ -593,7 +626,12 @@ def main(argv=None):
                         if args.mode == "loopback":
                             selected_tools["rcpd"] = tools["rcpd-baseline"]
                     commands = plan_commands(variant, source, destination, selected_tools, args.mode)
-                    trial = {"case_id": case["id"], "variant_id": variant["id"], "iteration": iteration, "commands": commands, "status": "running", "validation": {"ok": False}, "exit_codes": [], "logs": []}
+                    timing_policy = timing_collection[variant["id"]]
+                    timing_prefix = output / "timings" / trial_path / "trace"
+                    if timing_policy == "coarse":
+                        timing_prefix.parent.mkdir(parents=True, exist_ok=False)
+                        commands = [[command[0], f"--timings={timing_prefix}", *command[1:]] for command in commands]
+                    trial = {"case_id": case["id"], "variant_id": variant["id"], "iteration": iteration, "commands": commands, "status": "running", "validation": {"ok": False}, "exit_codes": [], "logs": [], "timings": {"status": timing_policy, "reports": []}}
                     record["trials"].append(trial)
                     _persist(output, record)
                     try:
@@ -605,7 +643,22 @@ def main(argv=None):
                         raise
                     outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout)
                     trial.update(outcome)
+                    timing_error = None
+                    if timing_policy == "coarse":
+                        expected_roles = ["rcp-master"] * len(commands)
+                        if args.mode == "loopback":
+                            expected_roles += ["rcpd-source"] * len(commands)
+                            expected_roles += ["rcpd-destination"] * len(commands)
+                        try:
+                            trial["timings"]["reports"] = timings.collect(timing_prefix, expected_roles, successful=outcome["ok"])
+                        except timings.CollectionError as error:
+                            trial["timings"]["reports"] = error.reports
+                            timing_error = str(error)
                     trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": "command failed or timed out"}
+                    if timing_error:
+                        trial["validation"]["timing_error"] = timing_error
+                        if trial["validation"]["ok"]:
+                            trial["validation"].update(ok=False, error=f"timing collection failed: {timing_error}")
                     trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] else "failed"
                     _persist(output, record)
                     if trial["status"] != "ok":
@@ -618,7 +671,7 @@ def main(argv=None):
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"]), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
             shutil.rmtree(fixture_root)

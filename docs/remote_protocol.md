@@ -62,7 +62,8 @@ actual CPU-selected capacity before it announces readiness and before destinatio
 readiness record, typed internal spawn arguments, and source-first bootstrap contract. Wire revision
 5 protects removal of the unreachable explicit-unlimited override and the positive remote-copy
 connection timeout. Wire revision 6 protects the public `--max-files-in-flight=unlimited` daemon
-spawn spelling.
+spawn spelling. Wire revision 7 protects the `--timings` and `--timings-detail` daemon spawn
+arguments; the serialized messages remain unchanged.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
@@ -261,6 +262,40 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 - Use `--no-encryption` for trusted networks where performance is critical. It disables TLS and
   certificate authentication on every rcp TCP connection; SSH remains protected.
 - See [security.md](security.md) for detailed threat model and best practices
+
+### 1.5 Scoped Performance Timings
+
+`--timings=PREFIX` is propagated to both daemons, which aggregate timing spans locally and write
+their own `.timings.json` files on their respective hosts at shutdown. These measurements are not
+sent over the tracing connection. Startup notices follow the existing readiness/logging rules.
+`--timings-detail` enables finer per-file scopes; ordinary copies collect neither summaries nor
+elapsed timelines unless requested. `--chrome-trace` additionally produces a separate `.scopes.json`
+elapsed timeline. See [the profiling reference](../README.md#scoped-timings) for the schema and
+scope API.
+
+The source scopes have these boundaries in both the hardened and dereferencing walks:
+
+| Scope                                                                       | Measured interval                                                                                                                           |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.pass1`                                                              | Root resolution and structural traversal through sending `DirStructureComplete`; excludes a root file's later data send.                    |
+| `source.pass1.scan`                                                         | Per-directory enumeration, classification, filtering, and preparation of directory metadata; excludes recursion and directory-credit waits. |
+| `source.pass1.wait_credit`                                                  | Waiting for an outstanding-directory credit or held-fd permit.                                                                              |
+| `source.pass1.send_structure`                                               | Committing a directory message; on the hardened path also preparing and sending that directory's symlink messages.                          |
+| `source.pass2`                                                              | One acknowledged directory's task, from scheduling through file completion and accounting, including empty directories.                     |
+| `source.pass2.scan`                                                         | Enumerating, classifying, and filtering one directory into its file list; directories with zero expected files do not scan.                 |
+| `source.pass2.dispatch`                                                     | Scheduling that list, including throttling, pending-file backpressure, and unchanged-file notifications.                                    |
+| `source.pass2.drain`                                                        | Waiting for the remaining file tasks after dispatch.                                                                                        |
+| `source.pass2.wait_pending`                                                 | Detailed per-file wait for pending-file admission.                                                                                          |
+| `source.file.wait_stream`, `source.file.wait_open`, `source.file.wait_iops` | Detailed waits for a data stream, open-file admission, and IOPS admission.                                                                  |
+| `source.file.open`, `source.file.send`                                      | Detailed file opening and the data-send operation.                                                                                          |
+
+`operation` covers each process's main operation; `local.copy` covers each local copy invocation.
+Pass 1 overlaps Pass 2, and Pass 2 tasks run concurrently across directories. Durations include
+async suspension and are cumulative rather than additive wall time. In particular, a long Pass 1 can
+reflect downstream backpressure, and a long Pass 2 dispatch can reflect pending-file waits; neither
+alone establishes that directory scanning needs more parallelism. Compare the scan and wait scopes,
+then use the elapsed timeline to inspect overlap. This instrumentation changes no traversal
+concurrency, message ordering, admission, or completion accounting.
 
 ## 2. Protocol Messages
 
@@ -1099,6 +1134,10 @@ EOF handshake.
 2. Closes TCP connections to both rcpd processes
 3. Waits for rcpd SSH processes to exit
 4. Reports combined results to user
+
+After successful wire results, a failed daemon exit or process wait still fails the invocation. This
+includes errors flushing explicitly requested timing artifacts during daemon shutdown. Earlier
+operation or protocol failures remain the primary error; teardown still drains tracing receivers.
 
 **rcpd Lifecycle Management:**
 

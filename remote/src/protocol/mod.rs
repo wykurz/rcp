@@ -499,6 +499,10 @@ pub struct RcpdConfig {
     pub pending_writes_multiplier: usize,
     /// Chrome trace output prefix for profiling
     pub chrome_trace_prefix: Option<String>,
+    /// Aggregate scope timing output prefix, local to each daemon host.
+    pub timings_prefix: Option<String>,
+    /// Include detailed per-file timing scopes.
+    pub timings_detail: bool,
     /// Flamegraph output prefix for profiling
     pub flamegraph_prefix: Option<String>,
     /// Log level for profiling (default: trace when profiling is enabled)
@@ -603,6 +607,12 @@ impl RcpdConfig {
             self.chrome_trace_prefix.is_some() || self.flamegraph_prefix.is_some();
         if let Some(ref prefix) = self.chrome_trace_prefix {
             args.push(format!("--chrome-trace={prefix}"));
+        }
+        if let Some(ref prefix) = self.timings_prefix {
+            args.push(format!("--timings={prefix}"));
+        }
+        if self.timings_detail {
+            args.push("--timings-detail".to_string());
         }
         if let Some(ref prefix) = self.flamegraph_prefix {
             args.push(format!("--flamegraph={prefix}"));
@@ -1090,6 +1100,8 @@ mod tests {
             max_connections: 1,
             pending_writes_multiplier: 1,
             chrome_trace_prefix: None,
+            timings_prefix: None,
+            timings_detail: false,
             flamegraph_prefix: None,
             profile_level: None,
             tokio_console: false,
@@ -1098,6 +1110,20 @@ mod tests {
             master_cert_fingerprint: None,
             overwrite_manifest_max_entries: DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
         }
+    }
+
+    #[test]
+    fn to_args_propagates_scoped_timing_options() {
+        let mut config = minimal_rcpd_config();
+        config.timings_prefix = Some("/tmp/profile with spaces".to_string());
+        config.timings_detail = true;
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--timings=/tmp/profile with spaces")
+        );
+        assert!(args.iter().any(|arg| arg == "--timings-detail"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--profile-level=")));
     }
 
     #[test]

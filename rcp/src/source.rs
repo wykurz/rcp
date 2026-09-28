@@ -144,10 +144,8 @@ impl DereferenceWalkState {
     }
     /// Record one directory and retain its credit through its matching acknowledgement and Pass 2.
     async fn insert(&self, src: std::path::PathBuf, contents: Pass1Contents) -> anyhow::Result<()> {
-        let credit = self
-            .credit
-            .clone()
-            .acquire_owned()
+        let credit = common::timing_scope!("source.pass1.wait_credit")
+            .measure(self.credit.clone().acquire_owned())
             .await
             .map_err(|_| anyhow::Error::new(FdBudgetClosed))?;
         self.contents.lock().unwrap().insert(
@@ -309,10 +307,8 @@ impl SourceDirMap {
         dir: Arc<Dir>,
         contents: Pass1Contents,
     ) -> anyhow::Result<()> {
-        let permit = self
-            .fd_budget
-            .clone()
-            .acquire_owned()
+        let permit = common::timing_scope!("source.pass1.wait_credit")
+            .measure(self.fd_budget.clone().acquire_owned())
             .await
             .map_err(|_| anyhow::Error::new(FdBudgetClosed))?;
         self.entries.lock().unwrap().insert(
@@ -528,10 +524,14 @@ impl DereferenceDirectoryCommit {
             entry_count,
             keep_if_empty,
         };
-        control_send_stream
-            .lock()
-            .await
-            .send_batch_message(&message)
+        common::timing_scope!("source.pass1.send_structure")
+            .measure(async {
+                control_send_stream
+                    .lock()
+                    .await
+                    .send_batch_message(&message)
+                    .await
+            })
             .await
     }
 }
@@ -779,6 +779,7 @@ async fn send_pass1_entry(
     // The open takes an ops token like every other metadata syscall in this walk — the hardened
     // twin (`Dir::read_entries`) already does, and without it this one call escapes
     // `--ops-throttle` entirely.
+    let scan = common::timing_scope!("source.pass1.scan");
     let mut file_children: Vec<ChildEntry> = Vec::new();
     let mut dir_children: Vec<ChildEntry> = Vec::new();
     let mut symlink_children: Vec<ChildEntry> = Vec::new();
@@ -787,6 +788,7 @@ async fn send_pass1_entry(
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
+            scan.finish();
             if settings.fail_early {
                 return Err(e.into());
             }
@@ -963,6 +965,7 @@ async fn send_pass1_entry(
     } else {
         metadata
     };
+    scan.finish();
     // register this `-L` directory's Pass-1 bookkeeping, acquire its outstanding credit, and send
     // the pre-computed entry count through the same commit funnel as unreadable directories.
     DereferenceDirectoryCommit {
@@ -1214,6 +1217,7 @@ async fn send_directory_fd_walk(
     error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
     dir_map: &Arc<SourceDirMap>,
 ) -> anyhow::Result<()> {
+    let scan = common::timing_scope!("source.pass1.scan");
     // the directory's wire metadata comes from its OWN held fd (the fd whose contents we enumerate
     // below), so a same-name dir swap can't pair the enumerated contents with another inode's
     // metadata (read-side fidelity, docs/tocttou.md).
@@ -1245,6 +1249,7 @@ async fn send_directory_fd_walk(
         Ok(entries) => entries,
         Err(e) => {
             tracing::error!("Cannot enumerate directory {src:?} for reading: {e:#}");
+            scan.finish();
             // we still committed to sending a (0-entry) `Directory` for this dir.
             // The directory fd IS held (open succeeded, only enumeration failed), so
             // register a real 0-file entry (it holds the fd's permit):
@@ -1375,6 +1380,7 @@ async fn send_directory_fd_walk(
         entry_count,
         keep_if_empty,
     };
+    scan.finish();
     // store this directory's held fd + its authoritative Pass-1 contents so Pass 2 can open
     // file data fd-relative, size its truncation / synthetic-skip logic, and skip the names
     // Pass 1 accounts for itself (`Pass1Contents`). Acquiring
@@ -1404,6 +1410,7 @@ async fn send_directory_fd_walk(
         entry_count,
         file_count
     );
+    let structure = common::timing_scope!("source.pass1.send_structure");
     control_send_stream
         .lock()
         .await
@@ -1447,6 +1454,7 @@ async fn send_directory_fd_walk(
             .send_batch_message(&symlink)
             .await?;
     }
+    structure.finish();
     // recurse into child directories: open each `O_NOFOLLOW` from this dir's held
     // fd and hand the resulting `Arc<Dir>` to the recursive call. The child's wire
     // metadata is built from its fd-pinned `FileMeta` (captured at classify time).
@@ -1540,6 +1548,7 @@ async fn send_fs_objects_tcp(
     let SourceRead::DereferencePath(deref_state) = &source_read else {
         anyhow::bail!("dereference walk started without dereference Pass-1 state");
     };
+    let pass1 = common::timing_scope!("source.pass1");
     let src_metadata = match common::walk::run_metadata_probed(
         common::Side::Source,
         common::MetadataOp::Stat,
@@ -1630,6 +1639,7 @@ async fn send_fs_objects_tcp(
         })
         .await?;
     drop(stream);
+    pass1.finish();
     if src_metadata.is_file() && !has_root_item {
         // root file was filtered out
         progress().files_skipped.inc();
@@ -1682,6 +1692,7 @@ async fn send_root_hardened(
 ) -> anyhow::Result<()> {
     use common::preserve::Metadata as _;
     use common::walk::EntryKind;
+    let pass1 = common::timing_scope!("source.pass1");
     let dir_map = source_read
         .dir_map()
         .expect("hardened source_read carries an fd-map")
@@ -1842,6 +1853,7 @@ async fn send_root_hardened(
         })
         .await?;
     // ── post-DirStructureComplete: the root file's data (fd-relative, O_NOFOLLOW) ──
+    pass1.finish();
     if kind == EntryKind::File {
         if !has_root_item {
             progress().files_skipped.inc();
@@ -1914,24 +1926,31 @@ async fn send_file_tcp(
     tracing::debug!("Sending file content for {:?}", src);
     // borrow a stream FIRST to provide backpressure. files are only opened after we have
     // a stream available, which limits memory usage when destination is slow.
-    let mut pooled_stream = stream_pool
-        .borrow()
-        .instrument(tracing::trace_span!("borrow_stream"))
+    let mut pooled_stream = common::timing_scope!(trace, "source.file.wait_stream")
+        .measure(
+            stream_pool
+                .borrow()
+                .instrument(tracing::trace_span!("borrow_stream")),
+        )
         .await?;
     // now that we have a stream, acquire file-related resources
-    let open_file_guard = throttle::open_file_permit()
-        .instrument(tracing::trace_span!("open_file_permit"))
+    let open_file_guard = common::timing_scope!(trace, "source.file.wait_open")
+        .measure(throttle::open_file_permit().instrument(tracing::trace_span!("open_file_permit")))
         .await;
     let admission = open_file_guard.admission();
     common::safedir::with_fd_admission(admission, async move {
         let _open_file_guard = open_file_guard;
-        throttle::get_file_iops_tokens(settings.chunk_size, size)
-            .instrument(tracing::trace_span!("iops_throttle", size))
+        common::timing_scope!(trace, "source.file.wait_iops")
+            .measure(
+                throttle::get_file_iops_tokens(settings.chunk_size, size)
+                    .instrument(tracing::trace_span!("iops_throttle", size)),
+            )
             .await;
         // open the file AFTER borrowing a stream for backpressure. on the hardened path
         // open fd-relative (O_NOFOLLOW + S_ISREG, no path re-resolution) so a concurrent
         // symlink swap can't redirect the read; the path-based open is only for the
         // `-L`/`--dereference` walk (which follows symlinks by design).
+        let file_open = common::timing_scope!(trace, "source.file.open");
         let open_result = match &file_read {
             FileRead::Hardened(dir, name) => dir
                 .open_file_read(name)
@@ -1950,6 +1969,7 @@ async fn send_file_tcp(
                 .map(|file| (tokio::fs::File::from_std(file), None))
             }
         };
+        file_open.finish();
         // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
         // docs/tocttou.md): a probe by path could be answered by a different inode than the one being
         // transferred, pairing one file's permissions with another's contents. Files have no default
@@ -2034,11 +2054,13 @@ async fn send_file_tcp(
             metadata,
             is_root,
         };
+        let send = common::timing_scope!(trace, "source.file.send");
         let send_result = pooled_stream
             .stream_mut()
             .send_message_with_data_buffered(&file_header, &mut buffered_file)
             .instrument(tracing::trace_span!("send_data", size, buffer_size))
             .await;
+        send.finish();
         match send_result {
             Ok(_bytes_sent) => {
                 // stream is returned to pool when pooled_stream is dropped
@@ -2276,6 +2298,7 @@ async fn send_files_in_directory_tcp(
         return Ok(());
     }
     // iterate directory and collect files to send
+    let scan = common::timing_scope!("source.pass2.scan");
     let mut file_entries: Vec<FileToSend> = Vec::new();
     if let Some(dir) = src_dir {
         // hardened enumeration: list + classify fd-relative (never follows a symlink).
@@ -2283,6 +2306,7 @@ async fn send_files_in_directory_tcp(
             Ok(entries) => entries,
             Err(e) => {
                 tracing::error!("Cannot enumerate directory {src:?} for reading: {e:#}");
+                scan.finish();
                 return send_files_missing_directory(
                     &src,
                     &dst,
@@ -2356,6 +2380,7 @@ async fn send_files_in_directory_tcp(
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
+                scan.finish();
                 return send_files_missing_directory(
                     &src,
                     &dst,
@@ -2448,6 +2473,7 @@ async fn send_files_in_directory_tcp(
         }
         drop(entries);
     }
+    scan.finish();
     let files_found = file_entries.len();
     tracing::info!(
         "Directory {:?} has {} files to send (expected {})",
@@ -2487,6 +2513,7 @@ async fn send_files_in_directory_tcp(
     let files_to_send = file_entries.len();
     // send the files
     let mut join_set = tokio::task::JoinSet::new();
+    let dispatch = common::timing_scope!("source.pass2.dispatch");
     for file in file_entries {
         throttle::get_ops_token().await;
         // skip transfer entirely when the destination already has a matching entry (per the
@@ -2532,9 +2559,8 @@ async fn send_files_in_directory_tcp(
             continue;
         }
         // wait for a pending slot - this is the main backpressure point
-        let permit = pending_limit
-            .clone()
-            .acquire_owned()
+        let permit = common::timing_scope!(trace, "source.pass2.wait_pending")
+            .measure(pending_limit.clone().acquire_owned())
             .await
             .map_err(|_| anyhow::anyhow!("pending limit semaphore closed"))?;
         let pool = stream_pool.clone();
@@ -2574,6 +2600,8 @@ async fn send_files_in_directory_tcp(
             result
         });
     }
+    dispatch.finish();
+    let drain = common::timing_scope!("source.pass2.drain");
     while let Some(res) = join_set.join_next().await {
         match res {
             Ok(Ok(())) => {}
@@ -2590,6 +2618,7 @@ async fn send_files_in_directory_tcp(
             }
         }
     }
+    drain.finish();
     // handle deficit: files disappeared since traversal
     // send synthetic FileSkipped messages so destination's entry count still completes
     if files_to_send < file_count {
@@ -2849,7 +2878,7 @@ async fn dispatch_control_messages_tcp(
                         };
                         let collector = error_collector.clone();
                         let settings = settings.clone();
-                        join_set.spawn(send_files_in_directory_tcp(
+                        join_set.spawn(common::timing_scope!("source.pass2").measure(send_files_in_directory_tcp(
                             settings,
                             capture,
                             src.clone(),
@@ -2861,7 +2890,7 @@ async fn dispatch_control_messages_tcp(
                             collector,
                             control_send_stream.clone(),
                             existing_map,
-                        ));
+                        )));
                     }
                     remote::protocol::DestinationMessage::DirectorySkipped {
                         ref src,

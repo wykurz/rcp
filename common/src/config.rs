@@ -466,6 +466,10 @@ pub struct TracingConfig {
     pub debug_log_file: Option<String>,
     /// Chrome trace output prefix (produces JSON viewable in Perfetto UI)
     pub chrome_trace_prefix: Option<String>,
+    /// Elapsed timing summary output prefix.
+    pub timings_prefix: Option<String>,
+    /// Include detailed per-file timing scopes.
+    pub timings_detail: bool,
     /// Flamegraph output prefix (produces folded stacks for inferno)
     pub flamegraph_prefix: Option<String>,
     /// Identifier for trace filenames (e.g., "rcp-master", "rcpd-source", "rcpd-destination")
@@ -489,6 +493,8 @@ impl TracingConfig {
             remote_layer: None,
             debug_log_file: None,
             chrome_trace_prefix: None,
+            timings_prefix: None,
+            timings_detail: false,
             flamegraph_prefix: None,
             trace_identifier: trace_identifier.to_string(),
             profile_level: None,
@@ -504,6 +510,8 @@ impl Default for TracingConfig {
             remote_layer: None,
             debug_log_file: None,
             chrome_trace_prefix: None,
+            timings_prefix: None,
+            timings_detail: false,
             flamegraph_prefix: None,
             trace_identifier: "unknown".to_string(),
             profile_level: None,

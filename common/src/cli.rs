@@ -35,6 +35,16 @@ pub struct CommonArgs {
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
     pub verbose: u8,
+    /// Write aggregate elapsed-scope timings to per-process JSON files
+    ///
+    /// The prefix is expanded with tool/role, hostname, PID and timestamp. Remote
+    /// daemons write on their own hosts. Overlapping scope durations are cumulative,
+    /// not percentages of command wall time. This also works with --quiet.
+    #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
+    pub timings: Option<String>,
+    /// Include detailed per-file scopes in timing summaries and elapsed-scope traces
+    #[arg(long, help_heading = "Profiling")]
+    pub timings_detail: bool,
     // Performance & throttling
     /// Throttle the number of operations per second (0 = no throttle)
     #[arg(
@@ -229,6 +239,15 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    /// Build the shared tracing configuration for a local tool.
+    #[must_use]
+    pub fn tracing_config(&self, identifier: &str) -> crate::TracingConfig {
+        crate::TracingConfig {
+            timings_prefix: self.timings.clone(),
+            timings_detail: self.timings_detail,
+            ..crate::TracingConfig::local(identifier)
+        }
+    }
     #[must_use]
     pub fn resolve_files_in_flight(&self) -> crate::ResolvedFilesInFlight {
         match (self.max_files_in_flight, self.max_open_files) {

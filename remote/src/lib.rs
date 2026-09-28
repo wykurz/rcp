@@ -3592,6 +3592,8 @@ mod tests {
                 max_connections: 4,
                 pending_writes_multiplier: 1,
                 chrome_trace_prefix: None,
+                timings_prefix: None,
+                timings_detail: false,
                 flamegraph_prefix: None,
                 profile_level: None,
                 tokio_console: false,
