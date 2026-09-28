@@ -198,7 +198,7 @@ pub fn generate_debug_log_filename(prefix: &str) -> String {
 pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) -> String {
     let hostname = get_hostname();
     let pid = std::process::id();
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
     format!("{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.{extension}")
 }
 
@@ -1930,6 +1930,22 @@ mod validate_histogram_log_target_tests {
 
 #[cfg(test)]
 mod timing_output_tests {
+    #[test]
+    fn trace_artifact_names_are_portable_for_ci_uploads() {
+        for extension in ["json", "scopes.json", "timings.json", "folded"] {
+            let path = super::generate_trace_filename("/tmp/trace", "rcp-master", extension);
+            let filename = std::path::Path::new(&path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(
+                !filename.contains([':', '"', '<', '>', '|', '*', '?', '\\', '\r', '\n']),
+                "artifact upload rejects non-portable filename: {filename}"
+            );
+        }
+    }
+
     #[test]
     fn shared_prefix_keeps_summary_and_both_chrome_artifacts_intact() {
         const CHILD: &str = "RCP_TEST_SHARED_TIMING_PREFIX";
