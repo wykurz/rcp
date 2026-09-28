@@ -430,23 +430,27 @@ mod tests {
 
     #[test]
     fn finished_scope_is_recorded_before_clones_and_children_drop() {
-        let (dispatch, mut guard, file) = collector(false);
-        let (clone, child) = tracing::dispatcher::with_default(&dispatch, || {
-            let scope = crate::timing_scope!("parent");
-            let clone = scope.span().clone();
-            let child = tracing::info_span!(target: "rcp::timing", parent: scope.span(), "child");
-            scope.finish();
-            (clone, child)
+        // another ambient registry exposes parent-reference teardown under the wrong subscriber
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let (dispatch, mut guard, file) = collector(false);
+            tracing::dispatcher::with_default(&dispatch, || {
+                let scope = crate::timing_scope!("parent");
+                let clone = scope.span().clone();
+                let child =
+                    tracing::info_span!(target: "rcp::timing", parent: scope.span(), "child");
+                scope.finish();
+                let result = report(&mut guard, &file);
+                assert_eq!(result["schema_version"], 1);
+                assert_eq!(result["identifier"], "test-role");
+                assert_eq!(result["pid"], std::process::id());
+                assert_eq!(result["scopes"].as_array().unwrap().len(), 1);
+                assert_eq!(result["scopes"][0]["count"], 1);
+                assert_eq!(result["scopes"][0]["finished"], 1);
+                assert_eq!(result["scopes"][0]["interrupted"], 0);
+                // tracing-subscriber releases the child's parent through the current dispatcher
+                drop((clone, child));
+            });
         });
-        let result = report(&mut guard, &file);
-        assert_eq!(result["schema_version"], 1);
-        assert_eq!(result["identifier"], "test-role");
-        assert_eq!(result["pid"], std::process::id());
-        assert_eq!(result["scopes"].as_array().unwrap().len(), 1);
-        assert_eq!(result["scopes"][0]["count"], 1);
-        assert_eq!(result["scopes"][0]["finished"], 1);
-        assert_eq!(result["scopes"][0]["interrupted"], 0);
-        drop((clone, child));
     }
 
     #[test]
