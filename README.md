@@ -964,9 +964,11 @@ Output files are named: `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.json
 
 Example output:
 
-- `/tmp/trace-rcp-master-myhost-12345-2025-01-15T10:30:45.json`
-- `/tmp/trace-rcpd-source-host1-23456-2025-01-15T10:30:46.json`
-- `/tmp/trace-rcpd-destination-host2-34567-2025-01-15T10:30:46.json`
+- `/tmp/trace-rcp-master-myhost-12345-2025-01-15T10-30-45Z.json`
+- `/tmp/trace-rcpd-source-host1-23456-2025-01-15T10-30-46Z.json`
+- `/tmp/trace-rcpd-destination-host2-34567-2025-01-15T10-30-46Z.json`
+
+Artifact timestamps use UTC with filename-safe separators so reports can be uploaded to CI storage.
 
 Artifact paths, Tokio-console addresses, legacy-option warnings, and explicit concurrency-clamp
 warnings are emitted through the normal notice logging target. In remote mode, daemon artifact
