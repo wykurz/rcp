@@ -1503,7 +1503,7 @@ mod tests {
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(20),
-                    crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                    crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
                         visitor,
                         target_dir,
                         &root_cx,

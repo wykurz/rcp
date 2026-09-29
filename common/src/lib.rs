@@ -129,6 +129,7 @@ pub mod rm;
 mod runtime_setup;
 pub mod safedir;
 mod settings_parse;
+pub mod task_scope;
 pub mod timing;
 pub mod version;
 

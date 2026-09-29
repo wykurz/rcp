@@ -933,7 +933,7 @@ before that endpoint count as interrupted, and both kinds contribute to duration
 To add a measurement in code, use a stable name and finish it at the intended boundary:
 
 ```rust,ignore
-let scan = common::timing_scope!("source.pass2.scan");
+let scan = common::timing_scope!("source.directory.scan");
 // scan this directory, including any async waits
 scan.finish();
 

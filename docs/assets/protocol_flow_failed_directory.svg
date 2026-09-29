@@ -1,86 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="failed-directory-title failed-directory-desc">
-  <title id="failed-directory-title">Failed-directory remote copy flow</title>
-  <desc id="failed-directory-desc">Destination cannot create dir1, sends DirectorySkipped before parent accounting, skips a symlink, then nacks descendant dir2. Its control receiver sends DestinationDone and exits without observing source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails.</desc>
-  <!-- Section 4.4 Failed Directory Handling: dir1 fails to create; descendants are skipped -->
-  <defs>
-    <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
-    </marker>
-    <marker id="ar-err" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 1 L 9 5 L 0 9 z" fill="#b91c1c"/>
-    </marker>
-  </defs>
-
-  <rect x="0.5" y="0.5" width="999" height="619" rx="8" fill="#ffffff" stroke="#d0d7de"/>
-
-  <rect x="185" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
-  <text x="270" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Source (rcpd)</text>
-  <rect x="615" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
-  <text x="700" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Destination (rcpd)</text>
-
-  <line x1="270" y1="52" x2="270" y2="556" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
-  <line x1="700" y1="52" x2="700" y2="556" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
-
-  <line x1="270" y1="96" x2="694" y2="96" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="485" y="90" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(dir1, entries=2, meta)</text>
-  <g font-size="12.5">
-    <text x="712" y="92" text-anchor="start" fill="#b91c1c" font-weight="600">mkdir dir1 → FAILS</text>
-    <text x="712" y="108" text-anchor="start" fill="#64748b">add to failed_directories</text>
-  </g>
-
-  <line x1="700" y1="146" x2="276" y2="146" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
-  <text x="485" y="140" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#b91c1c">DirectorySkipped(dir1)</text>
-  <text x="712" y="150" text-anchor="start" font-size="12.5" fill="#64748b">nack (not created)</text>
-  <g font-size="12.5" fill="#64748b">
-    <text x="258" y="166" text-anchor="end">release dir1 fd, no Pass 2</text>
-    <text x="712" y="174" text-anchor="start">then count dir1 in tracked parent</text>
-  </g>
-
-  <line x1="270" y1="218" x2="694" y2="218" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="485" y="212" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Symlink(dir1/link, …)</text>
-  <g font-size="12.5" fill="#64748b">
-    <text x="712" y="214" text-anchor="start">ancestor failed, skip (log warning);</text>
-    <text x="712" y="230" text-anchor="start">parent(dir1) accounting is a no-op</text>
-  </g>
-
-  <line x1="270" y1="278" x2="694" y2="278" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="485" y="272" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(dir1/dir2, …)</text>
-  <text x="712" y="282" text-anchor="start" font-size="12.5" fill="#64748b">ancestor failed, skip (log warning)</text>
-
-  <line x1="700" y1="326" x2="276" y2="326" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
-  <text x="485" y="320" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#b91c1c">DirectorySkipped(dir1/dir2)</text>
-  <g font-size="12.5" fill="#64748b">
-    <text x="712" y="322" text-anchor="start">nack before parent accounting</text>
-    <text x="712" y="338" text-anchor="start">(parent dir1 is untracked: no-op)</text>
-    <text x="258" y="346" text-anchor="end">release dir1/dir2 fd, no Pass 2</text>
-  </g>
-
-  <line x1="270" y1="382" x2="694" y2="382" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="485" y="376" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirStructureComplete</text>
-  <text x="712" y="386" text-anchor="start" font-size="12.5" fill="#64748b">structure complete</text>
-
-  <g font-size="12.5" fill="#64748b">
-    <text x="258" y="416" text-anchor="end">no DirectoryCreated for dir1,</text>
-    <text x="258" y="432" text-anchor="end">so source doesn't send its files</text>
-    <text x="712" y="424" text-anchor="start">all pending directories complete</text>
-  </g>
-
-  <line x1="700" y1="470" x2="276" y2="470" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="485" y="464" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DestinationDone</text>
-  <text x="712" y="474" text-anchor="start" font-size="12.5" fill="#64748b">control receiver sends, closes, exits</text>
-
-  <g font-size="12.5" fill="#64748b">
-    <text x="258" y="502" text-anchor="end">DestinationDone triggers shutdown;</text>
-    <text x="258" y="518" text-anchor="end">close pool, drain tasks, close control</text>
-    <text x="712" y="502" text-anchor="start">control-completed path: receiver exits</text>
-    <text x="712" y="518" text-anchor="start">without observing source control EOF</text>
-    <text x="500" y="548" text-anchor="middle">handlers end on EOF; workers exit after reconnect fails</text>
-  </g>
-
-  <g font-size="12">
-    <line x1="290" y1="586" x2="340" y2="586" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-    <text x="348" y="590" fill="#475569">control stream (FIFO)</text>
-    <line x1="530" y1="586" x2="580" y2="586" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
-    <text x="588" y="590" fill="#475569">skip notification (nack)</text>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 718" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="title">Rejected directories settle one parent entry</title>
+  <desc id="desc">A parent has admitted bad and good subdirectories. A child Begin already submitted under bad receives its own rejection. Every begun directory receives End even when rejected. No data file is sent under rejected directories.</desc>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="context-stroke"/></marker></defs>
+  <rect x="1" y="1" width="998" height="716" rx="10" fill="#fff" stroke="#cbd5e1"/>
+  <text x="32" y="34" font-size="18" font-weight="600" fill="#0f172a">Rejected directories settle one parent entry</text>
+<rect x="175" y="56" width="170" height="36" rx="6" fill="#e2e8f0"/><text x="260" y="80" text-anchor="middle" font-size="14" fill="#0f172a">Source (rcpd)</text><line x1="260" y1="92" x2="260" y2="630" stroke="#94a3b8" stroke-dasharray="5 5"/>
+<rect x="615" y="56" width="170" height="36" rx="6" fill="#e2e8f0"/><text x="700" y="80" text-anchor="middle" font-size="14" fill="#0f172a">Destination (rcpd)</text><line x1="700" y1="92" x2="700" y2="630" stroke="#94a3b8" stroke-dasharray="5 5"/>
+<line x1="260" y1="130" x2="694" y2="130" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="121" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(bad, metadata)</text>
+<text x="714" y="127" text-anchor="start" font-size="12" fill="#475569">creation fails</text>
+<text x="714" y="144" text-anchor="start" font-size="12" fill="#475569">record rejected Begin</text>
+<line x1="260" y1="186" x2="694" y2="186" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="177" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(bad/child, metadata)</text>
+<text x="246" y="183" text-anchor="end" font-size="12" fill="#475569">already submitted work</text>
+<text x="714" y="183" text-anchor="start" font-size="12" fill="#475569">failed ancestor: reject child</text>
+<line x1="700" y1="242" x2="266" y2="242" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="233" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectorySkipped(bad)</text>
+<text x="246" y="239" text-anchor="end" font-size="12" fill="#475569">stop new subtree work</text>
+<text x="246" y="256" text-anchor="end" font-size="12" fill="#475569">drain started classifiers</text>
+<text x="714" y="239" text-anchor="start" font-size="12" fill="#475569">complete bad in its parent once</text>
+<line x1="700" y1="306" x2="266" y2="306" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="297" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectorySkipped(bad/child)</text>
+<text x="246" y="303" text-anchor="end" font-size="12" fill="#475569">return child Begin credit</text>
+<text x="714" y="303" text-anchor="start" font-size="12" fill="#475569">no second ancestor completion</text>
+<line x1="260" y1="370" x2="694" y2="370" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="361" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryEnd(bad/child, count=0)</text>
+<text x="714" y="367" text-anchor="start" font-size="12" fill="#475569">close rejected discovery record</text>
+<line x1="260" y1="426" x2="694" y2="426" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="417" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryEnd(bad, count=1)</text>
+<text x="714" y="423" text-anchor="start" font-size="12" fill="#475569">close rejected discovery record</text>
+<rect x="285" y="460" width="390" height="32" rx="5" fill="#eff6ff"/><text x="480" y="481" text-anchor="middle" font-size="12.5" fill="#1e40af">Sibling directory good continues copying</text>
+<text x="246" y="479" text-anchor="end" font-size="12" fill="#475569">no data sends under bad</text>
+<text x="714" y="479" text-anchor="start" font-size="12" fill="#475569">keep accepting control traffic</text>
+<line x1="260" y1="538" x2="694" y2="538" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="529" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DiscoveryComplete(true)</text>
+<text x="246" y="535" text-anchor="end" font-size="12" fill="#475569">every Begin has an End</text>
+<text x="714" y="535" text-anchor="start" font-size="12" fill="#475569">wait for other admitted work</text>
+<line x1="700" y1="596" x2="266" y2="596" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="587" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DestinationDone</text>
+<text x="246" y="593" text-anchor="end" font-size="12" fill="#475569">report collected source errors</text>
+<text x="714" y="593" text-anchor="start" font-size="12" fill="#475569">report collected destination errors</text>
+<rect x="24" y="650" width="952" height="44" rx="6" fill="#f1f5f9"/><text x="500" y="676" text-anchor="middle" font-size="12.5" fill="#334155">A fatal failure cancels the session and wakes admission waiters; it never waits for missing acknowledgements.</text></svg>

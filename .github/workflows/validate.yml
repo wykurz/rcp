@@ -97,7 +97,9 @@ jobs:
       run: ./scripts/check-walk-driver-usage.sh
 
     - name: Check source-read fidelity
-      run: ./scripts/check-source-read-fidelity.sh
+      run: |
+        ./scripts/test-check-source-read-fidelity.sh
+        ./scripts/check-source-read-fidelity.sh
 
     - name: Check TLS handshake timeouts
       run: ./scripts/check-tls-handshake-timeout.sh

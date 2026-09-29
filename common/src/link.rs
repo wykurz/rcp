@@ -262,7 +262,7 @@ pub async fn link(
     settings: &Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
-    crate::walk_driver::scope_tasks(link_inner(
+    crate::task_scope::scope_tasks(link_inner(
         prog_track, cwd, src, dst, update, settings, is_fresh,
     ))
     .await
@@ -2147,7 +2147,7 @@ async fn link_dir_contents(
             .await
             .map(|result| LinkTaskResult::from_link(entry_name, result))
         };
-        crate::walk_driver::spawn_tracked(&mut join_set, do_link());
+        crate::task_scope::spawn_tracked(&mut join_set, do_link());
     }
     // only process update if the path was provided and the directory is present
     if let Some(update_dir) = update_dir {
@@ -2243,7 +2243,7 @@ async fn link_dir_contents(
                     admission,
                 )
             };
-            crate::walk_driver::spawn_tracked(&mut join_set, do_copy());
+            crate::task_scope::spawn_tracked(&mut join_set, do_copy());
         }
     }
     while let Some(res) = join_set.join_next().await {
@@ -4245,7 +4245,7 @@ mod link_tests {
                 delete_excluded: true,
             };
             let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
-            let result = crate::walk_driver::scope_tasks(link_internal(
+            let result = crate::task_scope::scope_tasks(link_internal(
                 &PROGRESS,
                 &src_parent,
                 None,
@@ -4327,7 +4327,7 @@ mod link_tests {
                 SourceEntryDecision::Dispatch(admission) => {
                     let admission =
                         walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
-                    let result = crate::walk_driver::scope_tasks(link_internal(
+                    let result = crate::task_scope::scope_tasks(link_internal(
                         &PROGRESS,
                         &src_dir,
                         None,
@@ -4404,7 +4404,7 @@ mod link_tests {
                 SourceEntryDecision::Dispatch(admission) => {
                     let admission =
                         walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
-                    let result = crate::walk_driver::scope_tasks(link_internal(
+                    let result = crate::task_scope::scope_tasks(link_internal(
                         &PROGRESS,
                         &src_dir,
                         None,
@@ -4471,7 +4471,7 @@ mod link_tests {
                 SourceEntryDecision::Dispatch(admission) => {
                     let admission =
                         walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
-                    let result = crate::walk_driver::scope_tasks(link_internal(
+                    let result = crate::task_scope::scope_tasks(link_internal(
                         &PROGRESS,
                         &src_dir,
                         None,
@@ -6281,7 +6281,7 @@ mod link_tests {
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             let dst = root.join("dst");
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 Some(&update_dir),
@@ -6456,7 +6456,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 Some(&update_dir),
@@ -6877,7 +6877,7 @@ mod link_tests {
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             settings.copy_settings.fail_early = true;
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 None,
@@ -6994,7 +6994,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 None,
@@ -7056,7 +7056,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
-            let summary = crate::walk_driver::scope_tasks(link_dir_contents(
+            let summary = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 None,
@@ -7114,7 +7114,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 None,
@@ -7206,7 +7206,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 Some(&update_dir),
@@ -7301,7 +7301,7 @@ mod link_tests {
                 std::ffi::OsString::from("last"),
             ];
             let settings = common_settings(false, false);
-            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
                 Some(&update_dir),

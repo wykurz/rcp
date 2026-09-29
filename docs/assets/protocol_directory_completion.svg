@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title id="title">Directory finalization requires three conditions</title>
+<desc id="desc">DirectoryReady has been flushed, DirectoryEnd has sealed the direct-child count, and all counted children have completed. Together these allow metadata application or empty directory pruning, followed by one completion in the parent.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 1 L 9 5 L 0 9 z" fill="#475569"/></marker></defs>
+<rect x="1" y="1" width="998" height="418" rx="10" fill="#fff" stroke="#cbd5e1"/>
+<text x="32" y="35" font-size="18" font-weight="600" fill="#0f172a">Directory finalization requires all three conditions</text>
+<g fill="#eff6ff" stroke="#93c5fd"><rect x="35" y="70" width="270" height="74" rx="7"/><rect x="365" y="70" width="270" height="74" rx="7"/><rect x="695" y="70" width="270" height="74" rx="7"/></g>
+<g font-size="14" fill="#0f172a" text-anchor="middle"><text x="170" y="98" font-weight="600">Ready flushed</text><text x="170" y="123">including manifest chunks</text><text x="500" y="98" font-weight="600">Discovery sealed</text><text x="500" y="123">DirectoryEnd(count) received</text><text x="830" y="98" font-weight="600">All children terminal</text><text x="830" y="123">completed == count</text></g>
+<path d="M 170 144 V 170 H 500 M 830 144 V 170 H 500 M 500 144 V 201" fill="none" stroke="#475569" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="230" y="206" width="540" height="68" rx="7" fill="#f0fdf4" stroke="#86efac"/>
+<text x="500" y="234" text-anchor="middle" font-size="14" font-weight="600" fill="#14532d">Apply metadata or prune a new traversal-only empty directory</text><text x="500" y="255" text-anchor="middle" font-size="13" fill="#14532d">Keep the directory fd and lockdown guards until this step finishes</text>
+<path d="M 500 274 V 303" stroke="#475569" stroke-width="1.7" marker-end="url(#arrow)"/>
+<rect x="300" y="308" width="400" height="43" rx="7" fill="#f1f5f9" stroke="#cbd5e1"/>
+<text x="500" y="335" text-anchor="middle" font-size="14" fill="#0f172a">Non-root: complete exactly one parent entry</text>
+<text x="500" y="387" text-anchor="middle" font-size="12.5" fill="#475569">A rejected Begin settles its parent entry once and still requires its own End before DiscoveryComplete.</text>
+</svg>

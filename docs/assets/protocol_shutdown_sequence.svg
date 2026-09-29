@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="shutdown-sequence-title shutdown-sequence-desc">
   <title id="shutdown-sequence-title">Graceful remote-copy shutdown sequence</title>
-  <desc id="shutdown-sequence-desc">DestinationDone triggers source shutdown. The source cancels the data pool, drains file tasks, closes its control send side, and joins its control-receive task. Data-stream and source control EOF are unordered closure effects with no guaranteed ordering. For each destination data worker, the current handler ends on EOF and the worker exits after reconnect fails. In the data-completed path the destination control receiver observes source EOF; in the control-completed path that receiver has already exited.</desc>
+  <desc id="shutdown-sequence-desc">DestinationDone triggers source shutdown. The source drains file tasks while preserving errors, cancels the data pool, closes its control send side, and joins its control-receive task. Fatal failures publish the original cause and cancel the pool before joining blocked tasks. Data-stream and source control EOF are unordered closure effects with no guaranteed ordering. For each destination data worker, the current handler ends on EOF and the worker exits after reconnect fails. In the data-completed path the destination control receiver observes source EOF; in the control-completed path that receiver has already exited.</desc>
   <!-- Section 6.1 Shutdown Sequence: DestinationDone is the shutdown trigger -->
   <defs>
     <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -30,10 +30,10 @@
   <rect x="62" y="160" width="310" height="96" rx="7" fill="#f8fafc" stroke="#64748b"/>
   <g font-size="12.5" fill="#475569">
     <text x="217" y="181" text-anchor="middle" font-weight="600">Source shutdown actions</text>
-    <text x="217" y="198" text-anchor="middle">cancel the pooled-data shutdown token</text>
-    <text x="217" y="215" text-anchor="middle">drain file-send tasks; close control send</text>
+    <text x="217" y="198" text-anchor="middle">drain file tasks, retaining genuine failures</text>
+    <text x="217" y="215" text-anchor="middle">cancel the data pool; close control send</text>
     <text x="217" y="232" text-anchor="middle">then join the control-receive task</text>
-    <text x="217" y="249" text-anchor="middle" font-style="italic">does not wait for control EOF to start shutdown</text>
+    <text x="217" y="249" text-anchor="middle" font-style="italic">fatal failure: publish, cancel, then join</text>
   </g>
 
   <text x="500" y="276" text-anchor="middle" font-size="12.5" font-weight="600" fill="#475569">unordered closure effects — no guaranteed ordering</text>

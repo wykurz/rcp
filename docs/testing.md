@@ -167,6 +167,11 @@ Tests using localhost SSH (`rcp/tests/remote_tests.rs` and the real-session test
 **Requirements**: localhost SSH must be available and usable (running sshd, accessible via
 `ssh localhost`).
 
+Linux mutation tests also require `cc` and permission to trace child processes with
+`PTRACE_GET_SYSCALL_INFO`. Their source-only tracer pauses a selected file or directory open and
+replaces the name synchronously, so the tests work with static musl binaries and concurrent walks.
+The tests require a mutation marker and fail if tracing is unavailable.
+
 Keep rcp's localhost-SSH integration tests in the `remote_tests` target and remote-crate
 real-session tests in `tests::localhost_ssh_tests`. Nextest selects those two structural locations
 for its serial group; test names do not control membership. Launcher fakes and socket-only protocol

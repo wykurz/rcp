@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="single-symlink-title single-symlink-desc">
   <title id="single-symlink-title">Single-symlink remote copy flow</title>
-  <desc id="single-symlink-desc">Source sends a root symlink and then announces that directory structure is complete. The destination control receiver sends DestinationDone and exits without observing source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails.</desc>
-  <!-- Section 4.3 Single Symlink Copy -->
+  <desc id="single-symlink-desc">Source sends a root symlink and then announces that discovery is complete. The destination control receiver sends DestinationDone and exits without observing source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails.</desc>
+  <!-- single-symlink copy -->
   <defs>
     <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
@@ -23,9 +23,9 @@
   <text x="565" y="98" text-anchor="start" font-size="12.5" fill="#64748b">create symlink</text>
 
   <line x1="190" y1="142" x2="549" y2="142" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="372" y="136" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirStructureComplete</text>
+  <text x="372" y="136" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DiscoveryComplete(true)</text>
   <g font-size="12.5" fill="#64748b">
-    <text x="565" y="138" text-anchor="start">structure complete,</text>
+    <text x="565" y="138" text-anchor="start">discovery complete,</text>
     <text x="565" y="154" text-anchor="start">root symlink done</text>
   </g>
 
