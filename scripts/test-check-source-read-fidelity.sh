@@ -54,6 +54,14 @@ expect_result 0 'Source-read fidelity check passed'
 
 printf '%s\n' 'fn source_payload() { tokio::fs::read_link("source"); }' > "$fixture/rcp/src/source/discovery.rs"
 expect_result 1 'rcp/src/source/discovery.rs:'
+cat > "$fixture/rcp/src/source/discovery.rs" <<'RS'
+fn source_directory() { DirectoryCursor::open_following_symlinks(path, side, credit); }
+RS
+expect_result 1 '::open_following_symlinks('
+cat > "$fixture/rcp/src/source/discovery.rs" <<'RS'
+fn dereferenced_directory() { DirectoryCursor::open_following_symlinks(path, side, credit); } // rcp-toctou-allow: explicit -L directory walk
+RS
+expect_result 0 'Source-read fidelity check passed'
 rm "$fixture/rcp/src/source/discovery.rs"
 expect_result 1 'expected file not found: rcp/src/source/discovery.rs'
 

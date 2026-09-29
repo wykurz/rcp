@@ -97,7 +97,9 @@ async fn send(
     }
 }
 
-async fn rejects_changed_payload(replacement: &'static [u8]) -> anyhow::Result<()> {
+#[tokio::test]
+async fn shrinking_file_discards_its_incomplete_data_frame() -> anyhow::Result<()> {
+    let replacement = b"new";
     for dereference in [false, true] {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("changing-file");
@@ -141,41 +143,79 @@ async fn rejects_changed_payload(replacement: &'static [u8]) -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn shrinking_file_discards_its_incomplete_data_frame() -> anyhow::Result<()> {
-    rejects_changed_payload(b"new").await
+async fn growing_file_sends_its_snapshot_length_and_reuses_the_stream() -> anyhow::Result<()> {
+    for dereference in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("growing-file");
+        std::fs::write(&path, b"original")?;
+        let next = temp.path().join("next-file");
+        std::fs::write(&next, b"next")?;
+        let (writer, reader) = tokio::io::duplex(4096);
+        let pool = pool(Box::new(HeaderMutation {
+            stream: writer,
+            mutation: Some(Box::new({
+                let path = path.clone();
+                move || std::fs::write(path, b"replacement grows")
+            })),
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(pool.clone(), &path, dereference),
+        )
+        .await??;
+        assert_eq!(pool.recv.len(), 1);
+        send(pool.clone(), &next, dereference).await?;
+        let mut receive = remote::streams::RecvStream::new(reader);
+        for (path, expected) in [(&path, b"replacem".as_slice()), (&next, b"next")] {
+            let header = receive
+                .recv_object::<remote::protocol::File>()
+                .await?
+                .unwrap();
+            assert_eq!(&header.src, path);
+            assert_eq!(header.size, expected.len() as u64);
+            let mut bytes = Vec::new();
+            receive
+                .copy_exact_to_buffered(&mut bytes, header.size, 32)
+                .await?;
+            assert_eq!(bytes, expected);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]
-async fn growing_file_never_sends_bytes_beyond_its_header() -> anyhow::Result<()> {
-    rejects_changed_payload(b"replacement grows").await
-}
-
-#[tokio::test]
-async fn size_zero_proc_file_with_content_is_rejected() -> anyhow::Result<()> {
+async fn size_zero_proc_file_sends_an_empty_frame_and_reuses_the_stream() -> anyhow::Result<()> {
     let path = std::path::Path::new("/proc/self/status");
     assert_eq!(std::fs::metadata(path)?.len(), 0);
     for dereference in [false, true] {
-        let (writer, mut reader) = tokio::io::duplex(16384);
+        let temp = tempfile::tempdir()?;
+        let next = temp.path().join("next-file");
+        std::fs::write(&next, b"next")?;
+        let (writer, reader) = tokio::io::duplex(16384);
         let pool = pool(Box::new(writer));
-        let error = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
             send(pool.clone(), path, dereference),
         )
-        .await?
-        .expect_err("a size-zero proc file's content was sent as an unframed payload");
-        assert!(
-            format!("{error:#}").contains("/proc/self/status"),
-            "{error:#}"
-        );
-        assert_eq!(pool.recv.len(), 0);
+        .await??;
+        assert_eq!(pool.recv.len(), 1);
+        send(pool.clone(), &next, dereference).await?;
+        let mut receive = remote::streams::RecvStream::new(reader);
+        let empty = receive
+            .recv_object::<remote::protocol::File>()
+            .await?
+            .unwrap();
+        assert_eq!(empty.src, path);
+        assert_eq!(empty.size, 0);
+        let following = receive
+            .recv_object::<remote::protocol::File>()
+            .await?
+            .unwrap();
+        assert_eq!(following.src, next);
+        assert_eq!(following.size, 4);
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await?;
-        let header_size = u32::from_be_bytes(bytes[..4].try_into()?) as usize;
-        assert_eq!(
-            bytes.len(),
-            4 + header_size,
-            "size-zero frame carried payload bytes"
-        );
+        receive.copy_exact_to_buffered(&mut bytes, 4, 32).await?;
+        assert_eq!(bytes, b"next");
     }
     Ok(())
 }
@@ -215,6 +255,7 @@ async fn unchanged_files_reuse_one_stream_with_exact_frame_boundaries() -> anyho
 struct CloseControlOnDrop {
     close_peer: Option<tokio::sync::oneshot::Sender<()>>,
     published: std::sync::mpsc::Receiver<()>,
+    panic_on_write: bool,
 }
 
 impl tokio::io::AsyncWrite for CloseControlOnDrop {
@@ -223,6 +264,7 @@ impl tokio::io::AsyncWrite for CloseControlOnDrop {
         _: &mut std::task::Context<'_>,
         _: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        assert!(!self.panic_on_write, "original payload writer panic");
         std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(libc::EIO)))
     }
 
@@ -254,8 +296,7 @@ impl Drop for CloseControlOnDrop {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn payload_error_is_published_before_stream_drop_closes_control() -> anyhow::Result<()> {
+async fn payload_failure_precedes_stream_drop(panic_on_write: bool) -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("file");
     std::fs::write(&path, b"payload")?;
@@ -264,6 +305,7 @@ async fn payload_error_is_published_before_stream_drop_closes_control() -> anyho
     let pool = pool(Box::new(CloseControlOnDrop {
         close_peer: Some(close_peer),
         published: observed,
+        panic_on_write,
     }));
     let (source_control, peer_control) = tokio::io::duplex(4096);
     let (read, write) = tokio::io::split(source_control);
@@ -300,14 +342,134 @@ async fn payload_error_is_published_before_stream_drop_closes_control() -> anyho
     .await?;
     peer?;
     let error = source.expect_err("payload failure must fail the source");
-    assert_eq!(
-        error
-            .root_cause()
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
-        Some(libc::EIO),
-        "the control close replaced the original payload error: {error:#}"
+    if panic_on_write {
+        assert!(
+            format!("{error:#}").contains("original payload writer panic"),
+            "{error:#}"
+        );
+    } else {
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EIO),
+            "the control close replaced the original payload error: {error:#}"
+        );
+        assert!(format!("{error:#}").contains(path.to_str().unwrap()));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payload_error_is_published_before_stream_drop_closes_control() -> anyhow::Result<()> {
+    payload_failure_precedes_stream_drop(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payload_panic_is_published_before_stream_drop_closes_control() -> anyhow::Result<()> {
+    payload_failure_precedes_stream_drop(true).await
+}
+
+#[tokio::test]
+async fn completion_panic_is_published_before_the_poisoned_stream_drops() -> anyhow::Result<()> {
+    use tracing::instrument::WithSubscriber as _;
+
+    struct PanicAtSendFinish;
+    impl tracing::Subscriber for PanicAtSendFinish {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(if attributes.metadata().name() == "source.file.send" {
+                1
+            } else {
+                2
+            })
+        }
+        fn record(&self, span: &tracing::Id, _: &tracing::span::Record<'_>) {
+            assert_ne!(span.into_u64(), 1, "original send completion panic");
+        }
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+    struct ObserveDrop {
+        published: PoolShutdownToken,
+        observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl tokio::io::AsyncWrite for ObserveDrop {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl Drop for ObserveDrop {
+        fn drop(&mut self) {
+            self.observed.store(
+                self.published.is_cancelled(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("file");
+    std::fs::write(&path, b"payload")?;
+    let published = PoolShutdownToken::new();
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fatal = discovery::Fatal::new(published.clone());
+    let pool = pool(Box::new(ObserveDrop {
+        published,
+        observed: observed.clone(),
+    }));
+    let (parent, name) = open_root_parent(&path).await?;
+    let settings = settings(false);
+    let errors = Default::default();
+    let send = send_file_tcp(
+        &settings,
+        Default::default(),
+        &path,
+        std::path::Path::new("/destination/file"),
+        0,
+        true,
+        pool,
+        &errors,
+        Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+        ))),
+        FileRead::Hardened(parent, name),
+        &fatal,
     );
-    assert!(format!("{error:#}").contains(path.to_str().unwrap()));
+    assert!(
+        discovery::supervise(&fatal, send)
+            .with_subscriber(PanicAtSendFinish)
+            .await
+            .is_err()
+    );
+    let error = fatal.take().expect("completion panic was not published");
+    assert!(
+        format!("{error:#}").contains("original send completion panic"),
+        "{error:#}"
+    );
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        "stream dropped before completion panic was published"
+    );
     Ok(())
 }
