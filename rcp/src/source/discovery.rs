@@ -1,5 +1,7 @@
 //! Single-pass source discovery and directory readiness accounting.
 
+mod resources;
+
 use anyhow::Context;
 use common::preserve::Metadata as _;
 use common::safedir::Dir;
@@ -132,26 +134,21 @@ pub(super) struct Fatal {
     cancel: tokio_util::sync::CancellationToken,
     pool_shutdown: super::PoolShutdownToken,
     gates: std::sync::Mutex<Vec<Arc<tokio::sync::Semaphore>>>,
-    errors: Arc<common::error_collector::ErrorCollector>,
 }
 
 impl Fatal {
-    pub(super) fn new(
-        pool_shutdown: super::PoolShutdownToken,
-        errors: Arc<common::error_collector::ErrorCollector>,
-    ) -> Self {
+    pub(super) fn new(pool_shutdown: super::PoolShutdownToken) -> Self {
         Self {
             error: Default::default(),
             cancel: Default::default(),
             pool_shutdown,
             gates: Default::default(),
-            errors,
         }
     }
     fn publish(&self, error: anyhow::Error) {
         let mut primary = self.error.lock().unwrap();
         if primary.is_none() {
-            *primary = Some(self.errors.take_error().unwrap_or(error));
+            *primary = Some(error);
         }
         // publication and admission closure precede any task abortion or pool cancellation
         for gate in self.gates.lock().unwrap().iter() {
@@ -240,85 +237,82 @@ struct Observation {
     size: u64,
     metadata: Metadata,
     target: Option<PathBuf>,
+    included: bool,
 }
 
 async fn classify(
+    context: &DiscoveryContext,
     parent: &Parent,
     pair: SrcDst,
     name: std::ffi::OsString,
-    notice: Option<common::safedir::RootAclNotice>,
+    is_root: bool,
 ) -> anyhow::Result<Observation> {
-    let (kind, size, metadata, target) = match parent {
-        Parent::Hardened(dir) => {
-            let handle = dir
-                .child(&name)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", pair.src))?;
-            if let Some(notice) = notice {
-                common::safedir::warn_if_root_acl_unpreserved(&handle, &pair.src, notice).await;
-            }
-            let kind = handle.kind();
-            let size = handle.meta().size();
-            let (metadata, target) = if kind == EntryKind::Symlink {
-                let (target, meta) = handle.read_symlink(dir.side()).await?;
-                (Metadata::from(&meta), Some(target))
-            } else {
-                (Metadata::from(handle.meta()), None)
-            };
-            (kind, size, metadata, target)
-        }
-        Parent::Path => {
-            let meta = common::walk::run_metadata_probed(
-                common::Side::Source,
-                common::MetadataOp::Stat,
-                tokio::fs::metadata(&pair.src),
-            )
-            .await?;
-            (
-                EntryKind::from_metadata(&meta),
-                meta.len(),
-                Metadata::from(&meta),
-                None,
-            )
-        }
-    };
-    Ok(Observation {
-        pair,
-        name,
-        kind,
-        size,
-        metadata,
-        target,
-    })
-}
-
-enum Cursor {
-    Hardened(common::safedir::DirectoryCursor),
-    Path(tokio::fs::ReadDir),
-}
-
-impl Cursor {
-    async fn next_batch(&mut self) -> anyhow::Result<Vec<std::ffi::OsString>> {
-        match self {
-            Self::Hardened(cursor) => Ok(cursor
-                .next_batch(std::num::NonZeroUsize::new(64).unwrap())
-                .await?
-                .into_iter()
-                .map(|entry| entry.name)
-                .collect()),
-            Self::Path(cursor) => {
-                throttle::get_ops_token().await;
-                let mut batch = Vec::with_capacity(64);
-                while batch.len() < 64 {
-                    match cursor.next_entry().await? {
-                        Some(entry) => batch.push(entry.file_name()),
-                        None => break,
-                    }
+    let metadata_guard = throttle::pending_meta_permit().await;
+    common::safedir::with_fd_admission(metadata_guard.admission(), async {
+        let (kind, size, metadata, symlink) = match parent {
+            Parent::Hardened(dir) => {
+                let handle = dir
+                    .child(&name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", pair.src))?;
+                if is_root {
+                    common::safedir::warn_if_root_acl_unpreserved(
+                        &handle,
+                        &pair.src,
+                        common::safedir::RootAclNotice::from(context.capture),
+                    )
+                    .await;
                 }
-                Ok(batch)
+                let kind = handle.kind();
+                let size = handle.meta().size();
+                let metadata = Metadata::from(handle.meta());
+                let symlink = (kind == EntryKind::Symlink).then_some((handle, dir.side()));
+                (kind, size, metadata, symlink)
             }
+            Parent::Path => {
+                let meta = common::walk::run_metadata_probed(
+                    common::Side::Source,
+                    common::MetadataOp::Stat,
+                    tokio::fs::metadata(&pair.src),
+                )
+                .await
+                .with_context(|| format!("failed reading source metadata {:?}", pair.src))?;
+                (
+                    EntryKind::from_metadata(&meta),
+                    meta.len(),
+                    Metadata::from(&meta),
+                    None,
+                )
+            }
+        };
+        let mut observation = Observation {
+            pair,
+            name,
+            kind,
+            size,
+            metadata,
+            target: None,
+            included: false,
+        };
+        observation.included = context.included(&observation, is_root);
+        if observation.included
+            && let Some((handle, side)) = symlink
+        {
+            let read = async {
+                #[cfg(test)]
+                context
+                    .checkpoint("read_symlink", &observation.pair.src, 0)
+                    .await?;
+                anyhow::Ok(handle.read_symlink(side).await?)
+            }
+            .await
+            .with_context(|| format!("failed reading source symlink {:?}", observation.pair.src))?;
+            observation.target = Some(read.0);
+            observation.metadata = Metadata::from(&read.1);
         }
-    }
+        Ok(observation)
+    })
+    .await
 }
 
 struct FileJob {
@@ -326,8 +320,10 @@ struct FileJob {
     parent: Parent,
     readiness: Option<Arc<Readiness>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    obligation: Obligation,
+    obligation: Option<Obligation>,
     is_root: bool,
+    // field order closes the parent before announcing completion, even for an unpolled job.
+    _completion: Option<tokio::sync::mpsc::UnboundedSender<std::convert::Infallible>>,
 }
 
 struct DiscoveryContext {
@@ -337,6 +333,7 @@ struct DiscoveryContext {
     control: remote::streams::BoxedSharedSendStream,
     registry: Registry,
     branches: Arc<tokio::sync::Semaphore>,
+    directories: resources::DirectoryBudget,
     classifiers: Arc<tokio::sync::Semaphore>,
     files: Arc<tokio::sync::Semaphore>,
     file_tx: tokio::sync::mpsc::Sender<FileJob>,
@@ -372,6 +369,25 @@ impl DiscoveryContext {
             return Err(error);
         }
         tracing::error!("Source discovery failed: {error:#}");
+        self.errors.push(error);
+        Ok(())
+    }
+    async fn recover_after(
+        &self,
+        error: anyhow::Error,
+        terminal: impl std::future::Future<Output = anyhow::Result<()>>,
+    ) -> anyhow::Result<()> {
+        if self.settings.fail_early {
+            return Err(error);
+        }
+        tracing::error!("Source discovery failed: {error:#}");
+        if let Err(terminal_error) = terminal.await {
+            return Err(error.context(format!(
+                "failed to report source discovery failure: {terminal_error:#}"
+            )));
+        }
+        // discovery is joined before final error collection, even when this terminal message
+        // completes the destination. Keep this operation's cause owned until its send succeeds.
         self.errors.push(error);
         Ok(())
     }
@@ -431,10 +447,47 @@ impl DiscoveryContext {
         .await
     }
     async fn failed_child(&self, pair: &SrcDst, error: anyhow::Error) -> anyhow::Result<()> {
-        self.recover(error)?;
-        self.send(SourceMessage::FileSkipped {
-            src: pair.src.clone(),
-            dst: pair.dst.clone(),
+        self.recover_after(
+            error,
+            self.send(SourceMessage::FileSkipped {
+                src: pair.src.clone(),
+                dst: pair.dst.clone(),
+            }),
+        )
+        .await
+    }
+    fn skip_unchanged(&self, observation: &Observation, manifest: &Manifest) -> bool {
+        let Some(existing) = manifest.get(Path::new(&observation.name)) else {
+            return false;
+        };
+        let source = remote::protocol::FileMetadata {
+            metadata: &observation.metadata,
+            size: observation.size,
+        };
+        let destination = remote::protocol::FileMetadata {
+            metadata: &existing.metadata,
+            size: existing.size,
+        };
+        common::copy::skip_unchanged_send(
+            &self.settings.overwrite_compare,
+            self.settings.overwrite_filter,
+            self.settings.ignore_existing,
+            &source,
+            Some(common::copy::ExistingDst {
+                meta: &destination,
+                is_file: existing.is_file,
+            }),
+        )
+    }
+    async fn send_unchanged(&self, observation: &Observation) -> anyhow::Result<()> {
+        tracing::info!(
+            "destination already has identical file, skipping transfer (manifest): {:?} -> {:?}",
+            observation.pair.src,
+            observation.pair.dst
+        );
+        self.send(SourceMessage::FileUnchanged {
+            src: observation.pair.src.clone(),
+            dst: observation.pair.dst.clone(),
         })
         .await
     }
@@ -445,7 +498,16 @@ impl DiscoveryContext {
         readiness: Option<Arc<Readiness>>,
         obligation: Obligation,
         is_root: bool,
+        completion: Option<tokio::sync::mpsc::UnboundedSender<std::convert::Infallible>>,
     ) -> anyhow::Result<()> {
+        let ready = readiness.as_ref().map(|state| state.0.borrow().clone());
+        if let Some(ReadyState::Ready(manifest)) = ready
+            && self.skip_unchanged(&observation, &manifest)
+        {
+            // known skips need no file-task capacity. Pending manifests keep their asynchronous
+            // file path so discovery never waits here for directory readiness.
+            return obligated(obligation, self.send_unchanged(&observation)).await;
+        }
         let permit = match self.files.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -459,8 +521,9 @@ impl DiscoveryContext {
                 parent,
                 readiness,
                 _permit: permit,
-                obligation,
+                obligation: Some(obligation),
                 is_root,
+                _completion: completion,
             })
             .await
             .map_err(|_| anyhow::anyhow!("file dispatcher closed"))
@@ -470,56 +533,32 @@ impl DiscoveryContext {
 async fn file_job(
     context: Arc<DiscoveryContext>,
     pool: Arc<super::AcceptingSendStreamPool>,
-    job: FileJob,
+    mut job: FileJob,
 ) -> anyhow::Result<()> {
-    let FileJob {
-        observation,
-        parent,
-        readiness,
-        _permit,
-        obligation,
-        is_root,
-    } = job;
+    let obligation = job
+        .obligation
+        .take()
+        .expect("a queued file owns its obligation");
+    // borrowing the whole job makes the fd-owning await finish or drop before the job's final
+    // completion field. The struct's field order also covers destruction before first poll.
     obligated(obligation, async {
-        if let Some(readiness) = readiness {
+        let observation = &job.observation;
+        if let Some(readiness) = &job.readiness {
             let state = readiness.wait().await;
             match state {
                 ReadyState::Rejected => return Ok(()),
                 ReadyState::Pending => unreachable!(),
                 ReadyState::Ready(manifest) => {
-                    if let Some(existing) = manifest.get(Path::new(&observation.name)) {
-                        let source = remote::protocol::FileMetadata {
-                            metadata: &observation.metadata,
-                            size: observation.size,
-                        };
-                        let destination = remote::protocol::FileMetadata {
-                            metadata: &existing.metadata,
-                            size: existing.size,
-                        };
-                        if common::copy::skip_unchanged_send(
-                            &context.settings.overwrite_compare,
-                            context.settings.overwrite_filter,
-                            context.settings.ignore_existing,
-                            &source,
-                            Some(common::copy::ExistingDst {
-                                meta: &destination,
-                                is_file: existing.is_file,
-                            }),
-                        ) {
-                            tracing::info!("destination already has identical file, skipping transfer (manifest): {:?} -> {:?}", observation.pair.src, observation.pair.dst);
-                            return context
-                                .send(SourceMessage::FileUnchanged {
-                                    src: observation.pair.src,
-                                    dst: observation.pair.dst,
-                                })
-                                .await;
-                        }
+                    if context.skip_unchanged(observation, &manifest) {
+                        return context.send_unchanged(observation).await;
                     }
                 }
             }
         }
-        let read = match parent {
-            Parent::Hardened(dir) => super::FileRead::Hardened(dir, observation.name),
+        let read = match &job.parent {
+            Parent::Hardened(dir) => {
+                super::FileRead::Hardened(dir.clone(), observation.name.clone())
+            }
             Parent::Path => super::FileRead::Path,
         };
         super::send_file_tcp(
@@ -528,11 +567,12 @@ async fn file_job(
             &observation.pair.src,
             &observation.pair.dst,
             observation.size,
-            is_root,
+            job.is_root,
             pool,
             &context.errors,
             context.control.clone(),
             read,
+            &context.fatal,
         )
         .await
     })
@@ -545,6 +585,7 @@ async fn directory(
     parent: Parent,
     observation: Observation,
     is_root: bool,
+    scan: resources::Scan,
 ) -> anyhow::Result<()> {
     let mut children = tokio::task::JoinSet::new();
     let mut classifications = tokio::task::JoinSet::new();
@@ -555,6 +596,7 @@ async fn directory(
             parent,
             observation,
             is_root,
+            scan,
             &mut children,
             &mut classifications,
         ),
@@ -562,37 +604,52 @@ async fn directory(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn directory_body(
     context: Arc<DiscoveryContext>,
     parent: Parent,
     observation: Observation,
     is_root: bool,
+    scan_credit: resources::Scan,
     children: &mut tokio::task::JoinSet<anyhow::Result<()>>,
     classifications: &mut tokio::task::JoinSet<anyhow::Result<Option<Observation>>>,
 ) -> anyhow::Result<()> {
     let scan = common::timing_scope!("source.directory.scan");
     let pair = observation.pair;
+    let mut admission = common::timing_scope!("source.directory.wait_resources")
+        .measure(context.directories.admit(scan_credit))
+        .await?;
+    let (file_completion, mut completed_files) = if admission.sequential() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     // opening is separate from metadata capture: only the former permits the legacy unreadable
     // root/-L tombstone with classification metadata and unknown ACLs
     let opened = match parent {
         Parent::Hardened(parent) => parent
-            .open_dir(&observation.name)
+            .open_dir_admitted(&observation.name, admission.credit())
             .await
             .map(|dir| Parent::Hardened(Arc::new(dir))),
         Parent::Path => Ok(Parent::Path),
-    };
+    }
+    .with_context(|| format!("failed opening source directory {:?}", pair.src));
     let opened = match opened {
         Ok(opened) => opened,
         Err(error) if is_root => {
-            context.recover(error.into())?;
             context
-                .begin(&pair, observation.metadata, is_root, true)
+                .recover_after(error, async {
+                    context
+                        .begin(&pair, observation.metadata, is_root, true)
+                        .await?;
+                    context.end(&pair, 0).await
+                })
                 .await?;
-            context.end(&pair, 0).await?;
             scan.finish();
             return Ok(());
         }
-        Err(error) => return context.failed_child(&pair, error.into()).await,
+        Err(error) => return context.failed_child(&pair, error).await,
     };
     let description = async {
         #[cfg(test)]
@@ -605,28 +662,40 @@ async fn directory_body(
                 } else {
                     metadata
                 };
-                (metadata, dir.entries().await.map(Cursor::Hardened))
+                (
+                    metadata,
+                    dir.entries().await.with_context(|| {
+                        format!("failed opening source directory cursor {:?}", pair.src)
+                    }),
+                )
             }
             Parent::Path => {
-                throttle::get_ops_token().await;
-                let cursor = tokio::fs::read_dir(&pair.src).await.map(Cursor::Path);
-                if cursor.is_err() {
-                    return anyhow::Ok((observation.metadata.clone(), cursor));
-                }
+                let cursor = common::safedir::DirectoryCursor::open_following_symlinks(
+                    &pair.src,
+                    common::Side::Source,
+                    admission.credit(),
+                )
+                .await
+                .with_context(|| format!("failed opening source directory cursor {:?}", pair.src));
+                let mut cursor = match cursor {
+                    Ok(cursor) => cursor,
+                    Err(error) => return anyhow::Ok((observation.metadata.clone(), Err(error))),
+                };
                 let metadata = if context.capture.dir_acl {
                     observation
                         .metadata
                         .clone()
-                        .with_acls(&super::read_dir_acls_by_path(&pair.src).await?)
+                        .with_acls(&cursor.read_acls(common::Side::Source).await?)
                 } else {
                     observation.metadata.clone()
                 };
-                (metadata, cursor)
+                (metadata, Ok(cursor))
             }
         };
         anyhow::Ok((metadata, cursor))
     }
-    .await;
+    .await
+    .with_context(|| format!("failed reading source directory metadata {:?}", pair.src));
     let (metadata, cursor) = match description {
         Ok(description) => description,
         Err(error) if !is_root => return context.failed_child(&pair, error).await,
@@ -635,9 +704,12 @@ async fn directory_body(
     let mut cursor = match cursor {
         Ok(cursor) => cursor,
         Err(error) => {
-            context.recover(error.into())?;
-            context.begin(&pair, metadata, is_root, true).await?;
-            context.end(&pair, 0).await?;
+            context
+                .recover_after(error, async {
+                    context.begin(&pair, metadata, is_root, true).await?;
+                    context.end(&pair, 0).await
+                })
+                .await?;
             scan.finish();
             return Ok(());
         }
@@ -665,13 +737,25 @@ async fn directory_body(
         let names = match async {
             #[cfg(test)]
             context.checkpoint("read_batch", &pair.src, 0).await?;
-            cursor.next_batch().await
+            cursor
+                .next_batch(std::num::NonZeroUsize::new(64).unwrap())
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| entry.name)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(anyhow::Error::from)
         }
         .await
         {
             Ok(names) => names,
             Err(error) => {
-                context.recover(error)?;
+                context.recover(error.context(format!(
+                    "failed enumerating source directory {:?}",
+                    pair.src
+                )))?;
                 break;
             }
         };
@@ -700,7 +784,7 @@ async fn directory_body(
                 let result = std::panic::AssertUnwindSafe(async {
                     #[cfg(test)]
                     context.checkpoint("classifying", &child.src, 0).await?;
-                    classify(&parent, child, name, None).await
+                    classify(&context, &parent, child, name, false).await
                 })
                 .catch_unwind()
                 .await;
@@ -749,7 +833,7 @@ async fn directory_body(
             if readiness.rejected() {
                 continue;
             }
-            if !context.included(&observation, false) {
+            if !observation.included {
                 observation.kind.inc_skipped(super::progress());
                 continue;
             }
@@ -778,6 +862,7 @@ async fn directory_body(
                             Some(readiness.clone()),
                             obligation,
                             false,
+                            file_completion.clone(),
                         )
                         .await?
                 }
@@ -799,21 +884,25 @@ async fn directory_body(
                 EntryKind::Dir => {
                     let parent = opened.clone();
                     let context = context.clone();
-                    match context.branches.clone().try_acquire_owned() {
-                        Ok(branch) => common::task_scope::spawn_tracked(children, async move {
-                            let _branch = branch;
-                            obligated(obligation, directory(context, parent, observation, false))
-                                .await
+                    match admission.try_fork(&context.branches)? {
+                        Some(scan) => common::task_scope::spawn_tracked(children, async move {
+                            obligated(
+                                obligation,
+                                directory(context, parent, observation, false, scan),
+                            )
+                            .await
                         }),
-                        Err(tokio::sync::TryAcquireError::NoPermits) => {
-                            // continue this same logical branch on a fresh task stack, immediately
-                            // joining it before this ancestor dispatches anything else. No extra E
-                            // permit is acquired, and deeply nested polls cannot overflow the stack
+                        None => {
+                            // move normal scan credit into the continuation. The suspended
+                            // ancestor owns none once its child finishes scanning. Reserved
+                            // descendants instead inherit their guaranteed sequential lane.
+                            let scan = admission.descend();
+                            let resumed = context.clone();
                             let mut continuation = tokio::task::JoinSet::new();
                             common::task_scope::spawn_tracked(&mut continuation, async move {
                                 obligated(
                                     obligation,
-                                    directory(context, parent, observation, false),
+                                    directory(context, parent, observation, false, scan),
                                 )
                                 .await
                             });
@@ -821,10 +910,7 @@ async fn directory_body(
                                 .join_next()
                                 .await
                                 .context("inline directory continuation disappeared")???;
-                        }
-                        Err(error) => {
-                            context.fatal.publish(error.into());
-                            return Err(anyhow::anyhow!("branch admission closed"));
+                            admission.resume(&resumed.branches).await?;
                         }
                     }
                 }
@@ -833,8 +919,15 @@ async fn directory_body(
         }
     }
     drop(cursor);
+    drop(opened);
     context.end(&pair, count).await?;
     scan.finish();
+    drop(file_completion);
+    if let Some(receiver) = completed_files.as_mut() {
+        // this channel has no values: closure follows destruction of direct file fd captures.
+        let _ = receiver.recv().await;
+    }
+    drop(admission);
     while let Some(result) = children.join_next().await {
         result??;
     }
@@ -843,7 +936,7 @@ async fn directory_body(
 
 async fn discover(context: Arc<DiscoveryContext>, root: SrcDst) -> anyhow::Result<bool> {
     let scope = common::timing_scope!("source.discovery");
-    let _branch = context.branches.clone().acquire_owned().await?;
+    let branch = context.branches.clone().acquire_owned().await?;
     let (parent, name) = if context.settings.dereference {
         let notice = common::safedir::RootAclNotice::from(context.capture);
         if common::safedir::root_acl_probe_worth_reaching(notice)
@@ -860,25 +953,28 @@ async fn discover(context: Arc<DiscoveryContext>, root: SrcDst) -> anyhow::Resul
         let (parent, name) = super::open_root_parent(&root.src).await?;
         (Parent::Hardened(parent), name)
     };
-    let observation = classify(
-        &parent,
-        root,
-        name,
-        Some(common::safedir::RootAclNotice::from(context.capture)),
-    )
-    .await?;
-    let included = context.included(&observation, true);
+    let observation = classify(&context, &parent, root, name, true).await?;
+    let included = observation.included;
     let has_root_item = included && observation.kind != EntryKind::Special;
     if !included {
         observation.kind.inc_skipped(super::progress());
     } else {
         match observation.kind {
-            EntryKind::Dir => directory(context.clone(), parent, observation, true).await?,
+            EntryKind::Dir => {
+                directory(
+                    context.clone(),
+                    parent,
+                    observation,
+                    true,
+                    resources::Scan::Normal(branch),
+                )
+                .await?
+            }
             EntryKind::File => {
                 let obligation =
                     Obligation::new(context.fatal.clone(), observation.pair.src.clone());
                 context
-                    .submit_file(observation, parent, None, obligation, true)
+                    .submit_file(observation, parent, None, obligation, true, None)
                     .await?;
             }
             EntryKind::Symlink => {
@@ -938,13 +1034,24 @@ pub(super) async fn run(
     errors: Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     let (file_tx, mut file_rx) = tokio::sync::mpsc::channel(pending);
+    let directories = resources::DirectoryBudget::for_process(branches, pending);
+    #[cfg(test)]
+    let directories = tests::DIRECTORY_GROUPS
+        .try_with(|groups| resources::DirectoryBudget::new(*groups))
+        .unwrap_or(directories);
+    let branches = Arc::new(tokio::sync::Semaphore::new(branches));
+    #[cfg(test)]
+    let branches = tests::SCAN_CREDIT
+        .try_with(Clone::clone)
+        .unwrap_or(branches);
     let context = Arc::new(DiscoveryContext {
         settings,
         capture,
         root: root.src.clone(),
         control,
         registry: Registry::new(pending),
-        branches: Arc::new(tokio::sync::Semaphore::new(branches)),
+        branches,
+        directories,
         classifiers: Arc::new(tokio::sync::Semaphore::new(pending)),
         files: Arc::new(tokio::sync::Semaphore::new(pending)),
         file_tx,
@@ -961,6 +1068,8 @@ pub(super) async fn run(
         for gate in [
             context.registry.credit.clone(),
             context.branches.clone(),
+            context.directories.normal.clone(),
+            context.directories.reserve.clone(),
             context.classifiers.clone(),
             context.files.clone(),
         ] {
@@ -1067,6 +1176,354 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    tokio::task_local! { pub(super) static DIRECTORY_GROUPS: usize; }
+    tokio::task_local! { pub(super) static SCAN_CREDIT: Arc<tokio::sync::Semaphore>; }
+
+    fn submission_context(
+        writer: remote::streams::BoxedWrite,
+    ) -> (Arc<DiscoveryContext>, tokio::sync::mpsc::Receiver<FileJob>) {
+        let (file_tx, file_rx) = tokio::sync::mpsc::channel(1);
+        let mut configuration = settings(false);
+        configuration.overwrite = true;
+        (
+            Arc::new(DiscoveryContext {
+                settings: configuration,
+                capture: Default::default(),
+                root: "/source".into(),
+                control: Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                    writer,
+                ))),
+                registry: Registry::new(1),
+                branches: Arc::new(tokio::sync::Semaphore::new(1)),
+                directories: resources::DirectoryBudget::new(1),
+                classifiers: Arc::new(tokio::sync::Semaphore::new(1)),
+                files: Arc::new(tokio::sync::Semaphore::new(1)),
+                file_tx,
+                fatal: Arc::new(Fatal::new(Default::default())),
+                errors: Default::default(),
+                discovery_sealed: Default::default(),
+                hooks: None,
+            }),
+            file_rx,
+        )
+    }
+
+    async fn unchanged_submission(
+        context: &DiscoveryContext,
+        ready: bool,
+    ) -> anyhow::Result<(Observation, Arc<Readiness>, Obligation)> {
+        let observation = Observation {
+            pair: SrcDst {
+                src: "/source/file".into(),
+                dst: "/destination/file".into(),
+            },
+            name: "file".into(),
+            kind: EntryKind::File,
+            size: 1024,
+            metadata: Metadata {
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                atime: 1,
+                mtime: 2,
+                atime_nsec: 0,
+                mtime_nsec: 3,
+                acls: remote::protocol::WireAcls::Unknown,
+            },
+            target: None,
+            included: true,
+        };
+        let pair = SrcDst {
+            src: "/source".into(),
+            dst: "/destination".into(),
+        };
+        let readiness = context.registry.register(&pair).await?;
+        context.registry.manifest(
+            &pair.dst,
+            vec![ExistingEntry {
+                name: "file".into(),
+                is_file: true,
+                metadata: observation.metadata.clone(),
+                size: 1024,
+            }],
+        )?;
+        if ready {
+            context.registry.resolve(&pair.src, &pair.dst, false)?;
+        }
+        let obligation = Obligation::new(context.fatal.clone(), observation.pair.src.clone());
+        Ok((observation, readiness, obligation))
+    }
+
+    #[tokio::test]
+    async fn ready_unchanged_file_bypasses_saturated_file_admission() -> anyhow::Result<()> {
+        let (write, read) = tokio::io::duplex(4096);
+        let (context, mut queued) = submission_context(Box::new(write));
+        let _occupied = context.files.clone().acquire_owned().await?;
+        let (observation, readiness, obligation) = unchanged_submission(&context, true).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            context.submit_file(
+                observation,
+                Parent::Path,
+                Some(readiness),
+                obligation,
+                false,
+                None,
+            ),
+        )
+        .await
+        .context("ready unchanged file waited for file admission")??;
+        assert!(matches!(
+            queued.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let mut receive = remote::streams::RecvStream::new(read);
+        assert!(matches!(receive.recv_object::<SourceMessage>().await?,
+            Some(SourceMessage::FileUnchanged { src, dst })
+                if src == Path::new("/source/file") && dst == Path::new("/destination/file")));
+        assert!(context.fatal.take().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_manifest_queues_file_before_readiness() -> anyhow::Result<()> {
+        let (write, read) = tokio::io::duplex(4096);
+        let (context, mut queued) = submission_context(Box::new(write));
+        let occupied = context.files.clone().acquire_owned().await?;
+        let (observation, readiness, obligation) = unchanged_submission(&context, false).await?;
+        let submission = context.submit_file(
+            observation,
+            Parent::Path,
+            Some(readiness),
+            obligation,
+            false,
+            None,
+        );
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
+        drop(occupied);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut submission)
+            .await
+            .context("file submission waited for pending manifest")??;
+        let job = queued.try_recv()?;
+        let (send, receive) = async_channel::bounded(1);
+        let pool = Arc::new(super::super::AcceptingSendStreamPool {
+            recv: receive,
+            return_tx: send,
+        });
+        let sending = file_job(context.clone(), pool, job);
+        tokio::pin!(sending);
+        assert!(futures::poll!(&mut sending).is_pending());
+        context
+            .registry
+            .resolve(Path::new("/source"), Path::new("/destination"), false)?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut sending).await??;
+        let mut receive = remote::streams::RecvStream::new(read);
+        assert!(matches!(
+            receive.recv_object::<SourceMessage>().await?,
+            Some(SourceMessage::FileUnchanged { .. })
+        ));
+        assert!(context.fatal.take().is_none());
+        assert_eq!(context.files.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_unchanged_send_failure_keeps_original_cause() -> anyhow::Result<()> {
+        let (context, mut queued) = submission_context(Box::new(FailingWriter));
+        let _occupied = context.files.clone().acquire_owned().await?;
+        let (observation, readiness, obligation) = unchanged_submission(&context, true).await?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            context.submit_file(
+                observation,
+                Parent::Path,
+                Some(readiness),
+                obligation,
+                false,
+                None,
+            ),
+        )
+        .await
+        .context("ready unchanged failure waited for file admission")?;
+        assert!(result.is_err());
+        assert!(matches!(
+            queued.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let error = context
+            .fatal
+            .take()
+            .context("send failure was not published")?;
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .to_string(),
+            "original payload send failure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_descriptors_are_bounded_by_one_depth_path_under_pressure()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        for branch in 0..16 {
+            let mut path = temp.path().join(format!("branch-{branch}"));
+            for _ in 0..12 {
+                std::fs::create_dir(&path)?;
+                path.push("child");
+            }
+        }
+        // a comb retains sibling work at every suspended level, and the root spans batches.
+        for branch in 0..4 {
+            let mut path = temp.path().join(format!("comb-{branch}"));
+            for _ in 0..8 {
+                std::fs::create_dir(&path)?;
+                std::fs::create_dir(path.join("left"))?;
+                std::fs::create_dir(path.join("right"))?;
+                path.push("next");
+            }
+        }
+        for index in 0..70 {
+            std::fs::create_dir(temp.path().join(format!("wide-{index}")))?;
+        }
+        fn source_descriptors(root: &Path) -> std::io::Result<usize> {
+            Ok(std::fs::read_dir("/proc/self/fd")?
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.starts_with(root))
+                .count())
+        }
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Hooks::new({
+            let peak = peak.clone();
+            let root = temp.path().to_owned();
+            move |event, _, _| {
+                let measure = event == "cursor";
+                let peak = peak.clone();
+                let root = root.clone();
+                Box::pin(async move {
+                    if measure {
+                        peak.fetch_max(
+                            source_descriptors(&root)?,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let (source, send, recv, errors) = connection(temp.path(), false, 4, 4, Vec::new());
+        let (source, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            DIRECTORY_GROUPS.scope(
+                1,
+                HOOKS.scope(
+                    hooks,
+                    common::task_scope::scope_tasks(async {
+                        tokio::join!(source, acknowledge_directories(send, recv))
+                    }),
+                ),
+            ),
+        )
+        .await?;
+        source?;
+        let messages = peer?;
+        assert!(!errors.has_errors());
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, SourceMessage::DirectoryBegin { .. }))
+                .count(),
+            359
+        );
+        let held = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            held >= 24,
+            "the measurement must observe the live depth-12 path"
+        );
+        assert!(
+            held <= 64,
+            "walk retained {held} descriptors; one budgeted group and one depth-12 path fit in 64"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_ancestors_release_scan_capacity_for_a_wide_frontier() -> anyhow::Result<()> {
+        for scans in [4, 8] {
+            for depth in [0, 3, 7] {
+                for dereference in [false, true] {
+                    let temp = tempfile::tempdir()?;
+                    let mut frontier = temp.path().to_owned();
+                    for index in 0..depth {
+                        frontier.push(format!("prefix-{index}"));
+                    }
+                    std::fs::create_dir_all(&frontier)?;
+                    for index in 0..scans {
+                        std::fs::create_dir(frontier.join(format!("leaf-{index}")))?;
+                    }
+                    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                    let release = Arc::new(tokio::sync::Semaphore::new(0));
+                    let branches = Arc::new(tokio::sync::Semaphore::new(scans));
+                    let hooks = Hooks::new({
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        let branches = branches.clone();
+                        let frontier = frontier.clone();
+                        move |event, path, _| {
+                            let at_frontier = event == "cursor" && path == frontier;
+                            let at_leaf = event == "cursor"
+                                && path
+                                    .file_name()
+                                    .unwrap()
+                                    .as_encoded_bytes()
+                                    .starts_with(b"leaf-");
+                            let entered = entered.clone();
+                            let release = release.clone();
+                            let branches = branches.clone();
+                            Box::pin(async move {
+                                if at_frontier {
+                                    // wait until prefix scans relinquish their credits. An active
+                                    // prefix can otherwise force the first leaf inline before the
+                                    // remaining siblings can reach the test's leaf barrier.
+                                    let available =
+                                        branches.acquire_many_owned((scans - 1) as u32).await?;
+                                    drop(available);
+                                }
+                                if at_leaf {
+                                    entered.add_permits(1);
+                                    release.acquire_owned().await?.forget();
+                                }
+                                Ok(())
+                            })
+                        }
+                    });
+                    let (source, send, recv, _) =
+                        connection(temp.path(), dereference, scans, scans, Vec::new());
+                    let frontier_progress = async {
+                        entered.acquire_many_owned(scans as u32).await?.forget();
+                        release.add_permits(scans);
+                        anyhow::Ok(())
+                    };
+                    let (source, peer, frontier_progress) = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        SCAN_CREDIT.scope(branches.clone(), DIRECTORY_GROUPS.scope(scans + depth + 2,
+                            HOOKS.scope(hooks.clone(), common::task_scope::scope_tasks(async {
+                                tokio::join!(source, acknowledge_directories(send, recv), frontier_progress)
+                            })))),
+                    ).await.with_context(|| format!(
+                        "completed ancestors retained scan capacity: E={scans}, depth={depth}, dereference={dereference}; available={}; events={:?}", branches.available_permits(), hooks.events.lock().unwrap()))?;
+                    source?;
+                    peer?;
+                    frontier_progress?;
+                }
+            }
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn acknowledgement_validates_both_paths_and_releases_credit_once() {
         let registry = Registry::new(1);
@@ -1103,10 +1560,7 @@ mod tests {
     }
     #[tokio::test]
     async fn lost_obligation_cancels_admission_without_replacing_primary_error() {
-        let fatal = Arc::new(Fatal::new(
-            tokio_util::sync::CancellationToken::new(),
-            Default::default(),
-        ));
+        let fatal = Arc::new(Fatal::new(tokio_util::sync::CancellationToken::new()));
         let guard = Obligation::new(fatal.clone(), "entry".into());
         fatal.publish(anyhow::anyhow!("original cause"));
         drop(guard);
@@ -1115,12 +1569,271 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelled_obligation_is_fatal() {
-        let fatal = Arc::new(Fatal::new(
-            tokio_util::sync::CancellationToken::new(),
-            Default::default(),
-        ));
+        let fatal = Arc::new(Fatal::new(tokio_util::sync::CancellationToken::new()));
         drop(Obligation::new(fatal.clone(), "entry".into()));
         assert!(fatal.take().unwrap().to_string().contains("obligation"));
+    }
+    #[tokio::test]
+    async fn collected_error_does_not_replace_the_failure_that_aborts_discovery()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("dangling");
+        std::os::unix::fs::symlink("missing", &path)?;
+        let (source, mut send, mut receive, errors) =
+            connection(temp.path(), true, 1, 1, Vec::new());
+        let peer = async {
+            loop {
+                match receive.recv_object::<SourceMessage>().await?.unwrap() {
+                    SourceMessage::DirectoryBegin { src, dst, .. } => {
+                        send.send_control_message(&DestinationMessage::DirectoryReady { src, dst })
+                            .await?;
+                    }
+                    SourceMessage::DirectoryEnd { .. } => {
+                        assert!(
+                            errors.has_errors(),
+                            "the earlier classification error was not collected"
+                        );
+                        send.close().await?;
+                        return anyhow::Ok(());
+                    }
+                    other => anyhow::bail!("unexpected message: {other:?}"),
+                }
+            }
+        };
+        let (source, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
+        )
+        .await?;
+        peer?;
+        let error = source.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("destination closed control"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn dereferenced_missing_entry_reports_its_source_path() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("dangling");
+        std::os::unix::fs::symlink("missing", &path)?;
+        let (source, send, receive, _) = connection(&path, true, 1, 1, Vec::new());
+        let (source, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            common::task_scope::scope_tasks(async {
+                tokio::join!(source, acknowledge_directories(send, receive))
+            }),
+        )
+        .await?;
+        let error = source.expect_err("dereferencing a dangling link must fail");
+        assert!(
+            format!("{error:#}").contains(path.to_str().unwrap()),
+            "{error:#}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn directory_open_failure_reports_its_source_path() -> anyhow::Result<()> {
+        for dereference in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("changed-directory");
+            std::fs::create_dir(&path)?;
+            let hooks = Hooks::new({
+                let path = path.clone();
+                move |event, observed, _| {
+                    let replace = event == "classified" && observed == path;
+                    let path = path.clone();
+                    Box::pin(async move {
+                        if replace {
+                            std::fs::remove_dir(&path)?;
+                            std::fs::write(path, b"replacement")?;
+                        }
+                        Ok(())
+                    })
+                }
+            });
+            let (source, send, receive, errors) =
+                connection(temp.path(), dereference, 1, 1, Vec::new());
+            let (source, peer) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                HOOKS.scope(
+                    hooks,
+                    common::task_scope::scope_tasks(async {
+                        tokio::join!(source, acknowledge_directories(send, receive))
+                    }),
+                ),
+            )
+            .await?;
+            source?;
+            peer?;
+            let error = errors
+                .take_error()
+                .context("replacement was not reported")?;
+            assert!(
+                format!("{error:#}").contains(path.to_str().unwrap()),
+                "{error:#}"
+            );
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ENOTDIR)
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn directory_enumeration_failure_reports_its_source_path() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let hooks = Hooks::new(|event, _, _| {
+            let fail = event == "read_batch";
+            Box::pin(async move {
+                if fail {
+                    return Err(std::io::Error::from_raw_os_error(libc::EACCES).into());
+                }
+                Ok(())
+            })
+        });
+        let (source, send, receive, errors) = connection(temp.path(), false, 1, 1, Vec::new());
+        let (source, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            HOOKS.scope(
+                hooks,
+                common::task_scope::scope_tasks(async {
+                    tokio::join!(source, acknowledge_directories(send, receive))
+                }),
+            ),
+        )
+        .await?;
+        source?;
+        peer?;
+        let error = errors
+            .take_error()
+            .context("enumeration failure was not reported")?;
+        assert!(
+            format!("{error:#}").contains(temp.path().to_str().unwrap()),
+            "{error:#}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        Ok(())
+    }
+    async fn symlink_read_failure(
+        is_root: bool,
+        excluded: bool,
+        fail_early: bool,
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink("target", &link)?;
+        let hooks = Hooks::new(|event, _, _| {
+            let fail = event == "read_symlink";
+            Box::pin(async move {
+                if fail {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                }
+                Ok(())
+            })
+        });
+        let mut configuration = settings(false);
+        configuration.fail_early = fail_early;
+        if excluded {
+            let mut filter = common::filter::FilterSettings::new();
+            filter.add_exclude("link")?;
+            configuration.filter = Some(filter);
+        }
+        let root = if is_root { link.as_path() } else { temp.path() };
+        let (source, send, receive, errors) =
+            configured_connection(root, configuration, 1, 1, Vec::new());
+        let (source, peer) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            HOOKS.scope(
+                hooks.clone(),
+                common::task_scope::scope_tasks(async {
+                    tokio::join!(source, acknowledge_directories(send, receive))
+                }),
+            ),
+        )
+        .await?;
+        if excluded {
+            source?;
+            let messages = peer?;
+            assert!(
+                !errors.has_errors(),
+                "an excluded symlink attempted a failing target read"
+            );
+            assert!(
+                !hooks
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(event, _, _)| event == "read_symlink")
+            );
+            assert!(
+                matches!(messages.last(), Some(SourceMessage::DiscoveryComplete { has_root_item }) if *has_root_item != is_root)
+            );
+        } else {
+            let error = if is_root || fail_early {
+                assert!(peer.is_err());
+                source.expect_err("an unreadable root or fail-early symlink must abort")
+            } else {
+                source?;
+                let messages = peer?;
+                assert!(messages.iter().any(|message| matches!(
+                    message,
+                    SourceMessage::DirectoryEnd { entry_count: 0, .. }
+                )));
+                errors
+                    .take_error()
+                    .context("the symlink read failure was not collected")?
+            };
+            assert!(
+                format!("{error:#}").contains(link.to_str().unwrap()),
+                "{error:#}"
+            );
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn excluded_root_symlink_does_not_read_its_target() -> anyhow::Result<()> {
+        symlink_read_failure(true, true, false).await
+    }
+    #[tokio::test]
+    async fn excluded_child_symlink_does_not_read_its_target() -> anyhow::Result<()> {
+        symlink_read_failure(false, true, false).await
+    }
+    #[tokio::test]
+    async fn included_symlink_read_failures_finish_without_pending_children() -> anyhow::Result<()>
+    {
+        symlink_read_failure(true, false, false).await?;
+        symlink_read_failure(false, false, false).await?;
+        symlink_read_failure(false, false, true).await
     }
     fn settings(dereference: bool) -> common::copy::Settings {
         common::copy::Settings {
@@ -1220,7 +1933,7 @@ mod tests {
             ))),
             remote::streams::RecvStream::new(Box::new(source_read) as remote::streams::BoxedRead),
             pool,
-            Arc::new(Fatal::new(Default::default(), errors.clone())),
+            Arc::new(Fatal::new(Default::default())),
             e,
             p,
             errors.clone(),
@@ -1264,7 +1977,7 @@ mod tests {
     #[tokio::test]
     async fn original_worker_error_and_panic_precede_obligation_drop() {
         for panic in [false, true] {
-            let fatal = Arc::new(Fatal::new(Default::default(), Default::default()));
+            let fatal = Arc::new(Fatal::new(Default::default()));
             let guard = Obligation::new(fatal.clone(), "admitted".into());
             let result = obligated(guard, async move {
                 assert!(!panic, "original worker panic");
@@ -1439,6 +2152,110 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn sequential_reserve_drains_file_parents_before_scanning_another_sibling()
+    -> anyhow::Result<()> {
+        for disconnect in [false, true] {
+            let temp = tempfile::tempdir()?;
+            for index in 0..8 {
+                let leaf = temp.path().join(format!("reserved/leaf-{index}"));
+                std::fs::create_dir_all(&leaf)?;
+                std::fs::write(leaf.join("payload"), b"payload")?;
+            }
+            let (cursor_tx, mut cursors) = tokio::sync::mpsc::unbounded_channel();
+            let hooks = Hooks::new(move |event, path, _| {
+                let leaf = event == "cursor"
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .as_encoded_bytes()
+                        .starts_with(b"leaf-");
+                let cursor_tx = cursor_tx.clone();
+                Box::pin(async move {
+                    if leaf {
+                        let _ = cursor_tx.send(());
+                    }
+                    Ok(())
+                })
+            });
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (source, mut send, mut recv, errors) = connection(
+                temp.path(),
+                false,
+                1,
+                32,
+                vec![Box::new(GatedWriter::new(started, gate.clone()))],
+            );
+            let (ended_tx, mut ended) = tokio::sync::mpsc::unbounded_channel();
+            let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let peer = async {
+                loop {
+                    tokio::select! {
+                        _ = close_rx.recv(), if disconnect => { send.close().await?; return anyhow::Ok(()); }
+                        message = recv.recv_object::<SourceMessage>() => {
+                            match message?.context("source closed before discovery completed")? {
+                                SourceMessage::DirectoryBegin { src, dst, .. } => {
+                                    send.send_control_message(&DestinationMessage::DirectoryReady {src, dst}).await?;
+                                }
+                                SourceMessage::DirectoryEnd { src, .. }
+                                    if src.file_name().unwrap().as_encoded_bytes().starts_with(b"leaf-") => {
+                                    let _ = ended_tx.send(());
+                                }
+                                SourceMessage::DiscoveryComplete { .. } => {
+                                    send.send_control_message(&DestinationMessage::DestinationDone).await?;
+                                    return Ok(());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            };
+            let observe = async {
+                cursors.recv().await.context("first leaf never opened")?;
+                starts.recv().await.context("first payload never started")?;
+                ended.recv().await.context("first leaf never sealed")?;
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), cursors.recv())
+                        .await
+                        .is_err(),
+                    "a reserved sibling advanced while the previous file still pinned its parent"
+                );
+                if disconnect {
+                    close_tx.send(())?;
+                } else {
+                    gate.add_permits(1);
+                }
+                anyhow::Ok(())
+            };
+            let (source, peer, observe) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                DIRECTORY_GROUPS.scope(
+                    1,
+                    HOOKS.scope(
+                        hooks,
+                        common::task_scope::scope_tasks(async {
+                            tokio::join!(source, peer, observe)
+                        }),
+                    ),
+                ),
+            )
+            .await?;
+            peer?;
+            observe?;
+            if disconnect {
+                assert!(
+                    format!("{:#}", source.unwrap_err()).contains("destination closed control")
+                );
+            } else {
+                source?;
+                assert!(!errors.has_errors());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn two_payloads_start_before_wide_directory_eof_and_every_name_is_classified_once()
     -> anyhow::Result<()> {
         for dereference in [false, true] {
@@ -1607,7 +2424,7 @@ mod tests {
             return_tx: send,
         });
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let fatal = Arc::new(Fatal::new(Default::default(), errors.clone()));
+        let fatal = Arc::new(Fatal::new(Default::default()));
         let missing = temp.path().join("missing");
         let guard = Obligation::new(fatal.clone(), missing.clone());
         let configuration = settings(false);
@@ -1626,6 +2443,7 @@ mod tests {
                     Box::new(FailingWriter) as remote::streams::BoxedWrite,
                 ))),
                 super::super::FileRead::Hardened(parent, "missing".into()),
+                &fatal,
             ),
         )
         .await;
@@ -1732,7 +2550,7 @@ mod tests {
             return_tx: send,
         });
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let fatal = Arc::new(Fatal::new(Default::default(), errors.clone()));
+        let fatal = Arc::new(Fatal::new(Default::default()));
         let path = temp.path().join("file");
         let guard = Obligation::new(fatal.clone(), path.clone());
         let configuration = settings(false);
@@ -1751,6 +2569,7 @@ mod tests {
                     Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
                 ))),
                 super::super::FileRead::Hardened(parent, "file".into()),
+                &fatal,
             ),
         )
         .await;
@@ -1859,9 +2678,14 @@ mod tests {
             };
         let (source, peer, ()) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            HOOKS.scope(
-                hooks.clone(),
-                common::task_scope::scope_tasks(async { tokio::join!(source, peer, observe) }),
+            // isolate classification admission: both sibling directories need independent
+            // resource groups while the first classifier deliberately waits for the second Begin.
+            DIRECTORY_GROUPS.scope(
+                3,
+                HOOKS.scope(
+                    hooks.clone(),
+                    common::task_scope::scope_tasks(async { tokio::join!(source, peer, observe) }),
+                ),
             ),
         )
         .await?;
@@ -1965,9 +2789,7 @@ mod tests {
             .await?;
             if root_failure {
                 assert!(
-                    source
-                        .unwrap_err()
-                        .to_string()
+                    format!("{:#}", source.unwrap_err())
                         .contains("original directory metadata failure")
                 );
                 assert!(peer.is_err());
@@ -1975,10 +2797,7 @@ mod tests {
                 source?;
                 let messages = peer?;
                 assert!(
-                    errors
-                        .take_error()
-                        .unwrap()
-                        .to_string()
+                    format!("{:#}", errors.take_error().unwrap())
                         .contains("original directory metadata failure")
                 );
                 assert_eq!(messages.iter().filter(|message| matches!(message, SourceMessage::FileSkipped { src, .. } if src == &temp.path().join("bad"))).count(), 1);
@@ -2028,10 +2847,7 @@ mod tests {
             }
         )));
         assert!(
-            errors
-                .take_error()
-                .unwrap()
-                .to_string()
+            format!("{:#}", errors.take_error().unwrap())
                 .contains("original directory enumeration failure")
         );
         assert_eq!(batches.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2218,7 +3034,7 @@ mod tests {
             ))),
             remote::streams::RecvStream::new(Box::new(PanicReader) as remote::streams::BoxedRead),
             pool,
-            Arc::new(Fatal::new(Default::default(), Default::default())),
+            Arc::new(Fatal::new(Default::default())),
             1,
             1,
             Default::default(),

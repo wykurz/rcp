@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420" role="img" aria-labelledby="title desc">
+  <title id="title">Source directory resource admission</title>
+  <desc id="desc">Each directory starts with a scan permit. Normal directory groups retain shared credits until all descriptor owners close. Under pressure one sequential reserve retains its scan permit, descends without further directory admission, and drains direct file jobs before returning. This bounds parallel descriptor overhead while preserving one depth-first progress path.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#475569"/></marker>
+  </defs>
+  <rect width="920" height="420" rx="12" fill="#f8fafc"/>
+  <g font-family="system-ui, sans-serif" text-anchor="middle" fill="#0f172a">
+    <text x="460" y="32" font-size="20" font-weight="600">Bound directory handles; keep a path to progress</text>
+    <rect x="300" y="50" width="320" height="55" rx="8" fill="#e2e8f0" stroke="#64748b"/>
+    <text x="460" y="73" font-size="16">Directory owns a scan permit</text>
+    <text x="460" y="94" font-size="13">At most E concurrent scans</text>
+    <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow)">
+      <path d="M390 105V127H230V164"/>
+      <path d="M530 105V127H690V164"/>
+    </g>
+    <text x="230" y="120" font-size="13">Normal group available</text>
+    <text x="690" y="120" font-size="13">Otherwise wait for a group or reserve</text>
+    <rect x="35" y="171" width="390" height="176" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+    <text x="230" y="199" font-size="17" font-weight="600">Normal admission: B groups</text>
+    <text x="230" y="228" font-size="14">Open one directory and one cursor</text>
+    <text x="230" y="253" font-size="14">Every descriptor alias retains group credit</text>
+    <text x="230" y="278" font-size="14">Move the scan permit into inline children</text>
+    <text x="230" y="303" font-size="14">At EOF, release scan before joining children</text>
+    <text x="230" y="329" font-size="13">File jobs may continue independently</text>
+    <rect x="495" y="171" width="390" height="176" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="690" y="199" font-size="17" font-weight="600">One sequential reserve</text>
+    <text x="690" y="228" font-size="14">Retain one scan permit for the whole subtree</text>
+    <text x="690" y="253" font-size="14">Descend without more group or scan permits</text>
+    <text x="690" y="278" font-size="14">Run no parallel discovery children</text>
+    <text x="690" y="303" font-size="14">Drain direct file jobs before each return</text>
+    <text x="690" y="329" font-size="13">No retired sibling handles accumulate</text>
+    <text x="460" y="381" font-size="16" font-weight="600">Directory / cursor fds ≤ 2B + 2D + constant</text>
+    <text x="460" y="405" font-size="13">D is reserve depth. Extreme depth can still exceed the inherited descriptor limit.</text>
+  </g>
+</svg>

@@ -11,7 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add reusable tracing-based scoped timings with `--timings=PREFIX`, optional per-file detail, and
   elapsed Chrome timelines. Benchmark reports collect coarse stage summaries automatically when
-  supported, including remote source scanning and backpressure measurements.
+  supported, including remote source scanning and backpressure measurements. Detailed destination
+  scopes cover file planning, creation, transfer, flushing, metadata, and payload draining.
 - Add `--reflink=auto|never` to `rcp` and `rlink` to control acceleration for local file copies,
   including files copied during `rlink --update`. The default `auto` keeps existing behavior;
   `never` uses sparse-aware read/write copying for benchmarking. An `always` mode is deferred until
@@ -19,7 +20,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Advance the remote compatibility revision to 7 for the scoped-timing daemon arguments.
+- Advance the remote compatibility revision to 8 for single-pass parallel source discovery and
+  explicit directory Begin/Ready/End completion. Source timings expose `source.discovery`,
+  `source.directory.scan`, `source.directory.wait_ready`, `source.directory.wait_resources`,
+  `source.discovery.wait_credit`, and `source.files.drain` in place of the `source.pass1` and
+  `source.pass2` scope families. Directory descriptor admission bounds parallel traversal overhead
+  while reserving a sequential path for progress under pressure. Files already proven unchanged by a
+  complete destination manifest bypass transfer-task admission.
 - Let `just test` and `just test-release` forward arguments to nextest. Split each Depot native test
   configuration across two shards, with the native Arm ABI smoke check on the first Arm shard.
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl
@@ -29,6 +36,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Reject remote file payloads that shrink or grow beyond their advertised size, discarding the
+  affected data stream before reuse. Preserve source paths and the primary fatal cause in discovery
+  errors.
 - Keep local sparse copies progressing when extent probes stop advancing or become unsupported,
   report the reconciled logical byte count after a partial kernel copy or a mid-copy fallback, and
   retry interrupted kernel copies, reads, and writes.

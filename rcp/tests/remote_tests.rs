@@ -169,6 +169,28 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                     detail
                 );
             }
+            if role == "rcpd-destination" {
+                for stage in [
+                    "wait_open",
+                    "parent",
+                    "plan",
+                    "wait_iops",
+                    "create",
+                    "receive",
+                    "flush",
+                    "metadata",
+                    "complete",
+                ] {
+                    let name = format!("destination.file.{stage}");
+                    let scope = scopes.iter().find(|scope| scope["name"] == name);
+                    assert_eq!(scope.is_some(), detail, "{name}");
+                    if let Some(scope) = scope {
+                        assert_eq!(scope["count"], 2, "{name}");
+                        assert_eq!(scope["finished"], 2, "{name}");
+                        assert_eq!(scope["interrupted"], 0, "{name}");
+                    }
+                }
+            }
         }
         if detail {
             assert_eq!(
@@ -6926,6 +6948,72 @@ async fn remote_capacity_one_deep_tree_preserves_files_and_directory_metadata() 
                 get_file_mode(&dst.join(directory)) & 0o777,
                 0o750,
                 "{directory:?}"
+            );
+        }
+    }
+}
+
+/// Parallel directory traversal fits a normal SSH soft limit even with large pending capacity.
+#[tokio::test]
+async fn remote_parallel_directories_preserve_every_subtree_under_a_low_soft_limit() {
+    require_local_ssh();
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    for branch in 0..64 {
+        let mut relative = std::path::PathBuf::from(format!("branch-{branch}"));
+        for _ in 0..13 {
+            std::fs::create_dir(src.join(&relative)).unwrap();
+            directories.push(relative.clone());
+            relative.push("child");
+        }
+        relative.pop();
+        let file = relative.join("payload");
+        common::filegen::write_file(&PROGRESS, src.join(&file), 1024, 1024, 0)
+            .await
+            .unwrap();
+        files.push(file);
+    }
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = source ]; then\n  ulimit -S -n 1024 || exit 1\nfi\nexec {daemon} \"$@\"\n"
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("localhost:{}", src.display());
+    for dereference in [false, true] {
+        let dst = fixture.path().join(if dereference {
+            "dereferenced"
+        } else {
+            "hardened"
+        });
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            daemon_arg.as_str(),
+            "--max-files-in-flight=64",
+            "--max-connections=64",
+            "--pending-writes-multiplier=16",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if dereference {
+            args.insert(0, "-L");
+        }
+        run_rcp_and_expect_success(&args);
+        assert!(dst.is_dir());
+        for directory in &directories {
+            assert!(dst.join(directory).is_dir(), "missing {directory:?}");
+        }
+        for file in &files {
+            assert_eq!(
+                std::fs::read(src.join(file)).unwrap(),
+                std::fs::read(dst.join(file)).unwrap(),
+                "{file:?}"
             );
         }
     }

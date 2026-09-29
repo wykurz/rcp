@@ -22,6 +22,9 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, 
 
 use crate::walk::EntryKind;
 
+#[cfg(test)]
+mod resource_tests;
+
 // ── Destination creation modes ───────────────────────────────────────────────
 
 /// The mode a destination FILE is created with, before it has any contents.
@@ -407,7 +410,7 @@ impl Handle {
 /// shape.
 #[derive(Debug)]
 pub struct Dir {
-    fd: Arc<OwnedFd>,
+    fd: Arc<DirectoryDescriptor>,
     /// Which filesystem side this directory lives on, for congestion gating.
     side: congestion::Side,
     /// Whether a file created in THIS directory may inherit an access ACL that rcp has not
@@ -433,6 +436,27 @@ pub struct Dir {
     children_may_inherit: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Owns the directory fd before the shared credit that accounts for its lifetime.
+///
+/// Field order makes the descriptor close before its last admission reference is released.
+#[derive(Debug)]
+struct DirectoryDescriptor {
+    fd: OwnedFd,
+    credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl AsFd for DirectoryDescriptor {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for DirectoryDescriptor {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 /// A directory entry returned by a streaming cursor.
 ///
 /// The type hint comes from `d_type` and must be checked before acting on the entry.
@@ -453,6 +477,54 @@ pub struct DirectoryCursor {
 }
 
 impl DirectoryCursor {
+    /// Read access and default ACLs from this cursor's open directory.
+    ///
+    /// The stream moves through the gated reads without opening or duplicating a descriptor.
+    /// An error or cancellation ends this cursor; started work owns its stream and credit.
+    pub async fn read_acls(&mut self, side: congestion::Side) -> std::io::Result<Acls> {
+        let iterator = self
+            .iterator
+            .take()
+            .ok_or_else(|| std::io::Error::other("directory cursor was interrupted or failed"))?;
+        let (iterator, acls) = read_acls_owned(iterator, side, true).await?;
+        self.iterator = Some(iterator);
+        Ok(acls)
+    }
+
+    /// Open a directory cursor by path, following symlinks for explicit dereferencing callers.
+    pub async fn open_following_symlinks(
+        path: &Path,
+        side: congestion::Side,
+        credit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    ) -> std::io::Result<Self> {
+        let path = path.to_owned();
+        let iterator = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            if strict_operand_resolution() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "following directory symlinks is incompatible with strict operand resolution",
+                ));
+            }
+            let fd = openat(
+                AT_FDCWD,
+                &path,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(nix_to_io)?;
+            let iterator = OwnedDirectoryStream::from_fd(fd, Some(credit))?;
+            #[cfg(test)]
+            let _visit = resource_tests::gate_opened_descriptor(iterator.as_raw_fd());
+            Ok(iterator)
+        })
+        .await?;
+        Ok(Self {
+            iterator: Some(iterator),
+            #[cfg(test)]
+            read_hook: None,
+        })
+    }
+
     /// Read at most `limit` entries, excluding `.` and `..`; an empty batch means EOF.
     ///
     /// An error or cancellation after admission ends this cursor. The blocking job then owns and
@@ -493,27 +565,38 @@ impl DirectoryCursor {
 
 /// Owns one `DIR*` and its fd for the entire lifetime of a movable cursor.
 #[derive(Debug)]
-struct OwnedDirectoryStream(std::ptr::NonNull<libc::DIR>);
+struct OwnedDirectoryStream {
+    dir: std::ptr::NonNull<libc::DIR>,
+    // closedir runs in Drop before fields release this shared descriptor credit
+    _credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
 
 // SAFETY: ownership is exclusive; the cursor moves into one blocking job at a time, and no
 // `readdir` call or entry reference can overlap a move to another thread.
 unsafe impl Send for OwnedDirectoryStream {}
 
 impl OwnedDirectoryStream {
-    fn from_fd(fd: OwnedFd) -> std::io::Result<Self> {
+    fn from_fd(
+        fd: OwnedFd,
+        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> std::io::Result<Self> {
+        let owner = DirectoryDescriptor { fd, credit };
         // SAFETY: fd is valid and held exclusively. On failure fdopendir leaves it open, so
-        // OwnedFd closes it; on success closedir takes over responsibility for closing it.
-        let dir = std::ptr::NonNull::new(unsafe { libc::fdopendir(fd.as_raw_fd()) })
+        // the owner closes it before releasing credit; on success closedir takes over the fd.
+        let dir = std::ptr::NonNull::new(unsafe { libc::fdopendir(owner.as_raw_fd()) })
             .ok_or_else(std::io::Error::last_os_error)?;
-        let _ = fd.into_raw_fd();
-        Ok(Self(dir))
+        let _ = owner.fd.into_raw_fd();
+        Ok(Self {
+            dir,
+            _credit: owner.credit,
+        })
     }
 
     fn next_raw_entry(&mut self) -> std::io::Result<Option<DirectoryEntry>> {
         nix::errno::Errno::clear();
         // SAFETY: self exclusively owns the live stream, and the returned dirent is copied
         // before another readdir call or the stream's Drop can invalidate it.
-        let raw = unsafe { libc::readdir(self.0.as_ptr()) };
+        let raw = unsafe { libc::readdir(self.dir.as_ptr()) };
         if raw.is_null() {
             let errno = nix::errno::Errno::last_raw();
             return if errno == 0 {
@@ -542,14 +625,14 @@ impl OwnedDirectoryStream {
 impl AsRawFd for OwnedDirectoryStream {
     fn as_raw_fd(&self) -> RawFd {
         // SAFETY: self owns the live DIR stream until Drop.
-        unsafe { libc::dirfd(self.0.as_ptr()) }
+        unsafe { libc::dirfd(self.dir.as_ptr()) }
     }
 }
 
 impl Drop for OwnedDirectoryStream {
     fn drop(&mut self) {
         // SAFETY: fdopendir transferred this one stream to self on success.
-        unsafe { libc::closedir(self.0.as_ptr()) };
+        unsafe { libc::closedir(self.dir.as_ptr()) };
     }
 }
 
@@ -557,8 +640,16 @@ impl Dir {
     /// Wrap a directory fd rcp merely OPENED (as opposed to created): its inherited-ACL state is
     /// unknown, so files created in it must assume the worst — see `children_may_inherit`.
     fn opened(fd: OwnedFd, side: congestion::Side) -> Dir {
+        Self::opened_with_credit(fd, side, None)
+    }
+
+    fn opened_with_credit(
+        fd: OwnedFd,
+        side: congestion::Side,
+        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Dir {
         Dir {
-            fd: Arc::new(fd),
+            fd: Arc::new(DirectoryDescriptor { fd, credit }),
             side,
             children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
@@ -689,6 +780,26 @@ impl Dir {
     /// refers to a non-directory entry. The returned `Dir` carries the same
     /// congestion side as `self`.
     pub async fn open_dir(&self, name: &OsStr) -> std::io::Result<Dir> {
+        self.open_dir_with_credit(name, None).await
+    }
+
+    /// Open a child directory while retaining its caller's shared descriptor credit.
+    ///
+    /// The credit moves into blocking work before opening and remains owned by the returned
+    /// directory, its independent cursors, and any fd-owning jobs that outlive cancellation.
+    pub async fn open_dir_admitted(
+        &self,
+        name: &OsStr,
+        credit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    ) -> std::io::Result<Dir> {
+        self.open_dir_with_credit(name, Some(credit)).await
+    }
+
+    async fn open_dir_with_credit(
+        &self,
+        name: &OsStr,
+        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> std::io::Result<Dir> {
         // `O_NOFOLLOW`/`O_PATH` only guard the final path component, so a `name`
         // containing `/` could let openat traverse an intermediate symlink. Reject
         // multi-component names at runtime (debug_assert is compiled out in release).
@@ -704,9 +815,12 @@ impl Dir {
         let name = name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-            openat(dir.as_fd(), name.as_bytes(), flags, Mode::empty())
-                .map(|fd| Dir::opened(fd, side))
-                .map_err(nix_to_io)
+            let fd =
+                openat(dir.as_fd(), name.as_bytes(), flags, Mode::empty()).map_err(nix_to_io)?;
+            let opened = Dir::opened_with_credit(fd, side, credit);
+            #[cfg(test)]
+            let _visit = resource_tests::gate_opened_descriptor(opened.fd.as_raw_fd());
+            Ok(opened)
         })
         .await
     }
@@ -779,7 +893,9 @@ impl Dir {
     /// the contents being copied. Callers gate this on `d:acl` — see [`read_acls_fd`] for what the
     /// probe costs.
     pub async fn read_acls(&self) -> std::io::Result<Acls> {
-        read_acls_fd(self.fd.as_fd(), self.side, true).await
+        read_acls_owned(self.fd.clone(), self.side, true)
+            .await
+            .map(|(_, acls)| acls)
     }
 
     /// Open a child entry by name, classifying it without following symlinks.
@@ -1101,7 +1217,10 @@ impl Dir {
             })
             .await?;
         Ok(Dir {
-            fd: Arc::new(created),
+            fd: Arc::new(DirectoryDescriptor {
+                fd: created,
+                credit: None,
+            }),
             side,
             // under strict mode the closure above stripped both ACLs, so nothing created in this
             // directory can inherit; outside strict mode inheritance is the documented default
@@ -1124,7 +1243,7 @@ impl Dir {
                 Mode::empty(),
             )
             .map_err(nix_to_io)?;
-            OwnedDirectoryStream::from_fd(fd)
+            OwnedDirectoryStream::from_fd(fd, dir.credit.clone())
         })
         .await?;
         Ok(DirectoryCursor {
@@ -1153,7 +1272,7 @@ impl Dir {
         let dir = self.fd.clone();
         run_fd_admitted_blocking(move || {
             // Dup the fd with FD_CLOEXEC so nix::dir::Dir can consume (and close)
-            // it on drop without touching self's Arc<OwnedFd>. A bare dup(2)
+            // it on drop without touching self's shared descriptor owner. A bare dup(2)
             // would clear FD_CLOEXEC; F_DUPFD_CLOEXEC atomically sets it.
             //
             // Re-entrancy: the dup shares the original's open file description,
@@ -1821,7 +1940,7 @@ pub struct ReusedDirLock {
     /// it costs no descriptor and no syscall, and it keeps the fd open for exactly as long as the
     /// guard can still need it, so `Drop` writes to the pinned inode rather than re-resolving a path
     /// an attacker may have swapped.
-    fd: Arc<OwnedFd>,
+    fd: Arc<DirectoryDescriptor>,
     /// The locked `Dir`'s inherit flag, shared so the rollback can RE-ARM it (`store(true)` before
     /// the restore syscall): restoring the original default ACL makes inheritance possible again,
     /// and a file created in the window after the rollback must strip what it inherited — see
@@ -1931,7 +2050,7 @@ impl Drop for ReusedDirLock {
 /// path can run it on a detached thread with the same serialization.
 fn rollback_default_acl(
     mut state: std::sync::MutexGuard<'_, DefaultAclGuard>,
-    fd: &OwnedFd,
+    fd: &DirectoryDescriptor,
     how: &str,
 ) {
     {
@@ -2161,32 +2280,46 @@ pub async fn read_acls_fd(
     side: congestion::Side,
     want_default: bool,
 ) -> std::io::Result<Acls> {
-    // dup once and share the owned fd across the (up to three) gated syscalls: each runs in its own
-    // `spawn_blocking` closure, which must own what it touches to be 'static.
-    let owned = Arc::new(fd.try_clone_to_owned()?);
-    let names = {
-        let owned = Arc::clone(&owned);
+    // dup once and move the owner through the (up to three) gated syscalls. Each blocking
+    // closure owns its descriptor until its returned output is consumed or dropped.
+    let owned = fd.try_clone_to_owned()?;
+    read_acls_owned(owned, side, want_default)
+        .await
+        .map(|(_, acls)| acls)
+}
+
+async fn read_acls_owned<F: AsRawFd + Send + 'static>(
+    owned: F,
+    side: congestion::Side,
+    want_default: bool,
+) -> std::io::Result<(F, Acls)> {
+    let (owned, names) =
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-            flistxattr_names(owned.as_raw_fd())
-        })
-        .await?
-    };
-    let mut acls = Acls::default();
-    if names_contain(&names, ACL_ACCESS_XATTR) {
-        let owned = Arc::clone(&owned);
-        acls.access = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-            fgetxattr_blob(owned.as_raw_fd(), ACL_ACCESS_XATTR)
+            #[cfg(test)]
+            let _visit = resource_tests::gate_opened_descriptor(owned.as_raw_fd());
+            let names = flistxattr_names(owned.as_raw_fd())?;
+            Ok((owned, names))
         })
         .await?;
-    }
-    if want_default && names_contain(&names, ACL_DEFAULT_XATTR) {
-        acls.default =
-            run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-                fgetxattr_blob(owned.as_raw_fd(), ACL_DEFAULT_XATTR)
-            })
-            .await?;
-    }
-    Ok(acls)
+    let (owned, access) = if names_contain(&names, ACL_ACCESS_XATTR) {
+        run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            let access = fgetxattr_blob(owned.as_raw_fd(), ACL_ACCESS_XATTR)?;
+            Ok((owned, access))
+        })
+        .await?
+    } else {
+        (owned, None)
+    };
+    let (owned, default) = if want_default && names_contain(&names, ACL_DEFAULT_XATTR) {
+        run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            let default = fgetxattr_blob(owned.as_raw_fd(), ACL_DEFAULT_XATTR)?;
+            Ok((owned, default))
+        })
+        .await?
+    } else {
+        (owned, None)
+    };
+    Ok((owned, Acls { access, default }))
 }
 
 /// Apply `acls` to a destination entry through an fd it is already open on, SETTING each attribute
@@ -3470,7 +3603,7 @@ mod tests {
         std::fs::write(&file_path, b"x")?;
         let fd: OwnedFd = std::fs::File::open(file_path)?.into();
         let raw_fd = fd.as_raw_fd();
-        let error = OwnedDirectoryStream::from_fd(fd).unwrap_err();
+        let error = OwnedDirectoryStream::from_fd(fd, None).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
         assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
         assert_eq!(
