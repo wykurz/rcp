@@ -34,8 +34,9 @@ FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/sourc
 # the held fd, pairing one entry's permissions with another's contents. The fd forms (`fgetxattr` /
 # `flistxattr`, used by `safedir::read_acls_fd`) are the correct ones and are deliberately absent
 # here. The `l`-prefixed forms are listed too: they do not follow a final symlink, but they still
-# resolve the name.
-PATTERNS=".read_link_at( tokio::fs::read_link( tokio::fs::File::open( std::fs::File::open( libc::getxattr( libc::lgetxattr( libc::listxattr( libc::llistxattr("
+# resolve the name. The path-based directory cursor is reserved for marked -L callers; match its
+# associated call syntax rather than its definition in safedir.rs.
+PATTERNS=".read_link_at( tokio::fs::read_link( tokio::fs::File::open( std::fs::File::open( ::open_following_symlinks( libc::getxattr( libc::lgetxattr( libc::listxattr( libc::llistxattr("
 MARKER="rcp-toctou-allow:"
 VIOLATIONS=0
 

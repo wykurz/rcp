@@ -435,8 +435,8 @@ where
     // fires at all. Without this reader the kernel marks the socket dead and nothing observes it:
     // both rcpds keep copying to each other, or waiting on each other, indefinitely. The
     // `select!`s below cancel the operation the moment this fires; dropping the operation future
-    // drops owned tasks inside `run_with_stdin_watchdog`'s surviving task scope; reused-directory
-    // lockdown guards restore before that scope returns.
+    // aborts its owned task sets. `run_with_stdin_watchdog`'s surviving task scope waits for tracked
+    // source descendants to release their captures; destination JoinSets are not tracked there.
     let master_watchdog = async move {
         loop {
             match master_recv_stream
@@ -606,7 +606,7 @@ where
     Watchdog: std::future::Future<Output = ()>,
 {
     // watchdog cancellation drops the losing operation inside this surviving scope, so aborted
-    // descendants release their captures before daemon teardown can finish
+    // tracked descendants release their captures before daemon teardown can finish
     common::task_scope::scope_tasks(async move {
         let map_result = |result: anyhow::Result<remote::protocol::RcpdResult>| match result {
             Ok(result) => result,

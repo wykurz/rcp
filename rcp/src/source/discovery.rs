@@ -619,6 +619,14 @@ async fn directory_body(
     let mut admission = common::timing_scope!("source.directory.wait_resources")
         .measure(context.directories.admit(scan_credit))
         .await?;
+    #[cfg(test)]
+    context
+        .checkpoint(
+            "directory_admitted",
+            &pair.src,
+            usize::from(admission.sequential()),
+        )
+        .await?;
     let (file_completion, mut completed_files) = if admission.sequential() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (Some(sender), Some(receiver))
@@ -670,7 +678,8 @@ async fn directory_body(
                 )
             }
             Parent::Path => {
-                let cursor = common::safedir::DirectoryCursor::open_following_symlinks(
+                #[rustfmt::skip]
+                let cursor = common::safedir::DirectoryCursor::open_following_symlinks( // rcp-toctou-allow: -L path (dereference, documented not hardened)
                     &pair.src,
                     common::Side::Source,
                     admission.credit(),
@@ -1034,7 +1043,7 @@ pub(super) async fn run(
     errors: Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     let (file_tx, mut file_rx) = tokio::sync::mpsc::channel(pending);
-    let directories = resources::DirectoryBudget::for_process(branches, pending);
+    let directories = resources::DirectoryBudget::for_process(branches);
     #[cfg(test)]
     let directories = tests::DIRECTORY_GROUPS
         .try_with(|groups| resources::DirectoryBudget::new(*groups))
@@ -1252,6 +1261,95 @@ mod tests {
         }
         let obligation = Obligation::new(context.fatal.clone(), observation.pair.src.clone());
         Ok((observation, readiness, obligation))
+    }
+
+    #[tokio::test]
+    async fn spawned_file_job_stays_below_large_allocation_threshold() -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct SpawnSize(usize);
+        impl tracing::field::Visit for SpawnSize {
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                if matches!(field.name(), "size.bytes" | "original_size.bytes") {
+                    self.0 = self.0.max(value as usize);
+                }
+            }
+        }
+        struct Capture(Arc<std::sync::Mutex<Vec<usize>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+                if attributes.metadata().target() == "tokio::task"
+                    && attributes.metadata().name() == "runtime.spawn"
+                {
+                    let mut size = SpawnSize::default();
+                    attributes.record(&mut size);
+                    self.0.lock().unwrap().push(size.0);
+                }
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let (context, mut queued) = submission_context(Box::new(tokio::io::sink()));
+        let (observation, readiness, obligation) = unchanged_submission(&context, false).await?;
+        context
+            .submit_file(
+                observation,
+                Parent::Path,
+                Some(readiness),
+                obligation,
+                false,
+                None,
+            )
+            .await?;
+        let job = queued.recv().await.unwrap();
+        context
+            .registry
+            .resolve(Path::new("/source"), Path::new("/destination"), false)?;
+        let (return_tx, recv) = async_channel::bounded(1);
+        let pool = Arc::new(super::super::AcceptingSendStreamPool { recv, return_tx });
+        let future = file_job(context, pool, job);
+        let file_job_size = std::mem::size_of_val(&future);
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = Capture(sizes.clone());
+        common::task_scope::scope_tasks(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            tracing::subscriber::with_default(subscriber, || {
+                common::task_scope::spawn_tracked(&mut tasks, future);
+            });
+            tasks.join_next().await.unwrap()??;
+            anyhow::Ok(())
+        })
+        .await?;
+        let sizes = sizes.lock().unwrap();
+        assert_eq!(
+            sizes.len(),
+            1,
+            "the actual file-task spawn was not observed"
+        );
+        assert!(
+            sizes[0] >= file_job_size,
+            "spawn size omitted the original future"
+        );
+        eprintln!(
+            "spawned file future: {} bytes; file_job: {file_job_size} bytes",
+            sizes[0]
+        );
+        // tokio 1.53 boxes release futures over 16 KiB. Leave at least 4 KiB for task-scope
+        // wrappers and subsequent fields; a near-threshold unboxed job is too fragile.
+        assert!(
+            sizes[0] <= 12 * 1024,
+            "spawned file future is {} bytes (file_job: {file_job_size}); exceeds 12 KiB budget",
+            sizes[0]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3049,6 +3147,124 @@ mod tests {
             format!("{error:#}").contains("original framed reader panic"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_ready_does_not_serialize_directory_heavy_discovery_with_fd_headroom()
+    -> anyhow::Result<()> {
+        use futures::StreamExt as _;
+        static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+            std::sync::LazyLock::new(common::progress::Progress::new);
+        let fixture = tempfile::tempdir()?;
+        let frontier = fixture.path().join("frontier");
+        let mut metadata = HashMap::new();
+        for index in 0..256 {
+            let leaf = frontier.join(format!("leaf-{index}"));
+            std::fs::create_dir_all(&leaf)?;
+            common::filegen::write_file(&PROGRESS, leaf.join("file"), 1, 1, 0)
+                .await
+                .map_err(|error| error.source)?;
+            metadata.insert(
+                leaf.clone(),
+                Metadata::from(&std::fs::metadata(leaf.join("file"))?),
+            );
+        }
+        for streams in [4, 8] {
+            for delay_ms in [0, 2] {
+                let pending = streams * 4;
+                let hooks = Hooks::new(|event, _, sequential| {
+                    let reserved = event == "directory_admitted" && sequential != 0;
+                    Box::pin(async move {
+                        anyhow::ensure!(
+                            !reserved,
+                            "entered sequential reserve with descriptor headroom"
+                        );
+                        Ok(())
+                    })
+                });
+                let mut configuration = settings(false);
+                configuration.overwrite = true;
+                let (source, mut send, mut receive, errors) = configured_connection(
+                    fixture.path(),
+                    configuration,
+                    streams,
+                    pending,
+                    Vec::new(),
+                );
+                let peer = async {
+                    let mut initial = Vec::new();
+                    let mut first_batch = true;
+                    let mut replies = futures::stream::FuturesUnordered::<
+                        futures::future::BoxFuture<'static, (PathBuf, PathBuf)>,
+                    >::new();
+                    let mut begins = 0;
+                    let mut unchanged = 0;
+                    let mut discovered = false;
+                    let delayed = |pair: (PathBuf, PathBuf)| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        pair
+                    };
+                    while !discovered || unchanged != 256 || !replies.is_empty() {
+                        tokio::select! {
+                            Some((src, dst)) = replies.next(), if !replies.is_empty() => {
+                                send.send_control_message(&DestinationMessage::DirectoryManifestChunk {
+                                    dst: dst.clone(),
+                                    entries: vec![ExistingEntry {
+                                        name: "file".into(), is_file: true, size: 1,
+                                        metadata: metadata[&src].clone(),
+                                    }],
+                                }).await?;
+                                send.send_control_message(&DestinationMessage::DirectoryReady { src, dst }).await?;
+                            }
+                            message = receive.recv_object::<SourceMessage>() => {
+                                match message?.context("source closed before all unchanged outcomes")? {
+                                    SourceMessage::DirectoryBegin { src, dst, .. } => {
+                                        begins += 1;
+                                        if !metadata.contains_key(&src) {
+                                            send.send_control_message(&DestinationMessage::DirectoryReady { src, dst }).await?;
+                                        } else if first_batch {
+                                            // retain P distinct file parents before any Ready can
+                                            // release one; scans still have real descriptor headroom.
+                                            initial.push((src, dst));
+                                            if initial.len() == pending {
+                                                first_batch = false;
+                                                for pair in initial.drain(..) { replies.push(Box::pin(delayed(pair))); }
+                                            }
+                                        } else {
+                                            replies.push(Box::pin(delayed((src, dst))));
+                                        }
+                                    }
+                                    SourceMessage::FileUnchanged { .. } => unchanged += 1,
+                                    SourceMessage::DirectoryEnd { .. } => {},
+                                    SourceMessage::DiscoveryComplete { .. } => discovered = true,
+                                    other => anyhow::bail!("unexpected source outcome: {other:?}"),
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(begins, 258);
+                    send.send_control_message(&DestinationMessage::DestinationDone)
+                        .await?;
+                    anyhow::Ok(())
+                };
+                let (source, peer) = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    DIRECTORY_GROUPS.scope(
+                        resources::directory_groups(1024, streams),
+                        HOOKS.scope(
+                            hooks,
+                            common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
+                        ),
+                    ),
+                )
+                .await
+                .with_context(|| format!("E={streams}, Ready delay={delay_ms}ms"))?;
+                source?;
+                peer?;
+                assert!(!errors.has_errors());
+            }
+        }
         Ok(())
     }
 }

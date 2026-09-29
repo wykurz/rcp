@@ -1276,6 +1276,7 @@ async fn create_symlink(
 async fn announce_directory_ready(
     directory_tracker: &directory_tracker::SharedDirectoryTracker,
     control_send: &remote::streams::BoxedSharedSendStream,
+    data_pool: &DataConnectionPool,
     src: &std::path::Path,
     dst: &std::path::Path,
     existing: Vec<remote::protocol::ExistingEntry>,
@@ -1290,13 +1291,19 @@ async fn announce_directory_ready(
                 dst: dst.to_path_buf(),
                 entries,
             };
-            stream.send_batch_message(&chunk_msg).await?;
+            stream
+                .send_batch_message(&chunk_msg)
+                .await
+                .map_err(|error| classify_control_reply_error(error, data_pool))?;
         }
         let message = remote::protocol::DestinationMessage::DirectoryReady {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
-        stream.send_control_message(&message).await?;
+        stream
+            .send_control_message(&message)
+            .await
+            .map_err(|error| classify_control_reply_error(error, data_pool))?;
     }
     tracing::info!(
         "Sent DirectoryReady: {:?} -> {:?} (manifest={})",
@@ -1311,7 +1318,10 @@ async fn announce_directory_ready(
         .context("Failed to complete announced directory")?;
     if tracker.is_done() {
         tracing::info!("All operations complete, sending DestinationDone");
-        tracker.send_destination_done().await?;
+        tracker
+            .send_destination_done()
+            .await
+            .map_err(|error| classify_control_reply_error(error, data_pool))?;
     }
     Ok(())
 }
@@ -1320,6 +1330,20 @@ async fn announce_directory_ready(
 #[derive(Debug, thiserror::Error)]
 #[error("source control message failed")]
 struct ControlMessageFailure;
+
+/// Identifies a reply transport failure observed after destination teardown began.
+#[derive(Debug, thiserror::Error)]
+#[error("control reply interrupted by destination teardown")]
+struct ControlReplyDuringTeardown;
+
+fn classify_control_reply_error(error: anyhow::Error, pool: &DataConnectionPool) -> anyhow::Error {
+    // classify at the send site: a filesystem failure with the same errno must stay fatal.
+    if pool.is_tearing_down() && is_peer_closure(&error) {
+        error.context(ControlReplyDuringTeardown)
+    } else {
+        error
+    }
+}
 
 #[instrument(skip(
     error_collector,
@@ -1391,7 +1415,10 @@ async fn process_control_stream(
                     tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
                     let mut tracker = directory_tracker.lock().await;
                     tracker.reject_directory(admission).await?;
-                    tracker.send_directory_skipped(src, dst).await?;
+                    tracker
+                        .send_directory_skipped(src, dst)
+                        .await
+                        .map_err(|error| classify_control_reply_error(error, &data_pool))?;
                     return Ok(());
                 }
                 // resolve the destination parent directory's held fd (for the root, open
@@ -1487,6 +1514,7 @@ async fn process_control_stream(
                                         announce_directory_ready(
                                             &tracker,
                                             &control_send,
+                                            &data_pool,
                                             &src,
                                             &dst,
                                             existing,
@@ -1500,6 +1528,7 @@ async fn process_control_stream(
                             announce_directory_ready(
                                 &directory_tracker,
                                 &control_send_stream,
+                                &data_pool,
                                 src,
                                 dst,
                                 Vec::new(),
@@ -1526,6 +1555,7 @@ async fn process_control_stream(
                         tracker
                             .send_directory_skipped(src, dst)
                             .await
+                            .map_err(|error| classify_control_reply_error(error, &data_pool))
                             .context("Failed to send DirectorySkipped for failed directory")?;
                         if create_failed && settings.fail_early {
                             return Err(anyhow::anyhow!(
@@ -1664,7 +1694,13 @@ async fn process_control_stream(
             anyhow::Ok(())
         }
         .await
-        .context(ControlMessageFailure)?;
+        .map_err(|error| {
+            if error.is::<ControlReplyDuringTeardown>() {
+                error
+            } else {
+                error.context(ControlMessageFailure)
+            }
+        })?;
         // check if we're done after each message
         let mut tracker = directory_tracker.lock().await;
         if tracker.is_done() {
@@ -1728,6 +1764,10 @@ async fn publish_announce_failure(
             anyhow::anyhow!("directory announcer panicked: {message}")
         }
     };
+    if error.is::<ControlReplyDuringTeardown>() {
+        tracing::debug!("directory announcer stopped during teardown: {error:#}");
+        return;
+    }
     tracing::error!("directory announcer failed: {error:#}");
     errors.push(error);
     signal_source_teardown(tracker, pool).await;
@@ -2074,7 +2114,9 @@ mod teardown_tests {
 
     #[tokio::test]
     async fn malformed_control_frame_remains_fatal_after_completion() {
-        for malformed in [false, true] {
+        for (malformed, tearing_down) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let reader: remote::streams::BoxedRead = if malformed {
                 Box::new(std::io::Cursor::new(vec![0, 0, 0, 0]))
             } else {
@@ -2091,6 +2133,10 @@ mod teardown_tests {
                 errors.clone(),
             );
             tracker.lock().await.finish_discovery(false).await.unwrap();
+            let pool = test_pool();
+            if tearing_down {
+                pool.close();
+            }
             let control_result = process_control_stream(
                 &test_copy_settings(),
                 10,
@@ -2098,7 +2144,7 @@ mod teardown_tests {
                 remote::streams::RecvStream::new(reader),
                 tracker.clone(),
                 send,
-                test_pool(),
+                pool,
                 errors.clone(),
             )
             .await;
@@ -2172,6 +2218,151 @@ mod teardown_tests {
         let e = format!("{:#}", r.unwrap_err());
         assert!(e.contains("connection refused"), "{e}");
         assert!(e.contains("incomplete transfer"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn control_reply_failure_after_teardown_preserves_data_connect_cause() {
+        for tearing_down in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (source, destination) = tokio::io::duplex(4096);
+            let mut source = remote::streams::SendStream::new(source);
+            source
+                .send_control_message(&remote::protocol::SourceMessage::DirectoryBegin {
+                    src: "/src".into(),
+                    dst: tmp.path().to_owned(),
+                    metadata: remote::protocol::Metadata::from(
+                        &std::fs::metadata(tmp.path()).unwrap(),
+                    ),
+                    is_root: true,
+                    keep_if_empty: true,
+                })
+                .await
+                .unwrap();
+            let (writer, closed_peer) = tokio::io::duplex(4096);
+            drop(closed_peer);
+            let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                Box::new(writer) as remote::streams::BoxedWrite,
+            )));
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = directory_tracker::make_shared(
+                send.clone(),
+                common::preserve::preserve_none(),
+                false,
+                errors.clone(),
+            );
+            let pool = test_pool();
+            pool.record_first_connect_error(
+                std::io::Error::from_raw_os_error(libc::ECONNREFUSED).into(),
+            );
+            if tearing_down {
+                signal_source_teardown(&tracker, &pool).await;
+            }
+            let control = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                process_control_stream(
+                    &test_copy_settings(),
+                    10,
+                    &common::preserve::preserve_none(),
+                    remote::streams::RecvStream::new(
+                        Box::new(destination) as remote::streams::BoxedRead
+                    ),
+                    tracker.clone(),
+                    send,
+                    pool.clone(),
+                    errors.clone(),
+                ),
+            )
+            .await
+            .expect("failed acknowledgement must not hang");
+            let error = choose_final_result(
+                errors.take_error(),
+                Ok(()),
+                control,
+                tracker.lock().await.is_done(),
+                pool.take_first_connect_error(),
+                summary(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                if tearing_down {
+                    std::io::ErrorKind::ConnectionRefused
+                } else {
+                    std::io::ErrorKind::BrokenPipe
+                },
+                "tearing_down={tearing_down}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn announcer_teardown_does_not_hide_independent_filesystem_failure() {
+        for failed_reply in [false, true] {
+            let (writer, closed_peer) = tokio::io::duplex(4096);
+            drop(closed_peer);
+            let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                Box::new(writer) as remote::streams::BoxedWrite,
+            )));
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = directory_tracker::make_shared(
+                send.clone(),
+                common::preserve::preserve_none(),
+                false,
+                errors.clone(),
+            );
+            let pool = test_pool();
+            pool.record_first_connect_error(
+                std::io::Error::from_raw_os_error(libc::ECONNREFUSED).into(),
+            );
+            pool.close();
+            if failed_reply {
+                publish_announce_failure(
+                    &tracker,
+                    &pool,
+                    &errors,
+                    announce_directory_ready(
+                        &tracker,
+                        &send,
+                        &pool,
+                        std::path::Path::new("/src"),
+                        std::path::Path::new("/dst"),
+                        Vec::new(),
+                    ),
+                )
+                .await;
+            } else {
+                publish_announce_failure(&tracker, &pool, &errors, async {
+                    Err(std::io::Error::from_raw_os_error(libc::EPIPE).into())
+                })
+                .await;
+            }
+            let error = choose_final_result(
+                errors.take_error(),
+                Ok(()),
+                Ok(()),
+                false,
+                pool.take_first_connect_error(),
+                summary(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                if failed_reply {
+                    std::io::ErrorKind::ConnectionRefused
+                } else {
+                    std::io::ErrorKind::BrokenPipe
+                },
+                "failed_reply={failed_reply}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -2608,6 +2799,7 @@ mod teardown_tests {
         announce_directory_ready(
             &tracker,
             &send,
+            &test_pool(),
             std::path::Path::new("/src"),
             tmp.path(),
             Vec::new(),

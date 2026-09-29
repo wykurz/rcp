@@ -3,13 +3,14 @@ mod discovery;
 mod tests;
 use anyhow::Context;
 use async_recursion::async_recursion;
+use futures::TryFutureExt as _;
 // trait-only import: brings FileMeta::size()/uid()/... into scope without shadowing std::fs::Metadata
 use common::preserve::Metadata as _;
 use common::safedir::Dir;
 use remote::protocol::ExtendedMetadataCapture;
 use std::os::fd::AsFd as _;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+use tokio::io::AsyncReadExt as _;
 use tracing::{Instrument, instrument};
 
 fn progress() -> &'static common::progress::Progress {
@@ -74,183 +75,169 @@ async fn send_file_tcp(
         .measure(throttle::open_file_permit().instrument(tracing::trace_span!("open_file_permit")))
         .await;
     let admission = open_file_guard.admission();
-    // the caught body borrows the stream guard. Its error is published before guard destruction
-    // can close the data connection and provoke a competing control-close failure from the peer.
-    discovery::supervise(
-        fatal,
-        common::safedir::with_fd_admission(admission, async {
-            let _open_file_guard = open_file_guard;
-            common::timing_scope!(trace, "source.file.wait_iops")
-                .measure(
-                    throttle::get_file_iops_tokens(settings.chunk_size, size)
-                        .instrument(tracing::trace_span!("iops_throttle", size)),
+    // keep the large file future in one pinned place. Async admission/supervision wrappers borrow
+    // it instead of embedding it again and pushing each spawned file task over Tokio's boxing limit.
+    let transfer = std::pin::pin!(async {
+        let _open_file_guard = open_file_guard;
+        common::timing_scope!(trace, "source.file.wait_iops")
+            .measure(
+                throttle::get_file_iops_tokens(settings.chunk_size, size)
+                    .instrument(tracing::trace_span!("iops_throttle", size)),
+            )
+            .await;
+        // open the file AFTER borrowing a stream for backpressure. on the hardened path
+        // open fd-relative (O_NOFOLLOW + S_ISREG, no path re-resolution) so a concurrent
+        // symlink swap can't redirect the read; the path-based open is only for the
+        // `-L`/`--dereference` walk (which follows symlinks by design).
+        let file_open = common::timing_scope!(trace, "source.file.open");
+        let open_result = match &file_read {
+            FileRead::Hardened(dir, name) => dir
+                .open_file_read(name)
+                .instrument(tracing::trace_span!("file_open"))
+                .await
+                .map(|(file, meta)| {
+                    (
+                        tokio::fs::File::from_std(file),
+                        meta.size(),
+                        remote::protocol::Metadata::from(&meta),
+                    )
+                }),
+            FileRead::Path => {
+                let src = src.to_owned();
+                common::safedir::run_metadata_probed_blocking(
+                    common::Side::Source,
+                    common::MetadataOp::Stat,
+                    move || {
+                        let file = std::fs::File::open(src)?; // rcp-toctou-allow: -L path (dereference, documented not hardened)
+                        let metadata = file.metadata()?;
+                        if !metadata.is_file() {
+                            return Err(std::io::Error::other(
+                                "source data descriptor is not a regular file",
+                            ));
+                        }
+                        Ok((file, metadata))
+                    },
                 )
-                .await;
-            // open the file AFTER borrowing a stream for backpressure. on the hardened path
-            // open fd-relative (O_NOFOLLOW + S_ISREG, no path re-resolution) so a concurrent
-            // symlink swap can't redirect the read; the path-based open is only for the
-            // `-L`/`--dereference` walk (which follows symlinks by design).
-            let file_open = common::timing_scope!(trace, "source.file.open");
-            let open_result = match &file_read {
-                FileRead::Hardened(dir, name) => dir
-                    .open_file_read(name)
-                    .instrument(tracing::trace_span!("file_open"))
+                .instrument(tracing::trace_span!("file_open"))
+                .await
+                .map(|(file, meta)| {
+                    (
+                        tokio::fs::File::from_std(file),
+                        meta.len(),
+                        remote::protocol::Metadata::from(&meta),
+                    )
+                })
+            }
+        };
+        file_open.finish();
+        // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
+        // docs/tocttou.md): a probe by path could be answered by a different inode than the one being
+        // transferred, pairing one file's permissions with another's contents. Files have no default
+        // ACL, so only the access one is asked for. Only when the master asked at all — with `f:acl`
+        // off this issues no xattr syscall, which is the whole reason the capture field is on the wire.
+        // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
+        // header has not been sent, so the destination is still owed exactly one entry for this file.
+        let open_result = match open_result {
+            Ok((file, size, meta)) if capture.file_acl => {
+                common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
                     .await
-                    .map(|(file, meta)| {
-                        (
-                            tokio::fs::File::from_std(file),
-                            meta.size(),
-                            remote::protocol::Metadata::from(&meta),
-                        )
-                    }),
-                FileRead::Path => {
-                    let src = src.to_owned();
-                    common::safedir::run_metadata_probed_blocking(
-                        common::Side::Source,
-                        common::MetadataOp::Stat,
-                        move || {
-                            let file = std::fs::File::open(src)?; // rcp-toctou-allow: -L path (dereference, documented not hardened)
-                            let metadata = file.metadata()?;
-                            if !metadata.is_file() {
-                                return Err(std::io::Error::other(
-                                    "source data descriptor is not a regular file",
-                                ));
-                            }
-                            Ok((file, metadata))
-                        },
-                    )
-                    .instrument(tracing::trace_span!("file_open"))
+                    .map(|acls| (file, size, meta, Some(acls)))
+            }
+            Ok((file, size, meta)) => Ok((file, size, meta, None)),
+            Err(e) => Err(e),
+        };
+        let (file, size, metadata, src_acls) = match open_result {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to read file {src:?} for sending: {e:#}");
+                // stream is returned to pool via Drop when pooled_stream goes out of scope
+                // for root file copies, failing to open the file is a fatal error -
+                // there's nothing else to transfer and the protocol would hang
+                let error = anyhow::Error::from(e)
+                    .context(format!("failed to read source file {src:?} for sending"));
+                if is_root {
+                    return Err(error);
+                }
+                if settings.fail_early {
+                    return Err(error);
+                }
+                let skip_msg = remote::protocol::SourceMessage::FileSkipped {
+                    src: src.to_path_buf(),
+                    dst: dst.to_path_buf(),
+                };
+                if let Err(skip_error) = control_send_stream
+                    .lock()
                     .await
-                    .map(|(file, meta)| {
-                        (
-                            tokio::fs::File::from_std(file),
-                            meta.len(),
-                            remote::protocol::Metadata::from(&meta),
-                        )
-                    })
+                    .send_control_message(&skip_msg)
+                    .await
+                {
+                    return Err(error.context(format!(
+                        "failed to report skipped source file {src:?}: {skip_error:#}"
+                    )));
                 }
-            };
-            file_open.finish();
-            // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
-            // docs/tocttou.md): a probe by path could be answered by a different inode than the one being
-            // transferred, pairing one file's permissions with another's contents. Files have no default
-            // ACL, so only the access one is asked for. Only when the master asked at all — with `f:acl`
-            // off this issues no xattr syscall, which is the whole reason the capture field is on the wire.
-            // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
-            // header has not been sent, so the destination is still owed exactly one entry for this file.
-            let open_result = match open_result {
-                Ok((file, size, meta)) if capture.file_acl => {
-                    common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
-                        .await
-                        .map(|acls| (file, size, meta, Some(acls)))
-                }
-                Ok((file, size, meta)) => Ok((file, size, meta, None)),
-                Err(e) => Err(e),
-            };
-            let (file, size, metadata, src_acls) = match open_result {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!("Failed to read file {src:?} for sending: {e:#}");
-                    // stream is returned to pool via Drop when pooled_stream goes out of scope
-                    // for root file copies, failing to open the file is a fatal error -
-                    // there's nothing else to transfer and the protocol would hang
-                    let error = anyhow::Error::from(e)
-                        .context(format!("failed to read source file {src:?} for sending"));
-                    if is_root {
-                        return Err(error);
-                    }
-                    if settings.fail_early {
-                        return Err(error);
-                    }
-                    let skip_msg = remote::protocol::SourceMessage::FileSkipped {
-                        src: src.to_path_buf(),
-                        dst: dst.to_path_buf(),
-                    };
-                    if let Err(skip_error) = control_send_stream
-                        .lock()
-                        .await
-                        .send_control_message(&skip_msg)
-                        .await
-                    {
-                        return Err(error.context(format!(
-                            "failed to report skipped source file {src:?}: {skip_error:#}"
-                        )));
-                    }
-                    // destination completion drains this task before the collector is inspected, so its
-                    // owned filesystem cause survives a failed skip without borrowing an older error.
-                    error_collector.push(error);
-                    return Ok(());
-                }
-            };
-            // both adapters derive the header from the opened data descriptor, so a compatible
-            // replacement contributes its own size, permissions, ownership, and timestamps
-            // attach the ACLs read above (both branches: they came from the data fd either way).
-            let metadata = match &src_acls {
-                Some(acls) => metadata.with_acls(acls),
-                None => metadata,
-            };
-            // wrap file in a buffered reader for better network throughput
-            // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
-            // but capped at file size to avoid over-allocation for small files
-            let file_size = size.min(usize::MAX as u64) as usize;
-            let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
-            let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
-            let file_header = remote::protocol::File {
-                src: src.to_path_buf(),
-                dst: dst.to_path_buf(),
-                size,
-                metadata,
-                is_root,
-            };
-            let send = common::timing_scope!(trace, "source.file.send");
-            let send_result = async {
-                let bytes_sent = pooled_stream
-                    .stream_mut()
-                    .send_message_with_data_buffered(
-                        &file_header,
-                        &mut (&mut buffered_file).take(size),
-                    )
-                    .await?;
-                if bytes_sent != size {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "source payload ended after {bytes_sent} bytes; header promised {size}"
-                        ),
-                    )
-                    .into());
-                }
-                // never put growth bytes on the wire: they would be read as the next file header.
-                // inspect this same held reader instead of observing the path again.
-                anyhow::ensure!(
-                    buffered_file.fill_buf().await?.is_empty(),
-                    "source payload exceeds its advertised size of {size} bytes"
+                // destination completion drains this task before the collector is inspected, so its
+                // owned filesystem cause survives a failed skip without borrowing an older error.
+                error_collector.push(error);
+                return Ok(());
+            }
+        };
+        // both adapters derive the header from the opened data descriptor, so a compatible
+        // replacement contributes its own size, permissions, ownership, and timestamps
+        // attach the ACLs read above (both branches: they came from the data fd either way).
+        let metadata = match &src_acls {
+            Some(acls) => metadata.with_acls(acls),
+            None => metadata,
+        };
+        // wrap file in a buffered reader for better network throughput
+        // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
+        // but capped at file size to avoid over-allocation for small files
+        let file_size = size.min(usize::MAX as u64) as usize;
+        let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+        let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
+        let file_header = remote::protocol::File {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            size,
+            metadata,
+            is_root,
+        };
+        let send = common::timing_scope!(trace, "source.file.send");
+        let send_result = async {
+            let bytes_sent = pooled_stream
+                .stream_mut()
+                .send_message_with_data_buffered(&file_header, &mut (&mut buffered_file).take(size))
+                .await?;
+            if bytes_sent != size {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "source payload ended after {bytes_sent} bytes; header promised {size}"
+                    ),
                 );
-                anyhow::Ok(())
+                return Err(error.into());
             }
-            .instrument(tracing::trace_span!("send_data", size, buffer_size))
-            .await
-            .with_context(|| format!("failed to send source file {src:?} to {dst:?}"));
-            send.finish();
-            match send_result {
-                Ok(()) => {
-                    pooled_stream.finish_message();
-                    // stream is returned to pool when pooled_stream is dropped
-                    prog.files_copied.inc();
-                    prog.bytes_copied.add(size);
-                    tracing::info!("Sent file: {:?} -> {:?}", src, dst);
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Failed to send file content for {src:?}: {e:#}");
-                    // keep the poisoned stream owned until supervision publishes the original cause.
-                    // guard destruction then discards it without awaiting an unresponsive shutdown.
-                    Err(e)
-                }
-            }
-        }),
-    )
-    .await
+            anyhow::Ok(())
+        }
+        .instrument(tracing::trace_span!("send_data", size, buffer_size))
+        .map_err(|error| {
+            let error = error.context(format!("failed to send source file {src:?} to {dst:?}"));
+            tracing::error!("Failed to send file content for {src:?}: {error:#}");
+            error
+        })
+        .await;
+        send.finish();
+        send_result?;
+        pooled_stream.finish_message();
+        // stream is returned to pool when pooled_stream is dropped
+        prog.files_copied.inc();
+        prog.bytes_copied.add(size);
+        tracing::info!("Sent file: {:?} -> {:?}", src, dst);
+        Ok(())
+    });
+    // the caught body borrows the stream guard. Publish every error or panic before dropping
+    // a poisoned stream can make the peer close control and replace the original cause.
+    let admitted = std::pin::pin!(common::safedir::with_fd_admission(admission, transfer));
+    discovery::supervise(fatal, admitted).await
 }
 
 type PoolShutdownToken = tokio_util::sync::CancellationToken;
@@ -399,8 +386,8 @@ struct PooledAcceptedSendStream {
 
 impl PooledAcceptedSendStream {
     fn stream_mut(&mut self) -> &mut remote::streams::BoxedSendStream {
-        // a cancelled or panicking send must discard its partial frame before the executor
-        // publishes failure; only successful completion below makes the stream reusable again
+        // any failure or cancellation must discard its partial frame; only successful completion
+        // below makes the stream reusable again
         self.reusable = false;
         self.stream.as_mut().expect("stream already taken")
     }

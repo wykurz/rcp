@@ -719,9 +719,9 @@ Shutdown is initiated by the protocol message and completed through stream closu
 
 After valid discovery, root-item, and pending-directory completion, destination sends
 `DestinationDone` and closes its control send stream. `DestinationDone` triggers source shutdown;
-the source drains its admitted file tasks and preserves any genuine error they return. It then
-cancels the pooled-data shutdown token, closes its control send stream, and joins the control
-receiver. A fatal failure publishes the original cause, closes admission, and cancels the data pool
+the source drains its admitted file tasks and preserves any genuine error they return. It stops and
+joins the control receiver, then scheduler teardown cancels the data pool and drops the control send
+stream. A fatal failure publishes the original cause, closes admission, and cancels the data pool
 before joining blocked senders.
 
 EOF ends each current data-stream handler. The enclosing destination worker then loops back to
@@ -877,10 +877,10 @@ Data connections are pooled for efficiency:
 - `size` field in headers delimits file boundaries within a connection
 - Avoids connection creation overhead per file
 
-The source reads at most the header's size from the held data fd. A short read or additional bytes
-observed by an EOF probe fails the transfer and discards the stream; overflow bytes are never sent.
-The stream becomes reusable only after exactly that size is sent and message completion succeeds.
-This validates framing without providing a snapshot of a concurrently changing file.
+The source sends exactly the header's size from the held data fd. Growth beyond that size is
+ignored; a short read fails the transfer and discards the stream. The stream becomes reusable only
+after exactly that size is sent and message completion succeeds. The size is a snapshot of the
+opened file, not a consistent snapshot of its contents.
 
 **Connection lifecycle:**
 
@@ -946,10 +946,12 @@ bound the discovery scheduler:
 
 Normal directory admission reserves a group for its held directory and cursor before opening them.
 Shared credit lives with the descriptor owners, including aliases retained by file jobs and blocking
-operations. With inherited soft descriptor limit S, `B = min(P, max(1, (S/5 - E - 32)/2))`, using
-integer division and saturating subtraction. This reserves headroom for data sockets, support fds,
-and the endpoint leaf-admission heuristic. A failed query falls back to B=1 with a notice; the
-daemon does not raise its inherited limit.
+operations. With inherited soft descriptor limit S, `B = max(1, (S/5 - E - 32)/2)`, using integer
+division and saturating subtraction, capped at the semaphore's representable capacity. This reserves
+headroom for data sockets, support fds, and the endpoint leaf-admission heuristic. B is independent
+of the pending-file limit P: file jobs can retain a directory credit while other directories are
+scanned. A failed query falls back to B=1 with a notice; the daemon does not raise its inherited
+limit.
 
 When normal groups are exhausted, admission waits for a group or the single sequential reserve. The
 reserve owns one scan permit throughout its subtree, never forks or acquires another directory

@@ -36,9 +36,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Reject remote file payloads that shrink or grow beyond their advertised size, discarding the
-  affected data stream before reuse. Preserve source paths and the primary fatal cause in discovery
-  errors.
+- Bound remote file payloads to their advertised size and reject short reads before stream reuse.
+  Preserve source paths and the primary fatal cause in discovery errors.
 - Keep local sparse copies progressing when extent probes stop advancing or become unsupported,
   report the reconciled logical byte count after a partial kernel copy or a mid-copy fallback, and
   retry interrupted kernel copies, reads, and writes.

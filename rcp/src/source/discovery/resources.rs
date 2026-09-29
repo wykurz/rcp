@@ -34,9 +34,9 @@ impl DirectoryBudget {
         }
     }
 
-    pub(super) fn for_process(streams: usize, pending: usize) -> Self {
+    pub(super) fn for_process(streams: usize) -> Self {
         let groups = match common::get_soft_open_file_limit() {
-            Ok(soft) => directory_groups(soft, streams, pending),
+            Ok(soft) => directory_groups(soft, streams),
             Err(error) => {
                 tracing::warn!(target: common::NOTICE_TARGET,
                     "Cannot query the source descriptor limit; using one normal directory group and a sequential reserve: {error:#}");
@@ -77,10 +77,13 @@ impl DirectoryBudget {
     }
 }
 
-fn directory_groups(soft: u64, streams: usize, pending: usize) -> usize {
+pub(super) fn directory_groups(soft: u64, streams: usize) -> usize {
     let remaining = (soft / 5).saturating_sub(streams as u64).saturating_sub(32);
-    usize::try_from((remaining / 2).max(1).min(pending as u64))
-        .expect("the directory budget is capped by pending capacity")
+    // pending files can each pin a different group while scanners need additional groups.
+    // reserve mode is for actual descriptor pressure, not exhausted file-task capacity. The
+    // semaphore stores a counter; a large soft limit does not eagerly allocate directory state.
+    usize::try_from((remaining / 2).max(1).min(Semaphore::MAX_PERMITS as u64))
+        .expect("the semaphore capacity fits usize")
 }
 
 impl DirectoryAdmission {
@@ -123,17 +126,59 @@ mod tests {
     use super::*;
     use futures::FutureExt as _;
 
+    #[tokio::test]
+    async fn pending_files_do_not_force_scans_into_reserve_with_descriptor_headroom()
+    -> anyhow::Result<()> {
+        for soft in [1024, 1_048_576] {
+            for streams in [4, 8] {
+                let pending = streams * 4;
+                let budget = DirectoryBudget::new(directory_groups(soft, streams));
+                let scans = Arc::new(Semaphore::new(streams));
+                let mut parents = Vec::new();
+                for _ in 0..pending {
+                    let admission = budget
+                        .admit(Scan::Normal(scans.clone().acquire_owned().await?))
+                        .await?;
+                    parents.push(admission.credit());
+                    drop(admission);
+                }
+                let mut active = Vec::new();
+                for _ in 0..streams {
+                    let admission = budget
+                        .admit(Scan::Normal(scans.clone().acquire_owned().await?))
+                        .await?;
+                    assert!(
+                        !admission.sequential(),
+                        "{pending} pinned file parents forced reserve at soft={soft}, E={streams}"
+                    );
+                    active.push(admission);
+                }
+                assert_eq!(budget.reserve.available_permits(), 1);
+                drop(active);
+                drop(parents);
+                assert_eq!(scans.available_permits(), streams);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn directory_capacity_reserves_leaf_socket_and_support_headroom() {
-        for (soft, streams, pending, expected) in [
-            (1024, 64, 256, 54),
-            (1024, 100, 400, 36),
-            (64, 1, 4, 1),
-            (1_000_000, 32, 128, 128),
-            (u64::MAX, 4, 16, 16),
+        for (soft, streams, expected) in [
+            (1024, 4, 84),
+            (1024, 8, 82),
+            (1024, 64, 54),
+            (1024, 100, 36),
+            (64, 1, 1),
+            (1_000_000, 32, 99_968),
+            (0, 1, 1),
         ] {
-            assert_eq!(directory_groups(soft, streams, pending), expected);
+            assert_eq!(directory_groups(soft, streams), expected);
         }
+        let groups = directory_groups(u64::MAX, 4);
+        let budget = DirectoryBudget::new(groups);
+        assert_eq!(budget.normal.available_permits(), groups);
+        assert!(groups <= Semaphore::MAX_PERMITS);
     }
 
     #[tokio::test]
