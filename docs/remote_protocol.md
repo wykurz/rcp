@@ -275,10 +275,18 @@ The source scopes have these boundaries in both the hardened and dereferencing w
 | `source.discovery`                                                          | Root resolution through `DiscoveryComplete` submission.                                                    |
 | `source.directory.scan`                                                     | Directory opening and metadata capture through Begin admission, enumeration, dispatch, and End submission. |
 | `source.directory.wait_ready`                                               | Waiting for `DirectoryReady` or rejection.                                                                 |
-| `source.discovery.wait_credit`                                              | Waiting for bounded discovery admission.                                                                   |
+| `source.directory.wait_resources`                                           | Waiting for a normal directory group or the sequential reserve.                                            |
+| `source.discovery.wait_credit`                                              | Waiting for unacknowledged Begin admission.                                                                |
 | `source.files.drain`                                                        | File-task and destination completion after discovery.                                                      |
 | `source.file.wait_stream`, `source.file.wait_open`, `source.file.wait_iops` | Detailed waits for stream, open-file, and IOPS admission.                                                  |
 | `source.file.open`, `source.file.send`                                      | Detailed data-file opening and sending.                                                                    |
+
+The destination's detailed scopes use the `destination.file` prefix: `wait_open`, `parent`, `plan`,
+`wait_iops`, `create`, `receive`, `flush`, `metadata`, `drain`, and `complete`. These cover
+admission, parent resolution, destination classification, IOPS admission, creation, payload reads
+and writes, flushing, metadata, discarded payloads, and tracker completion respectively. Completion
+includes waiting for the tracker and any resulting directory finalization. A creation race can
+produce a second plan or create sample.
 
 `operation` covers each process's main operation; `local.copy` covers each local copy invocation.
 Interrupted scopes report their interruption. Durations include async suspension and can overlap;
@@ -344,9 +352,10 @@ have joined, every Begin has an End, and no worker can submit more directory or 
 Files can still be in flight. A dry run or filtered root sends `has_root_item=false`. A root file
 can send its data header after `DiscoveryComplete(true)`.
 
-**`Symlink { src, dst, target, metadata, is_root }`** and **`SymlinkSkipped { src_dst, is_root }`**
-report a discovered symlink or failed symlink read. A nonroot outcome completes one admitted parent
-entry. A root outcome completes root processing.
+**`Symlink { src, dst, target, metadata, is_root }`** reports a discovered symlink. A nonroot
+outcome completes one admitted parent entry. A root outcome completes root processing. Target-read
+failures occur before admission: nested failures are collected without increasing the parent count,
+while a root failure aborts.
 
 **`FileSkipped { src, dst }`** completes one admitted child whose type can no longer be asserted or
 whose file cannot be opened before a data header starts. This includes an admitted nested directory
@@ -468,22 +477,22 @@ that restores the directory's ORIGINAL default ACL (the lockdown snapshot) — t
 
 **Which messages actually carry ACLs:**
 
-| message                                                              | carries                    | why                                                                                                                           |
-| -------------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                         |
-| `DirectoryBegin`                                                     | both, when captured        | read from the held `O_NOFOLLOW` fd whose children were enumerated; the default ACL is what the destination's children inherit |
-| a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                          |
-| a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest answer to give: the destination leaves the destination directory's ACLs untouched       |
-| `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                            |
-| `ExistingEntry` (manifest)                                           | `Unknown`                  | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                      |
+| message                                                              | carries                    | why                                                                                                                                 |
+| -------------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                               |
+| `DirectoryBegin`                                                     | both, when captured        | read from the held directory: `O_NOFOLLOW` in hardened mode, the following cursor in `-L` mode; the default ACL governs inheritance |
+| a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                                |
+| a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest answer to give: the destination leaves the destination directory's ACLs untouched             |
+| `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                                  |
+| `ExistingEntry` (manifest)                                           | `Unknown`                  | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                            |
 
 Reading a source entry's ACL from the same fd as its payload is the same read-side fidelity rule the
 rest of the source walk follows (Guarantee 2 in [tocttou.md](tocttou.md)): a probe by path could be
 answered by a different inode than the one whose bytes and metadata are on the wire, pairing one
 entry's permissions with another's contents. The `-L`/`--dereference` adapter obtains directory
-metadata by path and opens a separate by-path fd for directory ACLs; those observations are not
-bound to its enumeration cursor. That path ACL open is outside remote leaf OpenFile admission and
-its cancellation-lifetime guarantee.
+metadata by path, while ACL capture uses its held enumeration cursor without another open. The
+cursor retains directory admission through started ACL syscalls, including cancellation. Its earlier
+metadata snapshot is not bound to that cursor.
 
 **A failed ACL read FAILS the entry; it never degrades to "no ACL".** Because `None` means CLEAR,
 sending it for an ACL the source could not read would make an `EMFILE`, `EACCES` or `ENOENT` STRIP
@@ -566,8 +575,9 @@ A root that cannot be described or opened sufficiently to send a trustworthy Beg
 header aborts. A classified root directory whose data-directory open fails can use the committed
 unreadable-directory Begin/End(0) route in collect-errors mode (§7.1). Root classification is
 performed once and its snapshot drives filtering, dispatch, and `has_root_item`.
-`DiscoveryComplete(false)` represents a dry run or filtered root. A rejected root or failed root
-symlink is terminal at the destination, allowing valid discovery to finish with a nonzero result.
+`DiscoveryComplete(false)` represents a dry run or filtered root. Destination rejection of a root
+directory or failure to create a root symlink is terminal, allowing valid discovery to finish with a
+nonzero result.
 
 ## 4. Protocol Flow
 
@@ -653,8 +663,11 @@ missing acknowledgments.
 
 The destination tracks each accepted directory as Discovering or Sealed with a checked expected
 direct-child count, a checked completed-child count, its held fd and metadata, and a Ready-flushed
-gate. A lightweight terminal record distinguishes completed, rejected, and unknown directories
-without retaining finished directory fds or metadata.
+gate. Each pending parent retains the names of its finalized direct-child directories to reject
+duplicate Begins; those names are released when that parent finalizes. Exact rejected Begins remain
+until discovery validation, and minimal failed-subtree prefixes classify late outcomes. Valid
+`DiscoveryComplete` releases all structural history, retaining only failed prefixes needed by
+outstanding data work. Finished directories retain no fds or metadata.
 
 | Event                          | Effect                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
@@ -795,13 +808,14 @@ and reopened by path. The `-L` adapter uses the same single-cursor scheduling an
 its intentional symlink-following behavior. Dry-run performs one discovery for reporting, sends no
 Begin, End, or data jobs, and finishes with `DiscoveryComplete(false)`.
 
-File jobs are submitted as admitted entries appear. They wait for their directory's Ready and
-complete manifest, then send `FileUnchanged` or acquire a data stream before OpenFile admission,
-opening the source data fd, and sending the file. The data fd is checked with `fstat` and supplies
-the wire header's size, mode, owner, timestamps, and file ACLs. Both read modes derive the header
-from the opened data fd; `-L` still opens by path and follows symlinks. In hardened mode, the
-by-name open can select a compatible replacement within the held parent; discovery metadata is a
-snapshot, not authority for bytes or permissions sent.
+If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
+directly without file-task admission. Other admitted files enter the bounded file queue. Their jobs
+wait for Ready and the complete manifest, then send `FileUnchanged` or acquire a data stream before
+OpenFile admission, opening the source data fd, and sending the file. The data fd is checked with
+`fstat` and supplies the wire header's size, mode, owner, timestamps, and file ACLs. Both read modes
+derive the header from the opened data fd; `-L` still opens by path and follows symlinks. In
+hardened mode, the by-name open can select a compatible replacement within the held parent;
+discovery metadata is a snapshot, not authority for bytes or permissions sent.
 
 An admitted direct child increments its parent's End count in the same submission step. It
 contributes one terminal outcome: successful file or symlink work, an unchanged file, a pre-header
@@ -828,9 +842,10 @@ The count describes admitted work, not a stable inventory of the source tree.
 
 ### 7.2 Root Item Handling
 
-Root entries have no parent count. Their file, symlink, directory, or skipped outcome makes root
-processing terminal. `DiscoveryComplete(false)` makes a filtered or dry-run root terminal without
-destination filesystem work. A root file header can arrive after `DiscoveryComplete(true)`.
+Root entries have no parent count. Their file, symlink, or directory outcome makes root processing
+terminal. `DiscoveryComplete(false)` makes a filtered or dry-run root terminal without destination
+filesystem work. A root file header can arrive after `DiscoveryComplete(true)`. A root that cannot
+be classified, a failed root symlink target read, or a root-file pre-header failure aborts.
 
 ### 7.3 Rejected Directories
 
@@ -861,6 +876,11 @@ Data connections are pooled for efficiency:
   borrows the next free connection and returns it for reuse (RAII)
 - `size` field in headers delimits file boundaries within a connection
 - Avoids connection creation overhead per file
+
+The source reads at most the header's size from the held data fd. A short read or additional bytes
+observed by an EOF probe fails the transfer and discards the stream; overflow bytes are never sent.
+The stream becomes reusable only after exactly that size is sent and message completion succeeds.
+This validates framing without providing a snapshot of a concurrently changing file.
 
 **Connection lifecycle:**
 
@@ -911,32 +931,48 @@ The source resolves `E = min(F, M)`, where `F` is its logical file ceiling and `
 ceiling, then `P = E × pending-writes-multiplier` with checked, nonzero arithmetic. The same E and P
 bound the discovery scheduler:
 
-| Work                          | Bound and release point                                                     |
-| ----------------------------- | --------------------------------------------------------------------------- |
-| Concurrent traversal branches | E; siblings use available permits or reuse the current branch sequentially. |
-| Concurrent classifications    | P; transient handles close before permits release and before descent.       |
-| Unacknowledged Begins         | P; credits return on Ready or Skipped.                                      |
-| Pending file jobs             | P; includes waits for Ready, a stream, and completion.                      |
-| Cursor batch                  | At most 64 names per directory frame.                                       |
-| File streams                  | E; a stream is acquired before OpenFile admission and the data-fd open.     |
+| Work                       | Bound and release point                                                      |
+| -------------------------- | ---------------------------------------------------------------------------- |
+| Concurrent scans           | E; normal scans release their permit at EOF before joining descendants.      |
+| Concurrent classifications | P and endpoint PendingMeta admission; both release before descent.           |
+| Normal directory groups    | B; directory and cursor owners retain shared credits through aliases.        |
+| Sequential reserve         | One subtree; retains a scan permit and drains each directory's direct files. |
+| Unacknowledged Begins      | P; credits return on Ready or Skipped.                                       |
+| Pending file jobs          | P; includes waits for Ready, a stream, and completion.                       |
+| Cursor batch               | At most 64 names per directory frame.                                        |
+| File streams               | E; a stream is acquired before OpenFile admission and the data-fd open.      |
 
-The control receiver does not wait for a branch, file permit, or directory worker. A branch never
-waits for another branch permit while retaining its own. Sequential descent uses a tracked child
-task that the parent immediately joins, keeping the Rust call stack bounded without adding a
-concurrent branch. Classified entries are polled independently; descent holds no classification or
-file permit needed by a suspended ancestor. Completed handles are reaped continuously. Source file
-jobs belong to the connection, so a directory worker can End and discovery can finish while their
-payloads remain in flight. The daemon's task scope owns cancellation across stdin and master
-watchdog races; each spawned task also has abort-on-drop ownership. A fatal error closes admission
-and readiness, cancels the data pool before joining blocked senders, and preserves the primary
-cause. A started blocking syscall keeps its descriptor and admission lease until it exits;
-cancellation cannot interrupt the syscall.
+![Source directory resource admission](assets/protocol_directory_resources.svg)
+
+Normal directory admission reserves a group for its held directory and cursor before opening them.
+Shared credit lives with the descriptor owners, including aliases retained by file jobs and blocking
+operations. With inherited soft descriptor limit S, `B = min(P, max(1, (S/5 - E - 32)/2))`, using
+integer division and saturating subtraction. This reserves headroom for data sockets, support fds,
+and the endpoint leaf-admission heuristic. A failed query falls back to B=1 with a notice; the
+daemon does not raise its inherited limit.
+
+When normal groups are exhausted, admission waits for a group or the single sequential reserve. The
+reserve owns one scan permit throughout its subtree, never forks or acquires another directory
+group, and drains each directory's direct file jobs before returning. It can therefore make progress
+while normal ancestors retain all groups. Source directory/cursor descriptors are bounded by
+`2B + 2D + O(1)`, where D is reserve depth; an exceptionally deep path can still exhaust the process
+limit. Normal inline descent moves the parent's scan permit into its child and reacquires one only
+after that child returns. EOF releases normal scanner resources before joining descendants.
+
+The control receiver does not wait for a scan, file permit, or directory worker. Sequential descent
+uses a tracked child task that the parent immediately joins, keeping the Rust call stack bounded.
+Classified entries are polled independently; descent holds no classification or file permit needed
+by a suspended ancestor. Completed handles are reaped continuously. File jobs belong to the
+connection, so normal directory workers can End while payloads remain in flight. The daemon's task
+scope owns cancellation across stdin and master watchdog races; each spawned task also has
+abort-on-drop ownership. A fatal error closes admission and readiness, cancels the data pool before
+joining blocked senders, and preserves the primary cause. A started blocking syscall keeps its
+descriptor and admission lease until it exits; cancellation cannot interrupt the syscall.
 
 The destination independently admits a file only after reading its header, before parent resolution,
 creation, and writes. Its OpenFile pool and descriptor-safety heuristic are local, not wire state.
-Source and destination directory fds can scale with active depth, pending jobs, and unfinished
-subtrees; E/P bound active or queued work, not a fixed total fd or whole-tree memory ceiling. Cursor
-batches likewise scale with active recursive frames.
+Destination directory fds scale with unfinished subtrees. Source cursor batches scale with active
+recursive frames. These bounds do not impose a fixed total process-fd or whole-tree memory ceiling.
 
 `--max-connections` defaults to 100. `--pending-writes-multiplier` defaults to 4.
 `--max-files-in-flight=N|unlimited` sets the logical source ceiling; when omitted, the source

@@ -352,10 +352,6 @@ pub enum SourceMessage {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
-    /// Notify destination that a symlink failed to read.
-    /// If `is_root` is true, this signals that root processing is complete (even if failed).
-    /// Non-root skipped symlinks count as a processed entry for the parent directory.
-    SymlinkSkipped { src_dst: SrcDst, is_root: bool },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

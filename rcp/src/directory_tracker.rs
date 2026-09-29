@@ -27,6 +27,9 @@ struct DirectoryState {
     discovery: DiscoveryState,
     /// Completed direct-child obligations.
     entries_processed: usize,
+    /// Direct-child directory names that entered finalization, retained only until this parent
+    /// completes or discovery ends. They reject repeated Begins even if finalization failed.
+    completed_directories: std::collections::HashSet<std::ffi::OsString>,
     /// Ready and its preceding manifest chunks have flushed.
     announced: bool,
     /// whether to keep this directory if it ends up empty
@@ -64,9 +67,8 @@ impl DirectoryState {
     }
 }
 #[derive(Debug)]
-enum TerminalDirectory {
-    Completed,
-    Rejected { sealed: bool },
+struct RejectedDirectory {
+    sealed: bool,
 }
 
 /// An admitted Begin whose root claim precedes destination filesystem work.
@@ -81,8 +83,11 @@ pub(super) struct DirectoryAdmission {
 pub struct DirectoryTracker {
     /// Directories waiting for End, Ready, or child completion.
     pending_directories: std::collections::HashMap<std::path::PathBuf, DirectoryState>,
-    /// Completed directories and rejected Begins, including their End bookkeeping.
-    terminal_directories: std::collections::HashMap<std::path::PathBuf, TerminalDirectory>,
+    /// Exact rejected Begins and End bookkeeping, retained through discovery even after their
+    /// accepted parent completes. Each descendant Begin still requires its own End.
+    rejected_directories: std::collections::HashMap<std::path::PathBuf, RejectedDirectory>,
+    /// Minimal rejected subtree roots, retained for late file outcomes after discovery.
+    failed_subtrees: std::collections::HashSet<std::path::PathBuf>,
     root_observed: bool,
     /// directories that we created (vs reused existing) - used for empty dir cleanup
     created_directories: std::collections::HashSet<std::path::PathBuf>,
@@ -128,7 +133,8 @@ impl DirectoryTracker {
     ) -> Self {
         Self {
             pending_directories: std::collections::HashMap::new(),
-            terminal_directories: std::collections::HashMap::new(),
+            rejected_directories: std::collections::HashMap::new(),
+            failed_subtrees: std::collections::HashSet::new(),
             root_observed: false,
             created_directories: std::collections::HashSet::new(),
             dirs: std::collections::HashMap::new(),
@@ -149,10 +155,7 @@ impl DirectoryTracker {
     pub fn has_failed_ancestor(&self, path: &std::path::Path) -> bool {
         let mut current = path;
         while let Some(parent) = current.parent() {
-            if matches!(
-                self.terminal_directories.get(parent),
-                Some(TerminalDirectory::Rejected { .. })
-            ) {
+            if self.failed_subtrees.contains(parent) {
                 return true;
             }
             current = parent;
@@ -228,6 +231,7 @@ impl DirectoryTracker {
             DirectoryState {
                 discovery: DiscoveryState::Discovering,
                 entries_processed: 0,
+                completed_directories: std::collections::HashSet::new(),
                 announced: false,
                 keep_if_empty,
                 reused_lock,
@@ -263,17 +267,27 @@ impl DirectoryTracker {
         self.ensure_discovering()?;
         anyhow::ensure!(
             !self.pending_directories.contains_key(dst)
-                && !self.terminal_directories.contains_key(dst),
+                && !self.rejected_directories.contains_key(dst),
             "duplicate DirectoryBegin for {dst:?}"
         );
         if !is_root {
             let parent = dst
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("directory has no parent"))?;
-            anyhow::ensure!(
-                self.pending_directories.contains_key(parent) || self.in_rejected_subtree(parent),
-                "DirectoryBegin has unknown or completed parent {parent:?}"
-            );
+            if let Some(state) = self.pending_directories.get(parent) {
+                let name = dst
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("directory has no name"))?;
+                anyhow::ensure!(
+                    !state.completed_directories.contains(name),
+                    "duplicate DirectoryBegin for {dst:?}"
+                );
+            } else {
+                anyhow::ensure!(
+                    self.in_rejected_subtree(parent),
+                    "DirectoryBegin has unknown or completed parent {parent:?}"
+                );
+            }
         }
         Ok(())
     }
@@ -288,10 +302,7 @@ impl DirectoryTracker {
         Ok(())
     }
     fn in_rejected_subtree(&self, dst: &std::path::Path) -> bool {
-        matches!(
-            self.terminal_directories.get(dst),
-            Some(TerminalDirectory::Rejected { .. })
-        ) || self.has_failed_ancestor(dst)
+        self.failed_subtrees.contains(dst) || self.has_failed_ancestor(dst)
     }
     /// Record a rejected Begin and settle its parent slot exactly once.
     pub(super) async fn reject_directory(
@@ -301,10 +312,13 @@ impl DirectoryTracker {
         let DirectoryAdmission { dst, is_root } = admission;
         let dst = dst.as_path();
         self.validate_directory_begin(dst, is_root)?;
-        self.terminal_directories.insert(
-            dst.to_path_buf(),
-            TerminalDirectory::Rejected { sealed: false },
-        );
+        // parent membership is checked before admission, so an already rejected ancestor covers
+        // this entire subtree. No scan or removal of previously registered descendants is needed.
+        if !self.has_failed_ancestor(dst) {
+            self.failed_subtrees.insert(dst.to_path_buf());
+        }
+        self.rejected_directories
+            .insert(dst.to_path_buf(), RejectedDirectory { sealed: false });
         if is_root {
             self.set_root_complete();
         } else if let Some(parent) = dst.parent() {
@@ -319,10 +333,9 @@ impl DirectoryTracker {
         expected: usize,
     ) -> anyhow::Result<()> {
         self.ensure_discovering()?;
-        if let Some(TerminalDirectory::Rejected { sealed }) = self.terminal_directories.get_mut(dst)
-        {
-            anyhow::ensure!(!*sealed, "duplicate DirectoryEnd for {dst:?}");
-            *sealed = true;
+        if let Some(state) = self.rejected_directories.get_mut(dst) {
+            anyhow::ensure!(!state.sealed, "duplicate DirectoryEnd for {dst:?}");
+            state.sealed = true;
             return Ok(());
         }
         let state = self.pending_directories.get_mut(dst).ok_or_else(|| {
@@ -426,8 +439,22 @@ impl DirectoryTracker {
         dst: &std::path::Path,
         is_root: bool,
     ) -> anyhow::Result<()> {
-        self.terminal_directories
-            .insert(dst.to_path_buf(), TerminalDirectory::Completed);
+        if !is_root && !self.structure_complete {
+            let parent = dst
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("finalizing directory has no parent"))?;
+            let name = dst
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("finalizing directory has no name"))?;
+            let parent_state = self.pending_directories.get_mut(parent).ok_or_else(|| {
+                anyhow::anyhow!("finalizing child has no pending parent {parent:?}")
+            })?;
+            // reserve the identity before removing pending state or awaiting filesystem work.
+            // failed metadata must not make a duplicate Begin admissible during fatal teardown.
+            parent_state
+                .completed_directories
+                .insert(name.to_os_string());
+        }
         // remove from pending
         let state = self.pending_directories.remove(dst);
         let keep_if_empty = state.as_ref().is_none_or(|s| s.keep_if_empty);
@@ -586,12 +613,16 @@ impl DirectoryTracker {
             "DiscoveryComplete before accepted directory End"
         );
         anyhow::ensure!(
-            self.terminal_directories
-                .values()
-                .all(|state| !matches!(state, TerminalDirectory::Rejected { sealed: false })),
+            self.rejected_directories.values().all(|state| state.sealed),
             "DiscoveryComplete before rejected directory End"
         );
         self.structure_complete = true;
+        // structural traffic is now rejected globally. Release the allocations too, while keeping
+        // only the minimal rejected prefixes needed by independently arriving file outcomes.
+        self.rejected_directories = std::collections::HashMap::new();
+        for state in self.pending_directories.values_mut() {
+            state.completed_directories = std::collections::HashSet::new();
+        }
         if !has_root_item {
             self.root_complete = true;
         }
@@ -678,6 +709,156 @@ mod tests {
             false,
             std::sync::Arc::new(common::error_collector::ErrorCollector::default()),
         )
+    }
+    fn retained_history(t: &DirectoryTracker) -> usize {
+        t.pending_directories
+            .values()
+            .map(|state| state.completed_directories.len())
+            .sum::<usize>()
+            + t.rejected_directories.len()
+            + t.failed_subtrees.len()
+    }
+    fn register_virtual(t: &mut DirectoryTracker, path: &std::path::Path, dir: &Arc<Dir>) {
+        // these state-machine fixtures reuse one real descriptor: no metadata is preserved and
+        // no directory is marked created, so finalization performs no path-dependent mutations.
+        let admission = t.admit_directory(path, false).unwrap();
+        t.register_directory(admission, dir.clone(), meta(), false, true, None)
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn failed_finalization_rejects_duplicate_begin_without_settling_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let mut t = new_tracker();
+        t.fail_early = true;
+        t.preserve.dir.user_and_time.time = true;
+        register(&mut t, tmp.path(), true).await;
+        t.mark_announced(tmp.path()).await.unwrap();
+        t.seal_directory(tmp.path(), 1).await.unwrap();
+        let mut invalid_metadata = meta();
+        // outside the kernel's nanosecond range and neither UTIME_NOW nor UTIME_OMIT.
+        invalid_metadata.mtime_nsec = 1_000_000_000;
+        let admission = t.admit_directory(&child, false).unwrap();
+        t.register_directory(
+            admission,
+            open_dir(&child).await,
+            invalid_metadata,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        t.mark_announced(&child).await.unwrap();
+        let error = t.seal_directory(&child, 0).await.unwrap_err();
+        assert!(format!("{error:#}").contains("Invalid argument"));
+        assert!(!t.pending_directories.contains_key(&child));
+        assert_eq!(t.pending_directories[tmp.path()].entries_processed, 0);
+        assert!(t.admit_directory(&child, false).is_err());
+        assert!(t.seal_directory(&child, 0).await.is_err());
+        assert!(t.process_file(&child).await.is_err());
+        assert!(!t.is_done());
+    }
+    #[tokio::test]
+    async fn completed_subtrees_retain_only_names_under_pending_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(tmp.path()).await;
+        let mut t = new_tracker();
+        register(&mut t, tmp.path(), true).await;
+        t.mark_announced(tmp.path()).await.unwrap();
+        for group in 0..24 {
+            let branch = tmp.path().join(format!("branch-{group}"));
+            register_virtual(&mut t, &branch, &dir);
+            t.mark_announced(&branch).await.unwrap();
+            for leaf in 0..32 {
+                let leaf = branch.join(format!("leaf-{leaf}"));
+                register_virtual(&mut t, &leaf, &dir);
+                t.mark_announced(&leaf).await.unwrap();
+                t.seal_directory(&leaf, 0).await.unwrap();
+                assert!(t.admit_directory(&leaf, false).is_err());
+            }
+            t.seal_directory(&branch, 32).await.unwrap();
+            assert_eq!(retained_history(&t), group + 1);
+            assert_eq!(t.pending_directories.len(), 1);
+            assert!(t.admit_directory(&branch, false).is_err());
+            let pruned_leaf = branch.join("leaf-0");
+            assert!(t.admit_directory(&pruned_leaf, false).is_err());
+            assert!(t.seal_directory(&pruned_leaf, 0).await.is_err());
+            assert!(t.mark_announced(&pruned_leaf).await.is_err());
+            assert!(t.process_file(&pruned_leaf).await.is_err());
+        }
+        t.seal_directory(tmp.path(), 24).await.unwrap();
+        assert_eq!(retained_history(&t), 0);
+        assert!(t.admit_directory(tmp.path(), true).is_err());
+        t.finish_discovery(true).await.unwrap();
+        assert!(t.is_done());
+    }
+    #[tokio::test]
+    async fn discovery_releases_success_history_before_late_files_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(tmp.path()).await;
+        let mut t = new_tracker();
+        register(&mut t, tmp.path(), true).await;
+        t.mark_announced(tmp.path()).await.unwrap();
+        let completed = tmp.path().join("completed");
+        register_virtual(&mut t, &completed, &dir);
+        t.mark_announced(&completed).await.unwrap();
+        t.seal_directory(&completed, 0).await.unwrap();
+        let pending = tmp.path().join("pending");
+        register_virtual(&mut t, &pending, &dir);
+        t.mark_announced(&pending).await.unwrap();
+        t.seal_directory(&pending, 1).await.unwrap();
+        t.seal_directory(tmp.path(), 3).await.unwrap();
+        assert_eq!(retained_history(&t), 1);
+        t.finish_discovery(true).await.unwrap();
+        assert_eq!(retained_history(&t), 0);
+        assert!(
+            t.pending_directories
+                .values()
+                .all(|state| state.completed_directories.capacity() == 0)
+        );
+        assert!(t.admit_directory(&completed, false).is_err());
+        assert!(t.seal_directory(&completed, 0).await.is_err());
+        assert!(t.process_file(&completed).await.is_err());
+        t.process_file(&pending).await.unwrap();
+        assert_eq!(retained_history(&t), 0);
+        assert!(!t.is_done());
+        t.process_file(tmp.path()).await.unwrap();
+        assert!(t.is_done());
+        assert_eq!(retained_history(&t), 0);
+    }
+    #[tokio::test]
+    async fn rejected_descendant_ends_survive_parent_completion_then_compact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = new_tracker();
+        register(&mut t, tmp.path(), true).await;
+        t.mark_announced(tmp.path()).await.unwrap();
+        t.seal_directory(tmp.path(), 1).await.unwrap();
+        let rejected = tmp.path().join("rejected");
+        reject(&mut t, &rejected, false).await.unwrap();
+        assert!(t.pending_directories.is_empty());
+        t.seal_directory(&rejected, 64).await.unwrap();
+        for index in 0..64 {
+            let descendant = rejected.join(format!("child-{index}"));
+            reject(&mut t, &descendant, false).await.unwrap();
+            assert!(t.finish_discovery(true).await.is_err());
+            assert!(t.admit_directory(&descendant, false).is_err());
+            t.seal_directory(&descendant, 8).await.unwrap();
+            assert!(t.seal_directory(&descendant, 8).await.is_err());
+        }
+        assert!(t.admit_directory(&rejected, false).is_err());
+        t.finish_discovery(true).await.unwrap();
+        assert_eq!(retained_history(&t), 1);
+        assert_eq!(t.rejected_directories.capacity(), 0);
+        assert!(t.is_done());
+        let late = rejected.join("child-0/late-file");
+        assert!(t.has_failed_ancestor(&late));
+        assert!(!t.process_file(&rejected).await.unwrap());
+        t.process_child_entry(&late).await.unwrap();
+        assert!(t.process_file(tmp.path()).await.is_err());
+        assert!(t.process_file(&tmp.path().join("unknown")).await.is_err());
+        assert!(t.admit_directory(&late, false).is_err());
+        assert!(t.seal_directory(&rejected, 64).await.is_err());
     }
     fn meta() -> remote::protocol::Metadata {
         remote::protocol::Metadata {

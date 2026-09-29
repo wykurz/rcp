@@ -156,6 +156,7 @@ pub use progress::{RcpdProgressPrinter, SerializableProgress};
 // `common::collect_runtime_stats`, etc.
 pub use runtime_setup::{
     NOTICE_TARGET, collect_runtime_stats, generate_debug_log_filename, generate_trace_filename,
+    get_soft_open_file_limit,
 };
 pub use settings_parse::{
     parse_compare_settings, parse_metadata_cmp_settings, parse_preserve_settings,

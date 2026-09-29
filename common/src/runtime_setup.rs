@@ -169,7 +169,8 @@ pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
+/// Read the process's inherited soft descriptor limit without changing it.
+pub fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

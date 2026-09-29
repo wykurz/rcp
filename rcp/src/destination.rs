@@ -274,7 +274,9 @@ async fn drain_file_data(
     size: u64,
 ) -> anyhow::Result<()> {
     let mut sink = tokio::io::sink();
-    stream.copy_exact_to_buffered(&mut sink, size, 8192).await?;
+    common::timing_scope!(trace, "destination.file.drain")
+        .measure(stream.copy_exact_to_buffered(&mut sink, size, 8192))
+        .await?;
     Ok(())
 }
 
@@ -325,7 +327,8 @@ async fn process_single_file(
     // cancellation safety — `create_file` waits on the ops-throttle internally, so a cancelled
     // transfer can still land between the removal and the create — and it does not try to be; see
     // `common::copy::copy_file_fd` for why rcp accepts that instead of staging and renaming.
-    let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
+    let plan = common::timing_scope!(trace, "destination.file.plan")
+        .measure(plan_dst_file(settings, file_header, dst_parent, dst_name))
         .await
         .map_err(err_needs_drain)?;
     // a skipped file's bytes are already on the wire and must come off it before the next header.
@@ -339,11 +342,12 @@ async fn process_single_file(
     // plan but has not yet acted on it — the interval a competing writer can still slip into, and the
     // one a throttle-bound transfer spends all its time in.
     tracing::debug!("destination slot classified, reserving iops budget");
-    throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
-        .instrument(tracing::trace_span!(
-            "iops_throttle",
-            size = file_header.size
-        ))
+    common::timing_scope!(trace, "destination.file.wait_iops")
+        .measure(
+            throttle::get_file_iops_tokens(settings.chunk_size, file_header.size).instrument(
+                tracing::trace_span!("iops_throttle", size = file_header.size),
+            ),
+        )
         .await;
     // the reservation is held, so the occupied entry can go through the pinned parent.
     if let DstFilePlan::Replace(dst_snapshot) = &plan {
@@ -362,7 +366,10 @@ async fn process_single_file(
     // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. it is created owner-only
     // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_fd`
     // below, after the last byte, mirroring copy.rs.
-    let std_file = match dst_parent.create_file(dst_name).await {
+    let std_file = match common::timing_scope!(trace, "destination.file.create")
+        .measure(dst_parent.create_file(dst_name))
+        .await
+    {
         Ok(std_file) => std_file,
         // the slot is occupied: a writer filled it between the classification above — or during the
         // `--iops-throttle` wait after it, which can be seconds — and now. `create_file`'s `O_EXCL`
@@ -373,7 +380,8 @@ async fn process_single_file(
         // for between the removal and the retry.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             tracing::debug!("destination appeared after classification, re-planning");
-            let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
+            let plan = common::timing_scope!(trace, "destination.file.plan")
+                .measure(plan_dst_file(settings, file_header, dst_parent, dst_name))
                 .await
                 .map_err(err_needs_drain)?;
             if matches!(plan, DstFilePlan::Skip) {
@@ -396,8 +404,8 @@ async fn process_single_file(
             // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
             // another writer refilled it — report that rather than looping, which against a live
             // competing writer would never terminate.
-            dst_parent
-                .create_file(dst_name)
+            common::timing_scope!(trace, "destination.file.create")
+                .measure(dst_parent.create_file(dst_name))
                 .await
                 .with_context(|| format!("failed creating {:?}", file_header.dst))
                 .map_err(err_needs_drain)?
@@ -416,13 +424,16 @@ async fn process_single_file(
     let file_size = file_header.size.min(usize::MAX as u64) as usize;
     let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
     // once we start reading from the stream, any error means the stream is corrupted
-    let copied = file_recv_stream
-        .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
-        .instrument(tracing::trace_span!(
-            "recv_data",
-            size = file_header.size,
-            buffer_size
-        ))
+    let copied = common::timing_scope!(trace, "destination.file.receive")
+        .measure(
+            file_recv_stream
+                .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
+                .instrument(tracing::trace_span!(
+                    "recv_data",
+                    size = file_header.size,
+                    buffer_size
+                )),
+        )
         .await
         .map_err(err_corrupted)?;
     if copied != file_header.size {
@@ -435,7 +446,8 @@ async fn process_single_file(
     // flush before metadata to ensure all data reaches the kernel before we set mtime.
     // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
     // may complete after we set mtime, causing the file to appear modified.
-    file.flush()
+    common::timing_scope!(trace, "destination.file.flush")
+        .measure(file.flush())
         .await
         .map_err(|e| err_data_consumed(e.into()))?;
     tracing::info!(
@@ -462,16 +474,17 @@ async fn process_single_file(
     // (A source that cannot READ a file's ACL sends `FileSkipped`, never a `File` header, so an
     // `Unknown` here is never a degraded read.)
     let src_acls = file_header.metadata.captured_acls();
-    common::safedir::set_file_metadata_fd(
-        preserve,
-        &file_header.metadata,
-        src_acls.as_ref(),
-        file.as_fd(),
-        common::Side::Destination,
-    )
-    .await
-    .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))
-    .map_err(err_data_consumed)?;
+    common::timing_scope!(trace, "destination.file.metadata")
+        .measure(common::safedir::set_file_metadata_fd(
+            preserve,
+            &file_header.metadata,
+            src_acls.as_ref(),
+            file.as_fd(),
+            common::Side::Destination,
+        ))
+        .await
+        .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))
+        .map_err(err_data_consumed)?;
     drop(file);
     Ok(())
 }
@@ -710,8 +723,10 @@ async fn handle_file_stream(
             file_header.dst
         );
         // acquire throttle permits for this file
-        let _open_file_guard = throttle::open_file_permit()
-            .instrument(tracing::trace_span!("open_file_permit"))
+        let _open_file_guard = common::timing_scope!(trace, "destination.file.wait_open")
+            .measure(
+                throttle::open_file_permit().instrument(tracing::trace_span!("open_file_permit")),
+            )
             .await;
         throttle::get_ops_token().await;
         let _ops_guard = prog.ops.guard();
@@ -720,7 +735,12 @@ async fn handle_file_stream(
         // file are then fd-relative on that pinned parent. a resolution failure is a
         // pre-data error: the stream can be recovered by draining this file's bytes.
         let file_result = common::safedir::with_fd_admission(_open_file_guard.admission(), async {
-            match resolve_parent_dir(&directory_tracker, &file_header.dst, file_header.is_root)
+            match common::timing_scope!(trace, "destination.file.parent")
+                .measure(resolve_parent_dir(
+                    &directory_tracker,
+                    &file_header.dst,
+                    file_header.is_root,
+                ))
                 .await
             {
                 Ok((dst_parent, dst_name)) => {
@@ -780,37 +800,40 @@ async fn handle_file_stream(
         }
         // ALWAYS update directory tracker, even on error
         // this prevents hangs waiting for file counts
-        {
-            let mut tracker = directory_tracker.lock().await;
-            if file_header.is_root {
-                tracing::info!(
-                    "Root file processed (success={})",
-                    fail_early_error.is_none() && !stream_corrupted
-                );
-                tracker.set_root_complete();
-            } else {
-                // get parent directory
-                let parent_dir = file_header.dst.parent().ok_or_else(|| {
-                    anyhow::anyhow!("file {:?} has no parent directory", file_header.dst)
-                })?;
-                tracker
-                    .process_file(parent_dir)
-                    .await
-                    .context("Failed to update directory tracker after receiving file")?;
-            }
-            // check if we're done after each file - this may send DestinationDone. We send it even
-            // when THIS file failed: the failure is recorded (in the collector) so the destination
-            // still reports Failure, but DestinationDone is what lets the source shut down cleanly on
-            // the COMPLETION path. (On a non-completion abort the source is instead signaled by
-            // `signal_source_teardown` closing the control stream — see `run_destination` and
-            // docs/remote_protocol.md.)
-            if tracker.is_done() {
-                tracing::info!(
-                    "All operations complete after file processing, sending DestinationDone"
-                );
-                tracker.send_destination_done().await?;
-            }
-        }
+        common::timing_scope!(trace, "destination.file.complete")
+            .measure(async {
+                let mut tracker = directory_tracker.lock().await;
+                if file_header.is_root {
+                    tracing::info!(
+                        "Root file processed (success={})",
+                        fail_early_error.is_none() && !stream_corrupted
+                    );
+                    tracker.set_root_complete();
+                } else {
+                    // get parent directory
+                    let parent_dir = file_header.dst.parent().ok_or_else(|| {
+                        anyhow::anyhow!("file {:?} has no parent directory", file_header.dst)
+                    })?;
+                    tracker
+                        .process_file(parent_dir)
+                        .await
+                        .context("Failed to update directory tracker after receiving file")?;
+                }
+                // check if we're done after each file - this may send DestinationDone. We send it even
+                // when THIS file failed: the failure is recorded (in the collector) so the destination
+                // still reports Failure, but DestinationDone is what lets the source shut down cleanly on
+                // the COMPLETION path. (On a non-completion abort the source is instead signaled by
+                // `signal_source_teardown` closing the control stream — see `run_destination` and
+                // docs/remote_protocol.md.)
+                if tracker.is_done() {
+                    tracing::info!(
+                        "All operations complete after file processing, sending DestinationDone"
+                    );
+                    tracker.send_destination_done().await?;
+                }
+                anyhow::Ok(())
+            })
+            .await?;
         // now handle stream corruption or fail-early after tracking is updated
         if stream_corrupted {
             file_recv_stream.close().await;
@@ -1637,36 +1660,6 @@ async fn process_control_stream(
                     .await
                     .context("Failed to update tracker for unchanged file")?;
             }
-            remote::protocol::SourceMessage::SymlinkSkipped {
-                ref src_dst,
-                is_root,
-            } => {
-                {
-                    let mut tracker = directory_tracker.lock().await;
-                    tracker.ensure_discovering()?;
-                    if is_root {
-                        tracker.observe_root()?;
-                    }
-                }
-                tracing::info!(
-                    "Symlink was skipped by source: {:?} -> {:?}",
-                    src_dst.src,
-                    src_dst.dst
-                );
-                // if root symlink failed, mark root as complete to avoid hang
-                if is_root {
-                    directory_tracker.lock().await.set_root_complete();
-                }
-                // count this skipped symlink as a processed child entry for its parent
-                if !is_root && let Some(parent) = src_dst.dst.parent() {
-                    directory_tracker
-                        .lock()
-                        .await
-                        .process_child_entry(parent)
-                        .await
-                        .context("Failed to update parent tracker for skipped symlink")?;
-                }
-            }
         }
             anyhow::Ok(())
         }
@@ -2067,12 +2060,10 @@ mod teardown_tests {
             [(false, false), (true, false), (false, true), (true, true)]
         {
             assert_control_failure_survives_completion(
-                remote::protocol::SourceMessage::SymlinkSkipped {
-                    src_dst: remote::protocol::SrcDst {
-                        src: "/src".into(),
-                        dst: "/dst".into(),
-                    },
-                    is_root: true,
+                remote::protocol::SourceMessage::DirectoryEnd {
+                    src: "/src".into(),
+                    dst: "/dst".into(),
+                    entry_count: 0,
                 },
                 completes_before_rejection,
                 file_failed,
@@ -2759,13 +2750,6 @@ mod teardown_tests {
                 dst: dst.clone(),
                 target: "target".into(),
                 metadata,
-                is_root: true,
-            },
-            remote::protocol::SourceMessage::SymlinkSkipped {
-                src_dst: remote::protocol::SrcDst {
-                    src: "/src".into(),
-                    dst: dst.clone(),
-                },
                 is_root: true,
             },
         ];
