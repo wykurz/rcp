@@ -1355,10 +1355,10 @@ async fn process_control_stream(
                 keep_if_empty,
             } => {
                 let _ops_guard = prog.ops.guard();
-                directory_tracker
+                let admission = directory_tracker
                     .lock()
                     .await
-                    .validate_directory_begin(dst, is_root)?;
+                    .admit_directory(dst, is_root)?;
                 // check for failed ancestor
                 let has_failed_ancestor = {
                     let tracker = directory_tracker.lock().await;
@@ -1367,7 +1367,7 @@ async fn process_control_stream(
                 if has_failed_ancestor {
                     tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
                     let mut tracker = directory_tracker.lock().await;
-                    tracker.reject_directory(dst, is_root).await?;
+                    tracker.reject_directory(admission).await?;
                     tracker.send_directory_skipped(src, dst).await?;
                     return Ok(());
                 }
@@ -1416,10 +1416,9 @@ async fn process_control_stream(
                         // DirectoryBegin messages do not wait for this directory's
                         // DirectoryReady.
                         directory_tracker.lock().await.register_directory(
-                            dst,
+                            admission,
                             dir.clone(),
                             metadata.clone(),
-                            is_root,
                             was_created,
                             keep_if_empty,
                             reused_lock,
@@ -1498,7 +1497,7 @@ async fn process_control_stream(
                             ));
                         }
                         let mut tracker = directory_tracker.lock().await;
-                        tracker.reject_directory(dst, is_root).await?;
+                        tracker.reject_directory(admission).await?;
                         // nack returns the source's Begin credit and wakes its queued work.
                         // every submitted Begin needs a response, including rejected descendants.
                         tracker
@@ -2333,6 +2332,254 @@ mod teardown_tests {
         ))
     }
 
+    async fn receive_test_root_control(
+        tracker: directory_tracker::SharedDirectoryTracker,
+        send: remote::streams::BoxedSharedSendStream,
+        errors: Arc<common::error_collector::ErrorCollector>,
+        messages: Vec<remote::protocol::SourceMessage>,
+    ) -> anyhow::Result<()> {
+        let (source, destination) = tokio::io::duplex(4096);
+        let mut source = remote::streams::SendStream::new(source);
+        for message in messages {
+            source.send_control_message(&message).await?;
+        }
+        source.close().await?;
+        process_control_stream(
+            &test_copy_settings(),
+            10,
+            &common::preserve::preserve_none(),
+            remote::streams::RecvStream::new(Box::new(destination) as remote::streams::BoxedRead),
+            tracker,
+            send,
+            test_pool(),
+            errors,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn admitted_directory_root_excludes_file_and_symlink_before_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let file = tmp.path().join("file");
+        let link = tmp.path().join("link");
+        let metadata = remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap());
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+        )));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        let admission = tracker.lock().await.admit_directory(&root, true).unwrap();
+        let (source, destination) = tokio::io::duplex(4096);
+        let mut source = remote::streams::SendStream::new(source);
+        source
+            .send_control_message(&remote::protocol::File {
+                src: "/src".into(),
+                dst: file.clone(),
+                size: 0,
+                metadata: metadata.clone(),
+                is_root: true,
+            })
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        let file_receive = run_over_reader(tracker.clone(), test_pool(), Box::new(destination));
+        let link_receive = receive_test_root_control(
+            tracker.clone(),
+            send,
+            errors,
+            vec![remote::protocol::SourceMessage::Symlink {
+                src: "/src".into(),
+                dst: link.clone(),
+                target: "target".into(),
+                metadata: metadata.clone(),
+                is_root: true,
+            }],
+        );
+        let (file_result, link_result) = tokio::join!(file_receive, link_receive);
+        for result in [file_result, link_result] {
+            assert!(format!("{:#}", result.unwrap_err()).contains("duplicate root item"));
+        }
+        for path in [&root, &file, &link] {
+            assert!(path.symlink_metadata().is_err());
+        }
+        std::fs::create_dir(&root).unwrap();
+        let dir = Arc::new(
+            Dir::open_root_dir(&root, false, common::Side::Destination)
+                .await
+                .unwrap(),
+        );
+        tracker
+            .lock()
+            .await
+            .register_directory(admission, dir, metadata, true, true, None)
+            .unwrap();
+        assert!(tracker.lock().await.get_dir(&root).is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_root_symlink_is_rejected_before_creating_another_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let metadata = remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap());
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+        )));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        let messages = [&first, &second]
+            .into_iter()
+            .map(|dst| remote::protocol::SourceMessage::Symlink {
+                src: "/src".into(),
+                dst: dst.clone(),
+                target: "target".into(),
+                metadata: metadata.clone(),
+                is_root: true,
+            })
+            .collect();
+        let result =
+            receive_test_root_control(tracker.clone(), send, errors.clone(), messages).await;
+        assert_eq!(
+            std::fs::read_link(first).unwrap(),
+            std::path::Path::new("target")
+        );
+        assert!(
+            std::fs::symlink_metadata(&second).is_err(),
+            "a duplicate root must be rejected before mutation"
+        );
+        tracker.lock().await.finish_discovery(true).await.unwrap();
+        let error = choose_final_result(
+            errors.take_error(),
+            Ok(()),
+            result,
+            tracker.lock().await.is_done(),
+            None,
+            summary(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate root item"));
+    }
+    #[tokio::test]
+    async fn duplicate_root_file_is_recorded_even_after_root_completion() {
+        for first_is_symlink in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let first = tmp.path().join("first");
+            let second = tmp.path().join("second");
+            let metadata =
+                remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap());
+            let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+            )));
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = directory_tracker::make_shared(
+                send.clone(),
+                common::preserve::preserve_none(),
+                false,
+                errors.clone(),
+            );
+            let mut messages = Vec::new();
+            if first_is_symlink {
+                messages.push(remote::protocol::SourceMessage::Symlink {
+                    src: "/src".into(),
+                    dst: first.clone(),
+                    target: "target".into(),
+                    metadata: metadata.clone(),
+                    is_root: true,
+                });
+            }
+            messages.push(remote::protocol::SourceMessage::DiscoveryComplete {
+                has_root_item: true,
+            });
+            receive_test_root_control(tracker.clone(), send, errors.clone(), messages)
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let pool = Arc::new(DataConnectionPool::new(
+                listener.local_addr().unwrap(),
+                1,
+                remote::NetworkProfile::default(),
+                remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+                None,
+                1,
+            ));
+            let source = async {
+                let (stream, _) = remote::accept_tcp_data(
+                    &listener,
+                    remote::NetworkProfile::default(),
+                    remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+                )
+                .await
+                .unwrap();
+                drop(listener);
+                let mut source = remote::streams::SendStream::new(stream);
+                let paths = if first_is_symlink {
+                    vec![&second]
+                } else {
+                    vec![&first, &second]
+                };
+                for dst in paths {
+                    source
+                        .send_control_message(&remote::protocol::File {
+                            src: "/src".into(),
+                            dst: dst.clone(),
+                            size: 0,
+                            metadata: metadata.clone(),
+                            is_root: true,
+                        })
+                        .await
+                        .unwrap();
+                }
+                source.close().await.unwrap();
+            };
+            let receiver = process_incoming_file_streams_tcp(
+                test_copy_settings(),
+                common::preserve::preserve_none(),
+                pool,
+                tracker.clone(),
+                errors.clone(),
+            );
+            let (file_result, ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(receiver, source)
+                })
+                .await
+                .expect("duplicate root must terminate the data receiver");
+            assert!(
+                first.symlink_metadata().is_ok(),
+                "the first root must be accepted"
+            );
+            assert!(
+                second.symlink_metadata().is_err(),
+                "a duplicate root must be rejected before mutation"
+            );
+            let completed = tracker.lock().await.is_done();
+            assert!(
+                completed,
+                "verify the error collector defeats completed-result suppression"
+            );
+            let error = choose_final_result(
+                errors.take_error(),
+                file_result,
+                Ok(()),
+                completed,
+                None,
+                summary(),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("duplicate root item"));
+        }
+    }
+
     #[tokio::test]
     async fn final_ready_flushes_before_destination_done_exactly_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2353,12 +2600,12 @@ mod teardown_tests {
                     .await
                     .unwrap(),
             );
+            let admission = tracker.admit_directory(tmp.path(), true).unwrap();
             tracker
                 .register_directory(
-                    tmp.path(),
+                    admission,
                     dir,
                     remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap()),
-                    true,
                     false,
                     true,
                     None,
