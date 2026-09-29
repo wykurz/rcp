@@ -69,6 +69,14 @@ enum TerminalDirectory {
     Rejected { sealed: bool },
 }
 
+/// An admitted Begin whose root claim precedes destination filesystem work.
+/// Registration or rejection consumes its original destination identity.
+#[must_use]
+pub(super) struct DirectoryAdmission {
+    dst: std::path::PathBuf,
+    is_root: bool,
+}
+
 /// Tracks directory entry counts and completion state for remote copy operations.
 pub struct DirectoryTracker {
     /// Directories waiting for End, Ready, or child completion.
@@ -190,20 +198,18 @@ impl DirectoryTracker {
     /// Retain an accepted Begin's descriptor, metadata, and reused-directory lockdown.
     /// Children may arrive before Ready; finalization also waits for End and all children.
     #[allow(clippy::too_many_arguments)]
-    pub fn register_directory(
+    pub(super) fn register_directory(
         &mut self,
-        dst: &std::path::Path,
+        admission: DirectoryAdmission,
         dir: Arc<Dir>,
         metadata: remote::protocol::Metadata,
-        is_root: bool,
         was_created: bool,
         keep_if_empty: bool,
         reused_lock: Option<common::safedir::ReusedDirLock>,
     ) -> anyhow::Result<()> {
+        let DirectoryAdmission { dst, is_root } = admission;
+        let dst = dst.as_path();
         self.validate_directory_begin(dst, is_root)?;
-        if is_root {
-            self.observe_root()?;
-        }
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
         // store the open dir fd so children resolve relative to it (fd-map).
@@ -237,21 +243,30 @@ impl DirectoryTracker {
         );
         Ok(())
     }
-    /// Validate Begin before any destination filesystem mutation.
-    pub fn validate_directory_begin(
-        &self,
+    /// Admit a Begin and claim the root before destination filesystem work starts.
+    pub(super) fn admit_directory(
+        &mut self,
         dst: &std::path::Path,
         is_root: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<DirectoryAdmission> {
+        self.validate_directory_begin(dst, is_root)?;
+        if is_root {
+            self.observe_root()?;
+        }
+        Ok(DirectoryAdmission {
+            dst: dst.to_path_buf(),
+            is_root,
+        })
+    }
+    /// Validate discovery state, directory uniqueness, and parent membership.
+    fn validate_directory_begin(&self, dst: &std::path::Path, is_root: bool) -> anyhow::Result<()> {
         self.ensure_discovering()?;
         anyhow::ensure!(
             !self.pending_directories.contains_key(dst)
                 && !self.terminal_directories.contains_key(dst),
             "duplicate DirectoryBegin for {dst:?}"
         );
-        if is_root {
-            anyhow::ensure!(!self.root_observed, "duplicate root item");
-        } else {
+        if !is_root {
             let parent = dst
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("directory has no parent"))?;
@@ -264,8 +279,9 @@ impl DirectoryTracker {
     }
     /// Record a root header before starting its filesystem work.
     pub fn observe_root(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.root_observed, "duplicate root item");
         anyhow::ensure!(
-            !(self.structure_complete && self.root_complete && !self.root_observed),
+            !(self.structure_complete && self.root_complete),
             "root item after DiscoveryComplete(false)"
         );
         self.root_observed = true;
@@ -278,15 +294,13 @@ impl DirectoryTracker {
         ) || self.has_failed_ancestor(dst)
     }
     /// Record a rejected Begin and settle its parent slot exactly once.
-    pub async fn reject_directory(
+    pub(super) async fn reject_directory(
         &mut self,
-        dst: &std::path::Path,
-        is_root: bool,
+        admission: DirectoryAdmission,
     ) -> anyhow::Result<()> {
+        let DirectoryAdmission { dst, is_root } = admission;
+        let dst = dst.as_path();
         self.validate_directory_begin(dst, is_root)?;
-        if is_root {
-            self.observe_root()?;
-        }
         self.terminal_directories.insert(
             dst.to_path_buf(),
             TerminalDirectory::Rejected { sealed: false },
@@ -685,8 +699,17 @@ mod tests {
         )
     }
     async fn register(t: &mut DirectoryTracker, path: &std::path::Path, root: bool) {
-        t.register_directory(path, open_dir(path).await, meta(), root, false, true, None)
+        let admission = t.admit_directory(path, root).unwrap();
+        t.register_directory(admission, open_dir(path).await, meta(), false, true, None)
             .unwrap();
+    }
+    async fn reject(
+        t: &mut DirectoryTracker,
+        dst: &std::path::Path,
+        root: bool,
+    ) -> anyhow::Result<()> {
+        let admission = t.admit_directory(dst, root)?;
+        t.reject_directory(admission).await
     }
     #[tokio::test]
     async fn unsealed_empty_directory_keeps_its_descriptor() {
@@ -782,9 +805,9 @@ mod tests {
         register(&mut t, tmp.path(), true).await;
         t.seal_directory(tmp.path(), 1).await.unwrap();
         t.mark_announced(tmp.path()).await.unwrap();
-        t.reject_directory(&child, false).await.unwrap();
+        reject(&mut t, &child, false).await.unwrap();
         assert!(t.get_dir(tmp.path()).is_none());
-        t.reject_directory(&descendant, false).await.unwrap();
+        reject(&mut t, &descendant, false).await.unwrap();
         t.process_file(&child).await.unwrap();
         t.process_child_entry(&descendant).await.unwrap();
         assert!(t.finish_discovery(true).await.is_err());
@@ -792,7 +815,7 @@ mod tests {
         assert!(t.finish_discovery(true).await.is_err());
         t.seal_directory(&descendant, 8).await.unwrap();
         assert!(t.seal_directory(&child, 5).await.is_err());
-        assert!(t.reject_directory(&child, false).await.is_err());
+        assert!(reject(&mut t, &child, false).await.is_err());
         t.finish_discovery(true).await.unwrap();
         assert!(t.is_done());
     }
@@ -800,7 +823,7 @@ mod tests {
     async fn rejected_root_cannot_finish_discovery_without_end() {
         let mut t = new_tracker();
         let root = std::path::Path::new("/rejected");
-        t.reject_directory(root, true).await.unwrap();
+        reject(&mut t, root, true).await.unwrap();
         assert!(t.finish_discovery(true).await.is_err());
         assert!(t.finish_discovery(false).await.is_err());
         t.seal_directory(root, 0).await.unwrap();
@@ -815,18 +838,7 @@ mod tests {
         assert!(t.seal_directory(&unknown, 0).await.is_err());
         assert!(t.mark_announced(&unknown).await.is_err());
         register(&mut t, tmp.path(), true).await;
-        assert!(
-            t.register_directory(
-                tmp.path(),
-                open_dir(tmp.path()).await,
-                meta(),
-                true,
-                false,
-                true,
-                None
-            )
-            .is_err()
-        );
+        assert!(t.admit_directory(tmp.path(), true).is_err());
         t.mark_announced(tmp.path()).await.unwrap();
         assert!(t.mark_announced(tmp.path()).await.is_err());
         t.seal_directory(tmp.path(), 1).await.unwrap();
@@ -877,21 +889,21 @@ mod tests {
         t.finish_discovery(true).await.unwrap();
         assert!(t.finish_discovery(true).await.is_err());
         assert!(t.ensure_discovering().is_err());
-        assert!(
-            t.register_directory(
-                &tmp.path().join("late"),
-                open_dir(tmp.path()).await,
-                meta(),
-                false,
-                false,
-                true,
-                None
-            )
-            .is_err()
-        );
+        assert!(t.admit_directory(&tmp.path().join("late"), false).is_err());
         assert!(t.seal_directory(tmp.path(), 0).await.is_err());
         t.mark_announced(tmp.path()).await.unwrap();
         assert!(t.is_done());
+    }
+    #[tokio::test]
+    async fn admitted_root_directory_excludes_another_root_before_registration() {
+        let mut t = new_tracker();
+        let _admission = t
+            .admit_directory(std::path::Path::new("/root"), true)
+            .unwrap();
+        assert!(
+            t.observe_root().is_err(),
+            "directory admission must reserve the root before filesystem work"
+        );
     }
     #[tokio::test]
     async fn root_file_can_arrive_after_discovery() {
@@ -899,6 +911,7 @@ mod tests {
         t.finish_discovery(true).await.unwrap();
         assert!(!t.is_done());
         t.observe_root().unwrap();
+        assert!(t.observe_root().is_err());
         t.set_root_complete();
         assert!(t.is_done());
     }
@@ -918,16 +931,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let mut t = new_tracker();
         t.set_root_parent_dir(open_dir(tmp.path()).await);
-        t.register_directory(
-            &root,
-            open_dir(&root).await,
-            meta(),
-            true,
-            true,
-            false,
-            None,
-        )
-        .unwrap();
+        let admission = t.admit_directory(&root, true).unwrap();
+        t.register_directory(admission, open_dir(&root).await, meta(), true, false, None)
+            .unwrap();
         t.mark_announced(&root).await.unwrap();
         assert!(root.exists());
         t.seal_directory(&root, 0).await.unwrap();

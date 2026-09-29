@@ -672,7 +672,9 @@ the tracker lock; paths holding both locks acquire the tracker before the send l
 discovery on connection loss is fatal; no count or metadata is invented to turn it into success.
 Duplicate discovery markers and structural messages after DiscoveryComplete are protocol errors. The
 marker can precede a pending Ready or file completion. A false `has_root_item` is invalid after an
-observed root; a true value still permits the root file header to arrive later.
+observed root; a true value still permits the root file header to arrive later. Root admission is
+exclusive across entry kinds and streams: a duplicate root is rejected before its filesystem work
+begins. A directory claims its root slot before creation or reuse.
 
 The destination retains each accepted directory's held fd, source metadata, and strict-mode
 lockdown/default-ACL guard until finalization. A new directory stays private until its final
