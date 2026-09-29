@@ -7,7 +7,8 @@
 //! redirect operations outside the intended tree.
 
 use std::ffi::{CStr, OsStr};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::num::NonZeroUsize;
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -402,7 +403,7 @@ impl Handle {
 /// description alive for a started closure's full duration even if the
 /// originating `Dir` is dropped mid-flight, preserving the `openat` TOCTOU
 /// guarantee. Later fd-relative methods (`open_file_read`, `create_file`,
-/// `make_dir`, `read_entries`, …) must follow this same clone-Arc-into-closure
+/// `make_dir`, `entries`, `read_entries`, …) must follow this same clone-Arc-into-closure
 /// shape.
 #[derive(Debug)]
 pub struct Dir {
@@ -430,6 +431,126 @@ pub struct Dir {
     /// `create_file`'s blocking closure can consult it AFTER its `openat` (a pre-closure snapshot
     /// races the rollback: the closure can run after the restore with a stale `false`).
     children_may_inherit: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A directory entry returned by a streaming cursor.
+///
+/// The type hint comes from `d_type` and must be checked before acting on the entry.
+#[derive(Debug)]
+pub struct DirectoryEntry {
+    pub name: std::ffi::OsString,
+    pub kind_hint: Option<EntryKind>,
+}
+
+#[cfg(test)]
+type CursorReadHook = Box<dyn FnMut(usize, RawFd) -> std::io::Result<()> + Send>;
+
+/// An independently opened directory stream whose offset survives batch boundaries.
+pub struct DirectoryCursor {
+    iterator: Option<OwnedDirectoryStream>,
+    #[cfg(test)]
+    read_hook: Option<CursorReadHook>,
+}
+
+impl DirectoryCursor {
+    /// Read at most `limit` entries, excluding `.` and `..`; an empty batch means EOF.
+    ///
+    /// An error or cancellation after admission ends this cursor. The blocking job then owns and
+    /// closes its iterator, so a later call cannot rewind or duplicate already yielded entries.
+    pub async fn next_batch(
+        &mut self,
+        limit: NonZeroUsize,
+    ) -> std::io::Result<Vec<DirectoryEntry>> {
+        throttle::get_ops_token().await;
+        let mut iterator = self
+            .iterator
+            .take()
+            .ok_or_else(|| std::io::Error::other("directory cursor was interrupted or failed"))?;
+        #[cfg(test)]
+        let mut read_hook = self.read_hook.take();
+        let (returned, entries) = run_fd_admitted_blocking(move || {
+            let mut entries = Vec::with_capacity(limit.get());
+            while entries.len() < limit.get() {
+                #[cfg(test)]
+                if let Some(read_hook) = read_hook.as_mut() {
+                    read_hook(entries.len(), iterator.as_raw_fd())?;
+                }
+                let Some(entry) = iterator.next_raw_entry()? else {
+                    break;
+                };
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                entries.push(entry);
+            }
+            Ok((iterator, entries))
+        })
+        .await?;
+        self.iterator = Some(returned);
+        Ok(entries)
+    }
+}
+
+/// Owns one `DIR*` and its fd for the entire lifetime of a movable cursor.
+#[derive(Debug)]
+struct OwnedDirectoryStream(std::ptr::NonNull<libc::DIR>);
+
+// SAFETY: ownership is exclusive; the cursor moves into one blocking job at a time, and no
+// `readdir` call or entry reference can overlap a move to another thread.
+unsafe impl Send for OwnedDirectoryStream {}
+
+impl OwnedDirectoryStream {
+    fn from_fd(fd: OwnedFd) -> std::io::Result<Self> {
+        // SAFETY: fd is valid and held exclusively. On failure fdopendir leaves it open, so
+        // OwnedFd closes it; on success closedir takes over responsibility for closing it.
+        let dir = std::ptr::NonNull::new(unsafe { libc::fdopendir(fd.as_raw_fd()) })
+            .ok_or_else(std::io::Error::last_os_error)?;
+        let _ = fd.into_raw_fd();
+        Ok(Self(dir))
+    }
+
+    fn next_raw_entry(&mut self) -> std::io::Result<Option<DirectoryEntry>> {
+        nix::errno::Errno::clear();
+        // SAFETY: self exclusively owns the live stream, and the returned dirent is copied
+        // before another readdir call or the stream's Drop can invalidate it.
+        let raw = unsafe { libc::readdir(self.0.as_ptr()) };
+        if raw.is_null() {
+            let errno = nix::errno::Errno::last_raw();
+            return if errno == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::from_raw_os_error(errno))
+            };
+        }
+        // SAFETY: readdir returned a valid dirent with a NUL-terminated d_name.
+        let entry = unsafe { &*raw };
+        let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
+        let kind_hint = match entry.d_type {
+            libc::DT_UNKNOWN => None,
+            libc::DT_DIR => Some(EntryKind::Dir),
+            libc::DT_LNK => Some(EntryKind::Symlink),
+            libc::DT_REG => Some(EntryKind::File),
+            _ => Some(EntryKind::Special),
+        };
+        Ok(Some(DirectoryEntry {
+            name: OsStr::from_bytes(name.to_bytes()).to_owned(),
+            kind_hint,
+        }))
+    }
+}
+
+impl AsRawFd for OwnedDirectoryStream {
+    fn as_raw_fd(&self) -> RawFd {
+        // SAFETY: self owns the live DIR stream until Drop.
+        unsafe { libc::dirfd(self.0.as_ptr()) }
+    }
+}
+
+impl Drop for OwnedDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: fdopendir transferred this one stream to self on success.
+        unsafe { libc::closedir(self.0.as_ptr()) };
+    }
 }
 
 impl Dir {
@@ -989,6 +1110,30 @@ impl Dir {
         })
     }
 
+    /// Open an independent stream over this held directory.
+    ///
+    /// The `openat` of `.` creates a new open file description, so its offset is independent from
+    /// both this `Dir` and every other cursor. It remains anchored to this already held directory.
+    pub async fn entries(&self) -> std::io::Result<DirectoryCursor> {
+        let dir = Arc::clone(&self.fd);
+        let iterator = run_fd_admitted_blocking(move || {
+            let fd = openat(
+                dir.as_fd(),
+                c".",
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(nix_to_io)?;
+            OwnedDirectoryStream::from_fd(fd)
+        })
+        .await?;
+        Ok(DirectoryCursor {
+            iterator: Some(iterator),
+            #[cfg(test)]
+            read_hook: None,
+        })
+    }
+
     /// Enumerate the directory's entries (excluding `.` and `..`).
     ///
     /// Returns each entry's name and its `getdents` `d_type` as a best-effort
@@ -1020,12 +1165,9 @@ impl Dir {
             // (rewinddir(3) → offset 0), and that `Drop` runs on BOTH normal
             // completion AND the early `?`-return taken on a mid-iteration error
             // — so the dup is always rewound before it is closed, leaving self's
-            // fd at offset 0 either way. This re-entrancy is load-bearing: the
-            // hardened remote source enumerates a directory in Pass 1 and again
-            // in Pass 2 on the *same* `Arc<Dir>`. (Additionally every caller
-            // treats an enumeration error as terminal and never re-enumerates the
-            // directory, so a partially-advanced offset is never observed
-            // regardless.)
+            // fd at offset 0 either way. This preserves repeatable full listings
+            // for local callers. Streaming remote enumeration instead uses
+            // `entries`, whose independent open description keeps its own offset.
             let dup_raw: RawFd =
                 nix::fcntl::fcntl(dir.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))
                     .map_err(nix_to_io)?;
@@ -3319,6 +3461,251 @@ mod tests {
     use crate::preserve::Metadata;
     use crate::testutils;
     use std::io::Read;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn failed_stream_construction_closes_the_owned_fd() -> anyhow::Result<()> {
+        let root_path = tempfile::tempdir()?;
+        let file_path = root_path.path().join("regular-file");
+        std::fs::write(&file_path, b"x")?;
+        let fd: OwnedFd = std::fs::File::open(file_path)?.into();
+        let raw_fd = fd.as_raw_fd();
+        let error = OwnedDirectoryStream::from_fd(fd).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_visits_each_entry_once_across_batches() -> anyhow::Result<()> {
+        let root_path = testutils::create_temp_dir().await?;
+        for index in 0..150 {
+            tokio::fs::write(root_path.join(format!("file-{index:03}")), b"x").await?;
+        }
+        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
+        let mut cursor = root.entries().await?;
+        let mut names = Vec::new();
+        let mut batch_sizes = Vec::new();
+        loop {
+            let batch = cursor.next_batch(NonZeroUsize::new(64).unwrap()).await?;
+            if batch.is_empty() {
+                break;
+            }
+            batch_sizes.push(batch.len());
+            names.extend(batch.into_iter().map(|entry| entry.name));
+        }
+        names.sort();
+        let expected: Vec<_> = (0..150)
+            .map(|index| std::ffi::OsString::from(format!("file-{index:03}")))
+            .collect();
+        assert_eq!(batch_sizes, [64, 64, 22]);
+        assert_eq!(names, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_handles_empty_and_non_utf8_names() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root_path = testutils::create_temp_dir().await?;
+        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
+        let mut empty = root.entries().await?;
+        assert!(
+            empty
+                .next_batch(NonZeroUsize::new(1).unwrap())
+                .await?
+                .is_empty()
+        );
+
+        let name = std::ffi::OsString::from_vec(vec![b'n', 0xff]);
+        tokio::fs::write(root_path.join(&name), b"x").await?;
+        let mut cursor = root.entries().await?;
+        let batch = cursor.next_batch(NonZeroUsize::new(1).unwrap()).await?;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].name, name);
+        assert_eq!(batch[0].kind_hint, Some(EntryKind::File));
+        assert!(
+            cursor
+                .next_batch(NonZeroUsize::new(1).unwrap())
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_cursors_do_not_share_directory_offsets() -> anyhow::Result<()> {
+        let root_path = testutils::create_temp_dir().await?;
+        for index in 0..80 {
+            tokio::fs::write(root_path.join(format!("file-{index:02}")), b"x").await?;
+        }
+        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
+        let mut first = root.entries().await?;
+        let mut second = root.entries().await?;
+        let limit = NonZeroUsize::new(64).unwrap();
+        let first_batch = first.next_batch(limit).await?;
+        let second_batch = second.next_batch(limit).await?;
+        let first_rest = first.next_batch(limit).await?;
+        let second_rest = second.next_batch(limit).await?;
+        let mut first_names: Vec<_> = first_batch
+            .into_iter()
+            .chain(first_rest)
+            .map(|e| e.name)
+            .collect();
+        let mut second_names: Vec<_> = second_batch
+            .into_iter()
+            .chain(second_rest)
+            .map(|e| e.name)
+            .collect();
+        first_names.sort();
+        second_names.sort();
+        let expected: Vec<_> = (0..80)
+            .map(|index| std::ffi::OsString::from(format!("file-{index:02}")))
+            .collect();
+        assert_eq!(first_names, expected);
+        assert_eq!(second_names, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_failure_after_a_partial_read_does_not_restart() -> anyhow::Result<()> {
+        let root_path = testutils::create_temp_dir().await?;
+        for index in 0..3 {
+            tokio::fs::write(root_path.join(format!("file-{index}")), b"x").await?;
+        }
+        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
+        let mut cursor = root.entries().await?;
+        let fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+        cursor.read_hook = Some(Box::new(|accepted, _| {
+            if accepted == 1 {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        }));
+        let limit = NonZeroUsize::new(64).unwrap();
+        assert_eq!(
+            cursor.next_batch(limit).await.unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(
+            cursor.next_batch(limit).await.is_err(),
+            "a failed cursor restarted"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "failed cursor leaked its fd"
+        );
+
+        let mut independent = root.entries().await?;
+        assert_eq!(independent.next_batch(limit).await?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_admitted_batch_retains_its_fd_and_admission_until_exit() -> anyhow::Result<()>
+    {
+        use anyhow::Context;
+        use std::time::Duration;
+
+        let root_path = testutils::create_temp_dir().await?;
+        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
+        let mut inspect = root.entries().await?;
+        let mut raw_names = [
+            inspect
+                .iterator
+                .as_mut()
+                .unwrap()
+                .next_raw_entry()?
+                .unwrap()
+                .name,
+            inspect
+                .iterator
+                .as_mut()
+                .unwrap()
+                .next_raw_entry()?
+                .unwrap()
+                .name,
+        ];
+        raw_names.sort();
+        assert_eq!(
+            raw_names,
+            [
+                std::ffi::OsString::from("."),
+                std::ffi::OsString::from("..")
+            ]
+        );
+        assert!(
+            inspect
+                .iterator
+                .as_mut()
+                .unwrap()
+                .next_raw_entry()?
+                .is_none()
+        );
+        let mut cursor = root.entries().await?;
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_files_in_flight(1);
+        let guard = throttle::open_file_permit().await;
+        let fd_admission = guard.admission();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut started_tx = Some(started_tx);
+        let raw_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_raw_reads = Arc::clone(&raw_reads);
+        cursor.read_hook = Some(Box::new(move |_, fd| {
+            observed_raw_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(started_tx) = started_tx.take() {
+                let _ = started_tx.send(fd);
+                release_rx.recv().map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        }));
+        let task = tokio::spawn(async move {
+            with_fd_admission(fd_admission, async move {
+                let _guard = guard;
+                cursor.next_batch(NonZeroUsize::new(1).unwrap()).await
+            })
+            .await
+        });
+        let fd = started_rx.await.context("blocking batch did not start")?;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "cancelled batch lost its owned fd"
+        );
+        let mut second = Box::pin(throttle::open_file_permit());
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "admission released before read exited"
+        );
+        release_tx
+            .send(())
+            .context("blocking batch ended before release")?;
+        let permit = admission
+            .run_with_timeout(Duration::from_secs(20), second)
+            .await
+            .context("admission was not released after blocking batch exited")?;
+        drop(permit);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "cancelled batch leaked its fd"
+        );
+        assert!(
+            raw_reads.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the blocking job stopped before reading past dot entries; raw reads: {}",
+            raw_reads.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        Ok(())
+    }
 
     const EVERY_KIND: [EntryKind; 4] = [
         EntryKind::File,
@@ -4281,9 +4668,7 @@ mod tests {
         // second call on the SAME Dir must yield the identical entry set, not
         // just an equal count. read_entries dups a fd that shares the directory
         // read offset, so absent nix's rewinddir-on-completion this second call
-        // would see an empty (or partial) listing. The hardened remote source
-        // depends on exactly this re-entrancy (Pass 1 then Pass 2 enumerate the
-        // same Arc<Dir>).
+        // would see an empty (or partial) listing.
         let second = root.read_entries().await?;
         let mut first_names: Vec<_> = first.iter().map(|(name, _)| name.clone()).collect();
         let mut second_names: Vec<_> = second.iter().map(|(name, _)| name.clone()).collect();

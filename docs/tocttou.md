@@ -507,10 +507,13 @@ Specific invariants enforced:
   mode/owner/timestamps — or, under `acl`, with another inode's ACL, which is read from that same fd
   (`read_acls_fd` on a file's data fd, `Dir::read_acls` on the enumerated directory fd): a regular
   file via `open_file_read` → `(File, FileMeta)`; a symlink via the `O_PATH` handle's `read_symlink`
-  (target + metadata off the one fd); a directory via the enumerated `Dir` fd (`read_entries` +
-  `meta`). The remote *destination* is fidelity-safe by construction — it writes the received bytes
-  and applies the received metadata to its single created fd, so there are no two source fds to
-  mismatch. `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
+  (target + metadata off the one fd); a directory via its held, enumerated `Dir` fd. Remote source
+  discovery uses one fd-relative cursor per directory in bounded batches; each discovered name is
+  classified once for filtering and dispatch. A subsequently opened file data fd is checked again
+  and supplies the wire header's metadata and ACLs for the bytes it sends. The remote *destination*
+  is fidelity-safe by construction — it writes the received bytes and applies the received metadata
+  to its single created fd, so there are no two source fds to mismatch.
+  `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
   source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
   `-L`/`--dereference` path.
 
@@ -579,8 +582,8 @@ resolved form — that is the point, and it is why this is opt-in rather than th
 
 ### One shared traversal driver
 
-The recursive safe-walk is not re-implemented per tool. `rcp` (copy), `rchm`, and `rrm` are thin
-[`WalkVisitor`](../common/src/walk_driver.rs) implementations; the single shared driver in
+The recursive safe-walk is not re-implemented per tool. local `rcp` (copy), `rchm`, and `rrm` are
+thin [`WalkVisitor`](../common/src/walk_driver.rs) implementations; the single shared driver in
 `common/src/walk_driver.rs` owns the recursive spawn/classify/permit/drop-before-recurse skeleton,
 so the security-relevant invariants each live in exactly one place:
 
@@ -684,7 +687,7 @@ symlink/path swaps:
 | `rchm`                               | Recursive chmod/chgrp/chown                                                          |
 | `rrm`                                | Recursive remove incl. read-only-dir relax; final empty-slot identity is not pinned  |
 | `--delete` pruning                   | fd-relative prune; by-name removal is contained but does not pin final-slot identity |
-| `rcp` remote copy — source side      | Two-pass fd-map: dirs opened `O_NOFOLLOW`, files read fd-relative                    |
+| `rcp` remote copy — source side      | One held, fd-relative directory cursor; data files opened through pinned parents     |
 | `rcp` remote copy — destination side | Directory fd-map; overwrite has the same contained name-slot semantics as local copy |
 
 Remote `--delete` is unsupported and is rejected by rcp before any operation begins.
@@ -1019,7 +1022,7 @@ caller-provided option string.
 | Metadata ops (chown/chmod/utimes/ACLs)          | Hardened (Linux): fd-based, no path re-resolution                                                                                                                                                                                                                                                                                                         |
 | File data copy                                  | Hardened (Linux): `copy_file_range` or sparse-aware read/write between held source and destination fds                                                                                                                                                                                                                                                    |
 | `--delete` pruning                              | Hardened (Linux): fd-relative enumeration and removal                                                                                                                                                                                                                                                                                                     |
-| Remote copy (source side)                       | Hardened (Linux): two-pass dir-fd map                                                                                                                                                                                                                                                                                                                     |
+| Remote copy (source side)                       | Hardened (Linux): one held cursor per directory and fd-relative data opens                                                                                                                                                                                                                                                                                |
 | Remote copy (destination side)                  | Hardened (Linux): directory tracker fd-map                                                                                                                                                                                                                                                                                                                |
 | Remote `--delete`                               | Not supported (rejected before operation)                                                                                                                                                                                                                                                                                                                 |
 | `--dereference` / `-L`                          | **Not hardened** (follows symlinks by design)                                                                                                                                                                                                                                                                                                             |

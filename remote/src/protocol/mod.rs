@@ -1,56 +1,26 @@
 //! Remote copy protocol definitions for source-destination communication.
 //!
-//! # Protocol Overview
+//! The source listens on a bidirectional control port and a pooled file-data port. Each source
+//! directory sends [`SourceMessage::DirectoryBegin`] before its children and
+//! [`SourceMessage::DirectoryEnd`] with its admitted direct-child count after enumeration. The
+//! destination responds with manifest chunks followed by [`DestinationMessage::DirectoryReady`],
+//! or rejects the directory with [`DestinationMessage::DirectorySkipped`]. File jobs wait for
+//! readiness while directory discovery proceeds independently.
 //!
-//! The remote copy protocol uses TCP for communication between source and destination.
-//! The source listens on two ports: a control port for bidirectional messages and a
-//! data port for file transfers. Both sides exchange messages to coordinate directory
-//! creation, file transfers, and completion.
+//! Directory finalization requires Ready to be flushed, End to be received, and every admitted
+//! child to be terminal. A child directory completes its parent entry after its own finalization
+//! or once upon rejection. [`SourceMessage::DiscoveryComplete`] closes structural discovery;
+//! file data and file outcomes can still arrive afterward.
 //!
-//! See `docs/remote_protocol.md` for the full protocol specification.
+//! Sources report counted pre-header failures with [`SourceMessage::FileSkipped`] and retain
+//! their original errors. Destinations retain their own filesystem errors and use directory
+//! rejection to stop source subtree work. Fatal failures cancel the session and admission waits.
 //!
-//! # Message Flow
+//! [`DestinationMessage::DestinationDone`] signals completion. The source drains owned file
+//! results before closing its pool and control sender; fatal teardown cancels the pool before
+//! joining blocked work. Data and control EOF are unordered transport effects.
 //!
-//! ```text
-//! Source                              Destination
-//!   |                                      |
-//!   |  ---- Directory(root, meta) -------> |  Create root, store metadata
-//!   |  ---- Directory(child, meta) ------> |  Create child, store metadata
-//!   |  ---- Symlink(...) ----------------> |  Create symlink
-//!   |  ---- DirStructureComplete --------> |  Structure complete
-//!   |                                      |
-//!   |  <--- DirectoryManifestChunk(root,..)|  0+ manifest chunks for reused dirs
-//!   |                                      |  under --overwrite/--ignore-existing,
-//!   |                                      |  sent BEFORE the trigger (FIFO)
-//!   |  <--- DirectoryCreated(root) -------- |  Pass-2 trigger
-//!   |  <--- DirectoryCreated(child) ------- |
-//!   |                                      |
-//!   |  ~~~~ File(f) ~~~~~~~~~~~~~~~~~~~~~> |  Write file (not in manifest / differs)
-//!   |  ---- FileUnchanged(g) -----------> |  identical g not transferred
-//!   |                                      |  All files done → apply metadata
-//!   |                                      |
-//!   |  <--- DestinationDone -------------- |  Close send side
-//!   |  (close send side)                   |  (detect EOF)
-//!   |  (detect EOF)                        |  Close connection
-//! ```
-//!
-//! # Error Communication
-//!
-//! The protocol uses asymmetric error communication:
-//! - **Source → Destination**: Must communicate failures (`FileSkipped`, `SymlinkSkipped`)
-//!   so destination can track file counts correctly. `FileUnchanged` is also sent Source →
-//!   Destination but is an optimization notification (not a failure): it signals the source
-//!   skipped a file whose destination copy is already identical, and is counted as
-//!   `files_unchanged` on the destination.
-//! - **Destination → Source**: Does NOT communicate failures. Destination handles
-//!   errors locally and source continues sending the full structure.
-//!
-//! # Shutdown Sequence
-//!
-//! Shutdown is coordinated through TCP connection closure:
-//! 1. Destination sends `DestinationDone` and closes its send side
-//! 2. Source detects EOF on recv, closes its send side
-//! 3. Destination detects EOF on recv, closes connection
+//! See `docs/remote_protocol.md` for ordering, validation, security, and lifecycle guarantees.
 
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
@@ -70,10 +40,9 @@ pub const DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES: usize = 5_000_000;
 /// (see [`common::safedir::apply_acls_fd`]). `Unknown` says the wire carries no ACL information at
 /// all: either the master never asked ([`ExtendedMetadataCapture`]), or the source COULD NOT read
 /// them (a committed directory that failed to open, whose copy is already recorded as an error) —
-/// and the destination must leave the destination entry's ACLs alone. Collapsing the two (the
-/// previous shape, a pair of bare `Option`s) turned that source-side read failure into an
-/// authoritative clear, permanently stripping a reused destination directory's access and default
-/// ACLs on a copy that was already failing.
+/// and the destination must leave the destination entry's ACLs alone. Treating unavailable ACLs as
+/// an authoritative clear would strip a reused destination directory's access and default ACLs
+/// during a source read failure.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum WireAcls {
     /// No ACL information: not captured, or unreadable at the source. The destination must not
@@ -341,18 +310,20 @@ impl<'a> common::preserve::Metadata for FileMetadata<'a> {
 /// Messages sent from source to destination on the control stream.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum SourceMessage {
-    /// Create directory, store metadata, and declare entry counts for completion tracking.
-    /// Sent during directory tree traversal in depth-first order. Source pre-reads the
-    /// directory children before sending, so counts are known at send time.
-    Directory {
+    /// Begin a directory before submitting its children. Final metadata waits for End.
+    DirectoryBegin {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         metadata: Metadata,
         is_root: bool,
-        /// total child entries (files + directories + symlinks) for completion tracking
-        entry_count: usize,
-        /// whether to keep this directory if it ends up empty after filtering
+        /// Whether to retain this directory if no children remain after filtering.
         keep_if_empty: bool,
+    },
+    /// Seal discovery with the number of admitted direct-child obligations.
+    DirectoryEnd {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        entry_count: usize,
     },
     /// Create symlink with metadata.
     Symlink {
@@ -366,7 +337,7 @@ pub enum SourceMessage {
     /// Required before destination can send `DestinationDone`.
     /// `has_root_item` indicates whether a root file/directory/symlink will be sent.
     /// When false (dry-run or filtered root), destination can mark root as complete.
-    DirStructureComplete { has_root_item: bool },
+    DiscoveryComplete { has_root_item: bool },
     /// Notify destination that a file failed to send.
     /// Counts as a processed entry for the parent directory's completion tracking.
     FileSkipped {
@@ -399,33 +370,21 @@ pub enum DestinationMessage {
     /// Carry a chunk of the (reused) destination directory's pre-existing-entry manifest, used
     /// by the source to skip transferring identical files. A directory's manifest is split into
     /// one or more chunks (each well under the control stream's frame limit) and ALL of them are
-    /// sent BEFORE the directory's `DirectoryCreated`; the control stream is FIFO, so the source
-    /// has the complete manifest by the time it sees `DirectoryCreated`. No chunks are sent for a
+    /// sent BEFORE the directory's `DirectoryReady`; the control stream is FIFO, so the source
+    /// has the complete manifest by the time it sees `DirectoryReady`. No chunks are sent for a
     /// freshly-created directory, when neither `--overwrite` nor `--ignore-existing` is active, or
     /// when the directory exceeds the manifest cap (see `RcpdConfig::overwrite_manifest_max_entries`).
     DirectoryManifestChunk {
         dst: std::path::PathBuf,
         entries: Vec<ExistingEntry>,
     },
-    /// Confirm directory created, request file transfers. This is purely the
-    /// Pass-2 trigger: it tells the source the destination created the directory
-    /// and is ready to receive its files. The source already retains the
-    /// authoritative Pass-1 file count for the directory (in its fd-map entry under hardened
-    /// reads, or in a path-keyed Pass-1 entry under `-L`), so no count is echoed back here. Any
-    /// `DirectoryManifestChunk`s for this directory precede this message.
-    DirectoryCreated {
+    /// Confirm readiness to receive files, after all manifest chunks for this directory.
+    DirectoryReady {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
-    /// Acknowledge a `Directory` message the destination did NOT create (create
-    /// failed, ancestor failed, or `--ignore-existing` skipped a non-directory).
-    /// No files will be requested for it. The destination sends exactly one of
-    /// `DirectoryCreated` / `DirectorySkipped` per `Directory` message so the
-    /// source can release the matching Pass-1 entry (a held directory fd under hardened reads, or
-    /// an owned pacing credit under `-L`): without this nack a skipped directory's permit would
-    /// never be released, hanging large no-ack subtrees. `src` keys the source-side entry to
-    /// release (the map is inserted under `src`; see `take_for_skipped`); `dst` is carried for
-    /// symmetry/logging.
+    /// Reject a Begin, settling its parent slot and releasing source readiness credit.
+    /// Every Begin receives exactly one Ready or Skipped unless the session aborts.
     DirectorySkipped {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,

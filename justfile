@@ -67,6 +67,7 @@ lint: _lint-build _lint-targets
     @echo "🔍 Checking walk-driver usage..."
     ./scripts/check-walk-driver-usage.sh
     @echo "🔍 Checking source-read fidelity..."
+    ./scripts/test-check-source-read-fidelity.sh
     ./scripts/check-source-read-fidelity.sh
     @echo "🔍 Checking TLS handshake timeouts..."
     ./scripts/check-tls-handshake-timeout.sh

@@ -41,15 +41,9 @@ pub struct ProtocolVersion {
 /// Bump this on any wire-visible change to `remote/src/protocol` OR a version-sensitive rcpd spawn
 /// argument change whenever the crate version does not also change. The crate version alone cannot
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
-/// cache) would otherwise pass compatibility and then fail — or misbehave — mid-copy. Revision 1
-/// covers the 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture`
-/// gaining `root_acl_notice`; revision 3 covers the first max-files-in-flight rcpd spawn contract;
-/// revision 4 covers source-owned concurrency, its internal overrides, and readiness fields;
-/// revision 5 covers the final daemon CLI contract: removing its unreachable explicit-unlimited
-/// override and requiring a positive remote-copy connection timeout; revision 6 makes the public
-/// `--max-files-in-flight=unlimited` spelling part of the daemon spawn contract; revision 7 adds
-/// `--timings` and `--timings-detail` to that contract.
-pub const WIRE_REVISION: u32 = 7;
+/// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
+/// Revision 8 covers directory Begin/End sealing, explicit Ready, and DiscoveryComplete.
+pub const WIRE_REVISION: u32 = 8;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -264,10 +258,10 @@ mod tests {
     }
 
     #[test]
-    fn current_process_contract_rejects_daemons_without_scoped_timings() {
+    fn current_process_contract_rejects_daemons_without_directory_sealing() {
         let current = ProtocolVersion::current();
         let previous = ProtocolVersion {
-            semantic: format!("{}+w6", current.crate_version()),
+            semantic: format!("{}+w7", current.crate_version()),
             git_describe: None,
             git_hash: None,
         };
@@ -275,7 +269,7 @@ mod tests {
         assert!(!previous.is_compatible_with(&current));
         assert_eq!(
             current.cache_tag(),
-            format!("{}-w7", current.crate_version())
+            format!("{}-w8", current.crate_version())
         );
         assert_ne!(current.cache_tag(), previous.cache_tag());
     }

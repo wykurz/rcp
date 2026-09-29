@@ -1,5 +1,6 @@
 use anyhow::Context;
 use common::safedir::{Dir, RemovalSnapshot};
+use futures::FutureExt;
 use std::ffi::OsStr;
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ fn progress() -> &'static common::progress::Progress {
 /// Resolve the open `Dir` of `dst`'s parent for a fd-relative destination write.
 ///
 /// The destination tracks every created directory's `Dir` in the fd-map, top-down
-/// (a parent's `DirectoryCreated` precedes any message for its children), so for a
+/// (a parent's Begin precedes any message for its children), so for a
 /// non-root entry the parent is always already tracked. For the root entry — whose
 /// parent is the trusted user-specified destination parent and is itself never a
 /// tracked directory — the parent is opened once via `open_parent_dir` and cached in
@@ -610,6 +611,19 @@ async fn peer_close_is_benign(
     t.is_done() || t.is_closing()
 }
 
+/// Recognize transport closure independently of framing, decoding, and protocol failures.
+fn is_peer_closure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        use std::io::ErrorKind::{
+            BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+        };
+        matches!(
+            io.kind(),
+            UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | NotConnected
+        )
+    })
+}
+
 /// The error for a data stream that ended before the transfer completed.
 ///
 /// A FIXED message (never the transport error) so `ErrorCollector` dedups several concurrent
@@ -665,20 +679,7 @@ async fn handle_file_stream(
                 // or `ConnectionReset`, or any other "the peer closed" kind depending on timing. The
                 // clean-EOF shape arrives as `Ok(None)` above; both mean the same thing and share one
                 // gate.
-                let peer_closed = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                    use std::io::ErrorKind::{
-                        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
-                    };
-                    matches!(
-                        io.kind(),
-                        UnexpectedEof
-                            | ConnectionReset
-                            | ConnectionAborted
-                            | BrokenPipe
-                            | NotConnected
-                    )
-                });
-                if peer_closed {
+                if is_peer_closure(&e) {
                     // The kind alone is ambiguous — a truncated header ending in a reset looks
                     // identical to a benign close — so COMPLETION STATE decides, via the same gate
                     // the clean-EOF arm uses. A PRE-completion closure is FATAL: it propagates, the
@@ -700,6 +701,9 @@ async fn handle_file_stream(
                 return Err(e).context("transport or decode fault reading file header");
             }
         };
+        if file_header.is_root {
+            directory_tracker.lock().await.observe_root()?;
+        }
         tracing::info!(
             "Received file: {:?} -> {:?}",
             file_header.src,
@@ -829,9 +833,9 @@ async fn handle_file_stream(
 /// Signal the source to tear down, and stop the local data pool.
 ///
 /// This is the ONE abort funnel for the destination. Closing the control send stream makes the
-/// source observe the close, release its dir-fd budget, and tear down — so a source that is idle (an
+/// source observe the close, close its admission gates, and tear down — so a source that is idle (an
 /// all-empty-file transfer, whose header-only sends never trip a broken pipe) or parked on a
-/// saturated dir-fd budget stops, instead of leaving the destination waiting on `control_future`
+/// saturated admission gate stops, instead of leaving the destination waiting on `control_future`
 /// forever (an infinite hang). Closing the data pool fails the workers' reconnects so they exit.
 ///
 /// Both operations are idempotent, which is what lets every caller invoke it unconditionally: on the
@@ -1243,29 +1247,15 @@ async fn create_symlink(
     }
 }
 
-/// Announce a registered directory to the source: its manifest chunks (if any), then its
-/// `DirectoryCreated` trigger — then mark it announced, which is what unlocks its completion
-/// (see `DirectoryTracker::mark_announced`) and completes it on the spot when its entries are
-/// already all processed: always for a 0-entry directory, and whenever every child (symlinks,
-/// subdirectories) landed off Pass-1 messages while the manifest was still being built.
-///
-/// The chunks stay contiguous with their trigger under ONE stream-lock hold (the per-directory
-/// FIFO guarantee of `remote_protocol.md` §2.3); messages for DIFFERENT directories may
-/// interleave freely around them — the source accumulates chunks keyed by `dst`. The stream mutex
-/// (INNER) is taken WITHOUT the tracker mutex (OUTER) and released before OUTER is taken below:
-/// never hold INNER while acquiring OUTER (see the lock-order note in `run_destination`).
-///
-/// An announce-time completion runs the done-check itself (exactly as the data workers do after
-/// the last file): this announce can run from a per-directory task AFTER the control loop's final
-/// per-message check, so leaving `DestinationDone` to the loop would hang a copy whose last
-/// completing directory finishes here.
-async fn announce_directory_created(
+/// Flush a directory's manifest and Ready contiguously, then evaluate finalization.
+/// Release the send lock before taking the tracker lock to preserve lock ordering.
+/// The announcer checks DestinationDone because it can satisfy the final completion gate.
+async fn announce_directory_ready(
     directory_tracker: &directory_tracker::SharedDirectoryTracker,
     control_send: &remote::streams::BoxedSharedSendStream,
     src: &std::path::Path,
     dst: &std::path::Path,
     existing: Vec<remote::protocol::ExistingEntry>,
-    entry_count: usize,
 ) -> anyhow::Result<()> {
     let manifest_entries = existing.len();
     let chunks =
@@ -1279,17 +1269,16 @@ async fn announce_directory_created(
             };
             stream.send_batch_message(&chunk_msg).await?;
         }
-        let message = remote::protocol::DestinationMessage::DirectoryCreated {
+        let message = remote::protocol::DestinationMessage::DirectoryReady {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
         stream.send_control_message(&message).await?;
     }
     tracing::info!(
-        "Sent DirectoryCreated: {:?} -> {:?} (entries={}, manifest={})",
+        "Sent DirectoryReady: {:?} -> {:?} (manifest={})",
         src,
         dst,
-        entry_count,
         manifest_entries
     );
     let mut tracker = directory_tracker.lock().await;
@@ -1303,6 +1292,11 @@ async fn announce_directory_created(
     }
     Ok(())
 }
+
+/// Identifies a failure to decode or apply a control message, independent of stream teardown.
+#[derive(Debug, thiserror::Error)]
+#[error("source control message failed")]
+struct ControlMessageFailure;
 
 #[instrument(skip(
     error_collector,
@@ -1333,6 +1327,13 @@ async fn process_control_stream(
     while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
         .await
+        .map_err(|error| {
+            if is_peer_closure(&error) {
+                error
+            } else {
+                error.context(ControlMessageFailure)
+            }
+        })
         .context("Failed to receive source message")?
     {
         // reap announce tasks that already finished: without this the set grows by one JoinHandle
@@ -1344,16 +1345,20 @@ async fn process_control_stream(
         throttle::get_ops_token().await;
         tracing::debug!("Received source message: {:?}", source_message);
         let prog = progress();
+        async {
         match source_message {
-            remote::protocol::SourceMessage::Directory {
+            remote::protocol::SourceMessage::DirectoryBegin {
                 ref src,
                 ref dst,
                 ref metadata,
                 is_root,
-                entry_count,
                 keep_if_empty,
             } => {
                 let _ops_guard = prog.ops.guard();
+                directory_tracker
+                    .lock()
+                    .await
+                    .validate_directory_begin(dst, is_root)?;
                 // check for failed ancestor
                 let has_failed_ancestor = {
                     let tracker = directory_tracker.lock().await;
@@ -1361,25 +1366,10 @@ async fn process_control_stream(
                 };
                 if has_failed_ancestor {
                     tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
-                    // nack so the source releases this directory's held fd (it was
-                    // never created, so no files will be requested for it).
-                    {
-                        let tracker = directory_tracker.lock().await;
-                        tracker
-                            .send_directory_skipped(src, dst)
-                            .await
-                            .context("Failed to send DirectorySkipped for skipped directory")?;
-                    }
-                    // still count as a processed child entry for the parent
-                    if !is_root && let Some(parent) = dst.parent() {
-                        directory_tracker
-                            .lock()
-                            .await
-                            .process_child_entry(parent)
-                            .await
-                            .context("Failed to update parent tracker for skipped directory")?;
-                    }
-                    continue;
+                    let mut tracker = directory_tracker.lock().await;
+                    tracker.reject_directory(dst, is_root).await?;
+                    tracker.send_directory_skipped(src, dst).await?;
+                    return Ok(());
                 }
                 // resolve the destination parent directory's held fd (for the root, open
                 // the trusted parent via open_parent_dir). all creation is then fd-relative
@@ -1422,19 +1412,18 @@ async fn process_control_stream(
                 match resolved {
                     Some((dir, reused_lock)) => {
                         // register FIRST, before the next message is processed: children resolve
-                        // their parent through the tracker's fd-map, and the source's Pass-1
-                        // Directory messages for children do not wait for this directory's
-                        // DirectoryCreated.
+                        // their parent through the tracker's fd-map, and child
+                        // DirectoryBegin messages do not wait for this directory's
+                        // DirectoryReady.
                         directory_tracker.lock().await.register_directory(
                             dst,
                             dir.clone(),
                             metadata.clone(),
                             is_root,
                             was_created,
-                            entry_count,
                             keep_if_empty,
                             reused_lock,
-                        );
+                        )?;
                         // a manifest exists only for a REUSED dir under overwrite/ignore-existing;
                         // a freshly-created dir is empty and feature-off needs no manifest.
                         let needs_manifest =
@@ -1443,11 +1432,11 @@ async fn process_control_stream(
                             // Build the manifest OFF the receive loop. Building it inline
                             // (enumerating and stat'ing up to --overwrite-manifest-max-entries =
                             // 5M entries) stalls all reads from the control socket for its whole
-                            // duration; the source keeps sending Pass-1 messages meanwhile, the
+                            // duration; the source keeps sending discovery messages meanwhile, the
                             // receive window closes, and after --remote-keepalive-sec of zero
                             // window the TCP_USER_TIMEOUT on the SOURCE's control socket
                             // terminates an otherwise healthy copy. The task announces the
-                            // directory itself (chunks, then DirectoryCreated); per-directory
+                            // directory itself (chunks, then DirectoryReady); per-directory
                             // ordering is preserved inside the task, and cross-directory
                             // interleaving is fine — the source accumulates chunks keyed by dst.
                             let tracker = directory_tracker.clone();
@@ -1459,47 +1448,39 @@ async fn process_control_stream(
                             let dst = dst.clone();
                             let dir = dir.clone();
                             manifest_tasks.spawn(async move {
-                                // hold the single build slot across the build: one manifest in
-                                // memory at a time preserves the serial build's peak-memory
-                                // profile — the point of the task is to unblock the RECEIVE
-                                // LOOP, not to parallelize builds
-                                let _slot = build_slot
-                                    .acquire_owned()
-                                    .await
-                                    .expect("manifest build slot semaphore is never closed");
-                                let existing =
-                                    build_existing_manifest(&dir, overwrite_manifest_max_entries)
-                                        .await;
-                                if let Err(e) = announce_directory_created(
+                                publish_announce_failure(
                                     &tracker,
-                                    &control_send,
-                                    &src,
-                                    &dst,
-                                    existing,
-                                    entry_count,
+                                    &data_pool,
+                                    &error_collector,
+                                    async {
+                                        let _slot = build_slot
+                                            .acquire_owned()
+                                            .await
+                                            .context("manifest build admission closed")?;
+                                        let existing = build_existing_manifest(
+                                            &dir,
+                                            overwrite_manifest_max_entries,
+                                        )
+                                        .await;
+                                        announce_directory_ready(
+                                            &tracker,
+                                            &control_send,
+                                            &src,
+                                            &dst,
+                                            existing,
+                                        )
+                                        .await
+                                    },
                                 )
-                                .await
-                                {
-                                    // record and signal the source EAGERLY (idempotent): without
-                                    // the trigger the source never sends this directory's files
-                                    // and waits forever — the same rule the data workers follow
-                                    tracing::error!(
-                                        "Failed to announce directory {:?} to the source: {:#}",
-                                        dst,
-                                        e
-                                    );
-                                    error_collector.push(e);
-                                    signal_source_teardown(&tracker, &data_pool).await;
-                                }
+                                .await;
                             });
                         } else {
-                            announce_directory_created(
+                            announce_directory_ready(
                                 &directory_tracker,
                                 &control_send_stream,
                                 src,
                                 dst,
                                 Vec::new(),
-                                entry_count,
                             )
                             .await
                             .context("Failed to announce directory to the source")?;
@@ -1517,29 +1498,13 @@ async fn process_control_stream(
                             ));
                         }
                         let mut tracker = directory_tracker.lock().await;
-                        tracker.mark_directory_failed(dst);
-                        // nack so the source releases this directory's held fd: it was
-                        // not created and no files will be requested for it. Without this
-                        // a no-ack subtree larger than the source's dir-fd budget hangs
-                        // the copy. (Sent even on the fail_early return path below — the
-                        // source's Pass 1 may still be mid-walk when the failure races
-                        // its DestinationDone; an extra nack is harmless there.)
+                        tracker.reject_directory(dst, is_root).await?;
+                        // nack returns the source's Begin credit and wakes its queued work.
+                        // every submitted Begin needs a response, including rejected descendants.
                         tracker
                             .send_directory_skipped(src, dst)
                             .await
                             .context("Failed to send DirectorySkipped for failed directory")?;
-                        // if root directory failed, mark root as complete to avoid hang
-                        if is_root {
-                            tracker.set_root_complete();
-                        }
-                        // failed directory won't go through complete_directory, so
-                        // notify parent immediately
-                        if !is_root && let Some(parent) = dst.parent() {
-                            tracker
-                                .process_child_entry(parent)
-                                .await
-                                .context("Failed to update parent tracker for failed directory")?;
-                        }
                         if create_failed && settings.fail_early {
                             return Err(anyhow::anyhow!(
                                 "destination {dst:?} exists and is not a directory, use --overwrite to replace"
@@ -1550,6 +1515,15 @@ async fn process_control_stream(
                 // note: successfully created directories notify their parent when
                 // they complete (in complete_directory), not here at creation time
             }
+            remote::protocol::SourceMessage::DirectoryEnd {
+                dst, entry_count, ..
+            } => {
+                directory_tracker
+                    .lock()
+                    .await
+                    .seal_directory(&dst, entry_count)
+                    .await?;
+            }
             remote::protocol::SourceMessage::Symlink {
                 ref src,
                 ref dst,
@@ -1557,6 +1531,13 @@ async fn process_control_stream(
                 ref metadata,
                 is_root,
             } => {
+                {
+                    let mut tracker = directory_tracker.lock().await;
+                    tracker.ensure_discovering()?;
+                    if is_root {
+                        tracker.observe_root()?;
+                    }
+                }
                 let _ops_guard = prog.ops.guard();
                 // check for failed ancestor
                 let has_failed_ancestor = {
@@ -1574,7 +1555,7 @@ async fn process_control_stream(
                             .await
                             .context("Failed to update parent tracker for skipped symlink")?;
                     }
-                    continue;
+                    return Ok(());
                 }
                 // resolve the destination parent's held fd (for the root, open the trusted
                 // parent via open_parent_dir), then create the symlink fd-relative on it.
@@ -1614,15 +1595,16 @@ async fn process_control_stream(
                         .context("Failed to update parent tracker for symlink")?;
                 }
             }
-            remote::protocol::SourceMessage::DirStructureComplete { has_root_item } => {
+            remote::protocol::SourceMessage::DiscoveryComplete { has_root_item } => {
                 tracing::info!(
-                    "Received DirStructureComplete (has_root_item={})",
+                    "Received DiscoveryComplete (has_root_item={})",
                     has_root_item
                 );
                 directory_tracker
                     .lock()
                     .await
-                    .set_structure_complete(has_root_item);
+                    .finish_discovery(has_root_item)
+                    .await?;
             }
             remote::protocol::SourceMessage::FileSkipped { ref src, ref dst } => {
                 tracing::info!("File was skipped by source: {:?} -> {:?}", src, dst);
@@ -1660,6 +1642,13 @@ async fn process_control_stream(
                 ref src_dst,
                 is_root,
             } => {
+                {
+                    let mut tracker = directory_tracker.lock().await;
+                    tracker.ensure_discovering()?;
+                    if is_root {
+                        tracker.observe_root()?;
+                    }
+                }
                 tracing::info!(
                     "Symlink was skipped by source: {:?} -> {:?}",
                     src_dst.src,
@@ -1680,6 +1669,10 @@ async fn process_control_stream(
                 }
             }
         }
+            anyhow::Ok(())
+        }
+        .await
+        .context(ControlMessageFailure)?;
         // check if we're done after each message
         let mut tracker = directory_tracker.lock().await;
         if tracker.is_done() {
@@ -1695,11 +1688,11 @@ async fn process_control_stream(
     // wire and the tasks are done or finishing: this drain is quick, and reaping keeps a
     // JoinError from being silently discarded.
     //
-    // Without it, the source closed its stream mid-copy (a Pass-2 abort, a vanished host): the
+    // Without it, the source closed its stream mid-copy (a file-send failure, a vanished host): the
     // copy is failing, and the outstanding tasks are pure liability — each queued one would
     // acquire the single build slot and scan its complete directory (up to
     // --overwrite-manifest-max-entries = 5M entries) only to fail its announce against the closed
-    // peer. The `-L` outstanding-directory credit bounds how many manifest builds can be queued, but
+    // peer. Source Begin credits bound how many manifest builds can be queued, but
     // one build can still scan up to 5M entries or stall indefinitely in filesystem I/O. Draining
     // could therefore stall failure shutdown arbitrarily long. Abort instead: shutdown() cancels
     // queued tasks at their slot acquire and active ones at their next await (the manifest's
@@ -1723,11 +1716,33 @@ async fn process_control_stream(
     Ok(())
 }
 
-/// Record one joined announce task's outcome. A `JoinError` here is close to unreachable — the
-/// workspace builds `panic = "abort"`, so a panicking task ends the process, and the drain paths
-/// never abort tasks before joining them — but silently discarding one would hide a lost
-/// `DirectoryCreated`, so it is recorded and the source signaled (idempotent) like any worker
-/// abort.
+/// Publish an announcer's error or unwind panic before awaiting teardown.
+async fn publish_announce_failure(
+    tracker: &directory_tracker::SharedDirectoryTracker,
+    pool: &DataConnectionPool,
+    errors: &common::error_collector::ErrorCollector,
+    announce: impl std::future::Future<Output = anyhow::Result<()>>,
+) {
+    let result = std::panic::AssertUnwindSafe(announce).catch_unwind().await;
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            anyhow::anyhow!("directory announcer panicked: {message}")
+        }
+    };
+    tracing::error!("directory announcer failed: {error:#}");
+    errors.push(error);
+    signal_source_teardown(tracker, pool).await;
+}
+
+/// Reap owned announcers and report unexpected task-join failures.
+/// Returned errors and unwind panics are published eagerly by the announcer itself.
 async fn reap_announce_task(
     joined: Result<(), tokio::task::JoinError>,
     directory_tracker: &directory_tracker::SharedDirectoryTracker,
@@ -1845,7 +1860,7 @@ pub async fn run_destination(
     // very next statement — is never polled to release it. `join!` polls both, so the loser drains its
     // send, releases OUTER, and the signal then acquires it. This is deadlock-free because the lock
     // order is strictly OUTER ≺ INNER (the `control_send_stream` mutex): INNER is taken either through
-    // a `&mut DirectoryTracker` method, which holds OUTER first, or by `announce_directory_created`
+    // a `&mut DirectoryTracker` method, which holds OUTER first, or by `announce_directory_ready`
     // WITHOUT OUTER — which releases INNER before it takes OUTER for a 0-entry completion, so no one
     // ever holds INNER while acquiring OUTER and no cycle is possible; the source drains the control
     // stream continuously so the loser's send always completes. DO NOT reintroduce an inline
@@ -1867,12 +1882,6 @@ pub async fn run_destination(
             (file_result, control_result)
         }
     };
-    // `file_handler_future` returns Ok even when workers aborted (they record into the collector),
-    // so a stream-level error here is almost always the control future's; either way `take_error`
-    // below prefers the recorded operation cause.
-    let select_result: anyhow::Result<()> = file_result
-        .context("Failed to process incoming file streams")
-        .and(control_result.context("Failed to process control stream"));
     // build summary from progress counters (used by every exit path below; the counters are
     // final now that the select! above has driven both futures to completion).
     let prog = progress();
@@ -1906,28 +1915,37 @@ pub async fn run_destination(
     let completed = directory_tracker.lock().await.is_done();
     let recorded = error_collector.take_error();
     let connect_cause = data_pool.take_first_connect_error();
-    choose_final_result(recorded, select_result, completed, connect_cause, summary)
+    choose_final_result(
+        recorded,
+        file_result,
+        control_result,
+        completed,
+        connect_cause,
+        summary,
+    )
 }
 
-/// Decide the destination's final result from the three teardown signals. Extracted from
-/// [`run_destination`] so the decision matrix — which is easy to get subtly wrong — can be unit
-/// tested directly (see `teardown_tests`).
-///
-/// Priority: (1) a recorded per-operation error is the real user-facing cause; (2) an INCOMPLETE
-/// tracker must never report success even with nothing recorded (a data worker's `pool.connect()`
-/// failing before completion leaves queued files unsent, and the source reads our control-stream
-/// close as graceful) — name the actual cause, preferring the stashed `connect_cause` (e.g.
-/// "connection refused" / "TLS handshake timed out") over a `select_result` teardown symptom, over a
-/// synthetic message; (3) once complete, a late `select_result` error (and any stashed
-/// `connect_cause` from a benign late reconnect) is only a teardown symptom and is swallowed.
+/// Preserve recorded operation failures and control-message failures before considering completion.
+/// Stream teardown and late connection failures are benign only after successful completion.
 fn choose_final_result(
     recorded: Option<anyhow::Error>,
-    select_result: anyhow::Result<()>,
+    file_result: anyhow::Result<()>,
+    control_result: anyhow::Result<()>,
     completed: bool,
     connect_cause: Option<anyhow::Error>,
     summary: common::copy::Summary,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    if let Some(err) = recorded {
+    let control_error = control_result
+        .context("Failed to process control stream")
+        .err();
+    let file_error = file_result
+        .context("Failed to process incoming file streams")
+        .err();
+    let (message_failure, stream_error) = match control_error {
+        Some(error) if error.is::<ControlMessageFailure>() => (Some(error), file_error),
+        control_error => (None, file_error.or(control_error)),
+    };
+    if let Some(err) = recorded.or(message_failure) {
         return Err(common::copy::Error {
             source: err,
             summary,
@@ -1935,20 +1953,18 @@ fn choose_final_result(
         .into());
     }
     if !completed {
-        let cause = connect_cause
-            .or_else(|| select_result.err())
-            .unwrap_or_else(|| {
-                anyhow::anyhow!(
-                    "destination did not receive all expected entries (transfer incomplete)"
-                )
-            });
+        let cause = connect_cause.or(stream_error).unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "destination did not receive all expected entries (transfer incomplete)"
+            )
+        });
         return Err(common::copy::Error {
             source: cause.context("incomplete transfer"),
             summary,
         }
         .into());
     }
-    if let Err(e) = select_result {
+    if let Some(e) = stream_error {
         tracing::debug!("ignoring teardown symptom after successful completion: {e:#}");
     }
     tracing::info!("Destination is done");
@@ -1965,10 +1981,159 @@ mod teardown_tests {
 
     // ── choose_final_result: the completion-gate decision matrix ──
 
+    async fn assert_control_failure_survives_completion(
+        message: remote::protocol::SourceMessage,
+        completes_before_rejection: bool,
+        file_failed: bool,
+    ) {
+        let (source, destination) = tokio::io::duplex(4096);
+        let mut source = remote::streams::SendStream::new(source);
+        source.send_control_message(&message).await.unwrap();
+        source.close().await.unwrap();
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+        )));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        tracker.lock().await.finish_discovery(true).await.unwrap();
+        if completes_before_rejection {
+            tracker.lock().await.set_root_complete();
+        }
+        let control_result = process_control_stream(
+            &test_copy_settings(),
+            10,
+            &common::preserve::preserve_none(),
+            remote::streams::RecvStream::new(Box::new(destination) as remote::streams::BoxedRead),
+            tracker.clone(),
+            send,
+            test_pool(),
+            errors.clone(),
+        )
+        .await;
+        assert!(
+            control_result.is_err(),
+            "the receiver must reject the control message"
+        );
+        if !completes_before_rejection {
+            tracker.lock().await.set_root_complete();
+        }
+        let completed = tracker.lock().await.is_done();
+        assert!(
+            completed,
+            "exercise final selection with a completed tracker"
+        );
+        let file_result = if file_failed {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file stream closed during teardown",
+            )
+            .into())
+        } else {
+            Ok(())
+        };
+        let error = choose_final_result(
+            errors.take_error(),
+            file_result,
+            control_result,
+            completed,
+            None,
+            summary(),
+        )
+        .expect_err("completion must not turn a rejected control message into success");
+        assert!(format!("{error:#}").contains("structural message after DiscoveryComplete"));
+    }
+    #[tokio::test]
+    async fn duplicate_discovery_marker_remains_fatal_after_completion() {
+        for (completes_before_rejection, file_failed) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_control_failure_survives_completion(
+                remote::protocol::SourceMessage::DiscoveryComplete {
+                    has_root_item: true,
+                },
+                completes_before_rejection,
+                file_failed,
+            )
+            .await;
+        }
+    }
+    #[tokio::test]
+    async fn late_structural_message_remains_fatal_after_completion() {
+        for (completes_before_rejection, file_failed) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_control_failure_survives_completion(
+                remote::protocol::SourceMessage::SymlinkSkipped {
+                    src_dst: remote::protocol::SrcDst {
+                        src: "/src".into(),
+                        dst: "/dst".into(),
+                    },
+                    is_root: true,
+                },
+                completes_before_rejection,
+                file_failed,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_control_frame_remains_fatal_after_completion() {
+        for malformed in [false, true] {
+            let reader: remote::streams::BoxedRead = if malformed {
+                Box::new(std::io::Cursor::new(vec![0, 0, 0, 0]))
+            } else {
+                Box::new(FailingReader(std::io::ErrorKind::ConnectionReset))
+            };
+            let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+            )));
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = directory_tracker::make_shared(
+                send.clone(),
+                common::preserve::preserve_none(),
+                false,
+                errors.clone(),
+            );
+            tracker.lock().await.finish_discovery(false).await.unwrap();
+            let control_result = process_control_stream(
+                &test_copy_settings(),
+                10,
+                &common::preserve::preserve_none(),
+                remote::streams::RecvStream::new(reader),
+                tracker.clone(),
+                send,
+                test_pool(),
+                errors.clone(),
+            )
+            .await;
+            assert!(control_result.is_err());
+            let result = choose_final_result(
+                errors.take_error(),
+                Ok(()),
+                control_result,
+                tracker.lock().await.is_done(),
+                None,
+                summary(),
+            );
+            assert_eq!(
+                result.is_err(),
+                malformed,
+                "only a transport closure may be ignored after completion"
+            );
+        }
+    }
+
     #[test]
     fn recorded_error_is_reported_even_when_completed() {
         let r = choose_final_result(
             Some(anyhow::anyhow!("permission denied writing file")),
+            Ok(()),
             Ok(()),
             true,
             None,
@@ -1982,7 +2147,7 @@ mod teardown_tests {
     fn incomplete_without_a_recorded_error_fails_synthetically() {
         // a premature closure records nothing and the streams close cleanly, but the tracker never
         // reached is_done() — must NOT report success.
-        let r = choose_final_result(None, Ok(()), false, None, summary());
+        let r = choose_final_result(None, Ok(()), Ok(()), false, None, summary());
         let e = format!("{:#}", r.unwrap_err());
         assert!(e.to_lowercase().contains("incomplete"), "{e}");
     }
@@ -1991,6 +2156,7 @@ mod teardown_tests {
     fn incomplete_prefers_the_specific_stream_cause() {
         let r = choose_final_result(
             None,
+            Ok(()),
             Err(anyhow::anyhow!("Permission denied creating /dst/foo")),
             false,
             None,
@@ -2007,6 +2173,7 @@ mod teardown_tests {
         // generic message or a select_result teardown symptom).
         let r = choose_final_result(
             None,
+            Ok(()),
             Err(anyhow::anyhow!("peer closed connection")), // teardown symptom
             false,
             Some(anyhow::anyhow!("connection refused")), // the real connect cause
@@ -2024,6 +2191,7 @@ mod teardown_tests {
         let r = choose_final_result(
             None,
             Ok(()),
+            Ok(()),
             true,
             Some(anyhow::anyhow!("connection refused")),
             summary(),
@@ -2036,7 +2204,7 @@ mod teardown_tests {
 
     #[test]
     fn completed_with_no_error_is_success() {
-        assert!(choose_final_result(None, Ok(()), true, None, summary()).is_ok());
+        assert!(choose_final_result(None, Ok(()), Ok(()), true, None, summary()).is_ok());
     }
 
     #[test]
@@ -2045,6 +2213,7 @@ mod teardown_tests {
         // lost the race with the stream close) — success must not flip to failure.
         let r = choose_final_result(
             None,
+            Ok(()),
             Err(anyhow::anyhow!("peer closed connection")),
             true,
             None,
@@ -2164,6 +2333,339 @@ mod teardown_tests {
         ))
     }
 
+    #[tokio::test]
+    async fn final_ready_flushes_before_destination_done_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (writer, reader) = tokio::io::duplex(4096);
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(writer) as remote::streams::BoxedWrite,
+        )));
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            Arc::new(common::error_collector::ErrorCollector::default()),
+        );
+        {
+            let mut tracker = tracker.lock().await;
+            let dir = Arc::new(
+                Dir::open_root_dir(tmp.path(), false, common::Side::Destination)
+                    .await
+                    .unwrap(),
+            );
+            tracker
+                .register_directory(
+                    tmp.path(),
+                    dir,
+                    remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap()),
+                    true,
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap();
+            tracker.seal_directory(tmp.path(), 0).await.unwrap();
+            tracker.finish_discovery(true).await.unwrap();
+        }
+        announce_directory_ready(
+            &tracker,
+            &send,
+            std::path::Path::new("/src"),
+            tmp.path(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!tracker.lock().await.send_destination_done().await.unwrap());
+        let mut reader = remote::streams::RecvStream::new(reader);
+        assert!(matches!(
+            reader
+                .recv_object::<remote::protocol::DestinationMessage>()
+                .await
+                .unwrap(),
+            Some(remote::protocol::DestinationMessage::DirectoryReady { .. })
+        ));
+        assert!(matches!(
+            reader
+                .recv_object::<remote::protocol::DestinationMessage>()
+                .await
+                .unwrap(),
+            Some(remote::protocol::DestinationMessage::DestinationDone)
+        ));
+        assert!(
+            reader
+                .recv_object::<remote::protocol::DestinationMessage>()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn rejected_root_and_submitted_descendant_each_receive_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("file");
+        std::fs::write(&root, "existing").unwrap();
+        let child = root.join("child");
+        let metadata = remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap());
+        let (source, destination) = tokio::io::duplex(4096);
+        let mut source = remote::streams::SendStream::new(source);
+        for message in [
+            remote::protocol::SourceMessage::DirectoryBegin {
+                src: "/src".into(),
+                dst: root.clone(),
+                metadata: metadata.clone(),
+                is_root: true,
+                keep_if_empty: true,
+            },
+            remote::protocol::SourceMessage::DirectoryEnd {
+                src: "/src".into(),
+                dst: root.clone(),
+                entry_count: 1,
+            },
+            remote::protocol::SourceMessage::DirectoryBegin {
+                src: "/src/child".into(),
+                dst: child.clone(),
+                metadata,
+                is_root: false,
+                keep_if_empty: true,
+            },
+            remote::protocol::SourceMessage::DirectoryEnd {
+                src: "/src/child".into(),
+                dst: child.clone(),
+                entry_count: 0,
+            },
+            remote::protocol::SourceMessage::DiscoveryComplete {
+                has_root_item: true,
+            },
+        ] {
+            source.send_control_message(&message).await.unwrap();
+        }
+        let (writer, reader) = tokio::io::duplex(4096);
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(writer) as remote::streams::BoxedWrite,
+        )));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        let mut settings = test_copy_settings();
+        settings.ignore_existing = true;
+        process_control_stream(
+            &settings,
+            10,
+            &common::preserve::preserve_none(),
+            remote::streams::RecvStream::new(Box::new(destination) as remote::streams::BoxedRead),
+            tracker,
+            send,
+            test_pool(),
+            errors.clone(),
+        )
+        .await
+        .unwrap();
+        let mut reader = remote::streams::RecvStream::new(reader);
+        for expected in [root.clone(), child] {
+            assert!(
+                matches!(reader.recv_object::<remote::protocol::DestinationMessage>().await.unwrap(), Some(remote::protocol::DestinationMessage::DirectorySkipped { dst, .. }) if dst == expected)
+            );
+        }
+        assert!(matches!(
+            reader
+                .recv_object::<remote::protocol::DestinationMessage>()
+                .await
+                .unwrap(),
+            Some(remote::protocol::DestinationMessage::DestinationDone)
+        ));
+        assert!(
+            reader
+                .recv_object::<remote::protocol::DestinationMessage>()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(errors.take_error().is_none());
+        assert_eq!(std::fs::read_to_string(root).unwrap(), "existing");
+    }
+
+    #[tokio::test]
+    async fn discovery_marker_rejects_late_structural_messages_before_filesystem_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("late");
+        let metadata = remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap());
+        let messages = [
+            remote::protocol::SourceMessage::DirectoryBegin {
+                src: "/src".into(),
+                dst: dst.clone(),
+                metadata: metadata.clone(),
+                is_root: true,
+                keep_if_empty: true,
+            },
+            remote::protocol::SourceMessage::DirectoryEnd {
+                src: "/src".into(),
+                dst: dst.clone(),
+                entry_count: 0,
+            },
+            remote::protocol::SourceMessage::Symlink {
+                src: "/src".into(),
+                dst: dst.clone(),
+                target: "target".into(),
+                metadata,
+                is_root: true,
+            },
+            remote::protocol::SourceMessage::SymlinkSkipped {
+                src_dst: remote::protocol::SrcDst {
+                    src: "/src".into(),
+                    dst: dst.clone(),
+                },
+                is_root: true,
+            },
+        ];
+        for message in messages {
+            let (source, destination) = tokio::io::duplex(4096);
+            let mut source = remote::streams::SendStream::new(source);
+            source
+                .send_control_message(&remote::protocol::SourceMessage::DiscoveryComplete {
+                    has_root_item: true,
+                })
+                .await
+                .unwrap();
+            source.send_control_message(&message).await.unwrap();
+            source.close().await.unwrap();
+            let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+                Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
+            )));
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = directory_tracker::make_shared(
+                send.clone(),
+                common::preserve::preserve_none(),
+                false,
+                errors.clone(),
+            );
+            let result = process_control_stream(
+                &test_copy_settings(),
+                10,
+                &common::preserve::preserve_none(),
+                remote::streams::RecvStream::new(
+                    Box::new(destination) as remote::streams::BoxedRead
+                ),
+                tracker,
+                send,
+                test_pool(),
+                errors,
+            )
+            .await;
+            let error = result.expect_err("structural traffic must stop at DiscoveryComplete");
+            assert!(format!("{error:#}").contains("structural message after DiscoveryComplete"));
+            assert!(std::fs::symlink_metadata(&dst).is_err());
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    #[tokio::test]
+    async fn announcer_panic_cancels_pool_while_source_waits_for_ready() {
+        struct PanicOnce {
+            panicked: bool,
+            stream: tokio::io::DuplexStream,
+        }
+        impl tokio::io::AsyncWrite for PanicOnce {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if !self.panicked {
+                    self.panicked = true;
+                    panic!("announcer test panic");
+                }
+                std::task::Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (source_receive, destination_send) = tokio::io::duplex(4096);
+        let mut source_receive = remote::streams::RecvStream::new(source_receive);
+        let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            Box::new(PanicOnce {
+                panicked: false,
+                stream: destination_send,
+            }) as remote::streams::BoxedWrite,
+        )));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let tracker = directory_tracker::make_shared(
+            send.clone(),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        let pool = test_pool();
+        let (source, destination) = tokio::io::duplex(4096);
+        let mut source = remote::streams::SendStream::new(source);
+        source
+            .send_control_message(&remote::protocol::SourceMessage::DirectoryBegin {
+                src: "/src".into(),
+                dst: tmp.path().to_owned(),
+                metadata: remote::protocol::Metadata::from(&std::fs::metadata(tmp.path()).unwrap()),
+                is_root: true,
+                keep_if_empty: true,
+            })
+            .await
+            .unwrap();
+        let mut settings = test_copy_settings();
+        settings.overwrite = true;
+        let preserve = common::preserve::preserve_none();
+        let receive = process_control_stream(
+            &settings,
+            10,
+            &preserve,
+            remote::streams::RecvStream::new(Box::new(destination) as remote::streams::BoxedRead),
+            tracker,
+            send,
+            pool.clone(),
+            errors.clone(),
+        );
+        tokio::pin!(receive);
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut receive => panic!("source is idle, receive unexpectedly ended: {result:?}"),
+                () = pool.cancel.cancelled() => {},
+            }
+        }).await;
+        assert!(
+            cancelled.is_ok(),
+            "an announcer panic must publish cancellation without another source message"
+        );
+        let error = errors
+            .take_error()
+            .expect("panic must be recorded before cancellation");
+        assert!(format!("{error:#}").contains("announcer test panic"));
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            source_receive.recv_object::<remote::protocol::DestinationMessage>(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            closed.is_none(),
+            "source waiting for Ready must observe destination teardown"
+        );
+        source.close().await.unwrap();
+        receive.await.unwrap();
+    }
+
     async fn run_over_reader(
         tracker: directory_tracker::SharedDirectoryTracker,
         pool: std::sync::Arc<DataConnectionPool>,
@@ -2264,7 +2766,7 @@ mod teardown_tests {
     async fn peer_closure_after_completion_is_benign() {
         let t = tracker_over_sink();
         // has_root_item=false sets structure_complete AND root_complete → is_done() == true.
-        t.lock().await.set_structure_complete(false);
+        t.lock().await.finish_discovery(false).await.unwrap();
         assert!(t.lock().await.is_done());
         let r = run_handle_file_stream(t, std::io::ErrorKind::UnexpectedEof).await;
         assert!(

@@ -6,15 +6,15 @@
 # metadata come from the SAME fd:
 #   files    -> Dir::open_file_read(name) -> (File, FileMeta)
 #   symlinks -> Handle::read_symlink(side) -> (PathBuf, FileMeta)
-#   dirs     -> Dir::read_entries + Dir::meta (same fd)
+#   dirs     -> Dir::entries/read_entries + Dir::meta (same held directory)
 #
 # Legitimate exceptions — the `-L`/--dereference path-based walk (intentionally not hardened) and
 # destination-side reads — are marked inline with `// rcp-toctou-allow: <reason>` and skipped.
 #
-# Scope: non-test code only (lines before the first `#[cfg(test)]`; each scanned file keeps its unit
-# tests in a single module at the bottom, or has none).
+# Scope: lines before the final top-level #[cfg(test)] module. Test-only fields and hooks do not
+# end the scan; each scanned file keeps its unit-test module at the bottom, or has none.
 #
-# Uses only standard Unix tools (grep/head/cut) available in GitHub CI.
+# Uses only standard Unix tools available in GitHub CI.
 
 set -euo pipefail
 
@@ -24,8 +24,8 @@ echo "🔍 Checking source-read fidelity (no by-name/path source payload reads).
 # safedir.rs is scanned too because it is where the fd-paired primitives themselves live: a by-path
 # read added next to them is exactly the regression the `*xattr` patterns below exist to catch, and
 # it would not be caught by scanning only the callers. Its own tests read by path deliberately and
-# sit below the single `#[cfg(test)]`, which this scan already excludes.
-FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/source.rs"
+# sit inside the final test module, which this scan excludes.
+FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/source.rs rcp/src/source/discovery.rs"
 # the by-name / by-path SOURCE payload reads. NOT metadata/symlink_metadata: those have legitimate
 # dst-existence / -L / test uses and are not the drift vector (metadata pairing is structural).
 #
@@ -44,13 +44,14 @@ for file in $FILES; do
         echo -e "${RED}ERROR: expected file not found: $file${NC}"
         exit 1
     fi
-    # non-test portion: lines before the first `#[cfg(test)]` (whole file if none).
-    cut_line=$(grep -n -m1 -F '#[cfg(test)]' "$file" | cut -d: -f1 || true)
-    if [ -n "$cut_line" ]; then
-        end=$((cut_line - 1))
-    else
-        end=$(wc -l < "$file")
-    fi
+    # only a top-level test module ends production code; a cfg(test) field or hook cannot hide it.
+    end=$(awk '
+        /^#\[cfg\(test\)\]$/ { test_attribute = NR; next }
+        /^mod [[:alnum:]_]+[[:space:]]*\{/ && test_attribute == NR - 1 {
+            print test_attribute - 1; found = 1; exit
+        }
+        END { if (!found) print NR }
+    ' "$file")
     body=$(head -n "$end" "$file")
     for pattern in $PATTERNS; do
         # -F fixed string, -n line numbers; drop allow-marked lines; tolerate no-match under set -e.

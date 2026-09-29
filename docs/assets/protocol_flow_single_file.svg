@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 790 330" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="single-file-title single-file-desc">
   <title id="single-file-title">Single-file remote copy flow</title>
-  <desc id="single-file-desc">Source announces that directory structure is complete and sends the root file over an existing pooled data connection. The destination data worker sends DestinationDone, which triggers source shutdown; the destination control receiver later observes source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails, with no guaranteed ordering between data and control EOF.</desc>
-  <!-- Section 4.2 Single File Copy -->
+  <desc id="single-file-desc">Source announces that discovery is complete and sends the root file over an existing pooled data connection. The destination data worker sends DestinationDone, which triggers source shutdown; the destination control receiver later observes source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails, with no guaranteed ordering between data and control EOF.</desc>
+  <!-- single-file copy -->
   <defs>
     <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
@@ -22,7 +22,7 @@
   <line x1="555" y1="50" x2="555" y2="224" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
 
   <line x1="190" y1="94" x2="549" y2="94" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
-  <text x="372" y="88" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirStructureComplete</text>
+  <text x="372" y="88" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DiscoveryComplete(true)</text>
   <text x="565" y="98" text-anchor="start" font-size="12.5" fill="#64748b">no directories</text>
 
   <line x1="190" y1="142" x2="549" y2="142" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ar-data)"/>

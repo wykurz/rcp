@@ -5104,7 +5104,7 @@ mod copy_tests {
             };
             let (summary, processed) = run_with_open_file_cleanup(
                 &admission,
-                crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
                     Arc::clone(&visitor),
                     src_dir,
                     &root_cx,
@@ -5184,7 +5184,7 @@ mod copy_tests {
             // prune that consumes the driver's processed-child keep-set.
             let (summary, processed) = run_with_open_file_cleanup(&admission, async {
                 let (mut summary, processed) =
-                    crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                    crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
                         Arc::clone(&visitor),
                         src_dir,
                         &root_cx,
@@ -5269,7 +5269,7 @@ mod copy_tests {
             };
             let (summary, processed) = run_with_open_file_cleanup(
                 &admission,
-                crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
                     visitor,
                     src_dir,
                     &root_cx,

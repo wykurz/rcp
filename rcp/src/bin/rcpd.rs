@@ -435,8 +435,8 @@ where
     // fires at all. Without this reader the kernel marks the socket dead and nothing observes it:
     // both rcpds keep copying to each other, or waiting on each other, indefinitely. The
     // `select!`s below cancel the operation the moment this fires; dropping the operation future
-    // is the same cancel-safe teardown the stdin watchdog performs (see CANCEL SAFETY in
-    // `async_main` — in particular, reused-directory lockdown guards restore on drop).
+    // drops owned tasks inside `run_with_stdin_watchdog`'s surviving task scope; reused-directory
+    // lockdown guards restore before that scope returns.
     let master_watchdog = async move {
         loop {
             match master_recv_stream
@@ -596,6 +596,52 @@ where
     Ok(rcpd_result)
 }
 
+async fn run_with_stdin_watchdog<Operation, Watchdog>(
+    operation: Operation,
+    watchdog: Option<Watchdog>,
+    result_committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> remote::protocol::RcpdResult
+where
+    Operation: std::future::Future<Output = anyhow::Result<remote::protocol::RcpdResult>>,
+    Watchdog: std::future::Future<Output = ()>,
+{
+    // watchdog cancellation drops the losing operation inside this surviving scope, so aborted
+    // descendants release their captures before daemon teardown can finish
+    common::task_scope::scope_tasks(async move {
+        let map_result = |result: anyhow::Result<remote::protocol::RcpdResult>| match result {
+            Ok(result) => result,
+            Err(error) => remote::protocol::RcpdResult::Failure {
+                error: format!("{error:#}"),
+                summary: common::copy::Summary::default(),
+                runtime_stats: common::collect_runtime_stats(),
+            },
+        };
+        if let Some(watchdog) = watchdog {
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                result = &mut operation => map_result(result),
+                () = watchdog => {
+                    if result_committed.load(std::sync::atomic::Ordering::SeqCst) {
+                        // stdin EOF after result commitment belongs to normal master shutdown
+                        map_result(operation.await)
+                    } else {
+                        tracing::error!("Master (rcp) disconnected - stdin closed. Shutting down.");
+                        remote::protocol::RcpdResult::Failure {
+                            error: "master (rcp) disconnected - stdin closed".to_string(),
+                            summary: common::copy::Summary::default(),
+                            runtime_stats: common::collect_runtime_stats(),
+                        }
+                    }
+                }
+            }
+        } else {
+            map_result(operation.await)
+        }
+    })
+    .await
+}
+
 #[instrument]
 async fn async_main(
     args: Args,
@@ -729,118 +775,22 @@ async fn async_main(
             "disabled (stdin closed)"
         }
     );
-    // only start monitoring stdin if it's actually available
-    let stdin_watchdog = if stdin_available {
-        Some(tokio::spawn(stdin_monitor()))
-    } else {
-        None
-    };
-    // run operation with stdin monitoring (if available)
-    // if stdin closes while running, abort immediately
-    let rcpd_result = if let Some(watchdog) = stdin_watchdog {
-        // stdin is available - monitor for disconnection
-        // CANCEL SAFETY: both branches are cancel-safe. `run_operation` is a
-        // high-level future that can be dropped safely.
-        //
-        // The watchdog branch must NOT `process::exit` here, and that is a
-        // correctness requirement rather than tidiness. `run_operation` owns the
-        // `DirectoryTracker`, whose `pending_directories` holds a
-        // `common::safedir::ReusedDirLock` for every destination directory
-        // currently locked down under `--require-toctou-safe`. Each of those
-        // guards holds the ONLY copy of that directory's original default ACL —
-        // the lockdown removed it from the filesystem — and puts it back in its
-        // `Drop`. `process::exit` does not unwind, so exiting from inside this
-        // branch would terminate with `run_operation`'s future still alive and
-        // permanently destroy every one of those ACLs.
-        //
-        // This is not an exotic path: it is the normal consequence of the master
-        // going away, INCLUDING a master `--fail-early` abort (master exits, SSH
-        // closes, our stdin hits EOF, watchdog fires). So it returns a Failure
-        // instead. The `select!` then drops `run_operation`'s future, the tail
-        // below maps Failure to `Err`, and `common::run` drops the tokio runtime
-        // — which drops every remaining task, and with them every `Arc` clone of
-        // the tracker — before `main` exits 1. The guards fire during that
-        // runtime drop rather than racing it.
-        //
-        // The older comment here said there was no point cleaning up because the
-        // master is dead. That predates the lockdown; there is a point now.
-        let result_committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let operation = run_operation(
-            args.clone(),
-            &tcp_config,
-            concurrency,
-            master_send_stream,
-            master_recv_stream,
-            cert_key.clone(),
-            result_committed.clone(),
-        );
-        tokio::pin!(operation);
-        let map_result = |result: anyhow::Result<remote::protocol::RcpdResult>| match result {
-            Ok(r) => r,
-            Err(e) => {
-                let runtime_stats = common::collect_runtime_stats();
-                remote::protocol::RcpdResult::Failure {
-                    error: format!("{e:#}"),
-                    summary: common::copy::Summary::default(),
-                    runtime_stats,
-                }
-            }
-        };
-        tokio::select! {
-            // biased: a finished operation beats a simultaneously-ready stdin EOF
-            biased;
-            result = &mut operation => map_result(result),
-            _ = watchdog => {
-                if result_committed.load(std::sync::atomic::Ordering::SeqCst) {
-                    // the master consumed our result and exited — its SSH channel closing is the
-                    // ORDINARY end of a finished operation, not a disconnect. Finish the (short,
-                    // best-effort) tail of the operation instead of rewriting a committed success
-                    // into an exit-1 master loss.
-                    tracing::debug!(
-                        "stdin closed after the result was committed; finishing shutdown"
-                    );
-                    map_result(operation.await)
-                } else {
-                // stdin closed - master disconnected. Wind down through the normal
-                // return path (see CANCEL SAFETY above) rather than exiting here,
-                // so armed reused-directory lockdowns restore their ACLs.
-                tracing::error!(
-                    "Master (rcp) disconnected - stdin closed. \
-                     This usually means the master process was killed or the SSH connection was terminated. \
-                     Shutting down."
-                );
-                remote::protocol::RcpdResult::Failure {
-                    error: "master (rcp) disconnected - stdin closed".to_string(),
-                    summary: common::copy::Summary::default(),
-                    runtime_stats: common::collect_runtime_stats(),
-                }
-                }
-            }
-        }
-    } else {
-        // stdin not available - rely on TCP timeouts only
-        match run_operation(
-            args.clone(),
-            &tcp_config,
-            concurrency,
-            master_send_stream,
-            master_recv_stream,
-            cert_key.clone(),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let runtime_stats = common::collect_runtime_stats();
-                remote::protocol::RcpdResult::Failure {
-                    error: format!("{e:#}"),
-                    summary: common::copy::Summary::default(),
-                    runtime_stats,
-                }
-            }
-        }
-    };
+    let result_committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let operation = run_operation(
+        args.clone(),
+        &tcp_config,
+        concurrency,
+        master_send_stream,
+        master_recv_stream,
+        cert_key.clone(),
+        result_committed.clone(),
+    );
+    let rcpd_result = run_with_stdin_watchdog(
+        operation,
+        stdin_available.then(stdin_monitor),
+        result_committed,
+    )
+    .await;
     // cancel tracing task and wait for it to finish — BOUNDED: the sender polls its cancellation
     // token only between messages, so one suspended mid-send on a partitioned (or
     // stopped-reading) master would otherwise hold this await for a whole transport timeout
@@ -977,6 +927,109 @@ fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HeldCapture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for HeldCapture {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    async fn operation_holding_children(
+        dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        cancel: tokio::sync::oneshot::Sender<()>,
+    ) -> anyhow::Result<remote::protocol::RcpdResult> {
+        let mut children = tokio::task::JoinSet::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_capture = HeldCapture(dropped.clone());
+        common::task_scope::spawn_tracked(&mut children, async move {
+            let _capture = started_capture;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let unpolled_capture = HeldCapture(dropped);
+        common::task_scope::spawn_tracked(&mut children, async move {
+            let _capture = unpolled_capture;
+            std::future::pending::<()>().await;
+        });
+        let _ = cancel.send(());
+        std::future::pending().await
+    }
+    #[tokio::test]
+    async fn stdin_eof_waits_for_started_and_unpolled_captures() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let operation =
+            common::task_scope::scope_tasks(operation_holding_children(dropped.clone(), cancel));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_stdin_watchdog(
+                operation,
+                Some(async move {
+                    let _ = cancelled.await;
+                }),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        )
+        .await
+        .expect("stdin cancellation must drain child captures");
+        assert!(
+            matches!(result, remote::protocol::RcpdResult::Failure { error, .. } if error.contains("stdin closed"))
+        );
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn master_disconnect_waits_for_started_and_unpolled_captures() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let work =
+            common::task_scope::scope_tasks(operation_holding_children(dropped.clone(), cancel));
+        let operation = async move {
+            tokio::select! {
+                biased;
+                result = work => result,
+                _ = cancelled => Err(anyhow::anyhow!("master control connection lost")),
+            }
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_stdin_watchdog(
+                operation,
+                None::<std::future::Pending<()>>,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        )
+        .await
+        .expect("master cancellation must drain child captures");
+        assert!(
+            matches!(result, remote::protocol::RcpdResult::Failure { error, .. } if error == "master control connection lost")
+        );
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn committed_result_survives_stdin_eof_during_cleanup() {
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark_committed = committed.clone();
+        let operation = async move {
+            mark_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(remote::protocol::RcpdResult::Success {
+                message: "copy complete".to_string(),
+                summary: common::copy::Summary::default(),
+                runtime_stats: common::collect_runtime_stats(),
+            })
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_stdin_watchdog(operation, Some(std::future::ready(())), committed),
+        )
+        .await
+        .expect("committed operation must finish cleanup");
+        assert!(matches!(
+            result,
+            remote::protocol::RcpdResult::Success { .. }
+        ));
+    }
 
     fn daemon_args(extra: &[&str]) -> Args {
         let mut argv = vec!["rcpd", "--role=source"];

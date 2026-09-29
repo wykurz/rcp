@@ -92,7 +92,7 @@ fn require_local_ssh() {
 }
 
 #[tokio::test]
-async fn remote_scoped_timings_cover_both_walks_and_all_process_roles() {
+async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
         std::sync::LazyLock::new(common::progress::Progress::new);
@@ -157,12 +157,7 @@ async fn remote_scoped_timings_cover_both_walks_and_all_process_roles() {
             assert_eq!(operation["count"], 1);
             assert_eq!(operation["finished"], 1);
             if role == "rcpd-source" {
-                for (name, count) in [
-                    ("source.pass1", 1),
-                    ("source.pass1.scan", 3),
-                    ("source.pass2", 3),
-                    ("source.pass2.scan", 2),
-                ] {
+                for (name, count) in [("source.discovery", 1), ("source.directory.scan", 3)] {
                     let scope = scopes.iter().find(|scope| scope["name"] == name).unwrap();
                     assert_eq!(scope["count"], count, "{name}");
                     assert_eq!(scope["interrupted"], 0, "{name}");
@@ -1498,33 +1493,22 @@ fn test_remote_overwrite_directory_with_directory() {
     assert_eq!(summary.bytes_copied, 24); // "content1" (8) + "content2" (8) + "content3" (8)
 }
 
-/// A reused destination directory's `DirectoryCreated` runs from a per-directory task — it must
-/// first build the overwrite manifest (`remote_protocol.md` §2.3) — while symlink/subdirectory
-/// children arrive as Pass-1 control messages that do NOT wait for that trigger. A source
-/// directory holding only such children can therefore have every entry processed while the
-/// manifest is still being enumerated, and completing it then would send `DestinationDone` and
-/// close the control send stream out from under the directory's own queued announce: the copy
-/// did everything right and still exited 1 with a broken-pipe/closed-stream announce failure.
-/// Completion is gated on the announce (`DirectoryTracker::mark_announced`); this test pins the
-/// end-to-end symptom.
-///
-/// The window is deterministic by SIZE, not sleeps or luck: enumerating + stat'ing the reused
-/// root's 20k pre-existing entries takes orders of magnitude longer than the millisecond in
-/// which the destination processes the source's entire Pass-1 (one symlink plus
-/// `DirStructureComplete`) — before the gate, that always reached `DestinationDone` first.
+/// A reused destination directory announces Ready only after building its overwrite manifest.
+/// Symlink children and End can arrive earlier; completion must wait until Ready is flushed.
+/// A large destination manifest exercises that ordering without delaying source discovery.
 #[test]
 fn test_remote_overwrite_reused_dir_completes_only_after_announce() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // symlink target: a real file OUTSIDE the copied root, so the tree holds NO file entries —
-    // files are requested via the Pass-2 trigger and would mask the race by keeping the
+    // file sends wait for Ready and would mask the race by keeping the
     // directory's count open until after the announce
     let target = src_dir.path().join("outside.txt");
     create_test_file(&target, "symlink target", 0o644);
     let src_root = src_dir.path().join("tree");
     std::fs::create_dir(&src_root).unwrap();
     std::os::unix::fs::symlink(&target, src_root.join("link")).unwrap();
-    // reused destination root, pre-populated so the manifest build is slow relative to Pass-1
+    // reused destination root, pre-populated so the manifest build is slow relative to source discovery
     let dst_root = dst_dir.path().join("tree");
     std::fs::create_dir(&dst_root).unwrap();
     for i in 0..20_000 {
@@ -1923,15 +1907,8 @@ fn can_read_unreadable_dir() -> bool {
     readable
 }
 
-/// A root directory that EXISTS but is unreadable (`chmod 000`) must, in hardened
-/// mode WITHOUT `--fail-early`, produce an EMPTY destination directory and SUCCEED
-/// at the protocol level (an empty dir landed, only its contents could not be
-/// read), rather than aborting with a fail-closed "no held directory fd" error.
-///
-/// This exercises Change A (the unreadable-directory tombstone): the source can't
-/// open the root dir, sends a 0-entry `Directory`, and registers a tombstone so the
-/// destination's `DirectoryCreated` ack is consumed instead of hitting the
-/// fail-closed miss path. Before the tombstone fix this aborted the copy.
+/// A classified but unreadable root sends Begin and End(0), then consumes Ready or Skipped.
+/// The directory lands empty and the original read failure remains an error for the operation.
 #[test]
 fn test_remote_copy_unreadable_root_directory_continues() {
     require_local_ssh();
@@ -2011,7 +1988,7 @@ fn test_remote_copy_file_skipped_under_failed_parent_does_not_abort() {
     let (src_dir, dst_dir) = setup_test_env();
     // source: a directory `conflict` whose ONLY child is the subdirectory `sub`
     // (so `conflict`'s entry_count == 1, file_count == 0). `sub` is chmod 000 so the
-    // source's `open_dir("sub")` from `conflict`'s held fd fails EACCES at Pass-1,
+    // source's `open_dir("sub")` from `conflict`'s held fd fails EACCES after admission,
     // emitting a counted-child `FileSkipped` for `sub` under parent `conflict`.
     let src_conflict = src_dir.path().join("conflict");
     std::fs::create_dir(&src_conflict).unwrap();
@@ -2051,10 +2028,7 @@ fn test_remote_copy_file_skipped_under_failed_parent_does_not_abort() {
     );
 }
 
-/// Dereference (`-L`) copy of a directory tree, exercising the source-side path-keyed Pass-1
-/// entries. Because `DirectoryCreated` does not carry the count, `-L` retains each directory's
-/// contents and pacing credit. The directory is reached through a symlink and must be copied as a
-/// real directory with all files present.
+/// Dereference (`-L`) discovery follows the root symlink and copies a real directory tree.
 #[test]
 fn test_remote_copy_dereference_directory_tree() {
     require_local_ssh();
@@ -2916,22 +2890,22 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
             spawn_start.elapsed()
         );
     }
-    // second barrier, for the SOURCE-side half of this test (the close-attribution warning asserted
+    // second barrier, for the SOURCE-side half of this test (the close-attribution error asserted
     // at the end). It is the same FIN-vs-RST argument as above, applied to the OTHER control
     // connection: the destination also holds a control connection to the source rcpd, and the source
-    // sends exactly one message on it for a single-file copy - `DirStructureComplete`. Kill the
+    // sends exactly one message on it for a single-file copy - `DiscoveryComplete`. Kill the
     // destination with that message still queued and its kernel answers with an RST, which the source
     // reads as `RecvResult::Error` and reports as a transport failure - a different branch, so the
-    // warning would only be observed by luck. The destination logs this marker immediately after
+    // clean-EOF error would only be observed by luck. The destination logs this marker immediately after
     // consuming that message (rcp/src/destination.rs), so seeing it means the queue is drained and
-    // SIGKILL yields a clean FIN, which is the `RecvResult::StreamClosed` branch under test.
+    // SIGKILL yields a clean FIN, which is the dispatcher's missing-DestinationDone branch under test.
     //
     // Waiting for it does not weaken the master-side barrier above: the master sends nothing on its
     // own control connection to the destination after `MasterHello::Destination`, so that queue stays
     // drained no matter how much later the kill lands. And the copy cannot finish first: the source
     // reserves the whole file's iops budget before it opens the file at all (rcp/src/source.rs), so
     // it is ~10s from sending even the header when this marker appears.
-    let structure_marker = "Received DirStructureComplete";
+    let structure_marker = "Received DiscoveryComplete";
     // its own origin, not `spawn_start`: the barrier above may already have consumed most of that
     // budget, and a timeout measured from it would blame this marker for the first barrier's delay
     let structure_wait_start = std::time::Instant::now();
@@ -3022,22 +2996,18 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
          wording, which exercises an already-correct branch); got:\n{combined}"
     );
     eprintln!("✓ master reported a clean error (exit 1) instead of aborting");
-    // the SOURCE saw the same death on its own control connection, as EOF without a preceding
-    // `DestinationDone`. That path still returns Ok by design - not because the destination reported
-    // its own failure (it was SIGKILLed, so it reported NOTHING, which is exactly what the assertion
-    // above pins), but because the master's read of the destination's result is mandatory and fails
-    // the copy either way. Staying quiet there conceals nothing, which is precisely why this has to
-    // be visible in the log rather than in an exit code. Assert against the rcpd debug log rather
-    // than the master's forwarded output: only the source rcpd runs the dispatch loop that emits
-    // this, and the log file is written before the master is anywhere near exiting - the master
-    // reads the SOURCE's result first (rcp/src/bin/rcp.rs), which the source only sends after this.
+    // source EOF before DestinationDone is now fatal. Check its own role-marked log so the
+    // master's independent clean-EOF diagnostic cannot satisfy the source-attribution assertion.
+    let source_log = std::fs::read_dir(rcpd_log_dir.path())
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .find(|log| log.contains("Received side: Source"))
+        .expect("source rcpd must have logged its consumed master hello");
     assert!(
-        rcpd_logs_contain(
-            rcpd_log_dir.path(),
-            "closed its control stream without sending DestinationDone"
-        ),
-        "expected the source rcpd to warn that the destination went away without DestinationDone; \
-         without it a log read after the fact reports the abort-or-death as a clean finish"
+        source_log
+            .contains("rcpd operation failed: destination closed control before DestinationDone"),
+        "expected the source rcpd to fail because the destination closed before DestinationDone; \
+         source log:\n{source_log}"
     );
     eprintln!("✓ source rcpd attributed the control-stream close to the destination going away");
 }
@@ -4788,7 +4758,7 @@ fn test_remote_file_failure_still_applies_parent_directory_metadata() {
     // THE KEY ASSERTION: directory permissions should have been updated
     // Protocol flow:
     //   1. DirStub{metadata_test, 1} -> Destination creates dir, tracks count=1
-    //   2. DirectoryCreated sent to source
+    //   2. DirectoryReady sent to source
     //   3. Source tries to open file -> FAILS (Permission denied)
     //   4. Source sends FileSkipped message
     //   5. Destination receives FileSkipped, calls decrement_entry() -> count=0
@@ -6562,7 +6532,7 @@ fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
 /// out-of-tree sentinel regular file must be copied AS a symlink — its target's
 /// bytes must never be streamed into a destination regular file.
 ///
-/// This exercises the source-side fd-map's classification: Pass 1 opens the child
+/// This exercises the source-side discovery classification: it opens the child
 /// `O_NOFOLLOW` and `fstat`s it, so a symlink is a symlink (never a File), and the
 /// sentinel is never opened for data. (With `-L` the symlink would be followed —
 /// that path is intentionally not hardened and is covered by the dereference
@@ -6607,11 +6577,8 @@ fn test_remote_source_nested_symlink_not_dereferenced_for_data() {
 /// transfer the sentinel's content — either it reads the real file, or the
 /// fd-relative `O_NOFOLLOW` open fails closed and the entry is skipped.
 ///
-/// NOTE: this is a best-effort race (the source runs as a separate subprocess over
-/// SSH, so we can't deterministically hit the Pass-2 open window). A leaked
-/// sentinel is a true-positive failure; a clean run is the expected outcome. The
-/// deterministic guarantee is covered by
-/// `test_remote_source_nested_symlink_not_dereferenced_for_data`.
+/// This remains a best-effort stress race. The deterministic data-open replacement case is
+/// covered by `remote_admitted_file_mutation_uses_opened_object_and_preserves_siblings`.
 #[test]
 fn test_remote_source_file_swap_never_transfers_sentinel() {
     require_local_ssh();
@@ -6837,41 +6804,14 @@ fn test_remote_source_root_symlink_not_dereferenced_for_data() {
     );
 }
 
-// NOTE: there is deliberately no best-effort root-FILE swap race test (analogous to
-// `test_remote_source_file_swap_never_transfers_sentinel` for nested files). When a swap lands
-// during the root open, the hardened `open_file_read` correctly fails closed — but a root failure
-// returns `Err` and the destination then waits for the never-arriving root data until a transport
-// timeout (the pre-existing "root failure → Err" design; nested failures skip fast instead). That
-// makes such a test slow and flaky under concurrent load without adding coverage: the root file now
-// uses the same `open_file_read` primitive as nested files (swap-tested above and unit-tested in
-// `safedir`), and every existing root-file copy test now exercises the hardened root read.
-
-/// Regression for the source fd-map deadlock: a no-ack destination subtree larger
-/// than the source's dir-fd budget must NOT hang the copy.
-///
-/// The source-side fd-map gates Pass 1 with a dir-fd-in-flight semaphore. Pass 2's
-/// `MapEntryGuard` releases a permit only for directories the destination acks with
-/// `DirectoryCreated`. A directory the destination skips (here: its destination path
-/// is blocked by a pre-existing non-directory, so `create_directory` fails and every
-/// descendant is skipped as a failed-ancestor) sends no `DirectoryCreated`. Before
-/// the fix those skipped directories held their Pass-1 permits forever, so once the
-/// no-ack subtree exceeded the budget, Pass 1 blocked on `insert().await`,
-/// `DirStructureComplete` was never sent, and the whole copy hung. The fix is the
-/// `DirectorySkipped` nack: the destination sends exactly one ack/nack per
-/// `Directory`, and the source releases the permit on nack too.
-///
-/// We shrink the budget with `--max-connections 2 --pending-writes-multiplier 2`
-/// (budget = 4) and make the blocked subtree 16 directories (> budget), so the
-/// deadlock is deterministic without the fix. Bounding: the test harness wraps rcp
-/// in `timeout 90`; a hang trips that (exit 124) and `assert_not_timeout` (inside
-/// `run_rcp_with_args`) fails the test, so an unfixed build FAILS rather than
-/// hanging the suite forever. A fixed build completes in ~1s.
+/// Rejected directories must release Begin credits and settle parent entries. A rejected
+/// subtree larger than the pending capacity must not stop sibling discovery or file sends.
 #[test]
 fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // source: root/ with a real file, a copyable sibling subtree, and a `blocked`
-    // subtree holding > budget directories (budget below is 4).
+    // subtree holding more directories than the single Begin credit.
     let src_root = src_dir.path().join("root");
     std::fs::create_dir(&src_root).unwrap();
     create_test_file(&src_root.join("top.txt"), "top content", 0o644);
@@ -6879,8 +6819,7 @@ fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
     let src_ok = src_root.join("ok");
     std::fs::create_dir(&src_ok).unwrap();
     create_test_file(&src_ok.join("ok.txt"), "ok content", 0o644);
-    // blocked subtree: 16 directories (flat fan-out), each with a file so Pass 1
-    // definitely inserts a held fd per directory.
+    // rejected descendants may already have been submitted when the parent reply arrives
     let src_blocked = src_root.join("blocked");
     std::fs::create_dir(&src_blocked).unwrap();
     let blocked_dir_count = 16usize;
@@ -6896,17 +6835,17 @@ fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
     create_test_file(&dst_root.join("blocked"), "i am a file, not a dir", 0o644);
     let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    // shrink the dir-fd budget to 4 (2 * 2) so 16 no-ack dirs exceed it.
-    // default mode (no -L); fail_early off so the copy proceeds past the blocked dir.
     let output = run_rcp_with_args(&[
-        "--max-connections",
-        "2",
-        "--pending-writes-multiplier",
-        "2",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
         &src_remote,
         &dst_remote,
     ]);
     print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "rejected directories must report failure"
+    );
     // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang).
     // it exits non-zero because the blocked dir is a real error, but it must not hang.
     // the sibling subtree and the top-level file must have copied.
@@ -6923,32 +6862,225 @@ fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
     );
 }
 
-#[test]
-fn test_remote_dereference_tree_over_budget_completes() {
+/// Inline descent at E=P=1 must not retain a classification permit needed by its descendant.
+/// Several cursor batches, deep branches, and sibling files exercise independent progress.
+#[tokio::test]
+async fn remote_capacity_one_deep_tree_preserves_files_and_directory_metadata() {
     require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    let src_root = src_dir.path().join("root");
-    std::fs::create_dir(&src_root).unwrap();
-    for i in 0..3 {
-        let sibling = src_root.join(format!("sibling{i}"));
-        std::fs::create_dir(&sibling).unwrap();
-        create_test_file(&sibling.join("file.txt"), &format!("content {i}"), 0o644);
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    for branch in 0..3 {
+        let mut relative = std::path::PathBuf::from(format!("branch{branch}"));
+        for _ in 0..8 {
+            std::fs::create_dir(src.join(&relative)).unwrap();
+            std::fs::set_permissions(src.join(&relative), std::fs::Permissions::from_mode(0o750))
+                .unwrap();
+            let file = relative.join("payload");
+            common::filegen::write_file(&PROGRESS, src.join(&file), 256, 256, 0)
+                .await
+                .unwrap();
+            files.push(file);
+            directories.push(relative.clone());
+            relative.push("child");
+        }
     }
-    let dst_root = dst_dir.path().join("root");
-    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    run_rcp_and_expect_success(&[
-        "-L",
-        "--max-connections=1",
-        "--pending-writes-multiplier=1",
-        &src_remote,
-        &dst_remote,
-    ]);
-    for i in 0..3 {
-        assert_eq!(
-            get_file_content(&dst_root.join(format!("sibling{i}/file.txt"))),
-            format!("content {i}")
+    for i in 0..70 {
+        let file = std::path::PathBuf::from(format!("root-file-{i}"));
+        common::filegen::write_file(&PROGRESS, src.join(&file), 128, 128, 0)
+            .await
+            .unwrap();
+        files.push(file);
+    }
+    for dereference in [false, true] {
+        let dst = fixture.path().join(if dereference {
+            "dereferenced"
+        } else {
+            "hardened"
+        });
+        let src_remote = format!("localhost:{}", src.display());
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            "--max-connections=1",
+            "--pending-writes-multiplier=1",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if dereference {
+            args.insert(0, "-L");
+        }
+        run_rcp_and_expect_success(&args);
+        for file in &files {
+            assert_eq!(
+                std::fs::read(src.join(file)).unwrap(),
+                std::fs::read(dst.join(file)).unwrap(),
+                "{file:?}"
+            );
+        }
+        for directory in &directories {
+            assert_eq!(
+                get_file_mode(&dst.join(directory)) & 0o777,
+                0o750,
+                "{directory:?}"
+            );
+        }
+    }
+}
+
+/// Ancestor descriptors grow with depth even at E=P=1. Exhausting the source's descriptor limit
+/// must finish with the original EMFILE error instead of hanging or hiding it during teardown.
+#[test]
+fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    let mut deepest = src.clone();
+    for _ in 0..128 {
+        deepest.push("child");
+        std::fs::create_dir(&deepest).unwrap();
+    }
+    create_test_file(
+        &deepest.join("payload"),
+        "beyond the descriptor limit",
+        0o600,
+    );
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = source ]; then\n  ulimit -n 64 || exit 1\nfi\nexec {daemon} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("localhost:{}", src.display());
+    let cause = std::io::Error::from_raw_os_error(libc::EMFILE).to_string();
+    for dereference in [false, true] {
+        let dst = fixture.path().join(if dereference {
+            "dereferenced"
+        } else {
+            "hardened"
+        });
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            daemon_arg.as_str(),
+            "--max-connections=1",
+            "--pending-writes-multiplier=1",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if dereference {
+            args.insert(0, "-L");
+        }
+        let output = run_rcp_and_expect_failure(&args);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            combined
+                .lines()
+                .any(|line| line.contains("Source: ") && line.contains(&cause)),
+            "source descriptor exhaustion must retain its original cause, dereference={dereference}: {combined}"
+        );
+        assert!(
+            !combined.contains("Source: lost admitted child obligation")
+                && !combined.contains("Source: file admission closed")
+                && !combined.contains("Source: branch admission closed"),
+            "teardown must not replace descriptor exhaustion, dereference={dereference}: {combined}"
+        );
+        assert!(dst.is_dir(), "the daemon must reach source traversal");
+        assert!(
+            !dst.join(deepest.strip_prefix(&src).unwrap())
+                .join("payload")
+                .exists(),
+            "the source must exhaust its descriptors before reaching the leaf"
+        );
+    }
+}
+
+/// Manifest skips and new-file sends must share a capacity-one pipeline across nested directories.
+/// Ignore-existing additionally rejects a subtree while unrelated manifest work keeps progressing.
+#[test]
+fn remote_capacity_one_manifests_and_rejected_subtree_complete() {
+    require_local_ssh();
+    for dereference in [false, true] {
+        for option in ["--overwrite", "--ignore-existing"] {
+            let (src_dir, dst_dir) = setup_test_env();
+            let src = src_dir.path().join("root");
+            let dst = dst_dir.path().join("root");
+            let mut relative = std::path::PathBuf::new();
+            for _ in 0..6 {
+                relative.push("nested");
+                std::fs::create_dir_all(src.join(&relative)).unwrap();
+                std::fs::create_dir_all(dst.join(&relative)).unwrap();
+                for base in [&src, &dst] {
+                    let path = base.join(&relative).join("same.txt");
+                    create_test_file(&path, "identical", 0o640);
+                    filetime::set_file_mtime(
+                        path,
+                        filetime::FileTime::from_unix_time(1_700_000_000, 0),
+                    )
+                    .unwrap();
+                }
+                create_test_file(&src.join(&relative).join("new.txt"), "new", 0o600);
+            }
+            if option == "--ignore-existing" {
+                std::fs::create_dir_all(src.join("blocked/nested/deep")).unwrap();
+                create_test_file(&src.join("blocked/nested/deep/hidden"), "hidden", 0o600);
+                create_test_file(&dst.join("blocked"), "retained", 0o644);
+            }
+            let src_remote = format!("localhost:{}", src.display());
+            let dst_remote = format!("localhost:{}", dst.display());
+            let mut args = vec![
+                option,
+                "--summary",
+                "--max-connections=1",
+                "--pending-writes-multiplier=1",
+                src_remote.as_str(),
+                dst_remote.as_str(),
+            ];
+            if dereference {
+                args.insert(0, "-L");
+            }
+            let output = run_rcp_and_expect_success(&args);
+            let summary = parse_summary_from_output(&output).unwrap();
+            assert_eq!(summary.files_copied, 6);
+            assert_eq!(summary.files_unchanged, 6);
+            assert_eq!(summary.bytes_copied, 18);
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                combined.contains("skipping transfer (manifest)"),
+                "source manifest skips must execute: {combined}"
+            );
+            let mut relative = std::path::PathBuf::new();
+            for _ in 0..6 {
+                relative.push("nested");
+                assert_eq!(
+                    get_file_content(&dst.join(&relative).join("same.txt")),
+                    "identical"
+                );
+                assert_eq!(
+                    get_file_content(&dst.join(&relative).join("new.txt")),
+                    "new"
+                );
+            }
+            if option == "--ignore-existing" {
+                assert_eq!(get_file_content(&dst.join("blocked")), "retained");
+            }
+        }
     }
 }
 
@@ -7100,7 +7232,7 @@ fn test_remote_dereference_unreadable_nested_directories_over_budget_continues()
         "the copy must report the unreadable-directory cause; got:\n{combined}"
     );
     assert!(
-        !combined.contains("source dir-fd budget semaphore closed"),
+        !combined.contains("lost admitted child obligation"),
         "the copy must not report the synthetic credit-close wakeup; got:\n{combined}"
     );
     assert_eq!(
@@ -7171,24 +7303,8 @@ fn test_remote_dereference_no_ack_subtree_over_budget_does_not_hang() {
     }
 }
 
-/// Regression for the SOURCE skip-accounting deadlock (PR #247 review): a counted
-/// child directory that the source FAILS TO OPEN mid fd-walk must not hang the copy.
-///
-/// On the hardened (non-`-L`) remote source walk, `send_directory_fd_walk`
-/// pre-reads each directory's children and tallies every child (including
-/// subdirectories) into the parent's `Directory { entry_count }`. A subdirectory is
-/// classified via the parent's fd (`fstatat`, which succeeds even for a `0o000`
-/// child), so it IS counted — but the later `dir.open_dir(child)` fails with EACCES
-/// for a `0o000` directory. That failure must emit `FileSkipped` for the
-/// unprocessable child; emitting no protocol message would leave the destination's
-/// parent tracker waiting forever and prevent `DestinationDone`.
-///
-/// Here `blocked/` holds 16 subdirectories all mode `0o000`: each is counted in
-/// `blocked/`'s `entry_count` but every `open_dir` fails. Bounding/determinism is
-/// the same as the budget test: the harness wraps rcp in `timeout 90`, so an
-/// unfixed build trips the timeout (exit 124) and `assert_not_timeout` fails the
-/// test rather than hanging the suite; a fixed build completes in ~1s with the rest
-/// of the tree copied.
+/// A child classified and admitted as a directory can fail its later data-directory open.
+/// Every such failure must settle its parent slot while siblings continue at capacity one.
 #[test]
 fn test_remote_source_counted_child_open_failure_does_not_hang() {
     require_local_ssh();
@@ -7229,7 +7345,12 @@ fn test_remote_source_counted_child_open_failure_does_not_hang() {
     );
     // default mode (no -L → hardened fd-walk); fail_early off so the copy proceeds
     // past the un-openable children and must still COMPLETE.
-    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    let output = run_rcp_with_args(&[
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
     print_command_output(&output);
     // restore permissions so the TempDir cleanup can remove the 0o000 directories.
     for d in &unopenable {
@@ -7256,279 +7377,382 @@ fn test_remote_source_counted_child_open_failure_does_not_hang() {
     );
 }
 
-/// Run a remote copy and fire `mutate` the instant `trigger` has appeared `occurrence` times in
-/// rcp's `-vv` log, then return the finished process output (checked for the timeout wrapper, as
-/// [`run_rcp_with_args`] does).
-///
-/// The regression tests below all need a source entry to change between two points INSIDE one rcpd
-/// walk — a window on the far side of two process boundaries that no filesystem state reveals. Two
-/// things make hitting it deterministic rather than lucky:
-///
-/// - `--ops-throttle=1`: the token bucket is topped up to exactly one token per one-second tick, so
-///   every metadata syscall in rcpd is granted AT a tick and the next one cannot run for a further
-///   second. (`=2` would not do: two tokens per tick let a pair of syscalls run back to back, and
-///   the window between them collapses to nothing.)
-/// - a log line emitted between the two syscalls that bracket the window. It is ordered by program
-///   order, not by wall clock: the mutation is guaranteed to land after the earlier syscall, and the
-///   later one is a full throttle tick away — 200x the 5 ms poll interval here.
-///
-/// That throttle also sets the price: each test's runtime is roughly its source tree's metadata
-/// **op count × one second**, and nothing about a faster machine shortens it. Keep the fixtures
-/// minimal — every extra source entry costs about a second, invisibly, against the 90 s wrapper.
-///
-/// If the trigger never appears this panics rather than passing vacuously.
-///
-/// Output is captured to files, not pipes: `-vv` fills a pipe's kernel buffer long before rcp
-/// exits, and nothing drains it while this function is polling (see the same note in
-/// `test_remote_killed_destination_rcpd_reports_error`).
-fn run_rcp_with_log_trigger(
-    args: &[&str],
-    trigger: &str,
-    occurrence: usize,
-    mutate: impl FnOnce(),
-) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
-    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.args(["90", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv");
-    cmd.arg("--force-remote");
-    cmd.args(args);
-    cmd.stdout(
-        stdout_file
-            .reopen()
-            .expect("Failed to reopen stdout capture file"),
-    );
-    cmd.stderr(
-        stderr_file
-            .reopen()
-            .expect("Failed to reopen stderr capture file"),
-    );
-    let mut child = cmd.spawn().expect("Failed to execute rcp command");
-    let mut mutate = Some(mutate);
-    let status = loop {
-        if mutate.is_some()
-            && std::fs::read_to_string(stdout_file.path())
-                .unwrap_or_default()
-                .matches(trigger)
-                .count()
-                >= occurrence
-        {
-            (mutate.take().unwrap())();
+/// A source-only syscall tracer replaces an admitted name immediately before its data/directory
+/// open. O_PATH classification is left intact, and a marker proves the intended open occurred.
+/// This works with static musl daemons and avoids entry order, log delivery, and timing windows.
+#[cfg(target_os = "linux")]
+fn source_open_mutation_tracer() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("mutate.c");
+    std::fs::write(
+            &source,
+            r#"
+#define _GNU_SOURCE
+#include <sys/ptrace.h>
+#include <linux/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int fired;
+static pid_t owned_child = -1;
+static void fail(const char *operation) {
+    perror(operation);
+    if (owned_child > 0) {
+        kill(owned_child, SIGKILL);
+        while (waitpid(owned_child, 0, 0) < 0 && errno == EINTR) {}
+    }
+    exit(190);
+}
+static void read_name(pid_t tid, unsigned long long address, char name[PATH_MAX]) {
+    for (size_t offset = 0; offset < PATH_MAX; offset += sizeof(long)) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, tid, (void *)(address + offset), 0);
+        if (errno) fail("reading intercepted source path");
+        memcpy(name + offset, &word, sizeof(word));
+        if (memchr(&word, 0, sizeof(word))) return;
+    }
+    fail("intercepted source path is too long");
+}
+static void mutate_before_open(pid_t tid, int parent, unsigned long long address, int flags) {
+    if (fired || (flags & O_PATH)) return;
+    const char *target = getenv("RCP_TEST_MUTATION_TARGET");
+    char name[PATH_MAX];
+    read_name(tid, address, name);
+    char full[PATH_MAX];
+    if (name[0] == '/') {
+        if (strcmp(name, target)) return;
+    } else {
+        const char *leaf = strrchr(target, '/');
+        if (!leaf || strcmp(name, leaf + 1)) return;
+        char proc_path[64], parent_path[PATH_MAX];
+        if (parent == AT_FDCWD) snprintf(proc_path, sizeof(proc_path), "/proc/%d/cwd", tid);
+        else snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", tid, parent);
+        ssize_t count = readlink(proc_path, parent_path, sizeof(parent_path) - 1);
+        if (count < 0) fail("reading source parent");
+        parent_path[count] = 0;
+        if (snprintf(full, sizeof(full), "%s/%s", parent_path, name) >= sizeof(full)) fail("joining source path");
+        if (strcmp(full, target)) return;
+    }
+    fired = 1;
+    if (rename(target, getenv("RCP_TEST_MUTATION_MOVED"))) fail("moving admitted source entry");
+    const char *replacement = getenv("RCP_TEST_MUTATION_REPLACEMENT");
+    if (replacement && replacement[0] && rename(replacement, target)) fail("replacing admitted source entry");
+    int fd = open(getenv("RCP_TEST_MUTATION_MARKER"), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 || write(fd, "mutated", 7) != 7 || close(fd)) fail("writing mutation marker");
+}
+int main(int argc, char **argv) {
+    if (argc < 2) return 191;
+    pid_t child = fork();
+    if (child < 0) fail("forking source daemon");
+    if (child == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) fail("tracing source daemon");
+        raise(SIGSTOP);
+        execv(argv[1], argv + 1);
+        fail("executing source daemon");
+    }
+    owned_child = child;
+    int status, result = 192;
+    if (waitpid(child, &status, 0) != child || !WIFSTOPPED(status)) fail("initial source stop");
+    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK |
+                   PTRACE_O_TRACEVFORK | PTRACE_O_EXITKILL;
+    if (ptrace(PTRACE_SETOPTIONS, child, 0, options) < 0) fail("setting source trace options");
+    if (ptrace(PTRACE_SYSCALL, child, 0, 0) < 0) fail("starting source trace");
+    for (;;) {
+        pid_t tid = waitpid(-1, &status, __WALL);
+        if (tid < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) break;
+            fail("waiting for source syscall");
         }
-        if let Some(status) = child.try_wait().expect("Failed to wait for rcp") {
-            break status;
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (tid == child) {
+                result = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+                owned_child = -1;
+            }
+            continue;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    };
-    let output = std::process::Output {
-        status,
-        stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
-        stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
-    };
-    print_command_output(&output);
-    // a hang is reported as a hang first: reaching the timeout without the trigger having fired is
-    // some OTHER hang, and blaming the race window would send the next reader the wrong way.
-    assert_not_timeout(&output);
+        if (!WIFSTOPPED(status)) continue;
+        int signal = WSTOPSIG(status);
+        if (signal == (SIGTRAP | 0x80)) {
+            struct ptrace_syscall_info info;
+            if (ptrace(PTRACE_GET_SYSCALL_INFO, tid, sizeof(info), &info) < 0) fail("reading source syscall");
+            if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+                if (info.entry.nr == SYS_openat)
+                    mutate_before_open(tid, (int)info.entry.args[0], info.entry.args[1], (int)info.entry.args[2]);
+#ifdef SYS_open
+                else if (info.entry.nr == SYS_open)
+                    mutate_before_open(tid, AT_FDCWD, info.entry.args[0], (int)info.entry.args[1]);
+#endif
+            }
+            signal = 0;
+        } else if (signal == SIGSTOP || signal == SIGTRAP) {
+            signal = 0;
+        }
+        if (ptrace(PTRACE_SYSCALL, tid, 0, signal) < 0 && errno != ESRCH) fail("resuming source thread");
+    }
+    return result;
+}
+"#,
+        )
+        .unwrap();
+    let output = std::process::Command::new("cc")
+        .args(["-std=c11", "-O2", "-o"])
+        .arg(fixture.path().join("mutate"))
+        .arg(&source)
+        .output()
+        .expect("a C compiler is required for deterministic source mutation tests");
     assert!(
-        mutate.is_none(),
-        "the copy finished without ever logging {trigger:?} x{occurrence}, so the required race \
-         window was not exercised"
+        output.status.success(),
+        "syscall tracer compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fixture
+}
+
+#[cfg(target_os = "linux")]
+fn run_rcp_with_source_open_mutation(
+    args: &[&str],
+    target: &std::path::Path,
+    replacement: Option<&std::path::Path>,
+) -> std::process::Output {
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("mutated");
+    let moved = fixture.path().join("original");
+    let wrapper = fixture.path().join("rcpd");
+    let tracer_fixture = source_open_mutation_tracer();
+    let tracer = tracer_fixture.path().join("mutate");
+    let real_daemon = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = source ]; then\n  export RCP_TEST_MUTATION_TARGET={}\n  export RCP_TEST_MUTATION_MOVED={}\n  export RCP_TEST_MUTATION_REPLACEMENT={}\n  export RCP_TEST_MUTATION_MARKER={}\n  exec {} {} \"$@\"\nfi\nexec {} \"$@\"\n",
+        shell_quote_for_test(target),
+        shell_quote_for_test(&moved),
+        shell_quote_for_test(replacement.unwrap_or_else(|| std::path::Path::new(""))),
+        shell_quote_for_test(&marker),
+        shell_quote_for_test(&tracer),
+        shell_quote_for_test(&real_daemon),
+        shell_quote_for_test(&real_daemon),
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = format!("--rcpd-path={}", wrapper.display());
+    let mut command = vec![
+        daemon.as_str(),
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+    ];
+    command.extend_from_slice(args);
+    let output = run_rcp_with_args(&command);
+    print_command_output(&output);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "mutated",
+        "source must reach the intercepted use after classification"
     );
     output
 }
 
-/// Regression for the `-L` ROOT hang: a root operand that is a directory when the source classifies
-/// it and a regular file by the time the walk descends into it must not hang the copy.
-///
-/// `send_fs_objects_tcp` classifies the root once to decide `has_root_item` and whether to walk it or
-/// send it as a file, then hands that authoritative classification to the `-L` walk. A root that
-/// changes from directory to file before descent is caught at enumeration (`ENOTDIR`) and answered
-/// with the 0-entry `Directory` every committed-but-unreadable directory receives. The source must
-/// not return having sent nothing while the destination waits on `root_complete`.
-///
-/// The window is between the two stats, so the trigger is the walk's own entry log — the SECOND
-/// `Sending data from` for the root (the first is `send_fs_objects_tcp`'s, emitted before its stat).
+/// Each admitted directory failure must settle its parent slot while unrelated files and
+/// subtrees finish. Include filtering must use the original directory classification.
+#[cfg(target_os = "linux")]
 #[test]
-fn test_remote_dereference_root_kind_swap_does_not_hang() {
+fn remote_admitted_directory_open_failure_preserves_siblings() {
     require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    // what the root symlink points at: a real directory (with content, so a successful copy is
-    // unmistakable) and a real file to swap to. Both live outside the copied tree.
-    let real_dir = src_dir.path().join("real_dir");
-    std::fs::create_dir(&real_dir).unwrap();
-    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
-    let real_file = src_dir.path().join("real_file");
-    create_test_file(&real_file, "file content", 0o644);
-    // the root operand: a symlink, so the swap is a single atomic rename rather than an
-    // rmdir+create that would expose an unrelated "root vanished" state in between.
-    let root_link = src_dir.path().join("root_link");
-    std::os::unix::fs::symlink(&real_dir, &root_link).unwrap();
-    let dst_root = dst_dir.path().join("root_link");
-    let src_remote = format!("localhost:{}", root_link.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    let trigger = format!("Sending data from {root_link:?}");
-    let output = run_rcp_with_log_trigger(
-        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
-        &trigger,
-        2,
-        || {
-            let staged = src_dir.path().join("root_link.staged");
-            std::os::unix::fs::symlink(&real_file, &staged).unwrap();
-            std::fs::rename(&staged, &root_link).unwrap();
-        },
-    );
-    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang) and report the
-    // root it could not copy.
-    assert!(
-        !output.status.success(),
-        "copy should report a non-zero exit for a root that changed type mid-walk"
-    );
-    // the root lands as the empty directory the 0-entry `Directory` describes — the same answer the
-    // hardened root gives when its `open_dir` fails. Its former content must not have followed.
-    assert!(
-        dst_root.is_dir(),
-        "destination root should be the empty directory the source committed to"
-    );
-    assert!(
-        !dst_root.join("inside.txt").exists(),
-        "content of the directory the root no longer points at must not have been copied"
-    );
-    // and it must get there by the route the protocol documents (§3.3): the enumeration failing
-    // ENOTDIR on a root the caller already classified. Asserting only on the destination state
-    // would pass just as well if the swap landed a syscall later and the walk instead enumerated
-    // the old directory and failed on its children — same visible outcome, different code path,
-    // and the documented one then untested.
-    let log = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        log.contains("Cannot open directory") && log.contains("Not a directory"),
-        "expected the root's enumeration to fail ENOTDIR (the committed-but-unreadable route); \
-         the swap did not land inside the intended window"
-    );
+    for dereference in [false, true] {
+        for vanished in [false, true] {
+            let (src_dir, dst_dir) = setup_test_env();
+            let src = src_dir.path().join("root");
+            std::fs::create_dir_all(src.join("child")).unwrap();
+            std::fs::create_dir(src.join("keep")).unwrap();
+            create_test_file(&src.join("child/hidden.txt"), "hidden", 0o644);
+            create_test_file(&src.join("sibling.txt"), "sibling", 0o640);
+            create_test_file(&src.join("keep/keep.txt"), "keep", 0o600);
+            let replacement = src_dir.path().join("replacement");
+            create_test_file(&replacement, "changed directory", 0o644);
+            let dst = dst_dir.path().join("root");
+            let src_remote = format!("localhost:{}", src.display());
+            let dst_remote = format!("localhost:{}", dst.display());
+            let mut args = vec!["--include=*.txt", src_remote.as_str(), dst_remote.as_str()];
+            if dereference {
+                args.insert(0, "-L");
+            }
+            let output = run_rcp_with_source_open_mutation(
+                &args,
+                &src.join("child"),
+                (!vanished).then_some(replacement.as_path()),
+            );
+            assert!(
+                !output.status.success(),
+                "admitted directory open failure must be reported"
+            );
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let cause = if vanished {
+                "No such file or directory"
+            } else {
+                "Not a directory"
+            };
+            assert!(
+                combined.contains(cause),
+                "original open cause missing: {combined}"
+            );
+            assert_eq!(get_file_content(&dst.join("sibling.txt")), "sibling");
+            assert_eq!(get_file_content(&dst.join("keep/keep.txt")), "keep");
+            assert_eq!(get_file_mode(&dst.join("sibling.txt")) & 0o777, 0o640);
+            assert!(!dst.join("child/hidden.txt").exists());
+            assert!(
+                !dst.join("child").is_file(),
+                "a classified directory must not become a file transfer"
+            );
+        }
+    }
 }
 
-/// Regression for the `-L` NESTED hang, vanish variant: a child counted in its parent's
-/// `Directory { entry_count }` that disappears before the walk recurses into it must not hang the
-/// copy.
-///
-/// The parent pre-reads and counts every child, then recurses. If a child vanishes in between, its
-/// failed metadata read must produce `FileSkipped` accounting rather than return after sending
-/// nothing. The same compensation funnel covers every counted child that cannot produce its normal
-/// protocol message, allowing the destination to reach `entries_expected` and complete.
-///
-/// The window is between the parent's pre-read and the recursion, so the trigger is the parent's
-/// `Sending directory` log — emitted after the pre-read counted the child and before the first
-/// recursion.
+/// A classified root that cannot be opened still has a terminal empty-directory result in
+/// continue mode, including the explicitly dereferencing source path.
+#[cfg(target_os = "linux")]
 #[test]
-fn test_remote_dereference_vanished_child_does_not_hang() {
+fn remote_root_directory_open_failure_finishes_empty_tombstone() {
     require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    // outside the copied tree: what the racing child points at.
-    let real_dir = src_dir.path().join("real_dir");
-    std::fs::create_dir(&real_dir).unwrap();
-    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
-    // the copied tree: a file, a subtree that must survive the racing child's failure, and the
-    // child itself (a symlink, which `-L` counts as the directory it resolves to).
-    let src_root = src_dir.path().join("root");
-    std::fs::create_dir(&src_root).unwrap();
-    create_test_file(&src_root.join("top.txt"), "top content", 0o644);
-    let src_keep = src_root.join("keep");
-    std::fs::create_dir(&src_keep).unwrap();
-    create_test_file(&src_keep.join("keep.txt"), "keep content", 0o644);
-    let child = src_root.join("child");
-    std::os::unix::fs::symlink(&real_dir, &child).unwrap();
-    let dst_root = dst_dir.path().join("root");
-    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    let trigger = format!("Sending directory: {src_root:?}");
-    let output = run_rcp_with_log_trigger(
-        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
-        &trigger,
-        1,
-        || std::fs::remove_file(&child).unwrap(),
-    );
-    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang), report the
-    // child it could not read, and still deliver everything else.
-    assert!(
-        !output.status.success(),
-        "copy should report a non-zero exit for a child that vanished mid-walk"
-    );
-    assert_eq!(get_file_content(&dst_root.join("top.txt")), "top content");
-    assert_eq!(
-        get_file_content(&dst_root.join("keep/keep.txt")),
-        "keep content"
-    );
-    assert!(
-        !dst_root.join("child").exists(),
-        "a child that vanished before the source reached it must not be created"
-    );
+    for dereference in [false, true] {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src = src_dir.path().join("root");
+        std::fs::create_dir(&src).unwrap();
+        create_test_file(&src.join("hidden.txt"), "hidden", 0o644);
+        let replacement = src_dir.path().join("replacement");
+        create_test_file(&replacement, "now a file", 0o644);
+        let dst = dst_dir.path().join("root");
+        std::fs::create_dir(&dst).unwrap();
+        // unavailable source ACLs must remain Unknown, not clear a reused directory's ACL
+        set_acl(&dst, ACL_DEFAULT, &granting_acl());
+        let src_remote = format!("localhost:{}", src.display());
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            "--preserve-settings=all+acl",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if dereference {
+            args.insert(0, "-L");
+        }
+        let output = run_rcp_with_source_open_mutation(&args, &src, Some(&replacement));
+        assert!(!output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("Not a directory"),
+            "original root-open failure missing: {combined}"
+        );
+        assert!(
+            dst.is_dir(),
+            "committed unreadable root must become an empty directory"
+        );
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+        assert_eq!(get_acl(&dst, ACL_DEFAULT), Some(granting_acl()));
+    }
 }
 
-/// Regression for the `-L` walk's FILTER exit — the fourth way a counted child can end its step
-/// with nothing sent, and the one that needs both a filter and a type change to reach.
-///
-/// The filter is re-applied when the walk descends into a child, and its verdict depends on whether
-/// the entry is a directory. A child counted as a directory is traversed because it *could contain*
-/// matches (`should_include` folds `could_contain_matches` in); once it is a regular file, the same
-/// patterns judge it on its own name and can exclude it. The step then returns having sent nothing
-/// for an entry its parent counted — the same hang as the other three exits, which is why every
-/// exit reports through one funnel rather than each remembering the compensation.
-///
-/// `--include '*.txt'` gives exactly that asymmetry: `subdir` is traversed as a directory, and
-/// `subdir` as a plain file matches no pattern.
+/// Data opens must reject incompatible replacements without following symlinks or waiting for
+/// FIFO writers. A compatible replacement supplies both its own bytes and its own metadata.
+#[cfg(target_os = "linux")]
 #[test]
-fn test_remote_dereference_filtered_child_kind_swap_does_not_hang() {
+fn remote_admitted_file_mutation_uses_opened_object_and_preserves_siblings() {
     require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    // outside the copied tree: the directory the racing child points at, and the file it becomes.
-    let real_dir = src_dir.path().join("real_dir");
-    std::fs::create_dir(&real_dir).unwrap();
-    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
-    let real_file = src_dir.path().join("real_file");
-    create_test_file(&real_file, "file content", 0o644);
-    let src_root = src_dir.path().join("root");
-    std::fs::create_dir(&src_root).unwrap();
-    // matches the include pattern, so it must still arrive.
-    create_test_file(&src_root.join("keep.txt"), "keep content", 0o644);
-    // counted as a directory (traversed because it could contain `*.txt`), excluded once it is a
-    // file called `subdir`.
-    let subdir = src_root.join("subdir");
-    std::os::unix::fs::symlink(&real_dir, &subdir).unwrap();
-    let dst_root = dst_dir.path().join("root");
-    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    let trigger = format!("Sending directory: {src_root:?}");
-    let output = run_rcp_with_log_trigger(
-        &[
-            "-L",
-            "--include",
-            "*.txt",
-            "--ops-throttle=1",
-            &src_remote,
-            &dst_remote,
-        ],
-        &trigger,
-        1,
-        || {
-            let staged = src_dir.path().join("subdir.staged");
-            std::os::unix::fs::symlink(&real_file, &staged).unwrap();
-            std::fs::rename(&staged, &subdir).unwrap();
-        },
-    );
-    print_command_output(&output);
-    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang) and still
-    // deliver the file that does match. A filtered-out entry is not an error, so the exit code is
-    // deliberately not asserted here — the liveness and the delivered content are the contract.
-    assert_eq!(
-        get_file_content(&dst_root.join("keep.txt")),
-        "keep content",
-        "the matching file must still be copied when a sibling is filtered out mid-walk"
-    );
-    assert!(
-        !dst_root.join("subdir").exists(),
-        "an entry the filter excludes must not be created"
-    );
+    for dereference in [false, true] {
+        for kind in ["vanished", "symlink", "fifo", "directory", "regular"] {
+            if dereference && !matches!(kind, "vanished" | "regular") {
+                continue;
+            }
+            let (src_dir, dst_dir) = setup_test_env();
+            let src = src_dir.path().join("root");
+            std::fs::create_dir_all(src.join("keep")).unwrap();
+            create_test_file(&src.join("victim"), "old", 0o644);
+            create_test_file(&src.join("sibling.txt"), "sibling", 0o640);
+            create_test_file(&src.join("keep/keep.txt"), "keep", 0o600);
+            let replacement = src_dir.path().join("replacement");
+            match kind {
+                "vanished" => {}
+                "symlink" => {
+                    let sentinel = src_dir.path().join("sentinel");
+                    create_test_file(&sentinel, "SECRET SENTINEL", 0o600);
+                    std::os::unix::fs::symlink(&sentinel, &replacement).unwrap();
+                }
+                "fifo" => {
+                    let path =
+                        std::ffi::CString::new(replacement.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: path is NUL-terminated and remains valid for this syscall
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "directory" => std::fs::create_dir(&replacement).unwrap(),
+                "regular" => create_test_file(
+                    &replacement,
+                    "replacement has different bytes and length",
+                    0o600,
+                ),
+                _ => unreachable!(),
+            }
+            let dst = dst_dir.path().join("root");
+            let src_remote = format!("localhost:{}", src.display());
+            let dst_remote = format!("localhost:{}", dst.display());
+            let mut args = vec![src_remote.as_str(), dst_remote.as_str()];
+            if dereference {
+                args.insert(0, "-L");
+            }
+            let output = run_rcp_with_source_open_mutation(
+                &args,
+                &src.join("victim"),
+                (kind != "vanished").then_some(replacement.as_path()),
+            );
+            assert_eq!(
+                output.status.success(),
+                kind == "regular",
+                "replacement kind {kind}"
+            );
+            assert_eq!(get_file_content(&dst.join("sibling.txt")), "sibling");
+            assert_eq!(get_file_content(&dst.join("keep/keep.txt")), "keep");
+            if kind == "regular" {
+                assert_eq!(
+                    get_file_content(&dst.join("victim")),
+                    "replacement has different bytes and length"
+                );
+                assert_eq!(get_file_mode(&dst.join("victim")) & 0o777, 0o600);
+            } else {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let errno = match kind {
+                    "vanished" => libc::ENOENT,
+                    "symlink" => libc::ELOOP,
+                    "fifo" | "directory" => libc::EINVAL,
+                    _ => unreachable!(),
+                };
+                let cause = std::io::Error::from_raw_os_error(errno).to_string();
+                assert!(
+                    combined.contains(&cause),
+                    "original {kind} open failure missing: {combined}"
+                );
+                assert!(
+                    !dst.join("victim").exists(),
+                    "incompatible replacement must not send a header: {kind}"
+                );
+            }
+        }
+    }
 }
 
 /// A SPECIAL file as the root operand: skipped cleanly with `--skip-specials`, fatal without it.
@@ -7537,7 +7761,7 @@ fn test_remote_dereference_filtered_child_kind_swap_does_not_hang() {
 /// reach the `-L` walk's "root committed nothing" exit (the other is a filtered-out root). That
 /// exit must NOT be compensated with a `FileSkipped` — a root has no parent to account to, and
 /// `FileSkipped` does not set the destination's `root_complete` — so the destination is released by
-/// `DirStructureComplete { has_root_item: false }` instead. If the funnel ever compensated a root,
+/// `DiscoveryComplete { has_root_item: false }` instead. If the funnel ever compensated a root,
 /// this is the test that would notice the stray message.
 #[test]
 fn test_remote_special_root_skipped_or_fatal() {
@@ -7568,154 +7792,6 @@ fn test_remote_special_root_skipped_or_fatal() {
         "a special root without --skip-specials should fail the copy"
     );
     assert!(!dst_socket.exists());
-}
-
-/// Regression for the `-L` nested type-change accounting and sibling preservation.
-///
-/// Same accounting contract as the vanish case, reached through the walk's other "counted but
-/// nothing sent" exits: a child that becomes a regular file (the walk sends directories and
-/// symlinks), and one that becomes special (sockets/FIFOs/devices never produce a protocol message
-/// at all). Each counted entry must receive accounting compensation so either case can complete.
-///
-/// `sibling.txt` is what makes this also a DATA-LOSS test, and it must be asserted on contents
-/// rather than on the exit code, because the failure it guards is silent. Compensating the changed
-/// child with a `FileSkipped` is only half the requirement: Pass 2 re-enumerates the parent by path,
-/// so a child that is a regular file by then could consume a second entry slot and evict a genuinely
-/// counted file through `files_found > file_count` truncation. `Pass1Contents` makes the two passes
-/// mutually exclusive by name, so the changed child cannot take a file slot and `sibling.txt`
-/// remains included.
-#[test]
-fn test_remote_dereference_child_kind_swap_does_not_hang() {
-    require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    // outside the copied tree: what the racing children point at before and after the swap.
-    let real_dir = src_dir.path().join("real_dir");
-    std::fs::create_dir(&real_dir).unwrap();
-    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
-    let real_file = src_dir.path().join("real_file");
-    create_test_file(&real_file, "file content", 0o644);
-    // the socket file outlives the listener, but hold it anyway so the special exists for the whole
-    // copy rather than only for as long as the binding.
-    let real_socket = src_dir.path().join("real_socket");
-    let _listener = std::os::unix::net::UnixListener::bind(&real_socket).unwrap();
-    // `keep/` must survive both failures; `sibling.txt` is the file whose Pass-2 slot the changed
-    // child would steal (it is the parent's only counted file, so an eviction is unmistakable).
-    let src_root = src_dir.path().join("root");
-    std::fs::create_dir(&src_root).unwrap();
-    create_test_file(&src_root.join("sibling.txt"), "sibling content", 0o644);
-    let src_keep = src_root.join("keep");
-    std::fs::create_dir(&src_keep).unwrap();
-    create_test_file(&src_keep.join("keep.txt"), "keep content", 0o644);
-    let to_file = src_root.join("to_file");
-    std::os::unix::fs::symlink(&real_dir, &to_file).unwrap();
-    let to_special = src_root.join("to_special");
-    std::os::unix::fs::symlink(&real_dir, &to_special).unwrap();
-    let dst_root = dst_dir.path().join("root");
-    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    let trigger = format!("Sending directory: {src_root:?}");
-    let retarget = |link: &std::path::Path, target: &std::path::Path| {
-        let staged = link.with_extension("staged");
-        std::os::unix::fs::symlink(target, &staged).unwrap();
-        std::fs::rename(&staged, link).unwrap();
-    };
-    let output = run_rcp_with_log_trigger(
-        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
-        &trigger,
-        1,
-        || {
-            retarget(&to_file, &real_file);
-            retarget(&to_special, &real_socket);
-        },
-    );
-    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang), report the
-    // entries it could not copy, and still deliver everything it counted.
-    assert!(
-        !output.status.success(),
-        "copy should report a non-zero exit for the source entries that changed type"
-    );
-    // the data-loss assertion: an unrelated counted file must not be evicted by the changed child.
-    // Existence is asserted before content so the failure names the bug rather than surfacing as a
-    // "No such file or directory" out of the fixture helper.
-    assert!(
-        dst_root.join("sibling.txt").is_file(),
-        "a counted source file was silently dropped in favour of an entry Pass 1 had already \
-         accounted for"
-    );
-    assert_eq!(
-        get_file_content(&dst_root.join("sibling.txt")),
-        "sibling content"
-    );
-    assert_eq!(
-        get_file_content(&dst_root.join("keep/keep.txt")),
-        "keep content"
-    );
-    for changed in ["to_file", "to_special"] {
-        assert!(
-            !dst_root.join(changed).exists(),
-            "{changed} changed type before the source reached it and must not be created"
-        );
-    }
-}
-
-/// Regression for the same double-count on the HARDENED (default, non-`-L`) walk, where it is
-/// reached without any dereference: a counted child DIRECTORY that is a regular file by the time
-/// Pass 2 re-enumerates must not take a second entry slot and evict a counted sibling.
-///
-/// Pass 1 classifies `child` as a directory (fd-relative `fstatat`) and counts it, then fails to
-/// `open_dir` it once it has been replaced by a file and compensates with a `FileSkipped`. Pass 2
-/// then enumerates the parent from its held fd, sees a regular file at that same name, and — before
-/// the fix — counted it as one of the parent's expected files; `files_found(2) > file_count(1)`
-/// truncated to one, and whichever `readdir` returned first won. When that was `child`,
-/// `sibling.txt` was never sent, the parent still reached `entries_expected`, and the copy reported
-/// only the `open_dir` error while quietly dropping a file that never changed at all.
-///
-/// The window here is wide and needs no atomic swap: it spans Pass 1's classification through the
-/// network round-trip to Pass 2's enumeration, so a plain remove-then-create lands inside it.
-#[test]
-fn test_remote_counted_dir_becoming_file_does_not_evict_sibling() {
-    require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    let src_root = src_dir.path().join("root");
-    std::fs::create_dir(&src_root).unwrap();
-    // the parent's only counted FILE - the eviction casualty.
-    create_test_file(&src_root.join("sibling.txt"), "sibling content", 0o644);
-    // the counted DIRECTORY that becomes a regular file mid-copy.
-    let child = src_root.join("child");
-    std::fs::create_dir(&child).unwrap();
-    create_test_file(&child.join("inner.txt"), "inner content", 0o644);
-    let dst_root = dst_dir.path().join("root");
-    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
-    let trigger = format!("Sending directory: {src_root:?}");
-    let output = run_rcp_with_log_trigger(
-        // default mode: no `-L`, so this is the hardened fd-walk.
-        &["--ops-throttle=1", &src_remote, &dst_remote],
-        &trigger,
-        1,
-        || {
-            std::fs::remove_dir_all(&child).unwrap();
-            std::fs::write(&child, "now a regular file").unwrap();
-        },
-    );
-    assert!(
-        !output.status.success(),
-        "copy should report a non-zero exit for the child directory it could not open"
-    );
-    // existence first, so a regression reads as data loss rather than a fixture-helper panic.
-    assert!(
-        dst_root.join("sibling.txt").is_file(),
-        "a counted source file was silently dropped in favour of an entry Pass 1 had already \
-         accounted for"
-    );
-    assert_eq!(
-        get_file_content(&dst_root.join("sibling.txt")),
-        "sibling content"
-    );
-    assert!(
-        !dst_root.join("child").exists(),
-        "the replaced child was accounted for by Pass 1 and must not be copied by Pass 2 either"
-    );
 }
 
 /// TOCTOU hardening (Scenario 2 — destination write-escape): a symlink planted at an
@@ -8050,6 +8126,8 @@ fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
     let output = run_rcp_and_expect_success(&[
         "--overwrite",
         "--overwrite-manifest-max-entries=1",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
         "--summary",
         &src_remote,
         &dst_remote,
@@ -8492,23 +8570,15 @@ fn test_remote_dry_run_excluded_root_skips_under_execute_only_parent() {
     );
 }
 
-/// A saturated dir-fd budget plus a Pass-2 file failure under `--fail-early` must (a) NOT deadlock
-/// the source (the `run_rcp_and_expect_failure` helper asserts non-timeout) and (b) report the REAL
-/// cause, not the synthetic "budget semaphore closed" wakeup that `close_fd_budget()` raises to
-/// unblock the parked Pass-1 walk. Forcing the budget to 1 (`--max-connections 1
-/// --pending-writes-multiplier 1`) lets a handful of directories park the walk. Regression guard for
-/// the deadlock fix AND the error-prioritization fix.
+/// A pre-header file failure under capacity-one saturation must cancel blocked work promptly
+/// and keep the original error ahead of synthetic admission-close or lost-obligation errors.
 #[test]
 fn test_remote_fail_early_saturated_budget_reports_real_cause() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src = src_dir.path().canonicalize().unwrap();
     let dst = dst_dir.path().canonicalize().unwrap();
-    // several subdirs (> budget 1) so the Pass-1 walk parks on the fd-budget; EVERY subdir holds a
-    // file the source cannot read, so whichever directory Pass 2 reaches first (readdir order is
-    // unspecified) triggers a Pass-2 permission error under --fail-early while the walk is still
-    // parked — making the repro deterministic regardless of enumeration order (a single bad dir
-    // could land last, after the walk already drained, and let the old masking bug pass too).
+    // every subtree has an unreadable file so the test does not depend on classification order
     for i in 0..10 {
         let d = src.join(format!("d{i}"));
         std::fs::create_dir(&d).unwrap();
@@ -8537,11 +8607,21 @@ fn test_remote_fail_early_saturated_budget_reports_real_cause() {
     );
     // the reported top-level Source error must be the real cause, not the synthetic budget wakeup.
     assert!(
-        combined.contains("Source: Permission denied"),
+        combined.lines().any(|line| {
+            line.split_once("Source: ").is_some_and(|(_, source)| {
+                source
+                    .split("; Destination:")
+                    .next()
+                    .unwrap()
+                    .contains("Permission denied (os error 13)")
+            })
+        }),
         "top-level Source error must name the real cause (Permission denied); got:\n{combined}"
     );
     assert!(
-        !combined.contains("Source: source dir-fd budget semaphore closed"),
+        !combined.contains("Source: file admission closed")
+            && !combined.contains("Source: branch admission closed")
+            && !combined.contains("Source: lost admitted child obligation"),
         "top-level Source error must not be the synthetic budget wakeup; got:\n{combined}"
     );
     // restore perms so the tempdir cleans up
@@ -8582,11 +8662,21 @@ fn test_remote_dereference_fail_early_saturated_budget_reports_real_cause() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("Source: Permission denied"),
+        combined.lines().any(|line| {
+            line.split_once("Source: ").is_some_and(|(_, source)| {
+                source
+                    .split("; Destination:")
+                    .next()
+                    .unwrap()
+                    .contains("Permission denied (os error 13)")
+            })
+        }),
         "top-level Source error must name the real cause (Permission denied); got:\n{combined}"
     );
     assert!(
-        !combined.contains("Source: source dir-fd budget semaphore closed"),
+        !combined.contains("Source: file admission closed")
+            && !combined.contains("Source: branch admission closed")
+            && !combined.contains("Source: lost admitted child obligation"),
         "top-level Source error must not be the synthetic budget wakeup; got:\n{combined}"
     );
     for i in 0..10 {
@@ -8827,7 +8917,7 @@ fn test_remote_acl_off_issues_no_source_probe() {
          the root handle's /proc/self/fd magic symlink):\n{}",
         traced.join("\n")
     );
-    // `-L` runs an entirely separate Pass-1 walk with its own directory-ACL gate, so the check
+    // `-L` uses a path-based adapter with its own directory-ACL gate, so the check
     // above says nothing about it: removing that gate leaves this assertion passing. Cover it here
     // rather than assume the two walks stay in step.
     let deref_dst = dst_dir.path().join("plain_deref");
@@ -9015,7 +9105,7 @@ fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
     );
 }
 
-/// `-L`/`--dereference` reaches a different Pass-1 walk on the source: it does not retain the
+/// `-L`/`--dereference` uses a path-based source adapter: it does not retain the
 /// transient enumeration descriptor for the later ACL capture, so that read opens the directory by
 /// path. Without this the dereference walk would quietly send no directory ACLs — and "no ACL" is a
 /// request to CLEAR, so the destination would strip them rather than merely fail to copy them.
