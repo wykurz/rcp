@@ -489,25 +489,30 @@ impl DirectoryTracker {
             // swapped intermediate dir cannot redirect the removal. ENOTEMPTY (the common
             // "directory has content" case) is handled by keeping the directory below.
             match (parent_dir.as_ref(), entry_name) {
-                (Some(parent), Some(name)) => match parent.rmdir_at(name).await {
-                    Ok(()) => {
-                        tracing::info!("Removed empty directory: {:?}", dst);
-                        // don't apply metadata or increment counter for removed directories
-                        self.metadata.remove(dst);
-                        if is_root {
-                            self.set_root_complete();
+                (Some(parent), Some(name)) => {
+                    match common::timing_scope!(trace, "destination.directory.finalize.prune")
+                        .measure(parent.rmdir_at(name))
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("Removed empty directory: {:?}", dst);
+                            // don't apply metadata or increment counter for removed directories
+                            self.metadata.remove(dst);
+                            if is_root {
+                                self.set_root_complete();
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
+                        Err(e) => {
+                            // not empty or other error - keep it and proceed normally
+                            tracing::debug!(
+                                "Could not remove empty directory {:?} (keeping): {:#}",
+                                dst,
+                                e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        // not empty or other error - keep it and proceed normally
-                        tracing::debug!(
-                            "Could not remove empty directory {:?} (keeping): {:#}",
-                            dst,
-                            e
-                        );
-                    }
-                },
+                }
                 _ => {
                     // parent fd missing (shouldn't happen: parent is tracked until the
                     // child completes) — keep the directory rather than fall back to a
@@ -547,14 +552,16 @@ impl DirectoryTracker {
                     } else {
                         self.preserve
                     };
-                    let apply_result = common::safedir::set_reused_dir_metadata_fd(
-                        &preserve_for_entry,
-                        &metadata,
-                        acls.as_ref(),
-                        reused_lock,
-                        dir,
-                    )
-                    .await;
+                    let apply_result =
+                        common::timing_scope!(trace, "destination.directory.finalize.metadata")
+                            .measure(common::safedir::set_reused_dir_metadata_fd(
+                                &preserve_for_entry,
+                                &metadata,
+                                acls.as_ref(),
+                                reused_lock,
+                                dir,
+                            ))
+                            .await;
                     match apply_result {
                         Ok(()) => {
                             tracing::info!("Directory complete, metadata applied: {:?}", dst);
@@ -675,25 +682,203 @@ impl DirectoryTracker {
     }
 }
 
-pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTracker>>;
+/// Share directory completion state while measuring only time spent acquiring its mutex.
+#[derive(Clone)]
+pub(super) struct SharedDirectoryTracker(Arc<tokio::sync::Mutex<DirectoryTracker>>);
 
-pub fn make_shared(
-    control_send_stream: remote::streams::BoxedSharedSendStream,
-    preserve: common::preserve::Settings,
-    fail_early: bool,
-    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
-) -> SharedDirectoryTracker {
-    std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
-        control_send_stream,
-        preserve,
-        fail_early,
-        error_collector,
-    )))
+impl SharedDirectoryTracker {
+    pub(super) fn new(
+        control_send_stream: remote::streams::BoxedSharedSendStream,
+        preserve: common::preserve::Settings,
+        fail_early: bool,
+        error_collector: Arc<common::error_collector::ErrorCollector>,
+    ) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
+            control_send_stream,
+            preserve,
+            fail_early,
+            error_collector,
+        ))))
+    }
+    pub(super) async fn lock(&self) -> tokio::sync::MutexGuard<'_, DirectoryTracker> {
+        common::timing_scope!(trace, "destination.tracker.wait")
+            .measure(self.0.lock())
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
+    use tracing::instrument::WithSubscriber as _;
+
+    #[derive(Clone, Default)]
+    struct TimingObservation(Arc<std::sync::Mutex<Vec<ObservedScope>>>);
+    struct ObservedScope {
+        name: &'static str,
+        finished: Option<bool>,
+    }
+    impl TimingObservation {
+        fn counts(&self, name: &str) -> (usize, usize, usize) {
+            let scopes = self.0.lock().unwrap();
+            let matching: Vec<_> = scopes.iter().filter(|scope| scope.name == name).collect();
+            (
+                matching.len(),
+                matching
+                    .iter()
+                    .filter(|scope| scope.finished == Some(true))
+                    .count(),
+                matching
+                    .iter()
+                    .filter(|scope| scope.finished == Some(false))
+                    .count(),
+            )
+        }
+    }
+    impl tracing::Subscriber for TimingObservation {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "rcp::timing"
+        }
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+            let mut scopes = self.0.lock().unwrap();
+            scopes.push(ObservedScope {
+                name: attributes.metadata().name(),
+                finished: None,
+            });
+            tracing::Id::from_u64(scopes.len() as u64)
+        }
+        fn record(&self, id: &tracing::Id, values: &tracing::span::Record<'_>) {
+            struct Completion(Option<bool>);
+            impl tracing::field::Visit for Completion {
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "timing_finished" {
+                        self.0 = Some(value);
+                    }
+                }
+            }
+            let mut completion = Completion(None);
+            values.record(&mut completion);
+            if let Some(finished) = completion.0 {
+                self.0.lock().unwrap()[id.into_u64() as usize - 1].finished = Some(finished);
+            }
+        }
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    #[tokio::test]
+    async fn tracker_wait_finishes_when_the_guard_is_acquired() {
+        let tracker = SharedDirectoryTracker::new(
+            mock_stream(),
+            common::preserve::preserve_none(),
+            false,
+            Arc::new(common::error_collector::ErrorCollector::default()),
+        );
+        let held = tracker.lock().await;
+        let observed = TimingObservation::default();
+        async {
+            let waiting = tracker.lock();
+            tokio::pin!(waiting);
+            assert!(waiting.as_mut().now_or_never().is_none());
+            assert_eq!(observed.counts("destination.tracker.wait"), (1, 0, 0));
+            drop(held);
+            let mut acquired = waiting.await;
+            assert_eq!(observed.counts("destination.tracker.wait"), (1, 1, 0));
+            acquired.observe_root().unwrap();
+            assert_eq!(
+                observed.counts("destination.tracker.wait"),
+                (1, 1, 0),
+                "holding the returned guard must not extend the wait scope"
+            );
+        }
+        .with_subscriber(observed.clone())
+        .await;
+        assert!(tracker.lock().await.root_observed);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tracker_wait_is_interrupted_without_acquiring() {
+        let tracker = SharedDirectoryTracker::new(
+            mock_stream(),
+            common::preserve::preserve_none(),
+            false,
+            Arc::new(common::error_collector::ErrorCollector::default()),
+        );
+        let held = tracker.lock().await;
+        let observed = TimingObservation::default();
+        async {
+            let mut waiting = Box::pin(tracker.lock());
+            assert!(waiting.as_mut().now_or_never().is_none());
+            drop(waiting);
+        }
+        .with_subscriber(observed.clone())
+        .await;
+        assert_eq!(observed.counts("destination.tracker.wait"), (1, 0, 1));
+        drop(held);
+        tracker.lock().await.observe_root().unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_completion_times_each_directory_in_the_ancestor_cascade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let mut tracker = new_tracker();
+        register(&mut tracker, tmp.path(), true).await;
+        tracker.mark_announced(tmp.path()).await.unwrap();
+        tracker.seal_directory(tmp.path(), 1).await.unwrap();
+        register(&mut tracker, &child, false).await;
+        tracker.mark_announced(&child).await.unwrap();
+        let observed = TimingObservation::default();
+        tracker
+            .seal_directory(&child, 0)
+            .with_subscriber(observed.clone())
+            .await
+            .unwrap();
+        tracker.finish_discovery(true).await.unwrap();
+        assert!(tracker.is_done());
+        assert!(tracker.get_dir(tmp.path()).is_none());
+        assert!(tracker.get_dir(&child).is_none());
+        assert_eq!(
+            observed.counts("destination.directory.finalize.metadata"),
+            (2, 2, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn pruned_directory_times_removal_without_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("traversal-only");
+        std::fs::create_dir(&child).unwrap();
+        let mut tracker = new_tracker();
+        register(&mut tracker, tmp.path(), true).await;
+        let admission = tracker.admit_directory(&child, false).unwrap();
+        tracker
+            .register_directory(admission, open_dir(&child).await, meta(), true, false, None)
+            .unwrap();
+        tracker.mark_announced(&child).await.unwrap();
+        let observed = TimingObservation::default();
+        tracker
+            .seal_directory(&child, 0)
+            .with_subscriber(observed.clone())
+            .await
+            .unwrap();
+        assert!(!child.exists());
+        assert_eq!(tracker.pending_directories[tmp.path()].entries_processed, 1);
+        assert_eq!(
+            observed.counts("destination.directory.finalize.prune"),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            observed.counts("destination.directory.finalize.metadata"),
+            (0, 0, 0)
+        );
+    }
+
     // a sink writer discards every control message, so the completion state machine can be driven
     // without a real connection.
     fn mock_stream() -> remote::streams::BoxedSharedSendStream {
@@ -750,8 +935,17 @@ mod tests {
         )
         .unwrap();
         t.mark_announced(&child).await.unwrap();
-        let error = t.seal_directory(&child, 0).await.unwrap_err();
+        let observed = TimingObservation::default();
+        let error = t
+            .seal_directory(&child, 0)
+            .with_subscriber(observed.clone())
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("Invalid argument"));
+        assert_eq!(
+            observed.counts("destination.directory.finalize.metadata"),
+            (1, 1, 0)
+        );
         assert!(!t.pending_directories.contains_key(&child));
         assert_eq!(t.pending_directories[tmp.path()].entries_processed, 0);
         assert!(t.admit_directory(&child, false).is_err());
@@ -937,15 +1131,29 @@ mod tests {
             let mut t = new_tracker();
             t.preserve = common::preserve::Settings::default();
             register(&mut t, tmp.path(), true).await;
+            let observed = TimingObservation::default();
             for (index, gate) in order.into_iter().enumerate() {
-                match gate {
-                    0 => t.mark_announced(tmp.path()).await.unwrap(),
-                    1 => t.seal_directory(tmp.path(), 1).await.unwrap(),
-                    2 => {
-                        t.process_file(tmp.path()).await.unwrap();
+                async {
+                    match gate {
+                        0 => t.mark_announced(tmp.path()).await.unwrap(),
+                        1 => t.seal_directory(tmp.path(), 1).await.unwrap(),
+                        2 => {
+                            t.process_file(tmp.path()).await.unwrap();
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
                 }
+                .with_subscriber(observed.clone())
+                .await;
+                assert_eq!(
+                    observed.counts("destination.directory.finalize.metadata"),
+                    if index == 2 { (1, 1, 0) } else { (0, 0, 0) },
+                    "order {order:?}"
+                );
+                assert_eq!(
+                    observed.counts("destination.directory.finalize.prune"),
+                    (0, 0, 0)
+                );
                 let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
                 assert_eq!(
                     mode,

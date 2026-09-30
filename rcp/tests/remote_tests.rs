@@ -156,6 +156,35 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                 .unwrap();
             assert_eq!(operation["count"], 1);
             assert_eq!(operation["finished"], 1);
+            assert_eq!(operation["interrupted"], 0);
+            let metadata_operation = match role {
+                "rcpd-source" => Some("source.metadata.stat"),
+                "rcpd-destination" => Some("destination.metadata.open-create"),
+                _ => None,
+            };
+            if let Some(operation) = metadata_operation {
+                let mut counts = Vec::new();
+                for phase in ["wait_rate", "wait_admission", "wait_worker", "execute"] {
+                    let name = format!("{operation}.{phase}");
+                    let scope = scopes.iter().find(|scope| scope["name"] == name);
+                    assert_eq!(scope.is_some(), detail, "{name}");
+                    if let Some(scope) = scope {
+                        let count = scope["count"].as_u64().unwrap();
+                        assert!(count > 0, "{name}");
+                        assert_eq!(scope["finished"], count, "{name}");
+                        assert_eq!(scope["interrupted"], 0, "{name}");
+                        counts.push(count);
+                    }
+                }
+                if detail {
+                    assert!(
+                        counts[0] <= counts[1],
+                        "some operations already hold a rate token"
+                    );
+                    assert_eq!(counts[1], counts[2], "every admission submits work");
+                    assert_eq!(counts[2], counts[3], "every submitted closure runs");
+                }
+            }
             if role == "rcpd-source" {
                 for (name, count) in [("source.discovery", 1), ("source.directory.scan", 3)] {
                     let scope = scopes.iter().find(|scope| scope["name"] == name).unwrap();
@@ -170,6 +199,29 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                 );
             }
             if role == "rcpd-destination" {
+                for name in [
+                    "destination.tracker.wait",
+                    "destination.directory.finalize.metadata",
+                ] {
+                    let scope = scopes.iter().find(|scope| scope["name"] == name);
+                    assert_eq!(scope.is_some(), detail, "{name}");
+                    if let Some(scope) = scope {
+                        let count = scope["count"].as_u64().unwrap();
+                        if name == "destination.directory.finalize.metadata" {
+                            assert_eq!(count, 3, "root, nested, and empty each finalize once");
+                        } else {
+                            assert!(count > 0);
+                        }
+                        assert_eq!(scope["finished"], count, "{name}");
+                        assert_eq!(scope["interrupted"], 0, "{name}");
+                    }
+                }
+                assert!(
+                    !scopes
+                        .iter()
+                        .any(|scope| scope["name"] == "destination.directory.finalize.prune"),
+                    "ordinary empty directories are retained"
+                );
                 for stage in [
                     "wait_open",
                     "parent",
