@@ -42,7 +42,7 @@ pub struct CommonArgs {
     /// not percentages of command wall time. This also works with --quiet.
     #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
     pub timings: Option<String>,
-    /// Include detailed per-file scopes in timing summaries and elapsed-scope traces
+    /// Include file, metadata, and tracker scopes in timing summaries and elapsed-scope traces
     #[arg(long, help_heading = "Profiling")]
     pub timings_detail: bool,
     // Performance & throttling

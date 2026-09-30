@@ -387,3 +387,370 @@ fn metadata_errors_finish_execution_but_panics_interrupt_it() -> anyhow::Result<
         Ok(())
     })
 }
+
+#[test]
+fn async_metadata_reports_success_and_error_without_worker_queue() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let capture = Capture::new(true)?;
+        let directory = tempfile::tempdir()?;
+        let metadata = crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            tokio::fs::metadata(directory.path()),
+        )
+        .with_subscriber(capture.dispatch.clone())
+        .await?;
+        assert!(metadata.is_dir());
+        let error = crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            congestion::MetadataOp::OpenCreate,
+            tokio::fs::File::create(directory.path().join("missing/file")),
+        )
+        .with_subscriber(capture.dispatch.clone())
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let report = capture.report()?;
+        for operation in ["source.metadata.stat", "destination.metadata.open-create"] {
+            for phase in ["wait_rate", "wait_admission", "execute"] {
+                assert_sample(&report, &format!("{operation}.{phase}"), 1, 0);
+            }
+        }
+        assert_eq!(report["scopes"].as_array().unwrap().len(), 6);
+        Ok(())
+    })
+}
+
+#[test]
+fn async_metadata_cancelled_during_admission_never_executes() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let limits = crate::testutils::AdmissionLimit::new().await;
+        let resource = throttle::Resource::meta(
+            throttle::Side::Destination,
+            throttle::MetadataOp::OpenCreate,
+        );
+        limits.set_max_ops_in_flight(resource, 1);
+        let held = throttle::ops_in_flight_permit(resource).await;
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("never-created");
+        let capture = Capture::new(true)?;
+        let mut work = Box::pin(
+            crate::walk::run_metadata_probed_no_rate(
+                congestion::Side::Destination,
+                congestion::MetadataOp::OpenCreate,
+                tokio::fs::File::create(&destination),
+            )
+            .with_subscriber(capture.dispatch.clone()),
+        );
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        drop(work);
+        drop(held);
+        assert!(!destination.exists());
+        let report = capture.report()?;
+        assert_sample(
+            &report,
+            "destination.metadata.open-create.wait_admission",
+            0,
+            1,
+        );
+        assert_eq!(report["scopes"].as_array().unwrap().len(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn async_metadata_execution_spans_suspension_and_cancellation() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let limits = crate::testutils::AdmissionLimit::new().await;
+        let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+        limits.set_max_ops_in_flight(resource, 1);
+        let samples = Arc::new(congestion::testing::CollectingSink::new());
+        congestion::install_sample_sink(samples.clone());
+        let capture = Capture::new(true)?;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let mut work = Box::pin(
+            crate::walk::run_metadata_probed_no_rate(
+                congestion::Side::Source,
+                congestion::MetadataOp::Stat,
+                async { released.await.map_err(std::io::Error::other) },
+            )
+            .with_subscriber(capture.dispatch.clone()),
+        );
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        let suspended = capture.events();
+        let mut next = Box::pin(throttle::ops_in_flight_permit(resource));
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        drop(work);
+        assert!(futures::poll!(next.as_mut()).is_ready());
+        assert_eq!(
+            samples.metadata_count(),
+            0,
+            "cancelled operation must not publish a success probe"
+        );
+        assert!(release.send(()).is_err());
+        assert!(suspended.contains(&Event::Started("source.metadata.stat.execute")));
+        assert!(
+            !suspended
+                .iter()
+                .any(|event| matches!(event, Event::Completed("source.metadata.stat.execute", _)))
+        );
+        let report = capture.report()?;
+        assert_sample(&report, "source.metadata.stat.wait_admission", 1, 0);
+        assert_sample(&report, "source.metadata.stat.execute", 0, 1);
+        assert_eq!(report["scopes"].as_array().unwrap().len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn async_metadata_panic_interrupts_execution_and_releases_admission() -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    runtime()?.block_on(async {
+        let limits = crate::testutils::AdmissionLimit::new().await;
+        let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+        limits.set_max_ops_in_flight(resource, 1);
+        let capture = Capture::new(true)?;
+        let work = crate::walk::run_metadata_probed_no_rate(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            async {
+                panic!("async metadata panic");
+                #[allow(unreachable_code)]
+                std::io::Result::Ok(())
+            },
+        )
+        .with_subscriber(capture.dispatch.clone());
+        assert!(
+            std::panic::AssertUnwindSafe(work)
+                .catch_unwind()
+                .await
+                .is_err()
+        );
+        assert!(
+            throttle::ops_in_flight_permit(resource)
+                .now_or_never()
+                .is_some()
+        );
+        let report = capture.report()?;
+        assert_sample(&report, "source.metadata.stat.wait_admission", 1, 0);
+        assert_sample(&report, "source.metadata.stat.execute", 0, 1);
+        assert_eq!(report["scopes"].as_array().unwrap().len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn async_metadata_timings_require_detail_enablement() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let capture = Capture::new(false)?;
+        let directory = tempfile::tempdir()?;
+        let metadata = crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            tokio::fs::metadata(directory.path()),
+        )
+        .with_subscriber(capture.dispatch.clone())
+        .await?;
+        assert!(metadata.is_dir());
+        assert!(capture.report()?["scopes"].as_array().unwrap().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn blocking_execution_finishes_after_probe_and_operation_release() -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    struct Completion {
+        samples: Arc<congestion::testing::CollectingSink>,
+        observed: Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
+        resource: throttle::Resource,
+    }
+    impl<S> tracing_subscriber::Layer<S> for Completion
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_record(
+            &self,
+            id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Finished(bool);
+            impl tracing::field::Visit for Finished {
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "timing_finished" {
+                        self.0 = value;
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut finished = Finished(false);
+            values.record(&mut finished);
+            if finished.0
+                && context.span(id).unwrap().metadata().name() == "source.metadata.stat.execute"
+            {
+                let released = throttle::ops_in_flight_permit(self.resource)
+                    .now_or_never()
+                    .is_some();
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push((self.samples.metadata_count(), released));
+            }
+        }
+    }
+    runtime()?.block_on(async {
+        let limits = crate::testutils::AdmissionLimit::new().await;
+        let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+        limits.set_max_ops_in_flight(resource, 1);
+        let samples = Arc::new(congestion::testing::CollectingSink::new());
+        congestion::install_sample_sink(samples.clone());
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Completion {
+            samples,
+            observed: observed.clone(),
+            resource,
+        });
+        let file = tempfile::tempfile()?;
+        run_metadata_probed_blocking_no_rate(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            move || file.metadata(),
+        )
+        .with_subscriber(subscriber)
+        .await?;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(1, true)],
+            "execution completion must follow the probe and operation permit cleanup"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn async_metadata_no_rate_finishes_after_resuming_the_operation() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let capture = Capture::new(true)?;
+        let directory = tempfile::tempdir()?;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let mut work = Box::pin(
+            crate::walk::run_metadata_probed_no_rate(
+                congestion::Side::Source,
+                congestion::MetadataOp::Stat,
+                async {
+                    released.await.map_err(std::io::Error::other)?;
+                    tokio::fs::metadata(directory.path()).await
+                },
+            )
+            .with_subscriber(capture.dispatch.clone()),
+        );
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        let suspended = capture.events();
+        release.send(()).unwrap();
+        assert!(work.await?.is_dir());
+        assert_eq!(
+            suspended,
+            vec![
+                Event::Started("source.metadata.stat.wait_admission"),
+                Event::Completed("source.metadata.stat.wait_admission", true),
+                Event::Started("source.metadata.stat.execute"),
+            ]
+        );
+        let report = capture.report()?;
+        assert_sample(&report, "source.metadata.stat.wait_admission", 1, 0);
+        assert_sample(&report, "source.metadata.stat.execute", 1, 0);
+        assert_eq!(report["scopes"].as_array().unwrap().len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn moved_metadata_scopes_release_their_original_parent_under_another_subscriber()
+-> anyhow::Result<()> {
+    #[derive(Clone, Default)]
+    struct Closed(Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl<S> tracing_subscriber::Layer<S> for Closed
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::Id, context: tracing_subscriber::layer::Context<'_, S>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(context.span(&id).unwrap().metadata().name());
+        }
+    }
+    for finish in [false, true] {
+        for (phase, name) in [
+            (
+                MetadataTimingPhase::Queue,
+                "source.metadata.stat.wait_worker",
+            ),
+            (MetadataTimingPhase::Execute, "source.metadata.stat.execute"),
+            (MetadataTimingPhase::Rate, "source.metadata.stat.wait_rate"),
+            (
+                MetadataTimingPhase::Admission,
+                "source.metadata.stat.wait_admission",
+            ),
+        ] {
+            let file = tempfile::NamedTempFile::new()?;
+            let (layer, mut guard) = crate::timing::TimingLayer::new(
+                "moved-metadata".into(),
+                Some(file.reopen()?),
+                None,
+            );
+            let original_closed = Closed::default();
+            let other_closed = Closed::default();
+            let original = tracing::Dispatch::new(
+                tracing_subscriber::registry()
+                    .with(layer.with_filter(crate::timing::timing_filter(true)))
+                    .with(original_closed.clone()),
+            );
+            let other =
+                tracing::Dispatch::new(tracing_subscriber::registry().with(other_closed.clone()));
+            let scope = tracing::dispatcher::with_default(&original, || {
+                let parent = tracing::info_span!("active_metadata_parent");
+                let _entered = parent.enter();
+                metadata_timing_scope(
+                    congestion::Side::Source,
+                    congestion::MetadataOp::Stat,
+                    phase,
+                )
+            });
+            let joined = std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&other, || {
+                    if finish {
+                        scope.finish();
+                    } else {
+                        drop(scope);
+                    }
+                });
+            })
+            .join();
+            assert!(
+                joined.is_ok(),
+                "{name} crossed subscriber ownership while finish={finish}"
+            );
+            assert_eq!(
+                original_closed
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|name| **name == "active_metadata_parent")
+                    .count(),
+                1
+            );
+            assert!(
+                other_closed.0.lock().unwrap().is_empty(),
+                "foreign registry received a span close"
+            );
+            guard.finish()?;
+            let report: serde_json::Value = serde_json::from_reader(file.reopen()?)?;
+            assert_sample(&report, name, u64::from(finish), u64::from(!finish));
+            assert_eq!(report["scopes"].as_array().unwrap().len(), 1);
+        }
+    }
+    Ok(())
+}

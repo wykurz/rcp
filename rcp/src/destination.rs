@@ -728,7 +728,9 @@ async fn handle_file_stream(
                 throttle::open_file_permit().instrument(tracing::trace_span!("open_file_permit")),
             )
             .await;
-        throttle::get_ops_token().await;
+        common::timing_scope!(trace, "destination.file.wait_rate")
+            .measure(throttle::get_ops_token())
+            .await;
         let _ops_guard = prog.ops.guard();
         // resolve the destination parent directory's held fd from the tracker (for the
         // root file, open the trusted parent via open_parent_dir). all writes for this
@@ -1389,7 +1391,9 @@ async fn process_control_stream(
         while let Some(joined) = manifest_tasks.try_join_next() {
             reap_announce_task(joined, &directory_tracker, &data_pool, &error_collector).await;
         }
-        throttle::get_ops_token().await;
+        common::timing_scope!(trace, "destination.control.wait_rate")
+            .measure(throttle::get_ops_token())
+            .await;
         tracing::debug!("Received source message: {:?}", source_message);
         let prog = progress();
         async {

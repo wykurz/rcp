@@ -54,8 +54,9 @@ or malformed reports fails; partial reports from failed trials remain available.
 execution artifact and is not added to the manifest variant arguments.
 
 For deeper investigation, run `rcp` directly with `--timings-detail` alongside `--timings=PREFIX` to
-include hot per-file scopes, or with `--chrome-trace=PREFIX` to produce detailed trace output. These
-diagnostic runs add overhead and should be kept separate from comparable benchmark series.
+include file, metadata, and tracker scopes, or with `--chrome-trace=PREFIX` to produce detailed
+trace output. These diagnostic runs add overhead and should be kept separate from comparable
+benchmark series.
 
 ```bash
 just benchmark --case tiny-1m --mode local --cache linux-drop-caches --repetitions 4 --output /tmp/rcp-bench-local
