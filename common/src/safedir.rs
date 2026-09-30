@@ -24,6 +24,8 @@ use crate::walk::EntryKind;
 
 #[cfg(test)]
 mod resource_tests;
+#[cfg(test)]
+mod timing_tests;
 
 // ── Destination creation modes ───────────────────────────────────────────────
 
@@ -3523,6 +3525,59 @@ where
     result
 }
 
+enum MetadataTimingPhase {
+    Rate,
+    Admission,
+    Queue,
+    Execute,
+}
+
+fn metadata_timing_scope(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    phase: MetadataTimingPhase,
+) -> crate::timing::Scope {
+    // static callsites keep aggregate names bounded without allocating per-operation strings
+    macro_rules! scope {
+        ($side:literal, $op:literal, $phase:literal) => {
+            crate::timing::Scope::new(tracing::trace_span!(
+                target: "rcp::timing",
+                concat!($side, ".metadata.", $op, ".", $phase),
+                timing_finished = tracing::field::Empty
+            ))
+        };
+    }
+    macro_rules! phases {
+        ($side:literal, $op:literal) => {
+            match phase {
+                MetadataTimingPhase::Rate => scope!($side, $op, "wait_rate"),
+                MetadataTimingPhase::Admission => scope!($side, $op, "wait_admission"),
+                MetadataTimingPhase::Queue => scope!($side, $op, "wait_worker"),
+                MetadataTimingPhase::Execute => scope!($side, $op, "execute"),
+            }
+        };
+    }
+    macro_rules! operations {
+        ($side:literal) => {
+            match op {
+                congestion::MetadataOp::Stat => phases!($side, "stat"),
+                congestion::MetadataOp::ReadLink => phases!($side, "read-link"),
+                congestion::MetadataOp::MkDir => phases!($side, "mkdir"),
+                congestion::MetadataOp::RmDir => phases!($side, "rmdir"),
+                congestion::MetadataOp::Unlink => phases!($side, "unlink"),
+                congestion::MetadataOp::HardLink => phases!($side, "hard-link"),
+                congestion::MetadataOp::Symlink => phases!($side, "symlink"),
+                congestion::MetadataOp::Chmod => phases!($side, "chmod"),
+                congestion::MetadataOp::OpenCreate => phases!($side, "open-create"),
+            }
+        };
+    }
+    match side {
+        congestion::Side::Source => operations!("source"),
+        congestion::Side::Destination => operations!("destination"),
+    }
+}
+
 /// Run a blocking metadata syscall closure on the blocking pool, gated by the
 /// congestion controller for the given side and operation kind.
 ///
@@ -3540,7 +3595,9 @@ where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let rate = metadata_timing_scope(side, op, MetadataTimingPhase::Rate);
     throttle::get_ops_token().await;
+    rate.finish();
     run_metadata_probed_blocking_no_rate(side, op, f).await
 }
 
@@ -3555,10 +3612,26 @@ where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let admission = metadata_timing_scope(side, op, MetadataTimingPhase::Admission);
     let ops_permit = throttle::ops_in_flight_permit(crate::walk::meta_resource(side, op)).await;
+    admission.finish();
     let probe = congestion::Probe::start_metadata(side, op);
+    // worker threads do not inherit a task-local subscriber. Retain it only for constructing the
+    // execution scope; each scope carries its own subscriber through completion or cancellation.
+    let timing_dispatch = tracing::enabled!(target: "rcp::timing", tracing::Level::TRACE)
+        .then(|| tracing::dispatcher::get_default(Clone::clone));
+    let queue = metadata_timing_scope(side, op, MetadataTimingPhase::Queue);
     run_fd_admitted_blocking(move || {
+        queue.finish();
+        let execution = timing_dispatch.as_ref().map(|dispatch| {
+            tracing::dispatcher::with_default(dispatch, || {
+                metadata_timing_scope(side, op, MetadataTimingPhase::Execute)
+            })
+        });
         let result = f();
+        if let Some(execution) = execution {
+            execution.finish();
+        }
         match &result {
             Ok(_) => probe.complete_ok(0),
             Err(_) => probe.discard(),

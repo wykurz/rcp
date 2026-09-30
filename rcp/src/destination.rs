@@ -1846,7 +1846,7 @@ pub async fn run_destination(
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams");
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
-    let directory_tracker = directory_tracker::make_shared(
+    let directory_tracker = directory_tracker::SharedDirectoryTracker::new(
         control_send_stream.clone(),
         *preserve,
         settings.fail_early,
@@ -2026,7 +2026,7 @@ mod teardown_tests {
             Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
         )));
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,
@@ -2126,7 +2126,7 @@ mod teardown_tests {
                 Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
             )));
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let tracker = directory_tracker::make_shared(
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
                 send.clone(),
                 common::preserve::preserve_none(),
                 false,
@@ -2244,7 +2244,7 @@ mod teardown_tests {
                 Box::new(writer) as remote::streams::BoxedWrite,
             )));
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let tracker = directory_tracker::make_shared(
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
                 send.clone(),
                 common::preserve::preserve_none(),
                 false,
@@ -2308,7 +2308,7 @@ mod teardown_tests {
                 Box::new(writer) as remote::streams::BoxedWrite,
             )));
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let tracker = directory_tracker::make_shared(
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
                 send.clone(),
                 common::preserve::preserve_none(),
                 false,
@@ -2494,7 +2494,7 @@ mod teardown_tests {
         let send = remote::streams::SendStream::new(
             Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
         );
-        directory_tracker::make_shared(
+        directory_tracker::SharedDirectoryTracker::new(
             std::sync::Arc::new(tokio::sync::Mutex::new(send)),
             common::preserve::Settings::default(),
             false,
@@ -2549,7 +2549,7 @@ mod teardown_tests {
             Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
         )));
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,
@@ -2613,7 +2613,7 @@ mod teardown_tests {
             Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
         )));
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,
@@ -2663,7 +2663,7 @@ mod teardown_tests {
                 Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
             )));
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let tracker = directory_tracker::make_shared(
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
                 send.clone(),
                 common::preserve::preserve_none(),
                 false,
@@ -2769,7 +2769,7 @@ mod teardown_tests {
         let send = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
             Box::new(writer) as remote::streams::BoxedWrite,
         )));
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,
@@ -2875,7 +2875,7 @@ mod teardown_tests {
             Box::new(writer) as remote::streams::BoxedWrite,
         )));
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,
@@ -2960,7 +2960,7 @@ mod teardown_tests {
                 Box::new(tokio::io::sink()) as remote::streams::BoxedWrite,
             )));
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let tracker = directory_tracker::make_shared(
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
                 send.clone(),
                 common::preserve::preserve_none(),
                 false,
@@ -3027,7 +3027,7 @@ mod teardown_tests {
             }) as remote::streams::BoxedWrite,
         )));
         let errors = Arc::new(common::error_collector::ErrorCollector::default());
-        let tracker = directory_tracker::make_shared(
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
             send.clone(),
             common::preserve::preserve_none(),
             false,

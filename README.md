@@ -921,9 +921,27 @@ microsecond resolution; totals and maxima retain the measured duration precision
 
 The default scopes cover the operation, local copy, and remote source traversal, scanning,
 directory-credit waits, dispatch, and drain. Add `--timings-detail` to include per-file waits,
-opening, and sending. Detailed collection costs more and is intended for diagnosis. The benchmark
-harness collects coarse summaries by default and includes stage tables in its reports; see
-[benchmarking](docs/benchmarking.md).
+opening, sending, receiver completion, and shared metadata operations. Detailed collection costs
+more and is intended for diagnosis. The benchmark harness collects coarse summaries by default and
+includes stage tables in its reports; see [benchmarking](docs/benchmarking.md).
+
+Shared metadata scopes use `source.metadata.<operation>.<phase>` or
+`destination.metadata.<operation>.<phase>`. Operations are `stat`, `read-link`, `mkdir`, `rmdir`,
+`unlink`, `hard-link`, `symlink`, `chmod`, and `open-create`:
+
+| Phase            | Measured interval                                                     |
+| ---------------- | --------------------------------------------------------------------- |
+| `wait_rate`      | Waiting for a metadata rate token, when the caller requests one.      |
+| `wait_admission` | Waiting for metadata concurrency admission.                           |
+| `wait_worker`    | Preparing and submitting blocking work through its start on a worker. |
+| `execute`        | Running the metadata closure, including its filesystem calls.         |
+
+Cancellation while waiting for a worker interrupts `wait_worker` and produces no `execute` sample.
+Once work starts, `execute` follows the worker through completion even if its async waiter is
+cancelled. A returned error finishes the execution scope; unwinding interrupts it. These scopes
+measure elapsed time, not individual syscall latency. See
+[remote timings](docs/remote_protocol.md#15-scoped-performance-timings) for source traversal and
+receiver scope boundaries.
 
 Durations include time suspended at an async wait. Nested and concurrent scopes overlap: their
 totals are cumulative elapsed time, **not CPU time or additive command wall time**. A finished scope

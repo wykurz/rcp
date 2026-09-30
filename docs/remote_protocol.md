@@ -263,10 +263,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 `--timings=PREFIX` is propagated to both daemons, which aggregate timing spans locally and write
 their own `.timings.json` files on their respective hosts at shutdown. These measurements are not
 sent over the tracing connection. Startup notices follow the existing readiness/logging rules.
-`--timings-detail` enables finer per-file scopes; ordinary copies collect neither summaries nor
-elapsed timelines unless requested. `--chrome-trace` additionally produces a separate `.scopes.json`
-elapsed timeline. See [the profiling reference](../README.md#scoped-timings) for the schema and
-scope API.
+`--timings-detail` enables per-file, metadata, and tracker scopes; ordinary copies collect neither
+summaries nor elapsed timelines unless requested. `--chrome-trace` additionally produces a separate
+`.scopes.json` elapsed timeline. See [the profiling reference](../README.md#scoped-timings) for the
+schema and scope API.
 
 The source scopes have these boundaries in both the hardened and dereferencing walks:
 
@@ -287,6 +287,18 @@ admission, parent resolution, destination classification, IOPS admission, creati
 and writes, flushing, metadata, discarded payloads, and tracker completion respectively. Completion
 includes waiting for the tracker and any resulting directory finalization. A creation race can
 produce a second plan or create sample.
+
+`destination.tracker.wait` measures acquisition of the shared directory-tracker mutex, ending when
+the caller receives its guard. `destination.directory.finalize.metadata` measures applying final
+directory metadata; `destination.directory.finalize.prune` measures removing an empty traversal-only
+directory. Each finalization attempt has its own sample, including ancestors completed by a child.
+Finalization holds the tracker mutex, so its elapsed time can also contribute to other callers'
+tracker waits.
+
+Shared `source.metadata.<operation>.<phase>` and `destination.metadata.<operation>.<phase>` scopes
+separate rate admission, concurrency admission, blocking-worker queueing, and execution. Their
+[phase definitions](../README.md#scoped-timings) also describe cancellation boundaries. Filesystem
+execution includes closure work and can overlap the higher-level file or directory scopes.
 
 `operation` covers each process's main operation; `local.copy` covers each local copy invocation.
 Interrupted scopes report their interruption. Durations include async suspension and can overlap;
