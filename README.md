@@ -922,31 +922,48 @@ microsecond resolution; totals and maxima retain the measured duration precision
 The default scopes cover the operation, local copy, and remote source traversal, scanning,
 directory-credit waits, dispatch, and drain. Add `--timings-detail` to include per-file waits,
 opening, sending, receiver completion, and shared metadata operations. Detailed collection costs
-more and is intended for diagnosis. The benchmark harness collects coarse summaries by default and
-includes stage tables in its reports; see [benchmarking](docs/benchmarking.md).
+more and is intended for diagnosis; collection can affect scheduling and lock contention. The
+benchmark harness collects coarse summaries by default and includes stage tables in its reports; see
+[benchmarking](docs/benchmarking.md).
 
 Shared metadata scopes use `source.metadata.<operation>.<phase>` or
 `destination.metadata.<operation>.<phase>`. Operations are `stat`, `read-link`, `mkdir`, `rmdir`,
-`unlink`, `hard-link`, `symlink`, `chmod`, and `open-create`:
+`unlink`, `hard-link`, `symlink`, `chmod`, and `open-create`. These are
+[congestion buckets](docs/congestion_control.md#what-counts-as-a-metadata-op), not individual
+syscalls: for example, `chmod` also covers ownership, timestamps, and ACL updates, while `stat` can
+include opens.
 
-| Phase            | Measured interval                                                     |
-| ---------------- | --------------------------------------------------------------------- |
-| `wait_rate`      | Waiting for a metadata rate token, when the caller requests one.      |
-| `wait_admission` | Waiting for metadata concurrency admission.                           |
-| `wait_worker`    | Preparing and submitting blocking work through its start on a worker. |
-| `execute`        | Running the metadata closure, including its filesystem calls.         |
+| Phase            | Measured interval                                                                  |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| `wait_rate`      | Waiting for a metadata rate token, when the caller requests one.                   |
+| `wait_admission` | Waiting for metadata concurrency admission.                                        |
+| `wait_worker`    | Blocking helper only: preparing and submitting work through its start on a worker. |
+| `execute`        | Running the blocking closure or awaiting the async metadata future.                |
+
+Both metadata helpers record rate and concurrency admission. Calls that already consumed a rate
+token omit `wait_rate`. Async execution includes suspension and any worker scheduling inside the
+awaited API; it has no separate `wait_worker` sample. Admission samples are recorded even when the
+operation can proceed immediately, so their counts represent visits to that stage.
 
 Cancellation while waiting for a worker interrupts `wait_worker` and produces no `execute` sample.
 Once work starts, `execute` follows the worker through completion even if its async waiter is
-cancelled. A returned error finishes the execution scope; unwinding interrupts it. These scopes
-measure elapsed time, not individual syscall latency. See
+cancelled. Cancelling an async metadata future interrupts its execution scope. A returned error
+finishes the execution scope; unwinding interrupts it. These scopes measure elapsed time, not
+individual syscall latency. See
 [remote timings](docs/remote_protocol.md#15-scoped-performance-timings) for source traversal and
 receiver scope boundaries.
+
+Detailed collection adds work at worker startup inside the congestion probe interval. Execution
+completion is recorded after the probe ends and its concurrency permit is released. Collection can
+still change the latency observed by `--auto-meta-throttle`; use detail reports for diagnosis, and
+measure throughput separately with detail disabled.
 
 Durations include time suspended at an async wait. Nested and concurrent scopes overlap: their
 totals are cumulative elapsed time, **not CPU time or additive command wall time**. A finished scope
 reached its explicit endpoint; it does not imply the copy succeeded. Early exits and cancellation
-before that endpoint count as interrupted, and both kinds contribute to duration statistics.
+before that endpoint count as interrupted, and both kinds contribute to duration statistics. Reports
+include scopes recorded before artifact finalization. A blocking worker still stuck after the
+runtime's ten-second shutdown timeout has no recorded completion or interruption and is omitted.
 
 To add a measurement in code, use a stable name and finish it at the intended boundary:
 
@@ -999,9 +1016,9 @@ Chrome tracing also writes `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.s
 elapsed timing scopes above. The existing `.json` file records span enter/exit intervals, which can
 split an async operation across polls; the `.scopes.json` file records its logical elapsed lifetime,
 including waits. Concurrent elapsed scopes use separate lanes, reused after completion. Use
-`--timings-detail` for per-file elapsed scopes. `--profile-level` controls the existing poll trace
-only; elapsed scopes use their own coarse/detail selection. Chrome output is disabled by `--quiet`,
-as before. Summaries and both trace files can safely use the same prefix.
+`--timings-detail` for file, metadata, and tracker elapsed scopes. `--profile-level` controls the
+existing poll trace only; elapsed scopes use their own coarse/detail selection. Chrome output is
+disabled by `--quiet`. Summaries and both trace files can safely use the same prefix.
 
 ## Flamegraph
 

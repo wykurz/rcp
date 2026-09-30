@@ -281,24 +281,30 @@ The source scopes have these boundaries in both the hardened and dereferencing w
 | `source.file.wait_stream`, `source.file.wait_open`, `source.file.wait_iops` | Detailed waits for stream, open-file, and IOPS admission.                                                  |
 | `source.file.open`, `source.file.send`                                      | Detailed data-file opening and sending.                                                                    |
 
-The destination's detailed scopes use the `destination.file` prefix: `wait_open`, `parent`, `plan`,
-`wait_iops`, `create`, `receive`, `flush`, `metadata`, `drain`, and `complete`. These cover
-admission, parent resolution, destination classification, IOPS admission, creation, payload reads
-and writes, flushing, metadata, discarded payloads, and tracker completion respectively. Completion
-includes waiting for the tracker and any resulting directory finalization. A creation race can
-produce a second plan or create sample.
+The destination's detailed scopes use the `destination.file` prefix: `wait_open`, `wait_rate`,
+`parent`, `plan`, `wait_iops`, `create`, `receive`, `flush`, `metadata`, `drain`, and `complete`.
+These cover file and rate admission, parent resolution, destination classification, IOPS admission,
+creation, payload reads and writes, flushing, metadata, discarded payloads, and tracker completion
+respectively. Completion includes waiting for the tracker and any resulting directory finalization.
+A creation race can produce a second plan or create sample.
+
+`destination.control.wait_rate` measures rate admission for each received control message.
 
 `destination.tracker.wait` measures acquisition of the shared directory-tracker mutex, ending when
-the caller receives its guard. `destination.directory.finalize.metadata` measures applying final
-directory metadata; `destination.directory.finalize.prune` measures removing an empty traversal-only
-directory. Each finalization attempt has its own sample, including ancestors completed by a child.
-Finalization holds the tracker mutex, so its elapsed time can also contribute to other callers'
-tracker waits.
+the caller receives its guard. Recording that sample holds the acquired tracker guard while the
+timing collector aggregates it; detailed collection can therefore inflate other callers' waits.
+`destination.directory.finalize.metadata` measures applying final directory metadata;
+`destination.directory.finalize.prune` measures each attempt to remove an empty traversal-only
+directory. A failed removal, including a nonempty directory, finishes its prune scope and proceeds
+to metadata application. Prune counts are attempts, not counts of removed directories. Each
+finalization attempt has its own sample, including ancestors completed by a child. Finalization
+holds the tracker mutex, so its elapsed time can also contribute to other callers' tracker waits.
 
 Shared `source.metadata.<operation>.<phase>` and `destination.metadata.<operation>.<phase>` scopes
-separate rate admission, concurrency admission, blocking-worker queueing, and execution. Their
-[phase definitions](../README.md#scoped-timings) also describe cancellation boundaries. Filesystem
-execution includes closure work and can overlap the higher-level file or directory scopes.
+separate rate admission, concurrency admission, and execution; the blocking helper also records
+worker queueing. Their [phase definitions](../README.md#scoped-timings) also describe cancellation
+boundaries. Filesystem execution includes closure work and can overlap the higher-level file or
+directory scopes.
 
 `operation` covers each process's main operation; `local.copy` covers each local copy invocation.
 Interrupted scopes report their interruption. Durations include async suspension and can overlap;

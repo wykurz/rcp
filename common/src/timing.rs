@@ -10,6 +10,8 @@ use anyhow::Context;
 use serde::Serialize;
 use std::io::Write;
 
+pub(crate) mod metadata;
+
 const TARGET: &str = "rcp::timing";
 const FINISHED_FIELD: &str = "timing_finished";
 const MAX_SCOPES: usize = 256;

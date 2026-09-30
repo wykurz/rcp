@@ -105,11 +105,13 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
             .await
             .unwrap();
     }
-    for detail in [false, true] {
+    for (detail, dereference, destination) in [
+        (false, false, "coarse-hardened"),
+        (true, false, "detail-hardened"),
+        (true, true, "detail-dereferenced"),
+    ] {
         let artifacts = tempfile::tempdir().unwrap();
-        let dst = fixture
-            .path()
-            .join(if detail { "dereferenced" } else { "hardened" });
+        let dst = fixture.path().join(destination);
         let src_remote = format!("localhost:{}", src.display());
         let dst_remote = format!("localhost:{}", dst.display());
         let daemon = format!(
@@ -120,8 +122,11 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
         let timings = format!("--timings={}", prefix.display());
         let chrome = format!("--chrome-trace={}", prefix.display());
         let mut args = vec![daemon.as_str(), timings.as_str()];
+        if dereference {
+            args.push("-L");
+        }
         if detail {
-            args.extend(["-L", "--timings-detail", chrome.as_str()]);
+            args.extend(["--timings-detail", chrome.as_str()]);
         }
         args.extend([src_remote.as_str(), dst_remote.as_str()]);
         let output = run_rcp_with_args_at_default_verbosity(&args);
@@ -177,12 +182,25 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                     }
                 }
                 if detail {
-                    assert!(
-                        counts[0] <= counts[1],
-                        "some operations already hold a rate token"
+                    assert_eq!(
+                        counts[0], counts[1],
+                        "each metadata operation in this remote fixture requests a rate token"
                     );
-                    assert_eq!(counts[1], counts[2], "every admission submits work");
-                    assert_eq!(counts[2], counts[3], "every submitted closure runs");
+                    assert_eq!(counts[1], counts[3], "every admitted operation executes");
+                    assert!(
+                        counts[2] <= counts[3],
+                        "only blocking work has a worker scope"
+                    );
+                    let async_stats = if role == "rcpd-source" && dereference {
+                        5
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        counts[3] - counts[2],
+                        async_stats,
+                        "-L classifies the root, two directories, and two files through async stat"
+                    );
                 }
             }
             if role == "rcpd-source" {
@@ -199,6 +217,18 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                 );
             }
             if role == "rcpd-destination" {
+                let control_rate = scopes
+                    .iter()
+                    .find(|scope| scope["name"] == "destination.control.wait_rate");
+                assert_eq!(control_rate.is_some(), detail);
+                if let Some(scope) = control_rate {
+                    assert_eq!(
+                        scope["count"], 7,
+                        "three Begin, three End, DiscoveryComplete"
+                    );
+                    assert_eq!(scope["finished"], 7);
+                    assert_eq!(scope["interrupted"], 0);
+                }
                 for name in [
                     "destination.tracker.wait",
                     "destination.directory.finalize.metadata",
@@ -224,6 +254,7 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                 );
                 for stage in [
                     "wait_open",
+                    "wait_rate",
                     "parent",
                     "plan",
                     "wait_iops",

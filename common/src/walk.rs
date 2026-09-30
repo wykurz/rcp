@@ -22,6 +22,7 @@
 
 use crate::filter::{FilterResult, FilterSettings};
 use crate::progress::Progress;
+use crate::timing::metadata::{Phase as MetadataTimingPhase, scope as metadata_timing_scope};
 use anyhow::Context;
 
 /// Classification of a filesystem entry by type.
@@ -593,7 +594,9 @@ pub async fn run_metadata_probed<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
+    let rate = metadata_timing_scope(side, op_kind, MetadataTimingPhase::Rate);
     throttle::get_ops_token().await;
+    rate.finish();
     run_metadata_probed_no_rate(side, op_kind, fut).await
 }
 
@@ -615,14 +618,18 @@ pub async fn run_metadata_probed_no_rate<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
+    let admission = metadata_timing_scope(side, op_kind, MetadataTimingPhase::Admission);
     let ops_permit = throttle::ops_in_flight_permit(meta_resource(side, op_kind)).await;
+    admission.finish();
     let probe = congestion::Probe::start_metadata(side, op_kind);
+    let execution = metadata_timing_scope(side, op_kind, MetadataTimingPhase::Execute);
     let result = fut.await;
     match &result {
         Ok(_) => probe.complete_ok(0),
         Err(_) => probe.discard(),
     }
     drop(ops_permit);
+    execution.finish();
     result
 }
 

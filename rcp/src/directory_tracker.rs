@@ -879,6 +879,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn nonempty_traversal_directory_times_prune_attempt_and_metadata() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("traversal-only");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = child.join("externally-created");
+        std::fs::write(&retained, b"retained contents").unwrap();
+        let mut tracker = new_tracker();
+        tracker.preserve = common::preserve::Settings::default();
+        register(&mut tracker, tmp.path(), true).await;
+        let admission = tracker.admit_directory(&child, false).unwrap();
+        tracker
+            .register_directory(admission, open_dir(&child).await, meta(), true, false, None)
+            .unwrap();
+        tracker.mark_announced(&child).await.unwrap();
+        let observed = TimingObservation::default();
+        tracker
+            .seal_directory(&child, 0)
+            .with_subscriber(observed.clone())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&retained).unwrap(), b"retained contents");
+        assert_eq!(
+            std::fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "metadata still applies after rmdir returns ENOTEMPTY"
+        );
+        assert!(tracker.get_dir(&child).is_none());
+        assert_eq!(tracker.pending_directories[tmp.path()].entries_processed, 1);
+        assert_eq!(
+            observed.counts("destination.directory.finalize.prune"),
+            (1, 1, 0),
+            "an unsuccessful removal attempt finishes normally"
+        );
+        assert_eq!(
+            observed.counts("destination.directory.finalize.metadata"),
+            (1, 1, 0)
+        );
+    }
+
     // a sink writer discards every control message, so the completion state machine can be driven
     // without a real connection.
     fn mock_stream() -> remote::streams::BoxedSharedSendStream {
