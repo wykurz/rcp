@@ -25,6 +25,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Raise the soft descriptor limit to the inherited hard limit during tool and daemon startup,
+  without changing the hard limit or logical file-work concurrency. If the raise fails, warn with
+  the operating-system cause and retain admission based on the original soft limit.
+
 - Coalesce already-ready unchanged-file control messages in bounded groups, flushing before
   discovery waits and structural progress boundaries while retaining individual wire frames.
 
@@ -33,7 +37,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lifetime limits across endpoints and retain credits through descriptor and rollback closure,
   returning them with DirectoryReleased. Insufficient known headroom fails at startup with limits
   and remedies. Nested reserved-depth exhaustion records an error and skips that subtree unless
-  `--fail-early` is set; neither daemon changes its inherited soft descriptor limit.
+  `--fail-early` is set.
 
 - Prepare remote destination directories concurrently within the endpoint's installed leaf limit,
   using secured parent dependencies and at most P owned directory jobs. Preserve early End and child

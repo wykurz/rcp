@@ -170,19 +170,50 @@ pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Read the process's inherited soft descriptor limit without changing it.
-fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
+/// Raise the soft descriptor limit to the inherited hard ceiling when permitted.
+fn raise_open_file_limit() -> Result<u64, std::io::Error> {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // safety: we pass a valid "rlim" pointer and the result is checked
     let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) };
-    if result == 0 {
-        Ok(rlim.rlim_cur)
-    } else {
-        Err(std::io::Error::last_os_error())
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(raise_soft_limit(rlim, |limit| {
+        // safety: `limit` is valid for reads; only the process soft limit changes
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, limit) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }))
+}
+
+/// Return the effective soft limit, retaining the observed limit if raising it fails.
+fn raise_soft_limit(
+    mut limit: libc::rlimit,
+    set_limit: impl FnOnce(&libc::rlimit) -> Result<(), std::io::Error>,
+) -> u64 {
+    let inherited_soft = limit.rlim_cur;
+    if inherited_soft < limit.rlim_max {
+        limit.rlim_cur = limit.rlim_max;
+        match set_limit(&limit) {
+            Ok(()) => tracing::info!(
+                "Raised soft descriptor limit from {inherited_soft} to {}",
+                limit.rlim_cur,
+            ),
+            Err(error) => {
+                tracing::warn!(target: NOTICE_TARGET,
+                    "Could not raise soft RLIMIT_NOFILE from {inherited_soft} to inherited hard limit {}; using {inherited_soft}: {error:#}",
+                    limit.rlim_max,
+                );
+                return inherited_soft;
+            }
+        }
+    }
+    limit.rlim_cur
 }
 
 #[must_use]
@@ -550,7 +581,7 @@ impl RemoteResources {
                 let shortfall = minimum.saturating_sub(soft.get());
                 anyhow::ensure!(
                     available >= DESCRIPTORS_PER_WORK_SLOT,
-                    "insufficient remote descriptor headroom: soft RLIMIT_NOFILE={}, data connections={}, support reserve={SUPPORT_DESCRIPTORS}, minimum soft limit={minimum}, shortfall={shortfall}; reduce --max-connections or --max-files-in-flight, or raise the limit inherited by rcpd in the affected host's SSH session (ulimit -n / sshd session limits); changing only the local rcp shell limit does not change a remote daemon's limit",
+                    "insufficient remote descriptor headroom: soft RLIMIT_NOFILE={}, data connections={}, support reserve={SUPPORT_DESCRIPTORS}, minimum soft limit={minimum}, shortfall={shortfall}; reduce --max-connections or --max-files-in-flight, or configure a higher hard limit inherited by rcpd in the affected host's SSH session (ulimit -H -n / sshd session limits); changing only the local rcp shell limit does not change a remote daemon's limit",
                     soft.get(),
                     streams,
                 );
@@ -588,7 +619,7 @@ impl RemoteResources {
 
 /// The endpoint admission successfully installed during runtime setup.
 ///
-/// Disabled admission does not query the descriptor limit or configure either leaf pool.
+/// Disabled admission leaves both leaf pools unconfigured; startup still raises the process limit.
 /// A configured endpoint can have an unknown soft limit after explicit finite query fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointAdmission {
@@ -836,6 +867,7 @@ pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
 ) -> anyhow::Result<(tokio::runtime::Runtime, EndpointAdmission)> {
+    let soft_limit = raise_open_file_limit();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if runtime.max_workers > 0 {
@@ -845,11 +877,8 @@ pub(crate) fn build_tokio_runtime(
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
     let runtime = builder.build().context("failed to create Tokio runtime")?;
-    let admission = configure_file_admission(
-        throttle,
-        get_soft_open_file_limit,
-        configure_leaf_admission_limit,
-    )?;
+    let admission =
+        configure_file_admission(throttle, || soft_limit, configure_leaf_admission_limit)?;
     Ok((runtime, admission))
 }
 
@@ -890,7 +919,7 @@ mod default_leaf_operation_limit_tests {
     #[cfg(target_os = "linux")]
     const RLIMIT_CHILD_MARKER: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD";
     #[cfg(target_os = "linux")]
-    const RLIMIT_CHILD_MARKER_VALUE: &str = "preserve-session-soft-limit-v1";
+    const RLIMIT_CHILD_MARKER_VALUE: &str = "raise-session-soft-limit-v1";
     #[cfg(target_os = "linux")]
     const RLIMIT_CHILD_SUCCESS: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:success";
     #[cfg(target_os = "linux")]
@@ -920,6 +949,70 @@ mod default_leaf_operation_limit_tests {
             std::io::Error::last_os_error()
         );
         limit
+    }
+
+    #[test]
+    fn equal_descriptor_limits_do_not_require_a_setrlimit_call() {
+        let limit = raise_soft_limit(
+            libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            },
+            |_| panic!("an unchanged limit must not require permission to set it"),
+        );
+        assert_eq!(limit, 256);
+    }
+
+    #[test]
+    fn denied_descriptor_raise_retains_known_admission_and_reports_the_cause() {
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let soft = raise_soft_limit(
+                libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: 512,
+                },
+                |requested| {
+                    assert_eq!(requested.rlim_cur, 512);
+                    assert_eq!(requested.rlim_max, 512);
+                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                },
+            );
+            let admission = configure_file_admission(
+                &ThrottleConfig {
+                    files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
+                    ..ThrottleConfig::default()
+                },
+                || Ok(soft),
+                |capacity| {
+                    assert_eq!(
+                        capacity,
+                        ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(40).unwrap())
+                    );
+                    Ok(())
+                },
+            )
+            .expect("a denied raise must still permit budgeting from the known soft limit");
+            assert_eq!(
+                admission,
+                EndpointAdmission::Configured {
+                    soft_limit: std::num::NonZeroU64::new(256),
+                    leaf_capacity: std::num::NonZeroUsize::new(40).unwrap(),
+                }
+            );
+        });
+        let logs = captured.contents();
+        assert!(logs.contains("rcp::notice"), "{logs}");
+        assert!(logs.contains("256") && logs.contains("512"), "{logs}");
+        assert!(
+            logs.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()),
+            "{logs}"
+        );
     }
 
     #[test]
@@ -1338,14 +1431,14 @@ mod default_leaf_operation_limit_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn build_tokio_runtime_preserves_session_soft_limit_with_unlimited_file_ceiling() {
+    fn runtime_raises_soft_limit_and_budgets_without_raising_file_concurrency() {
         let is_child = std::env::var_os(RLIMIT_CHILD_MARKER)
             .is_some_and(|value| value == std::ffi::OsStr::new(RLIMIT_CHILD_MARKER_VALUE));
         if !is_child {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_preserves_session_soft_limit_with_unlimited_file_ceiling",
+                    "runtime_setup::default_leaf_operation_limit_tests::runtime_raises_soft_limit_and_budgets_without_raising_file_concurrency",
                     "--nocapture",
                 ])
                 .env(RLIMIT_CHILD_MARKER, RLIMIT_CHILD_MARKER_VALUE)
@@ -1368,83 +1461,113 @@ mod default_leaf_operation_limit_tests {
         }
         let original = nofile_limit();
         const TARGET_SOFT_LIMIT: libc::rlim_t = 256;
-        if original.rlim_max < TARGET_SOFT_LIMIT {
+        const TARGET_HARD_LIMIT: libc::rlim_t = 512;
+        if original.rlim_max < TARGET_HARD_LIMIT {
             eprintln!(
                 "{RLIMIT_CHILD_SKIP}: current={} hard={}",
                 original.rlim_cur, original.rlim_max
             );
             return;
         }
-        let lowered = libc::rlimit {
-            rlim_cur: TARGET_SOFT_LIMIT,
-            rlim_max: original.rlim_max,
-        };
-        // safety: `lowered` is a valid read-only limit and affects only this child process
-        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) };
-        assert_eq!(
-            result,
-            0,
-            "setrlimit failed: {:#}",
-            std::io::Error::last_os_error()
-        );
-        let before = nofile_limit();
-        assert_eq!(before.rlim_cur, TARGET_SOFT_LIMIT);
-        assert_eq!(before.rlim_max, original.rlim_max);
         let runtime = RuntimeConfig {
             max_workers: 1,
             max_blocking_threads: 1,
         };
-        let throttle = ThrottleConfig {
-            files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
-            ..ThrottleConfig::default()
-        };
-        let (runtime, _) =
-            build_tokio_runtime(&runtime, &throttle).expect("runtime setup must succeed");
-        let after = nofile_limit();
-        assert_eq!(
-            after.rlim_cur, TARGET_SOFT_LIMIT,
-            "runtime setup changed the session soft limit"
-        );
-        assert_eq!(
-            after.rlim_max, original.rlim_max,
-            "runtime setup changed the hard limit"
-        );
-        let (open_files, pending_meta) = runtime
-            .block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut open_files = Vec::with_capacity(40);
-                    let mut pending_meta = Vec::with_capacity(40);
-                    for _ in 0..40 {
-                        open_files.push(throttle::open_file_permit().await);
-                    }
-                    for _ in 0..40 {
-                        pending_meta.push(throttle::pending_meta_permit().await);
-                    }
-                    assert!(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            throttle::open_file_permit(),
-                        )
-                        .await
-                        .is_err(),
-                        "the 41st OpenFile acquisition must wait at the derived limit"
-                    );
-                    assert!(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            throttle::pending_meta_permit(),
-                        )
-                        .await
-                        .is_err(),
-                        "the 41st PendingMeta acquisition must wait at the derived limit"
-                    );
-                    (open_files, pending_meta)
+        let eight = std::num::NonZeroUsize::new(8).unwrap();
+        for (files_in_flight, admission_policy, capacity) in [
+            (
+                crate::ResolvedFilesInFlight::unlimited(),
+                AdmissionPolicy::Local,
+                81,
+            ),
+            (
+                crate::ResolvedFilesInFlight::explicit(eight),
+                AdmissionPolicy::Local,
+                8,
+            ),
+            (
+                crate::ResolvedFilesInFlight::explicit(eight),
+                AdmissionPolicy::Remote {
+                    streams: eight,
+                    pending: std::num::NonZeroUsize::new(32).unwrap(),
+                },
+                8,
+            ),
+        ] {
+            let lowered = libc::rlimit {
+                rlim_cur: TARGET_SOFT_LIMIT,
+                rlim_max: TARGET_HARD_LIMIT,
+            };
+            // safety: `lowered` is valid and affects only this isolated child process
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+                0
+            );
+            let throttle = ThrottleConfig {
+                files_in_flight,
+                admission_policy,
+                ..ThrottleConfig::default()
+            };
+            let (runtime, admission) =
+                build_tokio_runtime(&runtime, &throttle).expect("runtime setup must succeed");
+            let after = nofile_limit();
+            assert_eq!(
+                after.rlim_cur, TARGET_HARD_LIMIT,
+                "startup must raise the soft limit"
+            );
+            assert_eq!(
+                after.rlim_max, TARGET_HARD_LIMIT,
+                "startup must preserve the hard limit"
+            );
+            let (soft_limit, leaf_capacity) = match admission {
+                EndpointAdmission::Configured {
+                    soft_limit,
+                    leaf_capacity,
+                } => (soft_limit, leaf_capacity),
+                EndpointAdmission::Remote(resources) => {
+                    (resources.soft_limit, resources.leaf_capacity)
+                }
+                EndpointAdmission::Disabled => panic!("file admission must remain enabled"),
+            };
+            assert_eq!(soft_limit.unwrap().get(), 512);
+            assert_eq!(leaf_capacity.get(), capacity);
+            let (open_files, pending_meta) = runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        let mut open_files = Vec::with_capacity(capacity);
+                        let mut pending_meta = Vec::with_capacity(capacity);
+                        for _ in 0..capacity {
+                            open_files.push(throttle::open_file_permit().await);
+                        }
+                        for _ in 0..capacity {
+                            pending_meta.push(throttle::pending_meta_permit().await);
+                        }
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                throttle::open_file_permit(),
+                            )
+                            .await
+                            .is_err(),
+                            "OpenFile admission must wait at the resolved capacity"
+                        );
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                throttle::pending_meta_permit(),
+                            )
+                            .await
+                            .is_err(),
+                            "PendingMeta admission must wait at the resolved capacity"
+                        );
+                        (open_files, pending_meta)
+                    })
+                    .await
                 })
-                .await
-            })
-            .expect("derived admission boundary must complete within its watchdog");
-        drop((open_files, pending_meta));
-        throttle::set_admission_limits(None);
+                .expect("derived admission boundary must complete within its watchdog");
+            drop((open_files, pending_meta));
+            throttle::set_admission_limits(None);
+        }
         println!("{RLIMIT_CHILD_SUCCESS}");
     }
 }

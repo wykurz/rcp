@@ -614,18 +614,21 @@ product above Tokio's semaphore maximum are rejected rather than reaching semaph
 Explicit limits can be checked before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects; the source resolves and
 validates the actual capacity before its readiness record and before destination spawn. Each
-endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like work.
-If that query fails, a finite user-supplied limit becomes the endpoint's sole admission ceiling and
-produces a default-visible notice; automatic or unlimited admission fails instead. A successful
-query returning a zero soft limit fails closed for every policy. A file limit reduced by the
-connection ceiling, an explicitly requested connection ceiling reduced by `F`, or an explicit
-descriptor clamp produces a default-visible notice naming requested and effective values. The
-ordinary automatic/default intersection remains quiet. Profiling and Tokio-console artifact
-announcements likewise use the tracing notice target and reach master output only after the daemon
-readiness handshake. Pre-tracing configuration refusals use the same `RCP_ERROR` startup record;
-otherwise captured startup stdout and stderr are attached to handshake errors. Wire revision 10
-protects the readiness, directory lifetime, and preview-only daemon startup contracts and requires
-matching binaries.
+endpoint attempts to raise its soft descriptor limit to the inherited hard limit before runtime and
+admission setup, leaving the hard limit unchanged. A failed raise warns with its operating-system
+cause and admission uses the original soft limit. The remote hard limit comes from the affected
+host's SSH/session policy; changing only the master's shell limit does not change it. File-work
+concurrency remains independently bounded. If the limit query fails, a finite user-supplied limit
+becomes the endpoint's sole admission ceiling and produces a default-visible notice; automatic or
+unlimited admission fails instead. An effective zero soft limit fails closed for every policy. A
+file limit reduced by the connection ceiling, an explicitly requested connection ceiling reduced by
+`F`, or an explicit descriptor clamp produces a default-visible notice naming requested and
+effective values. The ordinary automatic/default intersection remains quiet. Profiling and
+Tokio-console artifact announcements likewise use the tracing notice target and reach master output
+only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
+`RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
+errors. Wire revision 10 protects the readiness, directory lifetime, and preview-only daemon startup
+contracts and requires matching binaries.
 
 ### Network Profiles
 
