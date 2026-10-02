@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "tiny-1m",
+      "description": "One million tiny files",
+      "directory_widths": [
+        10,
+        10,
+        10
+      ],
+      "files_per_leaf": 1024,
+      "file_size_bytes": 1024
+    },
+    {
+      "id": "medium-128k",
+      "description": "128,000 medium files, 31.25 GiB total",
+      "directory_widths": [
+        10,
+        10,
+        1
+      ],
+      "files_per_leaf": 1280,
+      "file_size_bytes": 262144
+    },
+    {
+      "id": "large-120",
+      "description": "120 files of 256 MiB, 30 GiB total",
+      "directory_widths": [
+        10,
+        1,
+        1
+      ],
+      "files_per_leaf": 12,
+      "file_size_bytes": 268435456
+    },
+    {
+      "id": "directory-90k",
+      "description": "90,000 leaves with one 1 KiB file per leaf",
+      "directory_widths": [
+        90,
+        1000
+      ],
+      "files_per_leaf": 1,
+      "file_size_bytes": 1024
+    },
+    {
+      "id": "tiny-unchanged",
+      "description": "Million-file unchanged update",
+      "directory_widths": [
+        10,
+        10,
+        10
+      ],
+      "files_per_leaf": 1024,
+      "file_size_bytes": 1024,
+      "mode": "unchanged"
+    },
+    {
+      "id": "tiny-partial",
+      "description": "Million-file partial update",
+      "directory_widths": [
+        10,
+        10,
+        10
+      ],
+      "files_per_leaf": 1024,
+      "file_size_bytes": 1024,
+      "mode": "partial"
+    }
+  ],
+  "variants": [
+    {
+      "id": "rcp-default",
+      "description": "rcp default copy",
+      "tool": "rcp",
+      "args": [
+        "--summary"
+      ],
+      "processes": 1
+    },
+    {
+      "id": "rsync-matched",
+      "description": "Single-process recursive copy preserving ordinary modes",
+      "tool": "rsync",
+      "args": [
+        "-rp",
+        "--stats"
+      ],
+      "processes": 1
+    }
+  ]
+}

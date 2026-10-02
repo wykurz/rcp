@@ -2,6 +2,7 @@
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from benchmarks.strict_json import parse_json
 from benchmarks.timings import require_roles, validate_report
+from benchmarks import operations, transport, sanitized
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -82,13 +84,29 @@ def validate_result(value):
         profile = context["ssh_transport_profile"]
         if profile is not None and (not isinstance(profile, str) or not profile.strip()):
             raise ValueError("context.ssh_transport_profile must be a nonblank string or null")
+    cases = _list(run.get("cases"), "cases")
+    trials = _list(run.get("trials"), "trials")
+    operation_revision = context.get("operation_contract_revision")
+    if operation_revision is None and (context["cache_policy"] == "source-verified" or any("mode" in case for case in cases if isinstance(case, dict)) or any("operation" in trial for trial in trials if isinstance(trial, dict))):
+        raise ValueError("context.operation_contract_revision is required for operation/cache records")
+    if operation_revision is not None and (type(operation_revision) is not int or operation_revision != operations.CONTRACT_REVISION):
+        raise ValueError("unsupported context.operation_contract_revision")
+    if operation_revision is not None and context.get("summary_locale") != operations.SUMMARY_LOCALE:
+        raise ValueError("context.summary_locale must be C for the operation contract")
+    if operation_revision is not None and context["cache_policy"] == "source-verified":
+        if type(context.get("cache_contract_revision")) is not int or context["cache_contract_revision"] != operations.CACHE_REVISION:
+            raise ValueError("unsupported context.cache_contract_revision")
     _object(run.get("tools"), "tools")
     case_ids = set()
-    for i, case in enumerate(_list(run.get("cases"), "cases")):
+    cases_by_id = {}
+    for i, case in enumerate(cases):
         case_id = _text(_object(case, f"cases[{i}]").get("id"), f"cases[{i}].id")
         if case_id in case_ids:
             raise ValueError(f"duplicate case id: {case_id}")
         case_ids.add(case_id)
+        cases_by_id[case_id] = case
+        if operation_revision is not None:
+            operations.validate_case(case)
     variant_ids = set()
     variants_by_id = {}
     for i, variant in enumerate(_list(run.get("variants"), "variants")):
@@ -97,6 +115,24 @@ def validate_result(value):
             raise ValueError(f"duplicate variant id: {variant_id}")
         variant_ids.add(variant_id)
         variants_by_id[variant_id] = variant
+        if operation_revision is not None:
+            if variant.get("tool") not in ("rcp", "rsync", "cp") or type(variant.get("processes")) is not int or variant["processes"] < 1 or not isinstance(variant.get("args"), list) or any(not isinstance(arg, str) or not arg for arg in variant["args"]):
+                raise ValueError(f"variants[{i}] has invalid tool/processes/args")
+    owned = context.get("owned_transport")
+    if owned is None and ("owned_transport" in context or context.get("ssh_transport_profile") == transport.PROFILE or any(isinstance(trial, dict) and ("transport" in trial or "transport_artifacts" in trial) for trial in trials)):
+        raise ValueError("context.owned_transport is required for owned profile/trial records")
+    if owned is not None:
+        try:
+            expected_owned = transport.semantics(owned["requested_rtt_ms"])
+            previous_owned = {key:value for key,value in expected_owned.items() if key != "account_policy"}
+            failed_previous = owned == previous_owned and run["status"] == "failed" and all(trial.get("status") != "ok" for trial in trials)
+            if context["topology"] != "loopback" or (owned != expected_owned and not failed_previous):
+                raise ValueError("owned context must declare its exact per-trial semantics")
+            if operation_revision is None or context.get("ssh_transport_profile") != transport.PROFILE:
+                raise ValueError("owned context requires the operation contract and owned SSH profile")
+            transport.validate_request(context["topology"], owned["requested_rtt_ms"], list(variants_by_id.values()), {})
+        except (KeyError, TypeError) as error:
+            raise ValueError("malformed context.owned_transport") from error
     policies = context.get("timing_collection")
     if policies is not None:
         _object(policies, "context.timing_collection")
@@ -116,7 +152,7 @@ def validate_result(value):
             raise ValueError("context.timing_capability must map known variants to booleans")
     if run["status"] == "complete" and (not case_ids or not variant_ids):
         raise ValueError("cases and variants must be nonempty")
-    for i, trial in enumerate(_list(run.get("trials"), "trials")):
+    for i, trial in enumerate(trials):
         trial = _object(trial, f"trials[{i}]")
         if trial.get("case_id") not in case_ids or trial.get("variant_id") not in variant_ids:
             raise ValueError(f"trials[{i}] references an unknown case or variant")
@@ -140,6 +176,13 @@ def validate_result(value):
             raise ValueError(f"trials[{i}].validation.ok must be a boolean")
         if trial["status"] == "ok" and not trial["validation"]["ok"]:
             raise ValueError(f"trials[{i}] is ok without passing validation")
+        if operation_revision is not None:
+            _validate_operation_trial(trial, cases_by_id[trial["case_id"]], variants_by_id[trial["variant_id"]], context)
+        if owned is not None and trial["status"] == "ok":
+            case = cases_by_id[trial["case_id"]]
+            counts = operations.expected_counts(case)
+            transport.validate_transport(trial.get("transport"), variants_by_id[trial["variant_id"]],
+                run["tools"], counts, case.get("mode", "fresh"), owned)
         if not isinstance(trial.get("logs"), (list, dict)):
             raise ValueError(f"trials[{i}].logs must be an array or object")
         if policies is not None and "timings" not in trial:
@@ -231,8 +274,64 @@ def validate_result(value):
     return run
 
 
-def load_results(path):
-    """Load one result or an immutable history tree, deduplicated by run ID."""
+def _validate_operation_trial(trial, case, variant, context):
+    operation = case.get("mode", "fresh")
+    operations.validate_variant(variant, operation)
+    child_locale = operations.SUMMARY_LOCALE if operations.summary_supported(variant) else "inherited"
+    if trial.get("child_locale") != child_locale:
+        raise ValueError("trial.child_locale differs from exact-summary locale policy")
+    if trial.get("operation") != operation:
+        raise ValueError("trial.operation differs from case mode")
+    counts = operations.expected_counts(case)
+    directories, files = counts["directories"], counts["files"]
+    expected = operations.transfer_counts(operation, counts)
+    value = trial.get("expected_transfer")
+    if value != expected or not isinstance(value, dict) or any(type(item) is not int for item in value.values()):
+        raise ValueError("trial.expected_transfer differs from operation counts")
+    if trial["status"] != "ok":
+        return
+
+    def proof(field):
+        value = _object(trial.get(field), f"trial.{field}")
+        if value.get("ok") is not True:
+            raise ValueError(f"trial.{field} is not a successful proof")
+        return value
+
+    def metadata(value, field, timestamps=False):
+        expected_fields = ["mode", "uid", "gid", "mtime_ns"] if timestamps else ["mode"]
+        if value.get("ok") is not True or type(value.get("entries")) is not int or value["entries"] != directories + files + 1 or value.get("checked_fields") != expected_fields:
+            raise ValueError(f"trial.{field} lacks required metadata proof")
+
+    def exact_counts(value):
+        return isinstance(value, dict) and value == counts and all(type(item) is int for item in value.values())
+
+    def content(value, field):
+        if not exact_counts(value.get("counts")) or value.get("digest") != case.get("fixture_digest") or not isinstance(value.get("digest"), str) or not SERIES_ID.fullmatch(value["digest"]):
+            raise ValueError(f"trial.{field} lacks exact source content proof")
+
+    content(proof("validation"), "validation")
+    if operation != "fresh":
+        seed = proof("seed_validation")
+        if not exact_counts(seed.get("counts")) or type(seed.get("stale_files")) is not int or seed["stale_files"] != expected["files_copied"] or seed.get("independent_files") is not True or seed.get("exact_seed_mtimes") is not True or not isinstance(seed.get("digest"), str) or not SERIES_ID.fullmatch(seed["digest"]):
+            raise ValueError("trial.seed_validation lacks exact seed proof")
+        metadata(_object(seed.get("modes"), "trial.seed_validation.modes"), "seed_validation.modes")
+    if operations.summary_supported(variant):
+        summary = trial.get("copy_summary")
+        if summary != expected or not isinstance(summary, dict) or any(type(item) is not int for item in summary.values()):
+            raise ValueError("trial.copy_summary differs from operation counts")
+        metadata(proof("metadata_validation"), "metadata_validation")
+    if context["cache_policy"] == "source-verified":
+        cache = proof("cache_validation")
+        content(cache, "cache_validation")
+        metadata(_object(cache.get("metadata"), "trial.cache_validation.metadata"), "cache_validation.metadata", timestamps=True)
+    if operation != "fresh" or operations.summary_supported(variant) or context["cache_policy"] == "source-verified":
+        source = proof("source_validation")
+        content(source, "source_validation")
+        metadata(_object(source.get("metadata"), "trial.source_validation.metadata"), "source_validation.metadata", timestamps=True)
+
+
+def load_result_records(path):
+    """Validate/deduplicate runs and retain exact original input fingerprints."""
     if path.is_file():
         files = [path]
     elif (path / "results.json").is_file():
@@ -243,17 +342,24 @@ def load_results(path):
         raise ValueError(f"input is not a result or history directory: {path}")
     if not files:
         raise ValueError(f"history contains no JSON runs: {path}")
-    by_id = {}
-    for file in files:
+    by_id, sources = {}, {}
+    for ordinal, file in enumerate(files):
         try:
-            run = parse_result(file.read_text(encoding="utf-8"))
+            original = file.read_bytes()
+            run = parse_result(original.decode("utf-8"))
         except (OSError, json.JSONDecodeError, ValueError) as error:
             raise ValueError(f"{file}: {error}") from error
         earlier = by_id.get(run["run_id"])
         if earlier is not None and earlier != run:
             raise ValueError(f"duplicate run_id {run['run_id']} has conflicting data")
         by_id[run["run_id"]] = run
-    return sorted(by_id.values(), key=lambda run: (dt.datetime.fromisoformat(run["timestamp"].replace("Z", "+00:00")), run["run_id"]))
+        sources.setdefault(run["run_id"], []).append(dict(artifact_id=f"source-{ordinal + 1}", sha256=hashlib.sha256(original).hexdigest()))
+    return sorted(by_id.values(), key=lambda run: (dt.datetime.fromisoformat(run["timestamp"].replace("Z", "+00:00")), run["run_id"])), sources
+
+
+def load_results(path):
+    """Load one result or an immutable history tree, deduplicated by run ID."""
+    return load_result_records(path)[0]
 
 
 def render(input_path, output):
@@ -273,10 +379,14 @@ def render(input_path, output):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Render benchmark history as a standalone dashboard")
     parser.add_argument("input", type=Path, help="results.json, a result directory, or history with runs/*.json")
-    parser.add_argument("--output", required=True, type=Path, help="site output directory")
+    parser.add_argument("--output", required=True, type=Path, help="output directory (sanitized JSON requires a new directory)")
+    parser.add_argument("--format", choices=("html", "sanitized-json"), default="html")
     args = parser.parse_args(argv)
     try:
-        render(args.input, args.output)
+        if args.format == "sanitized-json":
+            sanitized.export_results(args.input, args.output)
+        else:
+            render(args.input, args.output)
     except (OSError, ValueError) as error:
         parser.exit(1, f"benchmark report: {error}\n")
 

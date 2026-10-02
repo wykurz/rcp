@@ -180,9 +180,146 @@ combination requires a manifest entry rather than a runner change:
 ```
 
 Pass an alternative definition with `--manifest`. Definitions are versioned and validated; unknown
-fields and invalid counts fail instead of silently changing the workload. New operation types,
-special-file fixtures, or two-host orchestration need a runner extension and tests. The variant ID
-`rcp-baseline` is reserved for `--baseline-bin-dir`; custom manifests cannot define it.
+fields and invalid counts fail instead of silently changing the workload. Special-file fixtures,
+additional operation types, or two-host orchestration need a runner extension and tests. The variant
+ID `rcp-baseline` is reserved for `--baseline-bin-dir`; custom manifests cannot define it.
+
+## Bounded receiver workloads
+
+`benchmarks/receiver-performance.json` adds six explicitly selected workloads: fresh `tiny-1m`,
+`medium-128k`, `large-120`, `directory-90k`, and million-file `tiny-unchanged` and `tiny-partial`.
+The directory case has 90,000 files, 90,090 directories below the root and 90,091 including it. It
+offers `rcp-default` and single-process `rsync-matched` (`-rp --stats`). Select both case and
+variants with this manifest.
+
+An optional case `mode` is `fresh` (the default), `unchanged`, or `partial`. This operation is
+distinct from CLI `--mode local|loopback`, which selects transport. Every trial uses a new owned
+destination. Updates seed independent ordinary files with exact source contents, modes and mtimes.
+Partial seeds invert every byte of selected files and age their mtimes by exactly two seconds.
+Selection is fixed: floor one percent of all files, evenly distributed over lexically sorted
+file-containing directories and files, with the remainder assigned to the first directories. Both
+file-placement policies are supported; `files_per_directory` includes the fixture root. For the
+million case this selects ten files per leaf plus one in the first 240 leaves: 10,240 files. Partial
+cases require at least 100 files and files no larger than 1 KiB; there is no configurable mutation
+percentage.
+
+Update operations support only single-process `rcp --summary` and `rsync -rp --stats`. Custom
+arguments, concurrency sweeps, archive/cp and multi-process update variants fail before fixture
+work. Fresh cases support arbitrary variants. The planner adds `--overwrite` to rcp updates and
+keeps its destination operand without a trailing slash, so it updates that root. Single-process
+rsync uses source and destination trailing slashes. A supplied baseline uses its matching master and
+daemon with the same operation and seed procedure.
+
+Before timing, seeds undergo full path/type/size/content, ordinary mode, exact mtime and
+independence proofs; source hardlinks, ACLs, special mode bits and foreign ownership are rejected.
+Single-process supported variants require exact rcp copied/unchanged counts or rsync
+transferred-file/byte counts, full final contents and modes, and unchanged source
+contents/modes/mtimes. Rsync's unchanged count is inferred from the verified total and transferred
+count; `-rp` does not preserve final timestamps. Exact-summary variants launch timed children with
+`LC_ALL=C` and `LANG=C` in a copied environment, independent of the caller locale. The parent
+environment is unchanged; other fresh variants retain their inherited locale. Results and new
+operation series record this locale policy. Preparation and all proofs stay outside the command
+timer. Attempts are saved before destination preparation. Failed rows and destinations remain
+available, and a failure stops subsequent trials. New rows and series include operation/cache
+contract revisions; legacy saved identities remain readable and unchanged.
+
+With prepared full releases and usable localhost SSH, use a new output path for every command:
+
+```bash
+just benchmark-run --manifest benchmarks/receiver-performance.json \
+  --case medium-128k --mode loopback --cache source-verified \
+  --variant rcp-default --variant rsync-matched \
+  --bin-dir /release/candidate --baseline-bin-dir /release/reference \
+  --no-timings --repetitions 3 --output /new/medium-localhost
+
+just benchmark-run --manifest benchmarks/receiver-performance.json \
+  --case tiny-partial --mode loopback --cache source-verified \
+  --variant rcp-default --variant rsync-matched \
+  --bin-dir /release/candidate --baseline-bin-dir /release/reference \
+  --no-timings --repetitions 3 --output /new/partial-localhost
+```
+
+Replace the explicit case with another of the six to run that operation. Three repetitions rotate
+candidate, matched rsync and full baseline across positions. This evaluation uses the explicit rsync
+comparison screen (`candidate / rsync <= 1.20`) separately from the baseline regression screen
+(`candidate / baseline <= 1.05`); retain every raw sample and its spread. These are interpretation
+rules, not CI timing gates. Never pool different operations, cache procedures or transports, or
+replace slow samples.
+
+### Owned loopback RTT
+
+`--mode loopback --rtt-ms 0|2|10` opts into an internal rootless namespace executor for each trial.
+Omitted RTT keeps ordinary localhost behavior; explicit zero still selects isolation and a separate
+series. This path supports only single exact-summary rcp and matched rsync variants, including a
+supplied full baseline. Custom arguments, multi-process variants, concurrency sweeps, `RSYNC_RSH`
+and a custom `--ssh-transport-profile` fail before fixture/tool work.
+
+The host needs Linux, a nonzero caller UID, permitted user/network/mount/PID namespaces, and
+`unshare`, `nsenter`, `ip`, `tc`, `mount`, `setpriv`, `ssh`, `sshd`, `ssh-keygen` and `ping` on
+PATH. Missing or unusable prerequisites fail without a host-network fallback. Private ephemeral SSH
+credentials and strict host keys route the source through `192.0.2.2` and destination-side localhost
+SSH through the client namespace. Copy processes have no capabilities and set no-new-privileges. A
+private read-only passwd bind preserves the caller account fields and sets its home to the owned
+trial directory. StrictModes remains enabled and checks the authorized key within that home,
+including when output is under `/tmp`. Accounts must have one matching local passwd entry; malformed
+fields or an inconsistent effective lookup fail setup. The host passwd file and home stay untouched.
+Copy environments contain that private HOME, account USER/LOGNAME/SHELL, inherited PATH with private
+SSH first, and LANG/LC_ALL=C; other variables are cleared without changing the parent environment.
+
+The runner generates fixtures, seeds updates, rotates variants and prepares the selected cache
+procedure **before** each namespace setup. Setup, preflight and executable hashing precede the
+command timer. The reported sample is the inner copy command's elapsed time, including
+SSH/role-wrapper startup. Postflight, PID cleanup, the actual waited launcher exit and read-only
+host topology checks must all pass before destination/source proofs can admit the row. Failures
+retain the attempted row, provisional evidence and destination and stop subsequent trials; command
+exit zero or an inner result alone is insufficient. Setup, worker, postflight and teardown have
+bounded deadlines, and cleanup failures remain diagnostics after the first failure.
+
+Pre/postflight evidence binds exact preflight bytes, private endpoint/user/mount/PID identities, SSH
+configuration, routes, requested RTT, stable drained netem queues, zero drops and positive traffic
+in both directions. Fresh trials require at least their full logical payload in source-to-client
+traffic; updates instead retain their exact seed/transfer proof. Actual role argv, selected
+executable hashes, CPU affinity/quota and inherited FD limits are retained. Automatic rcp F comes
+from destination `--resolved-automatic-files-in-flight`; E comes from its negotiated
+`--max-connections`, checked against source M, and P uses the observed pending multiplier. No CPU
+formula, F20/E20/P80 or FD1024 invariant is imposed. Changed observed role conditions between
+repetitions fail rather than pool different conditions. Logical F and actual leaf capacity differ.
+
+For example, after validating the prerequisites on a tiny custom fixture:
+
+```bash
+just benchmark-run --manifest benchmarks/receiver-performance.json \
+  --case tiny-partial --mode loopback --rtt-ms 10 --cache source-verified \
+  --variant rcp-default --variant rsync-matched \
+  --bin-dir /release/candidate --baseline-bin-dir /release/reference \
+  --no-timings --repetitions 3 --output /new/partial-owned-rtt10
+```
+
+The bounded evaluation cells are:
+
+| Workload                         | Operation                       | Owned RTT   |
+| -------------------------------- | ------------------------------- | ----------- |
+| `medium-128k`, `large-120`       | fresh                           | 0 ms        |
+| `directory-90k`                  | fresh                           | 10 ms       |
+| `tiny-unchanged`, `tiny-partial` | updates                         | 10 ms       |
+| `tiny-1m`                        | separately declared fresh cells | 0 and 10 ms |
+
+RTT2 is an optional diagnostic. Series identity records the per-trial namespace lifetime and
+cache-before-setup order; pool samples only when these policies match. Transport series include RTT,
+SSH/environment policy and stable role capacity/resource observations, while ephemeral paths, ports,
+PIDs and namespace IDs are excluded. Declare the CPU and FD conditions being compared and check the
+actual role evidence on each machine.
+
+`transport/<case>/<variant>/<iteration>/` retains private request/launcher/copy records, raw role
+argv, network evidence and credentials with a restricted directory mode. These artifacts and the
+HTML history contain private evidence. The [sanitized JSON export](#share-an-all-row-json-export)
+uses recorded symbolic path bindings and qualified role/tool identities; opaque arguments stay
+withheld.
+
+Record the storage profile and allow space/inodes for source, an independent seed/copy, logs and
+overhead. Loopback remains a shared-host, reused-filesystem, command-completion experiment, not
+durable-copy or physical two-host evidence. Evaluate the 20% rsync allowance separately from the
+1.05 baseline screen and retain all rows.
 
 ## Measurement and cache contract
 
@@ -193,11 +330,11 @@ independently generated runs do not. The result records a fixture digest and the
 The fixture contract has an explicit revision; change it when generation semantics change. A filegen
 release version alone does not start a new performance series.
 
-Every trial prepares a fresh destination and its cache state, then measures from launching the first
-process until the last process exits. All child exit codes are checked. Full content and directory
-verification follows timing. Before recording a completed case, the harness verifies that the source
-tree still matches its original snapshot. Variant order rotates between repetitions. Logs retain
-rcp's own summary alongside the external wall time.
+Every trial prepares an independent destination for its operation and its cache state, then measures
+from launching the first process until the last process exits. All child exit codes are checked.
+Full content and directory verification follows timing. Before recording a completed case, the
+harness verifies that the source tree still matches its original snapshot. Variant order rotates
+between repetitions. Logs retain rcp's own summary alongside the external wall time.
 
 Full positional balance requires a repetition count divisible by the number of selected variants
 after adding baseline or concurrency variants. Fewer repetitions are allowed for exploratory runs,
@@ -208,8 +345,11 @@ appropriate count explicitly when constructing a custom comparison.
 
 Cache modes are procedures, not assumptions:
 
-- `source-warm` reads source data before every trial. The destination is still fresh; no claim is
+- `source-warm` first calls global `sync`, then reads source data before every trial. No claim is
   made about warming every metadata structure or executable page.
+- `source-verified` checks full source content, ordinary modes, ownership and exact original mtimes
+  before every trial. It neither syncs nor drops host caches. This is a verification procedure, not
+  proof of cache residency; it has a separate cache contract and historical series.
 - `linux-drop-caches` syncs and requests Linux page/dentry/inode cache reclamation immediately
   before each trial. It explicitly requires permission for noninteractive privileged cache dropping,
   affects the host globally, and fails if preparation is unavailable. Loopback drops once because
@@ -328,6 +468,35 @@ First collect repeated main-branch runs, including repeats of the same commit, a
 spread. A future gate should be based on demonstrated noise bounds and paired candidate/base
 measurements, with a repeat policy for suspicious results. Until then, timing remains informational
 and correctness/operational failures remain visible failures.
+
+## Share an all-row JSON export
+
+```bash
+just benchmark-report /private/run/results.json \
+  --format sanitized-json --output /new/shareable-export
+```
+
+A result directory or history with `runs/*.json` also works. The output directory must be new and
+contains only `export.json`. Keep the input records and their raw evidence privately. The export
+retains every attempted trial in its original order, including failed and running trials, measured
+durations, exits, counts, proof qualifications, resource observations and timing values. It
+preserves original run/series IDs and exact SHA256 hashes of all input files, including identical
+duplicate records with different byte formatting.
+
+Paths, account/host names, credentials, raw errors, labels and unknown fields are withheld. Captured
+operand bindings become symbolic paths; unclassified operands stay null. Missing bindings make
+command reproduction incomplete. Timing identifiers and unclassified scope names become aliases.
+Known version formats and binary digests remain available; an executable's build source stays
+unknown unless independently recorded, rather than being inferred from the repository revision.
+
+Evidence references are opaque IDs. Preflight hashes cover the original embedded UTF-8 bytes;
+postflight hashes cover a canonical embedded record and are labelled accordingly. An unrecorded raw
+log hash stays unknown. Recorded proof success in an unvalidated failed trial is explicitly
+unqualified. Completed-case ratios identify both series, divide candidate elapsed time by the
+matched rsync or full-baseline elapsed time, and preserve the enclosing run status. They require
+matching process counts and comparison arguments; incomplete comparisons have no ratio. Numeric
+ratios do not evaluate acceptance. The evaluation screens are 1.20 against matched rsync and 1.05
+against the full baseline; these are comparison screens, not performance guarantees.
 
 ## Enable the historical site
 
