@@ -24,7 +24,8 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings
+from benchmarks import timings, operations, transport
+from benchmarks.operations import expected_counts
 
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
@@ -59,7 +60,7 @@ def load_manifest(path):
         seen = set()
         for entry in data[kind]:
             required = {"id", "directory_widths", "file_size_bytes"} if kind == "cases" else {"id", "tool", "args", "processes"}
-            optional = {"description", "files_per_leaf", "files_per_directory"} if kind == "cases" else {"description"}
+            optional = {"description", "mode", "files_per_leaf", "files_per_directory"} if kind == "cases" else {"description"}
             _fields(entry, required, optional, kind[:-1])
             identifier = entry["id"]
             if not isinstance(identifier, str) or not ID_PATTERN.fullmatch(identifier):
@@ -72,17 +73,7 @@ def load_manifest(path):
             if "description" in entry and not isinstance(entry["description"], str):
                 raise ValueError("description must be a string")
             if kind == "cases":
-                widths = entry["directory_widths"]
-                if not isinstance(widths, list) or not widths:
-                    raise ValueError("directory_widths must be a nonempty list")
-                for width in widths:
-                    _positive(width, "directory width")
-                policies = entry.keys() & {"files_per_leaf", "files_per_directory"}
-                if len(policies) != 1:
-                    raise ValueError("case requires exactly one of files_per_leaf and files_per_directory")
-                policy = next(iter(policies))
-                _positive(entry[policy], policy)
-                _positive(entry["file_size_bytes"], "file_size_bytes")
+                operations.validate_case(entry)
             else:
                 if entry["tool"] not in ("rcp", "rsync", "cp"):
                     raise ValueError("variant tool must be rcp, rsync, or cp")
@@ -90,16 +81,6 @@ def load_manifest(path):
                     raise ValueError("variant args must be nonempty strings")
                 _positive(entry["processes"], "processes")
     return data
-
-
-def expected_counts(case):
-    directories = 0
-    breadth = 1
-    for width in case["directory_widths"]:
-        breadth *= width
-        directories += breadth
-    files = (directories + 1) * case["files_per_directory"] if "files_per_directory" in case else breadth * case["files_per_leaf"]
-    return {"directories": directories, "files": files, "bytes": files * case["file_size_bytes"]}
 
 
 def scan_tree(root):
@@ -160,22 +141,32 @@ def _validate_variant_mode(variant, mode):
         raise ValueError("custom --rsync-path is reserved in loopback mode")
 
 
-def plan_commands(variant, source, destination, tools, mode):
+def plan_commands(variant, source, destination, tools, mode, operation="fresh", *, source_endpoint=None):
     _validate_variant_mode(variant, mode)
+    operations.validate_variant(variant, operation)
+    if source_endpoint is not None:
+        if not isinstance(source_endpoint, transport.SourceEndpoint):
+            raise ValueError("source_endpoint must be a typed owned transport endpoint")
+        transport.validate_request(mode, 0, [variant], {})
+    host = source_endpoint.host if source_endpoint is not None else "localhost"
     source = Path(source)
     destination = Path(destination)
     tool = variant["tool"]
     executable = str(tools[tool])
     args = list(variant["args"])
+    if tool == "rcp" and operation != "fresh":
+        args.append("--overwrite")
     if tool == "rcp" and mode == "loopback":
         args += ["--force-remote", f"--rcpd-path={tools['rcpd']}"]
+    if tool == "rsync" and source_endpoint is not None:
+        args.append(f"--rsh={shlex.quote(str(source_endpoint.ssh_launcher))}")
     if tool == "rsync" and mode == "loopback":
         args.append(f"--rsync-path={shlex.quote(executable)}")
     processes = variant["processes"]
     if processes == 1:
-        operand = f"localhost:{source}" if tool == "rcp" and mode == "loopback" else str(source)
+        operand = f"{host}:{source}" if tool == "rcp" and mode == "loopback" else str(source)
         if tool == "rsync":
-            operand = f"localhost:{source}" if mode == "loopback" else str(source)
+            operand = f"{host}:{source}" if mode == "loopback" else str(source)
             return [[executable, *args, operand + "/", str(destination) + "/"]]
         return [[executable, *args, operand, str(destination)]]
     children = sorted(source.iterdir())
@@ -185,7 +176,7 @@ def plan_commands(variant, source, destination, tools, mode):
         raise ValueError(f"top-level directories ({len(children)}) exceed configured processes ({processes})")
     commands = []
     for child in children:
-        operand = f"localhost:{child}" if mode == "loopback" else str(child)
+        operand = f"{host}:{child}" if mode == "loopback" else str(child)
         target = destination / child.name if tool == "rcp" else destination
         commands.append([executable, *args, operand, str(target)])
     return commands
@@ -242,7 +233,7 @@ class _SignalCancellation:
         return False
 
 
-def execute_commands(commands, log_dir, timeout):
+def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False):
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=False)
     children = []
@@ -250,6 +241,7 @@ def execute_commands(commands, log_dir, timeout):
     waiters = []
     finished = {}
     condition = threading.Condition()
+    child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale else None
     started = time.monotonic()
     launch_error = None
     timed_out = False
@@ -277,7 +269,7 @@ def execute_commands(commands, log_dir, timeout):
                 stderr = stderr_path.open("wb")
                 files.append(stderr)
                 try:
-                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True, env=child_environment)
                 except OSError as exc:
                     launch_error = str(exc)
                 else:
@@ -360,7 +352,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy"):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy", operation_revision=None, owned_transport=None):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -376,6 +368,14 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "timing_request": timing_request, "timing_collection": timing_collection, "timing_capability": timing_capability, "verification_policy": VERIFICATION_POLICY}
+    if operation_revision is not None:
+        value["case"]["mode"] = case.get("mode", "fresh")
+        value["operation_contract_revision"] = operation_revision
+        value["child_locale"] = operations.SUMMARY_LOCALE if operations.summary_supported(variant) else "inherited"
+        if cache_policy == "source-verified":
+            value["cache_contract_revision"] = operations.CACHE_REVISION
+    if owned_transport is not None:
+        value["owned_transport"] = owned_transport
     if topology == "loopback":
         value["ssh_transport_profile"] = ssh_transport_profile
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -451,7 +451,11 @@ def _persist(output, record):
     (output / "summary.md").write_text("\n".join(lines) + "\n")
 
 
-def _prepare_cache(policy, source, timeout):
+def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
+    if policy == "source-verified":
+        if expected is None or metadata is None:
+            raise ValueError("source-verified requires the initial source snapshots")
+        return operations.validate_source(source, expected, metadata)
     if policy == "uncontrolled":
         return
     subprocess.run(["sync"], check=True, timeout=timeout)
@@ -491,12 +495,13 @@ def _arguments(argv):
     parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--baseline-bin-dir", type=Path)
     parser.add_argument("--mode", choices=("local", "loopback"), default="local")
+    parser.add_argument("--rtt-ms", type=int, choices=(0, 2, 10), help="opt into a private per-trial loopback namespace")
     parser.add_argument("--purpose", choices=("smoke", "performance"), default="performance")
     parser.add_argument("--source-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--destination-root", type=Path, default=Path(tempfile.gettempdir()))
     parser.add_argument("--source-storage-id", type=_nonblank)
     parser.add_argument("--destination-storage-id", type=_nonblank)
-    parser.add_argument("--cache", choices=("source-warm", "linux-drop-caches", "uncontrolled"), default="source-warm")
+    parser.add_argument("--cache", choices=("source-warm", "linux-drop-caches", "uncontrolled", "source-verified"), default="source-warm")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--output", type=Path, required=True)
@@ -505,6 +510,8 @@ def _arguments(argv):
     parser.add_argument("--ssh-transport-profile", type=_nonblank)
     parser.add_argument("--no-timings", action="store_true", help="disable scoped timing collection for overhead diagnostics")
     args = parser.parse_args(argv)
+    if args.rtt_ms is not None and args.mode != "loopback":
+        parser.error("--rtt-ms requires loopback mode")
     if args.mode == "local" and args.ssh_transport_profile is not None:
         parser.error("--ssh-transport-profile requires loopback mode")
     return args
@@ -523,8 +530,14 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
     record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    record["context"]["operation_contract_revision"] = operations.CONTRACT_REVISION
+    record["context"]["summary_locale"] = operations.SUMMARY_LOCALE
+    if args.cache == "source-verified":
+        record["context"]["cache_contract_revision"] = operations.CACHE_REVISION
     if args.mode == "loopback":
-        record["context"]["ssh_transport_profile"] = args.ssh_transport_profile
+        record["context"]["ssh_transport_profile"] = transport.PROFILE if args.rtt_ms is not None else args.ssh_transport_profile
+    if args.rtt_ms is not None:
+        record["context"]["owned_transport"] = transport.semantics(args.rtt_ms)
     if args.baseline_bin_dir:
         record["context"]["baseline_commit"] = os.environ.get("RCP_BENCH_BASELINE_COMMIT", "")
     storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
@@ -561,6 +574,13 @@ def main(argv=None):
             variants.append({**default, "id": "rcp-baseline"})
         if len({variant["id"] for variant in variants}) != len(variants):
             raise ValueError("variant expansion produced duplicate ids")
+        if args.rtt_ms is not None:
+            transport.validate_request(args.mode, args.rtt_ms, variants, os.environ)
+            if args.ssh_transport_profile is not None:
+                raise ValueError("owned RTT supplies its own SSH profile; omit --ssh-transport-profile")
+        for case in cases:
+            for variant in variants:
+                operations.validate_variant(variant, case.get("mode", "fresh"))
         record["cases"] = cases
         record["variants"] = variants
         _persist(output, record)
@@ -624,6 +644,10 @@ def main(argv=None):
             source_scan = scan_tree(source)
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
+            operation = case.get("mode", "fresh")
+            source_metadata = operations.metadata_tree(source) if args.cache == "source-verified" or operation != "fresh" or any(operations.summary_supported(variant) for variant in variants) else None
+            stale_names = operations.select_stale(source_scan["entries"]) if operation == "partial" else []
+            expected_transfer = operations.transfer_counts(operation, source_scan["counts"])
             case["fixture_digest"] = source_scan["digest"]
             case["realized_counts"] = source_scan["counts"]
             _persist(output, record)
@@ -632,31 +656,53 @@ def main(argv=None):
                 for variant in order:
                     trial_path = Path(case["id"]) / variant["id"] / str(iteration)
                     destination = destination_scratch / trial_path
+                    timing_policy = timing_collection[variant["id"]]
+                    stable_summary_locale = operations.summary_supported(variant)
+                    trial = {"case_id": case["id"], "variant_id": variant["id"], "iteration": iteration,
+                             "operation": operation, "expected_transfer": expected_transfer,
+                             "child_locale": operations.SUMMARY_LOCALE if stable_summary_locale else "inherited",
+                             "commands": [], "status": "running", "validation": {"ok": False},
+                             "exit_codes": [], "logs": [], "timings": {"status": timing_policy, "reports": []}}
+                    record["trials"].append(trial)
+                    _persist(output, record)
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    if variant["processes"] > 1 or variant["tool"] == "rsync":
+                    if operation != "fresh":
+                        stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
+                        trial["seed_validation"] = operations.validate_seed(source, destination, source_scan, source_metadata, stale)
+                    elif variant["processes"] > 1 or variant["tool"] == "rsync":
                         destination.mkdir()
                     selected_tools = dict(tools)
                     if variant["id"] == "rcp-baseline":
                         selected_tools["rcp"] = tools["rcp-baseline"]
                         if args.mode == "loopback":
                             selected_tools["rcpd"] = tools["rcpd-baseline"]
-                    commands = plan_commands(variant, source, destination, selected_tools, args.mode)
-                    timing_policy = timing_collection[variant["id"]]
+                    commands = [] if args.rtt_ms is not None else plan_commands(variant, source, destination, selected_tools, args.mode, operation)
                     timing_prefix = output / "timings" / trial_path / "trace"
                     if timing_policy == "coarse":
                         timing_prefix.parent.mkdir(parents=True, exist_ok=False)
                         commands = [[command[0], f"--timings={timing_prefix}", *command[1:]] for command in commands]
-                    trial = {"case_id": case["id"], "variant_id": variant["id"], "iteration": iteration, "commands": commands, "status": "running", "validation": {"ok": False}, "exit_codes": [], "logs": [], "timings": {"status": timing_policy, "reports": []}}
-                    record["trials"].append(trial)
-                    _persist(output, record)
+                    trial["commands"] = commands
+                    if args.rtt_ms is not None:
+                        trial["transport_artifacts"] = str(output / "transport" / trial_path)
                     try:
-                        _prepare_cache(args.cache, source, args.timeout)
+                        proof = _prepare_cache(args.cache, source, args.timeout, source_scan, source_metadata)
+                        if args.cache == "source-verified":
+                            trial["cache_validation"] = proof
                     except Exception as exc:
                         trial["status"] = "failed"
                         trial["validation"] = {"ok": False, "error": f"cache preparation failed: {exc}"}
                         _persist(output, record)
                         raise
-                    outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout)
+                    _persist(output, record)
+                    if args.rtt_ms is not None:
+                        identities = {key: record["tools"][key + "-baseline" if variant["id"] == "rcp-baseline" else key]["sha256"] for key in (("rcp", "rcpd") if variant["tool"] == "rcp" else ("rsync",))}
+                        outcome = transport.execute_trial(variant, source, destination, selected_tools,
+                            output / "logs" / trial_path, Path(trial["transport_artifacts"]), args.timeout,
+                            args.rtt_ms, operation, source_scan["counts"], timing_policy, timing_prefix,
+                            len(record["trials"]) - 1, expected_pins=identities, ssh_identity=record["tools"]["ssh"])
+                        commands = outcome["commands"]
+                    else:
+                        outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale)
                     trial.update(outcome)
                     timing_error = None
                     if timing_policy == "coarse":
@@ -669,7 +715,17 @@ def main(argv=None):
                         except timings.CollectionError as error:
                             trial["timings"]["reports"] = error.reports
                             timing_error = str(error)
-                    trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": "command failed or timed out"}
+                    trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message", "command failed or timed out")}
+                    if outcome["ok"] and trial["validation"]["ok"]:
+                        try:
+                            if operations.summary_supported(variant):
+                                text = "\n".join(Path(path).read_text() for item in outcome["logs"] for path in item.values())
+                                trial["copy_summary"] = operations.validate_summary(variant, text, expected_transfer)
+                                trial["metadata_validation"] = operations.validate_metadata(destination, source_metadata)
+                            if source_metadata is not None:
+                                trial["source_validation"] = operations.validate_source(source, source_scan, source_metadata)
+                        except (OSError, ValueError) as error:
+                            trial["validation"].update(ok=False, error=str(error))
                     if timing_error:
                         trial["validation"]["timing_error"] = timing_error
                         if trial["validation"]["ok"]:
@@ -679,14 +735,21 @@ def main(argv=None):
                     if trial["status"] != "ok":
                         raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                     shutil.rmtree(destination)
-            source_validation = validate_tree(source, source, source_scan)
+            source_validation = record["trials"][-1]["source_validation"] if source_metadata is not None else validate_tree(source, source, source_scan)
             if not source_validation["ok"]:
                 raise RuntimeError(f"source changed during case {case['id']}: {source_validation['error']}")
             case_summaries = []
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
                 median = statistics.median(samples)
-                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"]), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                owned_semantics = None
+                if args.rtt_ms is not None:
+                    accepted = [trial for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]
+                    observations = [transport.series_observations(trial["transport"]) for trial in accepted]
+                    if any(observation != observations[0] for observation in observations):
+                        raise ValueError("owned role capacity/resource observations changed between repetitions; refusing to pool samples")
+                    owned_semantics = {**transport.semantics(args.rtt_ms), "observations": observations[0]}
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
             shutil.rmtree(fixture_root)

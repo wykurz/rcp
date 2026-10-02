@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add fresh, unchanged and partial benchmark scenarios with owned loopback latency, verified source
+  cache preparation and sanitized JSON exports that retain every attempted copy.
+
 - Add reusable tracing-based scoped timings with `--timings=PREFIX`, optional detailed scopes, and
   elapsed Chrome timelines. Benchmark reports collect coarse stage summaries automatically when
   supported, including remote source scanning and backpressure measurements. Detailed destination

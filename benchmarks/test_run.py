@@ -277,8 +277,8 @@ generate(pathlib.Path(sys.argv[1]) / 'filegen', 0)
             manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "all-levels", "directory_widths": [2, 1], "files_per_directory": 1, "file_size_bytes": 8}], "variants": [{"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}]}))
             copied = []
             execute_commands = run.execute_commands
-            def execute_and_inspect(commands, log_dir, timeout):
-                outcome = execute_commands(commands, log_dir, timeout)
+            def execute_and_inspect(commands, log_dir, timeout, **kwargs):
+                outcome = execute_commands(commands, log_dir, timeout, **kwargs)
                 copied.append(run.scan_tree(commands[0][-1]))
                 return outcome
             output = root / "out"
