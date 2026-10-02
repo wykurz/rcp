@@ -304,6 +304,7 @@ impl CommonArgs {
         crate::ThrottleConfig {
             files_in_flight,
             apply_files_in_flight: true,
+            admission_policy: crate::AdmissionPolicy::Local,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,

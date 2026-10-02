@@ -418,6 +418,8 @@ async fn handle_connection(
     dst: &std::path::Path,
     tcp_config: &remote::TcpConfig,
     concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
+    files_source: common::FilesInFlightSource,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
@@ -429,13 +431,20 @@ async fn handle_connection(
     // wrap control connection with TLS if configured; the handshake is bounded because a peer that
     // establishes TCP then stalls it would otherwise hang the source here indefinitely, before any
     // teardown state exists
-    let (control_send_stream, control_recv_stream) = remote::tls::accept_bounded(
+    let (control_send_stream, mut control_recv_stream) = remote::tls::accept_bounded(
         tls_acceptor.as_deref(),
         control_stream,
         std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
         "control",
     )
     .await?;
+    let receiver_limits = tokio::time::timeout(
+        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+        control_recv_stream.recv_object::<remote::protocol::DirectoryLimits>(),
+    )
+    .await
+    .context("timed out receiving destination directory limits")??
+    .context("destination closed before directory limits")?;
     // wrap in Arc<Mutex<>> for shared access
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams for directory transfer");
@@ -473,6 +482,9 @@ async fn handle_connection(
         fatal.clone(),
         pool_size,
         max_pending_files,
+        admission,
+        files_source,
+        receiver_limits,
         error_collector,
     )
     .await;
@@ -1160,7 +1172,7 @@ async fn dry_run_traverse_fd(
 }
 
 /// Handle a dry-run connection: traverse, log entries, and complete without transferring data.
-/// Destination sees an empty copy and completes immediately.
+/// Destination completes after receiving the empty discovery marker.
 async fn handle_dry_run_connection(
     stream: tokio::net::TcpStream,
     settings: &common::copy::Settings,
@@ -1244,8 +1256,7 @@ async fn handle_dry_run_connection(
                 tracing::debug!("Ignoring message during dry-run: {:?}", other);
             }
             None => {
-                tracing::debug!("Control stream closed");
-                break;
+                anyhow::bail!("destination closed control before DestinationDone during dry run");
             }
         }
     }
@@ -1276,6 +1287,8 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     capture: ExtendedMetadataCapture,
     tcp_config: &remote::TcpConfig,
     concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
+    files_source: common::FilesInFlightSource,
     bind_ip: Option<&str>,
     cert_key: Option<&remote::tls::CertifiedKey>,
     dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
@@ -1358,6 +1371,8 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 dst,
                 tcp_config,
                 concurrency,
+                admission,
+                files_source,
                 error_collector.clone(),
                 tls_acceptor,
             )

@@ -145,7 +145,7 @@ fn main() -> Result<(), anyhow::Error> {
     let files_in_flight = args.common.resolve_files_in_flight();
     let func = {
         let args = args.clone();
-        || async_main(args)
+        |_admission| async_main(args)
     };
     let output = args.common.output_config(args.quiet, args.summary);
     let runtime = args.common.runtime_config();

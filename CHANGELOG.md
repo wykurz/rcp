@@ -13,8 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   elapsed Chrome timelines. Benchmark reports collect coarse stage summaries automatically when
   supported, including remote source scanning and backpressure measurements. Detailed destination
   scopes cover rate admission, file planning, creation, transfer, flushing, metadata, payload
-  draining, tracker waits, and directory finalization. Shared metadata scopes separate rate and
-  concurrency admission, execution, and blocking-worker queueing where applicable.
+  draining, tracker access, and directory finalization. Shared metadata scopes separate rate and
+  concurrency admission, execution, and blocking-worker queueing where applicable. Coarse
+  destination manifest scopes separate build admission, inventory, and manifest/Ready publication.
+  Coarse directory scopes cover preparation and attribute finalization cascades to control messages,
+  Ready announcements, or data workers.
 - Add `--reflink=auto|never` to `rcp` and `rlink` to control acceleration for local file copies,
   including files copied during `rlink --update`. The default `auto` keeps existing behavior;
   `never` uses sparse-aware read/write copying for benchmarking. An `always` mode is deferred until
@@ -22,13 +25,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Advance the remote compatibility revision to 8 for single-pass parallel source discovery and
-  explicit directory Begin/Ready/End completion. Source timings expose `source.discovery`,
-  `source.directory.scan`, `source.directory.wait_ready`, `source.directory.wait_resources`,
-  `source.discovery.wait_credit`, and `source.files.drain` in place of the `source.pass1` and
-  `source.pass2` scope families. Directory descriptor admission bounds parallel traversal overhead
-  while reserving a sequential path for progress under pressure. Files already proven unchanged by a
-  complete destination manifest bypass transfer-task admission.
+- Coalesce already-ready unchanged-file control messages in bounded groups, flushing before
+  discovery waits and structural progress boundaries while retaining individual wire frames.
+
+- Resolve remote leaf and directory admission together before normal-copy daemon readiness,
+  preserving room for scans, pending file parents, and reserved depth. Negotiate normal and reserved
+  lifetime limits across endpoints and retain credits through descriptor and rollback closure,
+  returning them with DirectoryReleased. Insufficient known headroom fails at startup with limits
+  and remedies. Nested reserved-depth exhaustion records an error and skips that subtree unless
+  `--fail-early` is set; neither daemon changes its inherited soft descriptor limit.
+
+- Prepare remote destination directories concurrently within the endpoint's installed leaf limit,
+  using secured parent dependencies and at most P owned directory jobs. Preserve early End and child
+  outcomes and require every Ready, Skipped, and directory release to flush before DestinationDone.
+
+- Build remote destination manifests with concurrent child metadata lookups bounded by the installed
+  leaf limit and PendingMeta admission, retaining one directory builder at a time.
+
+- Keep accepted receiver directories in typed records that own their secured resources through
+  announcement and transfer them together into finalization. Filesystem work and control sends run
+  outside the tracker mutex. One shared shutdown handle cancels receiver work and serializes
+  cancellation with connect-error recording. Send DestinationDone only from the control receiver,
+  after all directory releases, and report success only after its frame and stream close succeed.
+  Join owned directory jobs on every control-receiver return and preserve the original failure
+  without retrying a partially sent Done. Flush queued lifetime releases in bounded batches between
+  valid control frames while preserving buffered framing-error priority and any pending decoder.
+
+- Advance the remote compatibility revision to 10 for single-pass parallel source discovery,
+  explicit directory Begin/Ready/End completion, lifetime admission and release, pipelined reserved
+  subtrees, and preview-only daemon startup. Source timings expose `source.discovery`,
+  `source.directory.scan`, `source.directory.wait_ready`, `source.directory.wait_release`,
+  `source.directory.wait_resources`, `source.discovery.wait_credit`, and `source.files.drain` in
+  place of the `source.pass1` and `source.pass2` scope families. Directory descriptor admission
+  bounds parallel traversal overhead while reserving an inline scan with pipelined completion for
+  progress under pressure. Files already proven unchanged by a complete destination manifest bypass
+  transfer-task admission.
 - Let `just test` and `just test-release` forward arguments to nextest. Split each Depot native test
   configuration across two shards, with the native Arm ABI smoke check on the first Arm shard.
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl
@@ -38,6 +69,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Retain rejected remote directory ancestry through End and release, allowing already-submitted
+  descendants to finish. Pipeline reserved-directory completion within its credit bound instead of
+  waiting for each directory's data and release before scanning siblings. Preserve destination
+  operation errors when a peer closes control, and keep automatic directory-capacity reductions
+  quiet. Split known directory headroom equally between normal and reserve traversal, and return
+  reserve scan capacity independently of pending directory lifetimes.
+
+- Keep control-message bookkeeping independent of filesystem ops throttling, and prevent fatal file
+  errors from finalizing pending directories or sending DestinationDone.
+- Allow encrypted remote dry runs to exceed the data connection timeout without starting data
+  workers, and reject a missing destination completion acknowledgement. Select metadata-only
+  admission before daemon readiness, without reserving unused remote streams or directory lifetimes,
+  and validate that both daemon roles' master messages agree with their startup preview policy.
 - Bound remote file payloads to their advertised size and reject short reads before stream reuse.
   Preserve source paths and the primary fatal cause in discovery errors.
 - Keep local sparse copies progressing when extent probes stop advancing or become unsupported,

@@ -304,3 +304,85 @@ async fn cursor_acl_reads_preserve_its_position_and_descriptor() -> anyhow::Resu
     assert_eq!(gate.available_permits(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn created_directory_lifetime_guard_runs_after_directory_and_cursor_close()
+-> anyhow::Result<()> {
+    struct Guard {
+        descriptors: Arc<std::sync::Mutex<Vec<crate::testutils::FdIdentityProbe>>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl std::fmt::Debug for Guard {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("DescriptorCloseGuard")
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for fd in self.descriptors.lock().unwrap().iter() {
+                assert!(
+                    fd.original_is_closed().unwrap(),
+                    "directory lease was released before its descriptor closed"
+                );
+            }
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let root_path = crate::testutils::create_temp_dir().await?;
+    let root = Dir::open_root_dir(&root_path, false, congestion::Side::Destination).await?;
+    let descriptors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Arc::new(Guard {
+        descriptors: descriptors.clone(),
+        dropped: dropped.clone(),
+    });
+    let dir = root
+        .make_dir_admitted(OsStr::new("child"), 0o700, guard.clone())
+        .await?;
+    let cursor = dir.entries().await?;
+    descriptors.lock().unwrap().extend([
+        crate::testutils::FdIdentityProbe::capture(dir.fd.as_raw_fd())?,
+        crate::testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?,
+    ]);
+    drop(guard);
+    drop(dir);
+    assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+    drop(cursor);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_directory_create_keeps_guard_until_abandoned_descriptor_closes()
+-> anyhow::Result<()> {
+    let root_path = crate::testutils::create_temp_dir().await?;
+    let child = root_path.join("child");
+    let root = Dir::open_root_dir(&root_path, false, congestion::Side::Destination).await?;
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let credit = credit(&gate).await;
+    let mut barrier = crate::testutils::BlockingPathGate::install(&child);
+    let task = tokio::spawn(async move {
+        root.make_dir_admitted(OsStr::new("child"), 0o700, credit)
+            .await
+    });
+    let fd =
+        tokio::time::timeout(std::time::Duration::from_secs(5), barrier.wait_started()).await??;
+    let probe = crate::testutils::FdIdentityProbe::capture(fd)?;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!probe.original_is_closed()?);
+    assert_eq!(
+        gate.available_permits(),
+        0,
+        "cancelled create released its held descriptor guard"
+    );
+    barrier.release_all();
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire()).await??;
+    assert!(
+        probe.original_is_closed()?,
+        "abandoned create returned credit before fd close"
+    );
+    drop(permit);
+    Ok(())
+}

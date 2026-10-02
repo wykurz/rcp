@@ -7,7 +7,8 @@
 //! public surface.
 
 use crate::config::{
-    AutoMetaThrottleConfig, ConcurrencyLimit, RuntimeConfig, ThrottleConfig, TracingConfig,
+    AdmissionPolicy, AutoMetaThrottleConfig, ConcurrencyLimit, RuntimeConfig, ThrottleConfig,
+    TracingConfig,
 };
 use crate::{
     PBAR, PROGRESS, REMOTE_RUNTIME_STATS, RuntimeStats, auto_meta, histogram_logger, is_localhost,
@@ -170,7 +171,7 @@ pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
 }
 
 /// Read the process's inherited soft descriptor limit without changing it.
-pub fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
+fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -209,9 +210,8 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 /// The verbose-level filter (`build_verbose_env_filter`, below) gives this target its own `warn`
 /// directive, which is more specific than the global level, so a notice renders at the DEFAULT
 /// verbosity while everything else stays at `error`. That targeting is the whole point. Raising the
-/// global default to `warn` instead would unmute every other `warn!` in the tools, 14 of which sit
-/// in per-entry paths (e.g. "Skipping directory {:?} - ancestor failed to create"), so one failed
-/// subtree would print thousands of lines.
+/// global default to `warn` instead would also expose per-entry warnings, so one failed subtree
+/// could print thousands of lines.
 ///
 /// **The bar for putting an event here** is that it is advice about the INVOCATION — constant in
 /// volume however large the tree, and actionable by changing the command line. A per-entry event
@@ -496,6 +496,110 @@ pub(crate) fn install_tracing_subscriber(
     })
 }
 
+// the combined model covers both independent leaf pools, not five units per pool.
+const DESCRIPTOR_UNITS_PER_OPERATION: u64 = 5;
+const MAX_LEAF_OPERATIONS_PER_POOL: usize = 4096;
+
+/// A remote endpoint's jointly resolved leaf and directory admission.
+///
+/// Runtime setup installs `leaf_capacity` in both leaf pools before publishing this plan. The
+/// directory counts reserve each endpoint's held descriptors through peer release. An unknown
+/// soft limit permits only logical bounds and carries no descriptor-safety guarantee.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteResources {
+    pub soft_limit: Option<std::num::NonZeroU64>,
+    pub leaf_capacity: std::num::NonZeroUsize,
+    pub normal_directories: std::num::NonZeroUsize,
+    pub reserved_directories: std::num::NonZeroUsize,
+}
+
+impl RemoteResources {
+    /// Resolve remote work bounds from one startup limit observation and resolved concurrency.
+    pub fn for_limits(
+        soft_limit: Option<std::num::NonZeroU64>,
+        leaf_ceiling: std::num::NonZeroUsize,
+        streams: std::num::NonZeroUsize,
+        pending: std::num::NonZeroUsize,
+    ) -> anyhow::Result<Self> {
+        const SUPPORT_DESCRIPTORS: u64 = 32;
+        // source: two data/ACL fds plus two classification/readlink fds per leaf slot.
+        // destination: two data/metadata fds, one manifest fd, and one extra preparation fd
+        // beyond the two-fd allowance for each directory lifetime.
+        const LEAF_DESCRIPTORS: u64 = 4;
+        // four leaf fds plus two normal and two reserved lifetimes, at two fds apiece.
+        const DESCRIPTORS_PER_WORK_SLOT: u64 = LEAF_DESCRIPTORS + 2 * (2 + 2);
+        let maximum = tokio::sync::Semaphore::MAX_PERMITS;
+        anyhow::ensure!(
+            streams.get() <= maximum && pending.get() <= maximum,
+            "remote concurrency exceeds semaphore capacity"
+        );
+        let requested = leaf_ceiling
+            .get()
+            .min(streams.get())
+            .min(MAX_LEAF_OPERATIONS_PER_POOL);
+        let (leaf_capacity, normal, reserve) = match soft_limit {
+            Some(soft) => {
+                let streams_u64 = u64::try_from(streams.get()).unwrap_or(u64::MAX);
+                let available = soft
+                    .get()
+                    .saturating_sub(streams_u64)
+                    .saturating_sub(SUPPORT_DESCRIPTORS);
+                let minimum = streams_u64
+                    .saturating_add(SUPPORT_DESCRIPTORS)
+                    .saturating_add(DESCRIPTORS_PER_WORK_SLOT);
+                let shortfall = minimum.saturating_sub(soft.get());
+                anyhow::ensure!(
+                    available >= DESCRIPTORS_PER_WORK_SLOT,
+                    "insufficient remote descriptor headroom: soft RLIMIT_NOFILE={}, data connections={}, support reserve={SUPPORT_DESCRIPTORS}, minimum soft limit={minimum}, shortfall={shortfall}; reduce --max-connections or --max-files-in-flight, or raise the limit inherited by rcpd in the affected host's SSH session (ulimit -n / sshd session limits); changing only the local rcp shell limit does not change a remote daemon's limit",
+                    soft.get(),
+                    streams,
+                );
+                let work_capacity =
+                    usize::try_from(available / DESCRIPTORS_PER_WORK_SLOT).unwrap_or(usize::MAX);
+                let leaf = requested.min(work_capacity);
+                let leaf_u64 = u64::try_from(leaf).expect("the leaf-operation cap fits in u64");
+                let groups = usize::try_from((available - LEAF_DESCRIPTORS * leaf_u64) / 2)
+                    .unwrap_or(usize::MAX);
+                // a scanner can retain an ancestor path independently of pending file work.
+                // split actual headroom between parallel traversal and its progress reserve.
+                let normal = (groups / 2).min(maximum);
+                (leaf, normal, (groups - normal).min(maximum))
+            }
+            None => {
+                let logical = pending
+                    .get()
+                    .saturating_add(streams.get())
+                    .saturating_mul(2)
+                    .min(maximum);
+                (requested, logical, logical)
+            }
+        };
+        Ok(Self {
+            soft_limit,
+            leaf_capacity: std::num::NonZeroUsize::new(leaf_capacity)
+                .context("remote leaf capacity is zero")?,
+            normal_directories: std::num::NonZeroUsize::new(normal)
+                .context("normal remote directory capacity is zero")?,
+            reserved_directories: std::num::NonZeroUsize::new(reserve)
+                .context("reserved remote directory capacity is zero")?,
+        })
+    }
+}
+
+/// The endpoint admission successfully installed during runtime setup.
+///
+/// Disabled admission does not query the descriptor limit or configure either leaf pool.
+/// A configured endpoint can have an unknown soft limit after explicit finite query fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointAdmission {
+    Disabled,
+    Configured {
+        soft_limit: Option<std::num::NonZeroU64>,
+        leaf_capacity: std::num::NonZeroUsize,
+    },
+    Remote(RemoteResources),
+}
+
 /// Derive a conservative leaf-operation count from the process descriptor limit.
 ///
 /// Local copy/link can overlap three known OpenFile descriptors during overwrite (source
@@ -508,15 +612,10 @@ pub(crate) fn install_tracing_subscriber(
 /// process support descriptors are outside leaf admission. A nonzero soft limit gets at least one
 /// operation so very small test/container limits do not silently disable backpressure.
 fn descriptor_admission_limit(soft_limit: std::num::NonZeroU64) -> ConcurrencyLimit {
-    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
-    const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
-    const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
-        OPEN_FILE_DESCRIPTOR_UNITS + OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS;
-    const MAX_LEAF_OPERATIONS_PER_POOL: u64 = 4096;
     let descriptor_budget = soft_limit.get().saturating_mul(8) / 10;
     let leaf_operation_limit = std::cmp::min(
         (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION).max(1),
-        MAX_LEAF_OPERATIONS_PER_POOL,
+        MAX_LEAF_OPERATIONS_PER_POOL as u64,
     );
     ConcurrencyLimit::Limited(
         std::num::NonZeroUsize::new(
@@ -613,15 +712,16 @@ fn configure_file_admission(
     throttle: &ThrottleConfig,
     get_soft_limit: impl FnOnce() -> Result<u64, std::io::Error>,
     configure_limit: impl FnOnce(ConcurrencyLimit) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EndpointAdmission> {
     if !throttle.apply_files_in_flight {
-        return Ok(());
+        return Ok(EndpointAdmission::Disabled);
     }
-    let descriptor_limit = match get_soft_limit() {
+    let soft_limit = match get_soft_limit() {
         Ok(soft_limit) => {
-            descriptor_admission_limit(std::num::NonZeroU64::new(soft_limit).context(
+            let soft_limit = std::num::NonZeroU64::new(soft_limit).context(
                 "soft RLIMIT_NOFILE is zero; descriptor-safe file admission is impossible",
-            )?)
+            )?;
+            Some(soft_limit)
         }
         Err(error) => match (
             throttle.files_in_flight.source(),
@@ -641,7 +741,7 @@ fn configure_file_admission(
                     target: NOTICE_TARGET,
                     "Failed to query RLIMIT_NOFILE; using {option}={limit} as the endpoint file-admission ceiling without an independent descriptor-safety ceiling: {error:#}"
                 );
-                ConcurrencyLimit::Unlimited
+                None
             }
             _ => {
                 return Err(error).context(
@@ -650,16 +750,73 @@ fn configure_file_admission(
             }
         },
     };
-    let leaf_capacity = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
-    tracing::info!(
-        "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
-        throttle.files_in_flight.limit(),
-        throttle.files_in_flight.source(),
-        descriptor_limit,
-        leaf_capacity,
-        leaf_capacity,
-    );
-    if let Some(diagnostic) = descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity) {
+    let (admission, leaf_capacity, diagnostic) = match throttle.admission_policy {
+        AdmissionPolicy::Local => {
+            let descriptor_limit = soft_limit
+                .map(descriptor_admission_limit)
+                .unwrap_or(ConcurrencyLimit::Unlimited);
+            let leaf_capacity =
+                resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
+            let ConcurrencyLimit::Limited(leaf) = leaf_capacity else {
+                unreachable!(
+                    "descriptor admission or explicit finite fallback supplies a finite ceiling"
+                )
+            };
+            tracing::info!(
+                "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
+                throttle.files_in_flight.limit(),
+                throttle.files_in_flight.source(),
+                descriptor_limit,
+                leaf_capacity,
+                leaf_capacity,
+            );
+            (
+                EndpointAdmission::Configured {
+                    soft_limit,
+                    leaf_capacity: leaf,
+                },
+                leaf_capacity,
+                descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity),
+            )
+        }
+        AdmissionPolicy::Remote { streams, pending } => {
+            let leaf_ceiling = match throttle.files_in_flight.limit() {
+                ConcurrencyLimit::Limited(ceiling) => ceiling,
+                ConcurrencyLimit::Unlimited => streams,
+            };
+            let resources =
+                RemoteResources::for_limits(soft_limit, leaf_ceiling, streams, pending)?;
+            let leaf_capacity = ConcurrencyLimit::Limited(resources.leaf_capacity);
+            tracing::info!(
+                "Resolved remote admission: file_ceiling={:?}, source={:?}, streams={}, pending={}, soft_limit={:?}, open_file={}, pending_meta={}, normal_directories={}, reserved_directories={}",
+                throttle.files_in_flight.limit(),
+                throttle.files_in_flight.source(),
+                streams,
+                pending,
+                soft_limit,
+                resources.leaf_capacity,
+                resources.leaf_capacity,
+                resources.normal_directories,
+                resources.reserved_directories,
+            );
+            if soft_limit.is_none() {
+                tracing::warn!(target: NOTICE_TARGET,
+                    "Remote descriptor headroom is unavailable; using bounded logical admission with {} leaf operations, {} normal directories, and {} reserved levels, without a descriptor-safety guarantee",
+                    resources.leaf_capacity, resources.normal_directories, resources.reserved_directories);
+            }
+            // the resolved stream count already reflects the logical file and connection ceilings. Their
+            // intersection is not a descriptor-safety clamp and must not produce another notice.
+            let diagnostic = (soft_limit.is_some() && resources.leaf_capacity < streams)
+                .then(|| descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity))
+                .flatten();
+            (
+                EndpointAdmission::Remote(resources),
+                leaf_capacity,
+                diagnostic,
+            )
+        }
+    };
+    if let Some(diagnostic) = diagnostic {
         match diagnostic.visibility {
             DescriptorClampVisibility::Notice => {
                 tracing::warn!(target: NOTICE_TARGET, "{}", diagnostic.message);
@@ -669,7 +826,8 @@ fn configure_file_admission(
             }
         }
     }
-    configure_limit(leaf_capacity)
+    configure_limit(leaf_capacity)?;
+    Ok(admission)
 }
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
@@ -677,7 +835,7 @@ fn configure_file_admission(
 pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
-) -> anyhow::Result<tokio::runtime::Runtime> {
+) -> anyhow::Result<(tokio::runtime::Runtime, EndpointAdmission)> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if runtime.max_workers > 0 {
@@ -687,12 +845,12 @@ pub(crate) fn build_tokio_runtime(
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
     let runtime = builder.build().context("failed to create Tokio runtime")?;
-    configure_file_admission(
+    let admission = configure_file_admission(
         throttle,
         get_soft_open_file_limit,
         configure_leaf_admission_limit,
     )?;
-    Ok(runtime)
+    Ok((runtime, admission))
 }
 
 #[cfg(test)]
@@ -762,6 +920,69 @@ mod default_leaf_operation_limit_tests {
             std::io::Error::last_os_error()
         );
         limit
+    }
+
+    #[test]
+    fn configured_admission_reports_actual_installed_leaf_capacity() {
+        let finite = |value| {
+            crate::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(value).unwrap())
+        };
+        for (soft, files, leaf) in [
+            (1024, finite(20), 20),
+            (1024, finite(1000), 163),
+            (1024, crate::ResolvedFilesInFlight::unlimited(), 163),
+            (1_000_000, crate::ResolvedFilesInFlight::unlimited(), 4096),
+            (1, finite(20), 1),
+            (u64::MAX, crate::ResolvedFilesInFlight::unlimited(), 4096),
+        ] {
+            let throttle = ThrottleConfig {
+                files_in_flight: files,
+                ..Default::default()
+            };
+            let mut configured = None;
+            let admission = configure_file_admission(
+                &throttle,
+                || Ok(soft),
+                |capacity| {
+                    configured = Some(capacity);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                configured,
+                Some(ConcurrencyLimit::Limited(
+                    std::num::NonZeroUsize::new(leaf).unwrap()
+                ))
+            );
+            assert_eq!(
+                admission,
+                EndpointAdmission::Configured {
+                    soft_limit: std::num::NonZeroU64::new(soft),
+                    leaf_capacity: std::num::NonZeroUsize::new(leaf).unwrap(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_admission_preserves_configuration_error() {
+        let error = configure_file_admission(
+            &ThrottleConfig::default(),
+            || Ok(1024),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "configuration rejected",
+                )
+                .into())
+            },
+        )
+        .expect_err("rejected configuration must not return a usable snapshot");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -879,7 +1100,7 @@ mod default_leaf_operation_limit_tests {
         };
         let mut queried = false;
         let mut configured = false;
-        configure_file_admission(
+        let admission = configure_file_admission(
             &throttle,
             || {
                 queried = true;
@@ -894,6 +1115,7 @@ mod default_leaf_operation_limit_tests {
         )
         .expect("disabled file admission must not touch runtime admission state");
 
+        assert_eq!(admission, EndpointAdmission::Disabled);
         assert!(!queried, "disabled file admission queried rlimit");
         assert!(
             !configured,
@@ -924,7 +1146,7 @@ mod default_leaf_operation_limit_tests {
                 };
                 let mut configured = None;
 
-                configure_file_admission(
+                let admission = configure_file_admission(
                     &throttle,
                     || Err(std::io::Error::other("sentinel rlimit failure")),
                     |capacity| {
@@ -935,6 +1157,13 @@ mod default_leaf_operation_limit_tests {
                 .expect("a finite user ceiling must remain usable when getrlimit fails");
 
                 assert_eq!(configured, Some(expected));
+                assert_eq!(
+                    admission,
+                    EndpointAdmission::Configured {
+                        soft_limit: None,
+                        leaf_capacity: eight
+                    }
+                );
             }
         });
 
@@ -1066,7 +1295,7 @@ mod default_leaf_operation_limit_tests {
             ),
             ..ThrottleConfig::default()
         };
-        let admission_runtime =
+        let (admission_runtime, _) =
             build_tokio_runtime(&runtime, &old_limit).expect("runtime setup must succeed");
         let (old_open_file, old_pending_meta) = admission_runtime.block_on(async {
             tokio::join!(
@@ -1169,7 +1398,8 @@ mod default_leaf_operation_limit_tests {
             files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
             ..ThrottleConfig::default()
         };
-        let runtime = build_tokio_runtime(&runtime, &throttle).expect("runtime setup must succeed");
+        let (runtime, _) =
+            build_tokio_runtime(&runtime, &throttle).expect("runtime setup must succeed");
         let after = nofile_limit();
         assert_eq!(
             after.rlim_cur, TARGET_SOFT_LIMIT,
@@ -1663,6 +1893,223 @@ fn spawn_auto_meta_throttle(
         auto.tick_interval,
         histogram_active,
     );
+}
+
+#[cfg(test)]
+mod remote_admission_tests {
+    use super::*;
+
+    fn nonzero(value: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(value).unwrap()
+    }
+
+    fn config(files: crate::ResolvedFilesInFlight, streams: usize) -> ThrottleConfig {
+        ThrottleConfig {
+            files_in_flight: files,
+            admission_policy: crate::AdmissionPolicy::Remote {
+                streams: nonzero(streams),
+                pending: nonzero(streams * 4),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn larger_file_requests_preserve_remote_directory_capacity() {
+        for files in [
+            crate::ResolvedFilesInFlight::explicit(nonzero(20)),
+            crate::ResolvedFilesInFlight::explicit(nonzero(163)),
+            crate::ResolvedFilesInFlight::explicit(nonzero(200)),
+            crate::ResolvedFilesInFlight::unlimited(),
+        ] {
+            let mut installed = None;
+            let admission = configure_file_admission(
+                &config(files, 20),
+                || Ok(1024),
+                |capacity| {
+                    installed = Some(capacity);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let EndpointAdmission::Remote(resources) = admission else {
+                panic!("remote setup returned local admission");
+            };
+            assert_eq!(installed, Some(ConcurrencyLimit::Limited(nonzero(20))));
+            assert_eq!(resources.leaf_capacity.get(), 20);
+            assert_eq!(resources.normal_directories.get(), 223);
+            assert_eq!(resources.reserved_directories.get(), 223);
+        }
+    }
+
+    #[test]
+    fn known_remote_headroom_supports_normal_ancestors_independently_of_pending_files() {
+        for (soft, streams, normal, reserve) in [
+            (1024, 4, 243, 243),
+            (1024, 8, 238, 238),
+            (1024, 20, 223, 223),
+            (1025, 4, 243, 243),
+            (1026, 4, 243, 244),
+        ] {
+            for pending in [streams, streams * 4, streams * 16] {
+                let mut configuration = config(
+                    crate::ResolvedFilesInFlight::explicit(nonzero(streams)),
+                    streams,
+                );
+                configuration.admission_policy = crate::AdmissionPolicy::Remote {
+                    streams: nonzero(streams),
+                    pending: nonzero(pending),
+                };
+                let mut installed = None;
+                let admission = configure_file_admission(
+                    &configuration,
+                    || Ok(soft),
+                    |capacity| {
+                        installed = Some(capacity);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                let EndpointAdmission::Remote(resources) = admission else {
+                    panic!("remote setup returned local admission");
+                };
+                assert_eq!(installed, Some(ConcurrencyLimit::Limited(nonzero(streams))));
+                assert_eq!(resources.leaf_capacity.get(), streams);
+                assert_eq!(
+                    resources.normal_directories.get(),
+                    normal,
+                    "soft={soft}, streams={streams}, pending={pending}"
+                );
+                assert_eq!(
+                    resources.reserved_directories.get(),
+                    reserve,
+                    "soft={soft}, streams={streams}, pending={pending}"
+                );
+                assert!(normal >= 2 * streams && reserve >= 2 * streams);
+                let charged = 4 * streams + 2 * (normal + reserve) + streams + 32;
+                assert!(charged <= soft as usize);
+                assert!(
+                    soft as usize - charged <= 1,
+                    "only an odd descriptor can remain unassigned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_setup_preserves_scan_and_reserve_capacity_at_low_limits() {
+        for (soft, streams, leaf, normal, reserve) in [
+            (1024, 100, 74, 149, 149),
+            (1024, 200, 66, 132, 132),
+            (1024, 400, 49, 99, 99),
+            (160, 20, 9, 18, 18),
+            (128, 20, 6, 13, 13),
+        ] {
+            let mut installed = None;
+            let admission = configure_file_admission(
+                &config(crate::ResolvedFilesInFlight::unlimited(), streams),
+                || Ok(soft),
+                |capacity| {
+                    installed = Some(capacity);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let EndpointAdmission::Remote(resources) = admission else {
+                panic!("remote setup returned local admission");
+            };
+            assert_eq!(installed, Some(ConcurrencyLimit::Limited(nonzero(leaf))));
+            assert_eq!(resources.normal_directories.get(), normal);
+            assert_eq!(resources.reserved_directories.get(), reserve);
+            assert!(normal >= 2 * leaf);
+            assert!(reserve >= 2 * leaf);
+            assert!(4 * leaf + 2 * (normal + reserve) + streams + 32 <= soft as usize);
+        }
+    }
+
+    #[test]
+    fn impossible_remote_socket_budget_fails_before_installing_pools() {
+        let mut configured = false;
+        let error = configure_file_admission(
+            &config(crate::ResolvedFilesInFlight::unlimited(), 100),
+            || Ok(128),
+            |_| {
+                configured = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("128") && message.contains("100"),
+            "{message}"
+        );
+        assert!(message.contains("--max-connections"), "{message}");
+        assert!(message.contains("minimum soft limit=144"), "{message}");
+        assert!(message.contains("shortfall=16"), "{message}");
+        assert!(message.contains("SSH session"), "{message}");
+        assert!(!configured);
+    }
+
+    #[test]
+    fn unknown_remote_limit_preserves_bounded_logical_traversal() {
+        let mut installed = None;
+        let admission = configure_file_admission(
+            &config(crate::ResolvedFilesInFlight::explicit(nonzero(20)), 20),
+            || Err(std::io::Error::other("limit unavailable")),
+            |capacity| {
+                installed = Some(capacity);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let EndpointAdmission::Remote(resources) = admission else {
+            panic!("remote setup returned local admission");
+        };
+        assert_eq!(installed, Some(ConcurrencyLimit::Limited(nonzero(20))));
+        assert_eq!(resources.soft_limit, None);
+        assert_eq!(resources.normal_directories.get(), 200);
+        assert_eq!(resources.reserved_directories.get(), 200);
+    }
+
+    #[test]
+    fn unknown_remote_limit_still_rejects_automatic_and_unlimited_requests() {
+        for files in [
+            crate::ResolvedFilesInFlight::automatic_with(nonzero(20)),
+            crate::ResolvedFilesInFlight::unlimited(),
+        ] {
+            let result = configure_file_admission(
+                &config(files, 20),
+                || Err(std::io::Error::other("limit unavailable")),
+                |_| panic!("unsubstantiated admission configured pools"),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn remote_resource_arithmetic_remains_bounded_at_extreme_capacities() {
+        let maximum = tokio::sync::Semaphore::MAX_PERMITS;
+        let resources = RemoteResources::for_limits(
+            std::num::NonZeroU64::new(u64::MAX),
+            nonzero(usize::MAX),
+            nonzero(maximum),
+            nonzero(maximum),
+        )
+        .unwrap();
+        assert_eq!(resources.leaf_capacity.get(), 4096);
+        assert!(resources.normal_directories.get() <= maximum);
+        assert!(resources.reserved_directories.get() <= maximum);
+        let unknown = RemoteResources::for_limits(
+            None,
+            nonzero(usize::MAX),
+            nonzero(maximum),
+            nonzero(maximum),
+        )
+        .unwrap();
+        assert_eq!(unknown.normal_directories.get(), maximum);
+        assert_eq!(unknown.reserved_directories.get(), maximum);
+    }
 }
 
 #[cfg(test)]

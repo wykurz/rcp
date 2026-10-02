@@ -1,15 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420" role="img" aria-labelledby="title desc">
-  <title id="title">Source directory resource admission</title>
-  <desc id="desc">Each directory starts with a scan permit. Normal directory groups retain shared credits until all descriptor owners close. Under pressure one sequential reserve retains its scan permit, descends without further directory admission, and drains direct file jobs before returning. This bounds parallel descriptor overhead while preserving one depth-first progress path.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="480" viewBox="0 0 920 480" role="img" aria-labelledby="title desc">
+  <title id="title">Directory lifetime admission at both endpoints</title>
+  <desc id="desc">For normal copies, each endpoint jointly budgets leaf capacity A and normal and reserved directory lifetimes N and R before readiness. The source requires at least two normal credits, intersects endpoint limits, and bounds scans by W=min(A,N/2) and pending work by Q=min(P,N-W). Ready returns only Begin credit; lifetime credit waits for DirectoryReleased and all local descriptor owners. One inline reserve scan pipelines completion within R lifetime credits; End and release must both arrive before receiver retirement; excess depth reports an error and skips the subtree, or aborts under fail-early. Preview startup uses local metadata admission without these remote lifetime reservations.</desc>
   <defs>
     <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#475569"/></marker>
   </defs>
-  <rect width="920" height="420" rx="12" fill="#f8fafc"/>
+  <rect width="920" height="480" rx="12" fill="#f8fafc"/>
   <g font-family="system-ui, sans-serif" text-anchor="middle" fill="#0f172a">
-    <text x="460" y="32" font-size="20" font-weight="600">Bound directory handles; keep a path to progress</text>
+    <text x="460" y="32" font-size="20" font-weight="600">Normal copies: bound lifetimes at both endpoints</text>
     <rect x="300" y="50" width="320" height="55" rx="8" fill="#e2e8f0" stroke="#64748b"/>
     <text x="460" y="73" font-size="16">Directory owns a scan permit</text>
-    <text x="460" y="94" font-size="13">At most E concurrent scans</text>
+    <text x="460" y="94" font-size="13">At most W concurrent scans</text>
     <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow)">
       <path d="M390 105V127H230V164"/>
       <path d="M530 105V127H690V164"/>
@@ -17,20 +17,23 @@
     <text x="230" y="120" font-size="13">Normal group available</text>
     <text x="690" y="120" font-size="13">Otherwise wait for a group or reserve</text>
     <rect x="35" y="171" width="390" height="176" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
-    <text x="230" y="199" font-size="17" font-weight="600">Normal admission: B groups</text>
+    <text x="230" y="199" font-size="17" font-weight="600">Normal admission: N lifetimes</text>
     <text x="230" y="228" font-size="14">Open one directory and one cursor</text>
-    <text x="230" y="253" font-size="14">Every descriptor alias retains group credit</text>
+    <text x="230" y="253" font-size="14">Every descriptor alias retains lifetime credit</text>
     <text x="230" y="278" font-size="14">Move the scan permit into inline children</text>
     <text x="230" y="303" font-size="14">At EOF, release scan before joining children</text>
-    <text x="230" y="329" font-size="13">File jobs may continue independently</text>
+    <text x="230" y="329" font-size="13">N = min(floor(G / 2), T)</text>
     <rect x="495" y="171" width="390" height="176" rx="8" fill="#dcfce7" stroke="#16a34a"/>
-    <text x="690" y="199" font-size="17" font-weight="600">One sequential reserve</text>
-    <text x="690" y="228" font-size="14">Retain one scan permit for the whole subtree</text>
-    <text x="690" y="253" font-size="14">Descend without more group or scan permits</text>
-    <text x="690" y="278" font-size="14">Run no parallel discovery children</text>
-    <text x="690" y="303" font-size="14">Drain direct file jobs before each return</text>
-    <text x="690" y="329" font-size="13">No retired sibling handles accumulate</text>
-    <text x="460" y="381" font-size="16" font-weight="600">Directory / cursor fds ≤ 2B + 2D + constant</text>
-    <text x="460" y="405" font-size="13">D is reserve depth. Extreme depth can still exceed the inherited descriptor limit.</text>
+    <text x="690" y="199" font-size="17" font-weight="600">One reserve lane; R live directories</text>
+    <text x="690" y="228" font-size="14">Return scan permit when subtree scan ends</text>
+    <text x="690" y="253" font-size="13">Excess depth: report and skip; fail-early aborts</text>
+    <text x="690" y="278" font-size="14">Scan children inline; pipeline their completion</text>
+    <text x="690" y="303" font-size="14">Return after End; aliases retain lifetime credit</text>
+    <text x="690" y="329" font-size="13">Full R: wait for ended siblings, never ancestors</text>
+    <text x="460" y="375" font-size="16" font-weight="600">Known headroom: 4A + 2(N + R) + E + 32 ≤ S</text>
+    <text x="460" y="399" font-size="13">B = max(S − E − 32, 0); A = min(E, F, 4096, floor(B / 12)); G = floor((B − 4A) / 2)</text>
+    <text x="460" y="421" font-size="13">Intersect endpoint N/R, then source W = min(A, floor(N / 2)); Q = min(P, N − W)</text>
+    <text x="460" y="443" font-size="13">Unknown headroom: bounded logical admission only. Known B &lt; 12: fail before readiness.</text>
+    <text x="460" y="465" font-size="13">Ready returns Q-bounded Begin credit; DirectoryReleased returns lifetime capacity.</text>
   </g>
 </svg>

@@ -136,7 +136,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual((output / "logs" / "tiny.filegen.stdout.log").read_text().strip(), f"2 1 {size} --leaf-files --bufsize={buffer_size}")
                 self.assertFalse(list(root.glob("rcp-bench-*")))
 
-    def _assert_rejected_before_fixture_work(self, variants, selections, diagnostic, baseline=False):
+    def _assert_rejected_before_fixture_work(self, variants, selections, diagnostic, baseline=False, case=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "bin"
@@ -150,7 +150,7 @@ class RunnerTests(unittest.TestCase):
             source.mkdir()
             destination.mkdir()
             manifest = root / "manifest.json"
-            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": variants}))
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [case or {"id": "tiny", "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1}], "variants": variants}))
             output = root / "out"
             arguments = ["--manifest", str(manifest), "--bin-dir", str(binary), "--source-root", str(source), "--destination-root", str(destination), "--output", str(output), *selections]
             if baseline:
@@ -220,6 +220,101 @@ class RunnerTests(unittest.TestCase):
 
     def test_expected_counts_include_all_directory_levels(self):
         self.assertEqual(run.expected_counts({"directory_widths": [2, 3], "files_per_leaf": 4, "file_size_bytes": 5}), {"directories": 8, "files": 24, "bytes": 120})
+
+    def test_expected_counts_include_files_in_root_and_intermediate_directories(self):
+        self.assertEqual(run.expected_counts({"directory_widths": [2, 3], "files_per_directory": 4, "file_size_bytes": 5}), {"directories": 8, "files": 36, "bytes": 180})
+
+    def test_deep_case_contains_twenty_eighty_level_branches_and_root_file(self):
+        manifest = run.load_manifest(Path(run.__file__).with_name("cases.json"))
+        case = next(case for case in manifest["cases"] if case["id"] == "deep-20x80")
+        self.assertEqual(case["directory_widths"], [20] + [1] * 79)
+        self.assertEqual(run.expected_counts(case), {"directories": 1600, "files": 1601, "bytes": 12808})
+
+    def test_manifest_accepts_files_per_directory_and_rejects_ambiguous_policies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "cases.json"
+            case = {"id": "all-levels", "directory_widths": [2, 1], "file_size_bytes": 8}
+            data = {"schema_version": 1, "cases": [{**case, "files_per_directory": 1}], "variants": [{"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}]}
+            manifest.write_text(json.dumps(data))
+            self.assertEqual(run.load_manifest(manifest)["cases"], data["cases"])
+            for policy in ({}, {"files_per_leaf": 1, "files_per_directory": 1}):
+                with self.subTest(policy=policy):
+                    data["cases"] = [{**case, **policy}]
+                    manifest.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(ValueError, "exactly one.*files_per_leaf.*files_per_directory"):
+                        run.load_manifest(manifest)
+            for invalid in (0, -1, True, "1"):
+                with self.subTest(invalid=invalid):
+                    data["cases"] = [{**case, "files_per_directory": invalid}]
+                    manifest.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(ValueError, "files_per_directory.*positive integer"):
+                        run.load_manifest(manifest)
+
+    def test_real_cp_copies_files_in_root_and_intermediate_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin"
+            binary.mkdir()
+            filegen = binary / "filegen"
+            filegen.write_text("""#!/usr/bin/env python3
+import pathlib, sys
+if '--version' in sys.argv:
+    print('filegen test fixture')
+    sys.exit(0)
+widths = list(map(int, sys.argv[2].split(',')))
+def generate(path, level):
+    path.mkdir()
+    if '--leaf-files' not in sys.argv or level == len(widths):
+        for index in range(int(sys.argv[3])):
+            (path / f'file{index}').write_bytes(b'x' * int(sys.argv[4]))
+    if level < len(widths):
+        for index in range(widths[level]):
+            generate(path / str(index), level + 1)
+generate(pathlib.Path(sys.argv[1]) / 'filegen', 0)
+""")
+            filegen.chmod(0o755)
+            manifest = root / "cases.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "all-levels", "directory_widths": [2, 1], "files_per_directory": 1, "file_size_bytes": 8}], "variants": [{"id": "cp-a", "tool": "cp", "args": ["-a"], "processes": 1}]}))
+            copied = []
+            execute_commands = run.execute_commands
+            def execute_and_inspect(commands, log_dir, timeout):
+                outcome = execute_commands(commands, log_dir, timeout)
+                copied.append(run.scan_tree(commands[0][-1]))
+                return outcome
+            output = root / "out"
+            with mock.patch.object(run, "execute_commands", side_effect=execute_and_inspect):
+                result = run.main(["--manifest", str(manifest), "--case", "all-levels", "--variant", "cp-a", "--purpose", "smoke", "--bin-dir", str(binary), "--source-root", str(root), "--destination-root", str(root), "--cache", "uncontrolled", "--repetitions", "1", "--output", str(output)])
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["cases"][0]["realized_counts"], {"directories": 4, "files": 5, "bytes": 40})
+            self.assertEqual(len(copied), 1)
+            expected_files = {"file0", "0/file0", "0/0/file0", "1/file0", "1/0/file0"}
+            self.assertEqual({path for path, entry in copied[0]["entries"].items() if entry["type"] == "file"}, expected_files)
+            for path in expected_files:
+                self.assertEqual(copied[0]["entries"][path], {"type": "file", "size": 8, "sha256": hashlib.sha256(b'x' * 8).hexdigest()})
+            self.assertTrue(result["trials"][0]["validation"]["ok"])
+            self.assertIn("files_per_directory", result["context"]["fixture_policy"])
+            self.assertEqual(report.parse_result((output / "results.json").read_text()), result)
+            self.assertFalse(list(root.glob("rcp-bench-*")))
+
+    def test_all_directory_cases_default_to_whole_tree_variants(self):
+        for mode, expected in (("local", ["rcp-default", "rsync-a", "cp-a"]), ("loopback", ["rcp-default", "rsync-a"])):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = root / "cases.json"
+                manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": "all-levels", "directory_widths": [2, 1], "files_per_directory": 1, "file_size_bytes": 8}], "variants": [{"id": identifier, "tool": tool, "args": [], "processes": processes} for identifier, tool, processes in (("rcp-default", "rcp", 1), ("rsync-a", "rsync", 1), ("rsync-a-10", "rsync", 10), ("cp-a", "cp", 1))]}))
+                output = root / "out"
+                with mock.patch.object(run, "_tool", side_effect=RuntimeError("stop before generation")), self.assertRaisesRegex(RuntimeError, "stop before generation"):
+                    run.main(["--manifest", str(manifest), "--case", "all-levels", "--mode", mode, "--bin-dir", str(root), "--source-root", str(root), "--destination-root", str(root), "--output", str(output)])
+                result = report.parse_result((output / "results.json").read_text())
+                self.assertEqual([variant["id"] for variant in result["variants"]], expected)
+
+    def test_all_directory_cases_reject_partitioning_before_fixture_work(self):
+        self._assert_rejected_before_fixture_work(
+            [{"id": "rsync-a-10", "tool": "rsync", "args": ["-a"], "processes": 10}],
+            ["--case", "all-levels", "--variant", "rsync-a-10"],
+            "partitioned.*files_per_directory.*root files",
+            case={"id": "all-levels", "directory_widths": [2, 1], "files_per_directory": 1, "file_size_bytes": 8},
+        )
 
     def test_manifest_rejects_boolean_schema_version(self):
         with tempfile.TemporaryDirectory() as root:

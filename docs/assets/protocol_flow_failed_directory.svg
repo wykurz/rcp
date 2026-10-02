@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 718" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title id="title">Rejected directories settle one parent entry</title>
-  <desc id="desc">A parent has admitted bad and good subdirectories. A child Begin already submitted under bad receives its own rejection. Every begun directory receives End even when rejected. No data file is sent under rejected directories.</desc>
+  <desc id="desc">A parent has admitted bad and good subdirectories. A child Begin already submitted under bad receives its own rejection. After DirectoryLimits, each begun directory has lifetime admission and receives End even when rejected. Releases follow rejection and descriptor closure, independently of End. No data file is sent under rejected directories.</desc>
   <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="context-stroke"/></marker></defs>
   <rect x="1" y="1" width="998" height="716" rx="10" fill="#fff" stroke="#cbd5e1"/>
   <text x="32" y="34" font-size="18" font-weight="600" fill="#0f172a">Rejected directories settle one parent entry</text>
@@ -17,8 +17,9 @@
 <text x="246" y="256" text-anchor="end" font-size="12" fill="#475569">drain started classifiers</text>
 <text x="714" y="239" text-anchor="start" font-size="12" fill="#475569">complete bad in its parent once</text>
 <line x1="700" y1="306" x2="266" y2="306" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="297" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectorySkipped(bad/child)</text>
-<text x="246" y="303" text-anchor="end" font-size="12" fill="#475569">return child Begin credit</text>
+<text x="246" y="303" text-anchor="end" font-size="12" fill="#475569">return only Q Begin credit</text>
 <text x="714" y="303" text-anchor="start" font-size="12" fill="#475569">no second ancestor completion</text>
+<line x1="700" y1="344" x2="266" y2="344" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="336" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryReleased(bad), DirectoryReleased(bad/child)</text>
 <line x1="260" y1="370" x2="694" y2="370" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="361" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryEnd(bad/child, count=0)</text>
 <text x="714" y="367" text-anchor="start" font-size="12" fill="#475569">close rejected discovery record</text>
 <line x1="260" y1="426" x2="694" y2="426" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="417" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryEnd(bad, count=1)</text>
@@ -28,7 +29,7 @@
 <text x="714" y="479" text-anchor="start" font-size="12" fill="#475569">keep accepting control traffic</text>
 <line x1="260" y1="538" x2="694" y2="538" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="529" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DiscoveryComplete(true)</text>
 <text x="246" y="535" text-anchor="end" font-size="12" fill="#475569">every Begin has an End</text>
-<text x="714" y="535" text-anchor="start" font-size="12" fill="#475569">wait for other admitted work</text>
+<text x="714" y="535" text-anchor="start" font-size="12" fill="#475569">wait for work and all releases</text>
 <line x1="700" y1="596" x2="266" y2="596" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="587" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DestinationDone</text>
 <text x="246" y="593" text-anchor="end" font-size="12" fill="#475569">report collected source errors</text>
 <text x="714" y="593" text-anchor="start" font-size="12" fill="#475569">report collected destination errors</text>

@@ -445,7 +445,7 @@ pub struct Dir {
 #[derive(Debug)]
 struct DirectoryDescriptor {
     fd: OwnedFd,
-    credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 impl AsFd for DirectoryDescriptor {
@@ -498,7 +498,7 @@ impl DirectoryCursor {
     pub async fn open_following_symlinks(
         path: &Path,
         side: congestion::Side,
-        credit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        credit: Arc<dyn std::fmt::Debug + Send + Sync>,
     ) -> std::io::Result<Self> {
         let path = path.to_owned();
         let iterator = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
@@ -571,7 +571,7 @@ impl DirectoryCursor {
 struct OwnedDirectoryStream {
     dir: std::ptr::NonNull<libc::DIR>,
     // closedir runs in Drop before fields release this shared descriptor credit
-    _credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 // SAFETY: ownership is exclusive; the cursor moves into one blocking job at a time, and no
@@ -581,7 +581,7 @@ unsafe impl Send for OwnedDirectoryStream {}
 impl OwnedDirectoryStream {
     fn from_fd(
         fd: OwnedFd,
-        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
     ) -> std::io::Result<Self> {
         let owner = DirectoryDescriptor { fd, credit };
         // SAFETY: fd is valid and held exclusively. On failure fdopendir leaves it open, so
@@ -649,7 +649,7 @@ impl Dir {
     fn opened_with_credit(
         fd: OwnedFd,
         side: congestion::Side,
-        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
     ) -> Dir {
         Dir {
             fd: Arc::new(DirectoryDescriptor { fd, credit }),
@@ -793,7 +793,7 @@ impl Dir {
     pub async fn open_dir_admitted(
         &self,
         name: &OsStr,
-        credit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        credit: Arc<dyn std::fmt::Debug + Send + Sync>,
     ) -> std::io::Result<Dir> {
         self.open_dir_with_credit(name, Some(credit)).await
     }
@@ -801,7 +801,7 @@ impl Dir {
     async fn open_dir_with_credit(
         &self,
         name: &OsStr,
-        credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
     ) -> std::io::Result<Dir> {
         // `O_NOFOLLOW`/`O_PATH` only guard the final path component, so a `name`
         // containing `/` could let openat traverse an intermediate symlink. Reject
@@ -1166,6 +1166,25 @@ impl Dir {
     /// who wants the destination tree's inheritance policy honored should not be using this flag on
     /// that tree.
     pub async fn make_dir(&self, name: &OsStr, mode: u32) -> std::io::Result<Dir> {
+        self.make_dir_with_credit(name, mode, None).await
+    }
+
+    /// Create a child while retaining its descriptor lifetime guard through blocking work.
+    pub async fn make_dir_admitted(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        credit: Arc<dyn std::fmt::Debug + Send + Sync>,
+    ) -> std::io::Result<Dir> {
+        self.make_dir_with_credit(name, mode, Some(credit)).await
+    }
+
+    async fn make_dir_with_credit(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
+    ) -> std::io::Result<Dir> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -1173,63 +1192,58 @@ impl Dir {
         let side = self.side;
         let name_owned = name.to_owned();
         let strict = strict_operand_resolution();
-        let created =
-            run_metadata_probed_blocking(side, congestion::MetadataOp::MkDir, move || {
-                mkdirat(
-                    dir.as_fd(),
-                    name_owned.as_bytes(),
-                    Mode::from_bits_truncate(mode),
-                )
-                .map_err(nix_to_io)?;
-                let open_flags =
-                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-                let fd = match openat(
-                    dir.as_fd(),
-                    name_owned.as_bytes(),
-                    open_flags,
-                    Mode::empty(),
-                )
-                .map_err(nix_to_io)
-                {
-                    Ok(fd) => fd,
-                    Err(err) => {
-                        // could not open what was just created: remove it best-effort. No fd
-                        // exists to anchor an inode recheck on, but the exposure is bounded —
-                        // `RemoveDir` refuses anything but an empty directory, so a swapped-in
-                        // file or symlink fails it and a swapped-in populated directory survives
-                        let _ =
-                            unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
-                        return Err(err);
-                    }
-                };
-                if strict {
-                    // both ACLs, the default (inheritance-carrying) one first — see the doc
-                    // comment for why this must happen inside the creation closure
-                    if let Err(err) = apply_one_acl(fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)
-                        .and_then(|()| apply_one_acl(fd.as_raw_fd(), ACL_ACCESS_XATTR, None))
-                    {
-                        // clean up the destination slot rather than leave inherited ACLs behind.
-                        // rmdir can remove only an empty directory and never follows a symlink; a
-                        // prior identity observation would not bind this by-name removal
-                        let _ =
-                            unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
-                        return Err(err);
-                    }
+        run_metadata_probed_blocking(side, congestion::MetadataOp::MkDir, move || {
+            mkdirat(
+                dir.as_fd(),
+                name_owned.as_bytes(),
+                Mode::from_bits_truncate(mode),
+            )
+            .map_err(nix_to_io)?;
+            let open_flags =
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            let fd = match openat(
+                dir.as_fd(),
+                name_owned.as_bytes(),
+                open_flags,
+                Mode::empty(),
+            )
+            .map_err(nix_to_io)
+            {
+                Ok(fd) => fd,
+                Err(err) => {
+                    // could not open what was just created: remove it best-effort. No fd
+                    // exists to anchor an inode recheck on, but the exposure is bounded —
+                    // `RemoveDir` refuses anything but an empty directory, so a swapped-in
+                    // file or symlink fails it and a swapped-in populated directory survives
+                    let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
+                    return Err(err);
                 }
-                Ok(fd)
-            })
-            .await?;
-        Ok(Dir {
-            fd: Arc::new(DirectoryDescriptor {
-                fd: created,
-                credit: None,
-            }),
-            side,
-            // under strict mode the closure above stripped both ACLs, so nothing created in this
-            // directory can inherit; outside strict mode inheritance is the documented default
-            // behavior and the flag is never consulted
-            children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
+            };
+            // construct the descriptor owner inside started work, before any fallible ACL
+            // action or completed-task handoff can outlive the awaiting caller.
+            let created = Dir {
+                fd: Arc::new(DirectoryDescriptor { fd, credit }),
+                side,
+                children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
+            };
+            #[cfg(test)]
+            let _visit = resource_tests::gate_opened_descriptor(created.fd.as_raw_fd());
+            if strict {
+                // both ACLs, the default (inheritance-carrying) one first — see the doc
+                // comment for why this must happen inside the creation closure
+                if let Err(err) = apply_one_acl(created.fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)
+                    .and_then(|()| apply_one_acl(created.fd.as_raw_fd(), ACL_ACCESS_XATTR, None))
+                {
+                    // clean up the destination slot rather than leave inherited ACLs behind.
+                    // rmdir can remove only an empty directory and never follows a symlink; a
+                    // prior identity observation would not bind this by-name removal
+                    let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
+                    return Err(err);
+                }
+            }
+            Ok(created)
         })
+        .await
     }
 
     /// Open an independent stream over this held directory.
@@ -2142,11 +2156,11 @@ fn rollback_default_acl(
 /// both — see [`Dir::make_dir`]: what it inherited is not its own, and with `d:acl` off nothing at
 /// finalize would remove an inherited access ACL, so the finalize `chmod` would make it effective.)
 ///
-/// KNOWN, PRE-EXISTING: two source operands whose destinations alias the same directory lock it
-/// twice, and the remote tracker's `pending_directories.insert` would drop the first guard mid-copy
-/// (restoring the ACL while the second lockdown is still live). `--require-toctou-safe` refuses
-/// byte-equal duplicate destinations up front and serializes strict multi-source copies, which
-/// covers the reachable cases; filesystem-level aliasing (casefold, bind mount) is not detected.
+/// Distinct destination paths can alias the same directory inode and create overlapping lockdowns:
+/// one guard can restore the ACL while another copy is still active. `--require-toctou-safe`
+/// refuses byte-equal duplicate destinations up front and serializes strict multi-source copies;
+/// filesystem-level aliasing (casefold, bind mount) is not detected. The remote tracker rejects
+/// duplicate directory paths but does not coordinate distinct paths by inode identity.
 ///
 /// Everything the lockdown changed is put back at finalize by [`set_reused_dir_metadata_fd`] (the
 /// owner component-wise, so no transient window hands the directory back to a hostile prior owner)

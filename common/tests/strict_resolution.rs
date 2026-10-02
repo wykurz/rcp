@@ -366,12 +366,11 @@ async fn strict_reuse_rlink_owned_readonly_dir_becomes_writable() -> anyhow::Res
 
 // ── ACL containment for a reused directory (`--require-toctou-safe`) ─────────
 //
-// The lockdown snapshots and strips a reused destination directory's access AND
-// default ACLs, so nothing written during the copy inherits them, and puts them
-// back at finalize. rlink reaches that finalize through `link_dir_contents`,
-// which is a DIFFERENT restore site from copy's `finalize_dir` and the remote
-// destination's `complete_directory_single` — so it needs its own test rather
-// than inheriting confidence from theirs.
+// lockdown snapshots and removes a reused destination directory's default ACL,
+// preventing children from inheriting it, and contains any retained access ACL
+// with owner-only permissions. rlink restores the default ACL through its own
+// directory finalization path, separate from local and remote copy, so each path
+// needs its own coverage.
 
 const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
 const ACL_DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";

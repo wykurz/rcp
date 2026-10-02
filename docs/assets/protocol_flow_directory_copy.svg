@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 866" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title id="title">Discovery overlaps file transfer</title>
-  <desc id="desc">One valid interleaving for root containing file a and child directory containing file b. Files a and b use independent data streams while directory discovery continues. DirectoryEnd seals each direct-child count; metadata is applied after all children finish.</desc>
+  <desc id="desc">After DirectoryLimits, one valid interleaving for root containing file a and child directory containing file b. Files a and b use independent data streams while directory discovery continues. DirectoryEnd seals each direct-child count; metadata is applied after all children finish. DirectoryReleased follows descriptor closure and precedes DestinationDone.</desc>
   <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 z" fill="context-stroke"/></marker></defs>
   <rect x="1" y="1" width="998" height="864" rx="10" fill="#fff" stroke="#cbd5e1"/>
-  <text x="32" y="34" font-size="18" font-weight="600" fill="#0f172a">Discovery overlaps file transfer</text>
+  <text x="32" y="34" font-size="18" font-weight="600" fill="#0f172a">Discovery overlaps file transfer (after DirectoryLimits)</text>
 <rect x="175" y="56" width="170" height="36" rx="6" fill="#e2e8f0"/><text x="260" y="80" text-anchor="middle" font-size="14" fill="#0f172a">Source (rcpd)</text><line x1="260" y1="92" x2="260" y2="778" stroke="#94a3b8" stroke-dasharray="5 5"/>
 <rect x="615" y="56" width="170" height="36" rx="6" fill="#e2e8f0"/><text x="700" y="80" text-anchor="middle" font-size="14" fill="#0f172a">Destination (rcpd)</text><line x1="700" y1="92" x2="700" y2="778" stroke="#94a3b8" stroke-dasharray="5 5"/>
-<line x1="260" y1="130" x2="694" y2="130" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="121" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(root, metadata)</text>
+<line x1="260" y1="130" x2="694" y2="130" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="121" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(root, Normal, …)</text>
 <text x="246" y="127" text-anchor="end" font-size="12" fill="#475569">open held root</text>
 <text x="714" y="127" text-anchor="start" font-size="12" fill="#475569">create or reuse root</text>
 <text x="714" y="144" text-anchor="start" font-size="12" fill="#475569">retain metadata and directory fd</text>
@@ -14,7 +14,7 @@
 <text x="714" y="181" text-anchor="start" font-size="12" fill="#475569">reused directory only</text>
 <line x1="700" y1="230" x2="266" y2="230" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="221" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryReady(root)</text>
 <text x="246" y="227" text-anchor="end" font-size="12" fill="#475569">scan one cursor</text>
-<line x1="260" y1="280" x2="694" y2="280" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="271" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(child, metadata)</text>
+<line x1="260" y1="280" x2="694" y2="280" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="271" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryBegin(child, Normal, …)</text>
 <text x="246" y="277" text-anchor="end" font-size="12" fill="#475569">scan child concurrently</text>
 <text x="714" y="277" text-anchor="start" font-size="12" fill="#475569">retain child metadata</text>
 <line x1="700" y1="326" x2="266" y2="326" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="317" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryReady(child)</text>
@@ -39,6 +39,7 @@
 <rect x="285" y="666" width="390" height="32" rx="5" fill="#eff6ff"/><text x="480" y="687" text-anchor="middle" font-size="12.5" fill="#1e40af">File a finishes</text>
 <text x="714" y="685" text-anchor="start" font-size="12" fill="#475569">root has 2/2 completed children</text>
 <text x="714" y="702" text-anchor="start" font-size="12" fill="#475569">finalize root metadata</text>
+<line x1="700" y1="722" x2="266" y2="722" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="715" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DirectoryReleased × 2 (after final owners close)</text>
 <line x1="700" y1="744" x2="266" y2="744" stroke="#334155" stroke-width="1.7" marker-end="url(#arrow)"/><text x="480" y="735" text-anchor="middle" font-size="12.5" font-family="ui-monospace, monospace" fill="#334155">DestinationDone</text>
 <text x="246" y="741" text-anchor="end" font-size="12" fill="#475569">drain file task results</text>
 <text x="714" y="741" text-anchor="start" font-size="12" fill="#475569">discovery and root complete</text>

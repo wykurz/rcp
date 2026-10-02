@@ -42,8 +42,8 @@ pub struct ProtocolVersion {
 /// argument change whenever the crate version does not also change. The crate version alone cannot
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
-/// Revision 8 covers directory Begin/End sealing, explicit Ready, and DiscoveryComplete.
-pub const WIRE_REVISION: u32 = 8;
+/// Revision 10 includes pipelined directory lifetimes and preview-only daemon startup.
+pub const WIRE_REVISION: u32 = 10;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -258,20 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn current_process_contract_rejects_daemons_without_directory_sealing() {
+    fn current_contract_rejects_daemons_without_pipelined_directory_lifetimes() {
         let current = ProtocolVersion::current();
-        let previous = ProtocolVersion {
-            semantic: format!("{}+w7", current.crate_version()),
-            git_describe: None,
-            git_hash: None,
-        };
-        assert!(!current.is_compatible_with(&previous));
-        assert!(!previous.is_compatible_with(&current));
-        assert_eq!(
-            current.cache_tag(),
-            format!("{}-w8", current.crate_version())
-        );
-        assert_ne!(current.cache_tag(), previous.cache_tag());
+        for revision in [8, 9] {
+            let previous = ProtocolVersion {
+                semantic: format!("{}+w{revision}", current.crate_version()),
+                git_describe: None,
+                git_hash: None,
+            };
+            assert!(!current.is_compatible_with(&previous));
+            assert!(!previous.is_compatible_with(&current));
+            assert_ne!(current.cache_tag(), previous.cache_tag());
+        }
     }
 
     #[test]

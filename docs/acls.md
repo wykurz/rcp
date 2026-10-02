@@ -305,10 +305,9 @@ does not know `all` excludes ACLs is exactly the user who will not think to ask 
 
 It gets there without making anything else noisier. The notice carries its own tracing target,
 `rcp::notice`, and that target has its own `warn` directive; a target directive is more specific
-than the global level, so it wins for this one target and nothing more. Raising the global default
-to `warn` instead would have unmuted every other `warn!` in the tools, 14 of which sit in per-entry
-paths (`Skipping directory {:?} - ancestor failed to create` and friends), so a single failed
-subtree would print thousands of lines. Every other warning still needs `-v`.
+than the global level, so it wins for this one target and nothing more. The global default keeps
+per-entry warnings behind `-v`, so a single failed subtree does not print thousands of warning
+lines.
 
 On a **remote** copy the probe runs on the source `rcpd`, where the root is. The notice keeps its
 target across the wire — the master re-emits forwarded notices on `rcp::notice` rather than on the

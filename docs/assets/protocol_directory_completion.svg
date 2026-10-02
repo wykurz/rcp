@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
 <title id="title">Directory finalization requires three conditions</title>
-<desc id="desc">DirectoryReady has been flushed, DirectoryEnd has sealed the direct-child count, and all counted children have completed. Together these allow metadata application or empty directory pruning, followed by one completion in the parent.</desc>
+<desc id="desc">DirectoryReady has been flushed, DirectoryEnd has sealed the direct-child count, and all counted children have completed. Together these allow metadata application or empty directory pruning, followed by one completion in the parent. DirectoryReleased waits for the final descriptor or rollback owner to close.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 1 L 9 5 L 0 9 z" fill="#475569"/></marker></defs>
 <rect x="1" y="1" width="998" height="418" rx="10" fill="#fff" stroke="#cbd5e1"/>
 <text x="32" y="35" font-size="18" font-weight="600" fill="#0f172a">Directory finalization requires all three conditions</text>
@@ -12,5 +12,5 @@
 <path d="M 500 274 V 303" stroke="#475569" stroke-width="1.7" marker-end="url(#arrow)"/>
 <rect x="300" y="308" width="400" height="43" rx="7" fill="#f1f5f9" stroke="#cbd5e1"/>
 <text x="500" y="335" text-anchor="middle" font-size="14" fill="#0f172a">Non-root: complete exactly one parent entry</text>
-<text x="500" y="387" text-anchor="middle" font-size="12.5" fill="#475569">A rejected Begin settles its parent entry once and still requires its own End before DiscoveryComplete.</text>
+<text x="500" y="387" text-anchor="middle" font-size="12.5" fill="#475569">DirectoryReleased follows the last descriptor owner; rejected Begins still require End independently.</text>
 </svg>

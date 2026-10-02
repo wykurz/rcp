@@ -22,6 +22,10 @@ struct Args {
     #[arg(long, value_name = "ROLE")]
     role: remote::protocol::RcpdRole,
 
+    /// Preview-only startup admission; the master's role hello must agree before work begins.
+    #[arg(long, hide = true)]
+    preview_only: bool,
+
     // Copy options
     /// Overwrite existing files/directories
     #[arg(short, long, help_heading = "Copy options")]
@@ -290,6 +294,33 @@ impl Args {
             self.pending_writes_multiplier,
         )
     }
+    fn throttle_config(
+        &self,
+        files_in_flight: common::ResolvedFilesInFlight,
+        concurrency: remote::ResolvedRemoteConcurrency,
+    ) -> common::ThrottleConfig {
+        let mut throttle = self
+            .common
+            .throttle_config(files_in_flight, self.chunk_size);
+        if !self.preview_only {
+            throttle.admission_policy = common::AdmissionPolicy::Remote {
+                streams: concurrency.max_connections(),
+                pending: concurrency.max_pending_files(),
+            };
+        }
+        throttle
+    }
+    fn validate_preview_mode(&self, hello: &remote::protocol::MasterHello) -> anyhow::Result<()> {
+        let preview = match hello {
+            remote::protocol::MasterHello::Source { dry_run, .. } => dry_run.is_some(),
+            remote::protocol::MasterHello::Destination { dry_run, .. } => *dry_run,
+        };
+        anyhow::ensure!(
+            preview == self.preview_only,
+            "master hello preview mode does not match daemon startup admission"
+        );
+        Ok(())
+    }
     /// Build the remote TCP config from CLI args. Shared by the listener setup in `async_main`
     /// and the source/destination operations in `run_operation`.
     fn to_tcp_config(&self) -> remote::TcpConfig {
@@ -400,10 +431,13 @@ fn rcpd_result_from(
 /// `result_committed` is flipped true the moment the final `RcpdResult` has been sent to the
 /// master — the outer stdin watchdog consults it so a master that consumes the result and then
 /// closes the SSH channel (stdin EOF) is not misread as a mid-operation disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn run_operation<W, R>(
     args: Args,
     tcp_config: &remote::TcpConfig,
     concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
+    files_source: common::FilesInFlightSource,
     master_send_stream: remote::streams::SendStream<W>,
     mut master_recv_stream: remote::streams::RecvStream<R>,
     cert_key: Option<remote::tls::CertifiedKey>,
@@ -424,6 +458,7 @@ where
             anyhow::anyhow!("master closed the control connection before sending its hello")
         })?;
     tracing::info!("Received side: {:?}", master_hello);
+    args.validate_preview_mode(&master_hello)?;
     // The master sends NOTHING further on this connection after `MasterHello` (see
     // docs/remote_protocol.md §2.1: it holds the connection open to await our `RcpdResult`), so
     // the only signals this read can produce are an EOF — the master exited, finished or killed —
@@ -436,7 +471,7 @@ where
     // both rcpds keep copying to each other, or waiting on each other, indefinitely. The
     // `select!`s below cancel the operation the moment this fires; dropping the operation future
     // aborts its owned task sets. `run_with_stdin_watchdog`'s surviving task scope waits for tracked
-    // source descendants to release their captures; destination JoinSets are not tracked there.
+    // source and destination descendants to release their captures before daemon teardown
     let master_watchdog = async move {
         loop {
             match master_recv_stream
@@ -492,6 +527,8 @@ where
                         capture,
                         tcp_config,
                         concurrency,
+                        admission,
+                        files_source,
                         args.bind_ip.as_deref(),
                         cert_key.as_ref(),
                         dest_cert_fingerprint,
@@ -540,6 +577,7 @@ where
             server_name,
             preserve,
             source_cert_fingerprint,
+            dry_run,
         } => {
             // destination doesn't use filter (filtering happens at source).
             // empty directory cleanup decisions are communicated per-directory
@@ -556,10 +594,12 @@ where
                         &source_data_addr,
                         &server_name,
                         &settings,
+                        dry_run,
                         args.overwrite_manifest_max_entries,
                         &preserve,
                         tcp_config,
                         concurrency,
+                        admission,
                         cert_key.as_ref(),
                         source_cert_fingerprint,
                     )
@@ -648,6 +688,7 @@ async fn async_main(
     tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
     files_in_flight: common::ResolvedFilesInFlight,
     concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
 ) -> anyhow::Result<String> {
     // install rustls crypto provider (ring) before any TLS operations
     if !args.no_encryption {
@@ -780,6 +821,8 @@ async fn async_main(
         args.clone(),
         &tcp_config,
         concurrency,
+        admission,
+        files_in_flight.source(),
         master_send_stream,
         master_recv_stream,
         cert_key.clone(),
@@ -875,7 +918,15 @@ fn main() -> Result<(), anyhow::Error> {
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {
         let args = args.clone();
-        || async_main(args, tracing_receiver, files_in_flight, concurrency)
+        |admission| {
+            async_main(
+                args,
+                tracing_receiver,
+                files_in_flight,
+                concurrency,
+                admission,
+            )
+        }
     };
     let debug_log_file = args.debug_log_prefix.as_ref().map(|prefix| {
         let filename = common::generate_debug_log_filename(prefix);
@@ -886,9 +937,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut output = args.common.output_config(args.quiet, false);
     output.startup_error_prefix = Some(remote::RCPD_STARTUP_ERROR_PREFIX);
     let runtime = args.common.runtime_config();
-    let throttle = args
-        .common
-        .throttle_config(files_in_flight, args.chunk_size);
+    let throttle = args.throttle_config(files_in_flight, concurrency);
     let tracing = common::TracingConfig {
         remote_layer: Some(tracing_layer),
         debug_log_file,
@@ -1035,6 +1084,69 @@ mod tests {
         let mut argv = vec!["rcpd", "--role=source"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn preview_startup_avoids_reserving_copy_streams_on_both_roles() {
+        for role in ["--role=source", "--role=destination"] {
+            for preview in [false, true] {
+                let mut argv = vec![
+                    "rcpd",
+                    role,
+                    "--max-files-in-flight=200",
+                    "--max-connections=100",
+                ];
+                if preview {
+                    argv.push("--preview-only");
+                }
+                let args = Args::try_parse_from(argv).unwrap();
+                let files = args.resolve_files_in_flight();
+                let concurrency = args.resolve_remote_concurrency(files).unwrap();
+                let throttle = args.throttle_config(files, concurrency);
+                assert_eq!(
+                    throttle.admission_policy,
+                    if preview {
+                        common::AdmissionPolicy::Local
+                    } else {
+                        common::AdmissionPolicy::Remote {
+                            streams: std::num::NonZeroUsize::new(100).unwrap(),
+                            pending: std::num::NonZeroUsize::new(400).unwrap(),
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hello_preview_mode_must_match_startup_admission() {
+        for preview in [false, true] {
+            let args = daemon_args(if preview { &["--preview-only"] } else { &[] });
+            for dry_run in [false, true] {
+                let source = remote::protocol::MasterHello::Source {
+                    src: "/source".into(),
+                    dst: "/destination".into(),
+                    dest_cert_fingerprint: None,
+                    filter: None,
+                    dry_run: dry_run.then_some(common::DryRunMode::Brief),
+                    capture: Default::default(),
+                };
+                let destination = remote::protocol::MasterHello::Destination {
+                    source_control_addr: "127.0.0.1:10001".parse().unwrap(),
+                    source_data_addr: "127.0.0.1:10002".parse().unwrap(),
+                    server_name: "source".to_owned(),
+                    preserve: Default::default(),
+                    source_cert_fingerprint: None,
+                    dry_run,
+                };
+                for hello in [&source, &destination] {
+                    assert_eq!(
+                        args.validate_preview_mode(hello).is_ok(),
+                        preview == dry_run
+                    );
+                }
+            }
+        }
     }
 
     #[test]

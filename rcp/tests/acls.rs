@@ -311,7 +311,9 @@ fn per_type_acl_applies_only_to_the_type_that_asked_for_it() {
 // A directory rcp creates has BOTH its ACLs stripped; a REUSED directory keeps its own access ACL
 // and has its default ACL removed for the copy's duration and restored at the end — it was already
 // there, and the flag is about what the copy writes, not about scrubbing the destination tree.
-// Either way nothing created beneath one can inherit.
+// during population, children cannot inherit the destination's default ACL. A preserved source
+// default ACL is installed at directory finalization; reused access ACL entries remain temporarily
+// masked by the owner-only mode.
 //
 // The two flags are orthogonal and deliberately do not imply each other; the tests below pin both
 // halves of that asymmetry, the last of them on syscall count.
