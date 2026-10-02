@@ -621,17 +621,19 @@ so the security-relevant invariants each live in exactly one place:
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
   parent/root open; remote source and destination have separate protocol-specific setup.
-- **Independent pools and recursive overwrite**: local runtime setup intersects the file-work
-  ceiling with the internal soft-`RLIMIT_NOFILE` descriptor ceiling independently for the OpenFile
-  and PendingMeta semaphores. If that query fails, only a finite user-supplied ceiling can recover;
-  it becomes the sole admission bound and produces a visible warning. Automatic admission and legacy
-  unlimited admission fail closed instead; a successful query returning a zero soft limit also fails
-  closed for every policy. The pools receive the same effective numerical ceiling, not one combined
-  total. Copy/link overwrite leaf work can retain OpenFile admission while recursively invoking rm,
-  which draws from PendingMeta. That OpenFile → PendingMeta call is the only direction between those
-  descriptor-admission pools; recursive directory handles and process-support descriptors remain
-  outside them. The static `--max-files-in-flight` ceiling therefore limits applicable file-like
-  work rather than every process descriptor or all possible concurrent activity.
+- **Independent pools and recursive overwrite**: startup attempts to raise soft `RLIMIT_NOFILE` to
+  its inherited hard limit, retaining the original soft limit and warning if the raise fails. Local
+  runtime setup intersects the file-work ceiling with the effective soft-`RLIMIT_NOFILE` descriptor
+  ceiling independently for the OpenFile and PendingMeta semaphores. If that query fails, only a
+  finite user-supplied ceiling can recover; it becomes the sole admission bound and produces a
+  visible warning. Automatic admission and legacy unlimited admission fail closed instead; an
+  effective zero soft limit also fails closed for every policy. The pools receive the same effective
+  numerical ceiling, not one combined total. Copy/link overwrite leaf work can retain OpenFile
+  admission while recursively invoking rm, which draws from PendingMeta. That OpenFile → PendingMeta
+  call is the only direction between those descriptor-admission pools; recursive directory handles
+  and process-support descriptors remain outside them. The static `--max-files-in-flight` ceiling
+  therefore limits applicable file-like work rather than every process descriptor or all possible
+  concurrent activity.
 - **Remote descriptor admission**: for normal copies, each daemon installs one joint leaf/directory
   plan before readiness, reserving capacity for leaf work, active directory scans, pending file
   parents, and a reserved subtree with one inline scan. Negotiated directory credits remain owned

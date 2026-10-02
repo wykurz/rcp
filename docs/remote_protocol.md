@@ -60,9 +60,10 @@ actual CPU-selected capacity before it announces readiness and before destinatio
 revision 10 covers directory discovery, pipelined directory lifetime admission, and preview-only
 daemon startup. It requires exact-version rcp/rcpd binaries.
 
-For normal copies, each daemon installs one joint leaf/directory resource plan before readiness
-(§7.8). Insufficient known descriptor headroom produces a typed `RCP_ERROR` startup refusal with the
-observed limit, stream count, and remedies; neither endpoint increases its inherited limit.
+Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
+and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
+before readiness. Insufficient known descriptor headroom produces a typed `RCP_ERROR` startup
+refusal with the effective limit, stream count, and remedies.
 
 For dry runs, the master passes hidden `--preview-only` to both roles. Before readiness, each daemon
 selects local leaf/metadata admission without reserving E data streams or N/R directory lifetimes.
@@ -1082,9 +1083,12 @@ come from the source regardless of mode.
 The source resolves `E = min(F, M)`, where F is the logical file ceiling and M is the connection
 ceiling, then `P = E × pending-writes-multiplier` with checked, nonzero arithmetic. For a normal
 copy, each daemon resolves one [`RemoteResources`](../common/src/runtime_setup.rs) plan before
-readiness, using its observed soft descriptor limit S. Runtime setup installs the plan's leaf
-capacity A once in each of the independent OpenFile and PendingMeta pools; directory negotiation
-consumes the same plan. Preview-only startup uses local admission instead (§1.2).
+readiness, using its effective soft descriptor limit S. Startup attempts to raise the soft limit to
+the inherited hard limit without changing the hard limit. A failed raise warns with the
+operating-system cause and preserves the original soft limit for admission. File-work concurrency
+remains independently bounded. Runtime setup installs the plan's leaf capacity A once in each of the
+independent OpenFile and PendingMeta pools; directory negotiation consumes the same plan.
+Preview-only startup uses local admission instead (§1.2).
 
 With known S, let T be the semaphore maximum. The calculation uses saturating subtraction and
 bounded arithmetic:
@@ -1104,9 +1108,10 @@ leaves at least two normal and two reserved lifetimes per leaf slot, with modele
 equally, with any odd remainder assigned to the reserve. Directory capacity is independent of the
 pending-file limit: one scanner can retain many ancestor directories. If B is below 12, startup
 fails before readiness with a typed `RCP_ERROR` naming S, E, the support reserve, and remedies:
-reduce connections/file concurrency or raise the limit inherited by rcpd in the affected host's SSH
-login/sshd session. Changing only the master's shell limit does not change remote daemon limits. The
-diagnostic gives the minimum limit and exact shortfall. Neither daemon adjusts its soft limit.
+reduce connections/file concurrency or configure a higher hard limit in the affected host's SSH
+login/sshd session. Changing only the master's shell limit does not change remote daemon limits. If
+raising the soft limit is denied, the startup warning identifies the operating-system cause. The
+diagnostic gives the minimum effective limit and exact shortfall.
 
 The source takes the smaller N and R supported by the two endpoints. It then sets its scan capacity
 `W = min(A, floor(N / 2))` and pending-work capacity `Q = min(P, N - W)`, using its own A and the
@@ -1117,8 +1122,8 @@ explicit file-work policy produce a notice; automatic reductions are visible at 
 
 Unknown descriptor headroom is accepted only with a finite user-supplied file limit. It uses
 `A = min(E, F, 4096)` and `N = R = min(2(P + E), T)`, with a notice and no descriptor-safety
-guarantee. Automatic or unlimited admission with a failed limit query, and any zero soft limit,
-remain startup errors.
+guarantee. Automatic or unlimited admission with a failed limit query, and any effective zero soft
+limit, remain startup errors.
 
 | Work                       | Bound and release point                                                               |
 | -------------------------- | ------------------------------------------------------------------------------------- |
@@ -1185,8 +1190,8 @@ or whole-tree memory ceiling.
 
 Recursive removal during `--overwrite` uses the shared removal walker when a destination directory
 must be replaced by a file or another entry type. Its directory descriptors are outside N/R lifetime
-admission. Concurrent removal of deep destination trees can therefore exhaust the descriptor limit
-even when copy discovery stays within its modeled bound.
+admission. Low hard limits or extreme destination trees can therefore exhaust descriptors during
+recursive removal even when copy discovery stays within its modeled bound.
 
 `--max-connections` defaults to 100 and `--pending-writes-multiplier` to 4. When
 `--max-files-in-flight` is omitted, the source chooses `max(available_parallelism(), 4)` and the

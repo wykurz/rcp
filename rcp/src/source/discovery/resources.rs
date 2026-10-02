@@ -6,7 +6,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "reserved directory depth exceeds the negotiated capacity of {capacity} held levels within one reserved subtree, not the total source path depth; reduce --max-connections or --max-files-in-flight, or raise the inherited soft file limit with ulimit -n on both endpoints, including the remote SSH environment"
+    "reserved directory depth exceeds the negotiated capacity of {capacity} held levels within one reserved subtree, not the total source path depth; reduce --max-connections or --max-files-in-flight, or configure a higher inherited hard file limit on both endpoints (ulimit -H -n / SSH session limits)"
 )]
 pub(super) struct ReservedDepthExhausted {
     capacity: usize,

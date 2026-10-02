@@ -1702,6 +1702,81 @@ fn test_remote_overwrite_directory_with_file() {
     assert_eq!(summary.bytes_copied, 12); // "file content"
 }
 
+/// Startup raises the soft limit before removal fans out, including inside a single file job.
+#[test]
+fn remote_overwrite_removes_branching_directories_with_a_low_inherited_soft_limit() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    // keep a fixed hard ceiling; only the daemon may raise this low soft limit
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nulimit -n 1024 || exit 1\nulimit -S -n 128 || exit 1\nexec {daemon} \"$@\"\n"
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for single_file in [false, true] {
+        let root = fixture
+            .path()
+            .join(if single_file { "single" } else { "multiple" });
+        std::fs::create_dir(&root).unwrap();
+        let generated = std::process::Command::new(assert_cmd::cargo::cargo_bin("filegen"))
+            .args([
+                root.to_str().unwrap(),
+                "40,1,1,1,1,1,1,1,1,1,1,1",
+                "1",
+                "8",
+                "--leaf-files",
+                "--bufsize=8",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let source = root.join("source");
+        let destination = root.join("filegen");
+        if single_file {
+            create_test_file(&source, "replacement", 0o600);
+        } else {
+            std::fs::create_dir(&source).unwrap();
+            for i in 0..40 {
+                create_test_file(&source.join(format!("dir{i}")), "replacement", 0o600);
+            }
+        }
+        let output = run_rcp_and_expect_success(&[
+            "--overwrite",
+            "--summary",
+            if single_file {
+                "--max-files-in-flight=1"
+            } else {
+                "--max-files-in-flight=20"
+            },
+            &format!("--rcpd-path={}", wrapper.display()),
+            &format!("localhost:{}", source.display()),
+            &format!("localhost:{}", destination.display()),
+        ]);
+        let summary = parse_summary_from_output(&output).unwrap();
+        assert_eq!(summary.files_copied, if single_file { 1 } else { 40 });
+        assert_eq!(summary.rm_summary.files_removed, 40);
+        assert_eq!(
+            summary.rm_summary.directories_removed,
+            if single_file { 481 } else { 480 }
+        );
+        if single_file {
+            assert_eq!(std::fs::read(destination).unwrap(), b"replacement");
+        } else {
+            for i in 0..40 {
+                assert_eq!(
+                    std::fs::read(destination.join(format!("dir{i}"))).unwrap(),
+                    b"replacement"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn test_remote_overwrite_symlink_with_symlink_same_target() {
     require_local_ssh();
@@ -7118,7 +7193,7 @@ fn remote_many_small_directories_fit_the_destination_descriptor_limit() {
     let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
     std::fs::write(
         &wrapper,
-        format!("#!/bin/sh\nulimit -S -n 1024 || exit 1\nexec {daemon} \"$@\"\n"),
+        format!("#!/bin/sh\nulimit -n 1024 || exit 1\nexec {daemon} \"$@\"\n"),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -7167,13 +7242,13 @@ fn remote_many_small_directories_fit_the_destination_descriptor_limit() {
     }
 }
 
-/// Parallel directory traversal fits a normal SSH soft limit even with large pending capacity.
+/// Parallel directory traversal fits a low hard descriptor limit even with large pending capacity.
 #[tokio::test]
-async fn remote_parallel_directories_preserve_every_subtree_under_a_low_soft_limit() {
+async fn remote_parallel_directories_preserve_every_subtree_under_a_low_hard_limit() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
         std::sync::LazyLock::new(common::progress::Progress::new);
-    for (branches, depth, file_limit, streams, multiplier, soft_limit) in [
+    for (branches, depth, file_limit, streams, multiplier, descriptor_limit) in [
         (64, 13, "64", "64", "16", 1024),
         (20, 80, "20", "20", "4", 1024),
         (1, 60, "200", "100", "4", 1024),
@@ -7204,7 +7279,7 @@ async fn remote_parallel_directories_preserve_every_subtree_under_a_low_soft_lim
         let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
         std::fs::write(
             &wrapper,
-            format!("#!/bin/sh\nulimit -S -n {soft_limit} || exit 1\nexec {daemon} \"$@\"\n"),
+            format!("#!/bin/sh\nulimit -n {descriptor_limit} || exit 1\nexec {daemon} \"$@\"\n"),
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -7257,7 +7332,7 @@ fn remote_low_descriptor_limit_supports_single_files_and_high_concurrency_previe
     let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
     std::fs::write(
         &wrapper,
-        format!("#!/bin/sh\nulimit -S -n 128 || exit 1\nexec {daemon} \"$@\"\n"),
+        format!("#!/bin/sh\nulimit -n 128 || exit 1\nexec {daemon} \"$@\"\n"),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -7301,7 +7376,7 @@ fn remote_insufficient_socket_headroom_is_reported_during_startup() {
         let destination = fixture.path().join(format!("destination-{role}"));
         let wrapper = fixture.path().join(format!("limited-{role}"));
         std::fs::write(&wrapper, format!(
-            "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = {role} ]; then\n  ulimit -S -n 64 || exit 1\nfi\nexec {daemon} \"$@\"\n"
+            "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = {role} ]; then\n  ulimit -n 64 || exit 1\nfi\nexec {daemon} \"$@\"\n"
         )).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = run_rcp_and_expect_failure(&[
@@ -7317,7 +7392,7 @@ fn remote_insufficient_socket_headroom_is_reported_during_startup() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(combined.contains("soft RLIMIT_NOFILE=64"), "{combined}");
-        assert!(combined.contains("ulimit -n"), "{combined}");
+        assert!(combined.contains("ulimit -H -n"), "{combined}");
         assert!(
             !combined.contains("Timed out waiting for destination"),
             "{combined}"
@@ -7439,7 +7514,7 @@ fn remote_rejected_directory_inside_reserve_preserves_healthy_siblings() {
     let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
     std::fs::write(
         &wrapper,
-        format!("#!/bin/sh\nulimit -S -n 96 || exit 1\nexec {daemon} \"$@\"\n"),
+        format!("#!/bin/sh\nulimit -n 96 || exit 1\nexec {daemon} \"$@\"\n"),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();

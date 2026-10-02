@@ -368,10 +368,12 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     explicit value remains controlled by the initiating `rcp`
   - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
     that the workload will achieve that much parallelism
-  - local runtime setup intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling for
-    each of two pools: OpenFile for fd-bearing leaf work and PendingMeta for spawned metadata work.
-    The pools receive the same effective numerical ceiling, but are not a combined total; recursive
-    directory, network socket, and process-support descriptors remain outside them
+  - startup attempts to raise soft `RLIMIT_NOFILE` to the inherited hard limit; file-work
+    concurrency remains independently bounded. Local runtime setup intersects that ceiling with its
+    effective soft-`RLIMIT_NOFILE` safety ceiling for each of two pools: OpenFile for fd-bearing
+    leaf work and PendingMeta for spawned metadata work. The pools receive the same effective
+    numerical ceiling, but are not a combined total; recursive directory, network socket, and
+    process-support descriptors remain outside them
   - for normal remote copies, daemons jointly budget leaf work and directory lifetimes before
     startup readiness, then negotiate scan and pending-work bounds that retain room for directory
     progress. Dry runs use local metadata admission without reserving data streams or directory
@@ -379,8 +381,8 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     [remote resource model](docs/remote_protocol.md#78-backpressure-and-task-ownership)
   - if querying `RLIMIT_NOFILE` fails, a finite value explicitly supplied through either flag
     remains usable as a logical ceiling and produces a visible warning. Automatic and unlimited
-    admission still fail because they have no independent descriptor-safety bound. A successful
-    query returning a zero soft limit fails closed for every policy
+    admission still fail because they have no independent descriptor-safety bound. An effective zero
+    soft limit fails closed for every policy
   - during one compatibility release, the hidden `--max-open-files=N` spelling remains accepted and
     warns. It conflicts with the new name; positive values map to the new ceiling, while legacy `0`
     maps to `--max-files-in-flight=unlimited`, removing only the user ceiling and leaving descriptor
@@ -761,28 +763,34 @@ The default is often insufficient for 10+ Gbps links.
 
 ### Open File Limits
 
-When copying large filesets with many concurrent operations, you may hit the open file limit:
+All tools, including the remote master and daemons, attempt to raise soft `RLIMIT_NOFILE` to the
+inherited hard limit before runtime and admission setup. The hard limit is unchanged. If the raise
+fails, startup warns with the operating-system cause and uses the original soft limit.
+
+Check both limits in the affected host's session:
 
 ```bash
-# Check current limit
-ulimit -n
+# Check soft limit and hard ceiling
+ulimit -Sn
+ulimit -Hn
 
-# Increase for current session
-ulimit -n 65536
-
-# Make permanent (add to /etc/security/limits.conf)
+# Example session policy (/etc/security/limits.conf, where applied)
 * soft nofile 65536
 * hard nofile 65536
 ```
 
-`rcp` queries the current session's **soft** limit without changing it. Local operations derive a
-descriptor safety ceiling from 80% of that limit, five modeled descriptor units, and a
-4096-operation cap; that ceiling is independently intersected with `--max-files-in-flight` for each
-file-work pool. Normal remote copies jointly budget leaf work, directory lifetimes, data
-connections, and support descriptors before readiness; dry runs retain local metadata admission. See
-the [remote resource model](docs/remote_protocol.md#78-backpressure-and-task-ownership). Raising the
-soft limit can raise safety headroom, but does not change the CPU-based default file-work ceiling.
-Neither setting is a literal count of every descriptor in the process.
+Remote `rcpd` inherits its hard limit from the SSH session. Configure that host's SSH/session policy
+if it is too low; changing only the initiating shell's limit does not change the remote limit.
+
+Local operations derive a descriptor safety ceiling from 80% of the effective soft limit, five
+modeled descriptor units, and a 4096-operation cap; that ceiling is independently intersected with
+`--max-files-in-flight` for each file-work pool. Normal remote copies jointly budget leaf work,
+directory lifetimes, data connections, and support descriptors before readiness; dry runs retain
+local metadata admission. See the
+[remote resource model](docs/remote_protocol.md#78-backpressure-and-task-ownership). A higher
+descriptor limit does not change the CPU-based default file-work ceiling. Recursive removal retains
+directory handles outside file-work admission, so low hard ceilings or extreme trees can still
+exhaust descriptors. Neither setting is a literal count of every descriptor in the process.
 
 ### Network Backlog (10+ Gbps)
 
@@ -883,7 +891,7 @@ ss -ti | grep retrans
 For optimal performance on high-speed networks:
 
 1. ☐ Increase `rmem_max`/`wmem_max` to 16+ MiB
-2. ☐ Increase `ulimit -n` if copying many files
+2. ☐ Check the hard descriptor limit on each host if copying many files
 3. ☐ Use `--network-profile=datacenter` for local/datacenter networks
 4. ☐ Use `--progress` to monitor throughput in real-time
 5. ☐ Check `-v` output to verify buffer sizes and connection setup
