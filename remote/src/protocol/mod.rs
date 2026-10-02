@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
+mod directory_limits;
+pub use directory_limits::{DirectoryClass, DirectoryLimits};
+
 /// Default cap on the number of pre-existing destination entries the destination will put in a
 /// directory's overwrite/ignore-existing manifest. Above this, the manifest is omitted and that
 /// directory falls back to transferring-and-draining files (see `docs/remote_protocol.md`). High
@@ -318,6 +321,8 @@ pub enum SourceMessage {
         is_root: bool,
         /// Whether to retain this directory if no children remain after filtering.
         keep_if_empty: bool,
+        /// Lifetime admission charged before Begin, independently of Ready.
+        admission: DirectoryClass,
     },
     /// Seal discovery with the number of admitted direct-child obligations.
     DirectoryEnd {
@@ -385,6 +390,11 @@ pub enum DestinationMessage {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
+    /// Return directory lifetime admission after all held descriptors and rollback owners close.
+    DirectoryReleased {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
     /// Signal destination has finished all operations.
     /// Initiates graceful shutdown via stream closure.
     DestinationDone,
@@ -402,6 +412,8 @@ pub enum RcpdFilesInFlight {
 pub struct RcpdConfig {
     pub verbose: u8,
     pub fail_early: bool,
+    /// Preview mode must be known before startup descriptor admission and match the role hello.
+    pub preview_only: bool,
     pub max_workers: usize,
     pub max_blocking_threads: usize,
     /// File-like work policy for this daemon's version-sensitive spawn contract.
@@ -491,6 +503,9 @@ impl RcpdConfig {
         }
         if self.fail_early {
             args.push("--fail-early".to_string());
+        }
+        if self.preview_only {
+            args.push("--preview-only".to_string());
         }
         match self.files_in_flight {
             RcpdFilesInFlight::Automatic => {}
@@ -769,6 +784,8 @@ pub enum MasterHello {
         preserve: common::preserve::Settings,
         /// Source's TLS certificate fingerprint (None if encryption disabled)
         source_cert_fingerprint: Option<CertFingerprint>,
+        /// Preview-only operation; the source does not accept data connections.
+        dry_run: bool,
     },
 }
 
@@ -1025,6 +1042,7 @@ mod tests {
         RcpdConfig {
             verbose: 0,
             fail_early: false,
+            preview_only: false,
             max_workers: 0,
             max_blocking_threads: 0,
             files_in_flight: RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Limited(
@@ -1065,6 +1083,14 @@ mod tests {
             master_cert_fingerprint: None,
             overwrite_manifest_max_entries: DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
         }
+    }
+
+    #[test]
+    fn to_args_propagates_preview_startup_policy() {
+        let mut config = minimal_rcpd_config();
+        assert!(!config.to_args().iter().any(|arg| arg == "--preview-only"));
+        config.preview_only = true;
+        assert!(config.to_args().iter().any(|arg| arg == "--preview-only"));
     }
 
     #[test]

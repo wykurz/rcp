@@ -181,6 +181,43 @@
 
 // Library for shared code between rcp and rcpd binaries
 pub mod destination;
-pub mod directory_tracker;
+mod directory_tracker;
 pub mod path;
+mod receiver_shutdown;
 pub mod source;
+
+#[cfg(test)]
+mod test_process {
+    const CHILD_TEST: &str = "RCP_ISOLATED_LIBRARY_TEST";
+    pub(super) fn run_in_child(test_name: &str) -> bool {
+        if std::env::var_os(CHILD_TEST).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+            return false;
+        }
+        let strict_before = common::safedir::strict_operand_resolution();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated test failed: {test_name}\n{stdout}\n{stderr}"
+        );
+        let sentinel = format!("isolated test completed: {test_name}");
+        assert!(
+            stdout.contains(&sentinel) || stderr.contains(&sentinel),
+            "isolated test did not reach its assertions: {test_name}\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            common::safedir::strict_operand_resolution(),
+            strict_before,
+            "isolated test changed its parent's strict operand policy"
+        );
+        true
+    }
+    pub(super) fn completed(test_name: &str) {
+        eprintln!("isolated test completed: {test_name}");
+    }
+}

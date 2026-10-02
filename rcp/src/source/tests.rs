@@ -53,6 +53,75 @@ fn settings(dereference: bool) -> common::copy::Settings {
     }
 }
 
+#[tokio::test]
+async fn dry_run_requires_destination_done() -> anyhow::Result<()> {
+    for acknowledge in [false, true] {
+        let source = tempfile::tempdir()?;
+        let destination = source.path().join("preview");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_config = remote::TcpConfig::default();
+        let (accepted, peer) = tokio::try_join!(
+            async {
+                remote::accept_tcp_control(&listener, &tcp_config)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            remote::connect_tcp_control(listener.local_addr()?, &tcp_config),
+        )?;
+        let settings = settings(false);
+        let source_operation = handle_dry_run_connection(
+            accepted.0,
+            &settings,
+            source.path(),
+            &destination,
+            common::config::DryRunMode::Brief,
+            None,
+            5,
+        );
+        let destination_operation = async {
+            let (mut send, mut receive) = remote::tls::connect_bounded(
+                None,
+                remote::tls::SERVER_NAME_SOURCE,
+                peer,
+                std::time::Duration::from_secs(5),
+                "dry-run test control",
+            )
+            .await?;
+            assert!(matches!(
+                receive
+                    .recv_object::<remote::protocol::SourceMessage>()
+                    .await?,
+                Some(remote::protocol::SourceMessage::DiscoveryComplete {
+                    has_root_item: false
+                })
+            ));
+            if acknowledge {
+                send.send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
+                    .await?;
+            }
+            send.close().await?;
+            anyhow::Ok(())
+        };
+        let (result, peer_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(source_operation, destination_operation)
+            })
+            .await?;
+        peer_result?;
+        if acknowledge {
+            result?;
+        } else {
+            let error = result.expect_err("control EOF cannot acknowledge a dry run");
+            assert!(
+                format!("{error:#}").contains("DestinationDone"),
+                "{error:#}"
+            );
+        }
+        assert!(!destination.exists());
+    }
+    Ok(())
+}
+
 fn pool(writer: remote::streams::BoxedWrite) -> Arc<AcceptingSendStreamPool> {
     let (send, receive) = async_channel::bounded(1);
     send.try_send(remote::streams::SendStream::new(writer))
@@ -326,6 +395,12 @@ async fn payload_failure_precedes_stream_drop(panic_on_write: bool) -> anyhow::R
         fatal,
         1,
         1,
+        common::EndpointAdmission::Disabled,
+        common::FilesInFlightSource::Automatic,
+        remote::protocol::DirectoryLimits {
+            normal: std::num::NonZeroUsize::new(2).unwrap(),
+            reserve: std::num::NonZeroUsize::MIN,
+        },
         Default::default(),
     );
     let peer = async move {

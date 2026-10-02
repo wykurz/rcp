@@ -55,32 +55,48 @@ struct Pending {
     _credit: tokio::sync::OwnedSemaphorePermit,
 }
 
+struct Lifetime {
+    src: PathBuf,
+    credit: Option<Arc<resources::DirectoryCredit>>,
+    ready: bool,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    pending: HashMap<PathBuf, Pending>,
+    lifetimes: HashMap<PathBuf, Lifetime>,
+}
+
 struct Registry {
-    pending: std::sync::Mutex<HashMap<PathBuf, Pending>>,
+    state: std::sync::Mutex<RegistryState>,
     credit: Arc<tokio::sync::Semaphore>,
 }
 
 impl Registry {
     fn new(capacity: usize) -> Self {
         Self {
-            pending: Default::default(),
+            state: Default::default(),
             credit: Arc::new(tokio::sync::Semaphore::new(capacity)),
         }
     }
-    async fn register(&self, pair: &SrcDst) -> anyhow::Result<Arc<Readiness>> {
+    async fn register(
+        &self,
+        pair: &SrcDst,
+        lifetime_credit: Arc<resources::DirectoryCredit>,
+    ) -> anyhow::Result<Arc<Readiness>> {
         let credit = common::timing_scope!("source.discovery.wait_credit")
             .measure(self.credit.clone().acquire_owned())
             .await?;
         let readiness = Arc::new(Readiness(
             tokio::sync::watch::channel(ReadyState::Pending).0,
         ));
-        let mut pending = self.pending.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         anyhow::ensure!(
-            !pending.contains_key(&pair.dst),
+            !state.lifetimes.contains_key(&pair.dst),
             "duplicate source directory Begin: {:?}",
             pair.dst
         );
-        pending.insert(
+        state.pending.insert(
             pair.dst.clone(),
             Pending {
                 src: pair.src.clone(),
@@ -89,11 +105,20 @@ impl Registry {
                 _credit: credit,
             },
         );
+        state.lifetimes.insert(
+            pair.dst.clone(),
+            Lifetime {
+                src: pair.src.clone(),
+                credit: Some(lifetime_credit),
+                ready: false,
+            },
+        );
         Ok(readiness)
     }
     fn manifest(&self, dst: &Path, entries: Vec<ExistingEntry>) -> anyhow::Result<()> {
-        let mut pending = self.pending.lock().unwrap();
-        let record = pending
+        let mut state = self.state.lock().unwrap();
+        let record = state
+            .pending
             .get_mut(dst)
             .with_context(|| format!("manifest without pending directory Begin: {dst:?}"))?;
         for entry in entries {
@@ -107,25 +132,57 @@ impl Registry {
         Ok(())
     }
     fn resolve(&self, src: &Path, dst: &Path, rejected: bool) -> anyhow::Result<()> {
-        let mut pending = self.pending.lock().unwrap();
-        let record = pending.get(dst).with_context(|| {
+        let mut state = self.state.lock().unwrap();
+        let record = state.pending.get(dst).with_context(|| {
             format!("unknown or duplicate directory acknowledgement: {src:?} -> {dst:?}")
         })?;
         anyhow::ensure!(
             record.src == src,
             "directory acknowledgement source mismatch: {src:?} -> {dst:?}"
         );
-        let record = pending.remove(dst).unwrap();
-        let state = if rejected {
+        let lifetime = state
+            .lifetimes
+            .get(dst)
+            .expect("pending Begin owns a lifetime record");
+        anyhow::ensure!(
+            rejected || lifetime.credit.is_some(),
+            "successful directory Ready after lifetime release: {src:?} -> {dst:?}"
+        );
+        let record = state.pending.remove(dst).unwrap();
+        record.readiness.0.send_replace(if rejected {
             ReadyState::Rejected
         } else {
             ReadyState::Ready(Arc::new(record.manifest))
-        };
-        record.readiness.0.send_replace(state);
+        });
+        let lifetime = state.lifetimes.get_mut(dst).unwrap();
+        lifetime.ready = true;
+        if lifetime.credit.is_none() {
+            state.lifetimes.remove(dst);
+        }
+        Ok(())
+    }
+    fn release(&self, src: &Path, dst: &Path) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let record = state.lifetimes.get_mut(dst).with_context(|| {
+            format!("unknown or duplicate directory release: {src:?} -> {dst:?}")
+        })?;
+        anyhow::ensure!(
+            record.src == src,
+            "directory release source mismatch: {src:?} -> {dst:?}"
+        );
+        anyhow::ensure!(
+            record.credit.is_some(),
+            "duplicate directory release: {src:?} -> {dst:?}"
+        );
+        drop(record.credit.take());
+        if record.ready {
+            state.lifetimes.remove(dst);
+        }
         Ok(())
     }
     fn is_empty(&self) -> bool {
-        self.pending.lock().unwrap().is_empty()
+        let state = self.state.lock().unwrap();
+        state.pending.is_empty() && state.lifetimes.is_empty()
     }
 }
 
@@ -189,6 +246,47 @@ impl Drop for Obligation {
                 self.path
             ));
         }
+    }
+}
+
+const UNCHANGED_GROUP_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct UnchangedGroup {
+    outcomes: Vec<(SourceMessage, Obligation)>,
+}
+
+impl UnchangedGroup {
+    fn push(&mut self, observation: &Observation, obligation: Obligation) {
+        self.outcomes.push((
+            SourceMessage::FileUnchanged {
+                src: observation.pair.src.clone(),
+                dst: observation.pair.dst.clone(),
+            },
+            obligation,
+        ));
+    }
+    // a named projection keeps the borrowed iterator's lifetime general across recursive futures
+    fn message((message, _): &(SourceMessage, Obligation)) -> &SourceMessage {
+        message
+    }
+    async fn flush(
+        &mut self,
+        control: &remote::streams::BoxedSharedSendStream,
+    ) -> anyhow::Result<()> {
+        if self.outcomes.is_empty() {
+            return Ok(());
+        }
+        control
+            .lock()
+            .await
+            .send_control_messages(self.outcomes.iter().map(Self::message))
+            .await?;
+        for (_, obligation) in &mut self.outcomes {
+            obligation.finish();
+        }
+        self.outcomes.clear();
+        Ok(())
     }
 }
 
@@ -322,8 +420,6 @@ struct FileJob {
     _permit: tokio::sync::OwnedSemaphorePermit,
     obligation: Option<Obligation>,
     is_root: bool,
-    // field order closes the parent before announcing completion, even for an unpolled job.
-    _completion: Option<tokio::sync::mpsc::UnboundedSender<std::convert::Infallible>>,
 }
 
 struct DiscoveryContext {
@@ -426,17 +522,29 @@ impl DiscoveryContext {
         metadata: Metadata,
         is_root: bool,
         keep_if_empty: bool,
+        admission: &resources::DirectoryAdmission,
     ) -> anyhow::Result<Arc<Readiness>> {
-        let readiness = self.registry.register(pair).await?;
+        let readiness = self.registry.register(pair, admission.credit()).await?;
         self.send(SourceMessage::DirectoryBegin {
             src: pair.src.clone(),
             dst: pair.dst.clone(),
             metadata,
             is_root,
             keep_if_empty,
+            admission: admission.class(),
         })
         .await?;
         Ok(readiness)
+    }
+    async fn tombstone(
+        &self,
+        pair: &SrcDst,
+        metadata: Metadata,
+        is_root: bool,
+        admission: &resources::DirectoryAdmission,
+    ) -> anyhow::Result<()> {
+        self.begin(pair, metadata, is_root, true, admission).await?;
+        self.end(pair, 0).await
     }
     async fn end(&self, pair: &SrcDst, count: usize) -> anyhow::Result<()> {
         self.send(SourceMessage::DirectoryEnd {
@@ -479,12 +587,15 @@ impl DiscoveryContext {
             }),
         )
     }
-    async fn send_unchanged(&self, observation: &Observation) -> anyhow::Result<()> {
+    fn log_unchanged(&self, observation: &Observation) {
         tracing::info!(
             "destination already has identical file, skipping transfer (manifest): {:?} -> {:?}",
             observation.pair.src,
             observation.pair.dst
         );
+    }
+    async fn send_unchanged(&self, observation: &Observation) -> anyhow::Result<()> {
+        self.log_unchanged(observation);
         self.send(SourceMessage::FileUnchanged {
             src: observation.pair.src.clone(),
             dst: observation.pair.dst.clone(),
@@ -498,7 +609,6 @@ impl DiscoveryContext {
         readiness: Option<Arc<Readiness>>,
         obligation: Obligation,
         is_root: bool,
-        completion: Option<tokio::sync::mpsc::UnboundedSender<std::convert::Infallible>>,
     ) -> anyhow::Result<()> {
         let ready = readiness.as_ref().map(|state| state.0.borrow().clone());
         if let Some(ReadyState::Ready(manifest)) = ready
@@ -523,7 +633,6 @@ impl DiscoveryContext {
                 _permit: permit,
                 obligation: Some(obligation),
                 is_root,
-                _completion: completion,
             })
             .await
             .map_err(|_| anyhow::anyhow!("file dispatcher closed"))
@@ -539,8 +648,7 @@ async fn file_job(
         .obligation
         .take()
         .expect("a queued file owns its obligation");
-    // borrowing the whole job makes the fd-owning await finish or drop before the job's final
-    // completion field. The struct's field order also covers destruction before first poll.
+    // the queued job retains its admitted parent through readiness and payload completion.
     obligated(obligation, async {
         let observation = &job.observation;
         if let Some(readiness) = &job.readiness {
@@ -589,6 +697,8 @@ async fn directory(
 ) -> anyhow::Result<()> {
     let mut children = tokio::task::JoinSet::new();
     let mut classifications = tokio::task::JoinSet::new();
+    // armed outcomes outlive the caught body so its original error or panic is published first
+    let mut unchanged = UnchangedGroup::default();
     supervise(
         &context.fatal,
         directory_body(
@@ -599,6 +709,7 @@ async fn directory(
             scan,
             &mut children,
             &mut classifications,
+            &mut unchanged,
         ),
     )
     .await
@@ -613,12 +724,23 @@ async fn directory_body(
     scan_credit: resources::Scan,
     children: &mut tokio::task::JoinSet<anyhow::Result<()>>,
     classifications: &mut tokio::task::JoinSet<anyhow::Result<Option<Observation>>>,
+    unchanged: &mut UnchangedGroup,
 ) -> anyhow::Result<()> {
     let scan = common::timing_scope!("source.directory.scan");
     let pair = observation.pair;
-    let mut admission = common::timing_scope!("source.directory.wait_resources")
+    let admission = common::timing_scope!("source.directory.wait_resources")
         .measure(context.directories.admit(scan_credit))
-        .await?;
+        .await
+        .with_context(|| format!("failed admitting source directory {:?}", pair.src));
+    let mut admission = match admission {
+        Ok(admission) => admission,
+        Err(error) if !is_root && error.is::<resources::ReservedDepthExhausted>() => {
+            context.failed_child(&pair, error).await?;
+            scan.finish();
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     #[cfg(test)]
     context
         .checkpoint(
@@ -627,12 +749,6 @@ async fn directory_body(
             usize::from(admission.sequential()),
         )
         .await?;
-    let (file_completion, mut completed_files) = if admission.sequential() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (Some(sender), Some(receiver))
-    } else {
-        (None, None)
-    };
     // opening is separate from metadata capture: only the former permits the legacy unreadable
     // root/-L tombstone with classification metadata and unknown ACLs
     let opened = match parent {
@@ -649,9 +765,8 @@ async fn directory_body(
             context
                 .recover_after(error, async {
                     context
-                        .begin(&pair, observation.metadata, is_root, true)
-                        .await?;
-                    context.end(&pair, 0).await
+                        .tombstone(&pair, observation.metadata, is_root, &admission)
+                        .await
                 })
                 .await?;
             scan.finish();
@@ -715,8 +830,9 @@ async fn directory_body(
         Err(error) => {
             context
                 .recover_after(error, async {
-                    context.begin(&pair, metadata, is_root, true).await?;
-                    context.end(&pair, 0).await
+                    context
+                        .tombstone(&pair, metadata, is_root, &admission)
+                        .await
                 })
                 .await?;
             scan.finish();
@@ -733,7 +849,7 @@ async fn directory_body(
             )
         });
     let readiness = context
-        .begin(&pair, metadata, is_root, keep_if_empty)
+        .begin(&pair, metadata, is_root, keep_if_empty, &admission)
         .await?;
     let mut count = 0usize;
     loop {
@@ -826,7 +942,22 @@ async fn directory_body(
                 result.map(Some)
             });
         }
-        while let Some(result) = classifications.join_next().await {
+        #[cfg(test)]
+        context
+            .checkpoint("drain", &pair.src, classifications.len())
+            .await?;
+        loop {
+            let result = match classifications.try_join_next() {
+                Some(result) => result,
+                None => {
+                    // never wait to fill a group: release ready outcomes before any blocking join
+                    unchanged.flush(&context.control).await?;
+                    let Some(result) = classifications.join_next().await else {
+                        break;
+                    };
+                    result
+                }
+            };
             let result = result?;
             if readiness.rejected() {
                 continue;
@@ -858,10 +989,27 @@ async fn directory_body(
                 }
                 continue;
             }
+            let immediate_unchanged = observation.kind == EntryKind::File
+                && match &*readiness.0.borrow() {
+                    ReadyState::Ready(manifest) => context.skip_unchanged(&observation, manifest),
+                    _ => false,
+                };
+            if !immediate_unchanged {
+                // file admission, structural sends and inline descent can all wait on peer work
+                unchanged.flush(&context.control).await?;
+            }
             count = count
                 .checked_add(1)
                 .context("source directory child count overflow")?;
             let obligation = Obligation::new(context.fatal.clone(), observation.pair.src.clone());
+            if immediate_unchanged {
+                unchanged.push(&observation, obligation);
+                context.log_unchanged(&observation);
+                if unchanged.outcomes.len() == UNCHANGED_GROUP_LIMIT {
+                    unchanged.flush(&context.control).await?;
+                }
+                continue;
+            }
             match observation.kind {
                 EntryKind::File => {
                     context
@@ -871,7 +1019,6 @@ async fn directory_body(
                             Some(readiness.clone()),
                             obligation,
                             false,
-                            file_completion.clone(),
                         )
                         .await?
                 }
@@ -931,11 +1078,8 @@ async fn directory_body(
     drop(opened);
     context.end(&pair, count).await?;
     scan.finish();
-    drop(file_completion);
-    if let Some(receiver) = completed_files.as_mut() {
-        // this channel has no values: closure follows destruction of direct file fd captures.
-        let _ = receiver.recv().await;
-    }
+    // lifetime credit stays with the registry and descriptor aliases after structural End.
+    // a later reserved admission waits only if those ended siblings consume all spare credit.
     drop(admission);
     while let Some(result) = children.join_next().await {
         result??;
@@ -983,7 +1127,7 @@ async fn discover(context: Arc<DiscoveryContext>, root: SrcDst) -> anyhow::Resul
                 let obligation =
                     Obligation::new(context.fatal.clone(), observation.pair.src.clone());
                 context
-                    .submit_file(observation, parent, None, obligation, true, None)
+                    .submit_file(observation, parent, None, obligation, true)
                     .await?;
             }
             EntryKind::Symlink => {
@@ -1040,13 +1184,30 @@ pub(super) async fn run(
     fatal: Arc<Fatal>,
     branches: usize,
     pending: usize,
+    admission: common::EndpointAdmission,
+    files_source: common::FilesInFlightSource,
+    receiver_limits: remote::protocol::DirectoryLimits,
     errors: Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
+    let (directories, branches, pending) = resources::DirectoryBudget::for_endpoint(
+        admission,
+        files_source,
+        branches,
+        pending,
+        receiver_limits,
+    )?;
     let (file_tx, mut file_rx) = tokio::sync::mpsc::channel(pending);
-    let directories = resources::DirectoryBudget::for_process(branches);
     #[cfg(test)]
-    let directories = tests::DIRECTORY_GROUPS
-        .try_with(|groups| resources::DirectoryBudget::new(*groups))
+    let directories = tests::DIRECTORY_LIMITS
+        .try_with(|limits| {
+            resources::DirectoryBudget::new(
+                limits.normal.get(),
+                limits
+                    .reserve
+                    .get()
+                    .min(directories.reserve.available_permits()),
+            )
+        })
         .unwrap_or(directories);
     let branches = Arc::new(tokio::sync::Semaphore::new(branches));
     #[cfg(test)]
@@ -1079,6 +1240,7 @@ pub(super) async fn run(
             context.branches.clone(),
             context.directories.normal.clone(),
             context.directories.reserve.clone(),
+            context.directories.lane.clone(),
             context.classifiers.clone(),
             context.files.clone(),
         ] {
@@ -1141,6 +1303,7 @@ pub(super) async fn run(
                         DestinationMessage::DirectoryManifestChunk { dst, entries } => context.registry.manifest(&dst, entries)?,
                         DestinationMessage::DirectoryReady { src, dst } => context.registry.resolve(&src, &dst, false)?,
                         DestinationMessage::DirectorySkipped { src, dst } => context.registry.resolve(&src, &dst, true)?,
+                        DestinationMessage::DirectoryReleased { src, dst } => context.registry.release(&src, &dst)?,
                         DestinationMessage::DestinationDone => {
                             anyhow::ensure!(context.discovery_sealed.load(std::sync::atomic::Ordering::Acquire), "DestinationDone before source discovery completed");
                             anyhow::ensure!(context.registry.is_empty(), "DestinationDone with unacknowledged directory Begins");
@@ -1185,8 +1348,15 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    tokio::task_local! { pub(super) static DIRECTORY_GROUPS: usize; }
+    tokio::task_local! { pub(super) static DIRECTORY_LIMITS: remote::protocol::DirectoryLimits; }
     tokio::task_local! { pub(super) static SCAN_CREDIT: Arc<tokio::sync::Semaphore>; }
+
+    fn normal_directory_limit(normal: usize) -> remote::protocol::DirectoryLimits {
+        remote::protocol::DirectoryLimits {
+            normal: std::num::NonZeroUsize::new(normal).unwrap(),
+            reserve: std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).unwrap(),
+        }
+    }
 
     fn submission_context(
         writer: remote::streams::BoxedWrite,
@@ -1204,7 +1374,7 @@ mod tests {
                 ))),
                 registry: Registry::new(1),
                 branches: Arc::new(tokio::sync::Semaphore::new(1)),
-                directories: resources::DirectoryBudget::new(1),
+                directories: resources::DirectoryBudget::new(1, 1),
                 classifiers: Arc::new(tokio::sync::Semaphore::new(1)),
                 files: Arc::new(tokio::sync::Semaphore::new(1)),
                 file_tx,
@@ -1246,7 +1416,10 @@ mod tests {
             src: "/source".into(),
             dst: "/destination".into(),
         };
-        let readiness = context.registry.register(&pair).await?;
+        let readiness = context
+            .registry
+            .register(&pair, directory_credit().await)
+            .await?;
         context.registry.manifest(
             &pair.dst,
             vec![ExistingEntry {
@@ -1306,7 +1479,6 @@ mod tests {
                 Some(readiness),
                 obligation,
                 false,
-                None,
             )
             .await?;
         let job = queued.recv().await.unwrap();
@@ -1366,7 +1538,6 @@ mod tests {
                 Some(readiness),
                 obligation,
                 false,
-                None,
             ),
         )
         .await
@@ -1395,7 +1566,6 @@ mod tests {
             Some(readiness),
             obligation,
             false,
-            None,
         );
         tokio::pin!(submission);
         assert!(futures::poll!(&mut submission).is_pending());
@@ -1439,7 +1609,6 @@ mod tests {
                 Some(readiness),
                 obligation,
                 false,
-                None,
             ),
         )
         .await
@@ -1465,8 +1634,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_descriptors_are_bounded_by_one_depth_path_under_pressure()
+    async fn pipelined_directory_descriptors_stay_within_admitted_ownership_bounds()
     -> anyhow::Result<()> {
+        const NORMAL: usize = 1;
+        const RESERVE: usize = 16;
+        const LEAF_CAPACITY: usize = 4;
         let temp = tempfile::tempdir()?;
         for branch in 0..16 {
             let mut path = temp.path().join(format!("branch-{branch}"));
@@ -1513,11 +1685,15 @@ mod tests {
                 })
             }
         });
-        let (source, send, recv, errors) = connection(temp.path(), false, 4, 4, Vec::new());
+        let (source, send, recv, errors) =
+            connection(temp.path(), false, LEAF_CAPACITY, LEAF_CAPACITY, Vec::new());
         let (source, peer) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            DIRECTORY_GROUPS.scope(
-                1,
+            DIRECTORY_LIMITS.scope(
+                remote::protocol::DirectoryLimits {
+                    normal: std::num::NonZeroUsize::new(NORMAL).unwrap(),
+                    reserve: std::num::NonZeroUsize::new(RESERVE).unwrap(),
+                },
                 HOOKS.scope(
                     hooks,
                     common::task_scope::scope_tasks(async {
@@ -1542,9 +1718,12 @@ mod tests {
             held >= 24,
             "the measurement must observe the live depth-12 path"
         );
+        // each directory owns at most a held Dir and cursor, with four transient fds per leaf.
+        // the trusted parent above this fixture is outside the measured subtree.
+        let bound = 2 * (NORMAL + RESERVE) + 4 * LEAF_CAPACITY;
         assert!(
-            held <= 64,
-            "walk retained {held} descriptors; one budgeted group and one depth-12 path fit in 64"
+            held <= bound,
+            "walk retained {held} descriptors; admission bounds ownership at {bound}"
         );
         Ok(())
     }
@@ -1608,7 +1787,7 @@ mod tests {
                     };
                     let (source, peer, frontier_progress) = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        SCAN_CREDIT.scope(branches.clone(), DIRECTORY_GROUPS.scope(scans + depth + 2,
+                        SCAN_CREDIT.scope(branches.clone(), DIRECTORY_LIMITS.scope(normal_directory_limit(scans + depth + 2),
                             HOOKS.scope(hooks.clone(), common::task_scope::scope_tasks(async {
                                 tokio::join!(source, acknowledge_directories(send, recv), frontier_progress)
                             })))),
@@ -1622,6 +1801,189 @@ mod tests {
         }
         Ok(())
     }
+    async fn directory_credit() -> Arc<resources::DirectoryCredit> {
+        let budget = resources::DirectoryBudget::new(1, 1);
+        let scans = Arc::new(tokio::sync::Semaphore::new(1));
+        budget
+            .admit(resources::Scan::Normal(
+                scans.acquire_owned().await.unwrap(),
+            ))
+            .await
+            .unwrap()
+            .credit()
+    }
+
+    #[tokio::test]
+    async fn reserved_depth_failure_settles_the_child_without_aborting_collect_errors()
+    -> anyhow::Result<()> {
+        for fail_early in [false, true] {
+            let (writer, reader) = tokio::io::duplex(4096);
+            let (mut context, _files) = submission_context(Box::new(writer));
+            Arc::get_mut(&mut context).unwrap().settings.fail_early = fail_early;
+            let scans = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut root = context
+                .directories
+                .admit(resources::Scan::Normal(scans.acquire_owned().await?))
+                .await?;
+            let mut reserved = context.directories.admit(root.descend()).await?;
+            let observation = Observation {
+                pair: SrcDst {
+                    src: "/source/deep".into(),
+                    dst: "/destination/deep".into(),
+                },
+                name: "deep".into(),
+                kind: EntryKind::Dir,
+                size: 0,
+                metadata: Metadata {
+                    mode: 0o40700,
+                    uid: 1000,
+                    gid: 1000,
+                    atime: 1,
+                    mtime: 2,
+                    atime_nsec: 0,
+                    mtime_nsec: 0,
+                    acls: remote::protocol::WireAcls::Unknown,
+                },
+                target: None,
+                included: true,
+            };
+            let result = directory(
+                context.clone(),
+                Parent::Path,
+                observation,
+                false,
+                reserved.descend(),
+            )
+            .await;
+            if fail_early {
+                result.expect_err("fail-early must stop on depth exhaustion");
+                let error = context
+                    .fatal
+                    .take()
+                    .expect("the original depth failure must be published");
+                assert!(error.is::<resources::ReservedDepthExhausted>(), "{error:#}");
+                assert!(context.fatal.cancel.is_cancelled());
+            } else {
+                result?;
+                assert!(!context.fatal.cancel.is_cancelled());
+                let error = context
+                    .errors
+                    .take_error()
+                    .expect("depth exhaustion must be collected");
+                assert!(error.is::<resources::ReservedDepthExhausted>(), "{error:#}");
+                assert!(format!("{error:#}").contains("/source/deep"));
+                let mut reader = remote::streams::RecvStream::new(
+                    Box::new(reader) as remote::streams::BoxedRead
+                );
+                let message = reader.recv_object::<SourceMessage>().await?.unwrap();
+                assert!(matches!(message, SourceMessage::FileSkipped { src, dst }
+                    if src == Path::new("/source/deep") && dst == Path::new("/destination/deep")));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reserved_tombstone_returns_before_release_while_retaining_lifetime_credit()
+    -> anyhow::Result<()> {
+        let (context, _) = submission_context(Box::new(tokio::io::sink()));
+        let scans = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut normal = context
+            .directories
+            .admit(resources::Scan::Normal(scans.acquire_owned().await?))
+            .await?;
+        let reserved = context.directories.admit(normal.descend()).await?;
+        let pair = SrcDst {
+            src: "source/failed-cursor".into(),
+            dst: "destination/failed-cursor".into(),
+        };
+        let metadata = Metadata {
+            mode: 0o40700,
+            uid: 1000,
+            gid: 1000,
+            atime: 1,
+            mtime: 2,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+            acls: remote::protocol::WireAcls::Unknown,
+        };
+        context
+            .tombstone(&pair, metadata, false, &reserved)
+            .now_or_never()
+            .expect("an ended tombstone must not wait for a receiver round trip")?;
+        drop(reserved);
+        assert_eq!(context.directories.reserve.available_permits(), 0);
+        context.registry.resolve(&pair.src, &pair.dst, false)?;
+        assert_eq!(
+            context.directories.reserve.available_permits(),
+            0,
+            "Ready returned lifetime credit"
+        );
+        context.registry.release(&pair.src, &pair.dst)?;
+        assert_eq!(context.directories.reserve.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_release_is_distinct_from_readiness_and_local_descriptor_ownership()
+    -> anyhow::Result<()> {
+        let budget = resources::DirectoryBudget::new(1, 1);
+        let scans = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission = budget
+            .admit(resources::Scan::Normal(scans.acquire_owned().await?))
+            .await?;
+        let alias = admission.credit();
+        let registry = Registry::new(1);
+        let pair = SrcDst {
+            src: "source".into(),
+            dst: "destination".into(),
+        };
+        registry.register(&pair, admission.credit()).await?;
+        drop(admission);
+        registry.resolve(&pair.src, &pair.dst, false)?;
+        assert_eq!(
+            registry.credit.available_permits(),
+            1,
+            "Ready must return only Begin P"
+        );
+        assert_eq!(budget.normal.available_permits(), 0);
+        assert!(
+            !registry.is_empty(),
+            "Ready removed the outstanding lifetime"
+        );
+        assert!(registry.release(Path::new("wrong"), &pair.dst).is_err());
+        registry.release(&pair.src, &pair.dst)?;
+        assert!(registry.is_empty());
+        assert!(registry.release(&pair.src, &pair.dst).is_err());
+        assert_eq!(
+            budget.normal.available_permits(),
+            0,
+            "receiver release discarded a local alias"
+        );
+        drop(alias);
+        assert_eq!(budget.normal.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_directory_release_can_precede_skipped_without_resolving_readiness()
+    -> anyhow::Result<()> {
+        let registry = Registry::new(1);
+        let pair = SrcDst {
+            src: "source".into(),
+            dst: "destination".into(),
+        };
+        let ready = registry.register(&pair, directory_credit().await).await?;
+        registry.release(&pair.src, &pair.dst)?;
+        assert!(matches!(*ready.0.borrow(), ReadyState::Pending));
+        assert!(registry.release(&pair.src, &pair.dst).is_err());
+        assert!(registry.resolve(&pair.src, &pair.dst, false).is_err());
+        registry.resolve(&pair.src, &pair.dst, true)?;
+        assert!(matches!(ready.wait().await, ReadyState::Rejected));
+        assert!(registry.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn acknowledgement_validates_both_paths_and_releases_credit_once() {
         let registry = Registry::new(1);
@@ -1629,7 +1991,10 @@ mod tests {
             src: "src".into(),
             dst: "dst".into(),
         };
-        let ready = registry.register(&pair).await.unwrap();
+        let ready = registry
+            .register(&pair, directory_credit().await)
+            .await
+            .unwrap();
         assert_eq!(registry.credit.available_permits(), 0);
         assert!(
             registry
@@ -1650,7 +2015,10 @@ mod tests {
             src: "src".into(),
             dst: "dst".into(),
         };
-        let ready = registry.register(&pair).await.unwrap();
+        let ready = registry
+            .register(&pair, directory_credit().await)
+            .await
+            .unwrap();
         registry.resolve(&pair.src, &pair.dst, true).unwrap();
         assert!(matches!(ready.wait().await, ReadyState::Rejected));
         assert!(registry.resolve(&pair.src, &pair.dst, true).is_err());
@@ -2034,6 +2402,20 @@ mod tests {
             Arc::new(Fatal::new(Default::default())),
             e,
             p,
+            common::EndpointAdmission::Remote(
+                common::RemoteResources::for_limits(
+                    std::num::NonZeroU64::new(1024),
+                    std::num::NonZeroUsize::new(e).unwrap(),
+                    std::num::NonZeroUsize::new(e).unwrap(),
+                    std::num::NonZeroUsize::new(p).unwrap(),
+                )
+                .unwrap(),
+            ),
+            common::FilesInFlightSource::Automatic,
+            remote::protocol::DirectoryLimits {
+                normal: std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).unwrap(),
+                reserve: std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).unwrap(),
+            },
             errors.clone(),
         );
         (
@@ -2043,11 +2425,109 @@ mod tests {
             errors,
         )
     }
+    struct PeerDirectory {
+        src: PathBuf,
+        ready: bool,
+        ended: bool,
+        children: usize,
+    }
+
+    #[derive(Default)]
+    struct PeerLifetimes(HashMap<PathBuf, PeerDirectory>);
+
+    impl PeerLifetimes {
+        fn begin(&mut self, src: &Path, dst: &Path) {
+            if let Some(parent) = dst.parent().and_then(|parent| self.0.get_mut(parent)) {
+                parent.children += 1;
+            }
+            assert!(
+                self.0
+                    .insert(
+                        dst.to_owned(),
+                        PeerDirectory {
+                            src: src.to_owned(),
+                            ready: false,
+                            ended: false,
+                            children: 0,
+                        }
+                    )
+                    .is_none()
+            );
+        }
+        fn ready(&mut self, dst: &Path) {
+            self.0.get_mut(dst).unwrap().ready = true;
+        }
+        fn end(&mut self, dst: &Path) {
+            self.0.get_mut(dst).unwrap().ended = true;
+        }
+        fn completed(&mut self) -> Vec<SrcDst> {
+            let mut completed = Vec::new();
+            while let Some(dst) = self.0.iter().find_map(|(dst, entry)| {
+                (entry.ready && entry.ended && entry.children == 0).then(|| dst.clone())
+            }) {
+                let record = self.0.remove(&dst).unwrap();
+                if let Some(parent) = dst.parent().and_then(|parent| self.0.get_mut(parent)) {
+                    parent.children -= 1;
+                }
+                completed.push(SrcDst {
+                    src: record.src,
+                    dst,
+                });
+            }
+            completed
+        }
+        async fn flush(
+            &mut self,
+            send: &mut remote::streams::BoxedSendStream,
+        ) -> anyhow::Result<()> {
+            for pair in self.completed() {
+                send.send_control_message(&DestinationMessage::DirectoryReleased {
+                    src: pair.src,
+                    dst: pair.dst,
+                })
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_peer_retains_ended_ancestors_until_begun_children_finish() -> anyhow::Result<()> {
+        let (writer, reader) = tokio::io::duplex(4096);
+        let mut send =
+            remote::streams::SendStream::new(Box::new(writer) as remote::streams::BoxedWrite);
+        let mut receive =
+            remote::streams::RecvStream::new(Box::new(reader) as remote::streams::BoxedRead);
+        let mut lifetimes = PeerLifetimes::default();
+        lifetimes.begin(Path::new("s"), Path::new("d"));
+        lifetimes.begin(Path::new("s/c"), Path::new("d/c"));
+        lifetimes.ready(Path::new("d"));
+        lifetimes.ready(Path::new("d/c"));
+        lifetimes.end(Path::new("d"));
+        lifetimes.flush(&mut send).await?;
+        assert_eq!(
+            lifetimes.0.len(),
+            2,
+            "parent End incorrectly returned its lifetime"
+        );
+        lifetimes.end(Path::new("d/c"));
+        lifetimes.flush(&mut send).await?;
+        assert!(
+            matches!(receive.recv_object::<DestinationMessage>().await?, Some(DestinationMessage::DirectoryReleased {dst, ..}) if dst == Path::new("d/c"))
+        );
+        assert!(
+            matches!(receive.recv_object::<DestinationMessage>().await?, Some(DestinationMessage::DirectoryReleased {dst, ..}) if dst == Path::new("d"))
+        );
+        assert!(lifetimes.0.is_empty());
+        Ok(())
+    }
+
     async fn acknowledge_directories(
         mut send: remote::streams::BoxedSendStream,
         mut recv: remote::streams::BoxedRecvStream,
     ) -> anyhow::Result<Vec<SourceMessage>> {
         let mut messages = Vec::new();
+        let mut lifetimes = PeerLifetimes::default();
         loop {
             let message = recv
                 .recv_object::<SourceMessage>()
@@ -2055,20 +2535,26 @@ mod tests {
                 .context("source closed before discovery complete")?;
             match &message {
                 SourceMessage::DirectoryBegin { src, dst, .. } => {
+                    lifetimes.begin(src, dst);
                     send.send_control_message(&DestinationMessage::DirectoryReady {
                         src: src.clone(),
                         dst: dst.clone(),
                     })
-                    .await?
+                    .await?;
+                    lifetimes.ready(dst);
                 }
+                SourceMessage::DirectoryEnd { dst, .. } => lifetimes.end(dst),
                 SourceMessage::DiscoveryComplete { .. } => {
                     messages.push(message);
+                    lifetimes.flush(&mut send).await?;
+                    assert!(lifetimes.0.is_empty());
                     send.send_control_message(&DestinationMessage::DestinationDone)
                         .await?;
                     return Ok(messages);
                 }
                 _ => {}
             }
+            lifetimes.flush(&mut send).await?;
             messages.push(message);
         }
     }
@@ -2250,8 +2736,8 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn sequential_reserve_drains_file_parents_before_scanning_another_sibling()
-    -> anyhow::Result<()> {
+    async fn reserved_siblings_scan_before_prior_payloads_and_releases_finish() -> anyhow::Result<()>
+    {
         for disconnect in [false, true] {
             let temp = tempfile::tempdir()?;
             for index in 0..8 {
@@ -2287,19 +2773,35 @@ mod tests {
             let (ended_tx, mut ended) = tokio::sync::mpsc::unbounded_channel();
             let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let peer = async {
+                let mut lifetimes = PeerLifetimes::default();
+                let mut ended_leaves = 0;
                 loop {
                     tokio::select! {
                         _ = close_rx.recv(), if disconnect => { send.close().await?; return anyhow::Ok(()); }
                         message = recv.recv_object::<SourceMessage>() => {
                             match message?.context("source closed before discovery completed")? {
                                 SourceMessage::DirectoryBegin { src, dst, .. } => {
+                                    lifetimes.begin(&src, &dst);
+                                    lifetimes.ready(&dst);
                                     send.send_control_message(&DestinationMessage::DirectoryReady {src, dst}).await?;
                                 }
-                                SourceMessage::DirectoryEnd { src, .. }
-                                    if src.file_name().unwrap().as_encoded_bytes().starts_with(b"leaf-") => {
-                                    let _ = ended_tx.send(());
+                                SourceMessage::DirectoryEnd { src, dst, .. } => {
+                                    if src.file_name().unwrap().as_encoded_bytes().starts_with(b"leaf-") {
+                                        ended_leaves += 1;
+                                        let _ = ended_tx.send(());
+                                    }
+                                    lifetimes.end(&dst);
+                                    if ended_leaves == 8 {
+                                        lifetimes.flush(&mut send).await?;
+                                    }
                                 }
                                 SourceMessage::DiscoveryComplete { .. } => {
+                                    if disconnect {
+                                        close_rx.recv().await.context("disconnect was not requested")?;
+                                        send.close().await?;
+                                        return Ok(());
+                                    }
+                                    lifetimes.flush(&mut send).await?;
                                     send.send_control_message(&DestinationMessage::DestinationDone).await?;
                                     return Ok(());
                                 }
@@ -2313,12 +2815,14 @@ mod tests {
                 cursors.recv().await.context("first leaf never opened")?;
                 starts.recv().await.context("first payload never started")?;
                 ended.recv().await.context("first leaf never sealed")?;
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(100), cursors.recv())
-                        .await
-                        .is_err(),
-                    "a reserved sibling advanced while the previous file still pinned its parent"
-                );
+                for _ in 1..8 {
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_secs(1), cursors.recv())
+                            .await
+                            .is_ok_and(|cursor| cursor.is_some()),
+                        "reserved siblings must progress while prior file parents and receiver releases remain held"
+                    );
+                }
                 if disconnect {
                     close_tx.send(())?;
                 } else {
@@ -2328,8 +2832,8 @@ mod tests {
             };
             let (source, peer, observe) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                DIRECTORY_GROUPS.scope(
-                    1,
+                DIRECTORY_LIMITS.scope(
+                    normal_directory_limit(1),
                     HOOKS.scope(
                         hooks,
                         common::task_scope::scope_tasks(async {
@@ -2350,6 +2854,128 @@ mod tests {
                 assert!(!errors.has_errors());
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_disconnect_cancels_exhausted_reserve_sibling_wait() -> anyhow::Result<()> {
+        struct WaitSignal(tokio::sync::mpsc::UnboundedSender<()>);
+        impl tracing::Subscriber for WaitSignal {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target() == "rcp::timing"
+            }
+            fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+                if attributes.metadata().name() == "source.directory.wait_release" {
+                    let _ = self.0.send(());
+                }
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+        let temp = tempfile::tempdir()?;
+        let reserved = temp.path().join("reserved");
+        for leaf in ["first", "second"] {
+            std::fs::create_dir_all(reserved.join(leaf))?;
+        }
+        let (blocked, mut waiting) = tokio::sync::mpsc::unbounded_channel();
+        // this current-thread test keeps the subscriber installed while spawned discovery polls.
+        let _subscriber = tracing::subscriber::set_default(WaitSignal(blocked));
+        let hooks = Hooks::new(|_, _, _| Box::pin(async { Ok(()) }));
+        let (source, mut send, mut recv, errors) = connection(temp.path(), false, 1, 1, Vec::new());
+        let (ended_tx, mut ended) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let peer = async {
+            let mut leaf_begins = 0;
+            let mut leaf_ends = 0;
+            loop {
+                tokio::select! {
+                    _ = close_rx.recv() => {
+                        send.close().await?;
+                        return anyhow::Ok((leaf_begins, leaf_ends));
+                    }
+                    message = recv.recv_object::<SourceMessage>() => {
+                        match message?.context("source closed before the requested disconnect")? {
+                            SourceMessage::DirectoryBegin { src, dst, .. } => {
+                                if src.parent() == Some(reserved.as_path()) {
+                                    leaf_begins += 1;
+                                }
+                                send.send_control_message(&DestinationMessage::DirectoryReady { src, dst }).await?;
+                            }
+                            SourceMessage::DirectoryEnd { src, .. } => {
+                                anyhow::ensure!(src.parent() == Some(reserved.as_path()), "an ancestor ended before its blocked sibling");
+                                leaf_ends += 1;
+                                ended_tx.send(())?;
+                                // withhold release: this ended sibling owns the only spare reserve credit.
+                            }
+                            other => anyhow::bail!("unexpected message while reserve is exhausted: {other:?}"),
+                        }
+                    }
+                }
+            }
+        };
+        let disconnect = async {
+            ended
+                .recv()
+                .await
+                .context("first reserved leaf never ended")?;
+            waiting
+                .recv()
+                .await
+                .context("reserve sibling admission never waited")?;
+            close_tx.send(())?;
+            anyhow::Ok(())
+        };
+        let (source, peer, disconnected) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            DIRECTORY_LIMITS.scope(
+                remote::protocol::DirectoryLimits {
+                    normal: std::num::NonZeroUsize::MIN,
+                    reserve: std::num::NonZeroUsize::new(2).unwrap(),
+                },
+                HOOKS.scope(
+                    hooks.clone(),
+                    common::task_scope::scope_tasks(async {
+                        tokio::join!(source, peer, disconnect)
+                    }),
+                ),
+            ),
+        )
+        .await
+        .context("disconnect did not cancel exhausted reserve admission")?;
+        disconnected?;
+        assert_eq!(
+            peer?,
+            (1, 1),
+            "another leaf crossed exhausted reserve admission"
+        );
+        let error = source.expect_err("peer disconnect must fail the blocked source");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "destination closed control before DestinationDone",
+            "{error:#}"
+        );
+        assert!(!error.is::<resources::ReservedDepthExhausted>());
+        assert!(
+            !errors.has_errors(),
+            "sibling backpressure was recorded as a copy error"
+        );
+        assert_eq!(
+            hooks
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(event, path, _)| {
+                    event == "directory_admitted" && path.parent() == Some(reserved.as_path())
+                })
+                .count(),
+            1,
+            "a second reserved sibling was admitted before cancellation",
+        );
         Ok(())
     }
 
@@ -2487,6 +3113,12 @@ mod tests {
                         }
                         SourceMessage::FileUnchanged { .. } => {
                             unchanged = true;
+                            let pair = pair.as_ref().unwrap();
+                            send.send_control_message(&DestinationMessage::DirectoryReleased {
+                                src: pair.src.clone(),
+                                dst: pair.dst.clone(),
+                            })
+                            .await?;
                         }
                         SourceMessage::DiscoveryComplete { .. } => {
                             complete = true;
@@ -2720,6 +3352,7 @@ mod tests {
         let (source, mut send, mut recv, _) = connection(temp.path(), false, 2, 1, Vec::new());
         let peer = async {
             let mut rejected_ends = 0;
+            let mut lifetimes = PeerLifetimes::default();
             loop {
                 match recv
                     .recv_object::<SourceMessage>()
@@ -2727,6 +3360,8 @@ mod tests {
                     .context("source ended")?
                 {
                     SourceMessage::DirectoryBegin { src, dst, .. } => {
+                        lifetimes.begin(&src, &dst);
+                        lifetimes.ready(&dst);
                         let reject = src == temp.path().join("a");
                         if reject {
                             started.clone().acquire_owned().await.unwrap().forget();
@@ -2742,10 +3377,16 @@ mod tests {
                         send.send_control_message(&message).await?;
                     }
                     SourceMessage::DirectoryEnd {
-                        src, entry_count, ..
-                    } if src == temp.path().join("a") => {
-                        assert_eq!(entry_count, 0);
-                        rejected_ends += 1;
+                        src,
+                        dst,
+                        entry_count,
+                    } => {
+                        if src == temp.path().join("a") {
+                            assert_eq!(entry_count, 0);
+                            rejected_ends += 1;
+                        }
+                        lifetimes.end(&dst);
+                        lifetimes.flush(&mut send).await?;
                     }
                     SourceMessage::DiscoveryComplete { .. } => {
                         send.send_control_message(&DestinationMessage::DestinationDone)
@@ -2778,8 +3419,8 @@ mod tests {
             std::time::Duration::from_secs(5),
             // isolate classification admission: both sibling directories need independent
             // resource groups while the first classifier deliberately waits for the second Begin.
-            DIRECTORY_GROUPS.scope(
-                3,
+            DIRECTORY_LIMITS.scope(
+                normal_directory_limit(3),
                 HOOKS.scope(
                     hooks.clone(),
                     common::task_scope::scope_tasks(async { tokio::join!(source, peer, observe) }),
@@ -3135,6 +3776,12 @@ mod tests {
             Arc::new(Fatal::new(Default::default())),
             1,
             1,
+            common::EndpointAdmission::Disabled,
+            common::FilesInFlightSource::Automatic,
+            remote::protocol::DirectoryLimits {
+                normal: std::num::NonZeroUsize::new(2).unwrap(),
+                reserve: std::num::NonZeroUsize::MIN,
+            },
             Default::default(),
         );
         let error = tokio::time::timeout(
@@ -3201,6 +3848,7 @@ mod tests {
                     let mut begins = 0;
                     let mut unchanged = 0;
                     let mut discovered = false;
+                    let mut lifetimes = PeerLifetimes::default();
                     let delayed = |pair: (PathBuf, PathBuf)| async move {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         pair
@@ -3215,13 +3863,17 @@ mod tests {
                                         metadata: metadata[&src].clone(),
                                     }],
                                 }).await?;
-                                send.send_control_message(&DestinationMessage::DirectoryReady { src, dst }).await?;
+                                send.send_control_message(&DestinationMessage::DirectoryReady { src: src.clone(), dst: dst.clone() }).await?;
+                                lifetimes.ready(&dst);
+                                lifetimes.flush(&mut send).await?;
                             }
                             message = receive.recv_object::<SourceMessage>() => {
                                 match message?.context("source closed before all unchanged outcomes")? {
                                     SourceMessage::DirectoryBegin { src, dst, .. } => {
+                                        lifetimes.begin(&src, &dst);
                                         begins += 1;
                                         if !metadata.contains_key(&src) {
+                                            lifetimes.ready(&dst);
                                             send.send_control_message(&DestinationMessage::DirectoryReady { src, dst }).await?;
                                         } else if first_batch {
                                             // retain P distinct file parents before any Ready can
@@ -3236,7 +3888,10 @@ mod tests {
                                         }
                                     }
                                     SourceMessage::FileUnchanged { .. } => unchanged += 1,
-                                    SourceMessage::DirectoryEnd { .. } => {},
+                                    SourceMessage::DirectoryEnd { dst, .. } => {
+                                        lifetimes.end(&dst);
+                                        lifetimes.flush(&mut send).await?;
+                                    },
                                     SourceMessage::DiscoveryComplete { .. } => discovered = true,
                                     other => anyhow::bail!("unexpected source outcome: {other:?}"),
                                 }
@@ -3250,12 +3905,9 @@ mod tests {
                 };
                 let (source, peer) = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    DIRECTORY_GROUPS.scope(
-                        resources::directory_groups(1024, streams),
-                        HOOKS.scope(
-                            hooks,
-                            common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
-                        ),
+                    HOOKS.scope(
+                        hooks,
+                        common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
                     ),
                 )
                 .await
@@ -3267,4 +3919,5 @@ mod tests {
         }
         Ok(())
     }
+    mod coalescing_tests;
 }

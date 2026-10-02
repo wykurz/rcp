@@ -141,9 +141,9 @@ pub mod walk;
 pub mod walk_driver;
 
 pub use config::{
-    AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings, FilesInFlightSource,
-    MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, ResolvedFilesInFlight, RuntimeConfig,
-    ThrottleConfig, TracingConfig,
+    AdmissionPolicy, AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings,
+    FilesInFlightSource, MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, ResolvedFilesInFlight,
+    RuntimeConfig, ThrottleConfig, TracingConfig,
 };
 // Re-export `Side` from the congestion crate so downstream binaries
 // (rcp, rrm, …) and integration tests can pass `common::Side::Source` /
@@ -155,8 +155,8 @@ pub use progress::{RcpdProgressPrinter, SerializableProgress};
 // `runtime_setup` so downstream binaries keep reaching them as
 // `common::collect_runtime_stats`, etc.
 pub use runtime_setup::{
-    NOTICE_TARGET, collect_runtime_stats, generate_debug_log_filename, generate_trace_filename,
-    get_soft_open_file_limit,
+    EndpointAdmission, NOTICE_TARGET, RemoteResources, collect_runtime_stats,
+    generate_debug_log_filename, generate_trace_filename,
 };
 pub use settings_parse::{
     parse_compare_settings, parse_metadata_cmp_settings, parse_preserve_settings,
@@ -625,6 +625,9 @@ fn print_startup_configuration_error(
     );
 }
 
+/// Run an operation after startup, passing the endpoint admission installed for this runtime.
+///
+/// Setup failure reports its diagnostic without invoking the operation callback.
 #[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary, Error>(
     progress: Option<ProgressSettings>,
@@ -632,7 +635,7 @@ pub fn run<Fut, Summary, Error>(
     runtime_config: RuntimeConfig,
     throttle_config: ThrottleConfig,
     tracing_config: TracingConfig,
-    func: impl FnOnce() -> Fut,
+    func: impl FnOnce(EndpointAdmission) -> Fut,
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function should NOT print the error
 where
@@ -676,13 +679,14 @@ where
         tracing::warn!(target: NOTICE_TARGET, "{warning}");
     }
     let res = {
-        let runtime = match runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                print_startup_configuration_error(startup_error_prefix, &error);
-                return None;
-            }
-        };
+        let (runtime, admission) =
+            match runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    print_startup_configuration_error(startup_error_prefix, &error);
+                    return None;
+                }
+            };
         runtime_setup::spawn_throttle_replenishers(&runtime, &throttle_config, &trace_identifier);
         let res = {
             let _progress_tracker = progress.map(|settings| {
@@ -694,7 +698,7 @@ where
                 ProgressTracker::new(settings.progress_type, delay)
             });
             let scope = timing_scope!("operation");
-            let result = runtime.block_on(func());
+            let result = runtime.block_on(func(admission));
             scope.finish();
             result
         };

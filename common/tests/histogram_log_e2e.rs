@@ -27,6 +27,7 @@ fn auto_meta_histogram_log_records_real_probes() {
     let throttle = common::ThrottleConfig {
         files_in_flight: common::ResolvedFilesInFlight::automatic(),
         apply_files_in_flight: true,
+        admission_policy: common::AdmissionPolicy::Local,
         ops_throttle: 0,
         iops_throttle: 0,
         chunk_size: 0,
@@ -46,7 +47,7 @@ fn auto_meta_histogram_log_records_real_probes() {
             trace_identifier: "rcp".to_string(),
             ..Default::default()
         },
-        || async move {
+        |_admission| async move {
             // Fire stat probes by creating + statting files via the
             // probed walk API so the auto-meta sample sink receives samples.
             for i in 0..50 {

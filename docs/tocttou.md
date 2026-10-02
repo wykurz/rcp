@@ -621,7 +621,7 @@ so the security-relevant invariants each live in exactly one place:
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
   parent/root open; remote source and destination have separate protocol-specific setup.
-- **Independent pools and recursive overwrite**: the runtime normally intersects the file-work
+- **Independent pools and recursive overwrite**: local runtime setup intersects the file-work
   ceiling with the internal soft-`RLIMIT_NOFILE` descriptor ceiling independently for the OpenFile
   and PendingMeta semaphores. If that query fails, only a finite user-supplied ceiling can recover;
   it becomes the sole admission bound and produces a visible warning. Automatic admission and legacy
@@ -632,6 +632,14 @@ so the security-relevant invariants each live in exactly one place:
   descriptor-admission pools; recursive directory handles and process-support descriptors remain
   outside them. The static `--max-files-in-flight` ceiling therefore limits applicable file-like
   work rather than every process descriptor or all possible concurrent activity.
+- **Remote descriptor admission**: for normal copies, each daemon installs one joint leaf/directory
+  plan before readiness, reserving capacity for leaf work, active directory scans, pending file
+  parents, and a reserved subtree with one inline scan. Negotiated directory credits remain owned
+  through the last held descriptor or rollback guard. Preview-only startup uses local metadata
+  admission without remote stream/lifetime reservations. Unknown headroom with an explicit finite
+  limit provides only logical bounds. These resource limits preserve the same fd-relative action
+  guarantees; see [remote admission](remote_protocol.md#78-backpressure-and-task-ownership) for the
+  model and its residual limits.
 - **Trusted vs hardened boundary**: the symlink-following parent-prefix open returns a distinct
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be
@@ -680,15 +688,15 @@ terminal hint exclusions remain a producer-side fast path.
 The following are fully TOCTOU-hardened on Linux, against both leaf-entry and intermediate-directory
 symlink/path swaps:
 
-| Tool / path                          | Notes                                                                                |
-| ------------------------------------ | ------------------------------------------------------------------------------------ |
-| `rcp` local copy                     | Files, dirs, symlinks; overwrite uses contained name-slot semantics                  |
-| `rlink`                              | Hard-link walk incl. copy delegations; same overwrite name-slot semantics            |
-| `rchm`                               | Recursive chmod/chgrp/chown                                                          |
-| `rrm`                                | Recursive remove incl. read-only-dir relax; final empty-slot identity is not pinned  |
-| `--delete` pruning                   | fd-relative prune; by-name removal is contained but does not pin final-slot identity |
-| `rcp` remote copy — source side      | One held, fd-relative directory cursor; data files opened through pinned parents     |
-| `rcp` remote copy — destination side | Directory fd-map; overwrite has the same contained name-slot semantics as local copy |
+| Tool / path                          | Notes                                                                                       |
+| ------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `rcp` local copy                     | Files, dirs, symlinks; overwrite uses contained name-slot semantics                         |
+| `rlink`                              | Hard-link walk incl. copy delegations; same overwrite name-slot semantics                   |
+| `rchm`                               | Recursive chmod/chgrp/chown                                                                 |
+| `rrm`                                | Recursive remove incl. read-only-dir relax; final empty-slot identity is not pinned         |
+| `--delete` pruning                   | fd-relative prune; by-name removal is contained but does not pin final-slot identity        |
+| `rcp` remote copy — source side      | One held, fd-relative directory cursor; data files opened through pinned parents            |
+| `rcp` remote copy — destination side | Owned directory records; overwrite has the same contained name-slot semantics as local copy |
 
 Remote `--delete` is unsupported and is rejected by rcp before any operation begins.
 
@@ -1023,7 +1031,7 @@ caller-provided option string.
 | File data copy                                  | Hardened (Linux): `copy_file_range` or sparse-aware read/write between held source and destination fds                                                                                                                                                                                                                                                    |
 | `--delete` pruning                              | Hardened (Linux): fd-relative enumeration and removal                                                                                                                                                                                                                                                                                                     |
 | Remote copy (source side)                       | Hardened (Linux): one held cursor per directory and fd-relative data opens                                                                                                                                                                                                                                                                                |
-| Remote copy (destination side)                  | Hardened (Linux): directory tracker fd-map                                                                                                                                                                                                                                                                                                                |
+| Remote copy (destination side)                  | Hardened (Linux): typed directory records retain held fds and rollback ownership through finalization                                                                                                                                                                                                                                                     |
 | Remote `--delete`                               | Not supported (rejected before operation)                                                                                                                                                                                                                                                                                                                 |
 | `--dereference` / `-L`                          | **Not hardened** (follows symlinks by design)                                                                                                                                                                                                                                                                                                             |
 | Unsupported non-Linux builds                    | **Unsupported** (no compatibility or hardening guarantees)                                                                                                                                                                                                                                                                                                |

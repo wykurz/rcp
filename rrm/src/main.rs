@@ -219,7 +219,7 @@ fn main() -> Result<()> {
     let is_dry_run = dry_run_warnings.is_some();
     let func = {
         let args = args.clone();
-        || async_main(args)
+        |_admission| async_main(args)
     };
     let output = args
         .common

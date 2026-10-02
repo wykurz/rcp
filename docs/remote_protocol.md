@@ -56,9 +56,17 @@ The resolved `E` and pending capacity `P = E × pending-writes-multiplier` use c
 must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Explicit capacity can be
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
-actual CPU-selected capacity before it announces readiness and before destination spawn.
-`MasterHello` and file data-message schemas are unchanged. Wire revision 8 covers directory
-discovery messages and requires exact-version rcp/rcpd binaries.
+actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
+revision 10 covers directory discovery, pipelined directory lifetime admission, and preview-only
+daemon startup. It requires exact-version rcp/rcpd binaries.
+
+For normal copies, each daemon installs one joint leaf/directory resource plan before readiness
+(§7.8). Insufficient known descriptor headroom produces a typed `RCP_ERROR` startup refusal with the
+observed limit, stream count, and remedies; neither endpoint increases its inherited limit.
+
+For dry runs, the master passes hidden `--preview-only` to both roles. Before readiness, each daemon
+selects local leaf/metadata admission without reserving E data streams or N/R directory lifetimes.
+Both roles validate that `MasterHello` carries the same preview policy before dispatching work.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
@@ -194,8 +202,9 @@ application-data direction:
 6. Destination opens the source/destination bidirectional control connection. Directory and symlink
    messages flow source → destination; manifests, directory acknowledgements, and `DestinationDone`
    flow destination → source.
-7. Destination also opens the pooled data connections to source. File headers and bytes flow only
-   source → destination and never through master.
+7. For copy operations, destination also opens the pooled data connections to source. File headers
+   and bytes flow only source → destination and never through master. A dry run uses only control
+   connections and starts no destination data workers.
 
 By default every rcp TCP connection uses TLS 1.3 and certificate-fingerprint authentication. The
 `--no-encryption` option disables TLS and certificate authentication on every rcp TCP connection;
@@ -275,6 +284,7 @@ The source scopes have these boundaries in both the hardened and dereferencing w
 | `source.discovery`                                                          | Root resolution through `DiscoveryComplete` submission.                                                    |
 | `source.directory.scan`                                                     | Directory opening and metadata capture through Begin admission, enumeration, dispatch, and End submission. |
 | `source.directory.wait_ready`                                               | Waiting for `DirectoryReady` or rejection.                                                                 |
+| `source.directory.wait_release`                                             | Reserve admission waiting for ended siblings to release peer and local lifetime ownership.                 |
 | `source.directory.wait_resources`                                           | Waiting for a normal directory group or the sequential reserve.                                            |
 | `source.discovery.wait_credit`                                              | Waiting for unacknowledged Begin admission.                                                                |
 | `source.files.drain`                                                        | File-task and destination completion after discovery.                                                      |
@@ -288,17 +298,42 @@ creation, payload reads and writes, flushing, metadata, discarded payloads, and 
 respectively. Completion includes waiting for the tracker and any resulting directory finalization.
 A creation race can produce a second plan or create sample.
 
-`destination.control.wait_rate` measures rate admission for each received control message.
+The destination's coarse per-directory manifest scopes separate build admission, inventory, and
+publication. `destination.manifest.wait_build` measures acquiring the manifest-build semaphore.
+`destination.manifest.inventory` covers the cap check, capped enumeration, and child metadata
+lookups for a reused directory, including empty fallback results. `destination.manifest.flush`
+covers chunking, send-lock acquisition, all manifest chunks, and the Ready flush, including
+announcements with an empty manifest. It ends after releasing the send lock, before tracker
+bookkeeping or resulting directory finalization. The build permit spans announcement and any
+resulting inline finalization.
 
-`destination.tracker.wait` measures acquisition of the shared directory-tracker mutex, ending when
-the caller receives its guard. Recording that sample holds the acquired tracker guard while the
-timing collector aggregates it; detailed collection can therefore inflate other callers' waits.
-`destination.directory.finalize.metadata` measures applying final directory metadata;
-`destination.directory.finalize.prune` measures each attempt to remove an empty traversal-only
-directory. A failed removal, including a nonempty directory, finishes its prune scope and proceeds
-to metadata application. Prune counts are attempts, not counts of removed directories. Each
-finalization attempt has its own sample, including ancestors completed by a child. Finalization
-holds the tracker mutex, so its elapsed time can also contribute to other callers' tracker waits.
+`destination.directory.prepare` covers trusted root-parent resolution and directory creation or
+reuse, including lockdown and metadata admission. Nonroot parent dependencies and A admission occur
+outside this scope. It ends before tracker registration and Ready publication; directories rejected
+because an ancestor failed have no preparation sample. Independent preparations overlap, so their
+cumulative duration is not serial control-reader wall time. `destination.directory.wait_parent`
+measures secured-parent dependency waits (also for symlinks), `destination.directory.wait_prepare`
+measures A preparation admission, and `destination.directory.wait_job` measures control-reader
+backpressure at the P owned-job limit.
+
+`destination.directory.finalize.control`, `.announce`, and `.data` measure claimed finalization
+cascades triggered by control messages, Ready publication, and data-worker completion respectively.
+Each sample starts after the initial claim and includes filesystem finalization and ancestor
+bookkeeping. The control receiver sends release and Done messages outside these scopes. Calls
+without an eligible claim produce no sample; counts represent cascades, not directories. Scope
+creation and recording run outside the tracker mutex. Control-triggered finalization occupies the
+serial control reader. Preparation and announcement-triggered finalization run in owned directory
+jobs; rejection-triggered finalization uses the same `.announce` origin. Directory-job and
+data-triggered finalization can overlap other work.
+
+`destination.tracker.access` measures synchronous access to the shared directory-tracker state,
+including mutex acquisition and short bookkeeping. Its sample is recorded after unlocking, so timing
+aggregation never holds the tracker mutex. `destination.directory.finalize.metadata` measures
+applying final directory metadata; `destination.directory.finalize.prune` measures each attempt to
+remove an empty traversal-only directory. A failed removal, including a nonempty directory, finishes
+its prune scope and proceeds to metadata application. Prune counts are attempts, not counts of
+removed directories. Each finalization attempt has its own sample, including ancestors completed by
+a child. Finalization runs outside the tracker mutex in the caller that claimed it.
 
 Shared `source.metadata.<operation>.<phase>` and `destination.metadata.<operation>.<phase>` scopes
 separate rate admission, concurrency admission, and execution; the blocking helper also records
@@ -333,10 +368,14 @@ When branch admission is full, `source.directory.scan` also includes sequential 
       metadata the source must read beyond the `stat` it already does — currently POSIX ACLs. The
       first two are per-entry reads whose bytes are sent; `root_acl_notice` buys one read on the
       ROOT whose only product is a log line. See §2.5.
-  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`:
+  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint, dry_run }`:
     Tells destination where to connect (both control and data addresses). Note: empty directory
     cleanup decisions are communicated per-directory via `keep_if_empty` in `DirectoryBegin`
     messages rather than a global flag.
+    - `dry_run`: The master's explicit preview-only policy. Destination starts no data workers and
+      waits for `DiscoveryComplete(false)` over control, then sends `DestinationDone`. Source must
+      receive that acknowledgement; premature control EOF is a failure. The data connection timeout
+      does not limit dry-run traversal.
 
 **`SourceMasterHello`** (Source → Master, bidirectional stream)
 
@@ -352,12 +391,24 @@ When branch admission is full, `source.directory.scan` also includes sequential 
 
 ### 2.2 Source → Destination Messages (Control Stream)
 
-**`DirectoryBegin { src, dst, metadata, is_root, keep_if_empty }`** opens one directory discovery
-record. The source captures metadata and ACLs from the held directory before sending Begin, and
-flushes the parent's Begin before work that can send descendants. The destination creates or reuses
-the directory, stores its metadata and held fd, then announces readiness. `keep_if_empty` retains
-roots, direct filter matches, reused directories, and ordinary unfiltered empty directories; a new
-directory traversed only to find filter matches can be pruned if empty after completion.
+**`DirectoryBegin { src, dst, metadata, is_root, keep_if_empty, admission }`** opens one directory
+discovery record. `admission` is `Normal` or `Reserve`, charged against the corresponding negotiated
+directory lifetime capacity (§7.8). The source captures metadata and ACLs from the held directory
+before sending Begin, and flushes the parent's Begin before work that can send descendants. The
+destination validates lifetime admission and reserves the identity and root claim before filesystem
+work, then runs an owned directory job. Admission does not wait for descriptor capacity in the
+control reader: an over-capacity or invalid reserve Begin is a protocol error. At most P jobs remain
+owned, including finished jobs awaiting reaping, parent waits, announcements, and immediately
+eligible finalization. Each job waits for its parent's secured creation or rejection before
+acquiring one of the destination's A preparation slots (§7.8). Secured publication installs the held
+directory descriptor and reused-directory lockdown before waking children, independently of Ready.
+Preparation releases its slot before manifest building, replies, or finalization. Pending jobs
+retain early End and child outcomes and may commit after DiscoveryComplete. No job waits for a
+future End or child outcome to release P.
+
+`keep_if_empty` retains roots, direct filter matches, reused directories, and ordinary unfiltered
+empty directories; a new directory traversed only to find filter matches can be pruned if empty
+after completion.
 
 **`DirectoryEnd { src, dst, entry_count }`** seals that directory's discovery. `entry_count` is the
 checked number of admitted direct-child obligations, including children that later fail. It excludes
@@ -373,7 +424,9 @@ can send its data header after `DiscoveryComplete(true)`.
 **`Symlink { src, dst, target, metadata, is_root }`** reports a discovered symlink. A nonroot
 outcome completes one admitted parent entry. A root outcome completes root processing. Target-read
 failures occur before admission: nested failures are collected without increasing the parent count,
-while a root failure aborts.
+while a root failure aborts. The receiver handles one symlink inline, waiting for its already
+admitted parent's secured creation or rejection; independently driven directory jobs keep this
+bounded wait progress-safe without retaining a symlink queue.
 
 **`FileSkipped { src, dst }`** completes one admitted child whose type can no longer be asserted or
 whose file cannot be opened before a data header starts. This includes an admitted nested directory
@@ -383,28 +436,43 @@ have started, a send failure is fatal and cannot be compensated by a skip.
 **`FileUnchanged { src, dst }`** completes one admitted file whose destination manifest entry calls
 for a successful skip; the destination records `files_unchanged`. No data is sent.
 
-Control messages are serialized and promptly flushed. Sibling directory discovery, file streams, and
-control replies may interleave. The source admits each child and increments its parent's final count
-in one step, so each admitted entry has exactly one terminal obligation or causes a fatal session
-abort.
+Control messages are serialized and flushed at progress boundaries (§7.4). Sibling directory
+discovery, file streams, and control replies may interleave. The source admits each child and
+increments its parent's final count in one step, so each admitted entry has exactly one terminal
+obligation or causes a fatal session abort.
 
 ### 2.3 Destination → Source Messages (Control Stream)
+
+**`DirectoryLimits { normal, reserve }`** is the initial framed object on a normal copy's
+destination-to-source control stream, before any `DestinationMessage`. Both capacities are nonzero;
+the source also requires normal capacity of at least two, leaving room for a scan and a pending file
+parent. It intersects these capacities with its own endpoint limits before admitting directories.
+Dry runs omit this header and perform no directory lifetime admission.
 
 **`DirectoryManifestChunk { dst, entries }`** carries destination entries from a reused directory
 for unchanged-file comparison. Each chunk fits the 8 MiB framed-control limit. Chunks and the
 matching `DirectoryReady` are contiguous under one send-stream lock hold, so Ready means the source
 has the complete manifest. Different directories may announce in any order. Manifest building runs
 outside the control receive loop, with one build slot and the configured
-`--overwrite-manifest-max-entries` cap (default 5,000,000). Fresh directories, inactive comparison
-modes, and directories above the cap send no chunks. A failed announce task or caught unwind panic
-publishes a fatal error and cancels the pool promptly; it cannot leave a source waiting indefinitely
-for Ready. On source control EOF, outstanding manifest builds are aborted.
+`--overwrite-manifest-max-entries` cap (default 5,000,000). Within that builder, at most the
+destination leaf capacity A child lookups run concurrently. Each lookup acquires PendingMeta
+admission and classifies through a held child descriptor; only owned metadata enters the manifest.
+Started blocking lookups retain their admission until any abandoned descriptor output closes. Entry
+order can vary, and failed child lookups are omitted so the source transfers those entries. A zero
+cap, failed enumeration, or over-cap directory starts no child lookups. The build permit remains
+held through manifest/Ready publication and resulting inline finalization. Fresh directories,
+inactive comparison modes, and directories above the cap send no chunks. A failed announce task or
+caught unwind panic publishes a fatal error and cancels the receiver promptly; it cannot leave a
+source waiting indefinitely for Ready. Parent and capacity waits observe teardown. On source control
+EOF, outstanding directory jobs are aborted and joined if Done has not completed; EOF never drains
+pending creation into a successful transfer.
 
 **`DirectoryReady { src, dst }`** says the directory was created or reused and can receive file
 data. Its manifest chunks have already been flushed. File jobs wait for their own directory's Ready
 before comparison or data open. Directory and symlink discovery can proceed without parent Ready.
 The destination marks Ready flushed before considering that directory complete, even if End and all
-children have already arrived.
+children have already arrived. Ready returns the source's Q-bounded unacknowledged-Begin credit, not
+its directory lifetime credit.
 
 **`DirectorySkipped { src, dst }`** rejects a Begin whose creation failed, whose ancestor was
 rejected, or whose existing non-directory is retained by `--ignore-existing`. In a live session the
@@ -415,19 +483,34 @@ The destination records exact rejected Begins and failed ancestor prefixes. Each
 descendant Begin receives its own Skipped, and each rejected Begin still needs one End. Neither
 descendant outcomes nor End settle the ancestor a second time.
 
+**`DirectoryReleased { src, dst }`** returns the destination's share of a directory lifetime credit.
+For an accepted directory it follows logical finalization and closure of the last held directory
+descriptor or alias, including blocking operations and rollback guards. For a rejected directory it
+follows rejection and closure of any preparation or rollback descriptors; its End may still be
+outstanding. Skipped, like Ready, returns only the separate unacknowledged-Begin credit. The source
+reuses lifetime capacity only after both this release and its own last descriptor owner have
+released their shared credit. Unknown, mismatched, or duplicate releases are protocol errors. Fatal
+teardown may close control without sending outstanding releases. Local descriptor owners still
+retain their leases through closure; source admission gates close instead of waiting for those
+acknowledgements.
+
 **`DestinationDone`** is sent once after valid discovery completion, terminal root processing, and
-completion of every accepted directory. It triggers source shutdown; a fatal error cannot be
-replaced by Done.
+completion of every accepted directory, with every admitted Begin's Ready or Skipped flushed. The
+control receiver is its sole sender and first flushes every DirectoryReleased. Directory jobs and
+data workers notify logical completion but never send Done. The acknowledgement gate survives
+compaction of rejected-directory discovery history. Done triggers source shutdown; a fatal error
+cannot be replaced by Done.
 
 **Fatal connection and framing rules.** Before completion, clean data-header EOF and transport peer
 closure are fatal truncation, including TLS closure without `close_notify`; either is benign only
-after completion or once teardown is underway. Invalid or oversized header frames, decode errors,
-TLS protocol faults, and short file bodies are fatal. The destination reports incomplete transfer as
-failure even if no specific operation error was recorded, preserving a known connection failure when
-available. A fatal data-worker error promptly closes the destination control send side so a source
-waiting on Ready or admission wakes. TLS handshakes and data connection attempts retain configured
-deadlines and teardown cancellation. Errors are published before awaited cleanup; a failed stream
-close cannot mask the original send error.
+after logical completion or once teardown is underway. Final success additionally requires Done to
+have been sent and its stream closed successfully. Invalid or oversized header frames, decode
+errors, TLS protocol faults, and short file bodies are fatal. The destination reports incomplete
+transfer as failure even if no specific operation error was recorded, preserving a known connection
+failure when available. A fatal data-worker error promptly closes the destination control send side
+so a source waiting on Ready or admission wakes. TLS handshakes and data connection attempts retain
+configured deadlines and teardown cancellation. Errors are published before awaited cleanup; a
+failed stream close cannot mask the original send error.
 
 ### 2.4 File Transfer Messages (Data Connections)
 
@@ -551,7 +634,7 @@ strip every ACL instead of copying it. This is a wire-format change, not a spawn
 
 **Application (destination).** File ACLs are applied through the created file's own fd in
 `process_single_file`, directory ACLs through the directory's own held fd when it completes
-(`DirectoryTracker::complete_directory_single`). Both go through the shared appliers
+(`DirectoryFinalization::execute`). Both go through the shared appliers
 (`common::safedir::set_file_metadata_fd` / `set_reused_dir_metadata_fd`), so the remote path
 inherits the local one's ordering rule: an access ACL is the step that WIDENS the destination from
 its owner-only create mode, so it runs last and the `fchmod` before it is narrowed to carry only the
@@ -606,17 +689,19 @@ nonzero result.
 <details>
 <summary>Text transcript</summary>
 
-This trace has a root file `a` and a child-directory file `b`. Destination data connections are
-already available. Source opens the held root and sends `DirectoryBegin(root)`. If the destination
-reuses it, its manifest chunks precede `DirectoryReady(root)`. Source can scan the root while the
-response is in flight. It sends `DirectoryBegin(child)`, receives `DirectoryReady(child)`, then
-sends `File(a)` and `File(b)` on separate data streams as enumeration continues.
+This trace has a root file `a` and a child-directory file `b`. Destination has sent DirectoryLimits
+and data connections are already available. Source admits and opens the held root, then sends
+`DirectoryBegin(root, Normal)`. If the destination reuses it, its manifest chunks precede
+`DirectoryReady(root)`. Source can scan the root while the response is in flight. It sends
+`DirectoryBegin(child)`, receives `DirectoryReady(child)`, then sends `File(a)` and `File(b)` on
+separate data streams as enumeration continues.
 
 At each cursor's EOF the source sends `DirectoryEnd(child, count=1)` and
 `DirectoryEnd(root, count=2)`. It sends `DiscoveryComplete(true)` after the discovery workers join.
 File `b` can finish afterward; the destination then applies child metadata and completes one root
-entry. File `a` finishes, making the root's completed count 2/2; destination applies root metadata
-and sends `DestinationDone`. End seals a count, not a data stream.
+entry. File `a` finishes, making the root's completed count 2/2; destination applies root metadata.
+As their final descriptor owners close, the control receiver flushes DirectoryReleased for both
+directories before sending `DestinationDone`. End seals a count, not a data stream.
 
 </details>
 
@@ -627,8 +712,9 @@ and sends `DestinationDone`. End seals a count, not a data stream.
 A successful directory finalizes only after Ready and any manifest chunks have been flushed, End has
 sealed its direct-child count, and exactly that many children are terminal. The destination keeps
 its held directory fd and strict-mode lockdown/default-ACL guards through metadata application or
-pruning. Finalization then completes exactly one entry in its parent. A rejected Begin settles its
-parent once and still requires its own End.
+pruning. Finalization then completes exactly one entry in its parent. DirectoryReleased waits for
+the final descriptor owner, including any rollback work, to close. A rejected Begin settles its
+parent once and still requires its own End, independently of its lifetime release.
 
 ### 4.3 Single File Copy
 
@@ -671,41 +757,55 @@ already submitted `DirectoryBegin(bad/child)`. Destination rejects both with the
 rejection does not complete that ancestor again. Source stops new work under `bad`, drains started
 classifiers, and sends `DirectoryEnd(bad/child, count=0)` followed by `DirectoryEnd(bad, count=1)`.
 The sibling continues copying. After every Begin has its End, source sends
-`DiscoveryComplete(true)`. Destination waits for remaining admitted work, then sends
-`DestinationDone`. A fatal failure cancels the session and admission waiters rather than waiting for
-missing acknowledgments.
+`DiscoveryComplete(true)`. Destination waits for remaining admitted work and flushes all lifetime
+releases, then sends `DestinationDone`. A fatal failure cancels the session and admission waiters
+rather than waiting for missing acknowledgments.
 
 </details>
 
 ## 5. Directory Completion and Validation
 
-The destination tracks each accepted directory as Discovering or Sealed with a checked expected
-direct-child count, a checked completed-child count, its held fd and metadata, and a Ready-flushed
-gate. Each pending parent retains the names of its finalized direct-child directories to reject
-duplicate Begins; those names are released when that parent finalizes. Exact rejected Begins remain
-until discovery validation, and minimal failed-subtree prefixes classify late outcomes. Valid
+The destination keeps one typed record per accepted directory. A pending record advances through
+Preparing, Secured, and Announced; Secured and Announced own the held fd, metadata, creation
+outcome, and rollback guard together. Discovering or Sealed child counts remain independent of that
+phase. Finalization moves the complete resource bundle into its job and leaves a Finalizing identity
+in the tracker. Each pending parent retains the names of its finalized direct-child directories to
+reject duplicate Begins; those names are released when that parent finalizes. Exact rejected Begins
+remain until discovery validation, and minimal failed-subtree prefixes classify late outcomes. Valid
 `DiscoveryComplete` releases all structural history, retaining only failed prefixes needed by
-outstanding data work. Finished directories retain no fds or metadata.
+outstanding data work. Finished tracker records retain no fds or metadata; other descriptor owners
+keep their lifetime admission until they close.
 
-| Event                          | Effect                                                                                                        |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `DirectoryBegin`               | Register an accepted directory before handling descendants, or record an exact rejection and send Skipped.    |
-| `DirectoryReady` flushed       | Open the completion gate after any manifest chunks are on the wire.                                           |
-| `DirectoryEnd(count)`          | Seal discovery; reject a missing or duplicate Begin/End, overflow, or count below already completed children. |
-| File, skip, unchanged, symlink | Complete one admitted direct child, never exceeding a sealed count.                                           |
-| Child directory finalization   | Complete one parent child after its own metadata/pruning; rejection completes the parent once immediately.    |
-| `DiscoveryComplete`            | Validate that every accepted and exact rejected Begin has End; close structural admission.                    |
+| Event                          | Effect                                                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `DirectoryBegin`               | Admit the lifetime and reserve identity before asynchronous creation; children wait for secured parent creation or rejection. |
+| `DirectoryReady` flushed       | Open the completion gate after any manifest chunks are on the wire.                                                           |
+| `DirectoryReleased` flushed    | Return peer lifetime capacity after finalization or rejection and the last descriptor owner closes.                           |
+| `DirectoryEnd(count)`          | Seal discovery; reject a missing or duplicate Begin/End, overflow, or count below already completed children.                 |
+| File, skip, unchanged, symlink | Complete one admitted direct child, never exceeding a sealed count.                                                           |
+| Child directory finalization   | Complete one parent child after its own metadata/pruning; rejection completes the parent once immediately.                    |
+| `DiscoveryComplete`            | Validate that every accepted and exact rejected Begin has End; close structural admission.                                    |
 
 An accepted directory finalizes precisely when Ready is flushed, End has sealed it, and
 `completed == expected`. End, last-child, and Ready-flushed handlers all check this condition,
-including when they run in either order. The announce path releases the send lock before acquiring
-the tracker lock; paths holding both locks acquire the tracker before the send lock. Incomplete
-discovery on connection loss is fatal; no count or metadata is invented to turn it into success.
-Duplicate discovery markers and structural messages after DiscoveryComplete are protocol errors. The
-marker can precede a pending Ready or file completion. A false `has_root_item` is invalid after an
-observed root; a true value still permits the root file header to arrive later. Root admission is
-exclusive across entry kinds and streams: a duplicate root is rejected before its filesystem work
-begins. A directory claims its root slot before creation or reuse.
+including when they run in either order. A successful claim moves the directory into Finalizing,
+reserving its identity while an owned job retains its held own/parent descriptors, metadata, and
+complete lockdown guard. Only successful completion of that job advances its parent. Finalizing
+paths reject duplicate or late Begin, End, Ready, and child outcomes, including new children beneath
+a finalizing parent. DiscoveryComplete can validate the already sealed finalizers while they run.
+Cancellation or failure leaves the obligation incomplete and latches teardown; collect-errors
+metadata failures still commit after recording their cause. Finalization runs in the claiming
+caller.
+
+Tracker bookkeeping uses closure-confined synchronous state access. Filesystem work, control sends,
+and ACL recovery happen outside its mutex. The announce path releases the send lock before recording
+Ready-flushed. Incomplete discovery on connection loss is fatal; no count or metadata is invented to
+turn it into success. Duplicate discovery markers and structural messages after DiscoveryComplete
+are protocol errors. The marker can precede a pending Ready or file completion. A false
+`has_root_item` is invalid after an observed root; a true value still permits the root file header
+to arrive later. Root admission is exclusive across entry kinds and streams: a duplicate root is
+rejected before its filesystem work begins. A directory claims its root slot before creation or
+reuse.
 
 The destination retains each accepted directory's held fd, source metadata, and strict-mode
 lockdown/default-ACL guard until finalization. A new directory stays private until its final
@@ -720,9 +820,10 @@ roots, explicit matches, reused directories, and ordinary unfiltered empty direc
 Destination files are created at `0o600` through their pinned parent and receive final mode only
 after all bytes are written and flushed. The root is terminal after its own file, symlink, or
 directory outcome. `DestinationDone` is sent once only when discovery is valid, the root is
-terminal, and no accepted directory is pending. Structural validation detects count and ordering
-errors but still relies on version-matched peers to produce one terminal event per admitted entry;
-the wire protocol has no per-file IDs or retry guarantee.
+terminal, no accepted directory is pending or finalizing, and all lifetime releases have flushed.
+Structural validation detects count and ordering errors but still relies on version-matched peers to
+produce one terminal event per admitted entry; the wire protocol has no per-file IDs or retry
+guarantee.
 
 ## 6. Connection Lifecycle
 
@@ -735,28 +836,50 @@ Shutdown is initiated by the protocol message and completed through stream closu
 <details>
 <summary>Text transcript</summary>
 
-After valid discovery, root-item, and pending-directory completion, destination sends
-`DestinationDone` and closes its control send stream. `DestinationDone` triggers source shutdown;
-the source drains its admitted file tasks and preserves any genuine error they return. It stops and
-joins the control receiver, then scheduler teardown cancels the data pool and drops the control send
-stream. A fatal failure publishes the original cause, closes admission, and cancels the data pool
-before joining blocked senders.
+After valid discovery, root-item, pending-directory completion, and flushed lifetime releases, the
+destination control receiver sends `DestinationDone` and closes its control send stream.
+`DestinationDone` triggers source shutdown; the source drains its admitted file tasks and preserves
+any genuine error they return. It stops and joins the control receiver, then scheduler teardown
+cancels the data pool and drops the control send stream. A fatal failure publishes the original
+cause, closes admission, and cancels the data pool before joining blocked senders.
 
-EOF ends each current data-stream handler. The enclosing destination worker then loops back to
-`DataConnectionPool::connect`.
+EOF ends each current data-stream handler. Its worker exits when shared receiver cancellation or a
+failed reconnect stops `DataConnectionPool::connect`. Data-stream EOF and source control EOF have no
+guaranteed ordering at the destination.
 
-After source pool/listener shutdown, the next connection attempt fails. The worker then exits.
-Data-stream EOF and source control EOF have no guaranteed ordering at the destination.
-
-Two destination-side paths are valid. In the **data-completed path**, the data worker that processes
-the final file sends `DestinationDone`; the destination control receiver remains active and later
-observes source control EOF. In the **control-completed path** (for example, a single symlink or a
-failed-directory-only flow), the destination control receiver sends `DestinationDone` and exits
-without observing source control EOF. Thus source control EOF is not a universal destination-side
-application event, and there is no application-level `SourceDone` message or universal bidirectional
-EOF handshake.
+Data workers and directory jobs publish logical completion to the control receiver. The receiver
+services descriptor-release notifications while retaining the same pending framed read. After each
+successfully handled source frame, it sends up to 64 queued release frames with one final flush so
+ready control traffic cannot starve lifetime credits. A batch never waits for more releases;
+lifetime bookkeeping commits only after the flush succeeds. After that flush it returns to the
+receive-first selection before considering Done, preserving buffered framing/protocol error
+priority. It flushes all releases, sends Done, and exits without requiring source control EOF. There
+is no application-level `SourceDone` message or universal bidirectional EOF handshake.
 
 </details>
+
+The Done lifecycle distinguishes Open, Sending, Sent, and Failed. Only the control receiver claims
+Sending, after logical completion and all lifetime releases, with no teardown latched. A sticky
+completion notification wakes it when a worker finishes the final item. Sent commits while the
+writer is held, only after both the Done frame and control-stream close succeed. A send/close error
+returns its original cause once; failure or cancellation latches Failed before unlocking the writer.
+Cleanup never retries a potentially partial Done frame.
+
+Before returning, the control receiver always joins its owned directory jobs: it drains them after
+successful Done, or latches teardown and aborts and joins them on EOF, error, or caught panic. The
+daemon task scope owns cancellation of the receiver and its children. Final success requires both
+logical completion and Sent, which remain sticky through post-success cleanup. A genuine control
+framing or protocol failure takes precedence over previously collected recoverable errors;
+teardown-induced closure does not replace a known cause.
+
+One `ReceiverShutdown` handle serves the pool, tracker, and admission/finalization/Done claims.
+Dropping an armed claim cancels that handle, waking control, parent, capacity, and connection waits,
+including connection-permit acquisition and TLS setup. Cancellation and first-connect-error
+insertion share one mutex, so an error observed after cancellation cannot replace the initiating
+cause. A failing directory job publishes its error in the same poll before its next await;
+unconditional joining retains that cause even when shared cancellation concurrently aborts the job.
+Stream cleanup publishes cancellation before waiting for the writer and runs concurrently with the
+remaining receiver future. Successful Sent remains sticky through cleanup.
 
 ### 6.2 Connection Types and Ownership
 
@@ -766,7 +889,8 @@ EOF handshake.
 - **Lifetime**: Entire copy operation
 - **Usage**:
   - Source → Destination: directory discovery, symlinks, skips, and completion marker
-  - Destination → Source: manifests, Ready/Skipped responses, and done signal
+  - Destination → Source: initial limits, manifests, Ready/Skipped responses, lifetime releases, and
+    Done
 
 **Data Connections (Pooled TCP)**
 
@@ -827,13 +951,14 @@ its intentional symlink-following behavior. Dry-run performs one discovery for r
 Begin, End, or data jobs, and finishes with `DiscoveryComplete(false)`.
 
 If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
-directly without file-task admission. Other admitted files enter the bounded file queue. Their jobs
-wait for Ready and the complete manifest, then send `FileUnchanged` or acquire a data stream before
-OpenFile admission, opening the source data fd, and sending the file. The data fd is checked with
-`fstat` and supplies the wire header's size, mode, owner, timestamps, and file ACLs. Both read modes
-derive the header from the opened data fd; `-L` still opens by path and follows symlinks. In
-hardened mode, the by-name open can select a compatible replacement within the held parent;
-discovery metadata is a snapshot, not authority for bytes or permissions sent.
+without file-task admission, coalescing already-available outcomes as described in §7.4. Other
+admitted files enter the bounded file queue. Their jobs wait for Ready and the complete manifest,
+then send `FileUnchanged` or acquire a data stream before OpenFile admission, opening the source
+data fd, and sending the file. The data fd is checked with `fstat` and supplies the wire header's
+size, mode, owner, timestamps, and file ACLs. Both read modes derive the header from the opened data
+fd; `-L` still opens by path and follows symlinks. In hardened mode, the by-name open can select a
+compatible replacement within the held parent; discovery metadata is a snapshot, not authority for
+bytes or permissions sent.
 
 An admitted direct child increments its parent's End count in the same submission step. It
 contributes one terminal outcome: successful file or symlink work, an unchanged file, a pre-header
@@ -876,11 +1001,17 @@ fatal abort closes readiness and admission gates so no worker waits for absent r
 
 ### 7.4 Control Message Flushing
 
-The serialized control sender flushes each message promptly. A Begin credit is acquired before
-registry insertion and sending; it returns on the matching Ready or Skipped. The destination keeps
-manifest chunks and Ready contiguous under one send-stream lock hold. The send lock is released
-before taking the tracker lock. These boundaries let the control receiver keep making progress while
-file jobs wait for Ready or admission.
+The serialized control sender flushes structural messages promptly. Each directory can retain up to
+64 already-available immediate `FileUnchanged` outcomes and their obligation guards. It flushes
+before waiting for more classification results, file admission, structural sends, inline descent, or
+batch and directory completion; it never waits to fill a group. Frames remain individual, with the
+framed writer's existing backpressure bound, and guards complete only after the whole flush
+succeeds. Pending-manifest file jobs send individual outcomes. A Q-bounded Begin credit (§7.8) is
+acquired before registry insertion and sending; it returns on the matching Ready or Skipped. The
+separate directory lifetime credit remains held through DirectoryReleased and local descriptor
+closure. The destination keeps manifest chunks and Ready contiguous under one send-stream lock hold.
+That publication releases the send lock before recording Ready in the tracker. These boundaries let
+the control receiver keep making progress while file jobs wait for Ready or admission.
 
 ### 7.5 Data Connection Pooling
 
@@ -925,11 +1056,14 @@ receiving more files:
 | **Corrupted**    | Error during data transfer                            | Discard the stream and abort the session       |
 
 Recoverable file errors are collected while other files continue unless `--fail-early` is set. A
-failed drain corrupts the stream and aborts the session.
+failed drain corrupts the stream and aborts the session. Corruption or fail-early latches teardown
+before file-completion bookkeeping, preventing new pending-directory finalization or Done. A failed
+copy can therefore leave directories in their temporary restricted mode; held reused-directory
+rollback guards still restore their protected state. Cleanup preserves the original error.
 
-Directory metadata errors are handled analogously in `DirectoryTracker::complete_directory_single`:
-the error is logged, pushed to the `ErrorCollector`, and processing continues (unless
-`--fail-early`). The directory is still marked complete and parent notifications still propagate.
+Directory metadata errors are handled analogously in `DirectoryFinalization::execute`: the error is
+logged, pushed to the `ErrorCollector`, and processing continues (unless `--fail-early`). The
+directory is still marked complete and parent notifications still propagate.
 
 ### 7.7 Summary Statistics Authority
 
@@ -945,62 +1079,118 @@ come from the source regardless of mode.
 
 ### 7.8 Backpressure and Task Ownership
 
-The source resolves `E = min(F, M)`, where `F` is its logical file ceiling and `M` is the connection
-ceiling, then `P = E × pending-writes-multiplier` with checked, nonzero arithmetic. The same E and P
-bound the discovery scheduler:
+The source resolves `E = min(F, M)`, where F is the logical file ceiling and M is the connection
+ceiling, then `P = E × pending-writes-multiplier` with checked, nonzero arithmetic. For a normal
+copy, each daemon resolves one [`RemoteResources`](../common/src/runtime_setup.rs) plan before
+readiness, using its observed soft descriptor limit S. Runtime setup installs the plan's leaf
+capacity A once in each of the independent OpenFile and PendingMeta pools; directory negotiation
+consumes the same plan. Preview-only startup uses local admission instead (§1.2).
 
-| Work                       | Bound and release point                                                      |
-| -------------------------- | ---------------------------------------------------------------------------- |
-| Concurrent scans           | E; normal scans release their permit at EOF before joining descendants.      |
-| Concurrent classifications | P and endpoint PendingMeta admission; both release before descent.           |
-| Normal directory groups    | B; directory and cursor owners retain shared credits through aliases.        |
-| Sequential reserve         | One subtree; retains a scan permit and drains each directory's direct files. |
-| Unacknowledged Begins      | P; credits return on Ready or Skipped.                                       |
-| Pending file jobs          | P; includes waits for Ready, a stream, and completion.                       |
-| Cursor batch               | At most 64 names per directory frame.                                        |
-| File streams               | E; a stream is acquired before OpenFile admission and the data-fd open.      |
+With known S, let T be the semaphore maximum. The calculation uses saturating subtraction and
+bounded arithmetic:
 
-![Source directory resource admission](assets/protocol_directory_resources.svg)
+```text
+B = max(S - E - 32, 0)
+A = min(E, F, 4096, floor(B / 12))
+G = floor((B - 4A) / 2)
+N = min(floor(G / 2), T)
+R = min(G - N, T)
+```
 
-Normal directory admission reserves a group for its held directory and cursor before opening them.
-Shared credit lives with the descriptor owners, including aliases retained by file jobs and blocking
-operations. With inherited soft descriptor limit S, `B = max(1, (S/5 - E - 32)/2)`, using integer
-division and saturating subtraction, capped at the semaphore's representable capacity. This reserves
-headroom for data sockets, support fds, and the endpoint leaf-admission heuristic. B is independent
-of the pending-file limit P: file jobs can retain a directory credit while other directories are
-scanned. A failed query falls back to B=1 with a notice; the daemon does not raise its inherited
-limit.
+The four descriptor units per A cover concurrent leaf work across both independent pools and
+additional destination preparation work. Each directory lifetime budgets two descriptors. The plan
+leaves at least two normal and two reserved lifetimes per leaf slot, with modeled consumption
+`4A + 2(N + R) + E + 32 ≤ S`. Normal and reserve traversal share the available directory budget
+equally, with any odd remainder assigned to the reserve. Directory capacity is independent of the
+pending-file limit: one scanner can retain many ancestor directories. If B is below 12, startup
+fails before readiness with a typed `RCP_ERROR` naming S, E, the support reserve, and remedies:
+reduce connections/file concurrency or raise the limit inherited by rcpd in the affected host's SSH
+login/sshd session. Changing only the master's shell limit does not change remote daemon limits. The
+diagnostic gives the minimum limit and exact shortfall. Neither daemon adjusts its soft limit.
 
-When normal groups are exhausted, admission waits for a group or the single sequential reserve. The
-reserve owns one scan permit throughout its subtree, never forks or acquires another directory
-group, and drains each directory's direct file jobs before returning. It can therefore make progress
-while normal ancestors retain all groups. Source directory/cursor descriptors are bounded by
-`2B + 2D + O(1)`, where D is reserve depth; an exceptionally deep path can still exhaust the process
-limit. Normal inline descent moves the parent's scan permit into its child and reacquires one only
-after that child returns. EOF releases normal scanner resources before joining descendants.
+The source takes the smaller N and R supported by the two endpoints. It then sets its scan capacity
+`W = min(A, floor(N / 2))` and pending-work capacity `Q = min(P, N - W)`, using its own A and the
+negotiated N. This leaves normal lifetime capacity for both active scans and pending file parents.
+For S=1024, E=20, and P=80 at both endpoints, A=20, N=223, R=223, W=20, and Q=80. A lower-limit peer
+can reduce W and Q without changing the source-authoritative F/E/P handshake. Reductions of an
+explicit file-work policy produce a notice; automatic reductions are visible at info verbosity.
 
-The control receiver does not wait for a scan, file permit, or directory worker. Sequential descent
-uses a tracked child task that the parent immediately joins, keeping the Rust call stack bounded.
-Classified entries are polled independently; descent holds no classification or file permit needed
-by a suspended ancestor. Completed handles are reaped continuously. File jobs belong to the
-connection, so normal directory workers can End while payloads remain in flight. The daemon's task
-scope owns cancellation across stdin and master watchdog races; each spawned task also has
-abort-on-drop ownership. A fatal error closes admission and readiness, cancels the data pool before
-joining blocked senders, and preserves the primary cause. A started blocking syscall keeps its
-descriptor and admission lease until it exits; cancellation cannot interrupt the syscall.
+Unknown descriptor headroom is accepted only with a finite user-supplied file limit. It uses
+`A = min(E, F, 4096)` and `N = R = min(2(P + E), T)`, with a notice and no descriptor-safety
+guarantee. Automatic or unlimited admission with a failed limit query, and any zero soft limit,
+remain startup errors.
 
-The destination independently admits a file only after reading its header, before parent resolution,
-creation, and writes. Its OpenFile pool and descriptor-safety heuristic are local, not wire state.
-Destination directory fds scale with unfinished subtrees. Source cursor batches scale with active
-recursive frames. These bounds do not impose a fixed total process-fd or whole-tree memory ceiling.
+| Work                       | Bound and release point                                                               |
+| -------------------------- | ------------------------------------------------------------------------------------- |
+| Concurrent scans           | W; normal scans release at EOF, reserve scans when their inline subtree scan ends.    |
+| Concurrent classifications | Q and source PendingMeta admission A; both release before descent.                    |
+| Normal directory lifetimes | N; credit covers both endpoints until release and last local descriptor closure.      |
+| Reserved lifetimes         | R outstanding lifetimes in one subtree; one inline scan pipelines their completion.   |
+| Unacknowledged Begins      | Q; credits return on Ready or Skipped.                                                |
+| Pending file jobs          | Q; includes waits for Ready, a stream, and completion.                                |
+| Destination directory jobs | P; includes parent waits, preparation, replies, and eligible finalization.            |
+| Destination preparations   | Destination A; acquired after the parent dependency and released before announcement. |
+| Manifest child lookups     | Destination A and PendingMeta admission, within one directory builder.                |
+| Cursor batch               | At most 64 names per directory frame.                                                 |
+| File streams               | E; a stream is acquired before OpenFile admission A and the data-fd open.             |
 
-`--max-connections` defaults to 100. `--pending-writes-multiplier` defaults to 4.
-`--max-files-in-flight=N|unlimited` sets the logical source ceiling; when omitted, the source
-chooses `max(std::thread::available_parallelism(), 4)` and the destination adopts it. Explicit
-unlimited leaves `--max-connections` as the stream ceiling. Endpoint OpenFile and PendingMeta pools
-also apply the local soft `RLIMIT_NOFILE` safety heuristic (80% / five modeled units, capped at
-4096). A failed limit query permits a finite explicit user limit with a notice; automatic or
-unlimited admission fails closed. A zero soft limit fails closed for every policy.
+![Directory lifetime admission at both endpoints](assets/protocol_directory_resources.svg)
+
+Directory admission reserves credit before opening a held directory and its cursor. Every descriptor
+owner retains that credit, including file-job aliases, blocking operations, and receiver rollback
+guards. Ready returns only the separate Q-bounded Begin credit. The source retains lifetime credit
+until DirectoryReleased arrives and its own final descriptor owner closes; the destination emits
+that release only after finalization or rejection and its last descriptor owner closes.
+
+When normal credits are exhausted, admission waits for a normal credit or the single reserve lane.
+The lane owns one scan permit while scanning its subtree and never forks. Each directory acquires a
+lifetime credit, sends End after its inline descendants have been scanned, and returns without
+waiting for file completion or DirectoryReleased. Registry and descriptor aliases retain its credit.
+The scan permit returns when the subtree scan ends; outstanding credits retain only lane
+exclusivity. If R credits are occupied, admission waits for an ended sibling's credit to return. A
+continuation with R reserved ancestors instead reports depth exhaustion immediately: waiting on
+those ancestors would prevent the End messages needed to release them. Fatal shutdown closes the
+admission gates.
+
+R bounds reserved ancestry below the lane's entry point, not total path depth. Concurrent normal
+work affects where that entry occurs. Raising the affected daemon's inherited SSH-session limit
+increases available directory capacity. For a nested depth error, collect-errors mode records and
+skips that subtree while other work continues; `--fail-early` aborts. Normal inline descent moves
+the parent's scan permit into its child and reacquires one after that child returns. EOF releases
+normal scanner resources before joining descendants.
+
+Ready waits stay within Q: each file's parent Begin already owns directory lifetime admission, and
+destination preparation/announcement does not need a source file-job permit. The destination
+validates Normal/Reserve admission synchronously. It retains each lifetime until both its End and
+its flushed release, including a rejected directory released before its End. A Reserve Begin must
+have an active, unended reserved parent, or start a new lane when no reserved lifetime remains.
+Ended siblings may still own descriptors while the next sibling begins, within R. The receiver
+retains the lane root's identity until its last lifetime retires and rejects unrelated reserved
+subtrees or normal descendants within the reserved subtree.
+
+The source control receiver never waits for a scan, file permit, or directory worker. Sequential
+descent uses a tracked child task that the parent immediately joins, keeping the Rust call stack
+bounded. Classified entries are polled independently; descent holds no classification or file permit
+needed by a suspended ancestor. Completed handles are reaped continuously. File jobs belong to the
+connection, so directory workers can End while payloads remain in flight. Task scopes and
+abort-on-drop ownership cover stdin and master-watchdog cancellation. Fatal errors close admission,
+cancel readiness waiters and the data pool, and join blocked senders. Started blocking syscalls
+retain their descriptor and admission lease until they exit.
+
+The destination admits each file after reading its header, before parent resolution, creation, and
+writes. A is endpoint-local; N/R are exchanged on control. Directory and cursor descriptors have a
+modeled bound of `2(N + R) + O(1)` per endpoint. This startup model does not account for arbitrary
+inherited support fds or later external limit changes and does not impose a fixed total process-fd
+or whole-tree memory ceiling.
+
+Recursive removal during `--overwrite` uses the shared removal walker when a destination directory
+must be replaced by a file or another entry type. Its directory descriptors are outside N/R lifetime
+admission. Concurrent removal of deep destination trees can therefore exhaust the descriptor limit
+even when copy discovery stays within its modeled bound.
+
+`--max-connections` defaults to 100 and `--pending-writes-multiplier` to 4. When
+`--max-files-in-flight` is omitted, the source chooses `max(available_parallelism(), 4)` and the
+destination adopts it. Explicit unlimited leaves the connection ceiling in force.
 
 **Cancellation-lifetime residual:** admitted remote payload streaming uses `tokio::fs::File`. A
 private Tokio blocking read or write can retain the same regular-file fd after its high-level future
@@ -1046,8 +1236,8 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
   `N` sets a finite ceiling and `unlimited` removes the user ceiling. When omitted, the source
   resolves `max(std::thread::available_parallelism(), 4)` and the destination adopts it. Finite
   values also clamp effective data connections, while explicit or legacy unlimited input does not
-- `--pending-writes-multiplier=N` (default: 4) - Pending capacity is effective streams × this
-  multiplier, checked before pending file tasks are admitted
+- `--pending-writes-multiplier=N` (default: 4) - Configured pending capacity P is effective streams
+  × this multiplier; source admission reduces it to Q when directory headroom requires (§7.8)
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
 Old-version cleanup is idempotent, best-effort cache hygiene. Its deadline bounds the master's local
@@ -1059,10 +1249,9 @@ and configures the source. For automatic policy, the master validates the config
 upper bound before remote side effects; source readiness then supplies `F/E`, the source validates
 its actual product before readiness, and the master gives the destination the same values and
 rejects a mismatch in destination readiness. A directly launched daemon validates before announcing
-its listener. This configuration travels only in version-sensitive rcpd spawn arguments and
-readiness: no `MasterHello` or data-message field changed. Compatibility revision 4 protects this
-contract. Revision 5 protects the final daemon CLI contract: removal of its unreachable
-explicit-unlimited override and rejection of a zero remote-copy connection timeout.
+its listener. File concurrency travels in version-sensitive rcpd spawn arguments and readiness;
+directory lifetime limits use the separate initial control header (§2.3). A zero remote-copy
+connection timeout is rejected.
 
 ### 8.2 Network Profiles
 
@@ -1129,10 +1318,11 @@ either. An **idle** data connection is still caught by keepalive after idle + re
 Note also that on Linux `TCP_USER_TIMEOUT` overrides the keepalive probe count, so `TCP_KEEPCNT` is
 inert on control connections and is what actually ends a dead data connection.
 
-Control connections are not entirely backpressure-free: the destination's control dispatch loop
-takes one ops token per message, so a pathological `--ops-throttle` could in principle stall a
-control read toward the budget. That is one token against the data path's thousands per file — a
-known residual, not a claim of immunity.
+Control bookkeeping does not consume filesystem ops tokens. The control reader can still wait for
+parent creation, owned directory-job capacity, or inline directory finalization. Filesystem work
+behind those waits remains rate- and congestion-limited. If reads stall long enough to fill the
+receive buffer and close the window, pending source control writes can reach the user-timeout
+budget. Removing the per-message rate charge does not make control connections backpressure-free.
 
 The sub-values are derived from the single budget rather than configured individually, so their
 relationship stays correct by construction. `N = 0` disables both, leaving no-delay and buffer

@@ -37,6 +37,19 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
         Ok(())
     }
 
+    /// Sends individual control frames with a shared final flush.
+    pub async fn send_control_messages<'a, T: serde::Serialize + 'a>(
+        &mut self,
+        objects: impl IntoIterator<Item = &'a T>,
+    ) -> anyhow::Result<()> {
+        for object in objects {
+            let bytes = bitcode::serialize(object).map_err(anyhow::Error::from)?;
+            self.framed.feed(bytes::Bytes::from(bytes)).await?;
+        }
+        self.framed.flush().await?;
+        Ok(())
+    }
+
     /// Sends an object followed by data from a buffered reader.
     ///
     /// This method uses `copy_buf` which avoids internal buffer allocation by using
@@ -232,3 +245,6 @@ impl ControlConnection {
         &mut self.recv
     }
 }
+
+#[cfg(test)]
+mod coalescing_tests;

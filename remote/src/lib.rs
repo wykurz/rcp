@@ -3463,14 +3463,12 @@ impl std::fmt::Display for ConnectionKind {
 /// retransmission limit (~15 minutes), exactly as before this option existed — an idle data
 /// connection is still caught by keepalive after idle + retries × interval.
 ///
-/// Control connections are not backpressure-free in the strict sense — the destination's control
-/// dispatch loop takes a single ops token per message, and directory COMPLETIONS run their
-/// congestion-gated finalize syscalls (chown/chmod/ACL/utimens, chained bottom-up) on that same
-/// loop — so a pathological `--ops-throttle` or badly stalled destination storage can stop the
-/// reads. The budget only starts once the multi-megabyte receive buffer has filled and closed the
-/// window on top of that. Known residual, not a claim of immunity; if it ever bites, the
-/// structural fix is decoupling finalization from the receive loop, exactly as the manifest build
-/// already was.
+/// Control bookkeeping does not consume filesystem ops tokens, but the reader can still wait for
+/// parent creation, owned directory-job capacity, or inline finalization. The filesystem work
+/// behind those waits remains rate- and congestion-limited, so a low `--ops-throttle` or stalled
+/// storage can stop reads. Pending sender data can reach the user-timeout budget once the receive
+/// buffer fills and closes the window. Removing the per-message rate charge does not make control
+/// connections backpressure-free.
 ///
 /// The keepalive sub-values are derived from the single budget rather than exposed individually, so
 /// their relationship stays correct by construction: idle at half the budget, probes every twelfth
@@ -3561,6 +3559,7 @@ mod tests {
             protocol::RcpdConfig {
                 verbose: 0,
                 fail_early: false,
+                preview_only: false,
                 max_workers: 0,
                 max_blocking_threads: 0,
                 files_in_flight: protocol::RcpdFilesInFlight::Explicit(

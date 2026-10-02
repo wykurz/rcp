@@ -689,6 +689,7 @@ fn build_master_remote_request(
     let rcpd = remote::protocol::RcpdConfig {
         verbose: args.common.verbose,
         fail_early: args.fail_early,
+        preview_only: args.dry_run.is_some(),
         max_workers: args.common.max_workers,
         max_blocking_threads: args.common.max_blocking_threads,
         files_in_flight: remote::protocol::RcpdFilesInFlight::Automatic,
@@ -1304,6 +1305,7 @@ async fn run_rcpd_master(
                     server_name: source_hello.server_name.clone(),
                     preserve: *preserve,
                     source_cert_fingerprint: source_conn_info.fingerprint,
+                    dry_run: request.rcpd.preview_only,
                 })
                 .await?;
         }
@@ -1909,7 +1911,7 @@ fn main() -> Result<(), anyhow::Error> {
     let func = {
         let args = args.clone();
         let remote_cleanup = remote_cleanup.clone();
-        move || async_main(args, files_in_flight, remote_cleanup)
+        move |_admission| async_main(args, files_in_flight, remote_cleanup)
     };
     let output = args
         .common
@@ -2203,6 +2205,26 @@ mod tests {
             fingerprint: None,
             files_in_flight,
             max_connections: std::num::NonZeroUsize::new(max_connections).unwrap(),
+        }
+    }
+
+    #[test]
+    fn master_forwards_preview_startup_policy_to_both_roles() {
+        for options in [vec![], vec!["--dry-run=brief"], vec!["--dry-run=explain"]] {
+            let args = master_args(&options);
+            let files =
+                common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
+            let request = build_master_remote_request(&args, files, None).unwrap();
+            let source = build_source_remote_config(&request);
+            let source_readiness = readiness(files.limit(), 100);
+            let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
+            for config in [&source.rcpd, &destination.rcpd] {
+                assert_eq!(config.preview_only, args.dry_run.is_some());
+                assert_eq!(
+                    config.to_args().iter().any(|arg| arg == "--preview-only"),
+                    args.dry_run.is_some(),
+                );
+            }
         }
     }
 

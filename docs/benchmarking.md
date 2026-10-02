@@ -5,6 +5,12 @@ informational: a slower copy does not fail CI. Failed commands, timeouts, incorr
 broken measurement infrastructure do fail. The suite covers tiny, medium, and large regular files;
 new cases and command variants belong in [benchmarks/cases.json](../benchmarks/cases.json).
 
+`deep-20x80` contains twenty chains of eighty directory levels, with one 8-byte file in every
+directory, including the fixture root: 1,600 directories and 1,601 files. It exercises directory
+lifetime pressure with interior file work. Case manifests select exactly one of `files_per_leaf`
+(deepest directories only) or `files_per_directory` (every directory including root). Cases with
+root files require whole-tree variants; partitioned variants are rejected before fixture generation.
+
 ## View results
 
 Open a **Copy benchmarks** run from its PR check or the Depot dashboard. Each local or loopback job
@@ -63,6 +69,12 @@ just benchmark --case tiny-1m --mode local --cache linux-drop-caches --repetitio
 just benchmark-run --case tiny-1m --mode loopback --cache linux-drop-caches --repetitions 3 --output /tmp/rcp-bench-remote
 just benchmark-report /tmp/rcp-bench-remote/results.json --output /tmp/rcp-bench-site
 ```
+
+For directory-lifetime comparisons, use `--case deep-20x80 --variant rcp-default --variant rsync-a`
+with a matching `--baseline-bin-dir`. Measure both zero added RTT and a recorded nonzero RTT in an
+isolated test network; ordinary loopback adds no delay. Keep fixture placement, file concurrency,
+descriptor limits, timing policy, and transport identical across variants. Interior files and
+leaf-only trees are different workloads and must not share a comparison.
 
 Open `/tmp/rcp-bench-site/index.html` in a browser. The report is self-contained; viewing it does
 not require a web server or external JavaScript service.

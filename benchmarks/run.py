@@ -58,8 +58,9 @@ def load_manifest(path):
     for kind in ("cases", "variants"):
         seen = set()
         for entry in data[kind]:
-            required = {"id", "directory_widths", "files_per_leaf", "file_size_bytes"} if kind == "cases" else {"id", "tool", "args", "processes"}
-            _fields(entry, required, {"description"}, kind[:-1])
+            required = {"id", "directory_widths", "file_size_bytes"} if kind == "cases" else {"id", "tool", "args", "processes"}
+            optional = {"description", "files_per_leaf", "files_per_directory"} if kind == "cases" else {"description"}
+            _fields(entry, required, optional, kind[:-1])
             identifier = entry["id"]
             if not isinstance(identifier, str) or not ID_PATTERN.fullmatch(identifier):
                 raise ValueError(f"invalid {kind} id: {identifier!r}")
@@ -76,7 +77,11 @@ def load_manifest(path):
                     raise ValueError("directory_widths must be a nonempty list")
                 for width in widths:
                     _positive(width, "directory width")
-                _positive(entry["files_per_leaf"], "files_per_leaf")
+                policies = entry.keys() & {"files_per_leaf", "files_per_directory"}
+                if len(policies) != 1:
+                    raise ValueError("case requires exactly one of files_per_leaf and files_per_directory")
+                policy = next(iter(policies))
+                _positive(entry[policy], policy)
                 _positive(entry["file_size_bytes"], "file_size_bytes")
             else:
                 if entry["tool"] not in ("rcp", "rsync", "cp"):
@@ -93,7 +98,7 @@ def expected_counts(case):
     for width in case["directory_widths"]:
         breadth *= width
         directories += breadth
-    files = breadth * case["files_per_leaf"]
+    files = (directories + 1) * case["files_per_directory"] if "files_per_directory" in case else breadth * case["files_per_leaf"]
     return {"directories": directories, "files": files, "bytes": files * case["file_size_bytes"]}
 
 
@@ -533,10 +538,15 @@ def main(argv=None):
             raise ValueError("repetitions and timeout must be positive; timeout must be finite")
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
-        default_variants = ["rcp-default", "rsync-a", "rsync-a-10"] + (["cp-a"] if args.mode == "local" else [])
+        all_directory_files = any("files_per_directory" in case for case in cases)
+        default_variants = ["rcp-default", "rsync-a"] + ([] if all_directory_files else ["rsync-a-10"]) + (["cp-a"] if args.mode == "local" else [])
         variants = _select(manifest["variants"], args.variants or default_variants, "variant")
         for variant in variants:
             _validate_variant_mode(variant, args.mode)
+        if all_directory_files:
+            if any(variant["processes"] > 1 for variant in variants):
+                raise ValueError("partitioned variants cannot copy files_per_directory cases with root files")
+            record["context"]["fixture_policy"] = "filegen --leaf-files for files_per_leaf; files_per_directory includes fixture root and intermediate directories; --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest"
         if args.files_in_flight is not None:
             if not any(variant["tool"] == "rcp" for variant in variants):
                 raise ValueError("files-in-flight requires a selected rcp variant")
@@ -599,7 +609,12 @@ def main(argv=None):
         for case in cases:
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
-            filegen_command = [tools["filegen"], str(fixture_root), ",".join(map(str, case["directory_widths"])), str(case["files_per_leaf"]), str(case["file_size_bytes"]), "--leaf-files", f"--bufsize={min(case['file_size_bytes'], 1048576)}"]
+            leaf_files = "files_per_leaf" in case
+            files_per_directory = case["files_per_leaf" if leaf_files else "files_per_directory"]
+            filegen_command = [tools["filegen"], str(fixture_root), ",".join(map(str, case["directory_widths"])), str(files_per_directory), str(case["file_size_bytes"])]
+            if leaf_files:
+                filegen_command.append("--leaf-files")
+            filegen_command.append(f"--bufsize={min(case['file_size_bytes'], 1048576)}")
             generated = subprocess.run(filegen_command, capture_output=True, text=True, timeout=args.timeout)
             (output / "logs" / f"{case['id']}.filegen.stdout.log").write_text(generated.stdout)
             (output / "logs" / f"{case['id']}.filegen.stderr.log").write_text(generated.stderr)

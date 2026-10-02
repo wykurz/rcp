@@ -6,7 +6,8 @@
     {"id": "medium-4k", "description": "Ten top-level directories, each with 400 medium files", "directory_widths": [10, 1, 1], "files_per_leaf": 400, "file_size_bytes": 262144},
     {"id": "large-100", "description": "Ten top-level directories, each with 10 large files", "directory_widths": [10, 1, 1], "files_per_leaf": 10, "file_size_bytes": 16777216},
     {"id": "medium-128k", "description": "128,000 medium files, 31.25 GiB total", "directory_widths": [10, 10, 1], "files_per_leaf": 1280, "file_size_bytes": 262144},
-    {"id": "large-120", "description": "120 files of 256 MiB, 30 GiB total", "directory_widths": [10, 1, 1], "files_per_leaf": 12, "file_size_bytes": 268435456}
+    {"id": "large-120", "description": "120 files of 256 MiB, 30 GiB total", "directory_widths": [10, 1, 1], "files_per_leaf": 12, "file_size_bytes": 268435456},
+    {"id": "deep-20x80", "description": "Twenty branches, each 80 directories deep, with one eight-byte file in every directory including the fixture root", "directory_widths": [20, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "files_per_directory": 1, "file_size_bytes": 8}
   ],
   "variants": [
     {"id": "rcp-default", "description": "rcp default copy", "tool": "rcp", "args": ["--summary"], "processes": 1},

@@ -368,12 +368,17 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     explicit value remains controlled by the initiating `rcp`
   - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
     that the workload will achieve that much parallelism
-  - the runtime normally intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling for
+  - local runtime setup intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling for
     each of two pools: OpenFile for fd-bearing leaf work and PendingMeta for spawned metadata work.
     The pools receive the same effective numerical ceiling, but are not a combined total; recursive
     directory, network socket, and process-support descriptors remain outside them
+  - for normal remote copies, daemons jointly budget leaf work and directory lifetimes before
+    startup readiness, then negotiate scan and pending-work bounds that retain room for directory
+    progress. Dry runs use local metadata admission without reserving data streams or directory
+    lifetimes. See the
+    [remote resource model](docs/remote_protocol.md#78-backpressure-and-task-ownership)
   - if querying `RLIMIT_NOFILE` fails, a finite value explicitly supplied through either flag
-    remains usable as the sole ceiling and produces a visible warning. Automatic and unlimited
+    remains usable as a logical ceiling and produces a visible warning. Automatic and unlimited
     admission still fail because they have no independent descriptor-safety bound. A successful
     query returning a zero soft limit fails closed for every policy
   - during one compatibility release, the hidden `--max-open-files=N` spelling remains accepted and
@@ -770,11 +775,14 @@ ulimit -n 65536
 * hard nofile 65536
 ```
 
-`rcp` queries the current session's **soft** limit without changing it. It derives a descriptor
-safety ceiling from 80% of that limit, five modeled descriptor units, and a 4096-operation cap; that
-ceiling is independently intersected with `--max-files-in-flight` for each file-work pool. Raising
-the soft limit can therefore raise safety headroom, but does not change the CPU-based default
-file-work ceiling. Neither setting is a literal count of every descriptor in the process.
+`rcp` queries the current session's **soft** limit without changing it. Local operations derive a
+descriptor safety ceiling from 80% of that limit, five modeled descriptor units, and a
+4096-operation cap; that ceiling is independently intersected with `--max-files-in-flight` for each
+file-work pool. Normal remote copies jointly budget leaf work, directory lifetimes, data
+connections, and support descriptors before readiness; dry runs retain local metadata admission. See
+the [remote resource model](docs/remote_protocol.md#78-backpressure-and-task-ownership). Raising the
+soft limit can raise safety headroom, but does not change the CPU-based default file-work ceiling.
+Neither setting is a literal count of every descriptor in the process.
 
 ### Network Backlog (10+ Gbps)
 
@@ -827,13 +835,13 @@ rcp --network-profile=internet host1:/data host2:/data
 ### Concurrent Connections
 
 Remote data streams are `min(--max-files-in-flight, --max-connections)`. `--max-connections` is a
-separately configurable ceiling with a default of 100; pending capacity is that effective stream
-count times `--pending-writes-multiplier`. The source reports its resolved logical file limit and
-effective stream count in its first stderr readiness record; the master connects to it before
-starting the destination with the same negotiated values. This source-first readiness contract is
-wire revision 4. Wire revision 5 protects the final daemon CLI contract: the unreachable
-explicit-unlimited override was removed and the remote-copy connection timeout must be positive.
-Wire revision 6 adds the public `--max-files-in-flight=unlimited` daemon spawn spelling.
+separately configurable ceiling with a default of 100. Configured pending capacity P is the
+effective stream count times `--pending-writes-multiplier`; descriptor admission can reduce source
+scans W and pending work to Q. The source reports its logical file limit and stream count before the
+master starts the destination with matching values. Each endpoint installs a joint leaf/directory
+resource plan, then the source intersects their directory lifetime limits. See
+[resource admission](docs/remote_protocol.md#78-backpressure-and-task-ownership) for the bounds.
+Wire revision 10 requires matching binaries, including the daemon startup and preview contract.
 
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves

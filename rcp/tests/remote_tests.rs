@@ -217,20 +217,36 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                 );
             }
             if role == "rcpd-destination" {
-                let control_rate = scopes
+                let prepare = scopes
                     .iter()
-                    .find(|scope| scope["name"] == "destination.control.wait_rate");
-                assert_eq!(control_rate.is_some(), detail);
-                if let Some(scope) = control_rate {
-                    assert_eq!(
-                        scope["count"], 7,
-                        "three Begin, three End, DiscoveryComplete"
-                    );
-                    assert_eq!(scope["finished"], 7);
+                    .find(|scope| scope["name"] == "destination.directory.prepare")
+                    .unwrap();
+                assert_eq!(prepare["count"], 3, "root, nested, and empty are prepared");
+                assert_eq!(prepare["finished"], 3);
+                assert_eq!(prepare["interrupted"], 0);
+                let finalizations: Vec<_> = scopes
+                    .iter()
+                    .filter(|scope| {
+                        matches!(
+                            scope["name"].as_str(),
+                            Some(
+                                "destination.directory.finalize.control"
+                                    | "destination.directory.finalize.announce"
+                                    | "destination.directory.finalize.data"
+                            )
+                        )
+                    })
+                    .collect();
+                let mut cascades = 0;
+                for scope in finalizations {
+                    let count = scope["count"].as_u64().unwrap();
+                    assert_eq!(scope["finished"], count);
                     assert_eq!(scope["interrupted"], 0);
+                    cascades += count;
                 }
+                assert!((1..=3).contains(&cascades));
                 for name in [
-                    "destination.tracker.wait",
+                    "destination.tracker.access",
                     "destination.directory.finalize.metadata",
                 ] {
                     let scope = scopes.iter().find(|scope| scope["name"] == name);
@@ -4546,22 +4562,9 @@ fn test_remote_file_fail_early_reports_failure() {
     );
 }
 
-/// Regression: a `--fail-early` file failure with MORE files still pending must fail fast,
-/// not hang. (`test_remote_file_fail_early_reports_failure` copies a single file, so the
-/// failing file is also the last item — the tracker reaches is_done() and sends
-/// DestinationDone, masking this bug. This test keeps files pending after the failure.)
-///
-/// Bug scenario: with a single data connection the failing file's worker recorded the error
-/// and `break`ed WITHOUT telling the source to stop. The files here are EMPTY, so the source
-/// sends only headers (no data body) and its sends never fail with a broken pipe — nothing
-/// tears the source down. It never closed its control stream, so the destination's
-/// control_future waited forever: an infinite hang. The worker now closes its control send
-/// stream on abort, which makes the source release its fd-budget and tear down. The empty
-/// files are essential: with data bodies, the source's broken-pipe teardown hides the bug.
-///
-/// This also covers Finding 2's shape (a `--fail-early` error surfacing through the data
-/// worker before completion accounting): the fix is the same worker-side abort signal
-/// whether the error is a file create or a directory-metadata failure.
+/// A fatal file failure must wake the source even when all remaining payloads are empty.
+/// The source can finish sending headers and wait for completion without a data write detecting
+/// the receiver's failure. Explicit control teardown must release that wait without sending Done.
 #[test]
 fn test_remote_multiple_empty_files_fail_early_no_hang() {
     require_local_ssh();
@@ -5109,6 +5112,59 @@ fn test_remote_copy_progress_reporting() {
 // ============================================================================
 // Remote filtering and dry-run tests
 // ============================================================================
+
+/// A dry run can outlive the data-handshake deadline without opening any data connections.
+#[test]
+fn remote_encrypted_dry_run_outlives_data_connection_timeout() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let generated = std::process::Command::new(assert_cmd::cargo::cargo_bin("filegen"))
+        .args([
+            src_dir.path().to_str().unwrap(),
+            "1",
+            "1500",
+            "1K",
+            "--leaf-files",
+        ])
+        .output()
+        .expect("failed to generate dry-run fixture");
+    assert!(
+        generated.status.success(),
+        "filegen failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let source = src_dir.path().join("filegen");
+    let destination = dst_dir.path().join("preview");
+    let source_remote = format!("localhost:{}", source.display());
+    let destination_remote = format!("localhost:{}", destination.display());
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    // metadata admission keeps discovery running beyond the unused data handshake's deadline
+    let started = std::time::Instant::now();
+    let output = run_rcp_with_args(&[
+        &daemon,
+        "--dry-run=brief",
+        "--ops-throttle=100",
+        "--remote-copy-conn-timeout-sec=5",
+        &source_remote,
+        &destination_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "a throttled encrypted dry run must not fail when unused data handshakes time out"
+    );
+    assert!(
+        started.elapsed() > std::time::Duration::from_secs(5),
+        "the fixture must outlive the configured data-connection timeout"
+    );
+    assert!(
+        !destination.exists(),
+        "dry run must not create its destination"
+    );
+}
 
 /// Test remote dry-run mode with brief output - should not hang and show what would be copied.
 #[test]
@@ -7036,76 +7092,243 @@ async fn remote_capacity_one_deep_tree_preserves_files_and_directory_metadata() 
     }
 }
 
+/// Receiver directory lifetimes stay bounded while tiny payloads let the source run ahead.
+#[test]
+fn remote_many_small_directories_fit_the_destination_descriptor_limit() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let generated = std::process::Command::new(assert_cmd::cargo::cargo_bin("filegen"))
+        .args([
+            fixture.path().to_str().unwrap(),
+            "60,100",
+            "10",
+            "8",
+            "--leaf-files",
+            "--bufsize=8",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let src = fixture.path().join("filegen");
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nulimit -S -n 1024 || exit 1\nexec {daemon} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("localhost:{}", src.display());
+    for preserve in [false, true] {
+        let dst = fixture
+            .path()
+            .join(if preserve { "preserved" } else { "plain" });
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            daemon_arg.as_str(),
+            "--max-files-in-flight=8",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if preserve {
+            args.insert(0, "--preserve");
+        }
+        run_rcp_and_expect_success(&args);
+        let mut pending = vec![src.clone()];
+        let mut files = 0;
+        while let Some(directory) = pending.pop() {
+            let relative = directory.strip_prefix(&src).unwrap();
+            assert!(
+                dst.join(relative).is_dir(),
+                "missing directory {relative:?}"
+            );
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                } else {
+                    let copied = dst.join(path.strip_prefix(&src).unwrap());
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        std::fs::read(&copied).unwrap(),
+                        "{copied:?}"
+                    );
+                    files += 1;
+                }
+            }
+        }
+        assert_eq!(files, 60_000);
+    }
+}
+
 /// Parallel directory traversal fits a normal SSH soft limit even with large pending capacity.
 #[tokio::test]
 async fn remote_parallel_directories_preserve_every_subtree_under_a_low_soft_limit() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
         std::sync::LazyLock::new(common::progress::Progress::new);
-    let fixture = tempfile::tempdir().unwrap();
-    let src = fixture.path().join("source");
-    std::fs::create_dir(&src).unwrap();
-    let mut directories = Vec::new();
-    let mut files = Vec::new();
-    for branch in 0..64 {
-        let mut relative = std::path::PathBuf::from(format!("branch-{branch}"));
-        for _ in 0..13 {
-            std::fs::create_dir(src.join(&relative)).unwrap();
-            directories.push(relative.clone());
-            relative.push("child");
+    for (branches, depth, file_limit, streams, multiplier, soft_limit) in [
+        (64, 13, "64", "64", "16", 1024),
+        (20, 80, "20", "20", "4", 1024),
+        (1, 60, "200", "100", "4", 1024),
+        (20, 30, "200", "100", "4", 1024),
+        (4, 6, "20", "20", "4", 160),
+        (4, 6, "20", "20", "4", 128),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let src = fixture.path().join("source");
+        std::fs::create_dir(&src).unwrap();
+        let mut directories = Vec::new();
+        let mut files = Vec::new();
+        for branch in 0..branches {
+            let mut relative = std::path::PathBuf::from(format!("branch-{branch}"));
+            for _ in 0..depth {
+                std::fs::create_dir(src.join(&relative)).unwrap();
+                directories.push(relative.clone());
+                relative.push("child");
+            }
+            relative.pop();
+            let file = relative.join("payload");
+            common::filegen::write_file(&PROGRESS, src.join(&file), 1024, 1024, 0)
+                .await
+                .unwrap();
+            files.push(file);
         }
-        relative.pop();
-        let file = relative.join("payload");
-        common::filegen::write_file(&PROGRESS, src.join(&file), 1024, 1024, 0)
-            .await
-            .unwrap();
-        files.push(file);
-    }
-    let wrapper = fixture.path().join("limited-rcpd");
-    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
-    std::fs::write(&wrapper, format!(
-        "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = source ]; then\n  ulimit -S -n 1024 || exit 1\nfi\nexec {daemon} \"$@\"\n"
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
-    let src_remote = format!("localhost:{}", src.display());
-    for dereference in [false, true] {
-        let dst = fixture.path().join(if dereference {
-            "dereferenced"
-        } else {
-            "hardened"
-        });
-        let dst_remote = format!("localhost:{}", dst.display());
-        let mut args = vec![
-            daemon_arg.as_str(),
-            "--max-files-in-flight=64",
-            "--max-connections=64",
-            "--pending-writes-multiplier=16",
-            src_remote.as_str(),
-            dst_remote.as_str(),
-        ];
-        if dereference {
-            args.insert(0, "-L");
-        }
-        run_rcp_and_expect_success(&args);
-        assert!(dst.is_dir());
-        for directory in &directories {
-            assert!(dst.join(directory).is_dir(), "missing {directory:?}");
-        }
-        for file in &files {
-            assert_eq!(
-                std::fs::read(src.join(file)).unwrap(),
-                std::fs::read(dst.join(file)).unwrap(),
-                "{file:?}"
-            );
+        let wrapper = fixture.path().join("limited-rcpd");
+        let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nulimit -S -n {soft_limit} || exit 1\nexec {daemon} \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+        let src_remote = format!("localhost:{}", src.display());
+        let files_arg = format!("--max-files-in-flight={file_limit}");
+        let streams_arg = format!("--max-connections={streams}");
+        let pending_arg = format!("--pending-writes-multiplier={multiplier}");
+        for dereference in [false, true] {
+            let dst = fixture.path().join(if dereference {
+                "dereferenced"
+            } else {
+                "hardened"
+            });
+            let dst_remote = format!("localhost:{}", dst.display());
+            let mut args = vec![
+                daemon_arg.as_str(),
+                files_arg.as_str(),
+                streams_arg.as_str(),
+                pending_arg.as_str(),
+                src_remote.as_str(),
+                dst_remote.as_str(),
+            ];
+            if dereference {
+                args.insert(0, "-L");
+            }
+            run_rcp_and_expect_success(&args);
+            assert!(dst.is_dir());
+            for directory in &directories {
+                assert!(dst.join(directory).is_dir(), "missing {directory:?}");
+            }
+            for file in &files {
+                assert_eq!(
+                    std::fs::read(src.join(file)).unwrap(),
+                    std::fs::read(dst.join(file)).unwrap(),
+                    "{file:?}"
+                );
+            }
         }
     }
 }
 
-/// Ancestor descriptors grow with depth even at E=P=1. Exhausting the source's descriptor limit
-/// must finish with the original EMFILE error instead of hanging or hiding it during teardown.
 #[test]
-fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
+fn remote_low_descriptor_limit_supports_single_files_and_high_concurrency_previews() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    create_test_file(&src, "low-limit payload", 0o600);
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nulimit -S -n 128 || exit 1\nexec {daemon} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for preview in [false, true] {
+        let destination = fixture
+            .path()
+            .join(if preview { "preview" } else { "destination" });
+        let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+        let source_arg = format!("localhost:{}", src.display());
+        let destination_arg = format!("localhost:{}", destination.display());
+        let mut args = vec![
+            daemon_arg.as_str(),
+            if preview {
+                "--max-files-in-flight=200"
+            } else {
+                "--max-files-in-flight=20"
+            },
+            source_arg.as_str(),
+            destination_arg.as_str(),
+        ];
+        if preview {
+            args.insert(0, "--dry-run=brief");
+        }
+        run_rcp_and_expect_success(&args);
+        if preview {
+            assert!(!destination.exists());
+        } else {
+            assert_eq!(std::fs::read(destination).unwrap(), b"low-limit payload");
+        }
+    }
+}
+
+#[test]
+fn remote_insufficient_socket_headroom_is_reported_during_startup() {
+    require_local_ssh();
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    create_test_file(&src, "payload", 0o600);
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    for role in ["source", "destination"] {
+        let destination = fixture.path().join(format!("destination-{role}"));
+        let wrapper = fixture.path().join(format!("limited-{role}"));
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nif [ \"$1\" = --role ] && [ \"$2\" = {role} ]; then\n  ulimit -S -n 64 || exit 1\nfi\nexec {daemon} \"$@\"\n"
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = run_rcp_and_expect_failure(&[
+            &format!("--rcpd-path={}", wrapper.display()),
+            "--max-files-in-flight=200",
+            "--remote-copy-conn-timeout-sec=3",
+            &format!("localhost:{}", src.display()),
+            &format!("localhost:{}", destination.display()),
+        ]);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("soft RLIMIT_NOFILE=64"), "{combined}");
+        assert!(combined.contains("ulimit -n"), "{combined}");
+        assert!(
+            !combined.contains("Timed out waiting for destination"),
+            "{combined}"
+        );
+        assert!(!destination.exists());
+    }
+}
+
+/// A depth failure is reported without opening excess descriptors or abandoning healthy siblings.
+#[test]
+fn remote_capacity_one_deep_tree_reports_reserved_depth_exhaustion() {
     require_local_ssh();
     let fixture = tempfile::tempdir().unwrap();
     let src = fixture.path().join("source");
@@ -7120,6 +7343,9 @@ fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
         "beyond the descriptor limit",
         0o600,
     );
+    let healthy = src.join("healthy");
+    std::fs::create_dir(&healthy).unwrap();
+    create_test_file(&healthy.join("payload"), "unaffected sibling", 0o600);
     let wrapper = fixture.path().join("limited-rcpd");
     let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
     std::fs::write(
@@ -7132,7 +7358,7 @@ fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let daemon_arg = format!("--rcpd-path={}", wrapper.display());
     let src_remote = format!("localhost:{}", src.display());
-    let cause = std::io::Error::from_raw_os_error(libc::EMFILE).to_string();
+    let cause = "reserved directory depth";
     for dereference in [false, true] {
         let dst = fixture.path().join(if dereference {
             "dereferenced"
@@ -7142,6 +7368,7 @@ fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
         let dst_remote = format!("localhost:{}", dst.display());
         let mut args = vec![
             daemon_arg.as_str(),
+            "--max-files-in-flight=1",
             "--max-connections=1",
             "--pending-writes-multiplier=1",
             src_remote.as_str(),
@@ -7159,21 +7386,109 @@ fn remote_capacity_one_deep_tree_reports_source_descriptor_exhaustion() {
         assert!(
             combined
                 .lines()
-                .any(|line| line.contains("Source: ") && line.contains(&cause)),
-            "source descriptor exhaustion must retain its original cause, dereference={dereference}: {combined}"
+                .any(|line| line.contains("Source: ") && line.contains(cause)),
+            "source depth exhaustion must retain its original cause, dereference={dereference}: {combined}"
         );
         assert!(
             !combined.contains("Source: lost admitted child obligation")
                 && !combined.contains("Source: file admission closed")
                 && !combined.contains("Source: branch admission closed"),
-            "teardown must not replace descriptor exhaustion, dereference={dereference}: {combined}"
+            "teardown must not replace depth exhaustion, dereference={dereference}: {combined}"
+        );
+        assert!(
+            !combined.contains(&std::io::Error::from_raw_os_error(libc::EMFILE).to_string()),
+            "depth must be charged before opening: {combined}"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("healthy/payload")).unwrap(),
+            b"unaffected sibling",
+            "collect-errors must finish a sibling after reserved-depth exhaustion"
         );
         assert!(dst.is_dir(), "the daemon must reach source traversal");
         assert!(
             !dst.join(deepest.strip_prefix(&src).unwrap())
                 .join("payload")
                 .exists(),
-            "the source must exhaust its descriptors before reaching the leaf"
+            "the source must stop at its depth budget before reaching the leaf"
+        );
+    }
+}
+
+/// Rejection inside the reserved subtree must preserve unrelated siblings in both traversal modes.
+#[test]
+fn remote_rejected_directory_inside_reserve_preserves_healthy_siblings() {
+    require_local_ssh();
+    let resources = common::RemoteResources::for_limits(
+        std::num::NonZeroU64::new(96),
+        std::num::NonZeroUsize::MIN,
+        std::num::NonZeroUsize::MIN,
+        std::num::NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let normal = resources.normal_directories.get();
+    let reserve = resources.reserved_directories.get();
+    assert!(
+        reserve >= 4,
+        "the fixture needs a rejected reserve parent and descendants"
+    );
+    // the root consumes a normal lifetime; rejection occurs below the first reserved level.
+    let obstruction_level = normal + 1;
+    let depth = normal + reserve - 2;
+    let fixture = tempfile::tempdir().unwrap();
+    let wrapper = fixture.path().join("limited-rcpd");
+    let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nulimit -S -n 96 || exit 1\nexec {daemon} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+    for dereference in [false, true] {
+        let (source, destination) = setup_test_env();
+        let src = source.path().join("root");
+        let dst = destination.path().join("root");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        let mut relative = std::path::PathBuf::new();
+        for level in 0..depth {
+            relative.push("nested");
+            std::fs::create_dir_all(src.join(&relative)).unwrap();
+            if level < obstruction_level {
+                std::fs::create_dir_all(dst.join(&relative)).unwrap();
+            } else if level == obstruction_level {
+                create_test_file(&dst.join(&relative), "retained obstruction", 0o640);
+            }
+        }
+        create_test_file(
+            &src.join(&relative).join("hidden"),
+            "rejected subtree",
+            0o600,
+        );
+        create_test_file(&src.join("healthy"), "healthy sibling", 0o600);
+        let src_remote = format!("localhost:{}", src.display());
+        let dst_remote = format!("localhost:{}", dst.display());
+        let mut args = vec![
+            daemon_arg.as_str(),
+            "--ignore-existing",
+            "--summary",
+            "--max-files-in-flight=1",
+            "--max-connections=1",
+            "--pending-writes-multiplier=1",
+            src_remote.as_str(),
+            dst_remote.as_str(),
+        ];
+        if dereference {
+            args.insert(0, "-L");
+        }
+        let output = run_rcp_and_expect_success(&args);
+        assert_eq!(parse_summary_from_output(&output).unwrap().files_copied, 1);
+        assert_eq!(get_file_content(&dst.join("healthy")), "healthy sibling");
+        let obstruction: std::path::PathBuf =
+            std::iter::repeat_n("nested", obstruction_level + 1).collect();
+        assert_eq!(
+            get_file_content(&dst.join(obstruction)),
+            "retained obstruction"
         );
     }
 }
@@ -8457,8 +8772,8 @@ fn test_remote_require_toctou_safe_copies() {
 /// the real protocol: a `--require-toctou-safe --overwrite` remote copy INTO a
 /// PRE-EXISTING (reused) destination directory locks it down for the copy
 /// (`create_directory`: verify_same_inode → secure_as_copier → 0o700) and restores
-/// it at completion (`complete_directory_single`: chown_to + the tracker threading
-/// through `DirectoryState.reused_lock.restore_owner`). The reused dir starts NON-WRITABLE at
+/// it at completion (`DirectoryFinalization::execute`: chown_to + the tracker threading
+/// through the owned `DirectoryFinalization.reused_lock`). The reused dir starts NON-WRITABLE at
 /// 0o500 (like the local test): without the lockdown (which fchmods it to 0o700) the
 /// copier could not write the child into it, so a successful copy PROVES the lockdown
 /// fired — not a vacuous pass. The source dir is at 0o755; a successful copy must
@@ -9388,8 +9703,8 @@ fn test_remote_strict_reused_dir_takes_the_source_acls_over_its_own() {
 /// The remote mirror of the local `strict_mode_contains_and_restores_a_reused_directorys_acls`: the
 /// `d:acl`-OFF branch, where the reused directory's OWN ACLs are what has to come back.
 ///
-/// The remote destination restores through its own site (`complete_directory_single`, threading the
-/// lock through `DirectoryState`) rather than the local copy's `finalize_dir`, so the two paths can
+/// The remote destination restores through its own site (`DirectoryFinalization::execute`, threading the
+/// lock into `DirectoryFinalization`) rather than the local copy's `finalize_dir`, so the two paths can
 /// regress independently. As locally, the source directory's mode (`0o700`) differs from the mode
 /// the destination's access ACL implies (`0o755`), so the final mode says unambiguously which one
 /// won.

@@ -605,9 +605,11 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.
 The source selects automatic `F` as `max(std::thread::available_parallelism(), 4)`, and the
-destination adopts its reported `F/E`; explicit `F` remains master-authoritative. Pending capacity
-is `E × --pending-writes-multiplier`. Values for `E` or that product above Tokio's semaphore maximum
-are rejected rather than reaching semaphore construction.
+destination adopts its reported `F/E`; explicit `F` remains master-authoritative. Configured pending
+capacity P is `E × --pending-writes-multiplier`. Negotiated directory headroom can reduce source
+scans W and pending work to Q; see
+[resource admission](remote_protocol.md#78-backpressure-and-task-ownership). Values for `E` or that
+product above Tokio's semaphore maximum are rejected rather than reaching semaphore construction.
 
 Explicit limits can be checked before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects; the source resolves and
@@ -621,11 +623,9 @@ descriptor clamp produces a default-visible notice naming requested and effectiv
 ordinary automatic/default intersection remains quiet. Profiling and Tokio-console artifact
 announcements likewise use the tracing notice target and reach master output only after the daemon
 readiness handshake. Pre-tracing configuration refusals use the same `RCP_ERROR` startup record;
-otherwise captured startup stdout and stderr are attached to handshake errors. These readiness and
-internal spawn-contract changes are protected by wire revision 4. Wire revision 5 covers the final
-daemon CLI contract: removal of its unreachable explicit-unlimited override and rejection of a zero
-remote-copy connection timeout. Wire revision 6 adds the public `--max-files-in-flight=unlimited`
-daemon spawn spelling.
+otherwise captured startup stdout and stderr are attached to handshake errors. Wire revision 10
+protects the readiness, directory lifetime, and preview-only daemon startup contracts and requires
+matching binaries.
 
 ### Network Profiles
 

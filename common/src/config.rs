@@ -162,6 +162,18 @@ pub struct AutoMetaThrottleConfig {
     pub tick_interval: std::time::Duration,
 }
 
+/// Descriptor admission appropriate to the work performed by this process.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum AdmissionPolicy {
+    #[default]
+    Local,
+    /// Jointly reserve leaf, directory, and socket capacity for a remote endpoint.
+    Remote {
+        streams: std::num::NonZeroUsize,
+        pending: std::num::NonZeroUsize,
+    },
+}
+
 /// Throttling configuration for resource control
 #[derive(Debug, Clone)]
 pub struct ThrottleConfig {
@@ -169,6 +181,8 @@ pub struct ThrottleConfig {
     pub files_in_flight: ResolvedFilesInFlight,
     /// Whether this process performs file work governed by `files_in_flight`.
     pub apply_files_in_flight: bool,
+    /// The operation-specific descriptor ownership model used during runtime setup.
+    pub admission_policy: AdmissionPolicy,
     /// Operations per second throttle (0 = no throttle)
     pub ops_throttle: usize,
     /// I/O operations per second throttle (0 = no throttle)
@@ -195,6 +209,7 @@ impl Default for ThrottleConfig {
         Self {
             files_in_flight: ResolvedFilesInFlight::automatic(),
             apply_files_in_flight: true,
+            admission_policy: AdmissionPolicy::Local,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -633,6 +648,7 @@ mod auto_meta_validation_tests {
         ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
             apply_files_in_flight: true,
+            admission_policy: AdmissionPolicy::Local,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -775,6 +791,7 @@ mod auto_meta_validation_tests {
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
             apply_files_in_flight: true,
+            admission_policy: AdmissionPolicy::Local,
             ops_throttle: 5,
             iops_throttle: 0,
             chunk_size: 0,
@@ -801,6 +818,7 @@ mod auto_meta_validation_tests {
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
             apply_files_in_flight: true,
+            admission_policy: AdmissionPolicy::Local,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -823,6 +841,7 @@ mod auto_meta_validation_tests {
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
             apply_files_in_flight: true,
+            admission_policy: AdmissionPolicy::Local,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,

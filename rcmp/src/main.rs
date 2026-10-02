@@ -168,7 +168,7 @@ fn main() -> Result<()> {
     let files_in_flight = args.common.resolve_files_in_flight();
     let func = {
         let args = args.clone();
-        || async_main(args)
+        |_admission| async_main(args)
     };
     let output = common::OutputConfig {
         suppress_runtime_stats: matches!(args.output_format, common::cmp::OutputFormat::Json),
