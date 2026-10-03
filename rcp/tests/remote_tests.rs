@@ -92,6 +92,64 @@ fn require_local_ssh() {
 }
 
 #[tokio::test]
+async fn remote_buffer_retention_overrides_copy_multiple_files_in_both_directions() {
+    require_local_ssh();
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    for index in 0..3 {
+        common::filegen::write_file(
+            &PROGRESS,
+            src.join(index.to_string()),
+            1024 * 1024,
+            65536,
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    for (index, retention) in ["0", "256KiB", "1MiB"].into_iter().enumerate() {
+        let dst = fixture.path().join(format!("destination-{index}"));
+        let source_arg = if index == 0 {
+            src.display().to_string()
+        } else {
+            format!("localhost:{}", src.display())
+        };
+        let destination_arg = if index == 1 {
+            dst.display().to_string()
+        } else {
+            format!("localhost:{}", dst.display())
+        };
+        let retention_arg = format!("--remote-copy-buffer-retention-limit={retention}");
+        let mut args = vec![
+            daemon.as_str(),
+            "--max-connections=1",
+            "--remote-copy-buffer-size=512KiB",
+            retention_arg.as_str(),
+        ];
+        if index == 1 {
+            args.push("--no-encryption");
+        }
+        args.extend([source_arg.as_str(), destination_arg.as_str()]);
+        let output = run_rcp_with_args(&args);
+        print_command_output(&output);
+        assert!(output.status.success());
+        for name in ["0", "1", "2"] {
+            assert_eq!(
+                std::fs::read(src.join(name)).unwrap(),
+                std::fs::read(dst.join(name)).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =

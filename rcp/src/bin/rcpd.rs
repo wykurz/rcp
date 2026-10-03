@@ -200,6 +200,13 @@ struct Args {
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     buffer_size: Option<usize>,
 
+    /// Maximum receiver scratch retained per data connection, in bytes.
+    ///
+    /// Defaults to the effective buffer size. Allocated lazily; zero disables retention.
+    /// Does not change I/O chunk sizes: larger chunks use temporary storage per file.
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    buffer_retention_limit: Option<usize>,
+
     /// Maximum concurrent data connections (default: 100)
     ///
     /// This separately configurable ceiling defaults to 100. Effective data streams are
@@ -329,6 +336,7 @@ impl Args {
             conn_timeout_sec: self.remote_copy_conn_timeout_sec,
             network_profile: self.network_profile,
             buffer_size: self.buffer_size,
+            buffer_retention_limit: self.buffer_retention_limit,
             keepalive_sec: self.remote_keepalive_sec,
         }
     }
@@ -1084,6 +1092,59 @@ mod tests {
         let mut argv = vec!["rcpd", "--role=source"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn daemon_resolves_buffer_retention_without_changing_copy_chunks() {
+        for role in ["--role=source", "--role=destination"] {
+            for (extra, chunk, limit) in [
+                (vec![], 16 * 1024 * 1024, 16 * 1024 * 1024),
+                (
+                    vec!["--network-profile=internet"],
+                    2 * 1024 * 1024,
+                    2 * 1024 * 1024,
+                ),
+                (vec!["--buffer-size=12345"], 12345, 12345),
+                (
+                    vec!["--buffer-size=12345", "--buffer-retention-limit=8192"],
+                    12345,
+                    8192,
+                ),
+                (vec!["--buffer-retention-limit=0"], 16 * 1024 * 1024, 0),
+                (
+                    vec!["--buffer-size=12345", "--buffer-retention-limit=32768"],
+                    12345,
+                    32768,
+                ),
+            ] {
+                let mut argv = vec!["rcpd", role];
+                argv.extend(extra);
+                let args = Args::try_parse_from(argv).unwrap();
+                let tcp = args.to_tcp_config();
+                assert_eq!(tcp.effective_buffer_size(), chunk);
+                assert_eq!(tcp.effective_buffer_retention_limit(), limit);
+                assert_eq!(
+                    args.to_copy_settings(None, None, &tcp)
+                        .unwrap()
+                        .remote_copy_buffer_size,
+                    chunk
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_rejects_invalid_buffer_retention_limits() {
+        for value in ["-1", "nonsense", "18446744073709551616"] {
+            assert!(
+                Args::try_parse_from([
+                    "rcpd",
+                    "--role=destination",
+                    &format!("--buffer-retention-limit={value}")
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

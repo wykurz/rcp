@@ -828,6 +828,15 @@ rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
 rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
 ```
 
+Receivers lazily reuse initialized scratch per data connection, retaining up to the copy chunk size
+by default. This avoids repeated allocation and initialization across files, at the cost of memory
+held until the connection closes. Use `--remote-copy-buffer-retention-limit=256KiB` to cap retained
+scratch independently, or `0` to disable reuse. Chunks above the cap still use the configured I/O
+size with temporary storage. At 100 connections the default retention ceilings are 1600 MiB
+(datacenter) or 200 MiB (internet); see
+[connection reuse](docs/remote_protocol.md#75-data-connection-pooling) for the full memory
+accounting.
+
 ### Network Profile
 
 Use `--network-profile` to optimize for your network type:
@@ -849,7 +858,8 @@ scans W and pending work to Q. The source reports its logical file limit and str
 master starts the destination with matching values. Each endpoint installs a joint leaf/directory
 resource plan, then the source intersects their directory lifetime limits. See
 [resource admission](docs/remote_protocol.md#78-backpressure-and-task-ownership) for the bounds.
-Wire revision 10 requires matching binaries, including the daemon startup and preview contract.
+Wire revision 11 requires matching binaries, including receiver-buffer retention startup
+configuration.
 
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves

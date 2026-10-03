@@ -57,8 +57,9 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 10 covers directory discovery, pipelined directory lifetime admission, and preview-only
-daemon startup. It requires exact-version rcp/rcpd binaries.
+revision 11 adds receiver copy-buffer retention configuration to daemon startup, following revision
+10's directory discovery, pipelined directory lifetime admission, and preview-only startup. It
+requires exact-version rcp/rcpd binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
 and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
@@ -1032,15 +1033,29 @@ ignored; a short read fails the transfer and discards the stream. The stream bec
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
-The destination lazily retains initialized copy scratch storage per receive connection, growing only
-when needed up to 256 KiB. A boxed slice bounds the entire retained allocation, including capacity,
-to 25 MiB across the default 100-connection ceiling. Empty files and payloads already in the framed
-reader need no scratch allocation. Larger chunks use temporary storage at the configured size
-(limited by remaining payload), leaving any retained small buffer available for later files and
-drains. This bounds idle scratch memory without reducing the 16 MiB datacenter or 2 MiB internet
-copy chunks; larger transfers still allocate per file. The bound excludes framing, transport, and
-active temporary buffers. Dropping a copy future releases its temporary storage; retained storage
-lives until the receive connection drops. Interrupted transfers still require discarding the stream.
+The destination lazily retains initialized copy scratch per data connection, growing only to the
+chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
+reader need no scratch allocation. By default the retention limit follows
+`--remote-copy-buffer-size`: 16 MiB for datacenter and 2 MiB for internet. This reuses initialized
+storage for large-file workloads as well as small files. Source reader buffers are unchanged.
+
+Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
+example, `256KiB`); `0` disables retention. Both local and remote daemons receive the setting as
+`--buffer-retention-limit=BYTES`. The limit does not shrink I/O chunks: chunks exceeding it use
+temporary storage for that file, leaving any smaller retained buffer available for later files and 8
+KiB drains. A limit above the copy chunk does not eagerly allocate that amount.
+
+A boxed slice has no spare capacity, so initialized retained scratch is bounded by the limit times
+the effective connection count, `min(max-files-in-flight, max-connections)`. At 32 connections the
+default ceilings are 512 MiB (datacenter) or 64 MiB (internet); at the default 100-connection
+ceiling they are 1600 MiB or 200 MiB. Automatic file concurrency uses the source CPU count (at least
+four). Descriptor admission can further limit active file operations but does not reduce the
+connection pool: all connections may eventually retain buffers. Retention grows only as connections
+encounter payloads that need scratch, and trades idle memory for fewer allocations and repeated
+initializations. These storage bounds exclude allocator overhead, framing, transport, source
+buffers, active temporary buffers, and transient overlap when growing a buffer; they are not process
+RSS bounds. Dropping a copy future releases temporary storage; retained storage lives until the
+receive connection drops. Interrupted transfers still require discarding the stream.
 
 **Connection lifecycle:**
 

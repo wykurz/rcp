@@ -276,6 +276,15 @@ struct Args {
     #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
     remote_copy_buffer_size: Option<bytesize::ByteSize>,
 
+    /// Maximum receiver scratch retained per remote data connection.
+    ///
+    /// Defaults to the remote copy buffer size (16 MiB datacenter, 2 MiB internet).
+    /// Allocated lazily, only as needed. Accepts sizes like "256KiB", "1MiB", or bytes.
+    /// Zero disables reuse. Smaller limits reduce idle memory without reducing I/O chunks;
+    /// chunks exceeding the limit allocate temporary storage for each file.
+    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
+    remote_copy_buffer_retention_limit: Option<bytesize::ByteSize>,
+
     /// Maximum concurrent data connections (default: 100)
     ///
     /// This separately configurable ceiling defaults to 100. Effective data streams are
@@ -679,11 +688,22 @@ fn build_master_remote_request(
             }
         }
     };
+    let buffer_size = args
+        .remote_copy_buffer_size
+        .map(|size| usize::try_from(size.0))
+        .transpose()
+        .context("remote copy buffer size exceeds this platform's addressable size")?;
+    let buffer_retention_limit = args
+        .remote_copy_buffer_retention_limit
+        .map(|size| usize::try_from(size.0))
+        .transpose()
+        .context("remote copy buffer retention limit exceeds this platform's addressable size")?;
     let tcp = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
-        buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
+        buffer_size,
+        buffer_retention_limit,
         keepalive_sec: args.remote_keepalive_sec,
     };
     let rcpd = remote::protocol::RcpdConfig {
@@ -741,7 +761,8 @@ fn build_master_remote_request(
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         remote_keepalive_sec: args.remote_keepalive_sec,
         network_profile: args.network_profile,
-        buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
+        buffer_size,
+        buffer_retention_limit,
         max_connections: configured_connections.get(),
         pending_writes_multiplier: args.pending_writes_multiplier.get(),
         chrome_trace_prefix: args.chrome_trace.clone(),
@@ -2205,6 +2226,80 @@ mod tests {
             fingerprint: None,
             files_in_flight,
             max_connections: std::num::NonZeroUsize::new(max_connections).unwrap(),
+        }
+    }
+
+    #[test]
+    fn master_forwards_buffer_retention_to_both_daemon_roles() {
+        for (options, chunk, limit) in [
+            (vec![], 16 * 1024 * 1024, None),
+            (vec!["--network-profile=internet"], 2 * 1024 * 1024, None),
+            (vec!["--remote-copy-buffer-size=1MiB"], 1024 * 1024, None),
+            (
+                vec![
+                    "--remote-copy-buffer-size=1MiB",
+                    "--remote-copy-buffer-retention-limit=256KiB",
+                ],
+                1024 * 1024,
+                Some(256 * 1024),
+            ),
+            (
+                vec!["--remote-copy-buffer-retention-limit=0"],
+                16 * 1024 * 1024,
+                Some(0),
+            ),
+            (
+                vec![
+                    "--remote-copy-buffer-size=1024",
+                    "--remote-copy-buffer-retention-limit=2MiB",
+                ],
+                1024,
+                Some(2 * 1024 * 1024),
+            ),
+        ] {
+            let args = master_args(&options);
+            let files =
+                common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(4).unwrap());
+            let request = build_master_remote_request(&args, files, None).unwrap();
+            let source = build_source_remote_config(&request);
+            let destination =
+                build_destination_remote_config(&request, &readiness(files.limit(), 4)).unwrap();
+            for config in [&source, &destination] {
+                assert_eq!(config.tcp.effective_buffer_size(), chunk);
+                assert_eq!(
+                    config.tcp.effective_buffer_retention_limit(),
+                    limit.unwrap_or(chunk)
+                );
+                assert_eq!(config.rcpd.buffer_retention_limit, limit);
+                let retained_args: Vec<_> = config
+                    .rcpd
+                    .to_args()
+                    .into_iter()
+                    .filter(|arg| arg.starts_with("--buffer-retention-limit="))
+                    .collect();
+                assert_eq!(
+                    retained_args,
+                    limit
+                        .map(|value| format!("--buffer-retention-limit={value}"))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn master_rejects_invalid_buffer_retention_sizes() {
+        for value in ["-1", "nonsense"] {
+            assert!(
+                Args::try_parse_from([
+                    "rcp",
+                    &format!("--remote-copy-buffer-retention-limit={value}"),
+                    "localhost:/src",
+                    "/dst"
+                ])
+                .is_err()
+            );
         }
     }
 

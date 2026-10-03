@@ -1502,6 +1502,9 @@ pub struct TcpConfig {
     pub network_profile: NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
+    /// Maximum retained receiver scratch per data connection; defaults to the effective chunk.
+    /// Zero disables retention without changing I/O chunk sizes.
+    pub buffer_retention_limit: Option<usize>,
     /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
     /// See [`configure_tcp_socket`].
     pub keepalive_sec: u64,
@@ -1598,6 +1601,7 @@ impl Default for TcpConfig {
             conn_timeout_sec: 15,
             network_profile: NetworkProfile::default(),
             buffer_size: None,
+            buffer_retention_limit: None,
             keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
         }
     }
@@ -1608,6 +1612,11 @@ impl TcpConfig {
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
             .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
+    }
+    /// Get the receiver retention limit independently of active I/O chunk size.
+    pub fn effective_buffer_retention_limit(&self) -> usize {
+        self.buffer_retention_limit
+            .unwrap_or_else(|| self.effective_buffer_size())
     }
 }
 
@@ -3588,6 +3597,7 @@ mod tests {
                 remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                 network_profile: NetworkProfile::default(),
                 buffer_size: None,
+                buffer_retention_limit: None,
                 max_connections: 4,
                 pending_writes_multiplier: 1,
                 chrome_trace_prefix: None,

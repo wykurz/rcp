@@ -86,9 +86,6 @@ pub type BoxedRecvStream = RecvStream<BoxedRead>;
 /// Shared send stream over boxed writer
 pub type BoxedSharedSendStream = SharedSendStream<BoxedWrite>;
 
-// at the default 100-connection ceiling, retained copy scratch totals at most 25 MiB
-const MAX_RETAINED_COPY_BUFFER_SIZE: usize = 256 * 1024;
-
 /// Framed receive stream for length-delimited messages.
 ///
 /// Generic over the underlying reader type - works with TCP, TLS, or any AsyncRead.
@@ -97,6 +94,7 @@ pub struct RecvStream<R = OwnedReadHalf> {
     framed: tokio_util::codec::FramedRead<R, tokio_util::codec::LengthDelimitedCodec>,
     // a boxed slice has no spare capacity: the retention bound covers the whole allocation
     copy_buffer: Box<[u8]>,
+    copy_buffer_retention_limit: usize,
 }
 
 impl<R: AsyncRead + Unpin> RecvStream<R> {
@@ -108,7 +106,20 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         Self {
             framed,
             copy_buffer: Box::default(),
+            copy_buffer_retention_limit: 0,
         }
+    }
+
+    /// Configure the maximum initialized copy scratch retained by this connection.
+    ///
+    /// Retention is disabled until configured. Zero disables it; chunks exceeding the limit
+    /// use temporary storage without shrinking I/O requests. No storage is allocated here.
+    pub fn with_copy_buffer_retention_limit(mut self, limit: usize) -> Self {
+        self.copy_buffer_retention_limit = limit;
+        if self.copy_buffer.len() > limit {
+            self.copy_buffer = Box::default();
+        }
+        self
     }
 
     pub async fn recv_object<T: serde::de::DeserializeOwned>(
@@ -164,9 +175,9 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     ///
     /// Unlike [`Self::copy_to_buffered`], this does NOT read until EOF. It reads
     /// exactly the specified number of bytes, leaving the stream open for
-    /// reading subsequent messages. Initialized scratch storage up to 256 KiB is
-    /// allocated lazily and reused by this connection. Larger chunks use temporary
-    /// storage without reducing the requested buffer size.
+    /// reading subsequent messages. Initialized scratch storage up to the configured
+    /// retention limit is allocated lazily and reused by this connection. Larger chunks
+    /// use temporary storage without reducing the requested buffer size.
     #[instrument(level = "trace", skip(self, writer))]
     pub async fn copy_exact_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
@@ -193,7 +204,7 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         let mut limited = data_stream.take(remaining);
         let buffer_size = buffer_size.min(remaining.min(usize::MAX as u64) as usize);
         let mut temporary;
-        let buf = if buffer_size <= MAX_RETAINED_COPY_BUFFER_SIZE {
+        let buf = if buffer_size <= self.copy_buffer_retention_limit {
             if self.copy_buffer.len() < buffer_size {
                 self.copy_buffer = vec![0; buffer_size].into_boxed_slice();
             }
