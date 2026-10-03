@@ -1032,6 +1032,16 @@ ignored; a short read fails the transfer and discards the stream. The stream bec
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
+The destination lazily retains initialized copy scratch storage per receive connection, growing only
+when needed up to 256 KiB. A boxed slice bounds the entire retained allocation, including capacity,
+to 25 MiB across the default 100-connection ceiling. Empty files and payloads already in the framed
+reader need no scratch allocation. Larger chunks use temporary storage at the configured size
+(limited by remaining payload), leaving any retained small buffer available for later files and
+drains. This bounds idle scratch memory without reducing the 16 MiB datacenter or 2 MiB internet
+copy chunks; larger transfers still allocate per file. The bound excludes framing, transport, and
+active temporary buffers. Dropping a copy future releases its temporary storage; retained storage
+lives until the receive connection drops. Interrupted transfers still require discarding the stream.
+
 **Connection lifecycle:**
 
 1. Destination opens N connections to source's data port

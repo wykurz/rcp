@@ -86,12 +86,17 @@ pub type BoxedRecvStream = RecvStream<BoxedRead>;
 /// Shared send stream over boxed writer
 pub type BoxedSharedSendStream = SharedSendStream<BoxedWrite>;
 
+// at the default 100-connection ceiling, retained copy scratch totals at most 25 MiB
+const MAX_RETAINED_COPY_BUFFER_SIZE: usize = 256 * 1024;
+
 /// Framed receive stream for length-delimited messages.
 ///
 /// Generic over the underlying reader type - works with TCP, TLS, or any AsyncRead.
 #[derive(Debug)]
 pub struct RecvStream<R = OwnedReadHalf> {
     framed: tokio_util::codec::FramedRead<R, tokio_util::codec::LengthDelimitedCodec>,
+    // a boxed slice has no spare capacity: the retention bound covers the whole allocation
+    copy_buffer: Box<[u8]>,
 }
 
 impl<R: AsyncRead + Unpin> RecvStream<R> {
@@ -100,7 +105,10 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
             stream,
             tokio_util::codec::LengthDelimitedCodec::new(),
         );
-        Self { framed }
+        Self {
+            framed,
+            copy_buffer: Box::default(),
+        }
     }
 
     pub async fn recv_object<T: serde::de::DeserializeOwned>(
@@ -156,7 +164,9 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     ///
     /// Unlike [`Self::copy_to_buffered`], this does NOT read until EOF. It reads
     /// exactly the specified number of bytes, leaving the stream open for
-    /// reading subsequent messages.
+    /// reading subsequent messages. Initialized scratch storage up to 256 KiB is
+    /// allocated lazily and reused by this connection. Larger chunks use temporary
+    /// storage without reducing the requested buffer size.
     #[instrument(level = "trace", skip(self, writer))]
     pub async fn copy_exact_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
@@ -181,10 +191,21 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         // read exactly `remaining` bytes from the underlying stream
         let data_stream = self.framed.get_mut();
         let mut limited = data_stream.take(remaining);
-        let mut buf = vec![0u8; buffer_size.min(remaining as usize)];
+        let buffer_size = buffer_size.min(remaining.min(usize::MAX as u64) as usize);
+        let mut temporary;
+        let buf = if buffer_size <= MAX_RETAINED_COPY_BUFFER_SIZE {
+            if self.copy_buffer.len() < buffer_size {
+                self.copy_buffer = vec![0; buffer_size].into_boxed_slice();
+            }
+            &mut self.copy_buffer[..buffer_size]
+        } else {
+            // oversized transfers must not pin their allocation for the connection's lifetime
+            temporary = vec![0; buffer_size];
+            temporary.as_mut_slice()
+        };
         let mut total_copied = buffered;
         loop {
-            let bytes_to_read = buf.len().min((size - total_copied) as usize);
+            let bytes_to_read = (buf.len() as u64).min(size - total_copied) as usize;
             if bytes_to_read == 0 {
                 break;
             }
@@ -248,3 +269,6 @@ impl ControlConnection {
 
 #[cfg(test)]
 mod coalescing_tests;
+
+#[cfg(test)]
+mod copy_buffer_tests;
