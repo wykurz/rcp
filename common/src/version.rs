@@ -42,8 +42,8 @@ pub struct ProtocolVersion {
 /// argument change whenever the crate version does not also change. The crate version alone cannot
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
-/// Revision 10 includes pipelined directory lifetimes and preview-only daemon startup.
-pub const WIRE_REVISION: u32 = 10;
+/// Revision 11 adds the receiver copy-buffer retention limit to daemon startup arguments.
+pub const WIRE_REVISION: u32 = 11;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -258,9 +258,9 @@ mod tests {
     }
 
     #[test]
-    fn current_contract_rejects_daemons_without_pipelined_directory_lifetimes() {
+    fn current_contract_rejects_daemons_without_required_startup_arguments() {
         let current = ProtocolVersion::current();
-        for revision in [8, 9] {
+        for revision in [8, 9, 10] {
             let previous = ProtocolVersion {
                 semantic: format!("{}+w{revision}", current.crate_version()),
                 git_describe: None,

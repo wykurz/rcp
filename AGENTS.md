@@ -75,6 +75,13 @@ General coding conventions are in [CONVENTIONS.md](CONVENTIONS.md). Several rule
 by CI scripts (each such subsection explicitly names the check); other guidance is still expected to
 be followed even if not CI-checked.
 
+### Performance and Resource Tuning
+
+Performance and resource-policy heuristics should have documented defaults and CLI overrides, so
+users can tune them for their workload and hardware. Keep independently useful controls separate
+(for example, I/O chunk size and idle buffer retention). Correctness and protocol invariants do not
+need tuning knobs.
+
 ### Error Logging
 
 **Always** use alternate display `{:#}` or debug `{:?}` when logging errors — never plain `{}`:
