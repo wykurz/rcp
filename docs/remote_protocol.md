@@ -57,8 +57,9 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 10 covers directory discovery, pipelined directory lifetime admission, and preview-only
-daemon startup. It requires exact-version rcp/rcpd binaries.
+revision 11 adds receiver copy-buffer retention configuration to daemon startup, following revision
+10's directory discovery, pipelined directory lifetime admission, and preview-only startup. It
+requires exact-version rcp/rcpd binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
 and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
@@ -1031,6 +1032,40 @@ The source sends exactly the header's size from the held data fd. Growth beyond 
 ignored; a short read fails the transfer and discards the stream. The stream becomes reusable only
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
+
+The destination lazily retains initialized copy scratch per data connection, growing only to the
+chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
+reader need no scratch allocation. The default retention limit is the smaller of
+`--remote-copy-buffer-size` and 2 MiB. The I/O chunks remain 16 MiB for datacenter and 2 MiB for
+internet. Source reader buffers are unchanged.
+
+Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
+example, `16MiB` to reuse full datacenter chunks); `0` disables retention. The shared daemon
+configuration forwards `--buffer-retention-limit=BYTES` to both roles, but only the destination uses
+it. It does not configure source reader buffers. The limit does not shrink I/O chunks: chunks
+exceeding it use temporary storage for that file. Smaller files and 8 KiB drains reuse retained
+storage when their required chunk fits the limit; drains above the limit also use temporary storage.
+A limit above the copy chunk does not eagerly allocate that amount.
+
+The 2 MiB default balances observed reuse benefits against idle memory. Measurements reported on
+[one WSL2 host using tmpfs and loopback](https://github.com/wykurz/rcp/pull/332#issuecomment-5975364418)
+found useful savings through roughly 2 MiB files and lower mixed-tree destination RSS with a 2 MiB
+limit than with 16 MiB retention. This is evidence for the default policy, not a throughput
+guarantee or an optimum for physical high-bandwidth networks; the override allows tuning for those
+workloads.
+
+A boxed slice has no spare capacity, so initialized retained scratch is bounded by the limit times
+the effective connection count, `min(max-files-in-flight, max-connections)`. At 32 connections the
+default ceiling is 64 MiB; at the default 100-connection ceiling it is 200 MiB for either profile.
+An explicit 16 MiB limit raises those ceilings to 512 MiB and 1600 MiB. Automatic file concurrency
+uses the source CPU count (at least four). Descriptor admission can further limit active file
+operations but does not reduce the connection pool: all connections may eventually retain buffers.
+Retention grows only as connections encounter payloads that need scratch, and trades idle memory for
+fewer allocations and repeated initializations. These storage bounds exclude allocator overhead,
+framing, transport, source buffers, active temporary buffers, and transient overlap when growing a
+buffer; they are not process RSS bounds. Dropping a copy future releases temporary storage; retained
+storage lives until the receive connection drops. Interrupted transfers still require discarding the
+stream.
 
 **Connection lifecycle:**
 

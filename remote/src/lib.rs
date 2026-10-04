@@ -1502,10 +1502,17 @@ pub struct TcpConfig {
     pub network_profile: NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
+    /// Maximum retained receiver scratch per data connection; defaults to min(chunk, 2 MiB).
+    /// Zero disables retention without changing I/O chunk sizes.
+    pub buffer_retention_limit: Option<usize>,
     /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
     /// See [`configure_tcp_socket`].
     pub keepalive_sec: u64,
 }
+
+/// Default ceiling for retained receiver scratch per data connection.
+/// The effective default also respects smaller configured I/O chunks.
+pub const DEFAULT_COPY_BUFFER_RETENTION_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Default ceiling for concurrent remote data connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
@@ -1598,6 +1605,7 @@ impl Default for TcpConfig {
             conn_timeout_sec: 15,
             network_profile: NetworkProfile::default(),
             buffer_size: None,
+            buffer_retention_limit: None,
             keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
         }
     }
@@ -1608,6 +1616,14 @@ impl TcpConfig {
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
             .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
+    }
+    /// Get the explicit receiver retention limit, or min(effective I/O chunk, 2 MiB).
+    /// This does not change the I/O chunk size.
+    pub fn effective_buffer_retention_limit(&self) -> usize {
+        self.buffer_retention_limit.unwrap_or_else(|| {
+            self.effective_buffer_size()
+                .min(DEFAULT_COPY_BUFFER_RETENTION_LIMIT)
+        })
     }
 }
 
@@ -3588,6 +3604,7 @@ mod tests {
                 remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                 network_profile: NetworkProfile::default(),
                 buffer_size: None,
+                buffer_retention_limit: None,
                 max_connections: 4,
                 pending_writes_multiplier: 1,
                 chrome_trace_prefix: None,
