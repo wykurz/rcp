@@ -51,3 +51,16 @@ jobs:
       - name: Deploy dashboard
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+      - name: Summarize historical changes
+        env:
+          REPORT_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          report = Path("_site/changes.md").read_text(encoding="utf-8")
+          url = os.environ["REPORT_URL"].rstrip("/")
+          report = report.replace("(index.html#run-", f"({url}/index.html#run-")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(report)
+          PY

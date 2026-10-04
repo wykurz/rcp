@@ -413,6 +413,83 @@ To render downloaded history locally:
 just benchmark-report /path/to/history-checkout --output /tmp/rcp-history-site
 ```
 
+## Automatic change reports
+
+Every `just benchmark-report` now writes `changes.json` and `changes.md` beside the dashboard. The
+existing Pages publication renders the full immutable history, publishes these files, and adds the
+Markdown report to its CI job summary. The dashboard links to both files. This consumes already
+collected measurements: it adds no copy runs, timing gate, new schedule, or service. Standalone
+single-run artifacts contain the same report, usually with no historical reference.
+
+For each completed case/variant, the report selects the most recent strictly earlier observation
+with the same recorded series ID, repository, case and variant. The existing series contract binds
+the workload, flags, reference binaries, cache, topology, timing collection and machine context.
+Smoke runs, running producers, dirty trees and unknown revisions cannot supply comparisons or
+references. Completed cases from terminal failed runs remain eligible and carry their enclosing
+failure status. Equal timestamps do not establish ordering; an ambiguous latest reference produces
+no ratio. A changed contract starts a new series and explicitly reports no compatible reference.
+
+The ratio is **current median / reference median**: above one is slower. The report retains both raw
+repeat sets, medians, ranges, revision pins, run IDs, exact original input SHA256 hashes and
+zero-based trial indices into `history.json`. It does not pool repeats across runs. Short samples
+and missing scoped timings stay visible. The JSON retains every run, including failures before a
+completed case; the Markdown summary shows the latest ten runs to bound CI output.
+
+These are **unpaired historical observations**, not evidence that a code change caused a regression.
+Matching recorded environments cannot eliminate noisy storage or host contention. Range overlap is
+not a statistical test and a narrow range does not establish between-run stability. No numeric
+change changes the CI exit code; malformed evidence still fails reporting. Original immutable JSON
+remains on `benchmark-history` after the 90-day raw artifact lifetime. Reports are reproducible
+derivatives of those records, regenerated on publication. Full HTML/JSON reports have the same
+privacy scope as existing history; use the sanitized export when sharing private runs.
+
+Triage a concerning observation in this order:
+
+1. Check producer status, exact case/series, binary identities and repeat ranges. Compare rcp and
+   existing rsync/cp rows in the same run to spot broad runner/storage shifts. Fix correctness or
+   infrastructure failures before interpreting elapsed times.
+2. Inspect the linked run records and dashboard timing tables by role. Existing scope totals include
+   waits and may overlap; they are not additive wall time or CPU utilization. Older records without
+   timing data remain usable numeric observations with an explicit diagnostic gap.
+3. Confirm on paired candidate/base samples for that workload and resource envelope. Repeat a
+   suspicious pair before escalating; do not turn an uncalibrated Depot percentage into a gate.
+4. After confirmation, choose a separate, bounded diagnostic run tied to the two run IDs, revisions,
+   case and series. Preserve all process roles and capture overhead; keep diagnostic times out of
+   performance history. The current change report does not launch this run or collect traces.
+
+## Coverage and next automation decisions
+
+The recurring suite currently covers fresh tiny/medium/large copies locally and over shared-host SSH
+loopback. PR smoke checks exercise correctness and the measurement mechanism, including an rcp base
+build. Weekly performance jobs compare tools, but do not yet build a paired previous rcp revision.
+The receiver manifest adds massive unchanged/partial updates and wide directory sets; owned
+RTT0/2/10 support is available but not part of the weekly matrix. Neither loopback nor a Depot
+runner demonstrates physical fast-NIC, separate-server storage behavior. Deep chains are useful
+mechanism checks, not the priority for representative performance coverage.
+
+Keep three distinct budgets as coverage grows:
+
+| Lane                     | Purpose                                                                       | Next decision                                                                                                                                            |
+| ------------------------ | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PR correctness/mechanism | Cheap fixtures and existing smoke checks; fail broken copies/evidence         | Keep behavioral checks in `benchmark-test`; review the current multi-variant smoke cost separately                                                       |
+| Paired numeric samples   | Candidate/base on the same workload with balanced order and verified outcomes | Choose a bounded subset of massive fresh, update and wide-directory/RTT workloads, a baseline pin policy and repeat budget before expanding the schedule |
+| Targeted diagnostics     | Explain a confirmed change with bounded evidence                              | Define one workload/role selection, timeout, byte/event cap, 90-day raw retention and durable numeric/provenance summary before automatic dispatch       |
+
+Dial9 belongs in the diagnostic lane once there is an automated consumer and a demonstrated question
+that existing `wait_rate`/admission/worker/execute scopes cannot answer. Its released API, root
+`block_on`, blocking-pool visibility and elapsed-scope correlation need a deliberate integration and
+overhead test. A runtime recorder alone would not provide this workflow. Detailed scopes and poll
+traces should not contaminate the paired numeric samples.
+
+Use Depot as a coarse screen while calibrating repeated same-commit pairs. A dedicated pair of
+fast-NIC servers would add physical-network and controlled storage coverage; evaluate that benefit
+against observed Depot variance, utilization, maintenance and quoted runner/storage/retention costs.
+No dedicated runners, new permissions, credentials, paid services, or additional recurring jobs are
+provisioned by this reporting change. The existing weekly schedule and 90-day artifact retention
+remain in place. CI run URLs in older records may be empty; run IDs, commits, binary fingerprints
+and input hashes remain the durable evidence keys, not a promise that expired raw logs are
+recoverable.
+
 ## CI and stability
 
 [Depot benchmarks](../.depot/workflows/benchmarks.yml) use separate local and loopback jobs on the

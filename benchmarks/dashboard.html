@@ -64,6 +64,7 @@
   </header>
   <main>
     <div class="topline"><div class="stats" id="stats"></div><a class="download" href="history.json" download>Download raw history JSON ↓</a></div>
+    <p class="subtle">Automatic historical comparisons: <a href="changes.md">read the change report</a> · <a href="changes.json" download>download comparison evidence</a>. Matching series only; historical changes are advisory and need paired confirmation.</p>
     <section aria-labelledby="chart-heading">
       <h2 id="chart-heading">Walltime over time</h2>
       <p class="subtle">Select a case, variant, machine group, and exact series. Points show the median; hover for run details.</p>
@@ -204,6 +205,7 @@
       const rows = $("run-rows");
       for (const run of [...runs].reverse()) {
         const row = node("tr"), timestamp = node("td", date(run.timestamp));
+        row.id = `run-${run.run_id}`;
         const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge, node("span", ` · ${purpose(run)}`));
         if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("span", " · Short sample: repeat under 10 s", "short-warning"));
         const rev = node("td"), hash = run.revision.commit || "unknown";
