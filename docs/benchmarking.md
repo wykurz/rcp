@@ -424,10 +424,12 @@ single-run artifacts contain the same report, usually with no historical referen
 For each completed case/variant, the report selects the most recent strictly earlier observation
 with the same recorded series ID, repository, case and variant. The existing series contract binds
 the workload, flags, reference binaries, cache, topology, timing collection and machine context.
-Smoke runs, running producers, dirty trees and unknown revisions cannot supply comparisons or
-references. Completed cases from terminal failed runs remain eligible and carry their enclosing
-failure status. Equal timestamps do not establish ordering; an ambiguous latest reference produces
-no ratio. A changed contract starts a new series and explicitly reports no compatible reference.
+Smoke runs, running producers, dirty trees, unknown revisions and missing or unqualified repository
+identities cannot supply comparisons or references. Repository identity must be an explicit
+`owner/repo` value; unknown local origins are not pooled together. Completed cases from terminal
+failed runs remain eligible and carry their enclosing failure status. Equal timestamps do not
+establish ordering; an ambiguous latest reference produces no ratio. A changed contract starts a new
+series and explicitly reports no compatible reference.
 
 The ratio is **current median / reference median**: above one is slower. The report retains both raw
 repeat sets, medians, ranges, revision pins, run IDs, exact original input SHA256 hashes and
