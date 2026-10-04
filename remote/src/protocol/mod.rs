@@ -459,6 +459,9 @@ pub struct RcpdConfig {
     pub network_profile: crate::NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
+    /// Maximum retained receiver scratch per data connection; defaults to min(chunk, 2 MiB).
+    /// Zero disables retention without changing I/O chunk sizes.
+    pub buffer_retention_limit: Option<usize>,
     /// Connection ceiling passed to this daemon. The automatic source receives configured `M`;
     /// negotiated source/destination configurations receive effective `E`.
     pub max_connections: usize,
@@ -566,6 +569,9 @@ impl RcpdConfig {
         // tcp tuning (only if set)
         if let Some(v) = self.buffer_size {
             args.push(format!("--buffer-size={v}"));
+        }
+        if let Some(v) = self.buffer_retention_limit {
+            args.push(format!("--buffer-retention-limit={v}"));
         }
         args.push(format!("--max-connections={}", self.max_connections));
         args.push(format!(
@@ -1070,6 +1076,7 @@ mod tests {
             remote_keepalive_sec: crate::DEFAULT_REMOTE_KEEPALIVE_SEC,
             network_profile: crate::NetworkProfile::default(),
             buffer_size: None,
+            buffer_retention_limit: None,
             max_connections: 1,
             pending_writes_multiplier: 1,
             chrome_trace_prefix: None,

@@ -89,9 +89,24 @@ pub type BoxedSharedSendStream = SharedSendStream<BoxedWrite>;
 /// Framed receive stream for length-delimited messages.
 ///
 /// Generic over the underlying reader type - works with TCP, TLS, or any AsyncRead.
-#[derive(Debug)]
 pub struct RecvStream<R = OwnedReadHalf> {
     framed: tokio_util::codec::FramedRead<R, tokio_util::codec::LengthDelimitedCodec>,
+    // a boxed slice has no spare capacity: the retention bound covers the whole allocation
+    copy_buffer: Box<[u8]>,
+    copy_buffer_retention_limit: usize,
+}
+
+impl<R> std::fmt::Debug for RecvStream<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // neither the reader nor the framing and copy buffers may expose payload bytes
+        f.debug_struct("RecvStream")
+            .field("copy_buffer_len", &self.copy_buffer.len())
+            .field(
+                "copy_buffer_retention_limit",
+                &self.copy_buffer_retention_limit,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R: AsyncRead + Unpin> RecvStream<R> {
@@ -100,7 +115,28 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
             stream,
             tokio_util::codec::LengthDelimitedCodec::new(),
         );
-        Self { framed }
+        Self {
+            framed,
+            copy_buffer: Box::default(),
+            copy_buffer_retention_limit: 0,
+        }
+    }
+
+    /// Configure the maximum initialized copy scratch retained by this connection.
+    ///
+    /// Retention is disabled until configured. Zero disables it; chunks exceeding the limit
+    /// use temporary storage without shrinking I/O requests. No storage is allocated here.
+    pub fn with_copy_buffer_retention_limit(mut self, limit: usize) -> Self {
+        self.copy_buffer_retention_limit = limit;
+        if self.copy_buffer.len() > limit {
+            self.copy_buffer = Box::default();
+        }
+        self
+    }
+
+    /// Return the retention limit configured on this receive stream.
+    pub fn copy_buffer_retention_limit(&self) -> usize {
+        self.copy_buffer_retention_limit
     }
 
     pub async fn recv_object<T: serde::de::DeserializeOwned>(
@@ -156,7 +192,9 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     ///
     /// Unlike [`Self::copy_to_buffered`], this does NOT read until EOF. It reads
     /// exactly the specified number of bytes, leaving the stream open for
-    /// reading subsequent messages.
+    /// reading subsequent messages. Initialized scratch storage up to the configured
+    /// retention limit is allocated lazily and reused by this connection. Larger chunks
+    /// use temporary storage without reducing the requested buffer size.
     #[instrument(level = "trace", skip(self, writer))]
     pub async fn copy_exact_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
@@ -181,10 +219,21 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         // read exactly `remaining` bytes from the underlying stream
         let data_stream = self.framed.get_mut();
         let mut limited = data_stream.take(remaining);
-        let mut buf = vec![0u8; buffer_size.min(remaining as usize)];
+        let buffer_size = buffer_size.min(remaining.min(usize::MAX as u64) as usize);
+        let mut temporary;
+        let buf = if buffer_size <= self.copy_buffer_retention_limit {
+            if self.copy_buffer.len() < buffer_size {
+                self.copy_buffer = vec![0; buffer_size].into_boxed_slice();
+            }
+            &mut self.copy_buffer[..buffer_size]
+        } else {
+            // chunks above the configured retention limit use temporary storage
+            temporary = vec![0; buffer_size];
+            temporary.as_mut_slice()
+        };
         let mut total_copied = buffered;
         loop {
-            let bytes_to_read = buf.len().min((size - total_copied) as usize);
+            let bytes_to_read = (buf.len() as u64).min(size - total_copied) as usize;
             if bytes_to_read == 0 {
                 break;
             }
@@ -248,3 +297,6 @@ impl ControlConnection {
 
 #[cfg(test)]
 mod coalescing_tests;
+
+#[cfg(test)]
+mod copy_buffer_tests;

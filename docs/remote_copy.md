@@ -590,17 +590,19 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 
 ### rcp Flags for Remote Operations
 
-| Flag                               | Description                                                                                 |
-| ---------------------------------- | ------------------------------------------------------------------------------------------- |
-| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                                                   |
-| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                                                   |
-| `--remote-copy-conn-timeout-sec=N` | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy) |
-| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)                                       |
-| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                                          |
-| `--max-files-in-flight=LIMIT`      | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                            |
-| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                                          |
-| `--pending-writes-multiplier=N`    | Pending-task capacity multiplier (default: 4)                                               |
-| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                                         |
+| Flag                                        | Description                                                                                 |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `--rcpd-path=PATH`                          | Override rcpd binary path on remote hosts                                                   |
+| `--auto-deploy-rcpd`                        | Automatically deploy rcpd to remote hosts                                                   |
+| `--remote-copy-conn-timeout-sec=N`          | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy) |
+| `--remote-keepalive-sec=N`                  | Dead-peer detection budget, 0 disables (default: 120)                                       |
+| `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999")                                          |
+| `--max-files-in-flight=LIMIT`               | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                            |
+| `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                          |
+| `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                               |
+| `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default) or `internet`                                         |
+| `--remote-copy-buffer-size=SIZE`            | File-transfer chunk size (default: 16 MiB datacenter, 2 MiB internet)                       |
+| `--remote-copy-buffer-retention-limit=SIZE` | Per-connection receiver scratch retention (default: min(copy chunk, 2 MiB); 0 disables)     |
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.
@@ -627,8 +629,8 @@ effective values. The ordinary automatic/default intersection remains quiet. Pro
 Tokio-console artifact announcements likewise use the tracing notice target and reach master output
 only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
 `RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
-errors. Wire revision 10 protects the readiness, directory lifetime, and preview-only daemon startup
-contracts and requires matching binaries.
+errors. Wire revision 11 additionally protects receiver-buffer retention startup configuration and
+requires matching binaries.
 
 ### Network Profiles
 

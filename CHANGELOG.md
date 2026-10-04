@@ -28,6 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reuse initialized receiver copy buffers across files on each remote data connection. Retention
+  defaults to the smaller of the copy chunk and 2 MiB, allocated lazily; configure it with
+  `--remote-copy-buffer-retention-limit=SIZE` (`0` disables reuse). Larger I/O chunks remain
+  unchanged and use temporary storage above the retention limit. Advance the remote compatibility
+  revision to 11 for the new daemon startup argument, requiring matching `rcp`/`rcpd` binaries.
+
 - Raise the soft descriptor limit to the inherited hard limit during tool and daemon startup,
   without changing the hard limit or logical file-work concurrency. If the raise fails, warn with
   the operating-system cause and retain admission based on the original soft limit.
@@ -58,15 +64,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without retrying a partially sent Done. Flush queued lifetime releases in bounded batches between
   valid control frames while preserving buffered framing-error priority and any pending decoder.
 
-- Advance the remote compatibility revision to 10 for single-pass parallel source discovery,
+- Advance the remote compatibility revision to 11 for single-pass parallel source discovery,
   explicit directory Begin/Ready/End completion, lifetime admission and release, pipelined reserved
-  subtrees, and preview-only daemon startup. Source timings expose `source.discovery`,
-  `source.directory.scan`, `source.directory.wait_ready`, `source.directory.wait_release`,
-  `source.directory.wait_resources`, `source.discovery.wait_credit`, and `source.files.drain` in
-  place of the `source.pass1` and `source.pass2` scope families. Directory descriptor admission
-  bounds parallel traversal overhead while reserving an inline scan with pipelined completion for
-  progress under pressure. Files already proven unchanged by a complete destination manifest bypass
-  transfer-task admission.
+  subtrees, preview-only daemon startup, and receiver buffer-retention configuration. Source timings
+  expose `source.discovery`, `source.directory.scan`, `source.directory.wait_ready`,
+  `source.directory.wait_release`, `source.directory.wait_resources`,
+  `source.discovery.wait_credit`, and `source.files.drain` in place of the `source.pass1` and
+  `source.pass2` scope families. Directory descriptor admission bounds parallel traversal overhead
+  while reserving an inline scan with pipelined completion for progress under pressure. Files
+  already proven unchanged by a complete destination manifest bypass transfer-task admission.
 - Let `just test` and `just test-release` forward arguments to nextest. Split each Depot native test
   configuration across two shards, with the native Arm ABI smoke check on the first Arm shard.
 - Make host build, test, lint, and documentation entrypoints default to the host architecture's musl

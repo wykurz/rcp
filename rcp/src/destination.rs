@@ -106,6 +106,7 @@ struct DataConnectionPool {
     /// reading for as long as its iops reservation makes it wait, and a user timeout cannot tell
     /// that from a dead peer.
     keepalive_sec: u64,
+    copy_buffer_retention_limit: usize,
     /// Semaphore to limit concurrent connections
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// Optional TLS connector for encrypted connections
@@ -121,19 +122,18 @@ impl DataConnectionPool {
     fn new(
         data_addr: std::net::SocketAddr,
         max_connections: usize,
-        network_profile: remote::NetworkProfile,
-        keepalive_sec: u64,
+        tcp_config: &remote::TcpConfig,
         tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
-        conn_timeout_sec: u64,
         shutdown: ReceiverShutdown,
     ) -> Self {
         Self {
             data_addr,
-            network_profile,
-            keepalive_sec,
+            network_profile: tcp_config.network_profile,
+            keepalive_sec: tcp_config.keepalive_sec,
+            copy_buffer_retention_limit: tcp_config.effective_buffer_retention_limit(),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
             tls_connector,
-            conn_timeout: std::time::Duration::from_secs(conn_timeout_sec),
+            conn_timeout: std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
             shutdown,
         }
     }
@@ -175,6 +175,12 @@ impl DataConnectionPool {
             "data",
         )
         .await?;
+        let recv_stream =
+            recv_stream.with_copy_buffer_retention_limit(self.copy_buffer_retention_limit);
+        tracing::debug!(
+            copy_buffer_retention_limit = recv_stream.copy_buffer_retention_limit(),
+            "configured receiver data stream"
+        );
         Ok(recv_stream)
     }
 }
@@ -1961,10 +1967,8 @@ pub async fn run_destination(
     let data_pool = std::sync::Arc::new(DataConnectionPool::new(
         *src_data_addr,
         concurrency.max_connections().get(),
-        tcp_config.network_profile,
-        tcp_config.keepalive_sec,
+        tcp_config,
         tls_connector,
-        tcp_config.conn_timeout_sec,
         directory_tracker.shutdown().clone(),
     ));
     // one operation-level indirection bounds the nested receiver layout in rcpd's watchdog
@@ -4416,12 +4420,50 @@ mod teardown_tests {
         std::sync::Arc::new(DataConnectionPool::new(
             "127.0.0.1:1".parse().unwrap(),
             1,
-            remote::NetworkProfile::default(),
-            remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+            &remote::TcpConfig {
+                keepalive_sec: remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+                conn_timeout_sec: 1,
+                ..Default::default()
+            },
             None,
-            1,
             tracker.shutdown().clone(),
         ))
+    }
+
+    #[tokio::test]
+    async fn data_pool_applies_buffer_retention_to_connected_receiver() {
+        for (chunk, limit, expected) in [
+            (None, None, 2 * 1024 * 1024),
+            (Some(4096), None, 4096),
+            (None, Some(0), 0),
+            (None, Some(262144), 262144),
+            (None, Some(16 * 1024 * 1024), 16 * 1024 * 1024),
+        ] {
+            let tcp = remote::TcpConfig {
+                buffer_size: chunk,
+                buffer_retention_limit: limit,
+                ..Default::default()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tracker = tracker_over_sink();
+            let pool = DataConnectionPool::new(
+                listener.local_addr().unwrap(),
+                1,
+                &tcp,
+                None,
+                tracker.shutdown().clone(),
+            );
+            let (receiver, peer) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    pool.connect_and_handshake(),
+                    remote::accept_tcp_data(&listener, tcp.network_profile, tcp.keepalive_sec)
+                )
+            })
+            .await
+            .unwrap();
+            let _peer = peer.unwrap();
+            assert_eq!(receiver.unwrap().copy_buffer_retention_limit(), expected);
+        }
     }
 
     #[tokio::test]
@@ -4453,10 +4495,12 @@ mod teardown_tests {
         let pool = DataConnectionPool::new(
             listener.local_addr().unwrap(),
             1,
-            remote::NetworkProfile::default(),
-            0,
+            &remote::TcpConfig {
+                keepalive_sec: 0,
+                conn_timeout_sec: 60,
+                ..Default::default()
+            },
             Some(Arc::new(tokio_rustls::TlsConnector::from(config))),
-            60,
             tracker.shutdown().clone(),
         );
         let admission = tracker
@@ -4666,10 +4710,12 @@ mod teardown_tests {
             let pool = Arc::new(DataConnectionPool::new(
                 listener.local_addr().unwrap(),
                 1,
-                remote::NetworkProfile::default(),
-                remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+                &remote::TcpConfig {
+                    keepalive_sec: remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+                    conn_timeout_sec: 1,
+                    ..Default::default()
+                },
                 None,
-                1,
                 tracker.shutdown().clone(),
             ));
             let source = async {
@@ -5188,10 +5234,12 @@ mod teardown_tests {
         let pool = Arc::new(DataConnectionPool::new(
             listener.local_addr().unwrap(),
             1,
-            remote::NetworkProfile::default(),
-            0,
+            &remote::TcpConfig {
+                keepalive_sec: 0,
+                conn_timeout_sec: 5,
+                ..Default::default()
+            },
             None,
-            5,
             tracker.shutdown().clone(),
         ));
         let worker_owner = Arc::downgrade(&pool);
