@@ -11,7 +11,7 @@ from pathlib import Path
 
 from benchmarks.strict_json import parse_json
 from benchmarks.timings import require_roles, validate_report
-from benchmarks import operations, transport, sanitized
+from benchmarks import operations, transport, sanitized, changes
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -364,7 +364,8 @@ def load_results(path):
 
 def render(input_path, output):
     """Write history.json and a self-contained dashboard after validation."""
-    runs = load_results(input_path)
+    runs, sources = load_result_records(input_path)
+    evidence = changes.build(runs, sources)
     history = {"schema_version": 1, "runs": runs}
     embedded = json.dumps(history, ensure_ascii=False, separators=(",", ":"))
     for literal, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
@@ -374,6 +375,8 @@ def render(input_path, output):
     output.mkdir(parents=True, exist_ok=True)
     (output / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (output / "index.html").write_text(page, encoding="utf-8")
+    (output / "changes.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    (output / "changes.md").write_text(changes.markdown(evidence, runs), encoding="utf-8")
 
 
 def main(argv=None):

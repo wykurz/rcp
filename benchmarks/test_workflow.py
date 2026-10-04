@@ -157,6 +157,10 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             "retention-days": 1, "if-no-files-found": "error",
         })
         render = next(step for step in steps if step.get("name") == "Render history using trusted main-branch code")
+        summarize = next(step for step in steps if step.get("name") == "Summarize historical changes")
+        self.assertEqual(summarize["env"]["REPORT_URL"], "${{ steps.deployment.outputs.page_url }}")
+        deployment = next(step for step in steps if step.get("id") == "deployment")
+        self.assertLess(steps.index(deployment), steps.index(summarize))
         package = next(step for step in steps if step.get("name") == "Package dashboard for Pages")
         self.assertLess(steps.index(render), steps.index(package))
         self.assertLess(steps.index(package), steps.index(upload))
@@ -171,6 +175,14 @@ class BenchmarkWorkflowTests(unittest.TestCase):
                 ["bash", "-e", "-c", render["run"]], cwd=root, env=environment,
                 capture_output=True, text=True, check=True, timeout=10,
             )
+            environment.update(REPORT_URL="https://example.test/rcp/", GITHUB_STEP_SUMMARY=str(root / "job-summary"))
+            subprocess.run(
+                ["bash", "-e", "-c", summarize["run"]], cwd=root, env=environment,
+                capture_output=True, text=True, check=True, timeout=10,
+            )
+            summary = (root / "job-summary").read_text()
+            self.assertIn(f"(https://example.test/rcp/index.html#run-{record['run_id']})", summary)
+            self.assertNotIn("(index.html#", summary)
             site = root / "_site"
             (site / "linked-index.html").symlink_to("index.html")
             os.link(site / "index.html", site / "hardlinked-index.html")
@@ -185,7 +197,7 @@ class BenchmarkWorkflowTests(unittest.TestCase):
                 members = archive.getmembers()
                 self.assertTrue(all(not member.issym() and not member.islnk() for member in members))
                 self.assertEqual({member.name.removeprefix("./") for member in members if member.isfile()}, {
-                    "index.html", "history.json", "linked-index.html", "hardlinked-index.html",
+                    "index.html", "history.json", "changes.json", "changes.md", "linked-index.html", "hardlinked-index.html",
                 })
                 for filename in ("index.html", "linked-index.html", "hardlinked-index.html"):
                     self.assertEqual(archive.extractfile(f"./{filename}").read(), (site / "index.html").read_bytes())
