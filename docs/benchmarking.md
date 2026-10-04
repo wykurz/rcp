@@ -415,35 +415,69 @@ just benchmark-report /path/to/history-checkout --output /tmp/rcp-history-site
 
 ## Automatic change reports
 
-Every `just benchmark-report` now writes `changes.json` and `changes.md` beside the dashboard. The
-existing Pages publication renders the full immutable history, publishes these files, and adds the
-Markdown report to its CI job summary. The dashboard links to both files. This consumes already
-collected measurements: it adds no copy runs, timing gate, new schedule, or service. Standalone
-single-run artifacts contain the same report, usually with no historical reference.
+The default HTML mode of `just benchmark-report` writes a browsable `changes.html`, `changes.json`
+and `changes.md` beside the dashboard. `--format sanitized-json` writes only the sanitized
+`export.json`. The existing Pages publication renders the full immutable history, publishes the HTML
+report and evidence JSON, and adds the Markdown report to its CI job summary. The HTML report and
+Markdown summary share an HTML-table renderer; metadata stays literal inside code elements. A failed
+Pages deployment still produces the job summary after successful rendering, with unlinked run IDs
+when no deployment URL is available. The dashboard links to the browsable report and evidence JSON.
+This consumes already collected measurements: it adds no copy runs, timing gate, new schedule, or
+service. Standalone single-run artifacts contain the same report, usually with no historical
+reference.
 
 For each completed case/variant, the report selects the most recent strictly earlier observation
 with the same recorded series ID, repository, case and variant. The existing series contract binds
 the workload, flags, reference binaries, cache, topology, timing collection and machine context.
 Smoke runs, running producers, dirty trees, unknown revisions and missing or unqualified repository
 identities cannot supply comparisons or references. Repository identity must be an explicit
-`owner/repo` value; unknown local origins are not pooled together. Completed cases from terminal
-failed runs remain eligible and carry their enclosing failure status. Equal timestamps do not
-establish ordering; an ambiguous latest reference produces no ratio. A changed contract starts a new
-series and explicitly reports no compatible reference.
+`owner/repo` value; unknown local origins are not pooled together. Set
+`GITHUB_REPOSITORY=owner/repo` in the environment of `just benchmark-run` before collecting local
+results. The publisher `--repository` argument chooses the publication destination; it does not
+stamp or repair producer records. Existing records with unknown origins remain reportable but cannot
+be compared.
+
+A qualified checkout revision is a clean tree with a hexadecimal commit ID. This is the harness
+checkout revision, not proof of the source revision of externally supplied `--bin-dir` binaries.
+Reference cells show the recorded checkout revision and timestamp; equal revisions are labeled "same
+recorded checkout revision". Inspect binary hashes before treating these as identical builds.
+Completed cases from terminal failed runs remain eligible and carry their enclosing failure status.
+Equal timestamps do not establish ordering; an ambiguous latest reference produces no ratio. A
+changed contract starts a new series and explicitly reports no compatible reference.
 
 The ratio is **current median / reference median**: above one is slower. The report retains both raw
-repeat sets, medians, ranges, revision pins, run IDs, exact original input SHA256 hashes and
-zero-based trial indices into `history.json`. It does not pool repeats across runs. Short samples
-and missing scoped timings stay visible. The JSON retains every run, including failures before a
-completed case; the Markdown summary shows the latest ten runs to bound CI output.
+repeat sets, medians, ranges, checkout revision pins, run IDs, exact original input SHA256 hashes
+and zero-based trial indices into `history.json`. Source identifiers are content-addressed as
+`sha256:<digest>`, independent of input filenames or enumeration order. It does not pool repeats
+across runs. Short performance samples identify the current or reference side. Timing statuses
+remain explicit: `coarse`, `disabled`, `unsupported`, `not_applicable`, or `missing-legacy` for old
+records. Nonpositive or unrepresentable ratios are withheld. The JSON and browsable HTML retain
+every run, including failures before a completed case; the Markdown summary shows the latest ten
+runs to bound CI output.
+
+The dashboard trend chart remains descriptive: it includes all performance observations, including
+dirty/unknown revisions or records missing repository identity that the historical report excludes.
+Its same-run speedup is reference-tool median / rcp median (above one is faster). The historical
+report instead uses current / previous median (above one is slower); these answer different
+questions.
 
 These are **unpaired historical observations**, not evidence that a code change caused a regression.
 Matching recorded environments cannot eliminate noisy storage or host contention. Range overlap is
 not a statistical test and a narrow range does not establish between-run stability. No numeric
 change changes the CI exit code; malformed evidence still fails reporting. Original immutable JSON
 remains on `benchmark-history` after the 90-day raw artifact lifetime. Reports are reproducible
-derivatives of those records, regenerated on publication. Full HTML/JSON reports have the same
-privacy scope as existing history; use the sanitized export when sharing private runs.
+derivatives of the available history snapshot, regenerated on publication. Reference selection uses
+producer start time, not publication order: a late-arriving record can become the reference for an
+already reported run and change that derived comparison. Measurements are immutable; comparisons are
+not an append-only ledger. Preserve the report snapshot if an exact previous comparison must be
+retained.
+
+Selected case composition/order and repeat counts are not part of the existing per-case series
+identity. The report records case order, shows repeat counts and flags differences between a pair,
+but does not claim that earlier cases have no effect on later ones. Compare matching run composition
+when confirming a change; splitting series by composition requires a separate compatibility-policy
+decision. Full HTML/JSON reports have the same privacy scope as existing history; use the sanitized
+export when sharing private runs.
 
 Triage a concerning observation in this order:
 
@@ -487,10 +521,12 @@ Use Depot as a coarse screen while calibrating repeated same-commit pairs. A ded
 fast-NIC servers would add physical-network and controlled storage coverage; evaluate that benefit
 against observed Depot variance, utilization, maintenance and quoted runner/storage/retention costs.
 No dedicated runners, new permissions, credentials, paid services, or additional recurring jobs are
-provisioned by this reporting change. The existing weekly schedule and 90-day artifact retention
-remain in place. CI run URLs in older records may be empty; run IDs, commits, binary fingerprints
-and input hashes remain the durable evidence keys, not a promise that expired raw logs are
-recoverable.
+required for this reporting workflow. The weekly schedule and 90-day artifact retention remain in
+place. Producer run URLs come only from `BENCHMARK_RUN_URL`, which the current workflows do not set;
+new records as well as older ones can therefore have empty URLs. A caller can set that environment
+variable to a verified run URL when collecting evidence. Run IDs, checkout commits, binary
+fingerprints and input hashes remain the durable evidence keys, not a promise that expired raw logs
+are recoverable.
 
 ## CI and stability
 

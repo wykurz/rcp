@@ -357,11 +357,6 @@ def load_result_records(path):
     return sorted(by_id.values(), key=lambda run: (dt.datetime.fromisoformat(run["timestamp"].replace("Z", "+00:00")), run["run_id"])), sources
 
 
-def load_results(path):
-    """Load one result or an immutable history tree, deduplicated by run ID."""
-    return load_result_records(path)[0]
-
-
 def render(input_path, output):
     """Write history.json and a self-contained dashboard after validation."""
     runs, sources = load_result_records(input_path)
@@ -372,11 +367,17 @@ def render(input_path, output):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
     page = template.replace("__HISTORY_JSON__", embedded)
+    # serialize every representation before publishing any output files
+    files = {
+        "history.json": json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+        "index.html": page,
+        "changes.json": json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        "changes.md": changes.markdown(evidence),
+        "changes.html": changes.html_report(evidence),
+    }
     output.mkdir(parents=True, exist_ok=True)
-    (output / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (output / "index.html").write_text(page, encoding="utf-8")
-    (output / "changes.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    (output / "changes.md").write_text(changes.markdown(evidence, runs), encoding="utf-8")
+    for name, content in files.items():
+        (output / name).write_text(content, encoding="utf-8")
 
 
 def main(argv=None):
