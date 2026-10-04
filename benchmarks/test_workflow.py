@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from benchmarks.test_publish import result as publication_result
+from benchmarks.test_changes import Fragment, observation
 
 
 class BenchmarkWorkflowTests(unittest.TestCase):
@@ -159,6 +160,8 @@ class BenchmarkWorkflowTests(unittest.TestCase):
         render = next(step for step in steps if step.get("name") == "Render history using trusted main-branch code")
         summarize = next(step for step in steps if step.get("name") == "Summarize historical changes")
         self.assertEqual(summarize["env"]["REPORT_URL"], "${{ steps.deployment.outputs.page_url }}")
+        self.assertEqual(summarize["if"], "always() && steps.render.outcome == 'success'")
+        self.assertEqual(render["id"], "render")
         deployment = next(step for step in steps if step.get("id") == "deployment")
         self.assertLess(steps.index(deployment), steps.index(summarize))
         package = next(step for step in steps if step.get("name") == "Package dashboard for Pages")
@@ -168,7 +171,10 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             root = Path(directory)
             history = root / "benchmark-history-data" / "runs"
             history.mkdir(parents=True)
-            record = publication_result("1" * 32)
+            before = observation("1", "2026-09-26T12:00:00Z")
+            record = observation("2", "2026-09-27T12:00:00Z")
+            record["context"]["runner_label"] = "literal (index.html#run-metadata)"
+            (history / "before.json").write_text(json.dumps(before))
             (history / "run.json").write_text(json.dumps(record))
             environment = {**os.environ, "PYTHONPATH": str(project), "RUNNER_TEMP": str(root)}
             subprocess.run(
@@ -181,8 +187,19 @@ class BenchmarkWorkflowTests(unittest.TestCase):
                 capture_output=True, text=True, check=True, timeout=10,
             )
             summary = (root / "job-summary").read_text()
-            self.assertIn(f"(https://example.test/rcp/index.html#run-{record['run_id']})", summary)
-            self.assertNotIn("(index.html#", summary)
+            parsed = Fragment(summary)
+            reference = parsed.rows()[0][4]
+            self.assertEqual(reference["children"][0]["attrs"]["href"], "https://example.test/rcp/index.html#run-" + before["run_id"])
+            self.assertIn(before["timestamp"], parsed.text(reference))
+            self.assertTrue(all(link["attrs"]["href"].startswith("https://example.test/rcp/index.html#run-") for link in parsed.elements("a")))
+            self.assertIn("literal (index.html#run-metadata)", summary)
+            # a failed deployment has no URL; the always() summary still retains the numeric evidence
+            environment.update(REPORT_URL="", GITHUB_STEP_SUMMARY=str(root / "failed-deploy-summary"))
+            subprocess.run(["bash", "-e", "-c", summarize["run"]], cwd=root, env=environment, capture_output=True, text=True, check=True, timeout=10)
+            fallback = Fragment((root / "failed-deploy-summary").read_text())
+            self.assertFalse(fallback.elements("a"))
+            self.assertIn(before["run_id"], fallback.text(fallback.rows()[0][4]))
+            self.assertEqual(fallback.text(fallback.rows()[0][3]), "1.000x (+0.0%)")
             site = root / "_site"
             (site / "linked-index.html").symlink_to("index.html")
             os.link(site / "index.html", site / "hardlinked-index.html")
@@ -197,11 +214,11 @@ class BenchmarkWorkflowTests(unittest.TestCase):
                 members = archive.getmembers()
                 self.assertTrue(all(not member.issym() and not member.islnk() for member in members))
                 self.assertEqual({member.name.removeprefix("./") for member in members if member.isfile()}, {
-                    "index.html", "history.json", "changes.json", "changes.md", "linked-index.html", "hardlinked-index.html",
+                    "index.html", "history.json", "changes.json", "changes.md", "changes.html", "linked-index.html", "hardlinked-index.html",
                 })
                 for filename in ("index.html", "linked-index.html", "hardlinked-index.html"):
                     self.assertEqual(archive.extractfile(f"./{filename}").read(), (site / "index.html").read_bytes())
-                self.assertEqual(json.load(archive.extractfile("./history.json")), {"schema_version": 1, "runs": [record]})
+                self.assertEqual(json.load(archive.extractfile("./history.json")), {"schema_version": 1, "runs": [before, record]})
 
 
 if __name__ == "__main__":

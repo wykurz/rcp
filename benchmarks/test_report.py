@@ -95,7 +95,7 @@ const document = {getElementById: id => ids[id], createElement: tag => new Eleme
 vm.runInNewContext(code, {document});
 const descendants = element => [element, ...element.children.flatMap(descendants)];
 const chart = descendants(ids.chart), rows = descendants(ids["run-rows"]);
-console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), tooltips: chart.filter(item => item.tagName === "title").map(item => item.textContent), table: rows.map(item => item.textContent).join(" "), comparisons: ids["run-rows"].children.map(row => row.children[4].textContent)}));
+console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id), points: chart.filter(item => item.tagName === "circle").length, lines: chart.filter(item => item.tagName === "polyline").length, labels: descendants(ids.legend).map(item => item.textContent).join(" "), tooltips: chart.filter(item => item.tagName === "title").map(item => item.textContent), table: rows.map(item => item.textContent).join(" "), comparisons: ids["run-rows"].children.map(row => row.children[4].textContent)}));
 '''
         process = subprocess.run(["node", "-e", script, str(output / "index.html")], capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)
@@ -115,6 +115,7 @@ console.log(JSON.stringify({points: chart.filter(item => item.tagName === "circl
         self.assertIn("tiny-10k", page)
         self.assertNotIn("<script src=", page)
         self.assertNotIn("<link href=", page)
+        self.assertEqual(self.dashboard_state(output)["runIds"], ["run-" + run["run_id"]])
 
     def test_history_keeps_incompatible_series_and_failed_runs_visible(self):
         first = sample_run()

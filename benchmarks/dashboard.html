@@ -64,10 +64,10 @@
   </header>
   <main>
     <div class="topline"><div class="stats" id="stats"></div><a class="download" href="history.json" download>Download raw history JSON ↓</a></div>
-    <p class="subtle">Automatic historical comparisons: <a href="changes.md">read the change report</a> · <a href="changes.json" download>download comparison evidence</a>. Matching series only; historical changes are advisory and need paired confirmation.</p>
+    <p class="subtle">Automatic historical comparisons: <a href="changes.html">read the change report</a> · <a href="changes.json" download>download comparison evidence</a>. Historical changes require matching repository and series identities plus clean, known checkout revisions and terminal producers. Current/reference ratios above 1× are slower; paired confirmation is required.</p>
     <section aria-labelledby="chart-heading">
       <h2 id="chart-heading">Walltime over time</h2>
-      <p class="subtle">Select a case, variant, machine group, and exact series. Points show the median; hover for run details.</p>
+      <p class="subtle">Select a case, variant, machine group, and exact series. Points show the median; hover for run details. These descriptive trends include all performance observations, including records excluded from historical comparisons for unknown/dirty revisions or missing repository identity.</p>
       <div class="controls">
         <label>Case<select id="case-filter"></select></label>
         <label>Variant<select id="variant-filter"></select></label>
@@ -80,7 +80,7 @@
     </section>
     <section aria-labelledby="runs-heading">
       <h2 id="runs-heading">Runs</h2>
-      <p class="subtle">Smoke runs stay in this table and are excluded from trends and ratios. A completed case from a later failed performance run still appears in the chart; incomplete cases have no point. Ratios compare medians from the same run and case; above 1× means rcp was faster. Expand a row for its measurement context and diagnostic.</p>
+      <p class="subtle">Smoke runs stay in this table and are excluded from trends and ratios. A completed case from a later failed performance run still appears in the chart; incomplete cases have no point. Same-run speedups use reference-tool median / rcp median for the same case; above 1× means rcp was faster. Historical change ratios on the linked report use current / previous median; above 1× means slower. Expand a row for its measurement context and diagnostic.</p>
       <div class="table-wrap"><table><thead><tr><th>Date (UTC)</th><th>Result</th><th>Revision</th><th>Machine / policy</th><th>rcp vs references</th><th>Details</th></tr></thead><tbody id="run-rows"></tbody></table></div>
     </section>
   </main>

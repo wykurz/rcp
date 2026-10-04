@@ -36,6 +36,7 @@ jobs:
           path: benchmark-history-data
           persist-credentials: false
       - name: Render history using trusted main-branch code
+        id: render
         run: python3 -m benchmarks.report benchmark-history-data --output _site
       # package directly because upload-pages-artifact pins its nested action to a tag
       - name: Package dashboard for Pages
@@ -52,15 +53,17 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
       - name: Summarize historical changes
+        if: always() && steps.render.outcome == 'success'
         env:
           REPORT_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
           python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
-          report = Path("_site/changes.md").read_text(encoding="utf-8")
-          url = os.environ["REPORT_URL"].rstrip("/")
-          report = report.replace("(index.html#run-", f"({url}/index.html#run-")
+          from benchmarks import changes
+          evidence = json.loads(Path("_site/changes.json").read_text(encoding="utf-8"))
+          report = changes.markdown(evidence, link_base=os.environ.get("REPORT_URL") or None)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(report)
           PY
