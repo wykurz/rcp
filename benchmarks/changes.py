@@ -3,6 +3,7 @@
 import datetime as dt
 import html
 import math
+import re
 
 
 POLICY = "previous-compatible-terminal-clean-run-v1"
@@ -17,7 +18,8 @@ def exclusion(run):
         return "not-performance"
     if run["status"] == "running":
         return "producer-running"
-    if not isinstance(run["context"].get("repository", ""), str):
+    repository = run["context"].get("repository")
+    if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         return "unqualified-repository"
     if run["revision"]["dirty"] is not False or not run["revision"].get("commit"):
         return "unqualified-revision"
@@ -26,7 +28,7 @@ def exclusion(run):
 
 def identity(run, summary):
     # series IDs already bind workload, tools, environment and measurement contracts
-    return (run["context"].get("repository", ""), summary["series_id"], summary["case_id"], summary["variant_id"])
+    return (run["context"]["repository"], summary["series_id"], summary["case_id"], summary["variant_id"])
 
 
 def point(run, summary, sources):

@@ -14,7 +14,7 @@ from benchmarks.test_report import sample_run
 
 def observation(identifier, stamp, samples=(20, 22, 24)):
     run = sample_run(identifier * 32, stamp)
-    run["context"]["purpose"] = "performance"
+    run["context"].update(purpose="performance", repository="test/rcp")
     for trial, seconds in zip(run["trials"], samples):
         trial["elapsed_seconds"] = seconds
     summary = run["summaries"][0]
@@ -112,6 +112,7 @@ class ChangeTests(unittest.TestCase):
 
     def test_legacy_performance_and_short_reference_are_explicit(self):
         self.before = sample_run()
+        self.before["context"]["repository"] = "test/rcp"
         evidence = self.evidence(self.before, self.after)
         row = evidence["changes"][-1]
         self.assertEqual(row["status"], "compared")
@@ -164,6 +165,22 @@ class ChangeTests(unittest.TestCase):
                 evidence = self.evidence(self.before, run)
                 self.assertEqual(evidence["changes"][-1]["status"], expected)
                 self.assertIn(expected, changes.markdown(evidence, [self.before, run]))
+
+    def test_missing_or_unqualified_repository_never_compares_or_becomes_a_reference(self):
+        for repository in (None, "", " ", "rcp", "/tmp/owner/rcp", "owner/rcp/extra"):
+            with self.subTest(repository=repository):
+                unknown = copy.deepcopy(self.before)
+                later = copy.deepcopy(self.after)
+                for run in (unknown, later):
+                    if repository is None:
+                        del run["context"]["repository"]
+                    else:
+                        run["context"]["repository"] = repository
+                evidence = self.evidence(unknown, later)
+                self.assertTrue(all(row["status"] == "unqualified-repository" and row["ratio"] is None for row in evidence["changes"]))
+                evidence = self.evidence(unknown, self.after)
+                self.assertEqual(evidence["changes"][-1]["status"], "no-compatible-reference")
+                self.assertIn("unqualified-repository", changes.markdown(evidence, [unknown, self.after]))
 
     def test_nonpositive_rounded_summary_does_not_crash_or_invent_a_ratio(self):
         for which in ("reference", "current"):
