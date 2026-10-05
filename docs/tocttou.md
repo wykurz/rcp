@@ -354,17 +354,20 @@ additionally re-stats each reused directory and fails closed if the restored own
 take effect (catching a backend that does not honor `chown`/`chmod`); a setgid bit that the kernel
 drops because the copier is not in the directory's group and is not privileged is reported as a
 WARNING (narrower than the source, and not a failure — matching the best-effort behavior of a
-non-strict copy). Two side effects are accepted, not hidden. First, a reused directory whose
-processing is *aborted after lockdown* — by a `--fail-early` abort, or by any per-directory error
-that returns before finalize (e.g. an enumeration failure) even *without* `--fail-early` — is left
-no wider than a successful copy's result: the local path leaves it *secured* (copier-owned at
-`0o700`), while the remote path may instead have already restored it to its transparent final state
-(source mode with the original/source owner). The lockdown restricts the mode to `0o700` immediately
-after taking ownership, and the takeover is VERIFIED (uid + exactly `0o700`) before any further
-step, so on a filesystem that honors these syscalls any later failure leaves the directory secured.
-Three exceptions still fail closed (no child written) but leave the directory no narrower than
-requested — possibly its ORIGINAL, pre-lockdown mode, which may be wider than the `0o700` a mid-copy
-directory holds (though never wider than the directory already was before rcp ran): (1) the
+non-strict copy). Two side effects are accepted, not hidden. First, a local reused directory whose
+processing is *aborted after lockdown, before metadata finalization* — for example, by a
+`--fail-early` abort — is left *secured* (copier-owned at `0o700`). A remote abort may instead leave
+a directory whose finalization already ran in its transparent final state (source mode with the
+original/source owner). A reported error does not imply that finalization was skipped: in keep-going
+mode, `rlink` collects source/update enumeration errors, drains all started workers, skips that
+directory's `--delete` pass, and still attempts normal directory finalization. A retained reused
+directory can therefore have its final source/update-derived mode and original/source owner even
+though `rlink` returns an error. The lockdown restricts the mode to `0o700` immediately after taking
+ownership, and the takeover is VERIFIED (uid + exactly `0o700`) before any further step; on a
+filesystem that honors these syscalls, the directory remains secured until metadata restoration
+begins. Three exceptions still fail closed (no child written) but leave the directory no narrower
+than requested — possibly its ORIGINAL, pre-lockdown mode, which may be wider than the `0o700` a
+mid-copy directory holds (though never wider than the directory already was before rcp ran): (1) the
 restricting `chmod` fails but the ownership rollback SUCCEEDS — the directory is returned to its
 original owner and mode (the failed `chmod` changed nothing); (2) BOTH the `chmod` and the rollback
 fail (a read-only or failing backend), reported with both errnos, leaving it copier-owned at its
@@ -373,19 +376,19 @@ without unix extensions), so the verification fails. rcp cannot force a non-hono
 narrower and does not retain the directory's original mode to re-restrict — and it does not chown a
 secured directory back to the prior owner (that would re-widen) — so it reports the true observed
 owner/mode and leaves repair to the operator. Restoration is likewise deliberately *not* forced onto
-the normal abort paths: doing so would re-widen the directory (chown it back to the prior owner and
-re-apply the source mode) while its children may be incomplete — the opposite of failing closed. On
-a honoring backend the secured `0o700` is the outcome and no abort yields a wider directory than the
-mid-copy state; the exceptions above only ever return the directory toward the state it already had.
-The directory's snapshotted **default ACL** is the one thing an abort must not merely leave alone:
-the lockdown removed it and holds the only copy of those bytes in memory, so losing it would be
-permanent data destruction rather than a permission left narrow. Its restore therefore runs from an
-RAII guard rather than from finalize alone, so every path that locks a directory and then never
-reaches finalize — a `--fail-early` abort that drops in-flight siblings, a per-directory error, a
-remote destination that fails between locking and registering — still puts it back. A failed restore
-there is logged with the directory and the ACL bytes, since a destructor cannot report an error —
-but as an ordinary `warn!`, so it needs `-v` to be seen (it is per-directory and unbounded on a mass
-abort, which is exactly what disqualifies it from the always-visible notice channel). See
+abort paths that skip metadata finalization: doing so would re-widen the directory (chown it back to
+the prior owner and re-apply the source mode) outside the normal post-order finalization path. On a
+honoring backend, an abort before metadata restoration leaves the directory secured at `0o700`; the
+exceptions above only ever return the directory toward the state it already had. The directory's
+snapshotted **default ACL** is the one thing an abort must not merely leave alone: the lockdown
+removed it and holds the only copy of those bytes in memory, so losing it would be permanent data
+destruction rather than a permission left narrow. Its restore therefore runs from an RAII guard
+rather than from finalize alone, so every path that locks a directory and then never reaches
+finalize — a `--fail-early` abort that drops in-flight siblings, a per-directory error, a remote
+destination that fails between locking and registering — still puts it back. A failed restore there
+is logged with the directory and the ACL bytes, since a destructor cannot report an error — but as
+an ordinary `warn!`, so it needs `-v` to be seen (it is per-directory and unbounded on a mass abort,
+which is exactly what disqualifies it from the always-visible notice channel). See
 [acls.md](acls.md#--require-toctou-safe-containment). Second, an actor holding a directory fd opened
 *before* the lockdown can still read the *names* of children written afterward (each child's
 contents stay protected by its own source-derived mode). This is destination-only and
