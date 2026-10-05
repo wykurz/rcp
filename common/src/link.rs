@@ -1993,11 +1993,15 @@ async fn ensure_link_admission(
 enum SourceEntries {
     Live,
     #[cfg(test)]
+    InjectedReadError(std::io::Error),
+    #[cfg(test)]
     Injected(Vec<(std::ffi::OsString, Option<EntryKind>)>),
 }
 
 enum UpdateEntries {
     Live,
+    #[cfg(test)]
+    InjectedReadError(tokio::sync::oneshot::Receiver<std::io::Error>),
     #[cfg(test)]
     Injected(Vec<(std::ffi::OsString, Option<EntryKind>)>),
 }
@@ -2032,15 +2036,6 @@ async fn link_dir_contents(
     update_entries: UpdateEntries,
 ) -> Result<Summary, Error> {
     tracing::debug!("process contents of 'src' directory");
-    let src_entries = match source_entries {
-        SourceEntries::Live => src_dir
-            .read_entries()
-            .await
-            .with_context(|| format!("cannot open directory {src_path:?} for reading"))
-            .map_err(|err| Error::new(err, base))?,
-        #[cfg(test)]
-        SourceEntries::Injected(entries) => entries,
-    };
     let mut link_summary = base;
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
@@ -2049,129 +2044,37 @@ async fn link_dir_contents(
     let mut processed_files = std::collections::HashSet::new();
     // keep-set for --delete: every spawned source/update worker folds its final exact outcome.
     let mut keep_set = DeleteNameCollector::new(settings.copy_settings.delete.as_ref());
-    // iterate through src entries and recursively call "link" on each one
-    for (entry_name, hint) in src_entries {
-        let entry_rel = rel_path.join(&entry_name);
-        let entry_path = src_path.join(&entry_name);
-        let decision = select_source_for_dispatch(hint, &entry_rel, settings, update_dir.is_some());
-        let admission = match decision {
-            SourceEntryDecision::Filtered { kind, result } => {
-                if let Some(mode) = settings.dry_run {
-                    crate::dry_run::report_skip(&entry_path, &result, mode, kind.label());
-                }
-                tracing::debug!("skipping {:?} due to filter", &entry_path);
-                link_summary = link_summary + skipped_summary_for(kind);
-                kind.inc_skipped(prog_track);
-                continue;
-            }
-            SourceEntryDecision::Dispatch(admission) => admission,
-        };
-        processed_files.insert(entry_name.clone());
-        let admission = match ensure_link_admission(
-            admission,
-            &mut join_set,
-            &mut link_summary,
-            &mut keep_set,
-            &errors,
-            settings.copy_settings.fail_early,
-            src_path,
-            dst_path,
-        )
-        .await
-        {
-            Ok(admission) => admission,
-            Err(error) => {
-                crate::walk_driver::abort_and_join(&mut join_set).await;
-                return Err(Error::new(error, link_summary));
-            }
-        };
-        // acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
-        // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
-        // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
-        // this mirrors the shared driver's incremental acquire-then-spawn loop; both reap ready
-        // workers into their exact-result folds while admission waits.
-        let src_parent = Arc::clone(src_dir);
-        let dst_parent = dst_dir.map(Arc::clone);
-        let update_parent = update_dir.map(Arc::clone);
-        let settings = settings.clone();
-        let src_root = src_root.to_owned();
-        let dst_root = dst_root.to_owned();
-        let update_root = update_root.map(std::path::Path::to_path_buf);
-        let do_link = move || async move {
-            let update_ref = update_parent
-                .as_ref()
-                .map(|dir| (dir, entry_name.as_os_str()));
-            link_internal(
-                prog_track,
-                &src_parent,
-                update_ref,
-                dst_parent.as_ref(),
-                &entry_name,
-                &src_root,
-                &dst_root,
-                update_root.as_deref(),
-                &entry_rel,
-                UpdateRootRequirement::Optional,
-                &settings,
-                is_fresh,
-                admission.into(),
-            )
-            .await
-            .map(|result| LinkTaskResult::from_link(entry_name, result))
-        };
-        crate::task_scope::spawn_tracked(&mut join_set, do_link());
-    }
-    // only process update if the path was provided and the directory is present
-    if let Some(update_dir) = update_dir {
-        let update_root = update_root.expect("update_dir present implies update_root present");
-        tracing::debug!("process contents of 'update' directory");
-        let update_entries = match update_entries {
-            UpdateEntries::Live => update_dir
-                .read_entries()
-                .await
-                .with_context(|| {
-                    format!(
-                        "cannot open directory {:?} for reading",
-                        update_path_dbg(update_root, rel_path)
-                    )
-                })
-                .map_err(|err| Error::new(err, link_summary))?,
+    // enumeration owns no workers: every fallible producer exit returns here, where the
+    // directory owns the decision to cancel or drain before pruning and finalization.
+    let enumeration_result = async {
+        let src_entries = match source_entries {
+            SourceEntries::Live => src_dir.read_entries().await,
             #[cfg(test)]
-            UpdateEntries::Injected(entries) => entries,
-        };
-        // iterate through update entries and copy names absent from src. reliable excluded hints
-        // keep their cheap skip in ordinary real runs; delete and preview runs reclassify before an
-        // observable decision. every entry that can reach copy transfers its exact handle and
-        // admission.
-        for (entry_name, hint) in update_entries {
+            SourceEntries::Injected(entries) => Ok(entries),
+            #[cfg(test)]
+            SourceEntries::InjectedReadError(error) => Err(error),
+        }
+        .with_context(|| format!("cannot open directory {src_path:?} for reading"))?;
+        // iterate through src entries and recursively call "link" on each one
+        for (entry_name, hint) in src_entries {
             let entry_rel = rel_path.join(&entry_name);
-            let update_entry_path = update_root.join(&entry_rel);
-            if processed_files.contains(&entry_name) {
-                // the source worker owns the exact joint source/update selection and reports its
-                // destination-protection decision when it completes.
-                continue;
-            }
-            let admission = match select_update_only_for_dispatch(hint, &entry_rel, settings) {
-                UpdateOnlyDispatch::Skipped { kind, result } => {
+            let entry_path = src_path.join(&entry_name);
+            let decision =
+                select_source_for_dispatch(hint, &entry_rel, settings, update_dir.is_some());
+            let admission = match decision {
+                SourceEntryDecision::Filtered { kind, result } => {
                     if let Some(mode) = settings.dry_run {
-                        crate::dry_run::report_skip(
-                            &update_entry_path,
-                            &result,
-                            mode,
-                            kind.label(),
-                        );
+                        crate::dry_run::report_skip(&entry_path, &result, mode, kind.label());
                     }
-                    tracing::debug!(
-                        "skipping update entry {:?} due to filter",
-                        &update_entry_path
-                    );
+                    tracing::debug!("skipping {:?} due to filter", &entry_path);
                     link_summary = link_summary + skipped_summary_for(kind);
                     kind.inc_skipped(prog_track);
                     continue;
                 }
-                UpdateOnlyDispatch::Dispatch(admission) => admission,
+                SourceEntryDecision::Dispatch(admission) => admission,
             };
-            let admission = match ensure_link_admission(
+            processed_files.insert(entry_name.clone());
+            let admission = ensure_link_admission(
                 admission,
                 &mut join_set,
                 &mut link_summary,
@@ -2181,42 +2084,143 @@ async fn link_dir_contents(
                 src_path,
                 dst_path,
             )
-            .await
-            {
-                Ok(admission) => admission,
-                Err(error) => {
-                    crate::walk_driver::abort_and_join(&mut join_set).await;
-                    return Err(Error::new(error, link_summary));
-                }
-            };
-            // acquire-then-IMMEDIATELY-spawn is load-bearing here for the same reason as the source
-            // loop: the worker owns authoritative classification and must be able to release the
-            // permit before scheduling waits for another one
-            let dst_entry_path = dst_path.join(&entry_name);
-            let update_parent = Arc::clone(update_dir);
+            .await?;
+            // acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
+            // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
+            // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
+            // this mirrors the shared driver's incremental acquire-then-spawn loop; both reap ready
+            // workers into their exact-result folds while admission waits.
+            let src_parent = Arc::clone(src_dir);
             let dst_parent = dst_dir.map(Arc::clone);
+            let update_parent = update_dir.map(Arc::clone);
             let settings = settings.clone();
-            let delete_scan_anchor = copy::DeleteScanAnchor::new(dst_root, &entry_rel);
-            let do_copy = move || {
-                // filter-base for the delegated copy: this update entry's path relative to the
-                // source root, so any --delete pruning inside it matches the include/exclude filter
-                // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
-                process_update_only_entry(
+            let src_root = src_root.to_owned();
+            let dst_root = dst_root.to_owned();
+            let update_root = update_root.map(std::path::Path::to_path_buf);
+            let do_link = move || async move {
+                let update_ref = update_parent
+                    .as_ref()
+                    .map(|dir| (dir, entry_name.as_os_str()));
+                link_internal(
                     prog_track,
-                    update_parent,
-                    dst_parent,
-                    entry_name,
-                    update_entry_path,
-                    dst_entry_path,
-                    entry_rel,
-                    delete_scan_anchor,
-                    settings,
+                    &src_parent,
+                    update_ref,
+                    dst_parent.as_ref(),
+                    &entry_name,
+                    &src_root,
+                    &dst_root,
+                    update_root.as_deref(),
+                    &entry_rel,
+                    UpdateRootRequirement::Optional,
+                    &settings,
                     is_fresh,
-                    admission,
+                    admission.into(),
                 )
+                .await
+                .map(|result| LinkTaskResult::from_link(entry_name, result))
             };
-            crate::task_scope::spawn_tracked(&mut join_set, do_copy());
+            crate::task_scope::spawn_tracked(&mut join_set, do_link());
         }
+        // only process update if the path was provided and the directory is present
+        if let Some(update_dir) = update_dir {
+            let update_root = update_root.expect("update_dir present implies update_root present");
+            tracing::debug!("process contents of 'update' directory");
+            let update_entries = match update_entries {
+                UpdateEntries::Live => update_dir.read_entries().await,
+                #[cfg(test)]
+                UpdateEntries::Injected(entries) => Ok(entries),
+                #[cfg(test)]
+                UpdateEntries::InjectedReadError(error) => {
+                    Err(error.await.expect("injected read error"))
+                }
+            }
+            .with_context(|| {
+                format!(
+                    "cannot open directory {:?} for reading",
+                    update_path_dbg(update_root, rel_path)
+                )
+            })?;
+            // iterate through update entries and copy names absent from src. reliable excluded hints
+            // keep their cheap skip in ordinary real runs; delete and preview runs reclassify before an
+            // observable decision. every entry that can reach copy transfers its exact handle and
+            // admission.
+            for (entry_name, hint) in update_entries {
+                let entry_rel = rel_path.join(&entry_name);
+                let update_entry_path = update_root.join(&entry_rel);
+                if processed_files.contains(&entry_name) {
+                    // the source worker owns the exact joint source/update selection and reports its
+                    // destination-protection decision when it completes.
+                    continue;
+                }
+                let admission = match select_update_only_for_dispatch(hint, &entry_rel, settings) {
+                    UpdateOnlyDispatch::Skipped { kind, result } => {
+                        if let Some(mode) = settings.dry_run {
+                            crate::dry_run::report_skip(
+                                &update_entry_path,
+                                &result,
+                                mode,
+                                kind.label(),
+                            );
+                        }
+                        tracing::debug!(
+                            "skipping update entry {:?} due to filter",
+                            &update_entry_path
+                        );
+                        link_summary = link_summary + skipped_summary_for(kind);
+                        kind.inc_skipped(prog_track);
+                        continue;
+                    }
+                    UpdateOnlyDispatch::Dispatch(admission) => admission,
+                };
+                let admission = ensure_link_admission(
+                    admission,
+                    &mut join_set,
+                    &mut link_summary,
+                    &mut keep_set,
+                    &errors,
+                    settings.copy_settings.fail_early,
+                    src_path,
+                    dst_path,
+                )
+                .await?;
+                // acquire-then-IMMEDIATELY-spawn is load-bearing here for the same reason as the source
+                // loop: the worker owns authoritative classification and must be able to release the
+                // permit before scheduling waits for another one
+                let dst_entry_path = dst_path.join(&entry_name);
+                let update_parent = Arc::clone(update_dir);
+                let dst_parent = dst_dir.map(Arc::clone);
+                let settings = settings.clone();
+                let delete_scan_anchor = copy::DeleteScanAnchor::new(dst_root, &entry_rel);
+                let do_copy = move || {
+                    // filter-base for the delegated copy: this update entry's path relative to the
+                    // source root, so any --delete pruning inside it matches the include/exclude filter
+                    // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
+                    process_update_only_entry(
+                        prog_track,
+                        update_parent,
+                        dst_parent,
+                        entry_name,
+                        update_entry_path,
+                        dst_entry_path,
+                        entry_rel,
+                        delete_scan_anchor,
+                        settings,
+                        is_fresh,
+                        admission,
+                    )
+                };
+                crate::task_scope::spawn_tracked(&mut join_set, do_copy());
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = enumeration_result {
+        if settings.copy_settings.fail_early {
+            crate::walk_driver::abort_and_join(&mut join_set).await;
+            return Err(Error::new(error, link_summary));
+        }
+        errors.push(error);
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = fold_link_task_result(
@@ -6808,6 +6812,377 @@ mod link_tests {
                             .await?;
                     assert_eq!(content, format!("upd-{}-{}", i, j));
                 }
+            }
+            Ok(())
+        }
+
+        async fn check_update_read_error(
+            fail_early: bool,
+            child_error: bool,
+        ) -> anyhow::Result<()> {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let update = root.join("update");
+            let dst = root.join("dst");
+            for path in [&src, &update, &dst] {
+                tokio::fs::create_dir(path).await?;
+            }
+            tokio::fs::write(src.join("first"), b"first").await?;
+            let (second, _socket) = if child_error {
+                tokio::fs::create_dir(src.join("sub")).await?;
+                tokio::fs::write(src.join("sub/good"), b"good").await?;
+                (
+                    "sub/good",
+                    Some(std::os::unix::net::UnixListener::bind(
+                        src.join("sub/bad.sock"),
+                    )?),
+                )
+            } else {
+                tokio::fs::write(src.join("second"), b"second").await?;
+                ("second", None)
+            };
+            tokio::fs::write(dst.join("must-survive"), b"extraneous").await?;
+            tokio::fs::set_permissions(&update, std::fs::Permissions::from_mode(0o751)).await?;
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_files_in_flight(2);
+            let resource = throttle::Resource::meta(
+                throttle::Side::Destination,
+                throttle::MetadataOp::HardLink,
+            );
+            admission.set_max_ops_in_flight(resource, 1);
+            let held_link = throttle::ops_in_flight_permit(resource).await;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let update_dir =
+                Arc::new(Dir::open_root_dir(&update, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let dst_parent =
+                Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let mut settings = common_settings(false, false);
+            settings.copy_settings.fail_early = fail_early;
+            settings.copy_settings.delete = Some(copy::DeleteSettings {
+                delete_excluded: false,
+            });
+            let progress = Box::leak(Box::new(progress::Progress::new()));
+            let (trigger_error, read_error) = tokio::sync::oneshot::channel();
+            let operation = crate::task_scope::scope_tasks(link_dir_contents(
+                progress,
+                &src_dir,
+                Some(&update_dir),
+                Some(&dst_dir),
+                Some(&dst_parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                Some(&update),
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                true,
+                false,
+                None,
+                &settings,
+                Summary {
+                    copy_summary: copy::Summary {
+                        directories_created: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                SourceEntries::Injected(vec![
+                    (std::ffi::OsString::from("first"), Some(EntryKind::File)),
+                    if child_error {
+                        (std::ffi::OsString::from("sub"), Some(EntryKind::Dir))
+                    } else {
+                        (std::ffi::OsString::from("second"), Some(EntryKind::File))
+                    },
+                ]),
+                UpdateEntries::InjectedReadError(read_error),
+            ));
+            tokio::pin!(operation);
+            // the read error is held until real source workers have started and retain both
+            // permits. the hard-link gate prevents their destination syscalls from completing.
+            let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    assert!(futures::poll!(operation.as_mut()).is_pending());
+                    let status = progress.ops.get();
+                    if status.started >= if child_error { 3 } else { 2 }
+                        && available_open_file_capacity(2) == 0
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            trigger_error
+                .send(std::io::Error::from_raw_os_error(libc::EIO))
+                .unwrap();
+            let gated_result = tokio::time::timeout(
+                std::time::Duration::from_millis(if fail_early { 1000 } else { 100 }),
+                operation.as_mut(),
+            )
+            .await;
+            let returned_while_gated = gated_result.is_ok();
+            drop(held_link);
+            let result = match gated_result {
+                Ok(result) => result,
+                Err(_) => {
+                    admission
+                        .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                        .await?
+                }
+            };
+            reacquire_all_open_file_capacity(&admission, 2).await?;
+            started.context("source workers did not start while update enumeration was pending")?;
+            assert_eq!(
+                returned_while_gated, fail_early,
+                "only fail-early may cancel pending source workers"
+            );
+            let error = result.expect_err("update enumeration must fail");
+            let message = format!("{:#}", error.source);
+            assert!(
+                message.contains(&std::io::Error::from_raw_os_error(libc::EIO).to_string()),
+                "{message}"
+            );
+            if !child_error {
+                assert!(message.contains(update.to_str().unwrap()), "{message}");
+                assert_eq!(
+                    error
+                        .source
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EIO)
+                );
+            }
+            assert_eq!(
+                error.summary.hard_links_created,
+                if fail_early { 0 } else { 2 }
+            );
+            assert_eq!(
+                error.summary.copy_summary.directories_created,
+                if child_error { 2 } else { 1 }
+            );
+            assert_eq!(error.summary.copy_summary.rm_summary.files_removed, 0);
+            assert_eq!(
+                tokio::fs::read(dst.join("must-survive")).await?,
+                b"extraneous"
+            );
+            assert_eq!(
+                tokio::fs::metadata(&dst).await?.mode() & 0o777,
+                if fail_early { 0o700 } else { 0o751 }
+            );
+            for name in ["first", second] {
+                if fail_early {
+                    assert!(!dst.join(name).exists());
+                } else {
+                    let source = tokio::fs::metadata(src.join(name)).await?;
+                    let destination = tokio::fs::metadata(dst.join(name)).await?;
+                    assert_eq!(
+                        (source.dev(), source.ino()),
+                        (destination.dev(), destination.ino())
+                    );
+                }
+            }
+            if child_error {
+                assert!(message.contains("unsupported"), "{message}");
+            }
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn update_read_error_drains_pending_source_workers() -> anyhow::Result<()> {
+            check_update_read_error(false, false).await
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn update_read_error_folds_failed_child_partial_summary() -> anyhow::Result<()> {
+            check_update_read_error(false, true).await
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn update_read_error_fail_early_cancels_pending_source_workers() -> anyhow::Result<()>
+        {
+            check_update_read_error(true, false).await
+        }
+
+        #[tokio::test]
+        async fn source_read_error_finalizes_without_dispatching_update_entries()
+        -> anyhow::Result<()> {
+            use std::os::unix::fs::MetadataExt as _;
+
+            for with_update in [false, true] {
+                for fail_early in [false, true] {
+                    let root = testutils::create_temp_dir().await?;
+                    let src = root.join("src");
+                    let update = root.join("update");
+                    let dst = root.join("dst");
+                    for path in [&src, &update, &dst] {
+                        tokio::fs::create_dir(path).await?;
+                    }
+                    tokio::fs::write(src.join("same"), b"source").await?;
+                    tokio::fs::write(update.join("same"), b"different update").await?;
+                    tokio::fs::write(update.join("update-only"), b"update-only").await?;
+                    tokio::fs::write(dst.join("must-survive"), b"extraneous").await?;
+                    for (path, mode) in [(&src, 0o750), (&update, 0o751), (&dst, 0o700)] {
+                        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                            .await?;
+                    }
+                    let src_dir =
+                        Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+                    let update_dir = Arc::new(
+                        Dir::open_root_dir(&update, false, congestion::Side::Source).await?,
+                    );
+                    let dst_dir = Arc::new(
+                        Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?,
+                    );
+                    let dst_parent = Arc::new(
+                        Dir::open_root_dir(&root, false, congestion::Side::Destination).await?,
+                    );
+                    let mut settings = common_settings(false, false);
+                    settings.copy_settings.fail_early = fail_early;
+                    settings.copy_settings.delete = Some(copy::DeleteSettings {
+                        delete_excluded: false,
+                    });
+                    let error = crate::task_scope::scope_tasks(link_dir_contents(
+                        &PROGRESS,
+                        &src_dir,
+                        with_update.then_some(&update_dir),
+                        Some(&dst_dir),
+                        Some(&dst_parent),
+                        std::ffi::OsStr::new("dst"),
+                        &src,
+                        &dst,
+                        with_update.then_some(update.as_path()),
+                        std::path::Path::new(""),
+                        &src,
+                        &dst,
+                        true,
+                        false,
+                        None,
+                        &settings,
+                        Summary {
+                            copy_summary: copy::Summary {
+                                directories_created: 1,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        SourceEntries::InjectedReadError(std::io::Error::from_raw_os_error(
+                            libc::EIO,
+                        )),
+                        UpdateEntries::Live,
+                    ))
+                    .await
+                    .expect_err("source enumeration must fail");
+                    assert!(format!("{:#}", error.source).contains(src.to_str().unwrap()));
+                    assert_eq!(
+                        error
+                            .source
+                            .downcast_ref::<std::io::Error>()
+                            .unwrap()
+                            .raw_os_error(),
+                        Some(libc::EIO)
+                    );
+                    assert_eq!(error.summary.copy_summary.directories_created, 1);
+                    assert_eq!(error.summary.hard_links_created, 0);
+                    assert_eq!(error.summary.copy_summary.files_copied, 0);
+                    assert_eq!(error.summary.copy_summary.rm_summary.files_removed, 0);
+                    assert!(!dst.join("same").exists());
+                    assert!(!dst.join("update-only").exists());
+                    assert_eq!(
+                        tokio::fs::read(dst.join("must-survive")).await?,
+                        b"extraneous"
+                    );
+                    assert_eq!(
+                        tokio::fs::metadata(&dst).await?.mode() & 0o777,
+                        if fail_early {
+                            0o700
+                        } else if with_update {
+                            0o751
+                        } else {
+                            0o750
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn source_read_error_finishes_empty_directory_cleanup() -> anyhow::Result<()> {
+            for dry_run in [false, true] {
+                let root = testutils::create_temp_dir().await?;
+                let src = root.join("src");
+                let dst = root.join("dst");
+                let dst_sub = dst.join("sub");
+                tokio::fs::create_dir(&src).await?;
+                tokio::fs::create_dir(&dst).await?;
+                if !dry_run {
+                    tokio::fs::create_dir(&dst_sub).await?;
+                }
+                let src_dir =
+                    Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+                let dst_parent =
+                    Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+                let dst_dir = if dry_run {
+                    None
+                } else {
+                    Some(Arc::new(
+                        Dir::open_root_dir(&dst_sub, false, congestion::Side::Destination).await?,
+                    ))
+                };
+                let mut settings = common_settings(false, false);
+                let mut filter = crate::filter::FilterSettings::new();
+                filter.add_include("*.match")?;
+                settings.filter = Some(filter.clone());
+                settings.copy_settings.filter = Some(filter);
+                settings.dry_run = dry_run.then_some(crate::config::DryRunMode::Brief);
+                settings.copy_settings.dry_run = settings.dry_run;
+                let error = crate::task_scope::scope_tasks(link_dir_contents(
+                    &PROGRESS,
+                    &src_dir,
+                    None,
+                    dst_dir.as_ref(),
+                    (!dry_run).then_some(&dst_parent),
+                    std::ffi::OsStr::new("sub"),
+                    &src,
+                    &dst,
+                    None,
+                    std::path::Path::new("sub"),
+                    &src,
+                    &dst_sub,
+                    true,
+                    true,
+                    None,
+                    &settings,
+                    Summary {
+                        copy_summary: copy::Summary {
+                            directories_created: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    SourceEntries::InjectedReadError(std::io::Error::from_raw_os_error(libc::EIO)),
+                    UpdateEntries::Live,
+                ))
+                .await
+                .expect_err("cleanup must preserve the read error");
+                assert_eq!(
+                    error
+                        .source
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EIO)
+                );
+                assert_eq!(error.summary.copy_summary.directories_created, 0);
+                assert!(!dst_sub.exists());
             }
             Ok(())
         }
