@@ -17,8 +17,8 @@ use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::safedir::{self, Dir, FileMeta, Handle, RemovalSnapshot};
 use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_admitted_entry,
-    process_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, WalkVisitor,
+    process_admitted_entry, process_entry,
 };
 
 /// Error type for copy operations. See [`crate::error::OperationError`] for
@@ -90,17 +90,7 @@ where
     false
 }
 
-/// Settings controlling rsync-style `--delete` (mirror) behavior.
-///
-/// Present (`Some`) only when `--delete` was requested. `None` means the
-/// destination is never enumerated and no pruning work is done, so the default
-/// copy path pays nothing for this feature.
-#[derive(Debug, Clone)]
-pub struct DeleteSettings {
-    /// Also remove destination entries that match an exclude pattern
-    /// (rsync `--delete-excluded`). When false, excluded entries are protected.
-    pub delete_excluded: bool,
-}
+pub use crate::delete::DeleteSettings;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -795,24 +785,21 @@ impl CopyVisitor {
     /// The destination entry's name within its parent. For nested entries this equals the source
     /// `cx.name`, but for the root the source and destination basenames may differ (e.g. copying
     /// `foo` → `bar`), so the root's destination name comes from `dst_root`. Mirrors `copy_internal`.
-    // copy's `Error` carries a `Summary` (intrinsically large); a fallible helper returning it trips
-    // `result_large_err` only because the `Ok` variant here is a small `OsString`. The error arm is
+    // copy's `Error` carries a large `Summary`; Clippy's `result_large_err` measures only the
+    // `Err` type, independently of the borrowed success value. the error arm is
     // unreachable in practice (`copy_with_filter_base` pre-validates the root's file name and a
     // delegated `copy_child` root path always has one) — keep it as defense-in-depth.
     #[allow(clippy::result_large_err)]
-    fn dst_name_for(&self, cx: &EntryCx) -> Result<OsString, Error> {
+    fn dst_name_for<'a>(&'a self, cx: &'a EntryCx) -> Result<&'a OsStr, Error> {
         if cx.rel_path.as_os_str().is_empty() {
-            self.dst_root
-                .file_name()
-                .map(OsStr::to_owned)
-                .ok_or_else(|| {
-                    Error::new(
-                        anyhow!("copy destination {:?} has no file name", &self.dst_root),
-                        Default::default(),
-                    )
-                })
+            self.dst_root.file_name().ok_or_else(|| {
+                Error::new(
+                    anyhow!("copy destination {:?} has no file name", &self.dst_root),
+                    Default::default(),
+                )
+            })
         } else {
-            Ok(cx.name.clone())
+            Ok(&cx.name)
         }
     }
 
@@ -823,35 +810,18 @@ impl CopyVisitor {
     /// destination's own pinned directory fd, so a concurrent symlink swap cannot redirect it outside
     /// the destination.
     ///
-    /// Folds the prune's `RmSummary` into `copy_summary`. On a non-fail-early prune error it records
-    /// the error in `child_error` (surfaced later by [`Self::finalize_dir`]); it returns `Err` only
-    /// in fail-early mode or when the dry-run delete-scan open fails outright.
+    /// Folds the successful or partial prune `RmSummary` into `copy_summary` and returns any scan
+    /// or prune error. [`Self::dir_post`] decides whether to fail early or finalize the directory
+    /// before surfacing that error. The typed keep-set arrives only from successful exact
+    /// collection; failed traversal never enters here.
     async fn prune_finished_dir(
         &self,
         copy_summary: &mut Summary,
-        child_error: &mut Option<anyhow::Error>,
-        processed: &ProcessedChildren,
+        keep_set: &crate::delete::DeleteKeepSet<&[OsString]>,
         dst_dir: &Option<Arc<Dir>>,
         dst_path: &std::path::Path,
         rel_path: &std::path::Path,
-    ) -> Result<(), Error> {
-        if child_error.is_some() && self.settings.delete.is_some() {
-            tracing::warn!(
-                "skipping --delete pruning of {:?} because the copy reported errors",
-                dst_path
-            );
-        }
-        let Some(delete_settings) = &self.settings.delete else {
-            return Ok(());
-        };
-        if child_error.is_some() {
-            return Ok(());
-        }
-        // the keep-set: every source child whose final exact decision included it and whose work
-        // succeeded (special files included — they have a source counterpart so must not be pruned).
-        // this is exactly the set `copy_dir_contents` built inline before the skip-specials check.
-        let keep_set: std::collections::HashSet<OsString> =
-            processed.names().iter().cloned().collect();
+    ) -> Result<(), anyhow::Error> {
         let relative_dir = self.filter_base.join(rel_path);
         // in a real copy we already hold the destination directory. Dry-run instead descends from
         // the original named operand one `O_NOFOLLOW` component at a time; the local `dst_path` is
@@ -871,23 +841,20 @@ impl CopyVisitor {
                     let err = anyhow::Error::new(err).context(format!(
                         "cannot open destination {dst_path:?} for delete scan"
                     ));
-                    // a scan-open failure is surfaced as this directory's own error (this runs only
-                    // when children all succeeded, so there is no prior error to combine with —
-                    // matching the old fail-early/collect handling).
-                    return Err(Error::new(err, *copy_summary));
+                    return Err(err);
                 }
             },
         };
         let Some(prune_dir) = prune_dir else {
             return Ok(());
         };
+        let keep_set = keep_set.hashed();
         match crate::delete::prune_extraneous(
             self.prog_track,
             &prune_dir,
             &relative_dir,
             &keep_set,
             self.settings.filter.as_ref(),
-            delete_settings,
             self.settings.fail_early,
             self.settings.dry_run,
         )
@@ -898,13 +865,7 @@ impl CopyVisitor {
             }
             Err(err) => {
                 copy_summary.rm_summary = copy_summary.rm_summary + err.summary;
-                if self.settings.fail_early {
-                    return Err(Error::new(err.source, *copy_summary));
-                }
-                // non-fail-early: remember the prune error but still apply this fully-copied
-                // directory's own metadata below (matching main's collect-then-finalize), surfacing
-                // the prune error from the tail.
-                *child_error = Some(err.source);
+                return Err(err.source);
             }
         }
         Ok(())
@@ -1207,6 +1168,13 @@ impl WalkVisitor for CopyVisitor {
         self.settings.fail_early
     }
 
+    fn name_collection(&self) -> NameCollection {
+        self.settings
+            .delete
+            .clone()
+            .map_or(NameCollection::None, NameCollection::Delete)
+    }
+
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
         self.settings.filter.as_ref()
     }
@@ -1216,10 +1184,9 @@ impl WalkVisitor for CopyVisitor {
     }
 
     fn filter_allows_hint_only_skip(&self, _dir_ctx: &Self::DirContext) -> bool {
-        // --delete derives its keep-set from dispatched children, and dry-run exposes the exact
-        // action/counters to the user. In either mode, a hint-only skip could omit an actually
-        // included source replacement from an observable result.
-        self.settings.delete.is_none() && self.settings.dry_run.is_none()
+        // the driver enforces exact filtering for delete evidence. dry-run also exposes exact
+        // action/counters, even without deletion, so it must not omit a replacement based on a hint
+        self.settings.dry_run.is_none()
     }
 
     fn on_skip(
@@ -1295,7 +1262,7 @@ impl WalkVisitor for CopyVisitor {
                     src_parent,
                     dst_parent,
                     name,
-                    &dst_name,
+                    dst_name,
                     &dst_path,
                     src_path,
                     leaf.handle(),
@@ -1310,7 +1277,7 @@ impl WalkVisitor for CopyVisitor {
                     self.prog_track,
                     src_parent,
                     dst_parent,
-                    &dst_name,
+                    dst_name,
                     src_path,
                     &dst_path,
                     leaf.handle(),
@@ -1362,7 +1329,7 @@ impl WalkVisitor for CopyVisitor {
         let name = cx.name.as_os_str();
         let src_path = &cx.real_path;
         let dst_path = self.dst_path_for(cx);
-        let dst_name = self.dst_name_for(cx)?;
+        let dst_name = self.dst_name_for(cx)?.to_owned();
         let is_root = cx.rel_path.as_os_str().is_empty();
         let is_fresh = parent_ctx.is_fresh;
         // open the source directory's contents (O_NOFOLLOW) — this is the `dir` the driver walks.
@@ -1526,8 +1493,7 @@ impl WalkVisitor for CopyVisitor {
         &self,
         cx: &EntryCx,
         state: CopyDirState,
-        processed: &ProcessedChildren,
-        child_result: Result<Summary, Error>,
+        child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
         let CopyDirState {
             dst_dir,
@@ -1545,23 +1511,40 @@ impl WalkVisitor for CopyVisitor {
         // prune and surface the child error). the partial child summary is folded either way,
         // seeded with `base` (this directory's own create/unchanged contribution) — exactly as
         // `copy_dir_contents` seeded `copy_summary = base` before joining the children.
-        let (child_summary, mut child_error) = match child_result {
-            Ok(summary) => (summary, None),
-            Err(err) => (err.summary, Some(err.source)),
+        let (copy_summary, child_error) = match child_result {
+            Ok((child_summary, processed)) => {
+                let mut summary = base + child_summary;
+                let mut error = None;
+                if let Some(keep_set) = crate::delete::DeleteKeepSet::from_processed(&processed) {
+                    match self
+                        .prune_finished_dir(
+                            &mut summary,
+                            &keep_set,
+                            &dst_dir,
+                            &self.dst_path_for(cx),
+                            &cx.rel_path,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(prune_error) if self.settings.fail_early => {
+                            return Err(Error::new(prune_error, summary));
+                        }
+                        Err(prune_error) => error = Some(prune_error),
+                    }
+                }
+                (summary, error)
+            }
+            Err(error) => {
+                if self.settings.delete.is_some() {
+                    tracing::warn!(
+                        "skipping --delete pruning of {:?} because the copy reported errors",
+                        self.dst_path_for(cx)
+                    );
+                }
+                (base + error.summary, Some(error.source))
+            }
         };
-        let mut copy_summary = base + child_summary;
-        let dst_path = self.dst_path_for(cx);
-        // rsync-style --delete prune (folds the RmSummary; may record a non-fail-early child error
-        // or fail-early). A no-op unless --delete was requested AND every child succeeded.
-        self.prune_finished_dir(
-            &mut copy_summary,
-            &mut child_error,
-            processed,
-            &dst_dir,
-            &dst_path,
-            &cx.rel_path,
-        )
-        .await?;
         // empty-dir cleanup + post-order directory metadata; also surfaces any collected child error.
         self.finalize_dir(
             FinalizeDir {
@@ -2907,6 +2890,107 @@ mod copy_tests {
             "extraneous symlink must be removed"
         );
         assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_scan_open_failure_finalizes_dry_run_counts_unless_fail_early()
+    -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let sub = src.join("sub");
+        let dst = root.join("destination");
+        tokio::fs::create_dir_all(&sub).await?;
+        tokio::fs::write(sub.join("a.txt"), b"excluded").await?;
+        for fail_early in [false, true] {
+            for through_parent in [false, true] {
+                let mut settings = settings_with_delete(delete_on());
+                settings.dry_run = Some(DryRunMode::Brief);
+                settings.fail_early = fail_early;
+                let mut filter = crate::filter::FilterSettings::new();
+                filter.add_include("*.rs")?;
+                settings.filter = Some(filter);
+                // an invalid scan anchor fails with EINVAL regardless of process privileges
+                let visitor = Arc::new(CopyVisitor {
+                    prog_track: &PROGRESS,
+                    dst_root: dst.clone(),
+                    filter_base: PathBuf::new(),
+                    delete_scan_anchor: DeleteScanAnchor::new(
+                        std::path::Path::new("/"),
+                        std::path::Path::new(""),
+                    ),
+                    settings,
+                    preserve: *NO_PRESERVE_SETTINGS,
+                    dst_parent: None,
+                    root_is_fresh: false,
+                });
+                let entry = if through_parent { &src } else { &sub };
+                let relative = entry.strip_prefix(&src)?;
+                let cx = EntryCx {
+                    parent: Arc::new(
+                        Dir::open_root_dir(
+                            entry.parent().unwrap(),
+                            false,
+                            congestion::Side::Source,
+                        )
+                        .await?,
+                    ),
+                    name: entry.file_name().unwrap().to_owned(),
+                    rel_path: relative.to_owned(),
+                    filter_path: relative.to_owned(),
+                    real_path: entry.clone(),
+                    dry_run: true,
+                    prog_track: &PROGRESS,
+                };
+                let context = visitor.root_dir_context();
+                let error = process_entry(visitor, cx, context, None).await.unwrap_err();
+                assert_eq!(
+                    error.summary.directories_created,
+                    usize::from(through_parent || fail_early),
+                    "keep-going must remove the empty child's count before folding into its parent"
+                );
+                assert_eq!(error.summary.files_skipped, 1);
+                let message = format!("{:#}", error.source);
+                assert!(message.contains("for delete scan"), "{message}");
+                assert!(
+                    message.contains(&format!("{:?}", dst.join("sub"))),
+                    "{message}"
+                );
+                assert!(error.source.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(libc::EINVAL))
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_prunes_with_a_collected_empty_keep_set() -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        tokio::fs::write(dst.join("stale"), b"stale").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert!(
+            tokio::fs::read_dir(&dst)
+                .await?
+                .next_entry()
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -5064,8 +5148,6 @@ mod copy_tests {
                 filter.should_include(std::path::Path::new("node"), true),
                 crate::filter::FilterResult::Included
             ));
-            let mut settings = settings_with_delete(None);
-            settings.filter = Some(filter);
 
             // inject the reliable file hint captured before this replacement, so the boundary is
             // deterministic without depending on a scheduler race or filesystem-specific d_type.
@@ -5079,48 +5161,59 @@ mod copy_tests {
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let dst_dir =
                 Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
-            let visitor = Arc::new(CopyVisitor {
-                prog_track: &PROGRESS,
-                dst_root: dst.clone(),
-                filter_base: PathBuf::new(),
-                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                settings,
-                preserve: *NO_PRESERVE_SETTINGS,
-                dst_parent: None,
-                root_is_fresh: false,
-            });
-            let root_cx = EntryCx {
-                parent: Arc::clone(&src_dir),
-                name: std::ffi::OsString::from("source"),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: src.clone(),
-                dry_run: false,
-                prog_track: &PROGRESS,
-            };
-            let child_ctx = CopyDirContext {
-                dst_dir: Some(dst_dir),
-                is_fresh: true,
-            };
-            let (summary, processed) = run_with_open_file_cleanup(
-                &admission,
-                crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
-                    Arc::clone(&visitor),
-                    src_dir,
-                    &root_cx,
-                    &child_ctx,
-                    vec![(std::ffi::OsString::from("node"), Some(EntryKind::File))],
-                )),
-            )
-            .await?
-            .map_err(|error| error.source)?;
+            for delete in [None, delete_on()] {
+                let collect_names = delete.is_some();
+                let visitor = Arc::new(CopyVisitor {
+                    prog_track: &PROGRESS,
+                    dst_root: dst.clone(),
+                    filter_base: PathBuf::new(),
+                    delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    settings: {
+                        let mut settings = settings_with_delete(delete);
+                        settings.filter = Some(filter.clone());
+                        settings
+                    },
+                    preserve: *NO_PRESERVE_SETTINGS,
+                    dst_parent: None,
+                    root_is_fresh: false,
+                });
+                let root_cx = EntryCx {
+                    parent: Arc::clone(&src_dir),
+                    name: std::ffi::OsString::from("source"),
+                    rel_path: PathBuf::new(),
+                    filter_path: PathBuf::new(),
+                    real_path: src.clone(),
+                    dry_run: false,
+                    prog_track: &PROGRESS,
+                };
+                let child_ctx = CopyDirContext {
+                    dst_dir: Some(Arc::clone(&dst_dir)),
+                    is_fresh: true,
+                };
+                let (summary, processed) = run_with_open_file_cleanup(
+                    &admission,
+                    crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
+                        Arc::clone(&visitor),
+                        Arc::clone(&src_dir),
+                        &root_cx,
+                        &child_ctx,
+                        vec![(std::ffi::OsString::from("node"), Some(EntryKind::File))],
+                    )),
+                )
+                .await?
+                .map_err(|error| error.source)?;
 
-            assert_eq!(summary.directories_skipped, 1);
-            assert!(processed.names().is_empty());
-            assert!(
-                !dst.join("node").exists(),
-                "an excluded nested replacement directory must not be materialized"
-            );
+                assert_eq!(summary.directories_skipped, 1);
+                if collect_names {
+                    assert!(processed.names().expect("delete collects names").is_empty());
+                } else {
+                    assert!(processed.names().is_none());
+                }
+                assert!(
+                    !dst.join("node").exists(),
+                    "an excluded nested replacement directory must not be materialized"
+                );
+            }
             Ok(())
         }
 
@@ -5193,24 +5286,24 @@ mod copy_tests {
                     ))
                     .await
                     .map_err(|error| error.source)?;
-                let mut child_error = None;
                 visitor
                     .prune_finished_dir(
                         &mut summary,
-                        &mut child_error,
-                        &processed,
+                        &crate::delete::DeleteKeepSet::from_processed(&processed)
+                            .expect("delete traversal completed"),
                         &Some(dst_dir),
                         &dst,
                         std::path::Path::new(""),
                     )
-                    .await
-                    .map_err(|error| error.source)?;
-                assert!(child_error.is_none());
+                    .await?;
                 Ok::<_, anyhow::Error>((summary, processed))
             })
             .await??;
 
-            assert_eq!(processed.names(), &[std::ffi::OsString::from("node")]);
+            assert_eq!(
+                processed.names().expect("delete collects names"),
+                &[std::ffi::OsString::from("node")]
+            );
             assert_eq!(summary.files_copied, 1);
             assert_eq!(summary.rm_summary.files_removed, 1);
             assert_eq!(
@@ -5281,7 +5374,10 @@ mod copy_tests {
                 )),
             )
             .await??;
-            assert_eq!(processed.names(), &[std::ffi::OsString::from("node")]);
+            assert!(
+                processed.names().is_none(),
+                "copy without --delete does not retain names"
+            );
             assert_eq!(summary.files_copied, 1);
             assert_eq!(summary.directories_skipped, 0);
             Ok(())

@@ -10,7 +10,7 @@ use crate::progress;
 use crate::safedir::{self, Dir, Handle};
 use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_admitted_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, WalkVisitor, process_admitted_entry,
     process_entry,
 };
 
@@ -280,7 +280,7 @@ pub async fn rm(
 /// already hold the relevant directory as an open [`Dir`] and want to remove one of its children
 /// through that pinned fd rather than re-resolving the entry by absolute path (the redirectable
 /// window):
-/// - `--delete` pruning (see [`crate::delete::prune_extraneous`]) removes each extraneous entry.
+/// - `--delete` pruning removes each extraneous entry.
 /// - the remote-copy destination (`rcpd`) replaces a non-matching destination subtree (a
 ///   directory/file/symlink in the way of the entry it must create) through the parent directory
 ///   fd held in its directory tracker.
@@ -720,8 +720,7 @@ impl WalkVisitor for RmVisitor {
         &self,
         cx: &EntryCx,
         state: RmDirState,
-        _processed: &ProcessedChildren,
-        child_result: Result<Summary, Error>,
+        child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
         let prog_track = self.prog_track;
         let settings = &self.settings;
@@ -734,7 +733,7 @@ impl WalkVisitor for RmVisitor {
         // a child failed (keep-going mode — fail-early aborts before `dir_post`). do not rmdir or
         // attempt metadata rollback; return the partial summary with the error.
         let mut rm_summary = match child_result {
-            Ok(summary) => summary,
+            Ok((summary, _)) => summary,
             Err(err) => return Err(err),
         };
         tracing::debug!("finally remove the empty directory");
@@ -908,6 +907,7 @@ mod tests {
     use super::*;
     use crate::config::DryRunMode;
     use crate::testutils;
+    use crate::walk_driver::ProcessedChildren;
     use tracing_test::traced_test;
 
     static PROGRESS: std::sync::LazyLock<progress::Progress> =
@@ -1522,7 +1522,10 @@ mod tests {
                 .context("rm dry-run hint recheck did not return pending-meta capacity")?;
             drop(returned);
             let (summary, processed) = result;
-            assert_eq!(processed.names(), &[std::ffi::OsString::from("node")]);
+            assert_eq!(
+                processed.names().expect("default visitor collects names"),
+                &[std::ffi::OsString::from("node")]
+            );
             assert_eq!(summary.files_removed, 1);
             assert_eq!(summary.directories_skipped, 0);
             assert_eq!(
@@ -2464,8 +2467,7 @@ mod tests {
                 .dir_post(
                     &cx,
                     state,
-                    &ProcessedChildren::default(),
-                    Ok(Summary::default()),
+                    Ok((Summary::default(), ProcessedChildren::default())),
                 )
                 .await?;
             assert_eq!(summary.directories_removed, 1);
@@ -2520,8 +2522,7 @@ mod tests {
                     .dir_post(
                         &cx,
                         state,
-                        &ProcessedChildren::default(),
-                        Ok(Summary::default()),
+                        Ok((Summary::default(), ProcessedChildren::default())),
                     )
                     .await
             });
@@ -2614,7 +2615,7 @@ mod tests {
             admission.set_max_ops_in_flight(chmod_resource, 1);
             let held_chmod = throttle::ops_in_flight_permit(chmod_resource).await;
             let processed = ProcessedChildren::default();
-            let restore = visitor.dir_post(&cx, state, &processed, Ok(Summary::default()));
+            let restore = visitor.dir_post(&cx, state, Ok((Summary::default(), processed)));
             tokio::pin!(restore);
             assert!(
                 futures::poll!(restore.as_mut()).is_pending(),

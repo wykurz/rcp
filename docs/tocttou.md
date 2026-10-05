@@ -599,15 +599,22 @@ so the security-relevant invariants each live in exactly one place:
   known non-directory otherwise acquires immediately before spawn. A positive directory hint
   normally takes no leaf admission. For destructive or observable shared-walk filter decisions, the
   worker owns one exact classification, applies the filter to that entry, and transfers the result
-  into dispatch. A skipped result has no processed/keep outcome; a selected result contributes its
-  exact outcome in directory-enumeration order. This prevents stale hints from authorizing
-  remove/delete work or destination protection. In rlink, `DT_UNKNOWN` source and update-only hints
-  also dispatch to scheduled workers for exact type-sensitive filtering and accounting. Its
-  dual-tree path admits before opening either source or update handle when an update counterpart
-  needs classification, because the source hint says nothing about that separate entry. An
-  authoritative directory releases any provisional permit inside the inner scope before `dir_pre` or
-  descent. This bounds fd-bearing leaf fan-out without putting arbitrary recursive directory
-  depth/breadth into a pool, which would recreate the deep-directory hold-and-wait deadlock.
+  into dispatch. A skipped result has no processed/keep outcome; when collection is requested, a
+  selected result contributes its exact outcome in directory-enumeration order. This exact
+  classification prevents stale hints from authorizing remove/delete work or destination protection.
+  Copy requests delete-name evidence only for `--delete`; that collection policy forces exact
+  filtering in the driver. `dir_post` receives names only in its successful child-result arm, so a
+  failed traversal has no delete evidence and still reaches keep-going finalization with its error.
+  Copy and rlink prune through one typed keep-set binding complete names to deletion settings; rlink
+  seals its source/update collector only after joining every child and checking for errors. A
+  dry-run scan-open failure records the error and finalizes empty-directory accounting in keep-going
+  mode. In rlink, `DT_UNKNOWN` source and update-only hints also dispatch to scheduled workers for
+  exact type-sensitive filtering and accounting. Its dual-tree path admits before opening either
+  source or update handle when an update counterpart needs classification, because the source hint
+  says nothing about that separate entry. An authoritative directory releases any provisional permit
+  inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf fan-out without
+  putting arbitrary recursive directory depth/breadth into a pool, which would recreate the
+  deep-directory hold-and-wait deadlock.
 - **Checked entry ownership**: `AdmittedEntry` binds an authoritative destructive-filter decision to
   dispatch without a second name lookup; only a checked non-directory handle can then construct
   `AdmittedLeaf`, so a directory-as-leaf state is unrepresentable in release builds. Their explicit

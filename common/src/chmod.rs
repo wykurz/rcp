@@ -8,7 +8,7 @@ use crate::progress::Progress;
 use crate::safedir::{self, Dir, FileMeta, Handle};
 use crate::walk::{AdmittedLeaf, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, WalkVisitor, process_entry,
 };
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
@@ -1219,8 +1219,7 @@ impl WalkVisitor for ChmodVisitor {
         &self,
         cx: &EntryCx,
         state: ChmodDirState,
-        _processed: &ProcessedChildren,
-        child_result: Result<Summary, Error>,
+        child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
         let ChmodDirState {
             handle,
@@ -1232,7 +1231,7 @@ impl WalkVisitor for ChmodVisitor {
         // seed with the dir's own pre-order contribution, then fold the children (the driver passes
         // `Err` here only in keep-going mode — fail-early aborts before post-order).
         let (child_summary, child_error) = match child_result {
-            Ok(summary) => (summary, None),
+            Ok((summary, _)) => (summary, None),
             Err(err) => (err.summary, Some(err.source)),
         };
         let mut summary = base + child_summary;
