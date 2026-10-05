@@ -1871,9 +1871,10 @@ pub async fn strict_probe_dst_kind(
 ///
 /// There are many ways to drop it. A `--fail-early` copy returns `Err` from the walk driver without
 /// ever reaching `dir_post`, and aborts its in-flight siblings by dropping their `JoinSet` — so one
-/// failed leaf can end a dozen directories' lockdowns at once. `link_dir_contents` returns early on
-/// a failed `read_entries` with no flag needed at all. The remote destination can fail between
-/// locking a directory and registering it, or shut down with directories still pending. Restoring at
+/// failed leaf can end a dozen directories' lockdowns at once. A failed `read_entries` in
+/// `link_dir_contents` also aborts under `--fail-early`; keep-going instead drains its workers and
+/// reaches directory finalization. The remote destination can fail between locking a directory and
+/// registering it, or shut down with directories still pending. Restoring at
 /// each of those sites is the shape `CLAUDE.md` warns about — a missed exit path is the recurring
 /// finding here, and there were six-plus of them.
 ///
