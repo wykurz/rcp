@@ -1,3 +1,4 @@
+use crate::delete::DeleteNameCollector;
 use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use std::sync::Arc;
@@ -802,35 +803,6 @@ async fn link_inner(
     .await
     .map(|result| result.summary)
 }
-/// Tracks which child names exact entry decisions protect from `--delete` for one directory pass.
-/// Source and update-only workers fold their final exact selection here, including terminal filter
-/// and special skips.
-///
-/// When `--delete` is off the inner set is `None` and every method is a no-op — zero heap
-/// cost in the hot path.
-struct DeleteKeepSet {
-    inner: Option<std::collections::HashSet<std::ffi::OsString>>,
-}
-
-impl DeleteKeepSet {
-    fn new(delete: Option<&copy::DeleteSettings>) -> Self {
-        Self {
-            inner: delete.is_some().then(std::collections::HashSet::new),
-        }
-    }
-    /// Exact worker result: retain a name only when the final joint decision selected an action.
-    fn record_exact(&mut self, name: std::ffi::OsString) {
-        if let Some(set) = &mut self.inner {
-            set.insert(name);
-        }
-    }
-    /// Borrow the underlying set for `prune_extraneous`. `None` means `--delete` is off and
-    /// the caller should skip the prune entirely.
-    fn as_set(&self) -> Option<&std::collections::HashSet<std::ffi::OsString>> {
-        self.inner.as_ref()
-    }
-}
-
 /// Keeps both comparison handles structurally ahead of their shared admission permit.
 struct AdmittedLinkEntry<S = Handle, U = Handle, P = LeafPermit> {
     src_handle: S,
@@ -887,7 +859,7 @@ impl LinkTaskResult {
         Self::from_link(name, result)
     }
 
-    fn fold(self, summary: &mut Summary, keep_set: &mut DeleteKeepSet) {
+    fn fold(self, summary: &mut Summary, keep_set: &mut DeleteNameCollector) {
         if let Some(name) = self.keep_name {
             keep_set.record_exact(name);
         }
@@ -1951,7 +1923,7 @@ async fn process_update_only_entry(
 fn fold_link_task_result(
     result: Result<Result<LinkTaskResult, Error>, tokio::task::JoinError>,
     link_summary: &mut Summary,
-    keep_set: &mut DeleteKeepSet,
+    keep_set: &mut DeleteNameCollector,
     errors: &crate::error_collector::ErrorCollector,
     fail_early: bool,
     src_path: &std::path::Path,
@@ -1990,7 +1962,7 @@ async fn ensure_link_admission(
     admission: EntryAdmission,
     join_set: &mut tokio::task::JoinSet<Result<LinkTaskResult, Error>>,
     link_summary: &mut Summary,
-    keep_set: &mut DeleteKeepSet,
+    keep_set: &mut DeleteNameCollector,
     errors: &crate::error_collector::ErrorCollector,
     fail_early: bool,
     src_path: &std::path::Path,
@@ -2076,7 +2048,7 @@ async fn link_dir_contents(
     // protection after their exact final selection.
     let mut processed_files = std::collections::HashSet::new();
     // keep-set for --delete: every spawned source/update worker folds its final exact outcome.
-    let mut keep_set = DeleteKeepSet::new(settings.copy_settings.delete.as_ref());
+    let mut keep_set = DeleteNameCollector::new(settings.copy_settings.delete.as_ref());
     // iterate through src entries and recursively call "link" on each one
     for (entry_name, hint) in src_entries {
         let entry_rel = rel_path.join(&entry_name);
@@ -2264,75 +2236,71 @@ async fn link_dir_contents(
     // protect. `keep_set` holds the selected src ∪ update names normally, or only selected update
     // names under --update-exclusive; deliberately skipped specials retain their historical
     // protection even though no new entry is materialized.
-    if let Some(delete_settings) = &settings.copy_settings.delete {
-        if errors.has_errors() {
-            // rsync-style safety: skip pruning when this subtree's link/update pass reported errors
-            // — deleting based on a run that did not fully succeed could remove data unexpectedly.
-            tracing::warn!(
-                "skipping --delete pruning of {:?} because the link/update pass reported errors",
-                dst_path
-            );
-        } else {
-            // a real link already holds the destination directory. Dry-run descends from the
-            // original named operand one `O_NOFOLLOW` component at a time, so the reconstructed
-            // `dst_path` remains diagnostics-only and a symlinked operand root cannot become an
-            // intermediate redirect into another tree.
-            let prune_dir: Option<Arc<Dir>> = match dst_dir {
-                Some(dir) => Some(Arc::clone(dir)),
-                None => match crate::safedir::open_existing_dir_beneath_operand(
-                    dst_root,
-                    rel_path,
-                    congestion::Side::Destination,
-                )
-                .await
-                {
-                    Ok(Some(dir)) => Some(Arc::new(dir)),
-                    Ok(None) => {
-                        tracing::debug!(
-                            "skipping --delete pruning of {:?}: not a real directory",
-                            dst_path
-                        );
-                        None
+    if settings.copy_settings.delete.is_some() && errors.has_errors() {
+        // rsync-style safety: skip pruning when this subtree's link/update pass reported errors
+        // — deleting based on a run that did not fully succeed could remove data unexpectedly.
+        tracing::warn!(
+            "skipping --delete pruning of {:?} because the link/update pass reported errors",
+            dst_path
+        );
+    }
+    if let Some(keep_set) = keep_set.finish(&errors) {
+        // a real link already holds the destination directory. Dry-run descends from the
+        // original named operand one `O_NOFOLLOW` component at a time, so the reconstructed
+        // `dst_path` remains diagnostics-only and a symlinked operand root cannot become an
+        // intermediate redirect into another tree.
+        let prune_dir: Option<Arc<Dir>> = match dst_dir {
+            Some(dir) => Some(Arc::clone(dir)),
+            None => match crate::safedir::open_existing_dir_beneath_operand(
+                dst_root,
+                rel_path,
+                congestion::Side::Destination,
+            )
+            .await
+            {
+                Ok(Some(dir)) => Some(Arc::new(dir)),
+                Ok(None) => {
+                    tracing::debug!(
+                        "skipping --delete pruning of {:?}: not a real directory",
+                        dst_path
+                    );
+                    None
+                }
+                Err(err) => {
+                    let err = anyhow::Error::new(err).context(format!(
+                        "cannot open destination {dst_path:?} for delete scan"
+                    ));
+                    if settings.copy_settings.fail_early {
+                        return Err(Error::new(err, link_summary));
                     }
-                    Err(err) => {
-                        let err = anyhow::Error::new(err).context(format!(
-                            "cannot open destination {dst_path:?} for delete scan"
-                        ));
-                        if settings.copy_settings.fail_early {
-                            return Err(Error::new(err, link_summary));
-                        }
-                        errors.push(err);
-                        None
+                    errors.push(err);
+                    None
+                }
+            },
+        };
+        if let Some(prune_dir) = prune_dir {
+            match crate::delete::prune_extraneous(
+                prog_track,
+                &prune_dir,
+                rel_path,
+                &keep_set,
+                settings.filter.as_ref(),
+                settings.copy_settings.fail_early,
+                settings.dry_run,
+            )
+            .await
+            {
+                Ok(rm_summary) => {
+                    link_summary.copy_summary.rm_summary =
+                        link_summary.copy_summary.rm_summary + rm_summary;
+                }
+                Err(err) => {
+                    link_summary.copy_summary.rm_summary =
+                        link_summary.copy_summary.rm_summary + err.summary;
+                    if settings.copy_settings.fail_early {
+                        return Err(Error::new(err.source, link_summary));
                     }
-                },
-            };
-            if let Some(prune_dir) = prune_dir {
-                match crate::delete::prune_extraneous(
-                    prog_track,
-                    &prune_dir,
-                    rel_path,
-                    keep_set
-                        .as_set()
-                        .expect("--delete is on, so DeleteKeepSet is active"),
-                    settings.filter.as_ref(),
-                    delete_settings,
-                    settings.copy_settings.fail_early,
-                    settings.dry_run,
-                )
-                .await
-                {
-                    Ok(rm_summary) => {
-                        link_summary.copy_summary.rm_summary =
-                            link_summary.copy_summary.rm_summary + rm_summary;
-                    }
-                    Err(err) => {
-                        link_summary.copy_summary.rm_summary =
-                            link_summary.copy_summary.rm_summary + err.summary;
-                        if settings.copy_settings.fail_early {
-                            return Err(Error::new(err.source, link_summary));
-                        }
-                        errors.push(err.source);
-                    }
+                    errors.push(err.source);
                 }
             }
         }
@@ -2526,10 +2494,10 @@ mod link_tests {
     }
 
     mod delete_keep_set_tests {
-        //! Pure-logic unit tests for `DeleteKeepSet`. No filesystem needed — these pin exact
+        //! Pure-logic unit tests for `DeleteNameCollector`. No filesystem needed — these pin exact
         //! worker ownership so a future refactor cannot silently restore hint-based keeps.
 
-        use super::super::DeleteKeepSet;
+        use super::super::DeleteNameCollector;
         use crate::copy::DeleteSettings;
         use std::ffi::{OsStr, OsString};
 
@@ -2541,7 +2509,7 @@ mod link_tests {
 
         #[test]
         fn exact_result_no_op_when_delete_off() {
-            let mut k = DeleteKeepSet::new(None);
+            let mut k = DeleteNameCollector::new(None);
             k.record_exact(OsString::from("foo"));
             assert!(k.as_set().is_none());
         }
@@ -2549,7 +2517,7 @@ mod link_tests {
         #[test]
         fn exact_materialized_update_exclusive_duplicate_is_retained() {
             let d = delete_on();
-            let mut k = DeleteKeepSet::new(Some(&d));
+            let mut k = DeleteNameCollector::new(Some(&d));
             let mut summary = super::super::Summary::default();
             super::super::LinkTaskResult::from_link(
                 OsString::from("node"),
@@ -2565,7 +2533,7 @@ mod link_tests {
         #[test]
         fn selected_source_entry_is_retained_in_normal_mode() {
             let d = delete_on();
-            let mut k = DeleteKeepSet::new(Some(&d));
+            let mut k = DeleteNameCollector::new(Some(&d));
             let mut summary = super::super::Summary::default();
             super::super::LinkTaskResult::from_link(
                 OsString::from("node"),
@@ -2589,7 +2557,7 @@ mod link_tests {
             // nothing). This is the corrected behavior versus the old type-mismatch bug, where
             // the excluded update dir was copied AND the src keep-set entry was dropped.
             let d = delete_on();
-            let mut k = DeleteKeepSet::new(Some(&d));
+            let mut k = DeleteNameCollector::new(Some(&d));
 
             let mut summary = super::super::Summary::default();
             for name in ["keep", "pipe", "node"] {
@@ -4244,7 +4212,7 @@ mod link_tests {
             let delete_settings = copy::DeleteSettings {
                 delete_excluded: true,
             };
-            let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
+            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
             let result = crate::task_scope::scope_tasks(link_internal(
                 &PROGRESS,
                 &src_parent,
@@ -4268,9 +4236,10 @@ mod link_tests {
                 &PROGRESS,
                 &dst_parent,
                 std::path::Path::new(""),
-                keep_set.as_set().expect("delete is enabled"),
+                &keep_set
+                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .expect("successful delete pass"),
                 settings.filter.as_ref(),
-                &delete_settings,
                 false,
                 None,
             )
@@ -4319,7 +4288,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
+            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4351,9 +4320,10 @@ mod link_tests {
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                keep_set.as_set().expect("delete is enabled"),
+                &keep_set
+                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .expect("successful delete pass"),
                 settings.filter.as_ref(),
-                &delete_settings,
                 false,
                 None,
             )
@@ -4396,7 +4366,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteKeepSet::new(None);
+            let mut keep_set = DeleteNameCollector::new(None);
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4463,7 +4433,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
+            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4495,9 +4465,10 @@ mod link_tests {
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                keep_set.as_set().expect("delete is enabled"),
+                &keep_set
+                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .expect("successful delete pass"),
                 None,
-                &delete_settings,
                 false,
                 None,
             )
@@ -4550,7 +4521,7 @@ mod link_tests {
             .await?;
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
+            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
             match decision {
                 UpdateOnlyDecision::Skipped { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4581,9 +4552,10 @@ mod link_tests {
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                keep_set.as_set().expect("delete is enabled"),
+                &keep_set
+                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .expect("successful delete pass"),
                 settings.filter.as_ref(),
-                &delete_settings,
                 false,
                 None,
             )
@@ -4627,7 +4599,7 @@ mod link_tests {
             .await?;
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteKeepSet::new(None);
+            let mut keep_set = DeleteNameCollector::new(None);
             match decision {
                 UpdateOnlyDecision::Skipped { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -6971,13 +6943,14 @@ mod link_tests {
         /// Unknown source classification errors are child errors, so keep-going must still run
         /// later siblings and fold the successful work into the combined result.
         #[tokio::test(flavor = "current_thread")]
-        async fn source_unknown_classification_error_keeps_going_with_siblings()
+        async fn source_error_keeps_going_without_pruning_partial_collection()
         -> Result<(), anyhow::Error> {
             let root = testutils::create_temp_dir().await?;
             let src = root.join("src");
             let dst = root.join("dst");
             tokio::fs::create_dir(&src).await?;
             tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(dst.join("must-survive"), b"extraneous").await?;
             tokio::fs::write(src.join("first"), b"first").await?;
             tokio::fs::write(src.join("last"), b"last").await?;
             tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
@@ -6992,6 +6965,9 @@ mod link_tests {
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("never/")?;
             let mut settings = common_settings(false, false);
+            settings.copy_settings.delete = Some(copy::DeleteSettings {
+                delete_excluded: false,
+            });
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
@@ -7030,6 +7006,11 @@ mod link_tests {
             assert_eq!(tokio::fs::read(dst.join("first")).await?, b"first");
             assert_eq!(tokio::fs::read(dst.join("last")).await?, b"last");
             assert!(!dst.join("uninjected").exists());
+            assert_eq!(
+                tokio::fs::read(dst.join("must-survive")).await?,
+                b"extraneous"
+            );
+            assert_eq!(error.summary.copy_summary.rm_summary.files_removed, 0);
             Ok(())
         }
 

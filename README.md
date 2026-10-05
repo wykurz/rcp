@@ -693,6 +693,13 @@ counterpart in the source is removed. `--delete` implies `--overwrite`, requires
 and cannot be combined with `--dereference` (`-L`). `rlink --delete` works the same way for
 hard-linked trees.
 
+**Known limitation:** delete matching compares source and destination names byte-for-byte. On a
+destination that folds case, normalizes Unicode, or rewrites names (for example, by stripping
+trailing dots), an entry copied into or retained under a different spelling can appear extraneous
+and be deleted. This can happen even when the destination starts empty. For a directory, the whole
+subtree this run just populated can be removed while the run still reports success. Avoid `--delete`
+on such destinations until this matching limitation is fixed; it affects both `rcp` and `rlink`.
+
 ```fish
 # make dst an exact mirror of src (removing anything in dst not present in src)
 > rcp --delete src dst --progress --summary

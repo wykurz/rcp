@@ -6,9 +6,91 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use crate::copy::DeleteSettings;
 use crate::progress;
 use crate::safedir::Dir;
+
+/// Settings controlling rsync-style `--delete` (mirror) behavior.
+///
+/// Present (`Some`) only when `--delete` was requested. `None` means the
+/// destination is never enumerated and no pruning work is done, so the default
+/// copy path pays nothing for this feature.
+#[derive(Debug, Clone)]
+pub struct DeleteSettings {
+    /// Also remove destination entries that match an exclude pattern
+    /// (rsync `--delete-excluded`). When false, excluded entries are protected.
+    pub delete_excluded: bool,
+}
+
+/// Complete exact child-name evidence, bound to the deletion settings that requested it.
+///
+/// Walkers create this only after successful collection. The storage can be ordered names from
+/// copy or a hashed set from rlink; pruning requires the hashed form. Fields stay private so the
+/// settings cannot be separated from the collection that authorizes deletion.
+#[derive(Debug)]
+pub(crate) struct DeleteKeepSet<N> {
+    settings: DeleteSettings,
+    names: N,
+}
+
+impl<N> DeleteKeepSet<N> {
+    /// Seal a completed, exact collection. Call only at a successful traversal boundary.
+    fn from_complete(settings: DeleteSettings, names: N) -> Self {
+        Self { settings, names }
+    }
+}
+
+impl<'a> DeleteKeepSet<&'a [OsString]> {
+    /// Borrow evidence that only a successful delete-collecting walk can produce. Ordinary
+    /// collected names and successful non-collecting walks cannot authorize pruning.
+    pub(crate) fn from_processed(
+        processed: &'a crate::walk_driver::ProcessedChildren,
+    ) -> Option<Self> {
+        processed
+            .delete_names()
+            .map(|(settings, names)| Self::from_complete(settings.clone(), names))
+    }
+    /// Hash borrowed names only once a destination exists to prune.
+    pub(crate) fn hashed(&self) -> DeleteKeepSet<std::collections::HashSet<&'a std::ffi::OsStr>> {
+        DeleteKeepSet::from_complete(
+            self.settings.clone(),
+            self.names.iter().map(OsString::as_os_str).collect(),
+        )
+    }
+}
+
+/// In-progress exact names for rlink's source/update pass. This cannot authorize pruning.
+pub(crate) struct DeleteNameCollector {
+    inner: Option<(DeleteSettings, std::collections::HashSet<OsString>)>,
+}
+
+impl DeleteNameCollector {
+    pub(crate) fn new(settings: Option<&DeleteSettings>) -> Self {
+        Self {
+            inner: settings.map(|settings| (settings.clone(), std::collections::HashSet::new())),
+        }
+    }
+    pub(crate) fn record_exact(&mut self, name: OsString) {
+        if let Some((_, names)) = &mut self.inner {
+            names.insert(name);
+        }
+    }
+    /// Seal only after every source/update worker has been joined. Any traversal or child error
+    /// discards the partial collection; the caller retains its errors for keep-going finalization.
+    pub(crate) fn finish(
+        self,
+        errors: &crate::error_collector::ErrorCollector,
+    ) -> Option<DeleteKeepSet<std::collections::HashSet<OsString>>> {
+        if errors.has_errors() {
+            return None;
+        }
+        self.inner
+            .map(|(settings, names)| DeleteKeepSet::from_complete(settings, names))
+    }
+    #[cfg(test)]
+    pub(crate) fn as_set(&self) -> Option<&std::collections::HashSet<OsString>> {
+        self.inner.as_ref().map(|(_, names)| names)
+    }
+}
 
 /// Remove entries in the already-open destination directory `dst_dir` whose names are not in
 /// `keep` (the source entry names that passed the filter for this directory).
@@ -25,19 +107,24 @@ use crate::safedir::Dir;
 ///
 /// `relative_dir` is this directory's path relative to the source root, used to match destination
 /// entries against `filter` for exclude-protection. Excluded destination entries are protected
-/// (kept) unless `delete_settings.delete_excluded` is set. Honors `dry_run` (reports without
+/// (kept) unless the keep-set's `delete_excluded` setting is set. Honors `dry_run` (reports without
 /// removing, via `rm::rm_child`).
-#[allow(clippy::too_many_arguments)]
-pub async fn prune_extraneous(
+pub(crate) async fn prune_extraneous<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
     relative_dir: &std::path::Path,
-    keep: &std::collections::HashSet<OsString>,
+    keep: &DeleteKeepSet<std::collections::HashSet<K>>,
     filter: Option<&crate::filter::FilterSettings>,
-    delete_settings: &DeleteSettings,
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
-) -> Result<crate::rm::Summary, crate::rm::Error> {
+) -> Result<crate::rm::Summary, crate::rm::Error>
+where
+    K: std::borrow::Borrow<std::ffi::OsStr> + Eq + std::hash::Hash + Sync,
+{
+    let DeleteKeepSet {
+        settings: delete_settings,
+        names: keep,
+    } = keep;
     let summary = crate::rm::Summary::default();
     // enumerate the destination through its pinned fd (no path re-resolution). `d_type` remains a
     // scheduling hint only: exclude protection classifies under admission and transfers that exact
@@ -66,22 +153,25 @@ pub async fn prune_extraneous(
 /// Production callers arrive through [`prune_extraneous`]. Separating enumeration lets tests
 /// inject stale and `DT_UNKNOWN` hints deterministically without requiring an NFS/FUSE fixture.
 #[allow(clippy::too_many_arguments)]
-async fn prune_entries(
+async fn prune_entries<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
     relative_dir: &std::path::Path,
-    keep: &std::collections::HashSet<OsString>,
+    keep: &std::collections::HashSet<K>,
     filter: Option<&crate::filter::FilterSettings>,
     delete_settings: &DeleteSettings,
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
     entries: Vec<(OsString, Option<crate::walk::EntryKind>)>,
-) -> Result<crate::rm::Summary, crate::rm::Error> {
+) -> Result<crate::rm::Summary, crate::rm::Error>
+where
+    K: std::borrow::Borrow<std::ffi::OsStr> + Eq + std::hash::Hash + Sync,
+{
     let mut summary = crate::rm::Summary::default();
     let errors = crate::error_collector::ErrorCollector::default();
     for (name, hint) in entries {
         let result: Result<crate::rm::Summary, crate::rm::Error> = async {
-            if keep.contains(&name) {
+            if keep.contains(name.as_os_str()) {
                 return Ok(Default::default());
             }
             // the entry's path relative to the destination (mirror) root: anchors filter matching
@@ -202,6 +292,40 @@ mod tests {
         DeleteSettings { delete_excluded }
     }
 
+    #[test]
+    fn failed_collection_cannot_authorize_pruning() {
+        let settings = delete_settings(true);
+        let mut collecting = DeleteNameCollector::new(Some(&settings));
+        collecting.record_exact(OsString::from("completed-child"));
+        let errors = crate::error_collector::ErrorCollector::default();
+        errors.push(anyhow::anyhow!("a later child failed"));
+        assert!(collecting.finish(&errors).is_none());
+        assert!(
+            errors.has_errors(),
+            "finalization must retain the traversal error"
+        );
+    }
+
+    #[test]
+    fn completed_collection_keeps_its_settings_and_empty_is_valid() {
+        for delete_excluded in [false, true] {
+            let settings = delete_settings(delete_excluded);
+            let errors = crate::error_collector::ErrorCollector::default();
+            let keep = DeleteNameCollector::new(Some(&settings))
+                .finish(&errors)
+                .unwrap();
+            assert!(keep.names.is_empty());
+            assert_eq!(keep.settings.delete_excluded, delete_excluded);
+        }
+        let mut collecting = DeleteNameCollector::new(None);
+        collecting.record_exact(OsString::from("ignored"));
+        assert!(
+            collecting
+                .finish(&crate::error_collector::ErrorCollector::default())
+                .is_none()
+        );
+    }
+
     /// Open `dst` as the destination directory `Dir` prune operates through, mirroring the copy/link
     /// call sites (`O_NOFOLLOW|O_DIRECTORY`, Destination side).
     async fn open_dst(dst: &std::path::Path) -> anyhow::Result<Arc<Dir>> {
@@ -232,7 +356,7 @@ mod tests {
                         &PROGRESS,
                         &dst_dir,
                         std::path::Path::new(""),
-                        &HashSet::new(),
+                        &HashSet::<OsString>::new(),
                         Some(&filter),
                         &delete_settings(false),
                         false,
@@ -268,7 +392,7 @@ mod tests {
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("protected")?;
-            let keep = HashSet::new();
+            let keep: HashSet<OsString> = HashSet::new();
             let settings = delete_settings(false);
             let prune = prune_entries(
                 &PROGRESS,
@@ -322,7 +446,7 @@ mod tests {
             let dst_dir = open_dst(&dst).await?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("protected")?;
-            let keep = HashSet::new();
+            let keep: HashSet<OsString> = HashSet::new();
             let settings = delete_settings(false);
             admission.set_files_in_flight(1);
             let stat_resource =
@@ -494,9 +618,8 @@ mod tests {
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             None,
-            &delete_settings(false),
             false,
             None,
         )
@@ -522,7 +645,7 @@ mod tests {
 
         let mut filter = crate::filter::FilterSettings::new();
         filter.add_exclude("*.log")?;
-        let keep = HashSet::new(); // both are extraneous
+        let keep: HashSet<OsString> = HashSet::new(); // both are extraneous
 
         // default: *.log is protected, data.bin is removed
         let dst_dir = open_dst(&dst).await?;
@@ -530,9 +653,8 @@ mod tests {
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
-            &delete_settings(false),
             false,
             None,
         )
@@ -551,9 +673,8 @@ mod tests {
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
-            &delete_settings(true),
             false,
             None,
         )
@@ -577,7 +698,7 @@ mod tests {
 
         let mut filter = crate::filter::FilterSettings::new();
         filter.add_exclude("*.log")?;
-        let keep = HashSet::new(); // extra_dir is extraneous
+        let keep: HashSet<OsString> = HashSet::new(); // extra_dir is extraneous
 
         // default --delete: the excluded descendant is protected, so the dir survives non-empty
         let dst_dir = open_dst(&dst).await?;
@@ -585,9 +706,8 @@ mod tests {
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
-            &delete_settings(false),
             false,
             None,
         )
@@ -606,9 +726,8 @@ mod tests {
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
-            &delete_settings(true),
             false,
             None,
         )
@@ -632,16 +751,15 @@ mod tests {
 
         let mut filter = crate::filter::FilterSettings::new();
         filter.add_exclude("cache/*.log")?;
-        let keep = HashSet::new();
+        let keep: HashSet<OsString> = HashSet::new();
 
         let dst_dir = open_dst(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
-            &keep,
+            &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
-            &delete_settings(false),
             false,
             None,
         )
@@ -674,7 +792,7 @@ mod tests {
         let mut filter = crate::filter::FilterSettings::new();
         filter.add_exclude("cache/")?; // dir-only exclude: only protects directories, not files
 
-        let keep = HashSet::new(); // both `cache/` and `unrelated.txt` are extraneous
+        let keep: HashSet<OsString> = HashSet::new(); // both `cache/` and `unrelated.txt` are extraneous
 
         let dst_dir = open_dst(&dst).await?;
         let summary = prune_entries(
@@ -778,7 +896,7 @@ mod tests {
         let swapper = spawn_extra_swapper(dst.clone(), sentinel.clone(), stop.clone());
 
         // empty keep-set: `extra` (and any other entry) is extraneous and marked for pruning.
-        let keep = HashSet::new();
+        let keep: HashSet<OsString> = HashSet::new();
         let mut pruned = 0usize;
         let mut errored = 0usize;
         for i in 0..400 {
@@ -811,9 +929,8 @@ mod tests {
                     &PROGRESS,
                     &dst_dir,
                     std::path::Path::new(""),
-                    &keep,
+                    &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
                     None,
-                    &delete_settings(false),
                     false,
                     None,
                 ),

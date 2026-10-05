@@ -9,7 +9,7 @@
 //! 3. apply only a reliable-hint terminal exclusion the visitor explicitly permits; every other
 //!    filter decision remains attached to the scheduled child,
 //! 4. admit each remaining possible leaf immediately before spawn. Join/fold summaries, errors,
-//!    and exact processed names together (NOT batched: see [`walk_dir_contents`] for why admission
+//!    and optionally collected processed names together (NOT batched: see [`walk_dir_contents`] for why admission
 //!    and spawn share one loop step),
 //! 5. in each task: classify once, apply any pending exact filter, then either skip or dispatch as
 //!    checked
@@ -70,8 +70,10 @@
 //!   [`DirAction::Descend`] whose `dir` is the *source* dir (opened via
 //!   `src_parent.open_dir(name)`), `child_ctx` carries the resolved `dst_dir` +
 //!   child `is_fresh`, and `state` carries the `DirState`.
+//! - **`name_collection`** requests delete evidence only for `--delete`; ordinary copies move names
+//!   through the worker without retaining a per-directory list.
 //! - **`dir_post`** receives the children's folded `Result`: on `Ok` it runs the
-//!   `--delete` prune (keep-set = `processed.names()`), empty-dir cleanup, and
+//!   `--delete` prune only after requiring collected names, then empty-dir cleanup and
 //!   `set_dir_metadata_fd` (post-order); on `Err` (a non-fail-early child failure)
 //!   it skips the destructive prune, still applies directory metadata, and returns
 //!   the combined error — exactly as `copy_dir_contents`'s tail did.
@@ -97,7 +99,7 @@
 //! into the driver — that asymmetry is what keeps rlink on the substrate, not the
 //! visitor; see docs/tocttou.md, "One shared traversal driver").
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -160,13 +162,13 @@ impl EntryCx {
     /// is the hardened directory the child lives in (for a directory entry's
     /// contents, the opened directory itself; for the root, the root directory).
     #[must_use]
-    pub fn child(&self, child_dir: Arc<Dir>, child_name: &OsStr) -> EntryCx {
+    fn child(&self, child_dir: Arc<Dir>, child_name: OsString) -> EntryCx {
         EntryCx {
             parent: child_dir,
-            name: child_name.to_owned(),
-            rel_path: self.rel_path.join(child_name),
-            filter_path: self.filter_path.join(child_name),
-            real_path: self.real_path.join(child_name),
+            rel_path: self.rel_path.join(&child_name),
+            filter_path: self.filter_path.join(&child_name),
+            real_path: self.real_path.join(&child_name),
+            name: child_name,
             dry_run: self.dry_run,
             prog_track: self.prog_track,
         }
@@ -203,28 +205,68 @@ pub enum DirAction<Sum, Ctx, State> {
     },
 }
 
-/// The names of the children whose final exact decision included them and whose work succeeded, in
-/// enumeration order.
+/// Requested child-name evidence for a successful directory walk.
+#[derive(Debug)]
+pub enum NameCollection {
+    /// Do not retain names.
+    None,
+    /// Retain ordered names under the visitor's existing filtering policy.
+    Names,
+    /// Retain exact names and their deletion settings. The driver requires authoritative
+    /// filtering and disallows hint-only exclusions for this policy.
+    Delete(crate::delete::DeleteSettings),
+}
+
+#[derive(Debug, Default)]
+enum CollectedNames<N> {
+    #[default]
+    None,
+    Names(N),
+    Delete(crate::delete::DeleteSettings, N),
+}
+
+impl<N> CollectedNames<N> {
+    fn names_mut(&mut self) -> Option<&mut N> {
+        match self {
+            Self::None => None,
+            Self::Names(names) | Self::Delete(_, names) => Some(names),
+        }
+    }
+    fn map<M>(self, map: impl FnOnce(N) -> M) -> CollectedNames<M> {
+        match self {
+            Self::None => CollectedNames::None,
+            Self::Names(names) => CollectedNames::Names(map(names)),
+            Self::Delete(settings, names) => CollectedNames::Delete(settings, map(names)),
+        }
+    }
+}
+
+/// Names from a successful directory walk, in enumeration order.
 ///
-/// Handed to [`WalkVisitor::dir_post`] so a visitor can build a `--delete`
-/// keep-set (the set of destination names with a source counterpart) without
-/// re-reading the directory.
+/// This value is delivered only in the successful child-result arm of [`WalkVisitor::dir_post`].
+/// Ordinary collection follows the visitor's filter policy; only [`NameCollection::Delete`]
+/// supplies exact delete evidence bound to settings. A successful non-collecting walk has no names.
 #[derive(Debug, Default)]
 pub struct ProcessedChildren {
-    names: Vec<OsString>,
+    names: CollectedNames<Vec<OsString>>,
 }
 
 impl ProcessedChildren {
-    /// The successfully processed children's names, in enumeration order.
+    /// Successfully dispatched child names, when requested. An empty slice is a completed empty
+    /// collection, not a failed traversal. Ordinary names alone do not authorize pruning.
     #[must_use]
-    pub fn names(&self) -> &[OsString] {
-        &self.names
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> Option<&[OsString]> {
+        match &self.names {
+            CollectedNames::None => None,
+            CollectedNames::Names(names) | CollectedNames::Delete(_, names) => Some(names),
+        }
     }
-
-    /// Move the names out (e.g. straight into a `--delete` keep-set).
-    #[must_use]
-    pub fn into_names(self) -> Vec<OsString> {
-        self.names
+    pub(crate) fn delete_names(&self) -> Option<(&crate::delete::DeleteSettings, &[OsString])> {
+        match &self.names {
+            CollectedNames::Delete(settings, names) => Some((settings, names)),
+            CollectedNames::None | CollectedNames::Names(_) => None,
+        }
     }
 }
 
@@ -237,6 +279,13 @@ pub type DirPreResult<V> = Result<
         <V as WalkVisitor>::DirContext,
         <V as WalkVisitor>::DirState,
     >,
+    OperationError<<V as WalkVisitor>::Summary>,
+>;
+
+/// Successful child summary and collected names, or a child error with its partial summary.
+/// Names are available only in the successful input to [`WalkVisitor::dir_post`].
+pub type DirPostInput<V> = Result<
+    (<V as WalkVisitor>::Summary, ProcessedChildren),
     OperationError<<V as WalkVisitor>::Summary>,
 >;
 
@@ -276,6 +325,15 @@ pub trait WalkVisitor: Send + Sync + 'static {
 
     /// Whether the walk stops at the first error (`--fail-early`).
     fn fail_early(&self) -> bool;
+
+    /// Which child-name evidence to retain after a successful directory walk.
+    ///
+    /// The default preserves ordered names for existing visitors. Opting out avoids retention and
+    /// sorting. Delete collection binds its settings to exact names and forces authoritative
+    /// filtering regardless of the visitor's hint policy; ordinary collection does not.
+    fn name_collection(&self) -> NameCollection {
+        NameCollection::Names
+    }
 
     /// The active filter, if any (applied to terminal reliable hints and, when required, the
     /// worker's exact classification through [`walk::should_skip_entry_ref`]).
@@ -355,8 +413,8 @@ pub trait WalkVisitor: Send + Sync + 'static {
 
     /// Post-order step for a directory entry, run *after* its contents are walked,
     /// in the same task as `dir_pre`. `state` is the [`DirAction::Descend`] state;
-    /// `processed` lists the successfully included children; `child_result` is the contents' folded
-    /// outcome — `Ok(summary)` when every child succeeded, or `Err` carrying the
+    /// `child_result` is the contents' folded outcome: `Ok((summary, processed))` contains names
+    /// according to [`Self::name_collection`] only when every child succeeded. `Err` carries only the
     /// combined child error and the partial summary when one or more children failed
     /// **without** `fail_early`. (Neither has `dir_pre`'s own contribution folded in
     /// — the visitor carries that in `state` and folds it here.)
@@ -379,8 +437,7 @@ pub trait WalkVisitor: Send + Sync + 'static {
         &self,
         cx: &EntryCx,
         state: Self::DirState,
-        processed: &ProcessedChildren,
-        child_result: Result<Self::Summary, OperationError<Self::Summary>>,
+        child_result: DirPostInput<Self>,
     ) -> impl std::future::Future<Output = Result<Self::Summary, OperationError<Self::Summary>>> + Send;
 }
 
@@ -509,13 +566,13 @@ where
 {
     let _ops_guard = cx.prog_track.ops.guard();
     let classified = classify_for_dispatch(visitor.as_ref(), &cx, source).await?;
-    dispatch_classified_entry(visitor, cx, parent_ctx, classified).await
+    dispatch_classified_entry(visitor, &cx, parent_ctx, classified).await
 }
 
 #[async_recursion]
 async fn dispatch_classified_entry<V>(
     visitor: Arc<V>,
-    cx: EntryCx,
+    cx: &EntryCx,
     parent_ctx: V::DirContext,
     classified: ClassifiedEntry,
 ) -> Result<V::Summary, OperationError<V::Summary>>
@@ -534,7 +591,7 @@ where
                 match entry.into_leaf() {
                     Ok(leaf) => {
                         return AdmittedDispatch::Leaf(
-                            visitor.visit_leaf(&cx, &parent_ctx, leaf).await,
+                            visitor.visit_leaf(cx, &parent_ctx, leaf).await,
                         );
                     }
                     Err(handle) => {
@@ -553,7 +610,7 @@ where
             }
         }
     };
-    let action = visitor.dir_pre(&cx, &parent_ctx, &handle).await?;
+    let action = visitor.dir_pre(cx, &parent_ctx, &handle).await?;
     // dir_pre has copied everything its state needs and opened the directory used for descent.
     // the classification handle is redundant from here on and must not inflate the per-depth fd
     // baseline alongside those deliberately unbudgeted recursive directory handles.
@@ -565,10 +622,10 @@ where
             child_ctx,
             state,
         } => {
-            match walk_dir_contents(Arc::clone(&visitor), dir, &cx, &child_ctx).await {
+            match walk_dir_contents(Arc::clone(&visitor), dir, cx, &child_ctx).await {
                 Ok((child_summary, processed)) => {
                     visitor
-                        .dir_post(&cx, state, &processed, Ok(child_summary))
+                        .dir_post(cx, state, Ok((child_summary, processed)))
                         .await
                 }
                 // a child failed. with `fail_early` the subtree's already-spawned siblings have
@@ -577,16 +634,13 @@ where
                 // invoked,
                 // with the combined error, so the visitor can apply safe post-order finalization
                 // (copy's directory metadata) while skipping destructive work (copy's `--delete`
-                // prune) and then return the combined error. `processed` is not recoverable on the
-                // error path, so an empty list is passed — the only consumer (a `--delete` keep-set)
-                // is skipped on error anyway.
+                // prune) and then return the combined error. the error arm carries no processed
+                // names or delete evidence; only a successful walk can produce them.
                 Err(walk_err) => {
                     if visitor.fail_early() {
                         Err(walk_err)
                     } else {
-                        visitor
-                            .dir_post(&cx, state, &ProcessedChildren::default(), Err(walk_err))
-                            .await
+                        visitor.dir_post(cx, state, Err(walk_err)).await
                     }
                 }
             }
@@ -600,10 +654,11 @@ where
 /// visitor permits. Every remaining possible leaf is admitted immediately before spawn. A child
 /// worker classifies once, applies any pending authoritative filter to that exact entry, and either
 /// skips it or transfers the same entry into dispatch. The result fold applies fail-early or
-/// keep-going policy and derives processed names from successful exact outcomes.
+/// keep-going policy and derives processed names from successful outcomes. Delete collection
+/// requires authoritative filtering, regardless of the visitor's ordinary hint policy.
 ///
 /// Returns the folded child summary (filter-skip contributions included) and the
-/// [`ProcessedChildren`] list of successfully included names. `parent_cx`
+/// [`ProcessedChildren`] with names present only if collection was requested. `parent_cx`
 /// describes the directory entry itself (its `rel_path`/`real_path` are the base
 /// the children extend). `dir_ctx` is the inherited context of `dir` (the context
 /// its children receive) — for the root walk this is
@@ -689,15 +744,19 @@ struct WalkEntryResult<S> {
 
 struct WalkEntryFold<S> {
     summary: S,
-    processed: Vec<(usize, OsString)>,
+    processed: CollectedNames<Vec<(usize, OsString)>>,
     errors: crate::error_collector::ErrorCollector,
 }
 
 impl<S: WalkSummary> WalkEntryFold<S> {
-    fn new(summary: S) -> Self {
+    fn new(summary: S, collection: NameCollection) -> Self {
         Self {
             summary,
-            processed: Vec::new(),
+            processed: match collection {
+                NameCollection::None => CollectedNames::None,
+                NameCollection::Names => CollectedNames::Names(Vec::new()),
+                NameCollection::Delete(settings) => CollectedNames::Delete(settings, Vec::new()),
+            },
             errors: crate::error_collector::ErrorCollector::default(),
         }
     }
@@ -714,7 +773,9 @@ impl<S: WalkSummary> WalkEntryFold<S> {
         match result {
             Ok(Ok(child)) => {
                 self.add_summary(child.summary);
-                self.processed.extend(child.processed);
+                if let Some(processed) = self.processed.names_mut() {
+                    processed.extend(child.processed);
+                }
             }
             Ok(Err(error)) => {
                 tracing::error!("walk child failed with: {:#}", &error);
@@ -741,19 +802,17 @@ impl<S: WalkSummary> WalkEntryFold<S> {
     fn finish(self) -> Result<(S, ProcessedChildren), OperationError<S>> {
         let Self {
             summary,
-            mut processed,
+            processed,
             errors,
         } = self;
         if let Some(error) = errors.into_error() {
             return Err(OperationError::new(error, summary));
         }
-        processed.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-        Ok((
-            summary,
-            ProcessedChildren {
-                names: processed.into_iter().map(|(_, name)| name).collect(),
-            },
-        ))
+        let names = processed.map(|mut names| {
+            names.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+            names.into_iter().map(|(_, name)| name).collect()
+        });
+        Ok((summary, ProcessedChildren { names }))
     }
 }
 
@@ -762,7 +821,6 @@ async fn process_scheduled_entry<V>(
     cx: EntryCx,
     parent_ctx: V::DirContext,
     ordinal: usize,
-    name: OsString,
     scheduled: ScheduledEntry,
 ) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
 where
@@ -789,10 +847,10 @@ where
             processed: None,
         });
     }
-    let summary = dispatch_classified_entry(visitor, cx, parent_ctx, classified).await?;
+    let summary = dispatch_classified_entry(visitor, &cx, parent_ctx, classified).await?;
     Ok(WalkEntryResult {
         summary,
-        processed: Some((ordinal, name)),
+        processed: Some((ordinal, cx.name)),
     })
 }
 
@@ -857,15 +915,18 @@ where
     V: WalkVisitor,
 {
     let fail_early = visitor.fail_early();
-    let mut fold = WalkEntryFold::new(V::Summary::default());
+    let collection = visitor.name_collection();
+    let delete_names = matches!(collection, NameCollection::Delete(_));
+    let mut fold = WalkEntryFold::new(V::Summary::default(), collection);
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
         // build the child's owned context once; reused whether it is skipped or spawned, and gives
         // an authoritative probe failure its operation-path context.
-        let child_cx = parent_cx.child(Arc::clone(&dir), &entry_name);
-        let authoritative_filter =
-            visitor.filter().is_some() && visitor.filter_requires_admitted_entry();
-        if visitor.filter_allows_hint_only_skip(dir_ctx)
+        let child_cx = parent_cx.child(Arc::clone(&dir), entry_name);
+        let authoritative_filter = visitor.filter().is_some()
+            && (delete_names || visitor.filter_requires_admitted_entry());
+        if !delete_names
+            && visitor.filter_allows_hint_only_skip(dir_ctx)
             && let Some(hinted_kind) = hint
             && let Some(skip_result) = walk::should_skip_entry_ref(
                 visitor.filter(),
@@ -912,14 +973,7 @@ where
         };
         spawn_tracked(
             &mut join_set,
-            process_scheduled_entry(
-                task_visitor,
-                child_cx,
-                task_ctx,
-                ordinal,
-                entry_name,
-                scheduled,
-            ),
+            process_scheduled_entry(task_visitor, child_cx, task_ctx, ordinal, scheduled),
         );
     }
     join_walk_entries(join_set, fail_early, fold).await
@@ -1002,6 +1056,7 @@ mod tests {
     use super::*;
     use crate::filter::FilterSettings;
     use crate::progress::Progress;
+    use std::ffi::OsStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1026,9 +1081,12 @@ mod tests {
         }
     }
 
+    type PostOrderObservations = Arc<std::sync::Mutex<Vec<bool>>>;
+
     /// A trivial visitor that just counts entries by kind. Exercises RPITIT +
     /// `Send` + recursion (compile and run). `DirState = ()`; leaf permit comes
     /// from the pending-meta pool for every possible leaf.
+    #[derive(Default)]
     struct CountingVisitor {
         /// counts every spawned leaf, to prove `visit_leaf` ran under backpressure.
         leaves_seen: Arc<AtomicUsize>,
@@ -1036,6 +1094,10 @@ mod tests {
         filter: Option<FilterSettings>,
         /// whether the filter authorizes destructive work and needs an exact entry transfer.
         authoritative_filter: bool,
+        omit_names: bool,
+        delete_names: bool,
+        fail_leaf: Option<OsString>,
+        post_observations: Option<PostOrderObservations>,
     }
 
     impl WalkVisitor for CountingVisitor {
@@ -1051,6 +1113,17 @@ mod tests {
         fn fail_early(&self) -> bool {
             false
         }
+        fn name_collection(&self) -> NameCollection {
+            if self.delete_names {
+                NameCollection::Delete(crate::delete::DeleteSettings {
+                    delete_excluded: false,
+                })
+            } else if self.omit_names {
+                NameCollection::None
+            } else {
+                NameCollection::Names
+            }
+        }
         fn filter(&self) -> Option<&FilterSettings> {
             self.filter.as_ref()
         }
@@ -1060,11 +1133,17 @@ mod tests {
 
         async fn visit_leaf(
             &self,
-            _cx: &EntryCx,
+            cx: &EntryCx,
             _parent_ctx: &(),
             leaf: AdmittedLeaf,
         ) -> Result<CountSummary, OperationError<CountSummary>> {
             self.leaves_seen.fetch_add(1, Ordering::SeqCst);
+            if self.fail_leaf.as_ref() == Some(&cx.name) {
+                return Err(OperationError::new(
+                    anyhow::anyhow!("injected leaf failure"),
+                    Default::default(),
+                ));
+            }
             Ok(match leaf.kind() {
                 EntryKind::Symlink => CountSummary {
                     symlinks: 1,
@@ -1102,12 +1181,13 @@ mod tests {
             &self,
             _cx: &EntryCx,
             _state: (),
-            _processed: &ProcessedChildren,
-            child_result: Result<CountSummary, OperationError<CountSummary>>,
+            child_result: DirPostInput<Self>,
         ) -> Result<CountSummary, OperationError<CountSummary>> {
-            // count this directory itself, post-order. a child error propagates (this test visitor
-            // has `fail_early == false` but never errors, so the `Ok` arm is what runs).
-            let child_summary = child_result?;
+            if let Some(observations) = &self.post_observations {
+                observations.lock().unwrap().push(child_result.is_err());
+            }
+            // count this directory only after successful children; failures preserve their partial summary
+            let (child_summary, _) = child_result?;
             Ok(child_summary
                 + CountSummary {
                     dirs: 1,
@@ -1127,6 +1207,155 @@ mod tests {
             dry_run: false,
             prog_track: &PROGRESS,
         }
+    }
+
+    #[tokio::test]
+    async fn omitting_names_preserves_summary_filtering_and_child_errors() -> anyhow::Result<()> {
+        let root = crate::testutils::create_temp_dir().await?;
+        tokio::fs::write(root.join("keep"), b"content").await?;
+        tokio::fs::write(root.join("skip"), b"excluded").await?;
+        tokio::fs::create_dir(root.join("dir")).await?;
+        tokio::fs::symlink("keep", root.join("link")).await?;
+        let dir = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+        let mut filter = FilterSettings::default();
+        filter.add_exclude("skip")?;
+        let visitor = Arc::new(CountingVisitor {
+            filter: Some(filter),
+            authoritative_filter: true,
+            omit_names: true,
+            ..Default::default()
+        });
+        let (summary, processed) =
+            walk_dir_contents(Arc::clone(&visitor), Arc::clone(&dir), &cx, &()).await?;
+        assert_eq!(
+            summary,
+            CountSummary {
+                files: 1,
+                dirs: 1,
+                symlinks: 1
+            }
+        );
+        assert_eq!(visitor.leaves_seen.load(Ordering::SeqCst), 2);
+        assert!(processed.names().is_none());
+        let error = walk_dir_entries(
+            visitor,
+            dir,
+            &cx,
+            &(),
+            vec![
+                (OsString::from("keep"), Some(EntryKind::File)),
+                (OsString::from("missing"), None),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.summary.files, 1);
+        assert!(format!("{:#}", error.source).contains("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn processed_names_distinguish_uncollected_empty_and_ordered() {
+        let (_, uncollected) = WalkEntryFold::new(CountSummary::default(), NameCollection::None)
+            .finish()
+            .unwrap();
+        assert!(uncollected.names().is_none());
+        assert!(crate::delete::DeleteKeepSet::from_processed(&uncollected).is_none());
+        let (_, empty) = WalkEntryFold::new(CountSummary::default(), NameCollection::Names)
+            .finish()
+            .unwrap();
+        assert_eq!(empty.names(), Some([].as_slice()));
+        assert!(crate::delete::DeleteKeepSet::from_processed(&empty).is_none());
+        let (_, delete_empty) = WalkEntryFold::new(
+            CountSummary::default(),
+            NameCollection::Delete(crate::delete::DeleteSettings {
+                delete_excluded: false,
+            }),
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(delete_empty.names(), Some([].as_slice()));
+        assert!(crate::delete::DeleteKeepSet::from_processed(&delete_empty).is_some());
+        let mut fold = WalkEntryFold::new(CountSummary::default(), NameCollection::Names);
+        for (ordinal, name) in [(2, "last"), (0, "first"), (1, "middle")] {
+            fold.push(
+                Ok(Ok(WalkEntryResult {
+                    summary: CountSummary::default(),
+                    processed: Some((ordinal, OsString::from(name))),
+                })),
+                false,
+            )
+            .unwrap();
+        }
+        let (_, collected) = fold.finish().unwrap();
+        assert_eq!(
+            collected.names().unwrap(),
+            ["first", "middle", "last"].map(OsString::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_collection_forces_exact_filtering_with_default_hint_policies()
+    -> anyhow::Result<()> {
+        let root = crate::testutils::create_temp_dir().await?;
+        tokio::fs::write(root.join("file"), b"included").await?;
+        tokio::fs::create_dir(root.join("directory")).await?;
+        let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+        let mut filter = FilterSettings::default();
+        filter.add_exclude("file/")?;
+        filter.add_exclude("directory/")?;
+        let visitor = Arc::new(CountingVisitor {
+            filter: Some(filter),
+            delete_names: true,
+            ..Default::default()
+        });
+        assert!(!visitor.filter_requires_admitted_entry());
+        assert!(visitor.filter_allows_hint_only_skip(&()));
+        let (summary, processed) = walk_dir_entries(
+            visitor,
+            dir,
+            &cx,
+            &(),
+            vec![
+                (OsString::from("file"), Some(EntryKind::Dir)),
+                (OsString::from("directory"), Some(EntryKind::File)),
+            ],
+        )
+        .await?;
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.dirs, 0);
+        assert_eq!(processed.names().unwrap(), [OsString::from("file")]);
+        assert!(crate::delete::DeleteKeepSet::from_processed(&processed).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_directory_post_order_receives_only_the_error() -> anyhow::Result<()> {
+        let root = crate::testutils::create_temp_dir().await?;
+        let source = root.join("source");
+        tokio::fs::create_dir(&source).await?;
+        tokio::fs::write(source.join("good"), b"good").await?;
+        tokio::fs::write(source.join("fail"), b"fail").await?;
+        let parent = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let visitor = Arc::new(CountingVisitor {
+            delete_names: true,
+            fail_leaf: Some(OsString::from("fail")),
+            post_observations: Some(Arc::clone(&observations)),
+            ..Default::default()
+        });
+        let cx = root_cx(Arc::clone(&parent), OsStr::new("source"), source.clone());
+        let error = process_entry(visitor, cx, (), None).await.unwrap_err();
+        assert_eq!(error.summary.files, 1);
+        assert!(format!("{:#}", error.source).contains("injected leaf failure"));
+        assert_eq!(*observations.lock().unwrap(), vec![true]);
+        Ok(())
     }
 
     struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
@@ -1366,8 +1595,7 @@ mod tests {
         let leaves_seen = Arc::new(AtomicUsize::new(0));
         let visitor = Arc::new(CountingVisitor {
             leaves_seen: Arc::clone(&leaves_seen),
-            filter: None,
-            authoritative_filter: false,
+            ..Default::default()
         });
         let cx = root_cx(Arc::clone(&root), std::ffi::OsStr::new("foo"), foo.clone());
         let (summary, processed) = walk_dir_contents(visitor, root, &cx, &()).await?;
@@ -1381,7 +1609,11 @@ mod tests {
             "the walk must count every entry once, by kind"
         );
         // the top-level processed list is foo's direct children: 0.txt, bar, baz.
-        assert_eq!(processed.names().len(), 3, "foo has three direct children");
+        assert_eq!(
+            processed.names().expect("names collected").len(),
+            3,
+            "foo has three direct children"
+        );
         assert_eq!(
             leaves_seen.load(Ordering::SeqCst),
             7,
@@ -1486,8 +1718,7 @@ mod tests {
                 &self,
                 _cx: &EntryCx,
                 _state: (),
-                _processed: &ProcessedChildren,
-                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+                _child_result: DirPostInput<Self>,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 unreachable!("fail-early classification visitor must not recurse")
             }
@@ -1589,8 +1820,7 @@ mod tests {
                 &self,
                 _cx: &EntryCx,
                 _state: (),
-                _processed: &ProcessedChildren,
-                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+                _child_result: DirPostInput<Self>,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 unreachable!("ordered filter visitor must not recurse")
             }
@@ -1688,8 +1918,7 @@ mod tests {
                 &self,
                 _cx: &EntryCx,
                 _state: (),
-                _processed: &ProcessedChildren,
-                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+                _child_result: DirPostInput<Self>,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 unreachable!("dir-pre lifetime visitor does not descend")
             }
@@ -1751,8 +1980,7 @@ mod tests {
                 &self,
                 _cx: &EntryCx,
                 _state: (),
-                _processed: &ProcessedChildren,
-                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+                _child_result: DirPostInput<Self>,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 unreachable!("leaf lifetime visitor must not recurse")
             }
@@ -2099,8 +2327,7 @@ mod tests {
             let leaves_seen = Arc::new(AtomicUsize::new(0));
             let visitor = Arc::new(CountingVisitor {
                 leaves_seen: Arc::clone(&leaves_seen),
-                filter: None,
-                authoritative_filter: false,
+                ..Default::default()
             });
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
@@ -2150,9 +2377,8 @@ mod tests {
             let mut filter = FilterSettings::default();
             filter.add_exclude("leaf")?;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
                 filter: Some(filter),
-                authoritative_filter: false,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), std::ffi::OsStr::new("root"), root.clone());
             admission.set_files_in_flight(1);
@@ -2194,7 +2420,7 @@ mod tests {
                 .map_err(|error| error.source)?;
             assert_eq!(summary, CountSummary::default());
             assert!(
-                processed.names().is_empty(),
+                processed.names().expect("names collected").is_empty(),
                 "filtered entry must not spawn"
             );
             Ok(())
@@ -2221,9 +2447,9 @@ mod tests {
             let mut filter = FilterSettings::default();
             filter.add_exclude("protected/")?;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let walk = scope_tasks(walk_dir_entries(
@@ -2256,7 +2482,7 @@ mod tests {
                 .map_err(|error| error.source)?;
             assert_eq!(summary.files, 2);
             assert_eq!(
-                processed.names(),
+                processed.names().expect("names collected"),
                 &[OsString::from("first"), OsString::from("second")]
             );
             Ok(())
@@ -2281,6 +2507,7 @@ mod tests {
                 leaves_seen: Arc::clone(&leaves_seen),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let error = admission
@@ -2554,7 +2781,7 @@ mod tests {
                 .map_err(|error| error.source)?;
             assert_eq!(summary.files, 2);
             assert_eq!(
-                processed.names(),
+                processed.names().expect("names collected"),
                 &[OsString::from("A"), OsString::from("C")]
             );
             Ok(())
@@ -2576,9 +2803,8 @@ mod tests {
             let mut filter = FilterSettings::default();
             filter.add_exclude("leaf")?;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
                 filter: Some(filter),
-                authoritative_filter: false,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let walk = scope_tasks(walk_dir_entries(
@@ -2605,7 +2831,7 @@ mod tests {
                 "a non-authoritative reliable-hint exclusion consumed admission"
             );
             assert_eq!(summary, CountSummary::default());
-            assert!(processed.names().is_empty());
+            assert!(processed.names().expect("names collected").is_empty());
             Ok(())
         }
 
@@ -2627,9 +2853,9 @@ mod tests {
             let mut filter = FilterSettings::default();
             filter.add_exclude("leaf")?;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let walk = scope_tasks(walk_dir_entries(
@@ -2656,7 +2882,7 @@ mod tests {
                 "an authoritative visitor's cheap filter skip waited for admission"
             );
             assert_eq!(summary.files, 0);
-            assert!(processed.names().is_empty());
+            assert!(processed.names().expect("names collected").is_empty());
             Ok(())
         }
 
@@ -2680,6 +2906,7 @@ mod tests {
                 leaves_seen: Arc::clone(&leaves_seen),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let (summary, processed) = admission
@@ -2697,7 +2924,7 @@ mod tests {
                 .context("destructive stale-hint filter did not terminate")?
                 .map_err(|error| error.source)?;
             assert_eq!(summary, CountSummary::default());
-            assert!(processed.names().is_empty());
+            assert!(processed.names().expect("names collected").is_empty());
             assert_eq!(leaves_seen.load(Ordering::SeqCst), 0);
             Ok(())
         }
@@ -2726,6 +2953,7 @@ mod tests {
                 leaves_seen: Arc::clone(&leaves_seen),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let walk = scope_tasks(walk_dir_entries(
@@ -2777,7 +3005,10 @@ mod tests {
             )?;
             assert_eq!(summary.files, 1);
             assert_eq!(summary.dirs, 0);
-            assert_eq!(processed.names(), &[OsString::from("leaf")]);
+            assert_eq!(
+                processed.names().expect("names collected"),
+                &[OsString::from("leaf")]
+            );
             assert_eq!(leaves_seen.load(Ordering::SeqCst), 1);
             Ok(())
         }
@@ -2811,6 +3042,7 @@ mod tests {
                 leaves_seen: Arc::clone(&leaves_seen),
                 filter: Some(filter),
                 authoritative_filter: true,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
             let (summary, processed) = admission
@@ -2830,7 +3062,10 @@ mod tests {
             assert_eq!(summary.files, depth);
             assert_eq!(summary.dirs, depth);
             assert_eq!(leaves_seen.load(Ordering::SeqCst), depth);
-            assert_eq!(processed.names(), &[OsString::from("extra")]);
+            assert_eq!(
+                processed.names().expect("names collected"),
+                &[OsString::from("extra")]
+            );
             Ok(())
         }
 
@@ -2848,9 +3083,7 @@ mod tests {
                     .into_tree(),
             );
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
-                filter: None,
-                authoritative_filter: false,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&parent), OsStr::new("root"), root);
             let result = admission
@@ -2870,7 +3103,10 @@ mod tests {
                 .context("hinted directory waited for pending-metadata admission")?
                 .map_err(|error| error.source)?;
             assert_eq!(summary.dirs, 1);
-            assert_eq!(processed.names(), &[OsString::from("dir")]);
+            assert_eq!(
+                processed.names().expect("names collected"),
+                &[OsString::from("dir")]
+            );
             Ok(())
         }
 
@@ -2893,9 +3129,7 @@ mod tests {
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
-                filter: None,
-                authoritative_filter: false,
+                ..Default::default()
             });
             let cx = root_cx(parent, OsStr::new("entry"), entry.clone());
             let mut operation = Box::pin(process_entry(
@@ -2989,9 +3223,8 @@ mod tests {
             let mut filter = FilterSettings::default();
             filter.add_exclude("vanished")?;
             let visitor = Arc::new(CountingVisitor {
-                leaves_seen: Arc::new(AtomicUsize::new(0)),
                 filter: Some(filter),
-                authoritative_filter: false,
+                ..Default::default()
             });
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.clone());
             let result = admission
@@ -3056,8 +3289,7 @@ mod tests {
             let leaves_seen = Arc::new(AtomicUsize::new(0));
             let visitor = Arc::new(CountingVisitor {
                 leaves_seen: Arc::clone(&leaves_seen),
-                filter: None,
-                authoritative_filter: false,
+                ..Default::default()
             });
             let cx = root_cx(Arc::clone(&parent), name, dir_path.clone());
             // pre-acquire the single permit exactly as the spawn loop does for a
