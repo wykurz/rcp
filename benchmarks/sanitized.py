@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 
+from benchmarks import measurements, pairs
+
 EXPORT_SCHEMA_VERSION = 1
 TOOLS = ('rcp', 'rcpd', 'rsync', 'cp', 'filegen', 'ssh', 'rcp-baseline', 'rcpd-baseline')
 ROLES = ('master', 'source', 'destination')
@@ -330,6 +332,7 @@ def project_run(run, source_results):
         result['summaries'].append(dict(series_id=summary['series_id'],case=case_aliases[summary['case_id']],variant=variant_aliases[summary['variant_id']],
             samples=summary['samples'],unit='seconds',median=summary['median'],minimum=summary['minimum'],maximum=summary['maximum'],stdev=summary['stdev'],
             files_per_second=summary['files_per_second'],run_status=run['status'],acceptance_evaluated=False))
+    project_experiment(run, result, case_aliases, variant_aliases)
     result['failure']=diagnostic(run.get('failure'),run['run_id']+'-diagnostic') if run['status']=='failed' else None
     result['ratios']=ratios(run,case_aliases,variant_aliases)
     return result
@@ -355,3 +358,52 @@ def export_results(input_path, output):
             except OSError:pass
         raise
     return envelope
+
+
+def project_experiment(run, result, cases, variants):
+    """Project only validated experiment constants, numeric fields and fingerprints."""
+    context = run['context']
+    config = context.get('pairing')
+    if config is not None:
+        result['pairing'] = dict(policy=pairs.POLICY, seed=config['seed'], pairs_per_case=config['pairs_per_case'],
+                                block_pairs=2, candidate=variants.get(pairs.CANDIDATE), reference=variants.get(pairs.REFERENCE))
+        result['paired_comparisons'] = [dict(case=cases[pair['case_id']], pair=pair['pair'], block=pair['block'],
+            order=[variants[key] for key in pair['order']], candidate_trial=pair['candidate_trial'],
+            reference_trial=pair['reference_trial'], candidate_over_reference=pair['candidate_over_reference'],
+            run_status=run['status'], completed_case=True, acceptance_evaluated=False) for pair in pairs.comparisons(run)]
+    resources = context.get('local_resources')
+    if resources is not None:
+        result['local_resources'] = dict(policy=measurements.POLICY, scope=measurements.SCOPE,
+                                        time_sha256=fingerprint(resources['time_sha256']), version_text_withheld=True)
+    if 'measurement_environment' in context:
+        result['measurement_environment'] = {key: dict(present=True, value_withheld=True)
+            for key in measurements.ENVIRONMENT_KEYS if key in context['measurement_environment']}
+    declared = context.get('build_provenance')
+    if declared is not None:
+        result['build_provenance'] = dict(qualification='caller-declared; executable hashes verified, source claims not attested',
+                                        input_sha256=fingerprint(declared['input_sha256']), builds={})
+        for key in ('rcp', 'rcp-baseline'):
+            if key not in declared['builds']:
+                continue
+            build = declared['builds'][key]
+            result['build_provenance']['builds'][key] = dict(
+                binary_sha256=fingerprint(build['binary_sha256']), source_revision=build['source_revision'],
+                source_dirty=build['source_dirty'], patch_sha256=fingerprint(build['patch_sha256']),
+                cargo_lock_sha256=fingerprint(build['cargo_lock_sha256']), flake_lock_sha256=fingerprint(build['flake_lock_sha256']),
+                configuration_text_withheld=True)
+    if 'phase_seconds' in run:
+        result['phase_seconds'] = {key:number(run['phase_seconds'][key]) for key in sorted(measurements.RUN_PHASES) if key in run['phase_seconds']}
+    for original, projected in zip(run['trials'], result['trials']):
+        if 'phase_seconds' in original:
+            projected['phase_seconds'] = {key:number(original['phase_seconds'][key]) for key in sorted(measurements.TRIAL_PHASES) if key in original['phase_seconds']}
+        if 'pairing' in original:
+            metadata = original['pairing']
+            projected['pairing'] = dict(pair=metadata['pair'], block=metadata['block'], position=metadata['position'],
+                                       order=[variants[key] for key in metadata['order']])
+        if 'resources' in original:
+            projected['exit_status_scope'] = enum(original.get('exit_status_scope'), {measurements.EXIT_STATUS_SCOPE})
+            projected['payload_status'] = enum(original.get('payload_status'), measurements.PAYLOAD_STATUSES)
+            value = original['resources']
+            projected['resources'] = dict(status=enum(value['status'], measurements.RESOURCE_STATUSES),
+                metrics={key:number(value['metrics'][key],integer=key not in measurements.FLOATS) for key in (*measurements.FLOATS,*measurements.COUNTS,'exit_code')} if value['status']=='complete' else None,
+                raw_sha256=fingerprint(value.get('raw_sha256')), reason=enum(value.get('reason'), measurements.UNAVAILABLE_REASONS), error_text_withheld='error' in value)

@@ -7,11 +7,12 @@ import json
 import math
 import re
 import statistics
+import tempfile
 from pathlib import Path
 
 from benchmarks.strict_json import parse_json
 from benchmarks.timings import require_roles, validate_report
-from benchmarks import operations, transport, sanitized, changes
+from benchmarks import operations, transport, sanitized, changes, pairs, measurements
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -31,7 +32,7 @@ def _text(value, name):
 
 
 def _number(value, name):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if not measurements.nonnegative(value):
         raise ValueError(f"{name} must be a finite nonnegative number")
     return value
 
@@ -271,13 +272,15 @@ def validate_result(value):
             raise ValueError("summaries must cover every selected case and variant")
     if run.get("error") is not None and not isinstance(run["error"], str):
         raise ValueError("error must be a string")
+    pairs.validate(run)
+    measurements.validate(run)
     return run
 
 
 def _validate_operation_trial(trial, case, variant, context):
     operation = case.get("mode", "fresh")
     operations.validate_variant(variant, operation)
-    child_locale = operations.SUMMARY_LOCALE if operations.summary_supported(variant) else "inherited"
+    child_locale = measurements.child_locale(variant, context.get("local_resources") is not None)
     if trial.get("child_locale") != child_locale:
         raise ValueError("trial.child_locale differs from exact-summary locale policy")
     if trial.get("operation") != operation:
@@ -362,22 +365,28 @@ def render(input_path, output):
     runs, sources = load_result_records(input_path)
     evidence = changes.build(runs, sources)
     history = {"schema_version": 1, "runs": runs}
-    embedded = json.dumps(history, ensure_ascii=False, separators=(",", ":"))
-    for literal, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+    embedded = json.dumps(history, ensure_ascii=True, separators=(",", ":"))
+    for literal, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e")):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
     page = template.replace("__HISTORY_JSON__", embedded)
     # serialize every representation before publishing any output files
     files = {
-        "history.json": json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+        "history.json": json.dumps(history, ensure_ascii=True, indent=2) + "\n",
         "index.html": page,
-        "changes.json": json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        "changes.json": json.dumps(evidence, ensure_ascii=True, indent=2, allow_nan=False) + "\n",
         "changes.md": changes.markdown(evidence),
         "changes.html": changes.html_report(evidence),
     }
+    # encode and stage all outputs before replacing any existing report file
+    encoded = {name: content.encode("utf-8") for name, content in files.items()}
     output.mkdir(parents=True, exist_ok=True)
-    for name, content in files.items():
-        (output / name).write_text(content, encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix=".render-", dir=output) as temporary:
+        staged = Path(temporary)
+        for name, content in encoded.items():
+            (staged / name).write_bytes(content)
+        for name in encoded:
+            (staged / name).replace(output / name)
 
 
 def main(argv=None):

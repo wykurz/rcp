@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport
+from benchmarks import timings, operations, transport, pairs, measurements
 from benchmarks.operations import expected_counts
 
 
@@ -233,34 +233,66 @@ class _SignalCancellation:
         return False
 
 
-def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False):
+def _execution_failure(outcome, *, wrapped=False):
+    """Classify primary execution failure once; resource diagnostics are secondary."""
+    if outcome["launch_error"] is not None:
+        kind, stage, category = "launch", "outer_launch", "execution"
+        message = f"resource supervisor launch failed: {outcome['launch_error']}"
+    elif outcome["timed_out"]:
+        kind, stage, category = "timeout", "command", "timeout"
+        message = "command timed out; payload termination is unconfirmed"
+    elif not outcome["ok"]:
+        kind, stage, category = "command", "command", "execution"
+        message = f"resource supervisor failed with exit codes {outcome['exit_codes']}; payload failure cause is unconfirmed"
+    elif wrapped and outcome["resources"]["status"] != "complete":
+        return dict(kind="resources", stage="postflight", category="validation",
+                    message=f"resource collection failed: {outcome['resources']['error']}")
+    else:
+        return None
+    return dict(kind=kind, stage=stage, category=category,
+                message=message if wrapped else "command failed or timed out")
+
+
+def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None):
+    if resource_time is not None and len(commands) != 1:
+        raise ValueError("local resources require exactly one command")
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=False)
+    resource_path = log_dir / "resources.json"
+    launched_commands = [measurements.wrap(command, resource_time, resource_path) for command in commands] if resource_time else commands
     children = []
     files = []
     waiters = []
     finished = {}
     condition = threading.Condition()
-    child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale else None
+    child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale or resource_time is not None else None
     started = time.monotonic()
     launch_error = None
     timed_out = False
     cleanup_groups = False
+    resources = None
     def terminate_groups():
-        for signal_to_send in (signal.SIGTERM, signal.SIGKILL):
-            for process in children:
+        groups = {process.pid for process in children}
+        def signal_groups(number):
+            for group in tuple(groups):
                 try:
-                    os.killpg(process.pid, signal_to_send)
+                    os.killpg(group, number)
                 except ProcessLookupError:
-                    pass
-            if signal_to_send == signal.SIGTERM:
-                grace = time.monotonic() + 1
-                with condition:
-                    while len(finished) < len(children) and time.monotonic() < grace:
-                        condition.wait(grace - time.monotonic())
+                    groups.remove(group)
+        signal_groups(signal.SIGTERM)
+        grace = time.monotonic() + 1
+        with condition:
+            while groups:
+                # a reaped supervisor can leave its measured command alive in the group
+                signal_groups(0)
+                remaining = grace - time.monotonic()
+                if not groups or remaining <= 0:
+                    break
+                condition.wait(min(remaining, .05))
+        signal_groups(signal.SIGKILL)
     with _SignalCancellation(condition) as cancellation:
         try:
-            for index, command in enumerate(commands):
+            for index, command in enumerate(launched_commands):
                 cancellation.checkpoint()
                 stdout_path = log_dir / f"{index}.stdout.log"
                 stderr_path = log_dir / f"{index}.stderr.log"
@@ -297,6 +329,10 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False)
                 cancellation.checkpoint()
                 timed_out = launch_error is None and len(finished) < len(children)
             cleanup_groups = bool(launch_error is not None or timed_out or any(code != 0 for code, _ in finished.values()))
+            if resource_time is not None and not cleanup_groups:
+                resources = measurements.collect(resource_path, successful=True)
+                cleanup_groups = resources["status"] != "complete"
+            cancellation.checkpoint()
         except BaseException:
             cleanup_groups = True
             raise
@@ -312,7 +348,18 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False)
                 handle.close()
     codes = [process.returncode for process in children]
     completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
-    return {"ok": not (launch_error or timed_out) and len(children) == len(commands) and all(code == 0 for code in codes), "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
+    status = measurements.payload_status(codes, timed_out, launch_error, expected_commands=len(commands))
+    outcome = {"ok": status == "succeeded", "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
+    if resource_time is not None:
+        outcome["measurement_commands"] = launched_commands
+        outcome["exit_status_scope"] = measurements.EXIT_STATUS_SCOPE
+        outcome["payload_status"] = status
+        outcome["resources"] = resources or measurements.collect(resource_path, status == "succeeded")
+    failure = _execution_failure(outcome, wrapped=resource_time is not None)
+    if failure is not None:
+        outcome["failure"] = failure
+        outcome["ok"] = False
+    return outcome
 
 
 def _read(path):
@@ -352,7 +399,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy", operation_revision=None, owned_transport=None):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy", operation_revision=None, owned_transport=None, experiment=None):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -368,10 +415,12 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "timing_request": timing_request, "timing_collection": timing_collection, "timing_capability": timing_capability, "verification_policy": VERIFICATION_POLICY}
+    if experiment is not None:
+        value["experiment"] = experiment
     if operation_revision is not None:
         value["case"]["mode"] = case.get("mode", "fresh")
         value["operation_contract_revision"] = operation_revision
-        value["child_locale"] = operations.SUMMARY_LOCALE if operations.summary_supported(variant) else "inherited"
+        value["child_locale"] = measurements.child_locale(variant, bool((experiment or {}).get("local_resources")))
         if cache_policy == "source-verified":
             value["cache_contract_revision"] = operations.CACHE_REVISION
     if owned_transport is not None:
@@ -433,6 +482,16 @@ def _persist(output, record):
                   "| --- | --- | ---: | ---: | ---: |"]
     for summary in record["summaries"]:
         lines.append(f"| {summary['case_id']} | {summary['variant_id']} | {summary['median']:.3f} | {summary['minimum']:.3f}–{summary['maximum']:.3f} | {len(summary['samples'])} |")
+    if "pairing" in record["context"]:
+        lines += ["", "## Adjacent pairs", "", "Candidate / reference wall time; incomplete or failed pairs and pairs from unfinished or failed cases are not compared.", "", "| Case | Pair | Block | Order | Ratio |", "| --- | ---: | ---: | --- | ---: |"]
+        for pair in pairs.comparisons(record):
+            lines.append(f"| {pair['case_id']} | {pair['pair']} | {pair['block']} | {' → '.join(pair['order'])} | {pair['candidate_over_reference']:.4f} |")
+    if "local_resources" in record["context"]:
+        lines += ["", "## Local process resources", "", measurements.SCOPE + ". RSS is a per-command peak, never a sum of simultaneous resident memory.", "", "| Case | Variant | Repeat | Trial status | User CPU s | System CPU s | Peak RSS KiB |", "| --- | --- | ---: | --- | ---: | ---: | ---: |"]
+        for trial in record["trials"]:
+            metrics = trial.get("resources", {}).get("metrics")
+            if metrics is not None:
+                lines.append(f"| {trial['case_id']} | {trial['variant_id']} | {trial['iteration']} | {trial['status']} | {metrics['user_seconds']:.2f} | {metrics['system_seconds']:.2f} | {metrics['max_rss_kib']} |")
     timing_trials = [trial for trial in record["trials"] if "timings" in trial]
     if timing_trials:
         lines += ["", "## Scoped timings", "", "Scope durations are cumulative elapsed seconds across invocations. Scopes can overlap each other and command wall time; their totals are not additive wall time.", "", "| Case | Variant | Repeat | Role | Scope | Count | Finished | Interrupted | Cumulative elapsed (s) | Mean (s) | P50 (s) | P95 (s) | Max (s) |", "| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
@@ -509,7 +568,18 @@ def _arguments(argv):
     parser.add_argument("--files-in-flight")
     parser.add_argument("--ssh-transport-profile", type=_nonblank)
     parser.add_argument("--no-timings", action="store_true", help="disable scoped timing collection for overhead diagnostics")
+    parser.add_argument("--paired-seed", type=int, help="opt into adjacent balanced local rcp/base pairs; repetitions counts pairs and must be even")
+    parser.add_argument("--local-resources", action="store_true", help="collect local single-process GNU-time CPU/RSS/context-switch metrics")
+    parser.add_argument("--resource-time", type=Path, help="GNU time executable for --local-resources")
+    parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
     args = parser.parse_args(argv)
+    if args.build_provenance is not None:
+        try:
+            measurements.validate_provenance_mode(args.mode)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.resource_time is not None and not args.local_resources:
+        parser.error("--resource-time requires --local-resources")
     if args.rtt_ms is not None and args.mode != "loopback":
         parser.error("--rtt-ms requires loopback mode")
     if args.mode == "local" and args.ssh_transport_profile is not None:
@@ -526,6 +596,8 @@ def _default_bin_dir():
 
 def main(argv=None):
     args = _arguments(argv)
+    run_started = time.monotonic()
+    collect_costs = args.paired_seed is not None or args.local_resources
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
@@ -549,6 +621,12 @@ def main(argv=None):
     try:
         if args.repetitions <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("repetitions and timeout must be positive; timeout must be finite")
+        if args.paired_seed is not None:
+            if not args.no_timings:
+                raise ValueError("paired v1 requires --no-timings for identical role instrumentation")
+            record["context"]["pairing"] = pairs.configuration(args.paired_seed, args.repetitions)
+        if collect_costs or args.build_provenance is not None:
+            record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
         all_directory_files = any("files_per_directory" in case for case in cases)
@@ -581,6 +659,10 @@ def main(argv=None):
         for case in cases:
             for variant in variants:
                 operations.validate_variant(variant, case.get("mode", "fresh"))
+        if args.paired_seed is not None:
+            pairs.validate_selection(args.mode, variants)
+        if args.local_resources:
+            measurements.validate_selection(args.mode, variants)
         record["cases"] = cases
         record["variants"] = variants
         _persist(output, record)
@@ -609,6 +691,17 @@ def main(argv=None):
             if not ssh:
                 raise ValueError("ssh executable not found")
             record["tools"]["ssh"] = _tool(ssh, "-V")
+        resource_time = None
+        if args.local_resources:
+            selected_time = args.resource_time or shutil.which("time")
+            if not selected_time:
+                raise ValueError("GNU time executable not found")
+            time_tool = _tool(selected_time)
+            record["context"]["local_resources"] = measurements.policy(time_tool)
+            resource_time = time_tool["path"]
+        if args.build_provenance is not None:
+            record["context"]["build_provenance"] = measurements.load_builds(args.build_provenance, record["tools"])
+        experiment = measurements.identity(record["context"])
         endpoints = environment(args.source_root, args.destination_root)
         record["context"]["environment"] = endpoints
         _persist(output, record)
@@ -635,17 +728,23 @@ def main(argv=None):
             if leaf_files:
                 filegen_command.append("--leaf-files")
             filegen_command.append(f"--bufsize={min(case['file_size_bytes'], 1048576)}")
+            generation_started = time.monotonic()
             generated = subprocess.run(filegen_command, capture_output=True, text=True, timeout=args.timeout)
+            if collect_costs:
+                measurements.add_cost(record, "generation", generation_started)
             (output / "logs" / f"{case['id']}.filegen.stdout.log").write_text(generated.stdout)
             (output / "logs" / f"{case['id']}.filegen.stderr.log").write_text(generated.stderr)
             if generated.returncode:
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
+            initial_started = time.monotonic()
             source_scan = scan_tree(source)
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
             operation = case.get("mode", "fresh")
             source_metadata = operations.metadata_tree(source) if args.cache == "source-verified" or operation != "fresh" or any(operations.summary_supported(variant) for variant in variants) else None
+            if collect_costs:
+                measurements.add_cost(record, "initial_verification", initial_started)
             stale_names = operations.select_stale(source_scan["entries"]) if operation == "partial" else []
             expected_transfer = operations.transfer_counts(operation, source_scan["counts"])
             case["fixture_digest"] = source_scan["digest"]
@@ -653,18 +752,27 @@ def main(argv=None):
             _persist(output, record)
             for iteration in range(1, args.repetitions + 1):
                 order = variants[(iteration - 1) % len(variants):] + variants[:(iteration - 1) % len(variants)]
-                for variant in order:
+                if args.paired_seed is not None:
+                    by_id = {variant["id"]: variant for variant in variants}
+                    order = [by_id[key] for key in pairs.order(record["context"]["pairing"], case["id"], iteration)]
+                for position, variant in enumerate(order):
                     trial_path = Path(case["id"]) / variant["id"] / str(iteration)
                     destination = destination_scratch / trial_path
                     timing_policy = timing_collection[variant["id"]]
-                    stable_summary_locale = operations.summary_supported(variant)
+                    child_locale = measurements.child_locale(variant, args.local_resources)
+                    stable_summary_locale = child_locale == operations.SUMMARY_LOCALE
                     trial = {"case_id": case["id"], "variant_id": variant["id"], "iteration": iteration,
                              "operation": operation, "expected_transfer": expected_transfer,
-                             "child_locale": operations.SUMMARY_LOCALE if stable_summary_locale else "inherited",
+                             "child_locale": child_locale,
                              "commands": [], "status": "running", "validation": {"ok": False},
                              "exit_codes": [], "logs": [], "timings": {"status": timing_policy, "reports": []}}
+                    if args.paired_seed is not None:
+                        trial["pairing"] = pairs.trial_metadata(record["context"]["pairing"], case["id"], iteration, position)
+                    if args.local_resources:
+                        trial["resources"] = {"status": "unavailable", "metrics": None}
                     record["trials"].append(trial)
                     _persist(output, record)
+                    preparation_started = time.monotonic()
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if operation != "fresh":
                         stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
@@ -693,6 +801,8 @@ def main(argv=None):
                         trial["validation"] = {"ok": False, "error": f"cache preparation failed: {exc}"}
                         _persist(output, record)
                         raise
+                    if collect_costs:
+                        measurements.add_cost(trial, "preparation", preparation_started)
                     _persist(output, record)
                     if args.rtt_ms is not None:
                         identities = {key: record["tools"][key + "-baseline" if variant["id"] == "rcp-baseline" else key]["sha256"] for key in (("rcp", "rcpd") if variant["tool"] == "rcp" else ("rsync",))}
@@ -702,7 +812,9 @@ def main(argv=None):
                             len(record["trials"]) - 1, expected_pins=identities, ssh_identity=record["tools"]["ssh"])
                         commands = outcome["commands"]
                     else:
-                        outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale)
+                        options = {"resource_time": resource_time} if resource_time is not None else {}
+                        outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale, **options)
+                    verification_started = time.monotonic()
                     trial.update(outcome)
                     timing_error = None
                     if timing_policy == "coarse":
@@ -715,7 +827,7 @@ def main(argv=None):
                         except timings.CollectionError as error:
                             trial["timings"]["reports"] = error.reports
                             timing_error = str(error)
-                    trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message", "command failed or timed out")}
+                    trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"}
                     if outcome["ok"] and trial["validation"]["ok"]:
                         try:
                             if operations.summary_supported(variant):
@@ -730,11 +842,16 @@ def main(argv=None):
                         trial["validation"]["timing_error"] = timing_error
                         if trial["validation"]["ok"]:
                             trial["validation"].update(ok=False, error=f"timing collection failed: {timing_error}")
+                    if collect_costs:
+                        measurements.add_cost(trial, "verification", verification_started)
                     trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] else "failed"
                     _persist(output, record)
                     if trial["status"] != "ok":
                         raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
+                    cleanup_started = time.monotonic()
                     shutil.rmtree(destination)
+                    if collect_costs:
+                        measurements.add_cost(trial, "cleanup", cleanup_started)
             source_validation = record["trials"][-1]["source_validation"] if source_metadata is not None else validate_tree(source, source, source_scan)
             if not source_validation["ok"]:
                 raise RuntimeError(f"source changed during case {case['id']}: {source_validation['error']}")
@@ -749,7 +866,7 @@ def main(argv=None):
                     if any(observation != observations[0] for observation in observations):
                         raise ValueError("owned role capacity/resource observations changed between repetitions; refusing to pool samples")
                     owned_semantics = {**transport.semantics(args.rtt_ms), "observations": observations[0]}
-                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics, experiment=experiment), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
             shutil.rmtree(fixture_root)
@@ -758,6 +875,8 @@ def main(argv=None):
         shutil.rmtree(destination_scratch)
     except BaseException as exc:
         record["status"] = "failed"
+        if collect_costs:
+            measurements.add_cost(record, "total", run_started)
         record["error"] = str(exc) or type(exc).__name__
         for trial in record["trials"]:
             if trial["status"] == "running":
@@ -767,6 +886,8 @@ def main(argv=None):
             record["context"]["failure_artifacts"] = {"source_scratch": str(source_scratch) if source_scratch else "", "destination_scratch": str(destination_scratch) if destination_scratch else ""}
         _persist(output, record)
         raise
+    if collect_costs:
+        measurements.add_cost(record, "total", run_started)
     _persist(output, record)
     return record
 

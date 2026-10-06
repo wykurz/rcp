@@ -360,6 +360,7 @@
                 pkgs.just
                 pkgs.llvmPackages.bintools
                 pythonWithPyYAML
+                pkgs.time
                 pkgs.tokio-console
                 depot
 

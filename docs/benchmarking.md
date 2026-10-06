@@ -124,6 +124,118 @@ current remote implementation, `--max-files-in-flight=128` remains limited by th
 nine variants: the three defaults plus six rcp limits. Nine repetitions let each variant occupy
 every trial position once.
 
+## Adjacent local pairs and process resources
+
+`--paired-seed SEED` opts into adjacent candidate/reference pairs instead of the default rotating
+variant order. Select only `--variant rcp-default` and supply `--baseline-bin-dir`; both roles must
+use identical single-process arguments in local mode. Paired v1 requires `--no-timings` and rejects
+explicit timing arguments in the manifest so both roles use the same instrumentation.
+`--repetitions` counts **pairs per case** and must be positive and even. Each two-pair block
+contains one candidate-first and one reference-first pair. SHA-256 of `seed:case_id:block` chooses
+the first order; the second reverses it. The seed is a JavaScript-safe integer from 0
+through 9007199254740991. Results record policy `adjacent-balanced-sha256-v1`, seed, pair, block,
+position (zero-based), and both role IDs. Scheduling is reproducible independently of Python's PRNG.
+
+The roles remain adjacent in execution order, with the normal preparation, full verification and
+cleanup between commands. They share one generated source but receive fresh destinations. A failure
+stops the run, retains diagnostics and owned failure trees, and never invents a missing measurement.
+Only pairs from fully validated cases with both committed summaries get candidate/reference wall
+ratios in `summary.md` and the sanitized run envelope; raw trial indices preserve the pairing. A
+partial prefix remains readable, but its unfinished case supplies no ratios. Earlier completed cases
+survive a later case failure. Ratios retain their run status and smoke/performance purpose and are
+not acceptance gates or statistical tests. Ordinary historical median ratios are still separate,
+unpaired summaries. Use a custom manifest to fix concurrency and runtime flags on `rcp-default`;
+paired mode intentionally rejects sweeps and additional variants. Smoke-purpose ratios, if
+explicitly paired, are diagnostic only.
+
+`--local-resources` independently opts into Linux GNU time measurements for one local command per
+trial. The Nix development environment provides GNU time; `--resource-time PATH` can select another
+GNU time executable explicitly. Its digest and version are recorded. The runner launches this small
+supervisor through a fresh exec, then GNU time forks and waits for the measured command. This avoids
+the large Python fixture inventory contaminating child peak RSS through a direct post-fork wait4
+measurement. Synthetic tests exercise that distinction with a resident 96 MiB parent.
+
+Metrics are user/system CPU seconds (GNU time's hundredth-second resolution), peak RSS in KiB,
+voluntary/involuntary context switches, minor/major faults, and exit code. They cover the local
+command's threads and waited descendants according to Linux process accounting. RSS is the kernel's
+per-command maximum, not sampled simultaneous process-tree RSS or summed peaks. Remote servers and
+unwaited descendants are not attributed; remote and multi-process variants are rejected. The
+supervisor adds launch/wait overhead to command wall time. Raw `resources.json` bytes and their
+SHA-256 are retained next to stdout/stderr for accepted measurements. Resource metrics are accepted
+only after successful command execution. A failed or timed-out command retains raw logs but has
+unavailable metrics: GNU time cannot distinguish failed exec from payload exits 126/127, and its
+exit field alone does not identify signal termination. In this opt-in mode, `exit_codes` explicitly
+have `exit_status_scope: resource-supervisor`; failed payload status is `unconfirmed`. Supervisor
+launch errors and timeouts remain primary diagnostics, independent of resource-file errors. Imports
+require one recorded command and explicit supervisor/payload qualification for executed resource
+trials. A recorded timeout or launch error counts as an execution attempt even when exit codes are
+absent. Failures before command execution is attempted may omit those qualifications. Process-group
+cleanup gives descendants their grace period even after the supervisor exits. Unwrapped command
+status behavior is unchanged. Missing or malformed measurements after successful execution fail the
+trial. Resource statuses are `complete`, `invalid` and `unavailable`; only `complete` carries
+accepted metrics. An `invalid` record requires confirmed successful execution and a SHA-256
+fingerprint of the malformed resource bytes. Failed execution requires `unavailable` with reason
+`execution_failed`, regardless of resource-file contents. Both supervisor and child use `LC_ALL=C`
+and `LANG=C`.
+
+Either option records phase costs: fixture generation and initial verification on the run;
+preparation (including cache preparation but excluding result persistence), verification and
+destination cleanup on each trial; and total elapsed run time. These completed-phase costs are
+diagnostic wall times outside command timing, not an exhaustive partition: probing, result
+serialization and final scratch removal also cost time. Interrupted phases can be absent; completed
+measured runs must retain all three trial costs and generation, initial verification and total run
+costs. With a small numeric tolerance, total must cover the accumulated generation, initial
+verification and per-trial phase costs. It is not their sum: copy commands, persistence and other
+unrecorded work take additional time. Total includes all phases and must not be added to them.
+`source-verified` reads and checks the source before each trial without a global sync or cache drop;
+it does not guarantee a fully hot cache or durable destination data. This remains command-completion
+measurement, not copy-plus-sync.
+
+For a small mechanism calibration, point both roles at the **same prepared full release**:
+
+```bash
+just benchmark-run --case tiny-10k --variant rcp-default --mode local \
+  --bin-dir /release/same --baseline-bin-dir /release/same \
+  --source-root /scratch/source --destination-root /scratch/destination \
+  --cache source-verified --no-timings --paired-seed 20261006 --repetitions 2 \
+  --local-resources --timeout 180 --purpose smoke --output /new/paired-smoke
+```
+
+Before scaling, set a finite disk/inode budget, total runtime limit and cleanup policy. Four A/A
+copies can calibrate cost and plumbing; they cannot characterize a noise distribution. Do not pool
+different targets, allocators, runtime flags, filesystems or cache policies, or treat a libc/target
+change as an isolated allocator experiment. These options change no scheduled workflows or gates.
+
+`--build-provenance PATH` is available only with `--mode local`. It loads a strict JSON sidecar with
+`schema_version: 1` and `builds`, mapping `rcp` and/or `rcp-baseline` to declarations. Remote and
+loopback runs are rejected because the sidecar describes only the local executables and environment.
+Each declaration requires `binary_sha256`, `source_revision` (full commit ID), `source_dirty`
+(boolean), `patch_sha256` (SHA-256 or null; required when dirty), `cargo_lock_sha256`,
+`flake_lock_sha256`, `target`, `profile`, `features` (distinct strings), `rustflags` (argument
+strings), and `rustc` (version text). Record the effective build configuration, not just the working
+checkout: executable digests are checked, but source/configuration claims remain caller-declared and
+are not build attestations. Sidecar bytes are fingerprinted. Any of the pairing, resource or
+provenance options records an allowlist of allocator/loader/runtime environment variables; this is
+not a complete environment capture. Keep raw results private if their paths, flags or declarations
+contain private details. Linux environment bytes represented by Python surrogate escapes remain
+lossless in ASCII-escaped JSON. The report stages encoded outputs before replacing each file
+atomically; this protects existing files from validation, encoding and staging failures, but is not
+a transaction across all files.
+
+Sanitized exports retain pair/order/phase metadata, accepted numeric resource metrics, historical
+series IDs and composite artifact fingerprints. Supervisor version text, build configuration text
+and environment values are omitted. Environment entries reveal presence only; no per-value digest is
+exported. Build configuration is not anonymized: `configuration_text_withheld` marks text omission
+only. Source-result and provenance-sidecar fingerprints remain available for integrity checks and
+evidence linkage, not anonymization guarantees. Build-source qualification stays explicit.
+
+Experiment policy, resource supervisor, observed environment allowlist and declared build
+configuration distinguish new historical series; seeds and repetition counts do not. Feature names
+are canonicalized as a set for series identity, while `rustflags` retain their order because
+argument order can change the build. Existing result schemas and identities remain unchanged when
+these options are absent. Imports with any pairing, resource or build-provenance context require the
+captured environment object, including an empty object when no allowlisted variables were present.
+
 ## Cases and variants
 
 | Purpose     | Case          | Directory widths | Files per leaf | File size | Total files | Logical data |
@@ -595,8 +707,8 @@ A result directory or history with `runs/*.json` also works. The output director
 contains only `export.json`. Keep the input records and their raw evidence privately. The export
 retains every attempted trial in its original order, including failed and running trials, measured
 durations, exits, counts, proof qualifications, resource observations and timing values. It
-preserves original run/series IDs and exact SHA256 hashes of all input files, including identical
-duplicate records with different byte formatting.
+preserves original run/series IDs and exact SHA256 hashes of source result files, including
+identical duplicate records with different byte formatting.
 
 Paths, account/host names, credentials, raw errors, labels and unknown fields are withheld. Captured
 operand bindings become symbolic paths; unclassified operands stay null. Missing bindings make
