@@ -834,7 +834,7 @@ impl CopyVisitor {
             return Ok(());
         };
         let keep_set = keep_set.hashed();
-        match crate::delete::prune_extraneous(
+        crate::delete::prune_and_fold(
             self.prog_track,
             prune_dir,
             &relative_dir,
@@ -842,18 +842,9 @@ impl CopyVisitor {
             self.settings.filter.as_ref(),
             self.settings.fail_early,
             self.settings.dry_run,
+            &mut copy_summary.rm_summary,
         )
         .await
-        {
-            Ok(rm_summary) => {
-                copy_summary.rm_summary = copy_summary.rm_summary + rm_summary;
-            }
-            Err(err) => {
-                copy_summary.rm_summary = copy_summary.rm_summary + err.summary;
-                return Err(err.source);
-            }
-        }
-        Ok(())
     }
 
     /// Finish a directory after its children and `--delete` prune have run: when filtering left it
@@ -1154,10 +1145,11 @@ impl WalkVisitor for CopyVisitor {
     }
 
     fn name_collection(&self) -> NameCollection {
-        self.settings
-            .delete
-            .clone()
-            .map_or(NameCollection::None, NameCollection::Delete)
+        if self.settings.delete.is_some() {
+            NameCollection::Delete
+        } else {
+            NameCollection::None
+        }
     }
 
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
@@ -1513,40 +1505,34 @@ impl WalkVisitor for CopyVisitor {
         // prune and surface the child error). the partial child summary is folded either way,
         // seeded with `base` (this directory's own create/unchanged contribution) — exactly as
         // `copy_dir_contents` seeded `copy_summary = base` before joining the children.
-        let (copy_summary, child_error) = match child_result {
-            Ok((child_summary, processed)) => {
-                let mut summary = base + child_summary;
-                let mut error = None;
-                if let Some(keep_set) = crate::delete::DeleteKeepSet::from_processed(&processed) {
-                    match self
-                        .prune_finished_dir(
-                            &mut summary,
-                            &keep_set,
-                            dst_dir.as_ref().or(preview_dir.as_ref()),
-                            &self.dst_path_for(cx),
-                            &cx.rel_path,
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(prune_error) if self.settings.fail_early => {
-                            return Err(Error::new(prune_error, summary));
-                        }
-                        Err(prune_error) => error = Some(prune_error),
-                    }
-                }
-                (summary, error)
-            }
-            Err(error) => {
-                if self.settings.delete.is_some() {
-                    tracing::warn!(
-                        "skipping --delete pruning of {:?} because the copy reported errors",
-                        self.dst_path_for(cx)
-                    );
-                }
-                (base + error.summary, Some(error.source))
-            }
+        let (mut copy_summary, mut child_error, processed) = match child_result {
+            Ok((summary, processed)) => (base + summary, None, Some(processed)),
+            Err(error) => (base + error.summary, Some(error.source), None),
         };
+        if self.settings.delete.is_some()
+            && let Some(keep_set) = crate::delete::DeleteDecision::from_processed(
+                self.settings.delete.as_ref(),
+                processed.as_ref(),
+            )
+            .into_ready(&self.dst_path_for(cx))
+        {
+            match self
+                .prune_finished_dir(
+                    &mut copy_summary,
+                    &keep_set,
+                    dst_dir.as_ref().or(preview_dir.as_ref()),
+                    &self.dst_path_for(cx),
+                    &cx.rel_path,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if self.settings.fail_early => {
+                    return Err(Error::new(error, copy_summary));
+                }
+                Err(error) => child_error = Some(error),
+            }
+        }
         // empty-dir cleanup + post-order directory metadata; also surfaces any collected child error.
         self.finalize_dir(
             FinalizeDir {
@@ -5516,8 +5502,11 @@ mod copy_tests {
                 visitor
                     .prune_finished_dir(
                         &mut summary,
-                        &crate::delete::DeleteKeepSet::from_processed(&processed)
-                            .expect("delete traversal completed"),
+                        &crate::delete::DeleteKeepSet::from_processed(
+                            visitor.settings.delete.as_ref().unwrap(),
+                            &processed,
+                        )
+                        .expect("delete traversal completed"),
                         Some(&dst_dir),
                         &dst,
                         std::path::Path::new(""),

@@ -212,9 +212,9 @@ pub enum NameCollection {
     None,
     /// Retain ordered names under the visitor's existing filtering policy.
     Names,
-    /// Retain exact names and their deletion settings. The driver requires authoritative
-    /// filtering and disallows hint-only exclusions for this policy.
-    Delete(crate::delete::DeleteSettings),
+    /// Retain exact names. The driver requires authoritative filtering and disallows hint-only
+    /// exclusions for this policy; the visitor owns any settings used to consume the evidence.
+    Delete,
 }
 
 #[derive(Debug, Default)]
@@ -222,21 +222,21 @@ enum CollectedNames<N> {
     #[default]
     None,
     Names(N),
-    Delete(crate::delete::DeleteSettings, N),
+    Delete(N),
 }
 
 impl<N> CollectedNames<N> {
     fn names_mut(&mut self) -> Option<&mut N> {
         match self {
             Self::None => None,
-            Self::Names(names) | Self::Delete(_, names) => Some(names),
+            Self::Names(names) | Self::Delete(names) => Some(names),
         }
     }
     fn map<M>(self, map: impl FnOnce(N) -> M) -> CollectedNames<M> {
         match self {
             Self::None => CollectedNames::None,
             Self::Names(names) => CollectedNames::Names(map(names)),
-            Self::Delete(settings, names) => CollectedNames::Delete(settings, map(names)),
+            Self::Delete(names) => CollectedNames::Delete(map(names)),
         }
     }
 }
@@ -245,7 +245,7 @@ impl<N> CollectedNames<N> {
 ///
 /// This value is delivered only in the successful child-result arm of [`WalkVisitor::dir_post`].
 /// Ordinary collection follows the visitor's filter policy; only [`NameCollection::Delete`]
-/// supplies exact delete evidence bound to settings. A successful non-collecting walk has no names.
+/// supplies exact delete evidence. A successful non-collecting walk has no names.
 #[derive(Debug, Default)]
 pub struct ProcessedChildren {
     names: CollectedNames<Vec<OsString>>,
@@ -259,12 +259,12 @@ impl ProcessedChildren {
     pub(crate) fn names(&self) -> Option<&[OsString]> {
         match &self.names {
             CollectedNames::None => None,
-            CollectedNames::Names(names) | CollectedNames::Delete(_, names) => Some(names),
+            CollectedNames::Names(names) | CollectedNames::Delete(names) => Some(names),
         }
     }
-    pub(crate) fn delete_names(&self) -> Option<(&crate::delete::DeleteSettings, &[OsString])> {
+    pub(crate) fn delete_names(&self) -> Option<&[OsString]> {
         match &self.names {
-            CollectedNames::Delete(settings, names) => Some((settings, names)),
+            CollectedNames::Delete(names) => Some(names),
             CollectedNames::None | CollectedNames::Names(_) => None,
         }
     }
@@ -329,7 +329,7 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// Which child-name evidence to retain after a successful directory walk.
     ///
     /// The default preserves ordered names for existing visitors. Opting out avoids retention and
-    /// sorting. Delete collection binds its settings to exact names and forces authoritative
+    /// sorting. Delete collection retains exact names and forces authoritative
     /// filtering regardless of the visitor's hint policy; ordinary collection does not.
     fn name_collection(&self) -> NameCollection {
         NameCollection::Names
@@ -755,7 +755,7 @@ impl<S: WalkSummary> WalkEntryFold<S> {
             processed: match collection {
                 NameCollection::None => CollectedNames::None,
                 NameCollection::Names => CollectedNames::Names(Vec::new()),
-                NameCollection::Delete(settings) => CollectedNames::Delete(settings, Vec::new()),
+                NameCollection::Delete => CollectedNames::Delete(Vec::new()),
             },
             errors: crate::error_collector::ErrorCollector::default(),
         }
@@ -916,7 +916,7 @@ where
 {
     let fail_early = visitor.fail_early();
     let collection = visitor.name_collection();
-    let delete_names = matches!(collection, NameCollection::Delete(_));
+    let delete_names = matches!(collection, NameCollection::Delete);
     let mut fold = WalkEntryFold::new(V::Summary::default(), collection);
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
@@ -1115,9 +1115,7 @@ mod tests {
         }
         fn name_collection(&self) -> NameCollection {
             if self.delete_names {
-                NameCollection::Delete(crate::delete::DeleteSettings {
-                    delete_excluded: false,
-                })
+                NameCollection::Delete
             } else if self.omit_names {
                 NameCollection::None
             } else {
@@ -1265,22 +1263,41 @@ mod tests {
             .finish()
             .unwrap();
         assert!(uncollected.names().is_none());
-        assert!(crate::delete::DeleteKeepSet::from_processed(&uncollected).is_none());
+        assert!(
+            crate::delete::DeleteKeepSet::from_processed(
+                &crate::delete::DeleteSettings {
+                    delete_excluded: false
+                },
+                &uncollected
+            )
+            .is_none()
+        );
         let (_, empty) = WalkEntryFold::new(CountSummary::default(), NameCollection::Names)
             .finish()
             .unwrap();
         assert_eq!(empty.names(), Some([].as_slice()));
-        assert!(crate::delete::DeleteKeepSet::from_processed(&empty).is_none());
-        let (_, delete_empty) = WalkEntryFold::new(
-            CountSummary::default(),
-            NameCollection::Delete(crate::delete::DeleteSettings {
-                delete_excluded: false,
-            }),
-        )
-        .finish()
-        .unwrap();
+        assert!(
+            crate::delete::DeleteKeepSet::from_processed(
+                &crate::delete::DeleteSettings {
+                    delete_excluded: false
+                },
+                &empty
+            )
+            .is_none()
+        );
+        let (_, delete_empty) = WalkEntryFold::new(CountSummary::default(), NameCollection::Delete)
+            .finish()
+            .unwrap();
         assert_eq!(delete_empty.names(), Some([].as_slice()));
-        assert!(crate::delete::DeleteKeepSet::from_processed(&delete_empty).is_some());
+        assert!(
+            crate::delete::DeleteKeepSet::from_processed(
+                &crate::delete::DeleteSettings {
+                    delete_excluded: false
+                },
+                &delete_empty
+            )
+            .is_some()
+        );
         let mut fold = WalkEntryFold::new(CountSummary::default(), NameCollection::Names);
         for (ordinal, name) in [(2, "last"), (0, "first"), (1, "middle")] {
             fold.push(
@@ -1297,6 +1314,41 @@ mod tests {
             collected.names().unwrap(),
             ["first", "middle", "last"].map(OsString::from)
         );
+    }
+
+    #[test]
+    fn delete_evidence_completion_rejects_missing_or_ordinary_names() {
+        use crate::delete::{DeleteDecision, DeleteSettings};
+        let settings = DeleteSettings {
+            delete_excluded: false,
+        };
+        assert!(matches!(
+            DeleteDecision::from_processed(None, None),
+            DeleteDecision::NotRequested
+        ));
+        assert!(matches!(
+            DeleteDecision::from_processed(Some(&settings), None),
+            DeleteDecision::Discarded
+        ));
+        for collection in [
+            NameCollection::None,
+            NameCollection::Names,
+            NameCollection::Delete,
+        ] {
+            let exact = matches!(collection, NameCollection::Delete);
+            let (_, processed) = WalkEntryFold::new(CountSummary::default(), collection)
+                .finish()
+                .unwrap();
+            assert!(matches!(
+                DeleteDecision::from_processed(None, Some(&processed)),
+                DeleteDecision::NotRequested
+            ));
+            let decision = DeleteDecision::from_processed(Some(&settings), Some(&processed));
+            assert_eq!(matches!(decision, DeleteDecision::Ready(_)), exact);
+            if !exact {
+                assert!(matches!(decision, DeleteDecision::Discarded));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1331,7 +1383,15 @@ mod tests {
         assert_eq!(summary.files, 1);
         assert_eq!(summary.dirs, 0);
         assert_eq!(processed.names().unwrap(), [OsString::from("file")]);
-        assert!(crate::delete::DeleteKeepSet::from_processed(&processed).is_some());
+        assert!(
+            crate::delete::DeleteKeepSet::from_processed(
+                &crate::delete::DeleteSettings {
+                    delete_excluded: false
+                },
+                &processed
+            )
+            .is_some()
+        );
         Ok(())
     }
 

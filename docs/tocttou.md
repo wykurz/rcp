@@ -610,11 +610,16 @@ so the security-relevant invariants each live in exactly one place:
   Copy requests delete-name evidence only for `--delete`; that collection policy forces exact
   filtering in the driver. `dir_post` receives names only in its successful child-result arm, so a
   failed traversal has no delete evidence and still reaches keep-going finalization with its error.
-  Copy and rlink prune through one typed keep-set binding complete names to deletion settings; rlink
-  seals its source/update collector only after joining every child and checking for errors. A
-  dry-run destination-open failure occurs before descent and contributes no counts for that subtree;
-  in keep-going mode its parent folds the error, suppresses pruning, and still finalizes normally.
-  In rlink, `DT_UNKNOWN` source and update-only hints also dispatch to scheduled workers for exact
+  Copy and rlink share a completion decision that distinguishes deletion not requested, discarded
+  evidence, and a complete typed keep-set. The generic walk retains exact names without carrying
+  deletion settings; copy binds its own settings at completion. Rlink's source/update collector owns
+  both names and traversal errors and is consumed only after every child has been joined. Errors
+  therefore discard that collector's evidence without losing keep-going finalization errors, even
+  when deletion is disabled. The shared prune helper folds successful or partial removal counts once
+  and preserves the original error chain; each caller still owns its finalization policy. A dry-run
+  destination-open failure occurs before descent and contributes no counts for that subtree; in
+  keep-going mode its parent folds the error, suppresses pruning, and still finalizes normally. In
+  rlink, `DT_UNKNOWN` source and update-only hints also dispatch to scheduled workers for exact
   type-sensitive filtering and accounting. Its dual-tree path admits before opening either source or
   update handle when an update counterpart needs classification, because the source hint says
   nothing about that separate entry. An authoritative directory releases any provisional permit

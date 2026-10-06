@@ -1939,7 +1939,6 @@ fn fold_link_task_result(
     result: Result<Result<LinkTaskResult, Error>, tokio::task::JoinError>,
     link_summary: &mut Summary,
     keep_set: &mut DeleteNameCollector,
-    errors: &crate::error_collector::ErrorCollector,
     fail_early: bool,
     src_path: &std::path::Path,
     dst_path: &std::path::Path,
@@ -1957,13 +1956,13 @@ fn fold_link_task_result(
             if fail_early {
                 return Err(error.source);
             }
-            errors.push(error.source);
+            keep_set.record_error(error.source);
         }
         Err(join_error) => {
             if fail_early {
                 return Err(join_error.into());
             }
-            errors.push(join_error.into());
+            keep_set.record_error(join_error.into());
         }
     }
     Ok(())
@@ -1978,7 +1977,6 @@ async fn ensure_link_admission(
     join_set: &mut tokio::task::JoinSet<Result<LinkTaskResult, Error>>,
     link_summary: &mut Summary,
     keep_set: &mut DeleteNameCollector,
-    errors: &crate::error_collector::ErrorCollector,
     fail_early: bool,
     src_path: &std::path::Path,
     dst_path: &std::path::Path,
@@ -1994,7 +1992,6 @@ async fn ensure_link_admission(
                     result.expect("a non-empty link JoinSet must yield one task result"),
                     link_summary,
                     keep_set,
-                    errors,
                     fail_early,
                     src_path,
                     dst_path,
@@ -2055,7 +2052,6 @@ async fn link_dir_contents(
     tracing::debug!("process contents of 'src' directory");
     let mut link_summary = base;
     let mut join_set = tokio::task::JoinSet::new();
-    let errors = crate::error_collector::ErrorCollector::default();
     // source names suppress only duplicate update-only scheduling; worker results own --delete keep
     // protection after their exact final selection.
     let mut processed_files = std::collections::HashSet::new();
@@ -2096,7 +2092,6 @@ async fn link_dir_contents(
                 &mut join_set,
                 &mut link_summary,
                 &mut keep_set,
-                &errors,
                 settings.copy_settings.fail_early,
                 src_path,
                 dst_path,
@@ -2196,7 +2191,6 @@ async fn link_dir_contents(
                     &mut join_set,
                     &mut link_summary,
                     &mut keep_set,
-                    &errors,
                     settings.copy_settings.fail_early,
                     src_path,
                     dst_path,
@@ -2239,14 +2233,13 @@ async fn link_dir_contents(
             crate::walk_driver::abort_and_join(&mut join_set).await;
             return Err(Error::new(error, link_summary));
         }
-        errors.push(error);
+        keep_set.record_error(error);
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = fold_link_task_result(
             res,
             &mut link_summary,
             &mut keep_set,
-            &errors,
             settings.copy_settings.fail_early,
             src_path,
             dst_path,
@@ -2259,18 +2252,10 @@ async fn link_dir_contents(
     // protect. `keep_set` holds the selected src ∪ update names normally, or only selected update
     // names under --update-exclusive; deliberately skipped specials retain their historical
     // protection even though no new entry is materialized.
-    if settings.copy_settings.delete.is_some() && errors.has_errors() {
-        // rsync-style safety: skip pruning when this subtree's link/update pass reported errors
-        // — deleting based on a run that did not fully succeed could remove data unexpectedly.
-        tracing::warn!(
-            "skipping --delete pruning of {:?} because the link/update pass reported errors",
-            dst_path
-        );
-    }
-    if let Some(keep_set) = keep_set.finish(&errors)
+    let (decision, errors) = keep_set.finish();
+    if let Some(keep_set) = decision.into_ready(dst_path)
         && let Some(prune_dir) = dst_dir.or(preview_dir)
-    {
-        match crate::delete::prune_extraneous(
+        && let Err(error) = crate::delete::prune_and_fold(
             prog_track,
             prune_dir,
             rel_path,
@@ -2278,22 +2263,14 @@ async fn link_dir_contents(
             settings.filter.as_ref(),
             settings.copy_settings.fail_early,
             settings.dry_run,
+            &mut link_summary.copy_summary.rm_summary,
         )
         .await
-        {
-            Ok(rm_summary) => {
-                link_summary.copy_summary.rm_summary =
-                    link_summary.copy_summary.rm_summary + rm_summary;
-            }
-            Err(err) => {
-                link_summary.copy_summary.rm_summary =
-                    link_summary.copy_summary.rm_summary + err.summary;
-                if settings.copy_settings.fail_early {
-                    return Err(Error::new(err.source, link_summary));
-                }
-                errors.push(err.source);
-            }
+    {
+        if settings.copy_settings.fail_early {
+            return Err(Error::new(error, link_summary));
         }
+        errors.push(error);
     }
     // when filtering is active and we created this directory, check if anything was actually
     // linked/copied into it. if nothing was linked, we may need to clean up the empty directory.
@@ -4231,7 +4208,9 @@ mod link_tests {
                 &dst_parent,
                 std::path::Path::new(""),
                 &keep_set
-                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .finish()
+                    .0
+                    .into_ready(std::path::Path::new("test-destination"))
                     .expect("successful delete pass"),
                 settings.filter.as_ref(),
                 false,
@@ -4316,7 +4295,9 @@ mod link_tests {
                 &dst_dir,
                 std::path::Path::new(""),
                 &keep_set
-                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .finish()
+                    .0
+                    .into_ready(std::path::Path::new("test-destination"))
                     .expect("successful delete pass"),
                 settings.filter.as_ref(),
                 false,
@@ -4463,7 +4444,9 @@ mod link_tests {
                 &dst_dir,
                 std::path::Path::new(""),
                 &keep_set
-                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .finish()
+                    .0
+                    .into_ready(std::path::Path::new("test-destination"))
                     .expect("successful delete pass"),
                 None,
                 false,
@@ -4550,7 +4533,9 @@ mod link_tests {
                 &dst_dir,
                 std::path::Path::new(""),
                 &keep_set
-                    .finish(&crate::error_collector::ErrorCollector::default())
+                    .finish()
+                    .0
+                    .into_ready(std::path::Path::new("test-destination"))
                     .expect("successful delete pass"),
                 settings.filter.as_ref(),
                 false,
