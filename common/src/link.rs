@@ -5232,6 +5232,160 @@ mod link_tests {
             Ok(())
         }
 
+        async fn delegated_empty_directory_case(
+            dry_run: bool,
+            directly_included: bool,
+        ) -> anyhow::Result<()> {
+            for relative in ["docs", "a/docs"] {
+                let test_path = testutils::create_temp_dir().await?;
+                let src = test_path.join("src");
+                let update = test_path.join("update");
+                let dst = test_path.join("dst");
+                tokio::fs::create_dir_all(src.join("a")).await?;
+                tokio::fs::create_dir_all(update.join(relative)).await?;
+                tokio::fs::write(update.join(relative).join("readme.md"), "FILTERED").await?;
+                let mut filter = FilterSettings::new();
+                filter.add_include("*.rs")?;
+                if directly_included {
+                    filter.add_include(&format!("/{relative}"))?;
+                }
+                let mut settings = common_settings(false, false);
+                settings.filter = Some(filter.clone());
+                settings.copy_settings.filter = Some(filter);
+                settings.dry_run = dry_run.then_some(crate::config::DryRunMode::Brief);
+                settings.copy_settings.dry_run = settings.dry_run;
+                let summary = link(
+                    &PROGRESS,
+                    &test_path,
+                    &src,
+                    &dst,
+                    &Some(update.clone()),
+                    &settings,
+                    false,
+                )
+                .await?;
+                let expected_dirs = if directly_included {
+                    1 + std::path::Path::new(relative).components().count()
+                } else {
+                    1
+                };
+                assert_eq!(summary.copy_summary.directories_created, expected_dirs);
+                assert_eq!(summary.copy_summary.files_copied, 0);
+                assert_eq!(summary.copy_summary.files_skipped, 1);
+                assert_eq!(summary.hard_links_created, 0);
+                assert_eq!(dst.exists(), !dry_run, "the true root must be retained");
+                assert_eq!(dst.join(relative).exists(), !dry_run && directly_included);
+                assert!(!dst.join(relative).join("readme.md").exists());
+                if !directly_included {
+                    assert!(
+                        !dst.join("a").exists(),
+                        "empty ancestors must also be removed"
+                    );
+                }
+                // the same filtered directory passed as the user's copy operand IS a true root
+                let copy_dst = test_path.join("copy-root");
+                let summary = copy::copy(
+                    &PROGRESS,
+                    &update.join(relative),
+                    &copy_dst,
+                    &settings.copy_settings,
+                    &settings.preserve,
+                    false,
+                )
+                .await?;
+                assert_eq!(summary.directories_created, 1);
+                assert_eq!(copy_dst.exists(), !dry_run);
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn delegated_traversal_only_directories_are_removed() -> anyhow::Result<()> {
+            delegated_empty_directory_case(false, false).await
+        }
+
+        #[tokio::test]
+        async fn delegated_traversal_only_directories_are_not_counted_in_dry_run()
+        -> anyhow::Result<()> {
+            delegated_empty_directory_case(true, false).await
+        }
+
+        #[tokio::test]
+        async fn delegated_directly_included_empty_directories_are_kept() -> anyhow::Result<()> {
+            delegated_empty_directory_case(false, true).await?;
+            delegated_empty_directory_case(true, true).await
+        }
+
+        #[tokio::test]
+        async fn delegated_reused_traversal_only_directory_is_kept() -> anyhow::Result<()> {
+            let test_path = testutils::create_temp_dir().await?;
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir_all(update.join("docs")).await?;
+            tokio::fs::create_dir_all(dst.join("docs")).await?;
+            tokio::fs::write(update.join("docs/readme.md"), "FILTERED").await?;
+            tokio::fs::write(dst.join("docs/sentinel"), "KEEP").await?;
+            let mut filter = FilterSettings::new();
+            filter.add_include("*.rs")?;
+            let mut settings = common_settings(false, true);
+            settings.copy_settings.filter = Some(filter.clone());
+            settings.filter = Some(filter);
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update),
+                &settings,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.copy_summary.directories_created, 0);
+            assert_eq!(summary.copy_summary.directories_unchanged, 2);
+            assert_eq!(tokio::fs::read(dst.join("docs/sentinel")).await?, b"KEEP");
+            assert!(!dst.join("docs/readme.md").exists());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn delegated_empty_directory_cleanup_preserves_child_errors() -> anyhow::Result<()> {
+            for dry_run in [false, true] {
+                let test_path = testutils::create_temp_dir().await?;
+                let src = test_path.join("src");
+                let update = test_path.join("update");
+                let dst = test_path.join("dst");
+                tokio::fs::create_dir(&src).await?;
+                tokio::fs::create_dir_all(update.join("docs")).await?;
+                let _socket = std::os::unix::net::UnixListener::bind(update.join("docs/bad.rs"))?;
+                let mut filter = FilterSettings::new();
+                filter.add_include("*.rs")?;
+                let mut settings = common_settings(false, false);
+                settings.copy_settings.filter = Some(filter.clone());
+                settings.filter = Some(filter);
+                settings.dry_run = dry_run.then_some(crate::config::DryRunMode::Brief);
+                settings.copy_settings.dry_run = settings.dry_run;
+                let error = link(
+                    &PROGRESS,
+                    &test_path,
+                    &src,
+                    &dst,
+                    &Some(update),
+                    &settings,
+                    false,
+                )
+                .await
+                .expect_err("empty-directory cleanup must preserve a failed child");
+                assert!(format!("{:#}", error.source).contains("unsupported src file type"));
+                assert_eq!(error.summary.copy_summary.directories_created, 1);
+                assert_eq!(error.summary.copy_summary.files_copied, 0);
+                assert!(!dst.join("docs").exists());
+                assert_eq!(dst.exists(), !dry_run);
+            }
+            Ok(())
+        }
+
         /// Regression: an update-only entry matching an `--exclude` pattern must NOT be copied to
         /// the destination when `--delete` is OFF. The fd-based link delegates update-only entries
         /// to `copy::copy_child` (which wraps `copy_internal` and does not re-apply a top-level
