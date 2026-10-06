@@ -1,4 +1,4 @@
-use crate::delete::DeleteNameCollector;
+use crate::delete::LinkChildOutcomes;
 use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use std::sync::Arc;
@@ -345,7 +345,7 @@ async fn link_inner(
     let setup_admission = permit.as_ref().map(LeafPermit::admission);
     let setup = safedir::with_optional_fd_admission(setup_admission, async move {
         // a missing --update root is destructive under both --update-exclusive (materialized set =
-        // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
+        // update set, so nothing materializes) AND --delete (the source-only keep-set makes any dst
         // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
         // in either case `link_internal` hits the recursive early-return / silent `None` fallback
         // before that destruction would happen, so rlink reports success — silently preserving
@@ -860,9 +860,9 @@ impl LinkTaskResult {
         Self::from_link(name, result)
     }
 
-    fn fold(self, summary: &mut Summary, keep_set: &mut DeleteNameCollector) {
+    fn fold(self, summary: &mut Summary, outcomes: &mut LinkChildOutcomes) {
         if let Some(name) = self.keep_name {
-            keep_set.record_exact(name);
+            outcomes.record_exact(name);
         }
         *summary = *summary + self.summary;
     }
@@ -1938,13 +1938,13 @@ async fn process_update_only_entry(
 fn fold_link_task_result(
     result: Result<Result<LinkTaskResult, Error>, tokio::task::JoinError>,
     link_summary: &mut Summary,
-    keep_set: &mut DeleteNameCollector,
+    outcomes: &mut LinkChildOutcomes,
     fail_early: bool,
     src_path: &std::path::Path,
     dst_path: &std::path::Path,
 ) -> Result<(), anyhow::Error> {
     match result {
-        Ok(Ok(result)) => result.fold(link_summary, keep_set),
+        Ok(Ok(result)) => result.fold(link_summary, outcomes),
         Ok(Err(error)) => {
             tracing::error!(
                 "link: {:?} -> {:?} failed with: {:#}",
@@ -1956,13 +1956,13 @@ fn fold_link_task_result(
             if fail_early {
                 return Err(error.source);
             }
-            keep_set.record_error(error.source);
+            outcomes.record_error(error.source);
         }
         Err(join_error) => {
             if fail_early {
                 return Err(join_error.into());
             }
-            keep_set.record_error(join_error.into());
+            outcomes.record_error(join_error.into());
         }
     }
     Ok(())
@@ -1971,12 +1971,11 @@ fn fold_link_task_result(
 /// Await link-entry admission while reaping ready children. A completed fail-early error wins a tie
 /// with newly available capacity, so another permanently pending worker cannot consume that
 /// capacity and strand the unread error. Both source and update-only producers use this boundary.
-#[allow(clippy::too_many_arguments)]
 async fn ensure_link_admission(
     admission: EntryAdmission,
     join_set: &mut tokio::task::JoinSet<Result<LinkTaskResult, Error>>,
     link_summary: &mut Summary,
-    keep_set: &mut DeleteNameCollector,
+    outcomes: &mut LinkChildOutcomes,
     fail_early: bool,
     src_path: &std::path::Path,
     dst_path: &std::path::Path,
@@ -1991,7 +1990,7 @@ async fn ensure_link_admission(
                 fold_link_task_result(
                     result.expect("a non-empty link JoinSet must yield one task result"),
                     link_summary,
-                    keep_set,
+                    outcomes,
                     fail_early,
                     src_path,
                     dst_path,
@@ -2055,8 +2054,8 @@ async fn link_dir_contents(
     // source names suppress only duplicate update-only scheduling; worker results own --delete keep
     // protection after their exact final selection.
     let mut processed_files = std::collections::HashSet::new();
-    // keep-set for --delete: every spawned source/update worker folds its final exact outcome.
-    let mut keep_set = DeleteNameCollector::new(settings.copy_settings.delete.as_ref());
+    // always retain worker/enumeration errors; also retain exact names when --delete is enabled.
+    let mut outcomes = LinkChildOutcomes::new(settings.copy_settings.delete.as_ref());
     // enumeration owns no workers: every fallible producer exit returns here, where the
     // directory owns the decision to cancel or drain before pruning and finalization.
     let enumeration_result = async {
@@ -2091,7 +2090,7 @@ async fn link_dir_contents(
                 admission,
                 &mut join_set,
                 &mut link_summary,
-                &mut keep_set,
+                &mut outcomes,
                 settings.copy_settings.fail_early,
                 src_path,
                 dst_path,
@@ -2190,7 +2189,7 @@ async fn link_dir_contents(
                     admission,
                     &mut join_set,
                     &mut link_summary,
-                    &mut keep_set,
+                    &mut outcomes,
                     settings.copy_settings.fail_early,
                     src_path,
                     dst_path,
@@ -2233,13 +2232,13 @@ async fn link_dir_contents(
             crate::walk_driver::abort_and_join(&mut join_set).await;
             return Err(Error::new(error, link_summary));
         }
-        keep_set.record_error(error);
+        outcomes.record_error(error);
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = fold_link_task_result(
             res,
             &mut link_summary,
-            &mut keep_set,
+            &mut outcomes,
             settings.copy_settings.fail_early,
             src_path,
             dst_path,
@@ -2249,12 +2248,12 @@ async fn link_dir_contents(
         }
     }
     // rsync-style --delete for rlink: remove destination entries the final exact decisions did not
-    // protect. `keep_set` holds the selected src ∪ update names normally, or only selected update
+    // protect. `outcomes` holds the selected src ∪ update names normally, or only selected update
     // names under --update-exclusive; deliberately skipped specials retain their historical
     // protection even though no new entry is materialized.
-    let (decision, errors) = keep_set.finish();
+    let (decision, errors) = outcomes.finish();
     if let Some(keep_set) = decision.into_ready(dst_path)
-        && let Some(prune_dir) = dst_dir.or(preview_dir)
+        && let Some(prune_dir) = crate::delete::select_scan_dir(dst_dir, preview_dir, dst_path)
         && let Err(error) = crate::delete::prune_and_fold(
             prog_track,
             prune_dir,
@@ -2461,10 +2460,10 @@ mod link_tests {
     }
 
     mod delete_keep_set_tests {
-        //! Pure-logic unit tests for `DeleteNameCollector`. No filesystem needed — these pin exact
+        //! Pure-logic unit tests for `LinkChildOutcomes`. No filesystem needed — these pin exact
         //! worker ownership so a future refactor cannot silently restore hint-based keeps.
 
-        use super::super::DeleteNameCollector;
+        use super::super::LinkChildOutcomes;
         use crate::copy::DeleteSettings;
         use std::ffi::{OsStr, OsString};
 
@@ -2476,7 +2475,7 @@ mod link_tests {
 
         #[test]
         fn exact_result_no_op_when_delete_off() {
-            let mut k = DeleteNameCollector::new(None);
+            let mut k = LinkChildOutcomes::new(None);
             k.record_exact(OsString::from("foo"));
             assert!(k.as_set().is_none());
         }
@@ -2484,7 +2483,7 @@ mod link_tests {
         #[test]
         fn exact_materialized_update_exclusive_duplicate_is_retained() {
             let d = delete_on();
-            let mut k = DeleteNameCollector::new(Some(&d));
+            let mut k = LinkChildOutcomes::new(Some(&d));
             let mut summary = super::super::Summary::default();
             super::super::LinkTaskResult::from_link(
                 OsString::from("node"),
@@ -2500,7 +2499,7 @@ mod link_tests {
         #[test]
         fn selected_source_entry_is_retained_in_normal_mode() {
             let d = delete_on();
-            let mut k = DeleteNameCollector::new(Some(&d));
+            let mut k = LinkChildOutcomes::new(Some(&d));
             let mut summary = super::super::Summary::default();
             super::super::LinkTaskResult::from_link(
                 OsString::from("node"),
@@ -2524,7 +2523,7 @@ mod link_tests {
             // nothing). This is the corrected behavior versus the old type-mismatch bug, where
             // the excluded update dir was copied AND the src keep-set entry was dropped.
             let d = delete_on();
-            let mut k = DeleteNameCollector::new(Some(&d));
+            let mut k = LinkChildOutcomes::new(Some(&d));
 
             let mut summary = super::super::Summary::default();
             for name in ["keep", "pipe", "node"] {
@@ -4182,7 +4181,7 @@ mod link_tests {
             let delete_settings = copy::DeleteSettings {
                 delete_excluded: true,
             };
-            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
+            let mut outcomes = LinkChildOutcomes::new(Some(&delete_settings));
             let result = crate::task_scope::scope_tasks(link_internal(
                 &PROGRESS,
                 &src_parent,
@@ -4202,19 +4201,16 @@ mod link_tests {
             .await?;
             let mut summary = Summary::default();
             LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
-                .fold(&mut summary, &mut keep_set);
-            crate::delete::prune_extraneous(
+                .fold(&mut summary, &mut outcomes);
+            crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_parent,
                 std::path::Path::new(""),
-                &keep_set
-                    .finish()
-                    .0
-                    .into_ready(std::path::Path::new("test-destination"))
-                    .expect("successful delete pass"),
+                &outcomes.expect_ready(),
                 settings.filter.as_ref(),
                 false,
                 None,
+                &mut summary.copy_summary.rm_summary,
             )
             .await?;
 
@@ -4261,7 +4257,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
+            let mut outcomes = LinkChildOutcomes::new(Some(&delete_settings));
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4287,21 +4283,18 @@ mod link_tests {
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
-                        .fold(&mut summary, &mut keep_set);
+                        .fold(&mut summary, &mut outcomes);
                 }
             }
-            crate::delete::prune_extraneous(
+            crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                &keep_set
-                    .finish()
-                    .0
-                    .into_ready(std::path::Path::new("test-destination"))
-                    .expect("successful delete pass"),
+                &outcomes.expect_ready(),
                 settings.filter.as_ref(),
                 false,
                 None,
+                &mut summary.copy_summary.rm_summary,
             )
             .await?;
 
@@ -4342,7 +4335,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteNameCollector::new(None);
+            let mut outcomes = LinkChildOutcomes::new(None);
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4368,7 +4361,7 @@ mod link_tests {
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
-                        .fold(&mut summary, &mut keep_set);
+                        .fold(&mut summary, &mut outcomes);
                 }
             }
 
@@ -4410,7 +4403,7 @@ mod link_tests {
             );
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
+            let mut outcomes = LinkChildOutcomes::new(Some(&delete_settings));
             match decision {
                 SourceEntryDecision::Filtered { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4436,21 +4429,18 @@ mod link_tests {
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
-                        .fold(&mut summary, &mut keep_set);
+                        .fold(&mut summary, &mut outcomes);
                 }
             }
-            crate::delete::prune_extraneous(
+            crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                &keep_set
-                    .finish()
-                    .0
-                    .into_ready(std::path::Path::new("test-destination"))
-                    .expect("successful delete pass"),
+                &outcomes.expect_ready(),
                 None,
                 false,
                 None,
+                &mut summary.copy_summary.rm_summary,
             )
             .await?;
 
@@ -4501,7 +4491,7 @@ mod link_tests {
             .await?;
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteNameCollector::new(Some(&delete_settings));
+            let mut outcomes = LinkChildOutcomes::new(Some(&delete_settings));
             match decision {
                 UpdateOnlyDecision::Skipped { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4525,21 +4515,18 @@ mod link_tests {
                         std::ffi::OsString::from("node"),
                         LinkEntryResult::selected(result),
                     )
-                    .fold(&mut summary, &mut keep_set);
+                    .fold(&mut summary, &mut outcomes);
                 }
             }
-            crate::delete::prune_extraneous(
+            crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
                 std::path::Path::new(""),
-                &keep_set
-                    .finish()
-                    .0
-                    .into_ready(std::path::Path::new("test-destination"))
-                    .expect("successful delete pass"),
+                &outcomes.expect_ready(),
                 settings.filter.as_ref(),
                 false,
                 None,
+                &mut summary.copy_summary.rm_summary,
             )
             .await?;
 
@@ -4581,7 +4568,7 @@ mod link_tests {
             .await?;
 
             let mut summary = Summary::default();
-            let mut keep_set = DeleteNameCollector::new(None);
+            let mut outcomes = LinkChildOutcomes::new(None);
             match decision {
                 UpdateOnlyDecision::Skipped { kind, .. } => {
                     summary = summary + skipped_summary_for(kind);
@@ -4605,7 +4592,7 @@ mod link_tests {
                         std::ffi::OsString::from("node"),
                         LinkEntryResult::selected(result),
                     )
-                    .fold(&mut summary, &mut keep_set);
+                    .fold(&mut summary, &mut outcomes);
                 }
             }
 
@@ -6147,6 +6134,9 @@ mod link_tests {
             dst.join("extraneous.txt").exists(),
             "pruning must be skipped when the link/update pass reported errors"
         );
+        assert!(logs_contain(
+            "because entry processing failed or did not provide complete exact names"
+        ));
         Ok(())
     }
 
