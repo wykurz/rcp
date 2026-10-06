@@ -1263,41 +1263,17 @@ mod tests {
             .finish()
             .unwrap();
         assert!(uncollected.names().is_none());
-        assert!(
-            crate::delete::DeleteKeepSet::from_processed(
-                &crate::delete::DeleteSettings {
-                    delete_excluded: false
-                },
-                &uncollected
-            )
-            .is_none()
-        );
+        assert!(uncollected.delete_names().is_none());
         let (_, empty) = WalkEntryFold::new(CountSummary::default(), NameCollection::Names)
             .finish()
             .unwrap();
         assert_eq!(empty.names(), Some([].as_slice()));
-        assert!(
-            crate::delete::DeleteKeepSet::from_processed(
-                &crate::delete::DeleteSettings {
-                    delete_excluded: false
-                },
-                &empty
-            )
-            .is_none()
-        );
+        assert!(empty.delete_names().is_none());
         let (_, delete_empty) = WalkEntryFold::new(CountSummary::default(), NameCollection::Delete)
             .finish()
             .unwrap();
         assert_eq!(delete_empty.names(), Some([].as_slice()));
-        assert!(
-            crate::delete::DeleteKeepSet::from_processed(
-                &crate::delete::DeleteSettings {
-                    delete_excluded: false
-                },
-                &delete_empty
-            )
-            .is_some()
-        );
+        assert!(delete_empty.delete_names().is_some());
         let mut fold = WalkEntryFold::new(CountSummary::default(), NameCollection::Names);
         for (ordinal, name) in [(2, "last"), (0, "first"), (1, "middle")] {
             fold.push(
@@ -1323,11 +1299,7 @@ mod tests {
             delete_excluded: false,
         };
         assert!(matches!(
-            DeleteDecision::from_processed(None, None),
-            DeleteDecision::NotRequested
-        ));
-        assert!(matches!(
-            DeleteDecision::from_processed(Some(&settings), None),
+            DeleteDecision::from_processed(&settings, None),
             DeleteDecision::Discarded
         ));
         for collection in [
@@ -1339,11 +1311,7 @@ mod tests {
             let (_, processed) = WalkEntryFold::new(CountSummary::default(), collection)
                 .finish()
                 .unwrap();
-            assert!(matches!(
-                DeleteDecision::from_processed(None, Some(&processed)),
-                DeleteDecision::NotRequested
-            ));
-            let decision = DeleteDecision::from_processed(Some(&settings), Some(&processed));
+            let decision = DeleteDecision::from_processed(&settings, Some(&processed));
             assert_eq!(matches!(decision, DeleteDecision::Ready(_)), exact);
             if !exact {
                 assert!(matches!(decision, DeleteDecision::Discarded));
@@ -1383,15 +1351,7 @@ mod tests {
         assert_eq!(summary.files, 1);
         assert_eq!(summary.dirs, 0);
         assert_eq!(processed.names().unwrap(), [OsString::from("file")]);
-        assert!(
-            crate::delete::DeleteKeepSet::from_processed(
-                &crate::delete::DeleteSettings {
-                    delete_excluded: false
-                },
-                &processed
-            )
-            .is_some()
-        );
+        assert!(processed.delete_names().is_some());
         Ok(())
     }
 

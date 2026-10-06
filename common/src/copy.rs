@@ -718,8 +718,6 @@ struct CopyVisitor {
     /// The *source* root needs no field: an entry's source real path is the driver-maintained
     /// `EntryCx::real_path` (seeded with the source root in [`run_copy_root`]).
     dst_root: PathBuf,
-    /// The logical filter base: an entry's filter path is `filter_base.join(rel_path)`.
-    filter_base: PathBuf,
     /// The root's preview authority: the original destination operand for a public copy, or an
     /// inherited held parent/absence for a delegated copy. Independent of filter coordinates.
     delete_scan_anchor: DeleteScanAnchor,
@@ -821,23 +819,14 @@ impl CopyVisitor {
         &self,
         copy_summary: &mut Summary,
         keep_set: &crate::delete::DeleteKeepSet<&[OsString]>,
-        scan_dir: Option<&Arc<Dir>>,
-        dst_path: &std::path::Path,
-        rel_path: &std::path::Path,
+        prune_dir: &Arc<Dir>,
+        filter_path: &std::path::Path,
     ) -> Result<(), anyhow::Error> {
-        let relative_dir = self.filter_base.join(rel_path);
-        let Some(prune_dir) = scan_dir else {
-            tracing::debug!(
-                "skipping --delete pruning of {:?}: no destination directory to scan",
-                dst_path
-            );
-            return Ok(());
-        };
         let keep_set = keep_set.hashed();
         crate::delete::prune_and_fold(
             self.prog_track,
             prune_dir,
-            &relative_dir,
+            filter_path,
             &keep_set,
             self.settings.filter.as_ref(),
             self.settings.fail_early,
@@ -1058,7 +1047,6 @@ async fn run_copy_root(
     let visitor = Arc::new(CopyVisitor {
         prog_track,
         dst_root: dst_root.to_path_buf(),
-        filter_base: filter_base.to_path_buf(),
         delete_scan_anchor,
         settings: settings.clone(),
         preserve: *preserve,
@@ -1505,34 +1493,39 @@ impl WalkVisitor for CopyVisitor {
         // prune and surface the child error). the partial child summary is folded either way,
         // seeded with `base` (this directory's own create/unchanged contribution) — exactly as
         // `copy_dir_contents` seeded `copy_summary = base` before joining the children.
-        let (mut copy_summary, mut child_error, processed) = match child_result {
-            Ok((summary, processed)) => (base + summary, None, Some(processed)),
-            Err(error) => (base + error.summary, Some(error.source), None),
-        };
-        if self.settings.delete.is_some()
-            && let Some(keep_set) = crate::delete::DeleteDecision::from_processed(
-                self.settings.delete.as_ref(),
-                processed.as_ref(),
-            )
-            .into_ready(&self.dst_path_for(cx))
-        {
-            match self
-                .prune_finished_dir(
-                    &mut copy_summary,
-                    &keep_set,
-                    dst_dir.as_ref().or(preview_dir.as_ref()),
-                    &self.dst_path_for(cx),
-                    &cx.rel_path,
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if self.settings.fail_early => {
-                    return Err(Error::new(error, copy_summary));
+        let (copy_summary, child_error) = {
+            let (mut summary, mut child_error, processed) = match child_result {
+                Ok((summary, processed)) => (base + summary, None, Some(processed)),
+                Err(error) => (base + error.summary, Some(error.source), None),
+            };
+            if let Some(delete) = &self.settings.delete {
+                let dst_path = self.dst_path_for(cx);
+                if let Some(keep_set) =
+                    crate::delete::DeleteDecision::from_processed(delete, processed.as_ref())
+                        .into_ready(&dst_path)
+                    && let Some(prune_dir) = crate::delete::select_scan_dir(
+                        dst_dir.as_ref(),
+                        preview_dir.as_ref(),
+                        &dst_path,
+                    )
+                {
+                    match self
+                        .prune_finished_dir(&mut summary, &keep_set, prune_dir, &cx.filter_path)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if self.settings.fail_early => {
+                            return Err(Error::new(error, summary));
+                        }
+                        Err(error) => {
+                            child_error.get_or_insert(error);
+                        }
+                    }
                 }
-                Err(error) => child_error = Some(error),
             }
-        }
+            // child names authorize only the prune; this scope frees them before gated metadata work.
+            (summary, child_error)
+        };
         // empty-dir cleanup + post-order directory metadata; also surfaces any collected child error.
         self.finalize_dir(
             FinalizeDir {
@@ -3007,6 +3000,95 @@ mod copy_tests {
         preview_retains_opened_destination_case(PreviewOperation::Dereference).await
     }
 
+    async fn prune_error_preserves_partial_counts_and_finalization_case(
+        use_link: bool,
+    ) -> anyhow::Result<()> {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping permission-denial case: root bypasses directory permissions");
+            return Ok(());
+        }
+        for fail_early in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let root = tmp.path();
+            let src = root.join("source");
+            let dst = root.join("destination");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o751)).await?;
+            for child in ["extra1", "extra2"] {
+                tokio::fs::create_dir_all(dst.join(child)).await?;
+                tokio::fs::write(dst.join(child).join("file"), b"abc").await?;
+            }
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
+            let mut settings = settings_with_delete(delete_on());
+            settings.fail_early = fail_early;
+            let mut preserve = *NO_PRESERVE_SETTINGS;
+            preserve.dir.mode_mask = 0o777;
+            let result = if use_link {
+                crate::link::link(
+                    &PROGRESS,
+                    root,
+                    &src,
+                    &dst,
+                    &None,
+                    &crate::link::Settings {
+                        copy_settings: settings.clone(),
+                        update_compare: Default::default(),
+                        update_exclusive: false,
+                        filter: None,
+                        dry_run: None,
+                        preserve,
+                    },
+                    false,
+                )
+                .await
+                .map(|summary| summary.copy_summary)
+                .map_err(|error| (error.source, error.summary.copy_summary))
+            } else {
+                copy(&PROGRESS, &src, &dst, &settings, &preserve, false)
+                    .await
+                    .map_err(|error| (error.source, error.summary))
+            };
+            let final_mode = tokio::fs::metadata(&dst).await?.permissions().mode() & 0o777;
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
+            let (error, summary) =
+                result.expect_err("parent permissions must prevent pruning directories");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            let removed = if fail_early { 1 } else { 2 };
+            assert_eq!(summary.rm_summary.files_removed, removed);
+            assert_eq!(summary.rm_summary.bytes_removed, 3 * removed as u64);
+            assert_eq!(summary.rm_summary.directories_removed, 0);
+            assert_eq!(
+                ["extra1", "extra2"]
+                    .iter()
+                    .filter(|child| dst.join(child).join("file").exists())
+                    .count(),
+                2 - removed,
+            );
+            assert_eq!(
+                final_mode,
+                if fail_early { 0o500 } else { 0o751 },
+                "keep-going must finalize directory metadata after a prune failure"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_prune_error_preserves_partial_counts_and_finalization() -> anyhow::Result<()> {
+        prune_error_preserves_partial_counts_and_finalization_case(false).await
+    }
+
+    #[tokio::test]
+    async fn link_prune_error_preserves_partial_counts_and_finalization() -> anyhow::Result<()> {
+        prune_error_preserves_partial_counts_and_finalization_case(true).await
+    }
+
     async fn preview_stops_at_unreadable_destination_case(use_link: bool) -> anyhow::Result<()> {
         for dry_run in [false, true] {
             let root = testutils::create_temp_dir().await?;
@@ -3122,7 +3204,6 @@ mod copy_tests {
                 let visitor = Arc::new(CopyVisitor {
                     prog_track: &PROGRESS,
                     dst_root: dst.clone(),
-                    filter_base: PathBuf::new(),
                     delete_scan_anchor: DeleteScanAnchor::new(
                         std::path::Path::new("/"),
                         std::path::Path::new(""),
@@ -3251,6 +3332,9 @@ mod copy_tests {
             dst.join("extraneous.txt").exists(),
             "pruning must be skipped when the copy reported errors"
         );
+        assert!(logs_contain(
+            "because entry processing failed or did not provide complete exact names"
+        ));
         Ok(())
     }
 
@@ -5377,7 +5461,6 @@ mod copy_tests {
                 let visitor = Arc::new(CopyVisitor {
                     prog_track: &PROGRESS,
                     dst_root: dst.clone(),
-                    filter_base: PathBuf::new(),
                     delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                     settings: {
                         let mut settings = settings_with_delete(delete);
@@ -5464,7 +5547,6 @@ mod copy_tests {
             let visitor = Arc::new(CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst.clone(),
-                filter_base: PathBuf::new(),
                 delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
@@ -5502,14 +5584,14 @@ mod copy_tests {
                 visitor
                     .prune_finished_dir(
                         &mut summary,
-                        &crate::delete::DeleteKeepSet::from_processed(
+                        &crate::delete::DeleteDecision::from_processed(
                             visitor.settings.delete.as_ref().unwrap(),
-                            &processed,
+                            Some(&processed),
                         )
+                        .into_ready(&dst)
                         .expect("delete traversal completed"),
-                        Some(&dst_dir),
-                        &dst,
-                        std::path::Path::new(""),
+                        &dst_dir,
+                        &root_cx.filter_path,
                     )
                     .await?;
                 Ok::<_, anyhow::Error>((summary, processed))
@@ -5560,7 +5642,6 @@ mod copy_tests {
             let visitor = Arc::new(CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst.clone(),
-                filter_base: PathBuf::new(),
                 delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
@@ -6471,7 +6552,6 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: PathBuf::new(),
-                filter_base: PathBuf::new(),
                 delete_scan_anchor: DeleteScanAnchor::new(
                     std::path::Path::new("dst"),
                     std::path::Path::new(""),
@@ -6520,7 +6600,6 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst_root.clone(),
-                filter_base: PathBuf::new(),
                 delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
                 settings: settings_with_delete(None),
                 preserve: *NO_PRESERVE_SETTINGS,
@@ -6602,7 +6681,6 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst_root.clone(),
-                filter_base: PathBuf::new(),
                 delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,

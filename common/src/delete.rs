@@ -21,11 +21,11 @@ pub struct DeleteSettings {
     pub delete_excluded: bool,
 }
 
-/// Complete exact child-name evidence, bound to the deletion settings that requested it.
+/// Complete exact child-name evidence, sealed with the settings that consume it.
 ///
-/// Walkers create this only after successful collection. The storage can be ordered names from
-/// copy or a hashed set from rlink; pruning requires the hashed form. Fields stay private so the
-/// settings cannot be separated from the collection that authorizes deletion.
+/// Rlink captures settings when collection starts; copy binds its own settings at completion.
+/// The storage can be ordered names from copy or a hashed set from rlink; pruning requires the
+/// hashed form. Once sealed, the private fields keep those settings and names together.
 #[derive(Debug)]
 pub(crate) struct DeleteKeepSet<N> {
     settings: DeleteSettings,
@@ -42,7 +42,7 @@ impl<N> DeleteKeepSet<N> {
 impl<'a> DeleteKeepSet<&'a [OsString]> {
     /// Borrow evidence that only a successful delete-collecting walk can produce. Ordinary
     /// collected names and successful non-collecting walks cannot authorize pruning.
-    pub(crate) fn from_processed(
+    fn from_processed(
         settings: &DeleteSettings,
         processed: &'a crate::walk_driver::ProcessedChildren,
     ) -> Option<Self> {
@@ -72,7 +72,7 @@ impl<N> DeleteDecision<N> {
             Self::NotRequested => None,
             Self::Discarded => {
                 tracing::warn!(
-                    "skipping --delete pruning of {:?} because child traversal did not provide complete exact names",
+                    "skipping --delete pruning of {:?} because entry processing failed or did not provide complete exact names",
                     dst_path
                 );
                 None
@@ -86,12 +86,9 @@ impl<'a> DeleteDecision<&'a [OsString]> {
     /// Only a successful exact collection can authorize pruning. An exact empty collection is
     /// valid evidence; failed traversal, ordinary names, and omitted collection are not.
     pub(crate) fn from_processed(
-        settings: Option<&DeleteSettings>,
+        settings: &DeleteSettings,
         processed: Option<&'a crate::walk_driver::ProcessedChildren>,
     ) -> Self {
-        let Some(settings) = settings else {
-            return Self::NotRequested;
-        };
         match processed.and_then(|processed| DeleteKeepSet::from_processed(settings, processed)) {
             Some(keep) => Self::Ready(keep),
             None => Self::Discarded,
@@ -99,13 +96,16 @@ impl<'a> DeleteDecision<&'a [OsString]> {
     }
 }
 
-/// In-progress exact names for rlink's source/update pass. This cannot authorize pruning.
-pub(crate) struct DeleteNameCollector {
+/// Outcomes of rlink's source/update pass: errors always, and exact names when deletion is enabled.
+///
+/// This is the directory's keep-going error sink even without `--delete`. After all workers have
+/// been joined, completion returns both the deletion decision and the errors needed by finalization.
+pub(crate) struct LinkChildOutcomes {
     errors: crate::error_collector::ErrorCollector,
     inner: Option<(DeleteSettings, std::collections::HashSet<OsString>)>,
 }
 
-impl DeleteNameCollector {
+impl LinkChildOutcomes {
     pub(crate) fn new(settings: Option<&DeleteSettings>) -> Self {
         Self {
             inner: settings.map(|settings| (settings.clone(), std::collections::HashSet::new())),
@@ -139,6 +139,19 @@ impl DeleteNameCollector {
         (decision, self.errors)
     }
     #[cfg(test)]
+    pub(crate) fn expect_ready(self) -> DeleteKeepSet<std::collections::HashSet<OsString>> {
+        let (decision, errors) = self.finish();
+        if let Some(error) = errors.into_error() {
+            panic!("expected successful child outcomes: {error:#}");
+        }
+        match decision {
+            DeleteDecision::Ready(keep) => keep,
+            DeleteDecision::NotRequested | DeleteDecision::Discarded => {
+                panic!("expected completed delete-name collection")
+            }
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn as_set(&self) -> Option<&std::collections::HashSet<OsString>> {
         self.inner.as_ref().map(|(_, names)| names)
     }
@@ -161,7 +174,7 @@ impl DeleteNameCollector {
 /// entries against `filter` for exclude-protection. Excluded destination entries are protected
 /// (kept) unless the keep-set's `delete_excluded` setting is set. Honors `dry_run` (reports without
 /// removing, via `rm::rm_child`).
-pub(crate) async fn prune_extraneous<K>(
+async fn prune_extraneous<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
     relative_dir: &std::path::Path,
@@ -198,6 +211,22 @@ where
         entries,
     )
     .await
+}
+
+/// Select the held real or preview directory, reporting the shared no-directory skip policy.
+pub(crate) fn select_scan_dir<'a>(
+    dst_dir: Option<&'a Arc<Dir>>,
+    preview_dir: Option<&'a Arc<Dir>>,
+    dst_path: &std::path::Path,
+) -> Option<&'a Arc<Dir>> {
+    let scan_dir = dst_dir.or(preview_dir);
+    if scan_dir.is_none() {
+        tracing::debug!(
+            "skipping --delete pruning of {:?}: no destination directory to scan",
+            dst_path
+        );
+    }
+    scan_dir
 }
 
 /// Prune through a held destination and fold successful or partial removal counts exactly once.
@@ -385,7 +414,7 @@ mod tests {
     #[test]
     fn failed_collection_cannot_authorize_pruning() {
         let settings = delete_settings(true);
-        let mut collecting = DeleteNameCollector::new(Some(&settings));
+        let mut collecting = LinkChildOutcomes::new(Some(&settings));
         collecting.record_exact(OsString::from("completed-child"));
         collecting.record_error(anyhow::anyhow!("a later child failed"));
         let (decision, errors) = collecting.finish();
@@ -400,7 +429,7 @@ mod tests {
     fn completed_collection_keeps_its_settings_and_empty_is_valid() {
         for delete_excluded in [false, true] {
             let settings = delete_settings(delete_excluded);
-            let (decision, errors) = DeleteNameCollector::new(Some(&settings)).finish();
+            let (decision, errors) = LinkChildOutcomes::new(Some(&settings)).finish();
             let DeleteDecision::Ready(keep) = decision else {
                 panic!("completed empty collection must authorize pruning")
             };
@@ -408,7 +437,7 @@ mod tests {
             assert!(keep.names.is_empty());
             assert_eq!(keep.settings.delete_excluded, delete_excluded);
         }
-        let mut collecting = DeleteNameCollector::new(None);
+        let mut collecting = LinkChildOutcomes::new(None);
         collecting.record_exact(OsString::from("ignored"));
         let (decision, errors) = collecting.finish();
         assert!(matches!(decision, DeleteDecision::NotRequested));
@@ -417,7 +446,7 @@ mod tests {
 
     #[test]
     fn collection_preserves_errors_without_delete() {
-        let mut collecting = DeleteNameCollector::new(None);
+        let mut collecting = LinkChildOutcomes::new(None);
         collecting.record_exact(OsString::from("unretained"));
         collecting.record_error(
             anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES))
@@ -441,59 +470,72 @@ mod tests {
     #[tokio::test]
     async fn prune_completion_folds_success_and_partial_counts_once() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        for block_parent_removal in [false, true] {
-            for fail_early in [false, true] {
-                let tmp = tempfile::tempdir()?;
-                let dst = tmp.path().join("dst");
-                tokio::fs::create_dir_all(dst.join("extra")).await?;
-                tokio::fs::write(dst.join("extra/file"), b"abc").await?;
-                let dir = open_dst(&dst).await?;
-                if block_parent_removal {
-                    tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500))
-                        .await?;
-                }
-                let keep = DeleteKeepSet::from_complete(
-                    delete_settings(false),
-                    HashSet::<OsString>::new(),
+        for (block_parent_removal, fail_early) in [(false, false), (true, false), (true, true)] {
+            if block_parent_removal && nix::unistd::geteuid().is_root() {
+                eprintln!("skipping permission-denial case: root bypasses directory permissions");
+                continue;
+            }
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            for child in ["extra1", "extra2"] {
+                tokio::fs::create_dir_all(dst.join(child)).await?;
+                tokio::fs::write(dst.join(child).join("file"), b"abc").await?;
+            }
+            let dir = open_dst(&dst).await?;
+            if block_parent_removal {
+                tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
+            }
+            let keep =
+                DeleteKeepSet::from_complete(delete_settings(false), HashSet::<OsString>::new());
+            let mut summary = crate::rm::Summary {
+                files_removed: 7,
+                bytes_removed: 11,
+                directories_removed: 2,
+                ..Default::default()
+            };
+            let result = prune_and_fold(
+                &PROGRESS,
+                &dir,
+                std::path::Path::new(""),
+                &keep,
+                None,
+                fail_early,
+                None,
+                &mut summary,
+            )
+            .await;
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
+            let removed = if block_parent_removal && fail_early {
+                1
+            } else {
+                2
+            };
+            assert_eq!(summary.files_removed, 7 + removed);
+            assert_eq!(summary.bytes_removed, 11 + 3 * removed as u64);
+            assert_eq!(
+                ["extra1", "extra2"]
+                    .iter()
+                    .filter(|child| dst.join(child).join("file").exists())
+                    .count(),
+                2 - removed,
+            );
+            if block_parent_removal {
+                let error = result.expect_err("parent permissions must prevent the final rmdir");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EACCES),
                 );
-                let mut summary = crate::rm::Summary {
-                    files_removed: 7,
-                    bytes_removed: 11,
-                    directories_removed: 2,
-                    ..Default::default()
-                };
-                let result = prune_and_fold(
-                    &PROGRESS,
-                    &dir,
-                    std::path::Path::new(""),
-                    &keep,
-                    None,
-                    fail_early,
-                    None,
-                    &mut summary,
-                )
-                .await;
-                tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
-                assert_eq!(summary.files_removed, 8);
-                assert_eq!(summary.bytes_removed, 14);
-                assert!(!dst.join("extra/file").exists());
-                if block_parent_removal {
-                    let error =
-                        result.expect_err("parent permissions must prevent the final rmdir");
-                    assert_eq!(
-                        error
-                            .downcast_ref::<std::io::Error>()
-                            .unwrap()
-                            .raw_os_error(),
-                        Some(libc::EACCES)
-                    );
-                    assert_eq!(summary.directories_removed, 2);
-                    assert!(dst.join("extra").is_dir());
-                } else {
-                    result?;
-                    assert_eq!(summary.directories_removed, 3);
-                    assert!(!dst.join("extra").exists());
-                }
+                assert_eq!(summary.directories_removed, 2);
+                assert!(dst.join("extra1").is_dir());
+                assert!(dst.join("extra2").is_dir());
+            } else {
+                result?;
+                assert_eq!(summary.directories_removed, 4);
+                assert!(!dst.join("extra1").exists());
+                assert!(!dst.join("extra2").exists());
             }
         }
         Ok(())
