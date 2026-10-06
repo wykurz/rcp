@@ -891,7 +891,6 @@ impl CopyVisitor {
         } = fin;
         let src_path = &cx.real_path;
         let dst_path = self.dst_path_for(cx);
-        let rel_path = &cx.rel_path;
         // when filtering is active and we created this directory, check whether anything was
         // actually copied into it. if not, we may need to clean up the empty directory.
         let this_dir_count = usize::from(we_created);
@@ -901,12 +900,12 @@ impl CopyVisitor {
         let anything_copied = copy_summary.files_copied > 0
             || copy_summary.symlinks_created > 0
             || child_dirs_created > 0;
-        let relative_path = self.filter_base.join(rel_path);
+
         match check_empty_dir_cleanup(
             self.settings.filter.as_ref(),
             we_created,
             anything_copied,
-            &relative_path,
+            &cx.filter_path,
             is_root,
             self.settings.dry_run.is_some(),
         ) {
@@ -1330,7 +1329,7 @@ impl WalkVisitor for CopyVisitor {
         let src_path = &cx.real_path;
         let dst_path = self.dst_path_for(cx);
         let dst_name = self.dst_name_for(cx)?.to_owned();
-        let is_root = cx.rel_path.as_os_str().is_empty();
+        let is_root = cx.filter_path.as_os_str().is_empty();
         let is_fresh = parent_ctx.is_fresh;
         // open the source directory's contents (O_NOFOLLOW) — this is the `dir` the driver walks.
         let src_dir = src_parent
