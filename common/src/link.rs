@@ -799,6 +799,7 @@ async fn link_inner(
         settings,
         is_fresh,
         admission,
+        copy::DeleteScanAnchor::new(dst, std::path::Path::new("")),
     )
     .await
     .map(|result| result.summary)
@@ -1075,12 +1076,13 @@ async fn link_internal(
     settings: &Settings,
     is_fresh: bool,
     admission: LinkEntryAdmission,
+    delete_scan_parent: copy::DeleteScanAnchor,
 ) -> Result<LinkEntryResult, Error> {
     let _prog_guard = prog_track.ops.guard();
     // real filesystem paths reconstructed from the roots + accumulated relative path. used for
-    // diagnostics, the path-based `--delete` prune scan / `rm`, the `--dereference` canonicalize
-    // fallback inside copy, and to derive `dst_name`. joining an empty `rel_path` (the root entry)
-    // would append a trailing separator, so use the root verbatim when `rel_path` is empty.
+    // diagnostics, the `--dereference` canonicalize fallback inside copy, and to derive `dst_name`.
+    // joining an empty `rel_path` (the root entry) would append a trailing separator, so use the root
+    // verbatim when `rel_path` is empty.
     let (src_path, dst_path) = if rel_path.as_os_str().is_empty() {
         (src_root.to_path_buf(), dst_root.to_path_buf())
     } else {
@@ -1272,7 +1274,7 @@ async fn link_internal(
                     update_path,
                     &dst_path,
                     rel_path,
-                    copy::DeleteScanAnchor::new(dst_root, rel_path),
+                    delete_scan_parent.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1332,7 +1334,7 @@ async fn link_internal(
                     update_path,
                     &dst_path,
                     rel_path,
-                    copy::DeleteScanAnchor::new(dst_root, rel_path),
+                    delete_scan_parent.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1353,7 +1355,7 @@ async fn link_internal(
                     update_path,
                     &dst_path,
                     rel_path,
-                    copy::DeleteScanAnchor::new(dst_root, rel_path),
+                    delete_scan_parent.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1405,7 +1407,7 @@ async fn link_internal(
                     &src_path,
                     &dst_path,
                     rel_path,
-                    copy::DeleteScanAnchor::new(dst_root, rel_path),
+                    delete_scan_parent.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1493,6 +1495,7 @@ async fn link_internal(
         update_path_for_dir,
         settings,
         is_fresh,
+        delete_scan_parent,
     )
     .await
     .map(LinkEntryResult::selected)
@@ -1502,7 +1505,7 @@ async fn link_internal(
 /// directory handles plus the entry `name` — never re-resolving a path. `filter_base` for the
 /// delegation is the entry's logical relative path (so `--delete` pruning inside the subtree
 /// matches include/exclude patterns at the entry's true path). `delete_scan_anchor` independently
-/// retains the original outer destination operand and physical subtree base. The returned copy
+/// carries the held preview parent or its known absence. The returned copy
 /// summary is folded into a link `Summary`.
 #[allow(clippy::too_many_arguments)]
 async fn delegate_copy(
@@ -1581,6 +1584,7 @@ async fn link_dir_entry(
     update_path: Option<&std::path::Path>,
     settings: &Settings,
     is_fresh: bool,
+    delete_scan_parent: copy::DeleteScanAnchor,
 ) -> Result<Summary, Error> {
     let src_dir = src_parent
         .open_dir(name)
@@ -1604,6 +1608,15 @@ async fn link_dir_entry(
     };
     // dry-run: report the directory and traverse its contents, but never create a destination dir.
     if settings.dry_run.is_some() {
+        let preview_dir = if settings.copy_settings.delete.is_some() {
+            delete_scan_parent
+                .open(dst_name)
+                .await
+                .with_context(|| format!("cannot open destination {dst_path:?} for delete scan"))
+                .map_err(|error| Error::new(error, Default::default()))?
+        } else {
+            None
+        };
         crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
         let base = Summary {
             copy_summary: CopySummary {
@@ -1627,11 +1640,12 @@ async fn link_dir_entry(
             dst_path,
             true, // treat as "created" so empty-dir cleanup can suppress the dry-run count
             is_fresh,
-            None, // dry-run: no destination dir is opened or locked, so nothing to restore
+            None, // preview handles never lock the destination, so nothing to restore
             settings,
             base,
             SourceEntries::Live,
             UpdateEntries::Live,
+            preview_dir.as_ref(),
         )
         .await;
     }
@@ -1691,6 +1705,7 @@ async fn link_dir_entry(
         },
         SourceEntries::Live,
         UpdateEntries::Live,
+        None,
     )
     .await
 }
@@ -2011,7 +2026,8 @@ enum UpdateEntries {
 /// copy those not present in the source, then run `--delete` pruning, empty-directory cleanup, and
 /// finally apply the directory's own metadata.
 ///
-/// `dst_dir == None` / `dst_parent == None` means dry-run (no destination mutation). `base` carries
+/// `dst_dir == None` / `dst_parent == None` means dry-run (no destination mutation). `preview_dir`
+/// is independently held from pre-order for dry-run deletion scans only. `base` carries
 /// the `directories_created`/`directories_unchanged` contribution from resolving this directory.
 #[allow(clippy::too_many_arguments)]
 async fn link_dir_contents(
@@ -2034,6 +2050,7 @@ async fn link_dir_contents(
     base: Summary,
     source_entries: SourceEntries,
     update_entries: UpdateEntries,
+    preview_dir: Option<&Arc<Dir>>,
 ) -> Result<Summary, Error> {
     tracing::debug!("process contents of 'src' directory");
     let mut link_summary = base;
@@ -2097,6 +2114,7 @@ async fn link_dir_contents(
             let src_root = src_root.to_owned();
             let dst_root = dst_root.to_owned();
             let update_root = update_root.map(std::path::Path::to_path_buf);
+            let delete_scan_parent = copy::DeleteScanAnchor::parent(preview_dir.cloned());
             let do_link = move || async move {
                 let update_ref = update_parent
                     .as_ref()
@@ -2115,6 +2133,7 @@ async fn link_dir_contents(
                     &settings,
                     is_fresh,
                     admission.into(),
+                    delete_scan_parent,
                 )
                 .await
                 .map(|result| LinkTaskResult::from_link(entry_name, result))
@@ -2190,7 +2209,7 @@ async fn link_dir_contents(
                 let update_parent = Arc::clone(update_dir);
                 let dst_parent = dst_dir.map(Arc::clone);
                 let settings = settings.clone();
-                let delete_scan_anchor = copy::DeleteScanAnchor::new(dst_root, &entry_rel);
+                let delete_scan_anchor = copy::DeleteScanAnchor::parent(preview_dir.cloned());
                 let do_copy = move || {
                     // filter-base for the delegated copy: this update entry's path relative to the
                     // source root, so any --delete pruning inside it matches the include/exclude filter
@@ -2248,64 +2267,31 @@ async fn link_dir_contents(
             dst_path
         );
     }
-    if let Some(keep_set) = keep_set.finish(&errors) {
-        // a real link already holds the destination directory. Dry-run descends from the
-        // original named operand one `O_NOFOLLOW` component at a time, so the reconstructed
-        // `dst_path` remains diagnostics-only and a symlinked operand root cannot become an
-        // intermediate redirect into another tree.
-        let prune_dir: Option<Arc<Dir>> = match dst_dir {
-            Some(dir) => Some(Arc::clone(dir)),
-            None => match crate::safedir::open_existing_dir_beneath_operand(
-                dst_root,
-                rel_path,
-                congestion::Side::Destination,
-            )
-            .await
-            {
-                Ok(Some(dir)) => Some(Arc::new(dir)),
-                Ok(None) => {
-                    tracing::debug!(
-                        "skipping --delete pruning of {:?}: not a real directory",
-                        dst_path
-                    );
-                    None
+    if let Some(keep_set) = keep_set.finish(&errors)
+        && let Some(prune_dir) = dst_dir.or(preview_dir)
+    {
+        match crate::delete::prune_extraneous(
+            prog_track,
+            prune_dir,
+            rel_path,
+            &keep_set,
+            settings.filter.as_ref(),
+            settings.copy_settings.fail_early,
+            settings.dry_run,
+        )
+        .await
+        {
+            Ok(rm_summary) => {
+                link_summary.copy_summary.rm_summary =
+                    link_summary.copy_summary.rm_summary + rm_summary;
+            }
+            Err(err) => {
+                link_summary.copy_summary.rm_summary =
+                    link_summary.copy_summary.rm_summary + err.summary;
+                if settings.copy_settings.fail_early {
+                    return Err(Error::new(err.source, link_summary));
                 }
-                Err(err) => {
-                    let err = anyhow::Error::new(err).context(format!(
-                        "cannot open destination {dst_path:?} for delete scan"
-                    ));
-                    if settings.copy_settings.fail_early {
-                        return Err(Error::new(err, link_summary));
-                    }
-                    errors.push(err);
-                    None
-                }
-            },
-        };
-        if let Some(prune_dir) = prune_dir {
-            match crate::delete::prune_extraneous(
-                prog_track,
-                &prune_dir,
-                rel_path,
-                &keep_set,
-                settings.filter.as_ref(),
-                settings.copy_settings.fail_early,
-                settings.dry_run,
-            )
-            .await
-            {
-                Ok(rm_summary) => {
-                    link_summary.copy_summary.rm_summary =
-                        link_summary.copy_summary.rm_summary + rm_summary;
-                }
-                Err(err) => {
-                    link_summary.copy_summary.rm_summary =
-                        link_summary.copy_summary.rm_summary + err.summary;
-                    if settings.copy_settings.fail_early {
-                        return Err(Error::new(err.source, link_summary));
-                    }
-                    errors.push(err.source);
-                }
+                errors.push(err.source);
             }
         }
     }
@@ -3945,6 +3931,7 @@ mod link_tests {
                     &settings,
                     false,
                     LinkEntryAdmission::Filtered(entry),
+                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                 ),
             )
             .await?;
@@ -4028,6 +4015,7 @@ mod link_tests {
                     &settings,
                     false,
                     LinkEntryAdmission::Filtered(entry),
+                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                 ),
             )
             .await??;
@@ -4091,6 +4079,7 @@ mod link_tests {
                     &common_settings(false, false),
                     false,
                     LinkEntryAdmission::Filtered(entry),
+                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
                 ),
             )
             .await??;
@@ -4231,6 +4220,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::RootOrDelegated.into(),
+                copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
             ))
             .await?;
             let mut summary = Summary::default();
@@ -4314,6 +4304,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
+                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -4392,6 +4383,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
+                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -4459,6 +4451,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
+                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -6371,6 +6364,7 @@ mod link_tests {
                 Summary::default(),
                 SourceEntries::Live,
                 UpdateEntries::Live,
+                None,
             );
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6431,6 +6425,7 @@ mod link_tests {
                 Summary::default(),
                 SourceEntries::Live,
                 UpdateEntries::Live,
+                None,
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6491,6 +6486,7 @@ mod link_tests {
                         &settings,
                         false,
                         walk::EntryAdmission::HintedDirectory.into(),
+                        copy::DeleteScanAnchor::new(&dst_path, std::path::Path::new("")),
                     ),
                 )
                 .await;
@@ -6542,6 +6538,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::HintedDirectory.into(),
+                copy::DeleteScanAnchor::new(&dst_root, std::path::Path::new("entry")),
             );
             tokio::pin!(operation);
             assert!(
@@ -6606,6 +6603,7 @@ mod link_tests {
                 Summary::default(),
                 SourceEntries::Live,
                 UpdateEntries::Live,
+                None,
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6698,6 +6696,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::RootOrDelegated.into(),
+                copy::DeleteScanAnchor::new(&dst_path, std::path::Path::new("")),
             );
             tokio::pin!(operation);
             let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
@@ -6766,6 +6765,7 @@ mod link_tests {
                     &common_settings(false, false),
                     true,
                     EntryAdmission::from(permit).into(),
+                    copy::DeleteScanAnchor::new(&task_dst_entry, std::path::Path::new("")),
                 )
                 .await
             });
@@ -7056,6 +7056,7 @@ mod link_tests {
                     },
                 ]),
                 UpdateEntries::InjectedReadError(read_error),
+                None,
             ));
             tokio::pin!(operation);
             // the read error is held until real source workers have started and retain both
@@ -7231,6 +7232,7 @@ mod link_tests {
                             libc::EIO,
                         )),
                         UpdateEntries::Live,
+                        None,
                     ))
                     .await
                     .expect_err("source enumeration must fail");
@@ -7324,6 +7326,7 @@ mod link_tests {
                     },
                     SourceEntries::InjectedReadError(std::io::Error::from_raw_os_error(libc::EIO)),
                     UpdateEntries::Live,
+                    None,
                 ))
                 .await
                 .expect_err("cleanup must preserve the read error");
@@ -7409,6 +7412,7 @@ mod link_tests {
                     (std::ffi::OsString::from("later"), Some(EntryKind::File)),
                 ]),
                 UpdateEntries::Live,
+                None,
             ));
             tokio::pin!(operation);
             let mut completed_while_gated = None;
@@ -7523,6 +7527,7 @@ mod link_tests {
                     (std::ffi::OsString::from("last"), None),
                 ]),
                 UpdateEntries::Live,
+                None,
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(20), operation)
@@ -7586,6 +7591,7 @@ mod link_tests {
                 Summary::default(),
                 SourceEntries::Injected(vec![(std::ffi::OsString::from("node"), None)]),
                 UpdateEntries::Live,
+                None,
             ))
             .await?;
             assert_eq!(summary.copy_summary.directories_skipped, 1);
@@ -7647,6 +7653,7 @@ mod link_tests {
                     (std::ffi::OsString::from("second"), None),
                 ]),
                 UpdateEntries::Live,
+                None,
             ));
             tokio::pin!(operation);
             let mut completed_while_gated = None;
@@ -7739,6 +7746,7 @@ mod link_tests {
                     (std::ffi::OsString::from("first"), Some(EntryKind::File)),
                     (std::ffi::OsString::from("second"), Some(EntryKind::File)),
                 ]),
+                None,
             ));
             tokio::pin!(operation);
             let available_while_classifying = loop {
@@ -7835,6 +7843,7 @@ mod link_tests {
                     (std::ffi::OsString::from("middle"), Some(EntryKind::File)),
                     (std::ffi::OsString::from("last"), Some(EntryKind::File)),
                 ]),
+                None,
             ));
             tokio::pin!(operation);
             loop {

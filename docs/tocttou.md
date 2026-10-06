@@ -538,7 +538,7 @@ The operand paths themselves — the one place the fd-based walk still consults 
   5.6+; on older kernels `--require-toctou-safe` refuses to run rather than degrade. The named entry
   itself keeps the tools' non-`-L` semantics: classified `O_NOFOLLOW`, a symlink operand is operated
   on as the link object and never followed (`ELOOP` where the open requires a directory, e.g. the
-  `--delete` prune reopen).
+  `--delete` preview open).
 - **Resolved up front, then threaded.** Every operand prefix is validated at the entry of the
   operation, **before any filter / dry-run / overwrite / `--update` branching**. A symlinked prefix
   therefore fails closed before any downstream branch (a filtered-out source root, a trailing-slash
@@ -552,14 +552,16 @@ The operand paths themselves — the one place the fd-based walk still consults 
   run holds no persistent destination fd, the existence probes re-resolve with a decomposed
   `openat2` (parent open + `O_NOFOLLOW` child), which is atomic and distinguishes an
   intermediate-prefix symlink (fail closed) from a final component that is merely a symlink or
-  non-directory (a replaceable operand, accepted). The `--delete` prune scan is the one consumer
-  that, in a dry run, reopens the destination directory by its full path (`openat2`
-  `RESOLVE_NO_SYMLINKS`): this path is *below* the named root, which the real run walks fd-relative
-  and would replace or skip as it goes, so a symlink anywhere in it (an intermediate the real run
-  would replace, or a final symlink) yields `ELOOP` and the prune preview is simply skipped —
-  nothing to prune, since the real run creates a fresh directory there and exits successfully. The
-  operand prefix *above* the named root is still validated up front (fatal), so this below-root skip
-  does not weaken the contract; it only keeps the preview consistent with the real run.
+  non-directory (a replaceable operand, accepted). Local `--dry-run --delete` opens a separate
+  read-only destination directory before visiting its children. The named operand is opened through
+  its trusted parent using the active default/strict policy; each nested directory is opened with
+  `O_NOFOLLOW` through its held preview parent. Copy, rlink, delegated update copies, and library
+  dereference handoffs retain that physical authority independently of their display/filter paths.
+  Missing, non-directory, or symlink counterparts mean no directory exists to scan, and descendants
+  inherit that absence without reopening a path. Other open failures, including permission errors,
+  stop that subtree before its children are reported. Successful previews prune through the held
+  directory after their children finish, without modifying it or restoring metadata. The operand
+  prefix *above* the named root is still validated up front in strict mode (fatal).
 - **Remote operands.** The master lints the remote path parts (which must be absolute as written;
   `host:~/x` forms are rejected) and mirrors the flag onto each spawned `rcpd`, which arms the same
   strict resolution for its root opens on the remote host. The source `rcpd` opens the source parent
@@ -610,11 +612,12 @@ so the security-relevant invariants each live in exactly one place:
   failed traversal has no delete evidence and still reaches keep-going finalization with its error.
   Copy and rlink prune through one typed keep-set binding complete names to deletion settings; rlink
   seals its source/update collector only after joining every child and checking for errors. A
-  dry-run scan-open failure records the error and finalizes empty-directory accounting in keep-going
-  mode. In rlink, `DT_UNKNOWN` source and update-only hints also dispatch to scheduled workers for
-  exact type-sensitive filtering and accounting. Its dual-tree path admits before opening either
-  source or update handle when an update counterpart needs classification, because the source hint
-  says nothing about that separate entry. An authoritative directory releases any provisional permit
+  dry-run destination-open failure occurs before descent and contributes no counts for that subtree;
+  in keep-going mode its parent folds the error, suppresses pruning, and still finalizes normally.
+  In rlink, `DT_UNKNOWN` source and update-only hints also dispatch to scheduled workers for exact
+  type-sensitive filtering and accounting. Its dual-tree path admits before opening either source or
+  update handle when an update counterpart needs classification, because the source hint says
+  nothing about that separate entry. An authoritative directory releases any provisional permit
   inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf fan-out without
   putting arbitrary recursive directory depth/breadth into a pool, which would recreate the
   deep-directory hold-and-wait deadlock.

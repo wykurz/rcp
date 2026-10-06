@@ -1770,6 +1770,19 @@ fn preview_scan_absence(error: &std::io::Error) -> bool {
         )
 }
 
+/// Open one preview child through its held parent without following a final symlink.
+/// Missing, non-directory, and symlink children have no directory to scan; other errors propagate.
+pub(crate) async fn open_existing_preview_child(
+    parent: &Dir,
+    name: &OsStr,
+) -> std::io::Result<Option<Dir>> {
+    match parent.open_dir(name).await {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if preview_scan_absence(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn preview_relative_components(relative: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
     if relative.as_os_str().is_empty() {
         return Ok(Vec::new());
