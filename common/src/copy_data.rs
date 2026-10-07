@@ -37,8 +37,8 @@
 //!   on reflink/sparse-capable filesystems (e.g. Btrfs/XFS) — on others (e.g.
 //!   ext4) the size is still `len` but the region may be fully allocated.
 //!
-//! These size bounds do not provide a consistent content snapshot of a source
-//! that is modified during the copy.
+//! These size bounds describe successful copies, not a consistent content snapshot
+//! of a source that is modified during the copy. Errors do not roll back writes.
 //!
 //! # Durability
 //!
@@ -70,7 +70,8 @@ pub enum ReflinkMode {
 ///
 /// Copies from byte zero in the source to byte zero in the destination, regardless
 /// of their current seek positions, and returns the logical number of bytes copied.
-/// File cursor positions after copying are unspecified.
+/// File cursor positions after copying are unspecified. Errors may leave a partially
+/// written destination; writes are not rolled back.
 /// The destination must be empty and exclusively owned by this copy operation.
 /// `Never` bypasses all `copy_file_range` acceleration, including non-reflink
 /// kernel and server-side copying. See the module docs for size and durability semantics.
@@ -109,8 +110,9 @@ fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64>
 }
 
 /// Run positioned kernel-copy attempts from the confirmed prefix. The syscall
-/// must report at most the requested length, with no confirmed progress on error.
-/// Mutated offset arguments are discarded; only a successful byte count advances
+/// must report no confirmed progress on error. Counts above the requested length
+/// are rejected with `EIO`; rejecting a count does not undo any kernel writes.
+/// Mutated offset arguments are discarded; only an accepted byte count advances
 /// the prefix used to initialize both offsets on the next attempt.
 fn copy_file_range_all_with(
     src: &File,
@@ -138,6 +140,11 @@ fn copy_file_range_all_with(
                 // if the source shrank beneath the prefix already written.
                 return copy_sparse_fallback(src, dst, copied, len);
             }
+            Err(nix::errno::Errno::EPERM) if copied == 0 => {
+                // syscall permission may be denied while positioned I/O is allowed.
+                return copy_sparse_fallback(src, dst, 0, len);
+            }
+            Ok(n) if n > remaining => return Err(nix::errno::Errno::EIO.into()),
             Ok(n) => copied += n as u64,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(errno) => return Err(std::io::Error::from(errno)),
@@ -201,7 +208,9 @@ fn classify_seek_data(result: nix::Result<libc::off_t>) -> std::io::Result<Spars
 ///
 /// The final size is reconciled with the source's *actual* end so this path
 /// agrees with the primary one on a shrunk source: after the data loop it
-/// computes `final = min(len, actual_eof)` and sizes `dst` to `final` if needed.
+/// bounds the final size by `len`, `SEEK_END`, and any earlier EOF observed by a
+/// read, then sizes `dst` to that end if needed. An observed read EOF also bounds
+/// virtual files whose advertised size exceeds their readable data.
 /// A legitimate trailing hole (source logical size still == `len`) leaves
 /// `actual_eof == len`, so `dst` ends at `len` with the trailing region
 /// unallocated; a source that shrank below `len` (`actual_eof < len`) sizes
@@ -231,6 +240,7 @@ fn copy_sparse_fallback_with_seek(
     }
     let mut off = start;
     let mut written_end = start;
+    let mut read_eof = None;
     let mut buf = Vec::new();
     while off < len {
         let extent = match next_copy_extent(&mut seek, off, len)? {
@@ -248,13 +258,15 @@ fn copy_sparse_fallback_with_seek(
             written_end = end;
         }
         if end < extent.end {
-            break; // the source shrank during the read loop.
+            // virtual files can advertise extents and a SEEK_END beyond readable data.
+            read_eof = Some(end);
+            break;
         }
         off = extent.end;
     }
     // keep the post-loop EOF observation: a source can shrink even after the last write.
     let actual_eof = seek(0, nix::unistd::Whence::SeekEnd).map_err(std::io::Error::from)? as u64;
-    let final_size = len.min(actual_eof);
+    let final_size = len.min(actual_eof).min(read_eof.unwrap_or(len));
     if written_end != final_size {
         // extend trailing holes or remove bytes beyond a concurrently shortened source.
         nix::unistd::ftruncate(dst.as_fd(), to_off_t(final_size)?).map_err(std::io::Error::from)?;
@@ -303,7 +315,7 @@ fn next_copy_extent(
 }
 
 /// Copy an extent with positioned I/O, retrying interruptions and handling short transfers.
-/// Returns the offset reached, which can be below `to` if the source shrank.
+/// Returns the offset reached, which can be below `to` if a read reaches EOF.
 fn copy_data_extent(
     src: &impl FileExt,
     dst: &impl FileExt,
@@ -411,7 +423,7 @@ mod tests {
         len: u64,
         steps: &[(i64, usize, nix::Result<usize>)],
         mut before_step: impl FnMut(usize),
-    ) -> u64 {
+    ) -> std::io::Result<u64> {
         let mut steps = steps.iter().enumerate();
         let copied =
             copy_file_range_all_with(src, dst, len, |src_offset, dst_offset, remaining| {
@@ -421,18 +433,113 @@ mod tests {
                     (offset, offset, expected_remaining)
                 );
                 before_step(step);
-                if let Ok(n) = result {
-                    let mut bytes = vec![0; n];
-                    src.read_exact_at(&mut bytes, *src_offset as u64).unwrap();
-                    dst.write_all_at(&bytes, *dst_offset as u64).unwrap();
-                    *src_offset += n as i64;
-                    *dst_offset += n as i64;
+                match result {
+                    Ok(n) if n <= remaining => {
+                        let mut bytes = vec![0; n];
+                        src.read_exact_at(&mut bytes, *src_offset as u64).unwrap();
+                        dst.write_all_at(&bytes, *dst_offset as u64).unwrap();
+                        *src_offset += n as i64;
+                        *dst_offset += n as i64;
+                    }
+                    _ => {}
                 }
                 result
-            })
-            .unwrap();
+            });
         assert!(steps.next().is_none());
         copied
+    }
+
+    #[test]
+    fn falls_back_when_kernel_copy_is_denied_before_progress() {
+        for interrupted in [false, true] {
+            for len in [7, 16, 20] {
+                let tmp = tempfile::tempdir().unwrap();
+                let contents = b"0123456789abcdef";
+                let mut src = make_file(tmp.path(), "src");
+                src.write_all(contents).unwrap();
+                let dst = make_file(tmp.path(), "dst");
+                nix::unistd::lseek(src.as_fd(), 3, nix::unistd::Whence::SeekSet).unwrap();
+                nix::unistd::lseek(dst.as_fd(), 11, nix::unistd::Whence::SeekSet).unwrap();
+                let mut steps = Vec::new();
+                if interrupted {
+                    steps.push((0, len as usize, Err(nix::errno::Errno::EINTR)));
+                }
+                steps.push((0, len as usize, Err(nix::errno::Errno::EPERM)));
+                let copied = copies_with_kernel_results(&src, &dst, len, &steps, |_| {}).unwrap();
+                let expected_len = len.min(contents.len() as u64);
+                assert_eq!(copied, expected_len);
+                assert_eq!(
+                    std::fs::read(tmp.path().join("dst")).unwrap(),
+                    &contents[..expected_len as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn propagates_permission_errors_after_partial_kernel_copy() {
+        for interrupted in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let contents = b"0123456789abcdef";
+            let mut src = make_file(tmp.path(), "src");
+            src.write_all(contents).unwrap();
+            let dst = make_file(tmp.path(), "dst");
+            let mut steps = vec![(0, 16, Ok(8))];
+            if interrupted {
+                steps.push((8, 8, Err(nix::errno::Errno::EINTR)));
+            }
+            steps.push((8, 8, Err(nix::errno::Errno::EPERM)));
+            let error = copies_with_kernel_results(&src, &dst, 16, &steps, |_| {}).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            assert_eq!(
+                std::fs::read(tmp.path().join("dst")).unwrap(),
+                &contents[..8]
+            );
+        }
+    }
+
+    #[test]
+    fn propagates_fallback_errors_after_initial_kernel_permission_denial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = make_file(tmp.path(), "src");
+        src.write_all(b"0123456789abcdef").unwrap();
+        drop(make_file(tmp.path(), "dst"));
+        let dst = File::open(tmp.path().join("dst")).unwrap();
+        let error = copies_with_kernel_results(
+            &src,
+            &dst,
+            16,
+            &[(0, 16, Err(nix::errno::Errno::EPERM))],
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(dst.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rejects_kernel_copy_counts_larger_than_remaining() {
+        for prefix in [0, 8] {
+            let remaining = 16 - prefix;
+            for reported in [remaining + 1, usize::MAX] {
+                let tmp = tempfile::tempdir().unwrap();
+                let contents = b"0123456789abcdef";
+                let mut src = make_file(tmp.path(), "src");
+                src.write_all(contents).unwrap();
+                let dst = make_file(tmp.path(), "dst");
+                let mut steps = Vec::new();
+                if prefix != 0 {
+                    steps.push((0, 16, Ok(prefix)));
+                }
+                steps.push((prefix as i64, remaining, Ok(reported)));
+                let error = copies_with_kernel_results(&src, &dst, 16, &steps, |_| {}).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+                assert_eq!(
+                    std::fs::read(tmp.path().join("dst")).unwrap(),
+                    &contents[..prefix]
+                );
+            }
+        }
     }
 
     #[test]
@@ -455,7 +562,8 @@ mod tests {
                 16,
                 &[(0, 16, Ok(8)), (8, 8, outcome)],
                 |_| {},
-            );
+            )
+            .unwrap();
             assert_eq!(copied, contents.len() as u64);
             assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
         }
@@ -479,7 +587,8 @@ mod tests {
                         src.set_len(final_len).unwrap();
                     }
                 },
-            );
+            )
+            .unwrap();
             assert_eq!(copied, final_len);
             assert_eq!(dst.metadata().unwrap().len(), final_len);
             assert_eq!(
@@ -506,7 +615,8 @@ mod tests {
                 (8, 8, Ok(8)),
             ],
             |_| {},
-        );
+        )
+        .unwrap();
         assert_eq!(copied, contents.len() as u64);
         assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
     }
@@ -569,6 +679,37 @@ mod tests {
         let dst = crate::testutils::InterruptedFile::new(dst);
         copy_data_extent(&src, &dst, 0, contents.len() as u64, &mut [0; 8]).unwrap();
         assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+    }
+
+    #[test]
+    fn does_not_pad_past_read_eof_when_seek_reports_a_larger_size() {
+        for start in [0, 3] {
+            for sparse in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let contents = b"short";
+                let mut src = make_file(tmp.path(), "src");
+                src.write_all(contents).unwrap();
+                let mut dst = make_file(tmp.path(), "dst");
+                dst.write_all(&contents[..start as usize]).unwrap();
+                // model regular virtual files whose advertised extents exceed readable data.
+                let copied =
+                    copy_sparse_fallback_with_seek(
+                        &src,
+                        &dst,
+                        start,
+                        16,
+                        |_, whence| match whence {
+                            nix::unistd::Whence::SeekData if sparse => Ok(start as libc::off_t),
+                            nix::unistd::Whence::SeekData => Err(nix::errno::Errno::EOPNOTSUPP),
+                            nix::unistd::Whence::SeekHole | nix::unistd::Whence::SeekEnd => Ok(16),
+                            _ => unreachable!(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(copied, contents.len() as u64);
+                assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+            }
+        }
     }
 
     #[test]
@@ -685,7 +826,8 @@ mod tests {
                 (4096, logical as usize - 4096, Err(nix::errno::Errno::EXDEV)),
             ],
             |_| {},
-        );
+        )
+        .unwrap();
         assert_eq!(copied, logical);
         assert_eq!(dst.metadata().unwrap().len(), logical);
         assert_eq!(
