@@ -1,7 +1,6 @@
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -169,7 +168,7 @@ async fn restore_retained_dir(
 /// and fail closed (ELOOP/ENOTDIR) rather than descending the link, and leaf removal uses
 /// `unlinkat` (never follows a symlink). The recursive walk skeleton — enumeration, the
 /// leaf-permit lifecycle, spawning, the single drop-before-recurse site, and the error fold —
-/// lives in the generic [`crate::walk_driver`]; this module supplies the remove visitor.
+/// lives in the generic `walk_driver`; this module supplies the remove visitor.
 #[instrument(skip(prog_track, settings))]
 pub async fn rm(
     prog_track: &'static progress::Progress,
@@ -254,23 +253,19 @@ pub async fn rm(
     };
     let name = operand.name.as_os_str();
     let path = operand.display.as_path();
-    // the root entry's owned context: rel_path/filter_path empty (the root), real_path = the
-    // operand. rm has no delegated subtree, so `filter_path == rel_path`. The root is processed
-    // exactly like a nested child via `process_admitted_entry`, transferring the root
-    // classification and admission acquired during setup.
+    // the root context starts with an empty logical path and the operand as its display path
+    // the root is processed like a nested child via `process_admitted_entry`, transferring
+    // classification and admission acquired during setup
     let visitor = Arc::new(RmVisitor {
         prog_track,
         settings: settings.clone(),
     });
-    let root_cx = EntryCx {
-        parent: Arc::clone(&parent),
-        name: name.to_owned(),
-        rel_path: PathBuf::new(),
-        filter_path: PathBuf::new(),
-        real_path: path.to_path_buf(),
-        dry_run: settings.dry_run.is_some(),
+    let root_cx = EntryCx::root(
+        Arc::clone(&parent),
+        name.to_owned(),
+        path.to_path_buf(),
         prog_track,
-    };
+    );
     process_admitted_entry(visitor, root_cx, (), entry).await // rm has no second tree → root context `()`
 }
 
@@ -287,16 +282,16 @@ pub async fn rm(
 ///
 /// The entry is classified via `parent.child(name)` (`O_PATH|O_NOFOLLOW`, so a symlink is
 /// classified as a symlink, never followed) and then removed through the same fd-relative remove
-/// machinery (driven by [`crate::walk_driver::process_entry`]): leaves via `unlinkat`, directories
+/// machinery (driven by `walk_driver::process_entry`): leaves via `unlinkat`, directories
 /// by recursing with `O_NOFOLLOW|O_DIRECTORY` descent and fd-pinned permission state. A privileged
 /// caller therefore cannot be redirected by a concurrent symlink swap of `name` into deleting a
 /// tree outside the directory it holds.
 ///
-/// `rel_path` is the entry's path relative to the mirror/destination root: seeded as the root
-/// entry's `rel_path`/`filter_path`/`real_path`, it both anchors include/exclude filter matching
-/// against the entry's destination-root-relative path and reconstructs the entry's display path for
-/// diagnostics / dry-run output. The caller is responsible for the top-level decision on `name`
-/// (keep-set membership, exclude-protection, or overwrite policy); this only removes the subtree.
+/// `rel_path` seeds both logical and display paths. Pruning supplies the entry's mirror-relative
+/// path to preserve the include/exclude namespace. Overwrite removal supplies the full destination
+/// display path and disables filtering. Neither form is opened by path. The caller owns the
+/// top-level decision on `name` (keep-set membership, exclude protection, or overwrite policy);
+/// this only removes the subtree.
 pub async fn rm_child(
     prog_track: &'static progress::Progress,
     parent: &Arc<Dir>,
@@ -373,25 +368,18 @@ async fn rm_child_with_source(
     settings: &Settings,
     source: RmChildSource,
 ) -> Result<Summary, Error> {
-    // build the child's owned context rooted at `rel_path`: the display path and the filter path
-    // then each equal `rel_path` (the destination-root-relative path), anchoring include/exclude
-    // matching against the entry's full root-relative path, and each descendant extends it by one
-    // component (exactly the bare-roots behavior the old `WalkRoots { operand: "", filter: "" }`
-    // produced via `operand.join(rel_path)`). these paths are pure display/filter strings — they
-    // are never opened, so there is no dst path for an attacker to redirect.
+    // pruning passes a mirror-relative seed; unfiltered overwrite passes a full display path
+    // both coordinates start from this one seed and are never used to open a removal target
     let visitor = Arc::new(RmVisitor {
         prog_track,
         settings: settings.clone(),
     });
-    let root_cx = EntryCx {
-        parent: Arc::clone(parent),
-        name: name.to_owned(),
-        rel_path: rel_path.to_path_buf(),
-        filter_path: rel_path.to_path_buf(),
-        real_path: rel_path.to_path_buf(),
-        dry_run: settings.dry_run.is_some(),
+    let root_cx = EntryCx::seeded(
+        Arc::clone(parent),
+        name.to_owned(),
+        rel_path.to_path_buf(),
         prog_track,
-    };
+    );
     match source {
         RmChildSource::Unclassified(admission) => {
             process_entry(visitor, root_cx, (), admission).await
@@ -654,9 +642,10 @@ impl WalkVisitor for RmVisitor {
         // pattern (it was entered only to search for matching content). `dir_post` combines this
         // with "nothing was removed". exclude-only filters never produce traversed-only directories
         // because `directly_matches_include` returns true when no includes exist.
-        let matches_no_include = settings.filter.as_ref().is_some_and(|f| {
-            f.has_includes() && !f.directly_matches_include(&cx.filter_path, true)
-        });
+        let matches_no_include = settings
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.has_includes() && !f.directly_matches_include(&cx.rel_path, true));
         // when the directory lacks owner write/execute we relax it so its contents can be cleared.
         // the relax goes through the directory's own `O_PATH` handle (via /proc), which works even
         // on a 0000-mode dir a non-root owner cannot open O_RDONLY — so it must happen BEFORE
@@ -1491,15 +1480,12 @@ mod tests {
                 prog_track: &PROGRESS,
                 settings,
             });
-            let root_cx = EntryCx {
-                parent: Arc::clone(&target_dir),
-                name: std::ffi::OsString::from("target"),
-                rel_path: std::path::PathBuf::new(),
-                filter_path: std::path::PathBuf::new(),
-                real_path: target.clone(),
-                dry_run: true,
-                prog_track: &PROGRESS,
-            };
+            let root_cx = EntryCx::root(
+                Arc::clone(&target_dir),
+                std::ffi::OsString::from("target"),
+                target.clone(),
+                &PROGRESS,
+            );
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(20),
@@ -2289,15 +2275,12 @@ mod tests {
                 prog_track: &PROGRESS,
                 settings: settings.clone(),
             });
-            let cx = EntryCx {
-                parent: Arc::clone(&parent),
-                name: name.to_owned(),
-                rel_path: std::path::PathBuf::new(),
-                filter_path: std::path::PathBuf::new(),
-                real_path: dir_path.clone(),
-                dry_run: false,
-                prog_track: &PROGRESS,
-            };
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                name.to_owned(),
+                dir_path.clone(),
+                &PROGRESS,
+            );
             // pre-acquire the single permit exactly as the spawn loop does for a hinted leaf, and
             // hand it to `process_entry`. The fix drops it before recursing into the directory.
             let permit =
@@ -2358,15 +2341,13 @@ mod tests {
                     dry_run: None,
                 },
             };
-            let cx = EntryCx {
+            let cx = EntryCx::root(
                 parent,
-                name: OsStr::new("entry").to_owned(),
-                rel_path: std::path::PathBuf::from("entry"),
-                filter_path: std::path::PathBuf::from("entry"),
-                real_path: entry.clone(),
-                dry_run: false,
-                prog_track: &RACE_PROGRESS,
-            };
+                OsStr::new("entry").to_owned(),
+                entry.clone(),
+                &RACE_PROGRESS,
+            )
+            .with_relative_path(std::path::PathBuf::from("entry"));
             let error = visitor
                 .visit_leaf(&cx, &(), leaf)
                 .await
@@ -2405,15 +2386,13 @@ mod tests {
                     dry_run: None,
                 },
             };
-            let cx = EntryCx {
+            let cx = EntryCx::root(
                 parent,
-                name: OsStr::new("entry").to_owned(),
-                rel_path: std::path::PathBuf::from("entry"),
-                filter_path: std::path::PathBuf::from("entry"),
-                real_path: entry.clone(),
-                dry_run: false,
-                prog_track: &RACE_PROGRESS,
-            };
+                OsStr::new("entry").to_owned(),
+                entry.clone(),
+                &RACE_PROGRESS,
+            )
+            .with_relative_path(std::path::PathBuf::from("entry"));
             let error = match visitor.dir_pre(&cx, &(), &handle).await {
                 Ok(_) => anyhow::bail!("a replacement passed the directory identity check"),
                 Err(error) => error,
@@ -2448,15 +2427,13 @@ mod tests {
                     dry_run: None,
                 },
             };
-            let cx = EntryCx {
+            let cx = EntryCx::root(
                 parent,
-                name: OsStr::new("entry").to_owned(),
-                rel_path: std::path::PathBuf::from("entry"),
-                filter_path: std::path::PathBuf::from("entry"),
-                real_path: entry.clone(),
-                dry_run: false,
-                prog_track: &RACE_PROGRESS,
-            };
+                OsStr::new("entry").to_owned(),
+                entry.clone(),
+                &RACE_PROGRESS,
+            )
+            .with_relative_path(std::path::PathBuf::from("entry"));
             let state = match visitor.dir_pre(&cx, &(), &handle).await? {
                 DirAction::Descend { state, .. } => state,
                 DirAction::Skip(_) => anyhow::bail!("unfiltered directory fixture was skipped"),
@@ -2497,15 +2474,13 @@ mod tests {
                     dry_run: None,
                 },
             };
-            let cx = EntryCx {
+            let cx = EntryCx::root(
                 parent,
-                name: OsStr::new("entry").to_owned(),
-                rel_path: std::path::PathBuf::from("entry"),
-                filter_path: std::path::PathBuf::from("entry"),
-                real_path: entry.clone(),
-                dry_run: false,
-                prog_track: &RACE_PROGRESS,
-            };
+                OsStr::new("entry").to_owned(),
+                entry.clone(),
+                &RACE_PROGRESS,
+            )
+            .with_relative_path(std::path::PathBuf::from("entry"));
             let state = match visitor.dir_pre(&cx, &(), &handle).await? {
                 DirAction::Descend { state, .. } => state,
                 DirAction::Skip(_) => anyhow::bail!("unfiltered directory fixture was skipped"),
@@ -2590,15 +2565,13 @@ mod tests {
                     dry_run: None,
                 },
             };
-            let cx = EntryCx {
+            let cx = EntryCx::root(
                 parent,
-                name: OsStr::new("entry").to_owned(),
-                rel_path: std::path::PathBuf::from("entry"),
-                filter_path: std::path::PathBuf::from("entry"),
-                real_path: entry.clone(),
-                dry_run: false,
-                prog_track: &RACE_PROGRESS,
-            };
+                OsStr::new("entry").to_owned(),
+                entry.clone(),
+                &RACE_PROGRESS,
+            )
+            .with_relative_path(std::path::PathBuf::from("entry"));
             let state = match visitor.dir_pre(&cx, &(), &handle).await? {
                 DirAction::Descend { state, .. } => state,
                 DirAction::Skip(_) => anyhow::bail!("include-filter ancestor was skipped"),

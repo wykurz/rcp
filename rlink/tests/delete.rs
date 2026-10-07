@@ -225,9 +225,10 @@ fn delete_update_path_include_keeps_matching_descendant() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(
-        dst.join("cache").join("keep.txt").exists(),
-        "an included update-only descendant must be kept, not pruned"
+    assert_eq!(
+        std::fs::read(dst.join("cache").join("keep.txt")).unwrap(),
+        b"x",
+        "an included update-only descendant must be updated, not skipped or pruned"
     );
 }
 
@@ -359,13 +360,9 @@ fn delete_path_include_materializes_nested_symlink() {
     std::fs::create_dir_all(dst.join("dir")).unwrap();
     symlink("../stale", dst.join("dir").join("link")).unwrap();
 
-    // --include 'dir/link' with rlink --delete. Regression: link_internal delegated symlink
-    // materialization through copy::copy with an empty filter_base, so the inner filter re-
-    // evaluated the include against the bare basename "link" (via should_include_root_item)
-    // and skipped the copy. Meanwhile the outer loop had already inserted "link" into the
-    // keep_set, so pruning protected the stale destination. Net: stale dst/dir/link survived
-    // a mirror sync. Fix: pass the entry's logical path as filter_base so the inner check
-    // uses nested semantics and matches `dir/link`.
+    // the delegated symlink must retain rlink's exact admission and bypass root-item filtering
+    // re-filtering by the bare basename would skip materialization while the outer keep-set
+    // protected the stale destination; descendants still inherit the original logical coordinate
     let status = Command::new(rlink_bin())
         .arg("--delete")
         .arg("--include")
