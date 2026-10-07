@@ -87,3 +87,60 @@ async fn copies_without_copy_file_range_when_reflink_is_disabled() {
         assert_eq!(std::fs::read(dst).unwrap(), expected);
     }
 }
+
+#[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot provide strace")]
+#[tokio::test]
+async fn copies_files_without_resetting_their_cursors() {
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("source");
+    let dst = tmp.path().join("destination");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..16 {
+        common::filegen::write_file(&PROGRESS, src.join(format!("file-{i}")), 1024, 1024, 0)
+            .await
+            .unwrap();
+    }
+    let trace_path = tmp.path().join("syscalls");
+    let output = std::process::Command::new("strace")
+        .args(["-f", "-yy", "-e", "trace=lseek,copy_file_range", "-o"])
+        .arg(&trace_path)
+        .arg(assert_cmd::cargo::cargo_bin("rcp"))
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap_or_else(|err| panic!("cannot run strace: {err:#}. Install strace."));
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(
+        output.status.success(),
+        "traced rcp failed: {}\n{}\n{trace}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // -yy identifies regular fixture fds, excluding unrelated directory/runtime seeks.
+    // observing the worker's copy attempt proves that tracing includes its syscalls.
+    assert!(
+        trace.contains("copy_file_range("),
+        "missing copy calls:\n{trace}"
+    );
+    assert!(
+        trace.contains("/source/file-"),
+        "missing fd paths:\n{trace}"
+    );
+    assert!(
+        !trace.lines().any(|line| {
+            line.contains("lseek(")
+                && line.contains("SEEK_SET")
+                && (line.contains("/source/file-") || line.contains("/destination/file-"))
+        }),
+        "copying regular files must not reset their cursors:\n{trace}"
+    );
+    for i in 0..16 {
+        let name = format!("file-{i}");
+        assert_eq!(
+            std::fs::read(dst.join(&name)).unwrap(),
+            std::fs::read(src.join(&name)).unwrap()
+        );
+    }
+}
