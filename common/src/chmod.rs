@@ -1011,7 +1011,7 @@ pub async fn chmod(
 }
 
 /// Build the [`ChmodVisitor`] and process the root entry through the generic
-/// [`crate::walk_driver`] driver. The root is processed exactly like a nested child: classified
+/// `walk_driver` driver. The root is processed exactly like a nested child: classified
 /// authoritatively, then dispatched to `visit_leaf` or `dir_pre`/recurse/`dir_post`.
 async fn run_chmod_root(
     prog_track: &'static Progress,
@@ -1025,17 +1025,13 @@ async fn run_chmod_root(
         prog_track,
         settings: settings.clone(),
     });
-    // the root entry's owned context: rel_path/filter_path empty (the root), real_path = the root
-    // operand. chmod has no filter base (no delegated subtree), so `filter_path == rel_path`.
-    let root_cx = EntryCx {
-        parent: Arc::clone(parent),
-        name: name.to_owned(),
-        rel_path: PathBuf::new(),
-        filter_path: PathBuf::new(),
-        real_path: root.to_path_buf(),
-        dry_run: settings.dry_run.is_some(),
+    // the root starts with an empty logical path and the operand as its display path
+    let root_cx = EntryCx::root(
+        Arc::clone(parent),
+        name.to_owned(),
+        root.to_path_buf(),
         prog_track,
-    };
+    );
     process_entry(visitor, root_cx, (), permit).await // chmod has no second tree → root context `()`
 }
 
@@ -1123,9 +1119,10 @@ impl WalkVisitor for ChmodVisitor {
         // a "traversed-only" dir was entered only because it COULD contain include-matches; it does
         // not directly match an include pattern, so its own mode/owner is left unchanged (mirrors
         // rm.rs) — only directly-selected entries are modified.
-        let traversed_only = self.settings.filter.as_ref().is_some_and(|f| {
-            f.has_includes() && !f.directly_matches_include(&cx.filter_path, true)
-        });
+        let traversed_only =
+            self.settings.filter.as_ref().is_some_and(|f| {
+                f.has_includes() && !f.directly_matches_include(&cx.rel_path, true)
+            });
         let mut base = Summary::default();
         let mut pre_order_error: Option<anyhow::Error> = None;
         // pre-order (default, like `chmod -R`): change the dir BEFORE descending, via the O_PATH
@@ -2058,15 +2055,12 @@ mod tests {
                 prog_track: &PROGRESS,
                 settings: settings_with("g+w", None, None),
             });
-            let cx = EntryCx {
-                parent: Arc::clone(&parent),
-                name: name.to_owned(),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: dir_path.clone(),
-                dry_run: false,
-                prog_track: &PROGRESS,
-            };
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                name.to_owned(),
+                dir_path.clone(),
+                &PROGRESS,
+            );
             let permit =
                 crate::walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File))
                     .await;

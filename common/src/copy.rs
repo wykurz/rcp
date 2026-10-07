@@ -142,7 +142,7 @@ fn skipped_summary_for(kind: EntryKind) -> Summary {
 /// Result of checking if an empty directory should be cleaned up.
 /// Used when filtering is active and a directory we created ended up empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmptyDirAction {
+pub(crate) enum EmptyDirAction {
     /// keep the directory (directly matched or no filter active)
     Keep,
     /// directory was only traversed, remove it
@@ -162,19 +162,20 @@ pub enum EmptyDirAction {
 /// * `filter` - the active filter settings (None means no filtering)
 /// * `we_created_dir` - whether we created this directory (vs it already existed)
 /// * `anything_copied` - whether any content was copied into this directory
-/// * `relative_path` - path relative to the source root (for pattern matching)
-/// * `is_root` - whether this is the root (user-specified) source directory
+/// * `relative_path` - logical filter path (empty only at the user-specified root)
 /// * `is_dry_run` - whether we're in dry-run mode
-pub fn check_empty_dir_cleanup(
+pub(crate) fn check_empty_dir_cleanup(
     filter: Option<&crate::filter::FilterSettings>,
     we_created_dir: bool,
     anything_copied: bool,
     relative_path: &std::path::Path,
-    is_root: bool,
     is_dry_run: bool,
 ) -> EmptyDirAction {
-    // if no filter active or something was copied, keep the directory
-    if filter.is_none() || anything_copied {
+    let Some(filter) = filter else {
+        return EmptyDirAction::Keep;
+    };
+    // if something was copied, keep the directory
+    if anything_copied {
         return EmptyDirAction::Keep;
     }
     // if we didn't create this directory, don't remove it
@@ -182,13 +183,11 @@ pub fn check_empty_dir_cleanup(
         return EmptyDirAction::Keep;
     }
     // never remove the root directory — it's the user-specified source
-    if is_root {
+    if relative_path.as_os_str().is_empty() {
         return EmptyDirAction::Keep;
     }
-    // filter is guaranteed to be Some here (checked above)
-    let f = filter.unwrap();
     // check if directory directly matches include pattern
-    if f.directly_matches_include(relative_path, true) {
+    if filter.directly_matches_include(relative_path, true) {
         return EmptyDirAction::Keep;
     }
     // directory was only traversed for potential matches
@@ -282,7 +281,14 @@ impl std::fmt::Display for Summary {
 }
 
 /// Public entry point for copy operations.
-/// Internally delegates to [`copy_with_filter_base`] with an empty filter base.
+///
+/// The local copy walk is fd-based: the source and destination roots are opened relative to
+/// their parent directories and payload operations use file-descriptor-relative syscalls
+/// (see [`crate::safedir`]). Held parents prevent full-path redirection and contain each by-name
+/// operation to its intended directory. `--dereference` still resolves symlinks by path
+/// (`canonicalize`) and is not hardened. Read-only `--dry-run --ignore-existing` destination
+/// probes also re-resolve paths: default mode may observe a redirected preview, while strict mode
+/// rejects intermediate symlinks via `openat2` and a no-follow final-component probe.
 #[instrument(skip(prog_track, settings, preserve))]
 pub async fn copy(
     prog_track: &'static progress::Progress,
@@ -293,51 +299,17 @@ pub async fn copy(
     is_fresh: bool,
 ) -> Result<Summary, Error> {
     crate::timing_scope!("local.copy")
-        .measure(copy_with_filter_base(
+        .measure(copy_root_admitted(
             prog_track,
             src,
             dst,
             settings,
             preserve,
             is_fresh,
-            std::path::Path::new(""),
+            DeleteScanAnchor::new(dst, std::path::Path::new("")),
+            None,
         ))
         .await
-}
-
-/// Like [`copy`], but treats `src` as living at `filter_base` relative to the original filter
-/// root. Used when `rlink` delegates an update-only entry to `copy`: `--delete` pruning inside
-/// the delegated subtree then matches the include/exclude filter at the entry's true relative
-/// path (e.g. `cache/*.log`) instead of relative to the delegated root.
-///
-/// The local copy walk is fd-based: the source and destination roots are opened relative to
-/// their parent directories and every per-entry operation is performed through
-/// file-descriptor-relative syscalls (see [`crate::safedir`]). The held parents prevent full-path
-/// redirection and contain each by-name operation to its intended directory. `--dereference` is the
-/// one exception — it still resolves symlinks by path (`canonicalize`) and is not hardened.
-#[instrument(skip(prog_track, settings, preserve))]
-#[allow(clippy::too_many_arguments)]
-pub async fn copy_with_filter_base(
-    prog_track: &'static progress::Progress,
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    settings: &Settings,
-    preserve: &preserve::Settings,
-    is_fresh: bool,
-    filter_base: &std::path::Path,
-) -> Result<Summary, Error> {
-    copy_with_filter_base_admitted(
-        prog_track,
-        src,
-        dst,
-        settings,
-        preserve,
-        is_fresh,
-        filter_base,
-        DeleteScanAnchor::new(dst, std::path::Path::new("")),
-        None,
-    )
-    .await
 }
 
 /// Path-based root setup with transferable leaf admission.
@@ -348,14 +320,13 @@ pub async fn copy_with_filter_base(
 /// releases the guard if authoritative target classification proves it is a directory.
 #[instrument(skip(prog_track, settings, preserve, open_file_guard))]
 #[allow(clippy::too_many_arguments)]
-async fn copy_with_filter_base_admitted(
+async fn copy_root_admitted(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    filter_base: &std::path::Path,
     delete_scan_anchor: DeleteScanAnchor,
     open_file_guard: Option<throttle::OpenFileGuard>,
 ) -> Result<Summary, Error> {
@@ -468,14 +439,7 @@ async fn copy_with_filter_base_admitted(
                     )
                 }
             };
-            // for a delegated subtree (non-empty filter_base) the source is not the true filter
-            // root, so match it at its logical path with nested semantics; for a normal copy use
-            // root-item semantics (anchored patterns don't apply to the root itself).
-            let result = if filter_base.as_os_str().is_empty() {
-                filter.should_include_root_item(std::path::Path::new(src_name), is_dir)
-            } else {
-                filter.should_include(filter_base, is_dir)
-            };
+            let result = filter.should_include_root_item(std::path::Path::new(src_name), is_dir);
             match result {
                 crate::filter::FilterResult::Included => {}
                 result => {
@@ -574,7 +538,6 @@ async fn copy_with_filter_base_admitted(
         &src_operand.name,
         &src_operand.display,
         dst,
-        filter_base,
         settings,
         preserve,
         is_fresh,
@@ -586,17 +549,22 @@ async fn copy_with_filter_base_admitted(
 
 /// Classification state accepted by copy's fd-relative root boundary.
 ///
-/// An admitted entry retains the exact handle whose type selected the copy action, but its root
-/// filter decision is still pending. A filtered entry is rlink's exact handle after filtering in
+/// Ordinary roots classify under admission; tests can also supply an exact admitted root whose
+/// root filter decision is pending. A filtered entry is rlink's exact handle after filtering in
 /// its logical namespace, so the shared driver must consume it directly rather than re-filter it
 /// under a delegated physical basename. Regular-file and directory payload opens remain fd-relative
 /// by parent and name, preserving their existing same-type replacement semantics; symlink payload
 /// stays pinned to the admitted handle. Ordinary unclassified entries retain the existing
-/// classify-under-admission path.
-pub(crate) enum CopyEntryAdmission {
+/// classify-under-admission path. Only the already-filtered variant carries a delegated logical
+/// base: ordinary roots always have empty coordinates and use root-item filtering.
+enum CopyEntryAdmission {
     Unclassified(EntryAdmission),
+    #[cfg(test)]
     Admitted(AdmittedEntry),
-    Filtered(AdmittedEntry),
+    Filtered {
+        entry: AdmittedEntry,
+        filter_base: PathBuf,
+    },
 }
 
 impl From<EntryAdmission> for CopyEntryAdmission {
@@ -605,25 +573,22 @@ impl From<EntryAdmission> for CopyEntryAdmission {
     }
 }
 
-impl From<AdmittedEntry> for CopyEntryAdmission {
-    fn from(entry: AdmittedEntry) -> Self {
-        Self::Admitted(entry)
-    }
-}
-
 /// Copy a single entry `name` (within `src_parent`) into `dst_parent`, using held directory
-/// handles rather than re-resolving any path. This is the fd-based delegation entry point for
+/// handles for the payload handoff. This is the fd-based delegation entry point for
 /// `rlink`: when an entry must be COPIED rather than hard-linked (a file that changed vs the
 /// update tree, a symlink, a type-mismatch, or an update-only entry), `link` hands its already-open
 /// parent `Dir`s plus the entry `name` here, so the copy inherits the same intermediate-component
-/// TOCTOU safety the link walk has — no path is re-walked from a root.
+/// TOCTOU safety the link walk has. The path-based dereference and read-only preview exceptions
+/// documented on [`copy`] still apply.
 ///
-/// `src_path`/`dst_path` are the entry's reconstructed real paths; they serve as the copy walk's
-/// roots for diagnostics and `--dereference` (`canonicalize`). `filter_base` is the entry's logical
-/// path relative to the original filter root. `delete_scan_anchor` separately carries the held
-/// preview parent or its known absence, so dry-run pruning never derives its trust boundary from
-/// either display or filter paths. `dst_parent` is `None` only in dry-run (no
-/// destination mutation).
+/// `admission` must be the exact entry already filtered by rlink. `src_path` is its source display
+/// path, also used by `--dereference`. `dst_root` is the original rlink destination root, and
+/// `filter_base` is the entry's logical path relative to that root and the original filter root.
+/// A nonempty base must end in `name`; an empty base uses `dst_root`'s basename for the destination.
+/// This entry point always seeds that coordinate and bypasses root filtering. Its descendants use
+/// the same coordinate for destination reconstruction, filtering, and deletion.
+/// `delete_scan_anchor` independently carries the held preview parent or its known absence, so
+/// preview authority never comes from a display or filter path. `dst_parent` is absent only in dry-run.
 #[instrument(skip(prog_track, src_parent, dst_parent, settings, preserve, admission))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_child(
@@ -632,27 +597,31 @@ pub(crate) async fn copy_child(
     dst_parent: Option<&Arc<Dir>>,
     name: &OsStr,
     src_path: &std::path::Path,
-    dst_path: &std::path::Path,
+    dst_root: &std::path::Path,
     filter_base: &std::path::Path,
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
     delete_scan_anchor: DeleteScanAnchor,
-    admission: CopyEntryAdmission,
+    admission: AdmittedEntry,
 ) -> Result<Summary, Error> {
+    // nonempty delegated paths name an entry within the original destination root
+    debug_assert!(filter_base.as_os_str().is_empty() || filter_base.file_name() == Some(name));
     run_copy_root(
         prog_track,
         src_parent,
         dst_parent.map(Arc::clone),
         name,
         src_path,
-        dst_path,
-        filter_base,
+        dst_root,
         settings,
         preserve,
         is_fresh,
         delete_scan_anchor,
-        admission,
+        CopyEntryAdmission::Filtered {
+            entry: admission,
+            filter_base: filter_base.to_path_buf(),
+        },
     )
     .await
 }
@@ -764,8 +733,6 @@ struct CopyDirState {
     /// applied post-order alongside it. `None` when `d:acl` was not requested (so nothing was read)
     /// or in dry-run (nothing is applied).
     src_acls: Option<safedir::Acls>,
-    /// Whether this is the user-specified root directory (never empty-dir-cleaned up).
-    is_root: bool,
     /// The `directories_created`/`directories_unchanged` contribution from resolving this
     /// directory's destination, folded into the final summary.
     base: Summary,
@@ -774,7 +741,7 @@ struct CopyDirState {
 impl CopyVisitor {
     /// The destination real path for the entry described by `cx` (`dst_root.join(rel_path)`, or the
     /// root verbatim when `rel_path` is empty — joining an empty `rel_path` would append a trailing
-    /// separator that `canonicalize`/ENOTDIR-sensitive paths reject). Mirrors `copy_internal`.
+    /// separator that `canonicalize`/ENOTDIR-sensitive paths reject).
     fn dst_path_for(&self, cx: &EntryCx) -> PathBuf {
         if cx.rel_path.as_os_str().is_empty() {
             self.dst_root.clone()
@@ -785,10 +752,10 @@ impl CopyVisitor {
 
     /// The destination entry's name within its parent. For nested entries this equals the source
     /// `cx.name`, but for the root the source and destination basenames may differ (e.g. copying
-    /// `foo` → `bar`), so the root's destination name comes from `dst_root`. Mirrors `copy_internal`.
+    /// `foo` → `bar`), so the root's destination name comes from `dst_root`.
     // copy's `Error` carries a large `Summary`; Clippy's `result_large_err` measures only the
     // `Err` type, independently of the borrowed success value. the error arm is
-    // unreachable in practice (`copy_with_filter_base` pre-validates the root's file name and a
+    // unreachable in practice (`copy_root_admitted` pre-validates the root's file name and a
     // delegated `copy_child` root path always has one) — keep it as defense-in-depth.
     #[allow(clippy::result_large_err)]
     fn dst_name_for<'a>(&'a self, cx: &'a EntryCx) -> Result<&'a OsStr, Error> {
@@ -852,7 +819,6 @@ impl CopyVisitor {
             src_acls,
             we_created,
             reused_lock,
-            is_root,
         } = fin;
         let src_path = &cx.real_path;
         let dst_path = self.dst_path_for(cx);
@@ -870,8 +836,7 @@ impl CopyVisitor {
             self.settings.filter.as_ref(),
             we_created,
             anything_copied,
-            &cx.filter_path,
-            is_root,
+            &cx.rel_path,
             self.settings.dry_run.is_some(),
         ) {
             EmptyDirAction::Keep => { /* proceed with metadata application */ }
@@ -989,7 +954,6 @@ struct FinalizeDir {
     src_acls: Option<safedir::Acls>,
     we_created: bool,
     reused_lock: Option<safedir::ReusedDirLock>,
-    is_root: bool,
 }
 
 async fn filter_and_process_admitted_root(
@@ -1000,14 +964,10 @@ async fn filter_and_process_admitted_root(
     filter: &crate::filter::FilterSettings,
 ) -> Result<Summary, Error> {
     let kind = entry.kind();
-    let filter_result = if root_cx.filter_path.as_os_str().is_empty() {
-        filter.should_include_root_item(
-            std::path::Path::new(root_cx.name.as_os_str()),
-            kind == EntryKind::Dir,
-        )
-    } else {
-        filter.should_include(&root_cx.filter_path, kind == EntryKind::Dir)
-    };
+    let filter_result = filter.should_include_root_item(
+        std::path::Path::new(root_cx.name.as_os_str()),
+        kind == EntryKind::Dir,
+    );
     if !matches!(filter_result, crate::filter::FilterResult::Included) {
         if let Some(mode) = visitor.settings.dry_run {
             crate::dry_run::report_skip(
@@ -1024,9 +984,9 @@ async fn filter_and_process_admitted_root(
 }
 
 /// Build the [`CopyVisitor`] for one copy operation and process the root entry through the generic
-/// driver. Shared by [`copy_with_filter_base`] (which acquires root admission before parent setup)
-/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an unclassified,
-/// admitted, or already-filtered exact entry). The root is processed exactly like a nested child via
+/// driver. Shared by [`copy`] (which acquires root admission before parent setup)
+/// and [`copy_child`] (rlink's already-filtered fd-based delegation entry point).
+/// The root is processed exactly like a nested child via
 /// [`process_entry`] or [`process_admitted_entry`], then dispatched to `visit_leaf`
 /// (file/symlink/special) or `dir_pre`/recurse/`dir_post` (directory).
 #[allow(clippy::too_many_arguments)]
@@ -1037,7 +997,6 @@ async fn run_copy_root(
     name: &OsStr,
     src_root: &std::path::Path,
     dst_root: &std::path::Path,
-    filter_base: &std::path::Path,
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
@@ -1053,23 +1012,14 @@ async fn run_copy_root(
         dst_parent,
         root_is_fresh: is_fresh,
     });
-    // the root entry's owned context: parent = the hardened source parent, name = the source root
-    // basename, rel_path = "" (the root), real_path = the source root. `filter_path` is seeded with
-    // `filter_base` so that inside a delegated subtree (rlink handing an update-only/type-changed
-    // subtree to `copy_child`, rooted BELOW the original filter root) every descendant's filter
-    // decision is evaluated at its true logical path (e.g. `cache/keep.txt`, not the bare basename
-    // relative to the delegated root). For a normal `copy()` (`filter_base` empty) this is "", so
-    // `filter_path == rel_path` throughout. dry_run is the destination's None signal carried on the
-    // context for the driver's bookkeeping.
-    let root_cx = EntryCx {
-        parent: Arc::clone(src_parent),
-        name: name.to_owned(),
-        rel_path: PathBuf::new(),
-        filter_path: filter_base.to_path_buf(),
-        real_path: src_root.to_path_buf(),
-        dry_run: settings.dry_run.is_some(),
+    // ordinary roots always use root-item filtering; only the already-filtered delegated
+    // variant below seeds the shared filtering and destination coordinate
+    let root_cx = EntryCx::root(
+        Arc::clone(src_parent),
+        name.to_owned(),
+        src_root.to_path_buf(),
         prog_track,
-    };
+    );
     let root_ctx = visitor.root_dir_context();
     match admission {
         CopyEntryAdmission::Unclassified(admission) => {
@@ -1094,6 +1044,7 @@ async fn run_copy_root(
             }
             process_entry(visitor, root_cx, root_ctx, admission).await
         }
+        #[cfg(test)]
         CopyEntryAdmission::Admitted(entry) => {
             if let Some(filter) = visitor.filter().cloned() {
                 return filter_and_process_admitted_root(
@@ -1103,8 +1054,14 @@ async fn run_copy_root(
             }
             process_admitted_entry(visitor, root_cx, root_ctx, entry).await
         }
-        CopyEntryAdmission::Filtered(entry) => {
-            process_admitted_entry(visitor, root_cx, root_ctx, entry).await
+        CopyEntryAdmission::Filtered { entry, filter_base } => {
+            process_admitted_entry(
+                visitor,
+                root_cx.with_relative_path(filter_base),
+                root_ctx,
+                entry,
+            )
+            .await
         }
     }
 }
@@ -1182,22 +1139,20 @@ impl WalkVisitor for CopyVisitor {
         let dst_name = self.dst_name_for(cx)?;
         let is_fresh = parent_ctx.is_fresh;
         // --dereference: resolve a symlink to its target by path and copy that instead. this is the
-        // one path-based branch we intentionally keep (hardening -L is out of scope). transfer the
+        // path-based payload branch we intentionally keep (hardening -L is out of scope). transfer
         // provisional admission into the target's root walk; that walk releases it if authoritative
-        // classification proves the target is a directory.
+        // classification proves the target is a directory
         if self.settings.dereference && leaf.kind() == EntryKind::Symlink {
             let open_file_guard = match leaf.into_permit() {
                 Some(permit) => permit.into_open_file(),
                 None => throttle::open_file_permit().await,
             };
-            // invariant: only the explicit `--dereference` path may re-resolve an entry by path
-            // (`canonicalize`). the non-dereference walk is fully fd-based and must never reach
-            // here. a future refactor that wires `dereference == false` into this branch trips in
-            // debug/tests.
+            // canonicalizing a payload target requires explicit dereferencing; read-only
+            // destination preview probes elsewhere do not enter this payload branch
             debug_assert!(
                 self.settings.dereference,
-                "canonicalize reached with dereference == false; the non-dereference copy path \
-                 must never re-resolve a path"
+                "canonicalize reached with dereference == false; payload target resolution \
+                 requires explicit dereferencing"
             );
             let link = crate::walk::run_metadata_probed(
                 congestion::Side::Source,
@@ -1207,14 +1162,13 @@ impl WalkVisitor for CopyVisitor {
             .await
             .with_context(|| format!("failed reading src symlink {:?}", src_path))
             .map_err(|err| Error::new(err, Default::default()))?;
-            return copy_with_filter_base_admitted(
+            return copy_root_admitted(
                 self.prog_track,
                 &link,
                 &dst_path,
                 &self.settings,
                 &self.preserve,
                 is_fresh,
-                std::path::Path::new(""),
                 parent_ctx.delete_scan_parent.clone(),
                 Some(open_file_guard),
             )
@@ -1295,7 +1249,6 @@ impl WalkVisitor for CopyVisitor {
         let src_path = &cx.real_path;
         let dst_path = self.dst_path_for(cx);
         let dst_name = self.dst_name_for(cx)?.to_owned();
-        let is_root = cx.filter_path.as_os_str().is_empty();
         let is_fresh = parent_ctx.is_fresh;
         // open the source directory's contents (O_NOFOLLOW) — this is the `dir` the driver walks.
         let src_dir = src_parent
@@ -1405,7 +1358,6 @@ impl WalkVisitor for CopyVisitor {
                     src_meta,
                     // dry-run applies no metadata at all, so it never reads ACLs either.
                     src_acls: None,
-                    is_root,
                     base,
                 },
             });
@@ -1464,7 +1416,6 @@ impl WalkVisitor for CopyVisitor {
                 reused_lock,
                 src_meta,
                 src_acls,
-                is_root,
                 base,
             },
         })
@@ -1485,7 +1436,6 @@ impl WalkVisitor for CopyVisitor {
             reused_lock,
             src_meta,
             src_acls,
-            is_root,
             base,
         } = state;
         // whether any child failed (non-fail-early: the driver still calls dir_post on error so we
@@ -1510,7 +1460,7 @@ impl WalkVisitor for CopyVisitor {
                     )
                 {
                     match self
-                        .prune_finished_dir(&mut summary, &keep_set, prune_dir, &cx.filter_path)
+                        .prune_finished_dir(&mut summary, &keep_set, prune_dir, &cx.rel_path)
                         .await
                     {
                         Ok(()) => {}
@@ -1538,7 +1488,6 @@ impl WalkVisitor for CopyVisitor {
                 src_acls,
                 we_created,
                 reused_lock,
-                is_root,
             },
             cx,
         )
@@ -2653,6 +2602,66 @@ mod copy_tests {
     }
 
     #[tokio::test]
+    async fn delegated_destination_paths_keep_original_root_and_logical_seed() -> anyhow::Result<()>
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = testutils::create_temp_dir().await?;
+        let parent = Arc::new(Dir::open_root_dir(&temp, false, congestion::Side::Source).await?);
+        let visitor = CopyVisitor {
+            prog_track: &PROGRESS,
+            dst_root: PathBuf::from("destination//./renamed"),
+            delete_scan_anchor: DeleteScanAnchor::parent(None),
+            settings: settings_with_delete(None),
+            preserve: *NO_PRESERVE_SETTINGS,
+            dst_parent: None,
+            root_is_fresh: false,
+        };
+        for physical in ["source-root", "update-root"] {
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                OsStr::new(physical).to_owned(),
+                PathBuf::from(physical),
+                &PROGRESS,
+            );
+            assert_eq!(
+                visitor.dst_path_for(&cx).as_os_str().as_bytes(),
+                b"destination//./renamed"
+            );
+            assert_eq!(visitor.dst_name_for(&cx)?, OsStr::new("renamed"));
+        }
+        for (relative, name, expected) in [
+            (
+                b"cache\xfe".as_slice(),
+                b"cache\xfe".as_slice(),
+                b"destination//./renamed/cache\xfe".as_slice(),
+            ),
+            (
+                b"cache\xfe/branch\xff",
+                b"branch\xff",
+                b"destination//./renamed/cache\xfe/branch\xff",
+            ),
+            (
+                b"cache\xfe/branch\xff/leaf\xfd",
+                b"leaf\xfd",
+                b"destination//./renamed/cache\xfe/branch\xff/leaf\xfd",
+            ),
+        ] {
+            let relative = std::path::Path::new(OsStr::from_bytes(relative));
+            let name = OsStr::from_bytes(name);
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                name.to_owned(),
+                PathBuf::from("update//./tree").join(relative),
+                &PROGRESS,
+            )
+            .with_relative_path(relative.to_path_buf());
+            assert_eq!(visitor.dst_path_for(&cx).as_os_str().as_bytes(), expected);
+            assert_eq!(visitor.dst_name_for(&cx)?, name);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     #[traced_test]
     async fn delete_protects_skipped_special_name() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
@@ -3215,8 +3224,8 @@ mod copy_tests {
                 });
                 let entry = if through_parent { &src } else { &sub };
                 let relative = entry.strip_prefix(&src)?;
-                let cx = EntryCx {
-                    parent: Arc::new(
+                let cx = EntryCx::root(
+                    Arc::new(
                         Dir::open_root_dir(
                             entry.parent().unwrap(),
                             false,
@@ -3224,13 +3233,11 @@ mod copy_tests {
                         )
                         .await?,
                     ),
-                    name: entry.file_name().unwrap().to_owned(),
-                    rel_path: relative.to_owned(),
-                    filter_path: relative.to_owned(),
-                    real_path: entry.clone(),
-                    dry_run: true,
-                    prog_track: &PROGRESS,
-                };
+                    entry.file_name().unwrap().to_owned(),
+                    entry.clone(),
+                    &PROGRESS,
+                )
+                .with_relative_path(relative.to_owned());
                 let context = visitor.root_dir_context();
                 let error = process_entry(visitor, cx, context, None).await.unwrap_err();
                 assert_eq!(error.summary.directories_created, 0);
@@ -4807,7 +4814,7 @@ mod copy_tests {
         fn test_check_empty_dir_cleanup_no_filter() {
             // when no filter, always keep
             assert_eq!(
-                check_empty_dir_cleanup(None, true, false, Path::new("any"), false, false),
+                check_empty_dir_cleanup(None, true, false, Path::new("any"), false),
                 EmptyDirAction::Keep
             );
         }
@@ -4817,7 +4824,7 @@ mod copy_tests {
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(Some(&filter), true, true, Path::new("any"), false, false),
+                check_empty_dir_cleanup(Some(&filter), true, true, Path::new("any"), false),
                 EmptyDirAction::Keep
             );
         }
@@ -4827,14 +4834,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(
-                    Some(&filter),
-                    false,
-                    false,
-                    Path::new("any"),
-                    false,
-                    false
-                ),
+                check_empty_dir_cleanup(Some(&filter), false, false, Path::new("any"), false),
                 EmptyDirAction::Keep
             );
         }
@@ -4844,14 +4844,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("target/").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(
-                    Some(&filter),
-                    true,
-                    false,
-                    Path::new("target"),
-                    false,
-                    false
-                ),
+                check_empty_dir_cleanup(Some(&filter), true, false, Path::new("target"), false),
                 EmptyDirAction::Keep
             );
         }
@@ -4861,7 +4854,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(Some(&filter), true, false, Path::new("src"), false, false),
+                check_empty_dir_cleanup(Some(&filter), true, false, Path::new("src"), false),
                 EmptyDirAction::Remove
             );
         }
@@ -4871,7 +4864,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(Some(&filter), true, false, Path::new("src"), false, true),
+                check_empty_dir_cleanup(Some(&filter), true, false, Path::new("src"), true),
                 EmptyDirAction::DryRunSkip
             );
         }
@@ -4881,7 +4874,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(Some(&filter), true, false, Path::new(""), true, false),
+                check_empty_dir_cleanup(Some(&filter), true, false, Path::new(""), false),
                 EmptyDirAction::Keep
             );
         }
@@ -4891,7 +4884,7 @@ mod copy_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
-                check_empty_dir_cleanup(Some(&filter), true, false, Path::new(""), true, true),
+                check_empty_dir_cleanup(Some(&filter), true, false, Path::new(""), true),
                 EmptyDirAction::Keep
             );
         }
@@ -5152,6 +5145,48 @@ mod copy_tests {
             );
             Ok(())
         }
+        #[tokio::test]
+        async fn anchored_nested_include_preserves_selection_and_dry_run_counts()
+        -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            tokio::fs::create_dir_all(src.join("sub")).await?;
+            tokio::fs::write(src.join("keep.txt"), b"root decoy").await?;
+            tokio::fs::write(src.join("sub/keep.txt"), b"nested match").await?;
+            tokio::fs::write(src.join("sub/drop.txt"), b"nested decoy").await?;
+            let mut filter = FilterSettings::new();
+            filter.add_include("/sub/keep.txt")?;
+            for dry_run in [false, true] {
+                let dst = root.join(if dry_run { "preview" } else { "destination" });
+                let mut settings = settings_with_delete(None);
+                settings.filter = Some(filter.clone());
+                settings.dry_run = dry_run.then_some(DryRunMode::Brief);
+                let summary = copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await?;
+                assert_eq!(summary.files_copied, 1);
+                assert_eq!(summary.files_skipped, 2);
+                assert_eq!(summary.directories_created, 2);
+                if dry_run {
+                    assert!(!dst.exists());
+                } else {
+                    assert_eq!(
+                        tokio::fs::read(dst.join("sub/keep.txt")).await?,
+                        b"nested match"
+                    );
+                    assert!(!dst.join("keep.txt").exists());
+                    assert!(!dst.join("sub/drop.txt").exists());
+                }
+            }
+            Ok(())
+        }
+
         /// Test that anchored patterns (starting with /) match only at root.
         #[tokio::test]
         #[traced_test]
@@ -5401,7 +5436,6 @@ mod copy_tests {
                     std::ffi::OsStr::new("source"),
                     &src,
                     &dst,
-                    std::path::Path::new(""),
                     &settings,
                     &NO_PRESERVE_SETTINGS,
                     false,
@@ -5471,15 +5505,12 @@ mod copy_tests {
                     dst_parent: None,
                     root_is_fresh: false,
                 });
-                let root_cx = EntryCx {
-                    parent: Arc::clone(&src_dir),
-                    name: std::ffi::OsString::from("source"),
-                    rel_path: PathBuf::new(),
-                    filter_path: PathBuf::new(),
-                    real_path: src.clone(),
-                    dry_run: false,
-                    prog_track: &PROGRESS,
-                };
+                let root_cx = EntryCx::root(
+                    Arc::clone(&src_dir),
+                    std::ffi::OsString::from("source"),
+                    src.clone(),
+                    &PROGRESS,
+                );
                 let child_ctx = CopyDirContext {
                     delete_scan_parent: DeleteScanAnchor::parent(None),
                     dst_dir: Some(Arc::clone(&dst_dir)),
@@ -5553,15 +5584,12 @@ mod copy_tests {
                 dst_parent: None,
                 root_is_fresh: false,
             });
-            let root_cx = EntryCx {
-                parent: Arc::clone(&src_dir),
-                name: std::ffi::OsString::from("source"),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: src.clone(),
-                dry_run: false,
-                prog_track: &PROGRESS,
-            };
+            let root_cx = EntryCx::root(
+                Arc::clone(&src_dir),
+                std::ffi::OsString::from("source"),
+                src.clone(),
+                &PROGRESS,
+            );
             let child_ctx = CopyDirContext {
                 delete_scan_parent: DeleteScanAnchor::parent(None),
                 dst_dir: Some(Arc::clone(&dst_dir)),
@@ -5591,7 +5619,7 @@ mod copy_tests {
                         .into_ready(&dst)
                         .expect("delete traversal completed"),
                         &dst_dir,
-                        &root_cx.filter_path,
+                        &root_cx.rel_path,
                     )
                     .await?;
                 Ok::<_, anyhow::Error>((summary, processed))
@@ -5648,15 +5676,12 @@ mod copy_tests {
                 dst_parent: None,
                 root_is_fresh: false,
             });
-            let root_cx = EntryCx {
-                parent: Arc::clone(&src_dir),
-                name: std::ffi::OsString::from("source"),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: src.clone(),
-                dry_run: true,
-                prog_track: &PROGRESS,
-            };
+            let root_cx = EntryCx::root(
+                Arc::clone(&src_dir),
+                std::ffi::OsString::from("source"),
+                src.clone(),
+                &PROGRESS,
+            );
             let (summary, processed) = run_with_open_file_cleanup(
                 &admission,
                 crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
@@ -6606,15 +6631,12 @@ mod copy_tests {
                 dst_parent: Some(Arc::clone(&dst_parent)),
                 root_is_fresh: true,
             };
-            let cx = EntryCx {
-                parent: src_parent,
-                name: src_name.to_owned(),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: root.join(src_name),
-                dry_run: false,
-                prog_track: &PROGRESS,
-            };
+            let cx = EntryCx::root(
+                src_parent,
+                src_name.to_owned(),
+                root.join(src_name),
+                &PROGRESS,
+            );
             let parent_ctx = CopyDirContext {
                 delete_scan_parent: DeleteScanAnchor::parent(None),
                 dst_dir: Some(dst_parent),
@@ -6687,15 +6709,12 @@ mod copy_tests {
                 dst_parent: None,
                 root_is_fresh: false,
             };
-            let cx = EntryCx {
-                parent: src_parent,
-                name: src_name.to_owned(),
-                rel_path: PathBuf::new(),
-                filter_path: PathBuf::new(),
-                real_path: root.join(src_name),
-                dry_run: true,
-                prog_track: &PROGRESS,
-            };
+            let cx = EntryCx::root(
+                src_parent,
+                src_name.to_owned(),
+                root.join(src_name),
+                &PROGRESS,
+            );
             let parent_ctx = CopyDirContext {
                 delete_scan_parent: DeleteScanAnchor::parent(None),
                 dst_dir: None,
@@ -7552,7 +7571,7 @@ mod copy_tests {
                     &NO_PRESERVE_SETTINGS,
                     false,
                     DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                    CopyEntryAdmission::Admitted(entry),
+                    entry,
                 ),
             )
             .await
@@ -7626,7 +7645,7 @@ mod copy_tests {
                     &NO_PRESERVE_SETTINGS,
                     false,
                     DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                    CopyEntryAdmission::Admitted(entry),
+                    entry,
                 ),
             )
             .await
@@ -7769,7 +7788,7 @@ mod copy_tests {
                 &NO_PRESERVE_SETTINGS,
                 false,
                 DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                CopyEntryAdmission::Admitted(entry),
+                entry,
             ),
         )
         .await??;
@@ -7826,7 +7845,7 @@ mod copy_tests {
                 &NO_PRESERVE_SETTINGS,
                 false,
                 DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                CopyEntryAdmission::Admitted(entry),
+                entry,
             ),
         )
         .await?
@@ -7890,7 +7909,7 @@ mod copy_tests {
                 &NO_PRESERVE_SETTINGS,
                 false,
                 DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-                CopyEntryAdmission::Admitted(entry),
+                entry,
             ),
         )
         .await??;
@@ -8963,9 +8982,9 @@ mod copy_tests {
         Ok(())
     }
 
-    // Task 1.6: a deep, narrow chain `a/a/a/.../file` copies fully without hanging or exhausting
-    // fds. `copy_internal` is `#[async_recursion]`, so depth exercises the recursive chain; 800 is
-    // deep enough to stress the fd budget / hold-and-wait avoidance without risking a stack blowup.
+    // a deep, narrow chain `a/a/a/.../file` copies fully without hanging or exhausting fds
+    // the shared driver uses async recursion, so depth exercises the recursive chain; 800 is
+    // deep enough to stress the fd budget / hold-and-wait avoidance without risking a stack blowup
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_deep_narrow_tree_completes() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::create_temp_dir().await?;

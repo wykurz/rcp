@@ -12,18 +12,61 @@ from benchmarks.test_publish import result as publication_result
 from benchmarks.test_changes import Fragment, observation
 
 
+# preserve stdin/file operand behavior without implementing hashing or option validation
+SHA256SUM_STUB = r'''sha256sum() {
+    local argument stdin_operand=0 file_operand=0 options=1
+    for argument in "$@"; do
+        if [[ "$argument" == - ]]; then
+            stdin_operand=1
+        elif (( options )) && [[ "$argument" == -- ]]; then
+            options=0
+        elif (( options )) && [[ "$argument" == -* ]]; then
+            :
+        else
+            file_operand=1
+        fi
+    done
+    if (( stdin_operand || !file_operand )); then cat >/dev/null; fi
+    printf "%064d  -\n" 0
+}
+'''
+
+
 class BenchmarkWorkflowTests(unittest.TestCase):
     def workflow(self):
         return yaml.safe_load((Path(__file__).resolve().parent.parent / ".depot/workflows/benchmarks.yml").read_text())
 
     def measure_arguments(self, *, event, mode="loopback", baseline="", case="all", cache="linux-drop-caches"):
         measure = next(step for step in self.workflow()["jobs"]["benchmark"]["steps"] if step.get("name") == "Measure copies")
-        script = 'just() { printf "%s\\n" "$@"; }\nsha256sum() { printf "%064d  -\\n" 0; }\n' + measure["run"]
+        script = 'just() { printf "%s\\n" "$@"; }\n' + SHA256SUM_STUB + measure["run"]
         environment = {**os.environ, "BENCHMARK_EVENT": event, "BENCHMARK_MODE": mode, "SELECTED_CASE": case, "SELECTED_CACHE": cache, "RUNNER_TEMP": "/tmp", "RCP_BENCH_BASELINE_BIN": baseline}
-        result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True, check=True)
+        result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10, check=True)
         arguments = result.stdout.splitlines()
         self.assertEqual(arguments[0], "benchmark-run")
         return arguments
+
+    def test_hash_fixture_consumes_pipeline_input_under_pipefail(self):
+        for arguments in [[], ["-"], ["-b"], ["--tag"], ["-z"], ["--"], ["--", "-"], ["file", "-"]]:
+            with self.subTest(arguments=arguments):
+                script = SHA256SUM_STUB + "set -o pipefail\nprintf '%4194304s' '' | sha256sum \"$@\"\n"
+                result = subprocess.run(["bash", "-c", script, "fixture", *arguments], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "0" * 64 + "  -\n")
+
+    def test_hash_fixture_file_operands_do_not_read_stdin(self):
+        for arguments in [["file"], ["-b", "file"], ["--", "-named-file"]]:
+            with self.subTest(arguments=arguments):
+                script = SHA256SUM_STUB + 'sha256sum "$@"\n'
+                with subprocess.Popen(["bash", "-c", script, "fixture", *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                        self.fail("file-only hashing fixture attempted to drain held-open stdin")
+                    stdout, stderr = process.communicate()
+                    self.assertEqual(process.returncode, 0, stderr)
+                    self.assertEqual(stdout, "0" * 64 + "  -\n")
 
     def values(self, arguments, option):
         return [arguments[index + 1] for index, item in enumerate(arguments) if item == option]

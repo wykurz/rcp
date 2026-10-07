@@ -138,7 +138,7 @@ pub mod progress;
 mod testutils;
 pub mod toctou_check;
 pub mod walk;
-pub mod walk_driver;
+pub(crate) mod walk_driver;
 
 pub use config::{
     AdmissionPolicy, AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings,

@@ -41,29 +41,22 @@
 //!
 //! `copy` is the reference single-tree visitor (`rcp::copy::CopyVisitor`); its
 //! mapping shaped this trait.
-//! `CopyVisitor` holds the run-constant state (`dst_root`, `filter_base`,
-//! `Settings`, `preserve::Settings`, the opened top-level destination parent — the
-//! *source* root needs no field, since each entry's source path is its
-//! [`EntryCx::real_path`]) and:
+//! `CopyVisitor` holds operation settings, destination reconstruction state, and root destination
+//! authority. Each entry carries its source display path in [`EntryCx::real_path`].
 //!
 //! - **`type Summary`** = `copy::Summary`.
-//! - **`type DirContext`** = the *destination* parent for one level:
-//!   `{ dst_dir: Option<Arc<Dir>>, is_fresh: bool }` (`None` dst = dry-run). This
-//!   is how the single-tree driver carries copy's second tree — each child reads
-//!   its destination parent from `parent_ctx` rather than the driver modeling two
-//!   trees. [`WalkVisitor::root_dir_context`] returns the opened top-level
-//!   destination (`Some(dst)`/`None`) with the initial `is_fresh`.
-//! - **`type DirState`** = `{ dst_dir, dst_parent, dst_name, we_created, src_meta,
-//!   is_root, base }` — what `dir_post` needs to apply directory metadata
-//!   (`src_meta` is read from the opened enumeration `Dir`, pairing it with the copied contents),
-//!   run empty-dir cleanup (`dst_parent.rmdir_at(dst_name)`), and `--delete`-prune,
-//!   plus the `base` create/unchanged contribution it folds with the children.
+//! - **`type DirContext`** = `CopyDirContext`, which carries the destination parent and freshness
+//!   for the next level, plus independent deletion-preview authority. Children inherit those held
+//!   handles or known absence from their parent; the driver itself models only the source tree.
+//! - **`type DirState`** = `CopyDirState`, which retains the handles, metadata, ownership state,
+//!   preview authority, and base summary needed for post-order finalization. Source metadata comes
+//!   from the opened enumeration directory, pairing it with the copied contents.
 //! - **`visit_leaf`** dispatches on `kind`: `File` → `copy_file_fd`, `Symlink` →
 //!   `copy_symlink_fd`, `Special` → skip-or-error. The admitted `permit` remains held across every
 //!   fd-bearing leaf-dispatch path, including recursive destination removal under overwrite.
 //!   `--dereference` of a symlink-to-dir stays inside `visit_leaf`: it transfers
 //!   the permit into the path-based target root walk (the one deliberately
-//!   non-fd-relative path). That walk releases the permit after authoritative
+//!   path-based payload branch). That walk releases the permit after authoritative
 //!   directory classification and before descent.
 //! - **`dir_pre`** runs `resolve_dst_dir`: `DirResolution::Skip` →
 //!   [`DirAction::Skip`] (`--ignore-existing` hit a non-dir); `Proceed{dir,..}` →
@@ -86,21 +79,19 @@
 //!   awaited and classification is repeated. An authoritative directory releases
 //!   any provisional permit before descent.
 //!
-//! The delegated-subtree case (rlink handing copy an update-only/type-changed
-//! subtree rooted below the original filter root) is carried by seeding the root
-//! [`EntryCx::filter_path`] with the subtree's logical base, so the filter still
-//! matches at the entry's true path while `rel_path`/`real_path` stay relative to
-//! the delegated root.
+//! Delegated copy seeds `rel_path` with the entry's path relative to rlink's original root and
+//! retains that original destination root for reconstruction. Filtering and destination paths use
+//! this one coordinate; `real_path` remains the source display path. Ordinary roots start empty.
+//! Pruning seeds a mirror-relative path, while unfiltered overwrite removal seeds the full
+//! destination display path. Removal never opens these strings.
 //!
-//! The dry-run "directory" path (no destination dir, contents still traversed for
-//! reporting) is just `DirContext.dst_dir == None` threaded through — the same
-//! branch copy already has. No part of copy needs a trait shape this module does
-//! not provide, which is why the trait stops here (no second-tree concept leaks
-//! into the driver — that asymmetry is what keeps rlink on the substrate, not the
-//! visitor; see docs/tocttou.md, "One shared traversal driver").
+//! Dry-run contexts omit writable destination handles but may retain a separate held directory for
+//! deletion preview. The driver passes this visitor-owned authority through without modeling a
+//! second tree; rlink's dual-tree walk remains on the substrate (see docs/tocttou.md,
+//! "One shared traversal driver").
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_recursion::async_recursion;
@@ -134,45 +125,75 @@ pub struct EntryCx {
     pub parent: Arc<Dir>,
     /// This entry's name within `parent`.
     pub name: OsString,
-    /// Path accumulated from the walk root to this entry (empty for the root
-    /// entry). Joined onto the tool's root it reconstructs the real path; used for
-    /// diagnostics and path reconstruction.
+    /// Path accumulated from the caller's coordinate anchor. Ordinary roots start empty;
+    /// delegated copies and pruning seed the path relative to the original mirror root.
+    /// Unfiltered overwrite removal instead seeds the full destination display path.
     pub rel_path: PathBuf,
-    /// The path the driver feeds to the include/exclude filter for this entry: the
-    /// entry's **logical** path relative to the filter root. Usually equals
-    /// `rel_path`, but a tool processing a *delegated subtree* (rlink handing an
-    /// update-only or type-changed subtree to copy, which is rooted below the
-    /// original filter root) seeds the root entry's `filter_path` with that subtree's
-    /// logical base so the filter still matches at the entry's true path (e.g.
-    /// `cache/keep.txt`, not the bare `keep.txt` relative to the delegated root). The
-    /// driver extends it by one component per level alongside `rel_path`.
-    pub filter_path: PathBuf,
-    /// `root.join(rel_path)` — the reconstructed real filesystem path, for
-    /// diagnostics and the deliberately-path-based features (`-L`/`--delete`).
+    /// Source operand or diagnostic display path, extended by one name per level.
+    /// Copy also uses it for deliberately path-based dereferencing. Removal never opens it.
     pub real_path: PathBuf,
-    /// Whether this is a dry run (no filesystem mutation).
-    pub dry_run: bool,
     /// The process-global progress tracker.
     pub prog_track: &'static Progress,
 }
 
 impl EntryCx {
+    /// Build an ordinary root with an empty logical path and the supplied display path.
+    pub(crate) fn root(
+        parent: Arc<Dir>,
+        name: OsString,
+        real_path: PathBuf,
+        prog_track: &'static Progress,
+    ) -> Self {
+        Self {
+            parent,
+            name,
+            rel_path: PathBuf::new(),
+            real_path,
+            prog_track,
+        }
+    }
+
+    /// Seed a removal walk whose logical and display paths start at the same path.
+    pub(crate) fn seeded(
+        parent: Arc<Dir>,
+        name: OsString,
+        path: PathBuf,
+        prog_track: &'static Progress,
+    ) -> Self {
+        Self::root(parent, name, path.clone(), prog_track).with_relative_path(path)
+    }
+
+    /// Set a root's logical path relative to the caller's original coordinate anchor.
+    /// This replaces the empty root path; it does not append a prefix to an existing path.
+    #[must_use]
+    pub(crate) fn with_relative_path(mut self, path: PathBuf) -> Self {
+        debug_assert!(self.rel_path.as_os_str().is_empty());
+        self.rel_path = path;
+        self
+    }
+
     /// Build the child context for `child_name` within `child_dir`, extending the
-    /// accumulated `rel_path`/`filter_path`/`real_path` by one component. `child_dir`
+    /// accumulated `rel_path`/`real_path` by one component. `child_dir`
     /// is the hardened directory the child lives in (for a directory entry's
     /// contents, the opened directory itself; for the root, the root directory).
     #[must_use]
     fn child(&self, child_dir: Arc<Dir>, child_name: OsString) -> EntryCx {
         EntryCx {
             parent: child_dir,
-            rel_path: self.rel_path.join(&child_name),
-            filter_path: self.filter_path.join(&child_name),
-            real_path: self.real_path.join(&child_name),
+            rel_path: join_child_path(&self.rel_path, &child_name),
+            real_path: join_child_path(&self.real_path, &child_name),
             name: child_name,
-            dry_run: self.dry_run,
             prog_track: self.prog_track,
         }
     }
+}
+
+// reserve the existing prefix and child together so extending a nonempty path needs one allocation
+fn join_child_path(base: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let mut path = PathBuf::with_capacity(base.as_os_str().len() + 1 + name.len());
+    path.push(base);
+    path.push(name);
+    path
 }
 
 /// What a [`WalkVisitor::dir_pre`] decided to do with a directory entry.
@@ -836,7 +857,7 @@ where
     if authoritative
         && let Some(skip_result) = walk::should_skip_entry_ref(
             visitor.filter(),
-            &cx.filter_path,
+            &cx.rel_path,
             classified.kind() == EntryKind::Dir,
         )
     {
@@ -930,7 +951,7 @@ where
             && let Some(hinted_kind) = hint
             && let Some(skip_result) = walk::should_skip_entry_ref(
                 visitor.filter(),
-                &child_cx.filter_path,
+                &child_cx.rel_path,
                 hinted_kind == EntryKind::Dir,
             )
         {
@@ -1014,7 +1035,8 @@ where
 /// separate fd-admission leases remain live until their work and abandoned outputs finish.
 /// Otherwise all errors are collected and deduplicated, and the single
 /// combined error (if any) is returned with the full folded summary.
-pub async fn join_and_fold<S>(
+#[cfg(test)]
+async fn join_and_fold<S>(
     mut join_set: tokio::task::JoinSet<Result<S, OperationError<S>>>,
     fail_early: bool,
     base: S,
@@ -1196,15 +1218,57 @@ mod tests {
 
     /// Build an `EntryCx` for the root directory `name` under `parent`.
     fn root_cx(parent: Arc<Dir>, name: &OsStr, real_path: PathBuf) -> EntryCx {
-        EntryCx {
-            parent,
-            name: name.to_owned(),
-            rel_path: PathBuf::new(),
-            filter_path: PathBuf::new(),
-            real_path,
-            dry_run: false,
-            prog_track: &PROGRESS,
+        EntryCx::root(parent, name.to_owned(), real_path, &PROGRESS)
+    }
+
+    #[tokio::test]
+    async fn entry_paths_preserve_root_seed_and_non_utf8_components() -> anyhow::Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let root = crate::testutils::create_temp_dir().await?;
+        let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        for (base, expected_child, expected_leaf) in [
+            (
+                b"".as_slice(),
+                b"branch\xff".as_slice(),
+                b"branch\xff/leaf\xfe".as_slice(),
+            ),
+            (
+                b"base//./cache\xfe",
+                b"base//./cache\xfe/branch\xff",
+                b"base//./cache\xfe/branch\xff/leaf\xfe",
+            ),
+        ] {
+            let cx = root_cx(
+                Arc::clone(&dir),
+                OsStr::new("root"),
+                PathBuf::from("source//./root"),
+            )
+            .with_relative_path(PathBuf::from(OsStr::from_bytes(base)));
+            assert_eq!(cx.rel_path.as_os_str().as_bytes(), base);
+            let child = cx.child(Arc::clone(&dir), OsString::from_vec(b"branch\xff".to_vec()));
+            let leaf = child.child(Arc::clone(&dir), OsString::from_vec(b"leaf\xfe".to_vec()));
+            assert_eq!(child.rel_path.as_os_str().as_bytes(), expected_child);
+            assert_eq!(leaf.rel_path.as_os_str().as_bytes(), expected_leaf);
+            assert_eq!(
+                leaf.real_path.as_os_str().as_bytes(),
+                b"source//./root/branch\xff/leaf\xfe"
+            );
         }
+        for (seed, expected) in [
+            ("cache", b"cache/keep.log".as_slice()),
+            ("/destination//./cache", b"/destination//./cache/keep.log"),
+        ] {
+            let cx = EntryCx::seeded(
+                Arc::clone(&dir),
+                OsString::from("cache"),
+                PathBuf::from(seed),
+                &PROGRESS,
+            );
+            let child = cx.child(Arc::clone(&dir), OsString::from("keep.log"));
+            assert_eq!(child.rel_path.as_os_str().as_bytes(), expected);
+            assert_eq!(child.rel_path.as_os_str(), child.real_path.as_os_str());
+        }
+        Ok(())
     }
 
     #[tokio::test]

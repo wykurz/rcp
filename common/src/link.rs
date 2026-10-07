@@ -1272,7 +1272,7 @@ async fn link_internal(
                     dst_parent,
                     update_name,
                     update_path,
-                    &dst_path,
+                    dst_root,
                     rel_path,
                     delete_scan_parent.clone(),
                     settings,
@@ -1332,7 +1332,7 @@ async fn link_internal(
                     dst_parent,
                     update_name,
                     update_path,
-                    &dst_path,
+                    dst_root,
                     rel_path,
                     delete_scan_parent.clone(),
                     settings,
@@ -1353,7 +1353,7 @@ async fn link_internal(
                     dst_parent,
                     update_name,
                     update_path,
-                    &dst_path,
+                    dst_root,
                     rel_path,
                     delete_scan_parent.clone(),
                     settings,
@@ -1405,7 +1405,7 @@ async fn link_internal(
                     dst_parent,
                     name,
                     &src_path,
-                    &dst_path,
+                    dst_root,
                     rel_path,
                     delete_scan_parent.clone(),
                     settings,
@@ -1502,8 +1502,9 @@ async fn link_internal(
 }
 
 /// Delegate a single entry to the fd-based copy ([`copy::copy_child`]), passing the HELD parent
-/// directory handles plus the entry `name` — never re-resolving a path. `filter_base` for the
-/// delegation is the entry's logical relative path (so `--delete` pruning inside the subtree
+/// directory handles plus the entry `name` for payload authority. Copy's documented dereference
+/// and read-only preview exceptions still apply. `dst_root` retains the original destination
+/// anchor; `filter_base` is the entry's logical relative path (so pruning inside the subtree
 /// matches include/exclude patterns at the entry's true path). `delete_scan_anchor` independently
 /// carries the held preview parent or its known absence. The returned copy
 /// summary is folded into a link `Summary`.
@@ -1514,7 +1515,7 @@ async fn delegate_copy(
     dst_parent: Option<&Arc<Dir>>,
     name: &std::ffi::OsStr,
     src_path: &std::path::Path,
-    dst_path: &std::path::Path,
+    dst_root: &std::path::Path,
     filter_base: &std::path::Path,
     delete_scan_anchor: copy::DeleteScanAnchor,
     settings: &Settings,
@@ -1539,13 +1540,13 @@ async fn delegate_copy(
         dst_parent,
         name,
         src_path,
-        dst_path,
+        dst_root,
         filter_base,
         copy_settings,
         &settings.preserve,
         is_fresh,
         delete_scan_anchor,
-        copy::CopyEntryAdmission::Filtered(admission),
+        admission,
     )
     .await
     .map_err(|err| {
@@ -1853,7 +1854,7 @@ async fn process_update_only_entry(
     dst_parent: Option<Arc<Dir>>,
     entry_name: std::ffi::OsString,
     update_entry_path: std::path::PathBuf,
-    dst_entry_path: std::path::PathBuf,
+    dst_root: std::path::PathBuf,
     entry_rel: std::path::PathBuf,
     delete_scan_anchor: copy::DeleteScanAnchor,
     settings: Settings,
@@ -1921,7 +1922,7 @@ async fn process_update_only_entry(
         dst_parent.as_ref(),
         &entry_name,
         &update_entry_path,
-        &dst_entry_path,
+        &dst_root,
         &entry_rel,
         delete_scan_anchor,
         &settings,
@@ -2198,7 +2199,7 @@ async fn link_dir_contents(
                 // acquire-then-IMMEDIATELY-spawn is load-bearing here for the same reason as the source
                 // loop: the worker owns authoritative classification and must be able to release the
                 // permit before scheduling waits for another one
-                let dst_entry_path = dst_path.join(&entry_name);
+                let dst_root = dst_root.to_path_buf();
                 let update_parent = Arc::clone(update_dir);
                 let dst_parent = dst_dir.map(Arc::clone);
                 let settings = settings.clone();
@@ -2213,7 +2214,7 @@ async fn link_dir_contents(
                         dst_parent,
                         entry_name,
                         update_entry_path,
-                        dst_entry_path,
+                        dst_root,
                         entry_rel,
                         delete_scan_anchor,
                         settings,
@@ -2282,13 +2283,11 @@ async fn link_dir_contents(
         || link_summary.copy_summary.files_copied > 0
         || link_summary.copy_summary.symlinks_created > 0
         || child_dirs_created > 0;
-    let is_root = rel_path.as_os_str().is_empty();
     match check_empty_dir_cleanup(
         settings.filter.as_ref(),
         we_created_this_dir,
         anything_linked,
         rel_path,
-        is_root,
         settings.dry_run.is_some(),
     ) {
         EmptyDirAction::Keep => { /* proceed with metadata application */ }
@@ -4118,7 +4117,7 @@ mod link_tests {
                     Some(&dst_parent),
                     std::ffi::OsStr::new("node"),
                     &entry_path,
-                    &dst_path,
+                    &dst,
                     std::path::Path::new("node"),
                     copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                     &settings,
@@ -4503,7 +4502,7 @@ mod link_tests {
                         Some(&dst_dir),
                         std::ffi::OsStr::new("node"),
                         &update.join("node"),
-                        &dst.join("node"),
+                        &dst,
                         std::path::Path::new("node"),
                         copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                         &settings,
@@ -4580,7 +4579,7 @@ mod link_tests {
                         None,
                         std::ffi::OsStr::new("node"),
                         &update.join("node"),
-                        &dst.join("node"),
+                        &dst,
                         std::path::Path::new("node"),
                         copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                         &settings,
@@ -5353,9 +5352,9 @@ mod link_tests {
 
         /// Regression: an update-only entry matching an `--exclude` pattern must NOT be copied to
         /// the destination when `--delete` is OFF. The fd-based link delegates update-only entries
-        /// to `copy::copy_child` (which wraps `copy_internal` and does not re-apply a top-level
-        /// filter), so the update loop must evaluate the filter itself — independently of `--delete`
-        /// — and skip the delegation, matching the old path-based `copy_with_filter_base`.
+        /// to `copy::copy_child` with an already-filtered admission, so the update loop must evaluate
+        /// the filter itself — independently of `--delete` — and skip excluded entries before
+        /// delegation
         #[tokio::test]
         #[traced_test]
         async fn update_only_excluded_entry_not_copied_without_delete() -> Result<(), anyhow::Error>

@@ -61,20 +61,23 @@ fn preserves_mtime_and_moves_ctime() {
 
 #[test]
 fn include_filter_changes_matches_not_traversed_dirs() {
-    // with --include '*.txt', only matching files are modified; directories entered
-    // only to find matches (and non-matching files) are left untouched.
+    // only the anchored descendant is modified; a same-basename root file and
+    // directories entered only to find matches are left untouched.
     let d = tempfile::tempdir().unwrap();
     let sub = d.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
     let txt = sub.join("a.txt");
     let other = sub.join("b.dat");
+    let decoy = d.path().join("a.txt");
     std::fs::write(&txt, b"x").unwrap();
     std::fs::write(&other, b"x").unwrap();
+    std::fs::write(&decoy, b"x").unwrap();
     std::fs::set_permissions(&txt, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     rchm()
-        .args(["--mode", "g+w", "--include", "*.txt"])
+        .args(["--mode", "g+w", "--include", "/sub/a.txt"])
         .arg(d.path())
         .assert()
         .success();
@@ -83,6 +86,11 @@ fn include_filter_changes_matches_not_traversed_dirs() {
         mode_of(&other),
         0o644,
         "non-matching file must be untouched"
+    );
+    assert_eq!(
+        mode_of(&decoy),
+        0o644,
+        "same-basename file outside the anchored path must be untouched"
     );
     assert_eq!(mode_of(&sub), 0o755, "traversed-only dir must be untouched");
 }
