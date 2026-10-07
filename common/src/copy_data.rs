@@ -89,38 +89,43 @@ pub fn copy_file_data(
 /// Copy up to `len` bytes from `src` to `dst` using the in-kernel
 /// `copy_file_range` (reflink/server-side capable), falling back to a
 /// sparse-aware userspace copy when the kernel/filesystem can't. Both files are
-/// already open; offsets start at `0`. Returns the number of bytes copied.
+/// already open; copies start at byte `0` of each via explicit offsets, ignoring
+/// the descriptors' cursors. Returns the number of bytes copied.
 /// The destination must be empty and exclusively owned by this copy operation.
 ///
 /// See the module docs for snapshot-size and durability semantics.
 fn copy_file_range_all(src: &File, dst: &File, len: u64) -> std::io::Result<u64> {
-    copy_file_range_all_with(src, dst, len, |offset, remaining| {
-        // derive both offsets from confirmed progress, including after an interrupted call.
-        // explicit offsets avoid resetting the file cursors before every copy.
-        let mut src_offset = i64::try_from(offset).map_err(|_| nix::errno::Errno::EOVERFLOW)?;
-        let mut dst_offset = src_offset;
+    copy_file_range_all_with(src, dst, len, |src_offset, dst_offset, remaining| {
         #[cfg(test)]
         crate::testutils::record_copy_file_range_call();
         nix::fcntl::copy_file_range(
             src.as_fd(),
-            Some(&mut src_offset),
+            Some(src_offset),
             dst.as_fd(),
-            Some(&mut dst_offset),
+            Some(dst_offset),
             remaining,
         )
     })
 }
 
+/// Run positioned kernel-copy attempts from the confirmed prefix. The syscall
+/// must report at most the requested length, with no confirmed progress on error.
+/// Mutated offset arguments are discarded; only a successful byte count advances
+/// the prefix used to initialize both offsets on the next attempt.
 fn copy_file_range_all_with(
     src: &File,
     dst: &File,
     len: u64,
-    mut copy_range: impl FnMut(u64, usize) -> nix::Result<usize>,
+    mut copy_range: impl FnMut(&mut i64, &mut i64, usize) -> nix::Result<usize>,
 ) -> std::io::Result<u64> {
     let mut copied: u64 = 0;
     while copied < len {
         let remaining = usize::try_from(len - copied).unwrap_or(usize::MAX);
-        match copy_range(copied, remaining) {
+        // explicit offsets make copying independent of the descriptors' cursors.
+        // derive both from confirmed progress, including after an interrupted call.
+        let mut src_offset = i64::try_from(copied).map_err(|_| nix::errno::Errno::EOVERFLOW)?;
+        let mut dst_offset = src_offset;
+        match copy_range(&mut src_offset, &mut dst_offset, remaining) {
             Ok(0)
             | Err(
                 nix::errno::Errno::ENOSYS
@@ -400,8 +405,38 @@ mod tests {
         assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
     }
 
+    fn copies_with_kernel_results(
+        src: &File,
+        dst: &File,
+        len: u64,
+        steps: &[(i64, usize, nix::Result<usize>)],
+        mut before_step: impl FnMut(usize),
+    ) -> u64 {
+        let mut steps = steps.iter().enumerate();
+        let copied =
+            copy_file_range_all_with(src, dst, len, |src_offset, dst_offset, remaining| {
+                let (step, &(offset, expected_remaining, result)) = steps.next().unwrap();
+                assert_eq!(
+                    (*src_offset, *dst_offset, remaining),
+                    (offset, offset, expected_remaining)
+                );
+                before_step(step);
+                if let Ok(n) = result {
+                    let mut bytes = vec![0; n];
+                    src.read_exact_at(&mut bytes, *src_offset as u64).unwrap();
+                    dst.write_all_at(&bytes, *dst_offset as u64).unwrap();
+                    *src_offset += n as i64;
+                    *dst_offset += n as i64;
+                }
+                result
+            })
+            .unwrap();
+        assert!(steps.next().is_none());
+        copied
+    }
+
     #[test]
-    fn reports_final_size_when_source_shrinks_after_partial_kernel_copy() {
+    fn falls_back_from_the_confirmed_prefix_for_each_outcome() {
         for outcome in [
             Ok(0),
             Err(nix::errno::Errno::ENOSYS),
@@ -409,38 +444,48 @@ mod tests {
             Err(nix::errno::Errno::EINVAL),
             Err(nix::errno::Errno::EOPNOTSUPP),
         ] {
-            for final_len in [0, 3, 8, 12, 16] {
-                let tmp = tempfile::tempdir().unwrap();
-                let contents = b"0123456789abcdef";
-                let mut src = make_file(tmp.path(), "src");
-                src.write_all(contents).unwrap();
-                let dst = make_file(tmp.path(), "dst");
-                let mut calls = 0;
-                let copied = copy_file_range_all_with(&src, &dst, 16, |offset, remaining| {
-                    calls += 1;
-                    match calls {
-                        1 => {
-                            assert_eq!((offset, remaining), (0, 16));
-                            dst.write_all_at(&contents[..8], offset).unwrap();
-                            Ok(8)
-                        }
-                        2 => {
-                            assert_eq!((offset, remaining), (8, 8));
-                            src.set_len(final_len).unwrap();
-                            outcome
-                        }
-                        _ => panic!("kernel copying must stop after falling back"),
+            let tmp = tempfile::tempdir().unwrap();
+            let contents = b"0123456789abcdef";
+            let mut src = make_file(tmp.path(), "src");
+            src.write_all(contents).unwrap();
+            let dst = make_file(tmp.path(), "dst");
+            let copied = copies_with_kernel_results(
+                &src,
+                &dst,
+                16,
+                &[(0, 16, Ok(8)), (8, 8, outcome)],
+                |_| {},
+            );
+            assert_eq!(copied, contents.len() as u64);
+            assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn reports_final_size_when_source_shrinks_after_partial_kernel_copy() {
+        for final_len in [0, 3, 8, 12] {
+            let tmp = tempfile::tempdir().unwrap();
+            let contents = b"0123456789abcdef";
+            let mut src = make_file(tmp.path(), "src");
+            src.write_all(contents).unwrap();
+            let dst = make_file(tmp.path(), "dst");
+            let copied = copies_with_kernel_results(
+                &src,
+                &dst,
+                16,
+                &[(0, 16, Ok(8)), (8, 8, Err(nix::errno::Errno::EXDEV))],
+                |step| {
+                    if step == 1 {
+                        src.set_len(final_len).unwrap();
                     }
-                })
-                .unwrap();
-                assert_eq!(calls, 2);
-                assert_eq!(copied, final_len);
-                assert_eq!(dst.metadata().unwrap().len(), final_len);
-                assert_eq!(
-                    std::fs::read(tmp.path().join("dst")).unwrap(),
-                    &contents[..final_len as usize]
-                );
-            }
+                },
+            );
+            assert_eq!(copied, final_len);
+            assert_eq!(dst.metadata().unwrap().len(), final_len);
+            assert_eq!(
+                std::fs::read(tmp.path().join("dst")).unwrap(),
+                &contents[..final_len as usize]
+            );
         }
     }
 
@@ -451,29 +496,17 @@ mod tests {
         let mut src = make_file(tmp.path(), "src");
         src.write_all(contents).unwrap();
         let dst = make_file(tmp.path(), "dst");
-        let mut calls = 0;
-        let copied = copy_file_range_all_with(&src, &dst, 16, |offset, remaining| {
-            calls += 1;
-            match calls {
-                1 => {
-                    assert_eq!((offset, remaining), (0, 16));
-                    dst.write_all_at(&contents[..8], offset).unwrap();
-                    Ok(8)
-                }
-                2 => {
-                    assert_eq!((offset, remaining), (8, 8));
-                    Err(nix::errno::Errno::EINTR)
-                }
-                3 => {
-                    assert_eq!((offset, remaining), (8, 8));
-                    dst.write_all_at(&contents[8..], offset).unwrap();
-                    Ok(8)
-                }
-                _ => panic!("kernel copying must stop after completing the range"),
-            }
-        })
-        .unwrap();
-        assert_eq!(calls, 3);
+        let copied = copies_with_kernel_results(
+            &src,
+            &dst,
+            16,
+            &[
+                (0, 16, Ok(8)),
+                (8, 8, Err(nix::errno::Errno::EINTR)),
+                (8, 8, Ok(8)),
+            ],
+            |_| {},
+        );
         assert_eq!(copied, contents.len() as u64);
         assert_eq!(std::fs::read(tmp.path().join("dst")).unwrap(), contents);
     }
@@ -614,60 +647,61 @@ mod tests {
         let contents = b"independent source and destination cursors";
         let mut src = make_file(tmp.path(), "src");
         src.write_all(contents).unwrap();
-        for policy in [ReflinkMode::Auto, ReflinkMode::Never] {
-            for len in [0, 7, contents.len() as u64, contents.len() as u64 + 10] {
-                let dst = make_file(tmp.path(), "dst");
-                nix::unistd::lseek(src.as_fd(), 3, nix::unistd::Whence::SeekSet).unwrap();
-                nix::unistd::lseek(dst.as_fd(), 11, nix::unistd::Whence::SeekSet).unwrap();
-                let copied = copy_file_data(&src, &dst, len, policy).unwrap();
-                let expected_len = len.min(contents.len() as u64);
-                assert_eq!(copied, expected_len);
-                assert_eq!(dst.metadata().unwrap().len(), expected_len);
-                assert_eq!(
-                    std::fs::read(tmp.path().join("dst")).unwrap(),
-                    &contents[..expected_len as usize]
-                );
-            }
+        for (policy, len) in [
+            (ReflinkMode::Auto, 7),
+            (ReflinkMode::Auto, contents.len() as u64 + 10),
+            (ReflinkMode::Never, contents.len() as u64),
+        ] {
+            let dst = make_file(tmp.path(), "dst");
+            nix::unistd::lseek(src.as_fd(), 3, nix::unistd::Whence::SeekSet).unwrap();
+            nix::unistd::lseek(dst.as_fd(), 11, nix::unistd::Whence::SeekSet).unwrap();
+            let copied = copy_file_data(&src, &dst, len, policy).unwrap();
+            let expected_len = len.min(contents.len() as u64);
+            assert_eq!(copied, expected_len);
+            assert_eq!(
+                std::fs::read(tmp.path().join("dst")).unwrap(),
+                &contents[..expected_len as usize]
+            );
         }
     }
 
     #[test]
     fn preserves_sparse_suffix_after_partial_kernel_copy() {
         let tmp = tempfile::tempdir().unwrap();
-        let logical = 1024 * 1024;
+        // leave whole 2 MiB regions as holes even on huge-page tmpfs.
+        let logical = 8 * 1024 * 1024;
         let src = make_file(tmp.path(), "src");
         src.set_len(logical).unwrap();
         src.write_all_at(b"head", 0).unwrap();
-        src.write_all_at(b"tail", logical - 4096).unwrap();
+        src.write_all_at(b"tail", 4 * 1024 * 1024).unwrap();
         src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
-        let mut calls = 0;
-        let copied = copy_file_range_all_with(&src, &dst, logical, |offset, remaining| {
-            calls += 1;
-            match calls {
-                1 => {
-                    assert_eq!((offset, remaining), (0, logical as usize));
-                    let mut prefix = [0; 4096];
-                    src.read_exact_at(&mut prefix, offset).unwrap();
-                    dst.write_all_at(&prefix, offset).unwrap();
-                    Ok(prefix.len())
-                }
-                2 => {
-                    assert_eq!((offset, remaining), (4096, logical as usize - 4096));
-                    Err(nix::errno::Errno::EXDEV)
-                }
-                _ => panic!("kernel copying must stop after falling back"),
-            }
-        })
-        .unwrap();
-        assert_eq!(calls, 2);
+        let copied = copies_with_kernel_results(
+            &src,
+            &dst,
+            logical,
+            &[
+                (0, logical as usize, Ok(4096)),
+                (4096, logical as usize - 4096, Err(nix::errno::Errno::EXDEV)),
+            ],
+            |_| {},
+        );
         assert_eq!(copied, logical);
         assert_eq!(dst.metadata().unwrap().len(), logical);
         assert_eq!(
             std::fs::read(tmp.path().join("dst")).unwrap(),
             std::fs::read(tmp.path().join("src")).unwrap()
         );
-        assert!(dst.metadata().unwrap().blocks() * 512 < logical);
+        let src_allocated = src.metadata().unwrap().blocks() * 512;
+        let dst_allocated = dst.metadata().unwrap().blocks() * 512;
+        assert!(
+            src_allocated < logical,
+            "source fixture is not sparse: allocated {src_allocated} >= logical {logical}"
+        );
+        assert!(
+            dst_allocated < logical,
+            "destination is not sparse: dst={dst_allocated}, src={src_allocated}, logical={logical}"
+        );
     }
 
     #[test]
@@ -678,7 +712,6 @@ mod tests {
         src.set_len(logical).unwrap();
         src.write_all_at(b"head", 0).unwrap();
         src.write_all_at(b"middle", logical / 2).unwrap();
-        src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
         let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Auto).unwrap();
         assert_eq!(copied, logical);
