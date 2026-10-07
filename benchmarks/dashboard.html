@@ -247,6 +247,23 @@
           }
           table.append(head, body); wrap.append(table); details.append(wrap);
         }
+        if (run.context.command_clocks) {
+          details.append(node("h3", "Command clock observations"));
+          details.append(node("p", __CLOCK_QUALIFICATION_JSON__, "footnote"));
+          details.append(node("p", "Sequential reads have uncertainty bounded by their MONOTONIC brackets. Signed differences are diagnostic observations; unavailable or regressed brackets supply no comparison bounds.", "footnote"));
+          const wrap = node("div", undefined, "table-wrap"), table = node("table"), head = node("thead"), heading = node("tr"), body = node("tbody");
+          for (const label of ["Case", "Variant", "Repeat", "Status", "RAW − MONOTONIC bounds (s)", "REALTIME − MONOTONIC bounds (s)", "Start / finish read skew (s)", "Unavailable readings"]) heading.append(node("th", label));
+          head.append(heading);
+          const seconds = value => value === null ? "—" : (value / 1e9).toFixed(9);
+          const bounds = value => value ? `[${value.map(seconds).join(", ")}]` : "—";
+          for (const trial of run.trials) {
+            const observation = trial.command_clocks, value = observation?.comparison, item = node("tr");
+            const unavailable = observation ? ["start", "finish"].flatMap(boundary => observation[boundary] ? Object.entries(observation[boundary]).filter(([, reading]) => reading.unavailable).map(([clock, reading]) => `${boundary}.${clock}: ${reading.unavailable}`) : [`${boundary}: no completed child`]).join("; ") : "No observations";
+            for (const cell of [trial.case_id, trial.variant_id, trial.iteration, value?.status ?? "No observations", bounds(value?.raw_minus_monotonic_bounds_ns), bounds(value?.realtime_minus_monotonic_bounds_ns), value ? `${seconds(value.start_read_skew_ns)} / ${seconds(value.finish_read_skew_ns)}` : "—", unavailable || "All available"]) item.append(node("td", cell));
+            body.append(item);
+          }
+          table.append(head, body); wrap.append(table); details.append(wrap);
+        }
         detail.append(details);
         row.append(timestamp, result, rev, machine, comparisons, detail); rows.append(row);
       }

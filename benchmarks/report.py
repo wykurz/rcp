@@ -12,7 +12,7 @@ from pathlib import Path
 
 from benchmarks.strict_json import parse_json
 from benchmarks.timings import require_roles, validate_report
-from benchmarks import operations, transport, sanitized, changes, pairs, measurements
+from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -274,6 +274,7 @@ def validate_result(value):
         raise ValueError("error must be a string")
     pairs.validate(run)
     measurements.validate(run)
+    clocks.validate(run)
     return run
 
 
@@ -369,7 +370,7 @@ def render(input_path, output):
     for literal, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e")):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
-    page = template.replace("__HISTORY_JSON__", embedded)
+    page = template.replace("__CLOCK_QUALIFICATION_JSON__", json.dumps(clocks.QUALIFICATION)).replace("__HISTORY_JSON__", embedded)
     # serialize every representation before publishing any output files
     files = {
         "history.json": json.dumps(history, ensure_ascii=True, indent=2) + "\n",

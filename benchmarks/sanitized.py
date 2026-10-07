@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 
-from benchmarks import measurements, pairs
+from benchmarks import measurements, pairs, clocks
 
 EXPORT_SCHEMA_VERSION = 1
 TOOLS = ('rcp', 'rcpd', 'rsync', 'cp', 'filegen', 'ssh', 'rcp-baseline', 'rcpd-baseline')
@@ -371,6 +371,8 @@ def project_experiment(run, result, cases, variants):
             order=[variants[key] for key in pair['order']], candidate_trial=pair['candidate_trial'],
             reference_trial=pair['reference_trial'], candidate_over_reference=pair['candidate_over_reference'],
             run_status=run['status'], completed_case=True, acceptance_evaluated=False) for pair in pairs.comparisons(run)]
+    if "command_clocks" in context:
+        result["command_clocks"] = dict(policy=clocks.POLICY, qualification=clocks.QUALIFICATION)
     resources = context.get('local_resources')
     if resources is not None:
         result['local_resources'] = dict(policy=measurements.POLICY, scope=measurements.SCOPE,
@@ -394,6 +396,8 @@ def project_experiment(run, result, cases, variants):
     if 'phase_seconds' in run:
         result['phase_seconds'] = {key:number(run['phase_seconds'][key]) for key in sorted(measurements.RUN_PHASES) if key in run['phase_seconds']}
     for original, projected in zip(run['trials'], result['trials']):
+        if 'command_clocks' in original:
+            projected['command_clocks'] = clocks.project(original['command_clocks'])
         if 'phase_seconds' in original:
             projected['phase_seconds'] = {key:number(original['phase_seconds'][key]) for key in sorted(measurements.TRIAL_PHASES) if key in original['phase_seconds']}
         if 'pairing' in original:

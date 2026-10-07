@@ -124,6 +124,35 @@ current remote implementation, `--max-files-in-flight=128` remains limited by th
 nine variants: the three defaults plus six rcp limits. Nine repetitions let each variant occupy
 every trial position once.
 
+## Optional command clock observations
+
+`--command-clocks` adds local command-boundary MONOTONIC, MONOTONIC_RAW and REALTIME observations.
+It changes neither `elapsed_seconds` nor the monotonic timeout policy. Loopback and owned remote
+execution are rejected before probing tools. The option is independent of pairing and resources; its
+policy distinguishes historical series. Omitting it preserves the existing record shape.
+
+After the existing start timestamp, but before launching commands, the runner reads MONOTONIC, RAW,
+REALTIME and MONOTONIC in that order. Each child waiter takes the same observation after its
+existing completion timestamp. The end observation belongs to the child with the last completion
+timestamp, even if another waiter's clock reads finish later. These are nearby observations, not
+replacement timestamps for the exact command interval. A resource-wrapped command observes the GNU
+time supervisor's completion. A launch failure without a completed child has no end observation;
+failures before execution and interruptions that cannot return an outcome may lack observations.
+
+Raw JSON retains integer nanoseconds, explicit unsupported/read-failed states, signed read skew,
+clock deltas and derived differences. Ordered monotonic brackets bound the elapsed monotonic
+interval between the sequential clock reads. These bounds describe read skew, not clock accuracy.
+Backwards or overlapping monotonic brackets retain their observations but provide no such bounds;
+RAW/REALTIME discontinuities remain signed. Imports recompute derived values and reject
+disagreement. Reports and sanitized exports show qualification and numeric differences; exports omit
+absolute clock epochs. Clock data never accepts or rejects a performance result automatically.
+
+RAW is not an external elapsed-time reference. Rate differences or clock adjustments qualify the
+observed durations; do not rescale results, attribute a cause from endpoints alone, or assume that
+agreement at the boundaries proves nothing changed between them. Any clock reads add measurement
+overhead. Keep the option identical across compared roles and retain a separate total campaign
+budget; per-command timeouts do not bound fixture preparation, verification or cleanup.
+
 ## Adjacent local pairs and process resources
 
 `--paired-seed SEED` opts into adjacent candidate/reference pairs instead of the default rotating
