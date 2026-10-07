@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport, pairs, measurements
+from benchmarks import timings, operations, transport, pairs, measurements, clocks
 from benchmarks.operations import expected_counts
 
 
@@ -253,7 +253,7 @@ def _execution_failure(outcome, *, wrapped=False):
                 message=message if wrapped else "command failed or timed out")
 
 
-def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None):
+def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None, command_clocks=False):
     if resource_time is not None and len(commands) != 1:
         raise ValueError("local resources require exactly one command")
     log_dir = Path(log_dir)
@@ -267,6 +267,8 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
     condition = threading.Condition()
     child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale or resource_time is not None else None
     started = time.monotonic()
+    clock_start = clocks.sample() if command_clocks else None
+    clock_finishes = {}
     launch_error = None
     timed_out = False
     cleanup_groups = False
@@ -312,6 +314,10 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
                         with condition:
                             finished[i] = (code, stamp)
                             condition.notify_all()
+                        if command_clocks:
+                            clock_finish = clocks.sample()
+                            with condition:
+                                clock_finishes[i] = clock_finish
                     waiter = threading.Thread(target=wait_child, daemon=True)
                     waiter.start()
                     waiters.append(waiter)
@@ -350,6 +356,9 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
     completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
     status = measurements.payload_status(codes, timed_out, launch_error, expected_commands=len(commands))
     outcome = {"ok": status == "succeeded", "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
+    if command_clocks:
+        index = max(finished, key=lambda i: finished[i][1]) if finished else None
+        outcome["command_clocks"] = clocks.observation(clock_start, clock_finishes.get(index), index)
     if resource_time is not None:
         outcome["measurement_commands"] = launched_commands
         outcome["exit_status_scope"] = measurements.EXIT_STATUS_SCOPE
@@ -486,6 +495,19 @@ def _persist(output, record):
         lines += ["", "## Adjacent pairs", "", "Candidate / reference wall time; incomplete or failed pairs and pairs from unfinished or failed cases are not compared.", "", "| Case | Pair | Block | Order | Ratio |", "| --- | ---: | ---: | --- | ---: |"]
         for pair in pairs.comparisons(record):
             lines.append(f"| {pair['case_id']} | {pair['pair']} | {pair['block']} | {' → '.join(pair['order'])} | {pair['candidate_over_reference']:.4f} |")
+    if "command_clocks" in record["context"]:
+        lines += ["", "## Command clock observations", "", clocks.QUALIFICATION, "",
+                  "Bounds account for sequential-read skew only. Bracketed endpoints do not identify when a clock changed.", "",
+                  "| Case | Variant | Repeat | Brackets | RAW minus MONOTONIC (s) | REALTIME minus MONOTONIC (s) |",
+                  "| --- | --- | ---: | --- | --- | --- |"]
+        for trial in record["trials"]:
+            if "command_clocks" not in trial:
+                continue
+            observed = clocks.project(trial["command_clocks"])
+            def bounds(key):
+                values = observed[key + "_minus_monotonic_bounds_seconds"]
+                return "unavailable" if values is None else f"[{values[0]:.9f}, {values[1]:.9f}]"
+            lines.append(f"| {trial['case_id']} | {trial['variant_id']} | {trial['iteration']} | {observed['status']} | {bounds('raw')} | {bounds('realtime')} |")
     if "local_resources" in record["context"]:
         lines += ["", "## Local process resources", "", measurements.SCOPE + ". RSS is a per-command peak, never a sum of simultaneous resident memory.", "", "| Case | Variant | Repeat | Trial status | User CPU s | System CPU s | Peak RSS KiB |", "| --- | --- | ---: | --- | ---: | ---: | ---: |"]
         for trial in record["trials"]:
@@ -572,7 +594,10 @@ def _arguments(argv):
     parser.add_argument("--local-resources", action="store_true", help="collect local single-process GNU-time CPU/RSS/context-switch metrics")
     parser.add_argument("--resource-time", type=Path, help="GNU time executable for --local-resources")
     parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
+    parser.add_argument("--command-clocks", action="store_true", help="record bracketed local command clock observations without changing elapsed timing")
     args = parser.parse_args(argv)
+    if args.command_clocks and args.mode != "local":
+        parser.error("--command-clocks requires local mode")
     if args.build_provenance is not None:
         try:
             measurements.validate_provenance_mode(args.mode)
@@ -602,6 +627,10 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
     record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    if args.command_clocks:
+        record["context"]["command_clocks"] = clocks.POLICY
+    if collect_costs or args.build_provenance is not None or args.command_clocks:
+        record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
     record["context"]["operation_contract_revision"] = operations.CONTRACT_REVISION
     record["context"]["summary_locale"] = operations.SUMMARY_LOCALE
     if args.cache == "source-verified":
@@ -625,8 +654,6 @@ def main(argv=None):
             if not args.no_timings:
                 raise ValueError("paired v1 requires --no-timings for identical role instrumentation")
             record["context"]["pairing"] = pairs.configuration(args.paired_seed, args.repetitions)
-        if collect_costs or args.build_provenance is not None:
-            record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
         all_directory_files = any("files_per_directory" in case for case in cases)
@@ -813,6 +840,8 @@ def main(argv=None):
                         commands = outcome["commands"]
                     else:
                         options = {"resource_time": resource_time} if resource_time is not None else {}
+                        if args.command_clocks:
+                            options["command_clocks"] = True
                         outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale, **options)
                     verification_started = time.monotonic()
                     trial.update(outcome)

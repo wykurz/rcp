@@ -67,7 +67,7 @@ def identity(context):
     result = {}
     if "pairing" in context:
         result["pairing_policy"] = context["pairing"]["policy"]
-    for key in ("local_resources", "measurement_environment"):
+    for key in ("local_resources", "measurement_environment", "command_clocks"):
         if key in context:
             result[key] = context[key]
     if "build_provenance" in context:
@@ -235,7 +235,7 @@ def _validate(run):
             raise ValueError("build provenance requires input fingerprint")
         validate_builds(declared["builds"], run["tools"])
     env = context.get("measurement_environment")
-    if any(key in context for key in ("pairing", "local_resources", "build_provenance")) and "measurement_environment" not in context:
+    if any(key in context for key in ("pairing", "local_resources", "build_provenance", "command_clocks")) and "measurement_environment" not in context:
         raise ValueError("experiment context requires measurement_environment evidence")
     if "measurement_environment" in context and (not isinstance(env, dict) or set(env) - set(ENVIRONMENT_KEYS) or any(not isinstance(value, str) for value in env.values())):
         raise ValueError("invalid measurement environment allowlist")
