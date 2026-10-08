@@ -427,7 +427,7 @@ pub struct Dir {
     /// default ACL for the copy's duration) — the ONLY two sites that clear it, via
     /// `Self::mark_children_cannot_inherit`.
     ///
-    /// Consulted ONLY by [`Self::create_file`], ONLY under `--require-toctou-safe`. The polarity is
+    /// Consulted ONLY by the file-creation helpers, ONLY under `--require-toctou-safe`. The polarity is
     /// deliberately fail-safe: a stale `true` on an already-sanitized parent costs one wasted
     /// `fremovexattr` per created file; a wrong `false` would silently reopen the containment hole
     /// (docs/acls.md, "containment"), so nothing but the two sanitizing sites may clear it — and
@@ -1636,11 +1636,43 @@ impl Dir {
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST`
     /// if a file or symlink at `name` already exists.
     pub async fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        let operation = self.file_create_operation(name, strict_operand_resolution())?;
+        run_metadata_probed_blocking(self.side, congestion::MetadataOp::OpenCreate, operation).await
+    }
+
+    /// Create a file and claim an unprobed continuation on the same blocking worker.
+    ///
+    /// Creation errors are passed to `continuation`, which can return any held source descriptor
+    /// for conflict recovery. Invalid names invoke it inline without submitting blocking work.
+    /// The outer error reports a blocking-worker failure. Cancelling before
+    /// the continuation claim destroys its captures without running it; a claimed continuation
+    /// retains the canonical blocking job's descriptor admission through completion and output drop.
+    pub(crate) async fn create_file_and_then<C, T>(
+        &self,
+        name: &OsStr,
+        continuation: C,
+    ) -> std::io::Result<T>
+    where
+        C: FnOnce(std::io::Result<std::fs::File>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let operation = match self.file_create_operation(name, strict_operand_resolution()) {
+            Ok(operation) => operation,
+            Err(error) => return Ok(continuation(Err(error))),
+        };
+        run_file_create_and_then(self.side, operation, continuation).await
+    }
+
+    fn file_create_operation(
+        &self,
+        name: &OsStr,
+        strict: bool,
+    ) -> std::io::Result<impl FnOnce() -> std::io::Result<std::fs::File> + Send + 'static + use<>>
+    {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         let dir = self.fd.clone();
-        let side = self.side;
         let name = name.to_owned();
         // the flag travels INTO the closure and is read AFTER the openat: a pre-submit snapshot
         // races the reused-dir rollback — a fail-early abort can restore the parent's default ACL
@@ -1648,9 +1680,8 @@ impl Dir {
         // rollback stores `true` before its restore syscall and this load runs after the openat;
         // syscalls order as full fences, so an openat that observed the restored ACL cannot then
         // load a stale `false`. A wasted strip on a not-yet-restored parent remains harmless.
-        let strict = strict_operand_resolution();
         let may_inherit = Arc::clone(&self.children_may_inherit);
-        run_metadata_probed_blocking(side, congestion::MetadataOp::OpenCreate, move || {
+        Ok(move || {
             let flags = OFlag::O_CREAT
                 | OFlag::O_EXCL
                 | OFlag::O_WRONLY
@@ -1660,6 +1691,8 @@ impl Dir {
             let file = openat(dir.as_fd(), name.as_bytes(), flags, file_mode)
                 .map(std::fs::File::from)
                 .map_err(nix_to_io)?;
+            #[cfg(test)]
+            let _visit = tests::gate_file_create_stage(file.as_raw_fd(), "before-sanitation");
             if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
                 // same-closure for the same reason as `make_dir`: queued work creates nothing,
                 // while work that starts runs to completion, so cancellation cannot abandon a
@@ -1673,7 +1706,6 @@ impl Dir {
             }
             Ok(file)
         })
-        .await
     }
 }
 
@@ -3621,6 +3653,8 @@ where
         admission: blocking_admission,
     })));
     let worker_job = Arc::clone(&shared_job);
+    #[cfg(test)]
+    crate::testutils::record_blocking_submission();
     let handle =
         tokio::task::spawn_blocking(move || take_blocking_job(&worker_job).map(BlockingJob::run));
     let (result, _blocking_admission) = BlockingJobWaiter { shared_job, handle }
@@ -3628,6 +3662,114 @@ where
         .map_err(std::io::Error::other)?
         .expect("blocking job disappeared while its waiter was alive");
     result
+}
+
+/// Owns one unclaimed continuation until the worker claims it or either owner cancels it.
+struct PendingContinuation<C>(Option<Arc<std::sync::Mutex<Option<C>>>>);
+
+impl<C> PendingContinuation<C> {
+    fn claim(&mut self) -> Option<C> {
+        let shared = self
+            .0
+            .take()
+            .expect("continuation already claimed or cancelled");
+        shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn cancel(&mut self) {
+        let Some(shared) = self.0.take() else {
+            return;
+        };
+        let mut pending = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // keep the lock until captured descriptors close. A worker that observes cancellation
+        // can then return without releasing its admission lease ahead of those descriptors.
+        drop(pending.take());
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<C> Drop for PendingContinuation<C> {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Cancels pending captures before the canonical waiter's queued-job lease can be released.
+    struct ContinuationWaiter<F, C> {
+        continuation: PendingContinuation<C>,
+        #[pin]
+        future: F,
+    }
+
+    impl<F, C> PinnedDrop for ContinuationWaiter<F, C> {
+        fn drop(this: Pin<&mut Self>) {
+            this.project().continuation.cancel();
+        }
+    }
+}
+
+impl<F, C> std::future::Future for ContinuationWaiter<F, C>
+where
+    F: std::future::Future,
+{
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let output = this.future.poll(cx);
+        if output.is_ready() {
+            // a completed worker has claimed or destroyed the continuation, including unwind
+            this.continuation.disarm();
+        }
+        output
+    }
+}
+
+async fn run_file_create_and_then<F, C, T>(
+    side: congestion::Side,
+    operation: F,
+    continuation: C,
+) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<std::fs::File> + Send + 'static,
+    C: FnOnce(std::io::Result<std::fs::File>) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let operation =
+        prepare_metadata_operation(side, congestion::MetadataOp::OpenCreate, operation).await;
+    let pending = Arc::new(std::sync::Mutex::new(Some(continuation)));
+    // the worker owns a second cancellation guard so a panic during creation destroys unclaimed
+    // captures before the canonical job unwinds and releases its descriptor-admission lease.
+    let mut worker_continuation = PendingContinuation(Some(Arc::clone(&pending)));
+    let future = run_fd_admitted_blocking(move || {
+        let created = operation();
+        #[cfg(test)]
+        let _visit = created.as_ref().ok().and_then(|file| {
+            tests::gate_file_create_stage(file.as_raw_fd(), "before-continuation")
+        });
+        // the operation's probe, permit, and execution timing have all finished before this claim
+        Ok(worker_continuation
+            .claim()
+            .map(|continuation| continuation(created)))
+    });
+    ContinuationWaiter {
+        continuation: PendingContinuation(Some(pending)),
+        future,
+    }
+    .await
+    .map(|output| output.expect("continuation disappeared while its waiter was alive"))
 }
 
 /// Run a blocking metadata syscall closure on the blocking pool, gated by the
@@ -3647,10 +3789,23 @@ where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let operation = prepare_metadata_operation(side, op, f).await;
+    run_fd_admitted_blocking(operation).await
+}
+
+async fn prepare_metadata_operation<F, T>(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    f: F,
+) -> impl FnOnce() -> std::io::Result<T> + Send + 'static
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     let rate = metadata_timing_scope(side, op, MetadataTimingPhase::Rate);
     throttle::get_ops_token().await;
     rate.finish();
-    run_metadata_probed_blocking_no_rate(side, op, f).await
+    prepare_metadata_operation_no_rate(side, op, f).await
 }
 
 /// Variant of [`run_metadata_probed_blocking`] for a caller that already consumed the static
@@ -3660,6 +3815,19 @@ pub async fn run_metadata_probed_blocking_no_rate<F, T>(
     op: congestion::MetadataOp,
     f: F,
 ) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let operation = prepare_metadata_operation_no_rate(side, op, f).await;
+    run_fd_admitted_blocking(operation).await
+}
+
+async fn prepare_metadata_operation_no_rate<F, T>(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    f: F,
+) -> impl FnOnce() -> std::io::Result<T> + Send + 'static
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -3674,7 +3842,7 @@ where
     let timing_dispatch = tracing::enabled!(target: "rcp::timing", tracing::Level::TRACE)
         .then(|| tracing::dispatcher::get_default(Clone::clone));
     let queue = metadata_timing_scope(side, op, MetadataTimingPhase::Queue);
-    run_fd_admitted_blocking(move || {
+    move || {
         queue.finish();
         let execution = timing_dispatch.as_ref().map(|dispatch| {
             tracing::dispatcher::with_default(dispatch, || {
@@ -3694,8 +3862,7 @@ where
             execution.finish();
         }
         result
-    })
-    .await
+    }
 }
 
 /// Convert a `nix::errno::Errno` to `std::io::Error`.
@@ -4024,6 +4191,14 @@ mod tests {
         Ok(())
     }
 
+    pub(super) fn gate_file_create_stage(
+        fd: RawFd,
+        stage: &str,
+    ) -> Option<testutils::BlockingPathGateVisit> {
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+        testutils::wait_on_blocking_path_gate(&path.join(stage), fd)
+    }
+
     mod max_files_in_flight_tests {
         use super::*;
         use anyhow::Context as _;
@@ -4074,6 +4249,532 @@ mod tests {
                         }
                     }));
             }
+        }
+
+        #[test]
+        fn cancelled_queued_file_creation_drops_payload_before_admission_without_creating()
+        -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let tmp = tempfile::tempdir()?;
+                let root =
+                    Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+                let destination = tmp.path().join("destination");
+                let source = tempfile::tempfile()?;
+                let probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+                let observation = Arc::new(std::sync::Mutex::new(None));
+                let capture = QueuedFdCapture {
+                    file: Some(source),
+                    probe,
+                    observation: Arc::clone(&observation),
+                };
+                let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let continuation_called = Arc::clone(&called);
+                let limits = testutils::AdmissionLimit::new().await;
+                limits.set_files_in_flight(1);
+                let guard = throttle::open_file_permit().await;
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                started_rx.await?;
+                let mut work = Box::pin(with_fd_admission(guard.admission(), async move {
+                    root.create_file_and_then(OsStr::new("destination"), move |created| {
+                        let _capture = capture;
+                        continuation_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                        created
+                    })
+                    .await
+                }));
+                let queued = futures::poll!(work.as_mut()).is_pending();
+                drop(guard);
+                drop(work);
+                let closed_before_release = probe.original_is_closed();
+                let drop_observation = observation.lock().unwrap().take().transpose();
+                let mut next_file = Box::pin(throttle::open_file_permit());
+                let returned = next_file.as_mut().now_or_never();
+                let capacity_returned_before_release = returned.is_some();
+                drop(release_tx);
+                blocker.await?;
+                tokio::task::spawn_blocking(|| ()).await?;
+                let permit = match returned {
+                    Some(permit) => permit,
+                    None => {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), next_file).await?
+                    }
+                };
+                drop(permit);
+                assert!(queued);
+                assert!(closed_before_release?);
+                assert!(capacity_returned_before_release);
+                assert_eq!(
+                    drop_observation?,
+                    Some(QueuedFdDropObservation {
+                        fd_was_closed: true,
+                        admission_was_retained: true,
+                    })
+                );
+                assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(
+                    !destination.exists(),
+                    "cancelled queued work created a destination"
+                );
+                Ok(())
+            })
+        }
+
+        async fn cancelled_unclaimed_file_continuation_case(
+            stage: &str,
+            strict: bool,
+        ) -> anyhow::Result<()> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = tempfile::tempdir()?;
+            if strict {
+                set_xattr_at(tmp.path(), ACL_DEFAULT_XATTR, &permissive_acl());
+            }
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let destination = tmp.path().join("destination");
+            let source = tempfile::tempfile()?;
+            let source_probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+            let observation = Arc::new(std::sync::Mutex::new(None));
+            let capture = QueuedFdCapture {
+                file: Some(source),
+                probe: source_probe,
+                observation: Arc::clone(&observation),
+            };
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let continuation_called = Arc::clone(&called);
+            let gate = testutils::BlockingPathGate::install(destination.join(stage));
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let resource = throttle::Resource::meta(
+                throttle::Side::Destination,
+                throttle::MetadataOp::OpenCreate,
+            );
+            limits.set_max_ops_in_flight(resource, 1);
+            let samples = Arc::new(congestion::testing::CollectingSink::new());
+            congestion::install_sample_sink(samples.clone());
+            let guard = throttle::open_file_permit().await;
+            let admission = guard.admission();
+            let task = tokio::spawn(with_fd_admission(admission, async move {
+                let _guard = guard;
+                let continuation = move |created| {
+                    let _capture = capture;
+                    continuation_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    created
+                };
+                if strict {
+                    let operation = root.file_create_operation(OsStr::new("destination"), true)?;
+                    run_file_create_and_then(congestion::Side::Destination, operation, continuation)
+                        .await
+                } else {
+                    root.create_file_and_then(OsStr::new("destination"), continuation)
+                        .await
+                }
+            }));
+            let mut next_operation = Box::pin(throttle::ops_in_flight_permit(resource));
+            let (
+                cancelled,
+                (
+                    created_probe,
+                    source_closed,
+                    mode,
+                    acquired_operation,
+                    sample_count,
+                    inherited_acl,
+                ),
+            ) = testutils::cancel_at_blocking_path(
+                limits,
+                gate,
+                task,
+                std::time::Duration::from_secs(20),
+                |fd| {
+                    (
+                        testutils::FdIdentityProbe::capture(fd),
+                        source_probe.original_is_closed(),
+                        std::fs::metadata(&destination)
+                            .map(|meta| meta.permissions().mode() & 0o7777),
+                        next_operation.as_mut().now_or_never(),
+                        samples.metadata_count(),
+                        strict.then(|| get_xattr_at(&destination, ACL_ACCESS_XATTR).is_some()),
+                    )
+                },
+            )
+            .await?;
+            let operation_was_finished = acquired_operation.is_some();
+            let permit = match acquired_operation {
+                Some(permit) => permit,
+                None => {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), next_operation).await?
+                }
+            };
+            drop(permit);
+            assert!(cancelled.waiter_was_cancelled);
+            assert!(cancelled.admission_was_retained_while_work_gated);
+            assert!(cancelled.fd_was_open_while_work_gated);
+            assert!(
+                source_closed?,
+                "unclaimed payload retained its captured source after cancellation"
+            );
+            assert_eq!(mode?, DST_FILE_CREATE_MODE);
+            assert_eq!(operation_was_finished, stage == "before-continuation");
+            assert_eq!(sample_count, usize::from(stage == "before-continuation"));
+            assert_eq!(samples.metadata_count(), 1);
+            assert!(created_probe?.original_is_closed()?);
+            assert_eq!(
+                observation.lock().unwrap().take().transpose()?,
+                Some(QueuedFdDropObservation {
+                    fd_was_closed: true,
+                    admission_was_retained: true,
+                })
+            );
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(cancelled.final_hit_count, 1);
+            assert_eq!(
+                std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
+                DST_FILE_CREATE_MODE
+            );
+            assert_eq!(std::fs::metadata(&destination)?.len(), 0);
+            if strict {
+                assert_eq!(inherited_acl, Some(stage == "before-sanitation"));
+                assert_eq!(get_xattr_at(&destination, ACL_ACCESS_XATTR), None);
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn cancelled_created_file_never_starts_an_unclaimed_payload() -> anyhow::Result<()> {
+            for stage in ["before-sanitation", "before-continuation"] {
+                cancelled_unclaimed_file_continuation_case(stage, false).await?;
+            }
+            Ok(())
+        }
+
+        #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+        #[tokio::test]
+        async fn cancelled_file_creation_finishes_acl_sanitation_without_starting_payload()
+        -> anyhow::Result<()> {
+            for stage in ["before-sanitation", "before-continuation"] {
+                cancelled_unclaimed_file_continuation_case(stage, true).await?;
+            }
+            Ok(())
+        }
+
+        async fn cancelled_claimed_file_continuation_case(
+            fail_payload: bool,
+        ) -> anyhow::Result<()> {
+            use std::io::{Seek as _, Write as _};
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = tempfile::tempdir()?;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let destination = tmp.path().join("destination");
+            let mut source = tempfile::tempfile()?;
+            source.write_all(b"complete payload")?;
+            source.rewind()?;
+            let source_probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+            let gate = testutils::BlockingPathGate::install(&destination);
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let resource = throttle::Resource::meta(
+                throttle::Side::Destination,
+                throttle::MetadataOp::OpenCreate,
+            );
+            limits.set_max_ops_in_flight(resource, 1);
+            let samples = Arc::new(congestion::testing::CollectingSink::new());
+            congestion::install_sample_sink(samples.clone());
+            let guard = throttle::open_file_permit().await;
+            let admission = guard.admission();
+            let data_path = destination.clone();
+            let task = tokio::spawn(with_fd_admission(admission, async move {
+                let _guard = guard;
+                root.create_file_and_then(OsStr::new("destination"), move |created| {
+                    let mut file = created?;
+                    let visit = testutils::wait_on_blocking_path_gate(&data_path, file.as_raw_fd());
+                    let copied = if fail_payload {
+                        file.write_all(b"partial")
+                            .and_then(|()| Err(std::io::Error::from_raw_os_error(libc::EIO)))
+                    } else {
+                        std::io::copy(&mut source, &mut file).map(|_| ())
+                    };
+                    std::io::Result::Ok((copied, source, file, visit))
+                })
+                .await
+            }));
+            let (cancelled, (source_open, mode, operation_available, sample_count)) =
+                testutils::cancel_at_blocking_path(
+                    limits,
+                    gate,
+                    task,
+                    std::time::Duration::from_secs(20),
+                    |_| {
+                        (
+                            source_probe.original_is_closed().map(|closed| !closed),
+                            std::fs::metadata(&destination)
+                                .map(|meta| meta.permissions().mode() & 0o7777),
+                            throttle::ops_in_flight_permit(resource)
+                                .now_or_never()
+                                .is_some(),
+                            samples.metadata_count(),
+                        )
+                    },
+                )
+                .await?;
+            assert!(cancelled.waiter_was_cancelled);
+            assert!(cancelled.admission_was_retained_while_work_gated);
+            assert!(cancelled.fd_was_open_while_work_gated && source_open?);
+            assert!(cancelled.fd_was_closed_at_output_drop_start);
+            assert!(cancelled.admission_was_retained_at_output_drop_start);
+            assert!(source_probe.original_is_closed()?);
+            assert!(
+                operation_available,
+                "payload retained the OpenCreate operation permit"
+            );
+            assert_eq!(
+                sample_count, 1,
+                "payload started before its metadata probe finished"
+            );
+            assert_eq!(samples.metadata_count(), 1);
+            assert_eq!(cancelled.final_hit_count, 1);
+            assert_eq!(mode?, DST_FILE_CREATE_MODE);
+            assert_eq!(
+                std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
+                DST_FILE_CREATE_MODE
+            );
+            assert_eq!(
+                std::fs::read(destination)?,
+                if fail_payload {
+                    b"partial".as_slice()
+                } else {
+                    b"complete payload".as_slice()
+                }
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn cancelled_started_file_continuation_keeps_fds_until_abandoned_output_drops()
+        -> anyhow::Result<()> {
+            cancelled_claimed_file_continuation_case(false).await
+        }
+
+        #[tokio::test]
+        async fn cancelled_failed_file_continuation_keeps_fds_until_abandoned_output_drops()
+        -> anyhow::Result<()> {
+            cancelled_claimed_file_continuation_case(true).await
+        }
+
+        #[tokio::test]
+        async fn panicking_file_create_closes_unclaimed_payload_before_its_admission_lease()
+        -> anyhow::Result<()> {
+            let source = tempfile::tempfile()?;
+            let probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+            let observation = Arc::new(std::sync::Mutex::new(None));
+            let capture = QueuedFdCapture {
+                file: Some(source),
+                probe,
+                observation: Arc::clone(&observation),
+            };
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let continuation_called = Arc::clone(&called);
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let guard = throttle::open_file_permit().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut work = Box::pin(with_fd_admission(guard.admission(), async move {
+                run_file_create_and_then(
+                    congestion::Side::Destination,
+                    move || -> std::io::Result<std::fs::File> {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                        panic!("injected file-create panic");
+                    },
+                    move |_created| {
+                        let _capture = capture;
+                        continuation_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await
+            }));
+            let pending = futures::poll!(work.as_mut()).is_pending();
+            drop(guard);
+            let started = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx).await;
+            drop(release_tx);
+            let result = work.await;
+            assert!(pending);
+            started??;
+            assert!(result.is_err(), "worker panic must fail the create waiter");
+            assert!(probe.original_is_closed()?);
+            assert_eq!(
+                observation.lock().unwrap().take().transpose()?,
+                Some(QueuedFdDropObservation {
+                    fd_was_closed: true,
+                    admission_was_retained: true,
+                })
+            );
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                throttle::open_file_permit(),
+            )
+            .await?;
+            drop(permit);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn cancelled_file_creation_waiting_for_opencreate_never_submits_or_runs_payload()
+        -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let destination = tmp.path().join("destination");
+            let source = tempfile::tempfile()?;
+            let probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+            let observation = Arc::new(std::sync::Mutex::new(None));
+            let capture = QueuedFdCapture {
+                file: Some(source),
+                probe,
+                observation: Arc::clone(&observation),
+            };
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let continuation_called = Arc::clone(&called);
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let resource = throttle::Resource::meta(
+                throttle::Side::Destination,
+                throttle::MetadataOp::OpenCreate,
+            );
+            limits.set_max_ops_in_flight(resource, 1);
+            let occupied = throttle::ops_in_flight_permit(resource).await;
+            let guard = throttle::open_file_permit().await;
+            let submissions = testutils::BlockingSubmissions::start(false);
+            let samples = Arc::new(congestion::testing::CollectingSink::new());
+            congestion::install_sample_sink(samples.clone());
+            let mut work = Box::pin(with_fd_admission(guard.admission(), async move {
+                root.create_file_and_then(OsStr::new("destination"), move |created| {
+                    let _capture = capture;
+                    continuation_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    created
+                })
+                .await
+            }));
+            let waiting = futures::poll!(work.as_mut()).is_pending();
+            let source_was_open = probe.original_is_closed().map(|closed| !closed);
+            drop(work);
+            let source_closed_while_outer_admitted = probe.original_is_closed();
+            let outer_admission_retained = throttle::open_file_permit().now_or_never().is_none();
+            let drop_observation = observation.lock().unwrap().take().transpose();
+            drop(occupied);
+            drop(guard);
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                throttle::open_file_permit(),
+            )
+            .await?;
+            drop(permit);
+            assert!(waiting && source_was_open?);
+            assert!(source_closed_while_outer_admitted?);
+            assert!(outer_admission_retained);
+            assert_eq!(
+                drop_observation?,
+                Some(QueuedFdDropObservation {
+                    fd_was_closed: true,
+                    admission_was_retained: true,
+                })
+            );
+            assert_eq!(submissions.count(), 0);
+            assert_eq!(samples.metadata_count(), 0);
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!destination.exists());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn panicking_claimed_file_continuation_closes_both_fds_before_admission()
+        -> anyhow::Result<()> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = tempfile::tempdir()?;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let destination = tmp.path().join("destination");
+            let source = tempfile::tempfile()?;
+            let source_probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+            let source_observation = Arc::new(std::sync::Mutex::new(None));
+            let destination_observation = Arc::new(std::sync::Mutex::new(None));
+            let payload_destination_observation = Arc::clone(&destination_observation);
+            let source_capture = QueuedFdCapture {
+                file: Some(source),
+                probe: source_probe,
+                observation: Arc::clone(&source_observation),
+            };
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let guard = throttle::open_file_permit().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut work = Box::pin(with_fd_admission(guard.admission(), async move {
+                root.create_file_and_then(
+                    OsStr::new("destination"),
+                    move |created| -> std::io::Result<()> {
+                        let _source = source_capture;
+                        let file = created?;
+                        let probe = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+                        let _destination = QueuedFdCapture {
+                            file: Some(file),
+                            probe,
+                            observation: payload_destination_observation,
+                        };
+                        let _ = started_tx.send(probe);
+                        let _ = release_rx.recv();
+                        panic!("injected claimed file-continuation panic");
+                    },
+                )
+                .await
+            }));
+            let pending = futures::poll!(work.as_mut()).is_pending();
+            drop(guard);
+            let started = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx).await;
+            let source_was_open = source_probe.original_is_closed().map(|closed| !closed);
+            let destination_was_open = match &started {
+                Ok(Ok(probe)) => Some(probe.original_is_closed().map(|closed| !closed)),
+                _ => None,
+            };
+            let admission_was_retained = throttle::open_file_permit().now_or_never().is_none();
+            drop(release_tx);
+            let result = work.await;
+            let destination_probe = started??;
+            assert!(pending);
+            assert!(source_was_open? && destination_was_open.transpose()?.unwrap());
+            assert!(admission_was_retained);
+            assert!(
+                result.is_err(),
+                "claimed continuation panic must fail the waiter"
+            );
+            assert!(source_probe.original_is_closed()? && destination_probe.original_is_closed()?);
+            for observation in [source_observation, destination_observation] {
+                assert_eq!(
+                    observation.lock().unwrap().take().transpose()?,
+                    Some(QueuedFdDropObservation {
+                        fd_was_closed: true,
+                        admission_was_retained: true,
+                    })
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(destination)?.permissions().mode() & 0o7777,
+                DST_FILE_CREATE_MODE
+            );
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                throttle::open_file_permit(),
+            )
+            .await?;
+            drop(permit);
+            Ok(())
         }
 
         /// Dropping a queued blocking waiter must synchronously close its captured fd and return

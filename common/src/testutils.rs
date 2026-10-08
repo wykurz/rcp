@@ -22,6 +22,73 @@ pub(crate) fn copy_file_range_calls() -> usize {
     COPY_FILE_RANGE_CALLS.get()
 }
 
+// a runtime-scoped observer includes spawned walk tasks without counting concurrent tests
+#[cfg(test)]
+static BLOCKING_SUBMISSIONS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<tokio::runtime::Id, std::sync::Arc<SubmissionState>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+struct SubmissionState {
+    count: std::sync::atomic::AtomicUsize,
+    separate_copy_jobs: bool,
+}
+
+/// Observes canonical blocking submissions in one runtime and optionally exercises separate jobs.
+#[cfg(test)]
+pub(crate) struct BlockingSubmissions {
+    runtime: tokio::runtime::Id,
+    state: std::sync::Arc<SubmissionState>,
+}
+
+#[cfg(test)]
+impl BlockingSubmissions {
+    pub(crate) fn start(separate_copy_jobs: bool) -> Self {
+        let runtime = tokio::runtime::Handle::current().id();
+        let state = std::sync::Arc::new(SubmissionState {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            separate_copy_jobs,
+        });
+        assert!(
+            lock_unpoisoned(&BLOCKING_SUBMISSIONS)
+                .insert(runtime, state.clone())
+                .is_none()
+        );
+        Self { runtime, state }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.state.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlockingSubmissions {
+    fn drop(&mut self) {
+        lock_unpoisoned(&BLOCKING_SUBMISSIONS).remove(&self.runtime);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_blocking_submission() {
+    let runtime = tokio::runtime::Handle::current().id();
+    if let Some(state) = lock_unpoisoned(&BLOCKING_SUBMISSIONS).get(&runtime) {
+        state
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn separate_copy_jobs() -> bool {
+    let runtime = tokio::runtime::Handle::current().id();
+    lock_unpoisoned(&BLOCKING_SUBMISSIONS)
+        .get(&runtime)
+        .is_some_and(|state| state.separate_copy_jobs)
+}
+
 /// A positioned-I/O fixture that interrupts once and limits successful writes.
 #[cfg(test)]
 pub(crate) struct InterruptedFile {
