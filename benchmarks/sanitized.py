@@ -372,7 +372,7 @@ def project_experiment(run, result, cases, variants):
             reference_trial=pair['reference_trial'], candidate_over_reference=pair['candidate_over_reference'],
             run_status=run['status'], completed_case=True, acceptance_evaluated=False) for pair in pairs.comparisons(run)]
     if "command_clocks" in context:
-        result["command_clocks"] = dict(policy=clocks.POLICY, qualification=clocks.QUALIFICATION)
+        result["command_clocks"] = dict(policy=context["command_clocks"], qualification=clocks.QUALIFICATION)
     resources = context.get('local_resources')
     if resources is not None:
         result['local_resources'] = dict(policy=measurements.POLICY, scope=measurements.SCOPE,

@@ -4,32 +4,67 @@ import time
 
 
 POLICY = "command-boundary-bracketed-v1"
+SUPPORTED_POLICIES = frozenset({"command-boundary-bracketed-v1"})
 QUALIFICATION = "Clock observations qualify timing only; elapsed_seconds and timeouts remain monotonic. RAW is not an external reference and durations are never rescaled. Bounds apply to sequential observations, not accuracy or exact command duration; scheduling can delay samples relative to command timestamps."
 READINGS = ("monotonic_before", "raw", "realtime", "monotonic_after")
 REASONS = frozenset({"unsupported", "read_failed"})
+STATUSES = frozenset({"bounded", "no_completed_child", "monotonic_unavailable", "monotonic_regressed"})
+_UNSUPPORTED, _READ_FAILED = object(), object()
+_READ_ERRORS = (OSError, ValueError, OverflowError, NotImplementedError)
 COMPARISON_KEYS = ("start_read_skew_ns", "finish_read_skew_ns", "monotonic_elapsed_bounds_ns",
                    "raw_elapsed_ns", "realtime_elapsed_ns", "raw_minus_monotonic_bounds_ns",
                    "realtime_minus_monotonic_bounds_ns")
 
 
-def _read(function, *args):
-    if function is None:
+def _reading(value):
+    if value is _UNSUPPORTED:
         return dict(unavailable="unsupported")
-    try:
-        return dict(value_ns=function(*args))
-    except (OSError, ValueError, OverflowError, NotImplementedError):
+    if value is _READ_FAILED:
         return dict(unavailable="read_failed")
+    return dict(value_ns=value)
 
 
 def sample():
     """Bracket sequential RAW and REALTIME reads with MONOTONIC reads."""
     monotonic = getattr(time, "monotonic_ns", None)
-    before = _read(monotonic)
+    raw_reader = getattr(time, "clock_gettime_ns", None)
     raw_id = getattr(time, "CLOCK_MONOTONIC_RAW", None)
-    raw = _read(getattr(time, "clock_gettime_ns", None), raw_id) if raw_id is not None else dict(unavailable="unsupported")
-    realtime = _read(getattr(time, "time_ns", None))
-    after = _read(monotonic)
-    return dict(monotonic_before=before, raw=raw, realtime=realtime, monotonic_after=after)
+    realtime_reader = getattr(time, "time_ns", None)
+    before = raw = realtime = after = _UNSUPPORTED
+    try:
+        if monotonic is not None:
+            before = monotonic()
+    except InterruptedError:
+        raise
+    except _READ_ERRORS:
+        before = _READ_FAILED
+    try:
+        if raw_reader is not None and raw_id is not None:
+            raw = raw_reader(raw_id)
+    except InterruptedError:
+        raise
+    except _READ_ERRORS:
+        raw = _READ_FAILED
+    try:
+        if realtime_reader is not None:
+            realtime = realtime_reader()
+    except InterruptedError:
+        raise
+    except _READ_ERRORS:
+        realtime = _READ_FAILED
+    try:
+        if monotonic is not None:
+            after = monotonic()
+    except InterruptedError:
+        raise
+    except _READ_ERRORS:
+        after = _READ_FAILED
+    return dict(monotonic_before=_reading(before), raw=_reading(raw), realtime=_reading(realtime), monotonic_after=_reading(after))
+
+
+def unavailable_sample():
+    """Record a failed boundary sample without retaining exception details."""
+    return {clock: dict(unavailable="read_failed") for clock in READINGS}
 
 
 def _value(sample, clock):
@@ -50,10 +85,8 @@ def compare(start, finish):
         result["status"] = "no_completed_child"
     elif any(value is None for value in (before, after, end_before, end_after)):
         result["status"] = "monotonic_unavailable"
-    elif after < before or end_after < end_before or end_after < before:
+    elif not before <= after <= end_before <= end_after:
         result["status"] = "monotonic_regressed"
-    elif end_before < after:
-        result["status"] = "overlapping_brackets"
     else:
         result["monotonic_elapsed_bounds_ns"] = [end_before - after, end_after - before]
     for clock in ("raw", "realtime"):
@@ -65,7 +98,12 @@ def compare(start, finish):
 
 
 def observation(start, finish, index):
-    return dict(start=start, finish=finish, finish_command_index=index, comparison=compare(start, finish))
+    return dict(start=start, finish=finish, finish_command_index=index)
+
+
+def comparison(value):
+    """Derive current diagnostics from the stored primitive observations."""
+    return compare(value["start"], value["finish"])
 
 
 def _sample(value):
@@ -82,20 +120,10 @@ def _sample(value):
             raise ValueError("invalid command clock availability")
 
 
-def _exact(actual, expected):
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(_exact(actual[key], item) for key, item in expected.items())
-    if isinstance(expected, list):
-        return len(actual) == len(expected) and all(_exact(a, b) for a, b in zip(actual, expected))
-    return actual == expected
-
-
 def validate_observation(value, exit_codes):
     if not isinstance(exit_codes, list) or any(type(code) is not int for code in exit_codes):
         raise ValueError("command clocks require completed integer exit codes")
-    if not isinstance(value, dict) or set(value) != {"start", "finish", "finish_command_index", "comparison"}:
+    if not isinstance(value, dict) or set(value) != {"start", "finish", "finish_command_index"}:
         raise ValueError("invalid command clock observation")
     _sample(value["start"])
     index = value["finish_command_index"]
@@ -106,14 +134,12 @@ def validate_observation(value, exit_codes):
         _sample(value["finish"])
         if type(index) is not int or not 0 <= index < len(exit_codes):
             raise ValueError("invalid command clock completion index")
-    if not _exact(value["comparison"], compare(value["start"], value["finish"])):
-        raise ValueError("command clock comparison differs from its observations")
 
 
 def validate(run):
     context = run["context"]
     enabled = "command_clocks" in context
-    if enabled and (context["command_clocks"] != POLICY or context.get("topology") != "local"):
+    if enabled and (not isinstance(context["command_clocks"], str) or context["command_clocks"] not in SUPPORTED_POLICIES or context.get("topology") != "local"):
         raise ValueError("command clocks require the supported local policy")
     for row in run["trials"]:
         if "command_clocks" in row:
@@ -126,12 +152,24 @@ def validate(run):
 
 def project(value):
     """Export only availability and derived seconds, withholding clock epochs."""
-    result = dict(finish_command_index=value["finish_command_index"], status=value["comparison"]["status"],
+    observed = comparison(value)
+    if not isinstance(observed["status"], str) or observed["status"] not in STATUSES:
+        raise ValueError("invalid command clock comparison status")
+    result = dict(finish_command_index=value["finish_command_index"], status=observed["status"],
                   epochs_withheld=True, availability={})
     for boundary in ("start", "finish"):
         record = value[boundary]
-        result["availability"][boundary] = {clock: record[clock].get("unavailable", "available") for clock in READINGS} if record is not None else None
+        if record is None:
+            result["availability"][boundary] = None
+            continue
+        available = {}
+        for clock in READINGS:
+            reason = record[clock].get("unavailable", "available")
+            if not isinstance(reason, str) or reason not in REASONS | {"available"}:
+                raise ValueError("invalid command clock availability")
+            available[clock] = reason
+        result["availability"][boundary] = available
     for key in COMPARISON_KEYS:
-        raw = value["comparison"][key]
+        raw = observed[key]
         result[key.removesuffix("_ns") + "_seconds"] = [item / 1e9 for item in raw] if isinstance(raw, list) else raw / 1e9 if raw is not None else None
     return result
