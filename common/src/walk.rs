@@ -29,7 +29,7 @@ use anyhow::Context;
 ///
 /// This preserves [`std::path::Path::join`] semantics, including lexical components, absolute
 /// suffix replacement, and the trailing separator added by an empty suffix. Callers that use an
-/// empty suffix to mean the root verbatim must continue to handle that case themselves.
+/// empty suffix to mean the root verbatim should use [`join_rel`].
 #[must_use]
 pub(crate) fn join_path(base: &std::path::Path, suffix: &std::path::Path) -> std::path::PathBuf {
     let mut path =
@@ -37,6 +37,16 @@ pub(crate) fn join_path(base: &std::path::Path, suffix: &std::path::Path) -> std
     path.push(base);
     path.push(suffix);
     path
+}
+
+/// Reconstruct a logical entry path, preserving the root operand verbatim for an empty coordinate.
+#[must_use]
+pub(crate) fn join_rel(root: &std::path::Path, rel_path: &std::path::Path) -> std::path::PathBuf {
+    if rel_path.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        join_path(root, rel_path)
+    }
 }
 
 /// Classification of a filesystem entry by type.
@@ -869,6 +879,30 @@ mod tests {
             let actual = join_path(base, suffix);
             assert_eq!(actual.as_os_str().as_bytes(), expected);
             assert_eq!(actual.as_os_str(), base.join(suffix).as_os_str());
+        }
+    }
+
+    #[test]
+    fn relative_join_preserves_root_operand_and_non_utf8_components() {
+        use std::os::unix::ffi::OsStrExt;
+        for (root, relative, expected) in [
+            (
+                b"file\xff".as_slice(),
+                b"".as_slice(),
+                b"file\xff".as_slice(),
+            ),
+            (b"source//./file\xff", b"", b"source//./file\xff"),
+            (
+                b"source//./",
+                b"branch\xff/leaf\xfe",
+                b"source//./branch\xff/leaf\xfe",
+            ),
+        ] {
+            let joined = join_rel(
+                std::path::Path::new(OsStr::from_bytes(root)),
+                std::path::Path::new(OsStr::from_bytes(relative)),
+            );
+            assert_eq!(joined.as_os_str().as_bytes(), expected);
         }
     }
 

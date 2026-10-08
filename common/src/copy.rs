@@ -743,11 +743,7 @@ impl CopyVisitor {
     /// root verbatim when `rel_path` is empty — joining an empty `rel_path` would append a trailing
     /// separator that `canonicalize`/ENOTDIR-sensitive paths reject).
     fn dst_path_for(&self, cx: &EntryCx) -> PathBuf {
-        if cx.rel_path.as_os_str().is_empty() {
-            self.dst_root.clone()
-        } else {
-            crate::walk::join_path(&self.dst_root, &cx.rel_path)
-        }
+        crate::walk::join_rel(&self.dst_root, &cx.rel_path)
     }
 
     /// The destination entry's name within its parent. For nested entries this equals the source
@@ -1119,11 +1115,7 @@ impl WalkVisitor for CopyVisitor {
     ) -> Summary {
         // mirror `copy_dir_contents`'s inline filter-skip: the dry-run "skip ..." line plus the
         // matching `*_skipped` counter. the driver already did the shared progress increment.
-        if let Some(mode) = self.settings.dry_run
-            && mode != crate::config::DryRunMode::Brief
-        {
-            crate::dry_run::report_skip(cx.real_path(), skip_result, mode, kind.label());
-        }
+        cx.report_skip(self.settings.dry_run, skip_result, kind);
         skipped_summary_for(kind)
     }
 

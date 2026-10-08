@@ -316,7 +316,6 @@ fn dry_run_makes_no_changes() {
 fn dry_run_filter_skip_preserves_nested_non_utf8_paths() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
-
     let d = tempfile::tempdir().unwrap();
     let nested = d.path().join(OsString::from_vec(b"nested-\xff".to_vec()));
     std::fs::create_dir(&nested).unwrap();
