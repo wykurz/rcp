@@ -8,7 +8,8 @@ use crate::progress::Progress;
 use crate::safedir::{self, Dir, FileMeta, Handle};
 use crate::walk::{AdmittedLeaf, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPostInput, DirPreResult, EntryCx, WalkVisitor, process_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, SkippedEntry, WalkVisitor,
+    process_entry,
 };
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
@@ -1079,20 +1080,26 @@ impl WalkVisitor for ChmodVisitor {
         self.settings.fail_early
     }
 
+    fn name_collection(&self) -> NameCollection {
+        NameCollection::None
+    }
+
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
         self.settings.filter.as_ref()
     }
 
     fn on_skip(
         &self,
-        cx: &EntryCx,
+        cx: &SkippedEntry<'_>,
         kind: EntryKind,
         skip_result: &crate::filter::FilterResult,
     ) -> Summary {
         // mirror the old spawn loop's inline filter-skip: the dry-run "skip ..." line plus the
         // matching `*_skipped` counter. the driver already did the shared progress increment.
-        if let Some(mode) = self.settings.dry_run {
-            crate::dry_run::report_skip(&cx.real_path, skip_result, mode, kind.label());
+        if let Some(mode) = self.settings.dry_run
+            && mode != crate::config::DryRunMode::Brief
+        {
+            crate::dry_run::report_skip(cx.real_path(), skip_result, mode, kind.label());
         }
         skipped_summary_for(kind)
     }

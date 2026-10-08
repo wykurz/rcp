@@ -25,6 +25,20 @@ use crate::progress::Progress;
 use crate::timing::metadata::{Phase as MetadataTimingPhase, scope as metadata_timing_scope};
 use anyhow::Context;
 
+/// Join paths with capacity for both components and a separator before copying either one.
+///
+/// This preserves [`std::path::Path::join`] semantics, including lexical components, absolute
+/// suffix replacement, and the trailing separator added by an empty suffix. Callers that use an
+/// empty suffix to mean the root verbatim must continue to handle that case themselves.
+#[must_use]
+pub(crate) fn join_path(base: &std::path::Path, suffix: &std::path::Path) -> std::path::PathBuf {
+    let mut path =
+        std::path::PathBuf::with_capacity(base.as_os_str().len() + 1 + suffix.as_os_str().len());
+    path.push(base);
+    path.push(suffix);
+    path
+}
+
 /// Classification of a filesystem entry by type.
 ///
 /// `Special` covers sockets, FIFOs, block/character devices — anything that
@@ -827,6 +841,36 @@ mod tests {
     use crate::testutils;
     use std::ffi::OsStr;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn joined_paths_preserve_literal_bytes_and_join_semantics() {
+        use std::os::unix::ffi::OsStrExt;
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"", b"", b""),
+            (b"", b"leaf", b"leaf"),
+            (b"root", b"", b"root/"),
+            (b"root/", b"", b"root/"),
+            (b"/", b"leaf", b"/leaf"),
+            (b"/", b"", b"/"),
+            (b"root", b"leaf", b"root/leaf"),
+            (b"root//./", b"branch//../leaf", b"root//./branch//../leaf"),
+            (b"./root/..", b"./leaf/", b"./root/.././leaf/"),
+            (b"root/.", b"leaf", b"root/./leaf"),
+            (b"root", b"/replacement//leaf", b"/replacement//leaf"),
+            (
+                b"root\xfe",
+                b"branch\xff/leaf\xfd",
+                b"root\xfe/branch\xff/leaf\xfd",
+            ),
+        ];
+        for &(base, suffix, expected) in cases {
+            let base = std::path::Path::new(OsStr::from_bytes(base));
+            let suffix = std::path::Path::new(OsStr::from_bytes(suffix));
+            let actual = join_path(base, suffix);
+            assert_eq!(actual.as_os_str().as_bytes(), expected);
+            assert_eq!(actual.as_os_str(), base.join(suffix).as_os_str());
+        }
+    }
 
     fn include_filter(pattern: &str) -> Option<FilterSettings> {
         let mut f = FilterSettings::new();

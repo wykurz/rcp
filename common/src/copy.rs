@@ -17,7 +17,7 @@ use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::safedir::{self, Dir, FileMeta, Handle, RemovalSnapshot};
 use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, WalkVisitor,
+    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, SkippedEntry, WalkVisitor,
     process_admitted_entry, process_entry,
 };
 
@@ -746,7 +746,7 @@ impl CopyVisitor {
         if cx.rel_path.as_os_str().is_empty() {
             self.dst_root.clone()
         } else {
-            self.dst_root.join(&cx.rel_path)
+            crate::walk::join_path(&self.dst_root, &cx.rel_path)
         }
     }
 
@@ -1113,14 +1113,16 @@ impl WalkVisitor for CopyVisitor {
 
     fn on_skip(
         &self,
-        cx: &EntryCx,
+        cx: &SkippedEntry<'_>,
         kind: EntryKind,
         skip_result: &crate::filter::FilterResult,
     ) -> Summary {
         // mirror `copy_dir_contents`'s inline filter-skip: the dry-run "skip ..." line plus the
         // matching `*_skipped` counter. the driver already did the shared progress increment.
-        if let Some(mode) = self.settings.dry_run {
-            crate::dry_run::report_skip(&cx.real_path, skip_result, mode, kind.label());
+        if let Some(mode) = self.settings.dry_run
+            && mode != crate::config::DryRunMode::Brief
+        {
+            crate::dry_run::report_skip(cx.real_path(), skip_result, mode, kind.label());
         }
         skipped_summary_for(kind)
     }

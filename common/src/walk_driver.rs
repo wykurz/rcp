@@ -113,7 +113,7 @@ pub trait WalkSummary: Default + std::ops::Add<Output = Self> + Send + Sized + '
 
 impl<T> WalkSummary for T where T: Default + std::ops::Add<Output = T> + Send + Sized + 'static {}
 
-/// Owned per-entry context handed to every [`WalkVisitor`] method.
+/// Owned per-entry context handed to entry-processing [`WalkVisitor`] methods.
 ///
 /// All fields are owned so the whole context can move into a spawned task (tasks
 /// are `'static`). It carries the hardened parent [`Dir`] (an `Arc`, cloned, never
@@ -172,28 +172,65 @@ impl EntryCx {
         self
     }
 
-    /// Build the child context for `child_name` within `child_dir`, extending the
-    /// accumulated `rel_path`/`real_path` by one component. `child_dir`
-    /// is the hardened directory the child lives in (for a directory entry's
-    /// contents, the opened directory itself; for the root, the root directory).
+    /// Build a scheduled child's owned context, reusing its already-computed logical path.
+    /// `child_dir` is the hardened directory containing `child_name`; only the display path still
+    /// needs extending here, after any hint-only exclusion has been considered.
     #[must_use]
-    fn child(&self, child_dir: Arc<Dir>, child_name: OsString) -> EntryCx {
+    fn child(&self, child_dir: Arc<Dir>, child_name: OsString, rel_path: PathBuf) -> EntryCx {
         EntryCx {
             parent: child_dir,
-            rel_path: join_child_path(&self.rel_path, &child_name),
-            real_path: join_child_path(&self.real_path, &child_name),
+            rel_path,
+            real_path: walk::join_path(&self.real_path, Path::new(&child_name)),
             name: child_name,
             prog_track: self.prog_track,
         }
     }
 }
 
-// reserve the existing prefix and child together so extending a nonempty path needs one allocation
-fn join_child_path(base: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let mut path = PathBuf::with_capacity(base.as_os_str().len() + 1 + name.len());
-    path.push(base);
-    path.push(name);
-    path
+/// Borrowed diagnostics for a filtered entry, without filesystem authority.
+///
+/// An exact exclusion borrows its existing display path. A hint-only exclusion builds its display
+/// path only if logging or dry-run reporting requests it; neither form owns a directory handle.
+pub struct SkippedEntry<'a> {
+    /// The excluded entry's name within its enumerated parent.
+    pub name: &'a std::ffi::OsStr,
+    real_path: SkippedPath<'a>,
+}
+
+enum SkippedPath<'a> {
+    Existing(&'a Path),
+    Child {
+        parent: &'a Path,
+        joined: std::cell::OnceCell<PathBuf>,
+    },
+}
+
+impl<'a> SkippedEntry<'a> {
+    fn from_entry(cx: &'a EntryCx) -> Self {
+        Self {
+            name: &cx.name,
+            real_path: SkippedPath::Existing(&cx.real_path),
+        }
+    }
+    fn child(parent: &'a Path, name: &'a std::ffi::OsStr) -> Self {
+        Self {
+            name,
+            real_path: SkippedPath::Child {
+                parent,
+                joined: std::cell::OnceCell::new(),
+            },
+        }
+    }
+    /// Return the display path, constructing and caching it only when needed.
+    #[must_use]
+    pub fn real_path(&self) -> &Path {
+        match &self.real_path {
+            SkippedPath::Existing(path) => path,
+            SkippedPath::Child { parent, joined } => {
+                joined.get_or_init(|| walk::join_path(parent, Path::new(self.name)))
+            }
+        }
+    }
 }
 
 /// What a [`WalkVisitor::dir_pre`] decided to do with a directory entry.
@@ -390,14 +427,15 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// visitor receives either the reliable kind that rejected cheaply or the exact classified kind
     /// from its final recheck. `skip_result` is the `FilterResult` that caused the exclusion. The
     /// driver still increments the shared progress counter via [`EntryKind::inc_skipped`] — override
-    /// only to add the summary counters and the `--dry-run` "skip …" line.
+    /// only to add the summary counters and the `--dry-run` "skip …" line. [`SkippedEntry`]
+    /// supplies diagnostics only; its display path remains lazy until requested.
     ///
     /// The default does nothing (returns `Default`), which suits metadata-only
     /// walks and the smoke tests; copy/chmod/rm override it to mirror their
     /// existing `skipped_summary_for` + `report_skip` behavior.
     fn on_skip(
         &self,
-        _cx: &EntryCx,
+        _cx: &SkippedEntry<'_>,
         _kind: EntryKind,
         _skip_result: &crate::filter::FilterResult,
     ) -> Self::Summary {
@@ -731,13 +769,14 @@ where
 /// Produces one filtered exclusion's shared progress and visitor-owned summary.
 fn filter_skip_summary<V: WalkVisitor>(
     visitor: &V,
-    child_cx: &EntryCx,
+    skipped: &SkippedEntry<'_>,
+    prog_track: &Progress,
     kind: EntryKind,
     skip_result: &crate::filter::FilterResult,
 ) -> V::Summary {
-    tracing::debug!("skipping {:?} due to filter", &child_cx.real_path);
-    kind.inc_skipped(child_cx.prog_track);
-    visitor.on_skip(child_cx, kind, skip_result)
+    tracing::debug!("skipping {:?} due to filter", skipped.real_path());
+    kind.inc_skipped(prog_track);
+    visitor.on_skip(skipped, kind, skip_result)
 }
 
 enum ScheduledEntry {
@@ -861,7 +900,13 @@ where
             classified.kind() == EntryKind::Dir,
         )
     {
-        let summary = filter_skip_summary(visitor.as_ref(), &cx, classified.kind(), &skip_result);
+        let summary = filter_skip_summary(
+            visitor.as_ref(),
+            &SkippedEntry::from_entry(&cx),
+            cx.prog_track,
+            classified.kind(),
+            &skip_result,
+        );
         drop(classified);
         return Ok(WalkEntryResult {
             summary,
@@ -941,9 +986,8 @@ where
     let mut fold = WalkEntryFold::new(V::Summary::default(), collection);
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
-        // build the child's owned context once; reused whether it is skipped or spawned, and gives
-        // an authoritative probe failure its operation-path context.
-        let child_cx = parent_cx.child(Arc::clone(&dir), entry_name);
+        // hint exclusions need only the logical path; scheduled entries take this same buffer
+        let child_rel_path = walk::join_path(&parent_cx.rel_path, Path::new(&entry_name));
         let authoritative_filter = visitor.filter().is_some()
             && (delete_names || visitor.filter_requires_admitted_entry());
         if !delete_names
@@ -951,7 +995,7 @@ where
             && let Some(hinted_kind) = hint
             && let Some(skip_result) = walk::should_skip_entry_ref(
                 visitor.filter(),
-                &child_cx.rel_path,
+                &child_rel_path,
                 hinted_kind == EntryKind::Dir,
             )
         {
@@ -960,12 +1004,14 @@ where
             // authoritative visitor rechecks it against the worker's exact classification.
             fold.add_summary(filter_skip_summary(
                 visitor.as_ref(),
-                &child_cx,
+                &SkippedEntry::child(&parent_cx.real_path, &entry_name),
+                parent_cx.prog_track,
                 hinted_kind,
                 &skip_result,
             ));
             continue;
         }
+        let child_cx = parent_cx.child(Arc::clone(&dir), entry_name, child_rel_path);
         let admission = EntryAdmission::from_hint(hint);
         let scheduled = if authoritative_filter || visitor.filter().is_some() && hint.is_none() {
             ScheduledEntry::Authoritative(admission)
@@ -1245,8 +1291,17 @@ mod tests {
             )
             .with_relative_path(PathBuf::from(OsStr::from_bytes(base)));
             assert_eq!(cx.rel_path.as_os_str().as_bytes(), base);
-            let child = cx.child(Arc::clone(&dir), OsString::from_vec(b"branch\xff".to_vec()));
-            let leaf = child.child(Arc::clone(&dir), OsString::from_vec(b"leaf\xfe".to_vec()));
+            let child_name = OsString::from_vec(b"branch\xff".to_vec());
+            let child_rel_path = walk::join_path(&cx.rel_path, Path::new(&child_name));
+            let logical_buffer = child_rel_path.as_os_str().as_bytes().as_ptr();
+            let child = cx.child(Arc::clone(&dir), child_name, child_rel_path);
+            assert_eq!(
+                child.rel_path.as_os_str().as_bytes().as_ptr(),
+                logical_buffer
+            );
+            let leaf_name = OsString::from_vec(b"leaf\xfe".to_vec());
+            let leaf_rel_path = walk::join_path(&child.rel_path, Path::new(&leaf_name));
+            let leaf = child.child(Arc::clone(&dir), leaf_name, leaf_rel_path);
             assert_eq!(child.rel_path.as_os_str().as_bytes(), expected_child);
             assert_eq!(leaf.rel_path.as_os_str().as_bytes(), expected_leaf);
             assert_eq!(
@@ -1264,10 +1319,114 @@ mod tests {
                 PathBuf::from(seed),
                 &PROGRESS,
             );
-            let child = cx.child(Arc::clone(&dir), OsString::from("keep.log"));
+            let child_rel_path = walk::join_path(&cx.rel_path, Path::new("keep.log"));
+            let child = cx.child(Arc::clone(&dir), OsString::from("keep.log"), child_rel_path);
             assert_eq!(child.rel_path.as_os_str().as_bytes(), expected);
             assert_eq!(child.rel_path.as_os_str(), child.real_path.as_os_str());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_child_display_path_is_lazy_cached_and_preserves_literal_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = OsStr::from_bytes(b"leaf\xfe");
+        for (parent, expected) in [
+            (b"".as_slice(), b"leaf\xfe".as_slice()),
+            (b"source//./branch\xff", b"source//./branch\xff/leaf\xfe"),
+            (
+                b"/destination//./branch\xff/",
+                b"/destination//./branch\xff/leaf\xfe",
+            ),
+        ] {
+            let skipped = SkippedEntry::child(Path::new(OsStr::from_bytes(parent)), name);
+            let SkippedPath::Child { joined, .. } = &skipped.real_path else {
+                panic!("a hinted child's diagnostic path must start unconstructed");
+            };
+            assert!(joined.get().is_none());
+            assert!(std::ptr::eq(skipped.name, name));
+            let progress = Progress::new();
+            let summary = tracing::subscriber::with_default(
+                tracing::subscriber::NoSubscriber::default(),
+                || {
+                    filter_skip_summary(
+                        &CountingVisitor::default(),
+                        &skipped,
+                        &progress,
+                        EntryKind::File,
+                        &crate::filter::FilterResult::ExcludedByDefault,
+                    )
+                },
+            );
+            assert_eq!(summary, CountSummary::default());
+            assert_eq!(progress.files_skipped.get(), 1);
+            assert!(
+                joined.get().is_none(),
+                "disabled diagnostics must not join paths"
+            );
+            assert_eq!(skipped.real_path().as_os_str().as_bytes(), expected);
+            let buffer = skipped.real_path().as_os_str().as_bytes().as_ptr();
+            assert_eq!(skipped.real_path().as_os_str().as_bytes().as_ptr(), buffer);
+            assert_eq!(
+                joined.get().unwrap().as_os_str().as_bytes().as_ptr(),
+                buffer
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_skip_borrows_its_existing_display_path_and_name() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let root = crate::testutils::create_temp_dir().await?;
+        let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let cx = root_cx(
+            dir,
+            OsStr::from_bytes(b"leaf\xfe"),
+            PathBuf::from(OsStr::from_bytes(b"source//./branch\xff/leaf\xfe")),
+        );
+        let skipped = SkippedEntry::from_entry(&cx);
+        assert!(matches!(skipped.real_path, SkippedPath::Existing(_)));
+        assert!(std::ptr::eq(skipped.name, cx.name.as_os_str()));
+        assert!(std::ptr::eq(skipped.real_path(), cx.real_path.as_path()));
+        assert_eq!(
+            skipped.real_path().as_os_str().as_bytes(),
+            b"source//./branch\xff/leaf\xfe"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reliable_hint_exclusion_does_not_open_a_missing_child() -> anyhow::Result<()> {
+        static SKIP_PROGRESS: std::sync::LazyLock<Progress> =
+            std::sync::LazyLock::new(Progress::new);
+        let root = crate::testutils::create_temp_dir().await?;
+        let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let cx = EntryCx::root(
+            Arc::clone(&dir),
+            OsString::from("root"),
+            root.clone(),
+            &SKIP_PROGRESS,
+        );
+        let mut filter = FilterSettings::default();
+        filter.add_exclude("missing")?;
+        let visitor = Arc::new(CountingVisitor {
+            filter: Some(filter),
+            authoritative_filter: true,
+            ..Default::default()
+        });
+        let (summary, processed) = walk_dir_entries(
+            Arc::clone(&visitor),
+            dir,
+            &cx,
+            &(),
+            vec![(OsString::from("missing"), Some(EntryKind::File))],
+        )
+        .await?;
+        assert_eq!(summary, CountSummary::default());
+        assert!(processed.names().unwrap().is_empty());
+        assert_eq!(visitor.leaves_seen.load(Ordering::SeqCst), 0);
+        assert_eq!(SKIP_PROGRESS.files_skipped.get(), 1);
+        assert!(!root.join("missing").exists());
         Ok(())
     }
 
@@ -1848,11 +2007,13 @@ mod tests {
 
             fn on_skip(
                 &self,
-                cx: &EntryCx,
+                cx: &SkippedEntry<'_>,
                 _kind: EntryKind,
                 _skip_result: &crate::filter::FilterResult,
             ) -> CountSummary {
-                let _ = self.events.send(CompletionEvent::Started(cx.name.clone()));
+                let _ = self
+                    .events
+                    .send(CompletionEvent::Started(cx.name.to_owned()));
                 self.skip_release
                     .lock()
                     .expect("skip release lock poisoned")
@@ -1862,7 +2023,7 @@ mod tests {
                     .expect("the exact exclusion gate was dropped before release");
                 let _ = self
                     .events
-                    .send(CompletionEvent::Completed(cx.name.clone()));
+                    .send(CompletionEvent::Completed(cx.name.to_owned()));
                 CountSummary::default()
             }
 
