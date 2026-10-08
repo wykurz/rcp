@@ -9,8 +9,8 @@ use crate::progress;
 use crate::safedir::{self, Dir, Handle};
 use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPostInput, DirPreResult, EntryCx, WalkVisitor, process_admitted_entry,
-    process_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, SkippedEntry, WalkVisitor,
+    process_admitted_entry, process_entry,
 };
 
 /// Error type for remove operations. See [`crate::error::OperationError`] for
@@ -432,6 +432,10 @@ impl WalkVisitor for RmVisitor {
         self.settings.fail_early
     }
 
+    fn name_collection(&self) -> NameCollection {
+        NameCollection::None
+    }
+
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
         self.settings.filter.as_ref()
     }
@@ -448,14 +452,16 @@ impl WalkVisitor for RmVisitor {
 
     fn on_skip(
         &self,
-        cx: &EntryCx,
+        cx: &SkippedEntry<'_>,
         kind: EntryKind,
         skip_result: &crate::filter::FilterResult,
     ) -> Summary {
         // mirror the old spawn loop's inline filter-skip: the dry-run "skip ..." line plus the
         // matching `*_skipped` counter. the driver already did the shared progress increment.
-        if let Some(mode) = self.settings.dry_run {
-            crate::dry_run::report_skip(&cx.real_path, skip_result, mode, kind.label());
+        if let Some(mode) = self.settings.dry_run
+            && mode != crate::config::DryRunMode::Brief
+        {
+            crate::dry_run::report_skip(cx.real_path(), skip_result, mode, kind.label());
         }
         skipped_summary_for(kind)
     }
@@ -1508,10 +1514,7 @@ mod tests {
                 .context("rm dry-run hint recheck did not return pending-meta capacity")?;
             drop(returned);
             let (summary, processed) = result;
-            assert_eq!(
-                processed.names().expect("default visitor collects names"),
-                &[std::ffi::OsString::from("node")]
-            );
+            assert!(processed.names().is_none());
             assert_eq!(summary.files_removed, 1);
             assert_eq!(summary.directories_skipped, 0);
             assert_eq!(

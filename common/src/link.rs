@@ -1086,13 +1086,16 @@ async fn link_internal(
     let (src_path, dst_path) = if rel_path.as_os_str().is_empty() {
         (src_root.to_path_buf(), dst_root.to_path_buf())
     } else {
-        (src_root.join(rel_path), dst_root.join(rel_path))
+        (
+            walk::join_path(src_root, rel_path),
+            walk::join_path(dst_root, rel_path),
+        )
     };
     let update_path = update_root.map(|root| {
         if rel_path.as_os_str().is_empty() {
             root.to_path_buf()
         } else {
-            root.join(rel_path)
+            walk::join_path(root, rel_path)
         }
     });
     // the destination entry's name within `dst_parent`. for nested entries this equals the source
@@ -2070,12 +2073,12 @@ async fn link_dir_contents(
         .with_context(|| format!("cannot open directory {src_path:?} for reading"))?;
         // iterate through src entries and recursively call "link" on each one
         for (entry_name, hint) in src_entries {
-            let entry_rel = rel_path.join(&entry_name);
-            let entry_path = src_path.join(&entry_name);
+            let entry_rel = walk::join_path(rel_path, std::path::Path::new(&entry_name));
             let decision =
                 select_source_for_dispatch(hint, &entry_rel, settings, update_dir.is_some());
             let admission = match decision {
                 SourceEntryDecision::Filtered { kind, result } => {
+                    let entry_path = walk::join_path(src_path, std::path::Path::new(&entry_name));
                     if let Some(mode) = settings.dry_run {
                         crate::dry_run::report_skip(&entry_path, &result, mode, kind.label());
                     }
@@ -2086,7 +2089,9 @@ async fn link_dir_contents(
                 }
                 SourceEntryDecision::Dispatch(admission) => admission,
             };
-            processed_files.insert(entry_name.clone());
+            if update_dir.is_some() {
+                processed_files.insert(entry_name.clone());
+            }
             let admission = ensure_link_admission(
                 admission,
                 &mut join_set,
@@ -2159,13 +2164,13 @@ async fn link_dir_contents(
             // observable decision. every entry that can reach copy transfers its exact handle and
             // admission.
             for (entry_name, hint) in update_entries {
-                let entry_rel = rel_path.join(&entry_name);
-                let update_entry_path = update_root.join(&entry_rel);
                 if processed_files.contains(&entry_name) {
                     // the source worker owns the exact joint source/update selection and reports its
                     // destination-protection decision when it completes.
                     continue;
                 }
+                let entry_rel = walk::join_path(rel_path, std::path::Path::new(&entry_name));
+                let update_entry_path = walk::join_path(update_root, &entry_rel);
                 let admission = match select_update_only_for_dispatch(hint, &entry_rel, settings) {
                     UpdateOnlyDispatch::Skipped { kind, result } => {
                         if let Some(mode) = settings.dry_run {
@@ -2413,7 +2418,7 @@ fn update_path_dbg(
     if rel_path.as_os_str().is_empty() {
         update_root.to_path_buf()
     } else {
-        update_root.join(rel_path)
+        walk::join_path(update_root, rel_path)
     }
 }
 
@@ -2790,6 +2795,83 @@ mod link_tests {
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_non_utf8_names_keep_source_and_update_outcomes_during_delete()
+    -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let branch = std::ffi::OsStr::from_bytes(b"branch\xff");
+        let shared_name = std::ffi::OsStr::from_bytes(b"shared\xfe");
+        let source_name = std::ffi::OsStr::from_bytes(b"source\xfd");
+        let update_name = std::ffi::OsStr::from_bytes(b"update\xfc");
+        for with_update in [false, true] {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let update = root.join("update");
+            let dst = root.join("dst");
+            let src_branch = src.join(branch);
+            let update_branch = update.join(branch);
+            let dst_branch = dst.join(branch);
+            tokio::fs::create_dir_all(&src_branch).await?;
+            tokio::fs::create_dir_all(&update_branch).await?;
+            tokio::fs::create_dir_all(&dst_branch).await?;
+            tokio::fs::write(src_branch.join(shared_name), b"original").await?;
+            tokio::fs::write(src_branch.join(source_name), b"source only").await?;
+            tokio::fs::write(update_branch.join(shared_name), b"updated contents").await?;
+            tokio::fs::write(update_branch.join(update_name), b"update only").await?;
+            tokio::fs::write(dst_branch.join("stale"), b"stale").await?;
+            let mut settings = common_settings(false, true);
+            settings.copy_settings.delete = Some(copy::DeleteSettings {
+                delete_excluded: false,
+            });
+            let summary = link(
+                &PROGRESS,
+                &root,
+                &src,
+                &dst,
+                &with_update.then_some(update),
+                &settings,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.hard_links_created, if with_update { 1 } else { 2 });
+            assert_eq!(
+                summary.copy_summary.files_copied,
+                if with_update { 2 } else { 0 }
+            );
+            assert_eq!(summary.copy_summary.rm_summary.files_removed, 1);
+            assert!(!dst_branch.join("stale").exists());
+            assert_eq!(
+                tokio::fs::read(dst_branch.join(shared_name)).await?,
+                if with_update {
+                    b"updated contents".as_slice()
+                } else {
+                    b"original"
+                }
+            );
+            assert_eq!(
+                tokio::fs::read(dst_branch.join(source_name)).await?,
+                b"source only"
+            );
+            let src_meta = tokio::fs::metadata(src_branch.join(source_name)).await?;
+            let dst_meta = tokio::fs::metadata(dst_branch.join(source_name)).await?;
+            assert_eq!(
+                (src_meta.dev(), src_meta.ino()),
+                (dst_meta.dev(), dst_meta.ino())
+            );
+            if with_update {
+                assert_eq!(
+                    tokio::fs::read(dst_branch.join(update_name)).await?,
+                    b"update only"
+                );
+            } else {
+                assert!(!dst_branch.join(update_name).exists());
+            }
+            tokio::fs::remove_dir_all(root).await?;
+        }
         Ok(())
     }
 

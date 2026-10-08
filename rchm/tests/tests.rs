@@ -313,6 +313,49 @@ fn dry_run_makes_no_changes() {
 }
 
 #[test]
+fn dry_run_filter_skip_preserves_nested_non_utf8_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let d = tempfile::tempdir().unwrap();
+    let nested = d.path().join(OsString::from_vec(b"nested-\xff".to_vec()));
+    std::fs::create_dir(&nested).unwrap();
+    let included = nested.join("keep.txt");
+    let excluded = nested.join("skip.log");
+    for file in [&included, &excluded] {
+        std::fs::write(file, b"unchanged").unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let root_mode = mode_of(d.path());
+    let nested_mode = mode_of(&nested);
+    for mode in ["brief", "all", "explain"] {
+        let output = rchm()
+            .args(["--mode", "f:g+w", "--exclude", "*.log", "--dry-run", mode])
+            .arg(d.path())
+            .assert()
+            .success();
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let skips: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("skip "))
+            .collect();
+        let expected = match mode {
+            "brief" => vec![],
+            "all" => vec![format!("skip file {excluded:?}")],
+            "explain" => vec![format!("skip file {excluded:?} (excluded by '*.log')")],
+            _ => unreachable!(),
+        };
+        assert_eq!(skips, expected, "dry-run mode {mode}");
+        for file in [&included, &excluded] {
+            assert_eq!(mode_of(file), 0o644);
+            assert_eq!(std::fs::read(file).unwrap(), b"unchanged");
+        }
+        assert_eq!(mode_of(d.path()), root_mode);
+        assert_eq!(mode_of(&nested), nested_mode);
+    }
+}
+
+#[test]
 fn exclude_filter_narrows_the_set() {
     let d = tempfile::tempdir().unwrap();
     let keep = d.path().join("keep.txt");
