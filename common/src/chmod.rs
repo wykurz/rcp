@@ -8,8 +8,7 @@ use crate::progress::Progress;
 use crate::safedir::{self, Dir, FileMeta, Handle};
 use crate::walk::{AdmittedLeaf, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPostInput, DirPreResult, EntryCx, NameCollection, SkippedEntry, WalkVisitor,
-    process_entry,
+    DirAction, DirPostInput, DirPreResult, EntryCx, SkippedEntry, WalkVisitor, process_entry,
 };
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
@@ -1080,10 +1079,6 @@ impl WalkVisitor for ChmodVisitor {
         self.settings.fail_early
     }
 
-    fn name_collection(&self) -> NameCollection {
-        NameCollection::None
-    }
-
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
         self.settings.filter.as_ref()
     }
@@ -1096,11 +1091,7 @@ impl WalkVisitor for ChmodVisitor {
     ) -> Summary {
         // mirror the old spawn loop's inline filter-skip: the dry-run "skip ..." line plus the
         // matching `*_skipped` counter. the driver already did the shared progress increment.
-        if let Some(mode) = self.settings.dry_run
-            && mode != crate::config::DryRunMode::Brief
-        {
-            crate::dry_run::report_skip(cx.real_path(), skip_result, mode, kind.label());
-        }
+        cx.report_skip(self.settings.dry_run, skip_result, kind);
         skipped_summary_for(kind)
     }
 
@@ -1307,6 +1298,48 @@ async fn apply_dir_self(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hint_skip_reporting_only_builds_paths_for_visible_modes() {
+        use crate::config::DryRunMode;
+        static PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            for (dry_run, expected_builds) in [
+                (None, 0),
+                (Some(DryRunMode::Brief), 0),
+                (Some(DryRunMode::All), 1),
+                (Some(DryRunMode::Explain), 1),
+            ] {
+                let visitor = ChmodVisitor {
+                    prog_track: &PROGRESS,
+                    settings: Settings {
+                        mode: ModeProgram::default(),
+                        owner: OwnerProgram::default(),
+                        group: OwnerProgram::default(),
+                        no_setid: false,
+                        fail_early: false,
+                        defer_dir_changes: false,
+                        filter: None,
+                        time_filter: None,
+                        dry_run,
+                    },
+                };
+                let skipped =
+                    SkippedEntry::child(Path::new("source//./nested"), OsStr::new("skip.log"));
+                let before = crate::walk_driver::skipped_path_builds();
+                let summary = visitor.on_skip(
+                    &skipped,
+                    EntryKind::File,
+                    &crate::filter::FilterResult::ExcludedByDefault,
+                );
+                assert_eq!(summary.files_skipped, 1);
+                assert_eq!(
+                    crate::walk_driver::skipped_path_builds() - before,
+                    expected_builds,
+                    "{dry_run:?}"
+                );
+            }
+        });
+    }
     #[test]
     fn mode_token_octal() {
         assert_eq!(parse_mode_token("2775").unwrap(), ModeSpec::Octal(0o2775));

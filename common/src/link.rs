@@ -1079,37 +1079,21 @@ async fn link_internal(
     delete_scan_parent: copy::DeleteScanAnchor,
 ) -> Result<LinkEntryResult, Error> {
     let _prog_guard = prog_track.ops.guard();
-    // real filesystem paths reconstructed from the roots + accumulated relative path. used for
-    // diagnostics, the `--dereference` canonicalize fallback inside copy, and to derive `dst_name`.
-    // joining an empty `rel_path` (the root entry) would append a trailing separator, so use the root
-    // verbatim when `rel_path` is empty.
-    let (src_path, dst_path) = if rel_path.as_os_str().is_empty() {
-        (src_root.to_path_buf(), dst_root.to_path_buf())
-    } else {
-        (
-            walk::join_path(src_root, rel_path),
-            walk::join_path(dst_root, rel_path),
-        )
-    };
-    let update_path = update_root.map(|root| {
-        if rel_path.as_os_str().is_empty() {
-            root.to_path_buf()
-        } else {
-            walk::join_path(root, rel_path)
-        }
-    });
-    // the destination entry's name within `dst_parent`. for nested entries this equals the source
-    // `name`, but for the root the source and destination basenames differ (e.g. linking `foo` to
-    // `bar`), so destination operations must use this name.
-    let dst_name = dst_path
-        .file_name()
-        .ok_or_else(|| {
+    // reconstruct diagnostic paths and the deliberately path-based dereference fallback.
+    let src_path = walk::join_rel(src_root, rel_path);
+    let dst_path = walk::join_rel(dst_root, rel_path);
+    let update_path = update_root.map(|root| walk::join_rel(root, rel_path));
+    // nested destination names equal the source name; a renamed root uses its destination basename.
+    let dst_name = if rel_path.as_os_str().is_empty() {
+        dst_root.file_name().ok_or_else(|| {
             Error::new(
                 anyhow!("link destination {:?} has no file name", &dst_path),
                 Default::default(),
             )
         })?
-        .to_owned();
+    } else {
+        name
+    };
     let mut admission = admission;
     if let LinkEntryAdmission::Unclassified {
         admission: entry_admission,
@@ -1315,7 +1299,7 @@ async fn link_internal(
                         prog_track,
                         leaf.handle(),
                         dst_dir,
-                        &dst_name,
+                        dst_name,
                         &dst_path,
                         settings,
                     )
@@ -1392,7 +1376,7 @@ async fn link_internal(
                     prog_track,
                     leaf.handle(),
                     dst_dir,
-                    &dst_name,
+                    dst_name,
                     &dst_path,
                     settings,
                 )
@@ -1488,7 +1472,7 @@ async fn link_internal(
         update_for_dir,
         dst_parent,
         name,
-        &dst_name,
+        dst_name,
         src_root,
         dst_root,
         update_root_for_dir,
@@ -1737,10 +1721,7 @@ fn requires_exact_entry_outcome(settings: &Settings) -> bool {
 /// Advisory source-loop decision made before the exact link worker runs.
 enum SourceEntryDecision {
     /// The cheap filter decision is terminal in an ordinary real run.
-    Filtered {
-        kind: EntryKind,
-        result: crate::filter::FilterResult,
-    },
+    Filtered { kind: EntryKind },
     /// The entry still needs its exact worker decision.
     Dispatch(EntryAdmission),
 }
@@ -1754,15 +1735,16 @@ fn select_source_for_dispatch(
     settings: &Settings,
     has_update: bool,
 ) -> SourceEntryDecision {
-    if let Some(kind) = hint
-        && let Some(result) = walk::should_skip_entry_ref(
+    if !requires_exact_entry_outcome(settings)
+        && let Some(kind) = hint
+        && walk::should_skip_entry_ref(
             settings.filter.as_ref(),
             relative_path,
             kind == EntryKind::Dir,
         )
-        && !requires_exact_entry_outcome(settings)
+        .is_some()
     {
-        return SourceEntryDecision::Filtered { kind, result };
+        return SourceEntryDecision::Filtered { kind };
     }
     SourceEntryDecision::Dispatch(source_entry_admission(hint, has_update))
 }
@@ -1793,10 +1775,7 @@ fn select_exact_update_only_entry(
 /// Advisory update-only decision made before the exact worker runs.
 enum UpdateOnlyDispatch {
     /// A reliable hint excludes this entry in a non-observable ordinary run.
-    Skipped {
-        kind: EntryKind,
-        result: crate::filter::FilterResult,
-    },
+    Skipped { kind: EntryKind },
     /// The entry still needs its exact worker decision.
     Dispatch(EntryAdmission),
 }
@@ -1807,15 +1786,16 @@ fn select_update_only_for_dispatch(
     relative_path: &std::path::Path,
     settings: &Settings,
 ) -> UpdateOnlyDispatch {
-    if let Some(kind) = hint
-        && let Some(result) = walk::should_skip_entry_ref(
+    if !requires_exact_entry_outcome(settings)
+        && let Some(kind) = hint
+        && walk::should_skip_entry_ref(
             settings.filter.as_ref(),
             relative_path,
             kind == EntryKind::Dir,
         )
-        && !requires_exact_entry_outcome(settings)
+        .is_some()
     {
-        return UpdateOnlyDispatch::Skipped { kind, result };
+        return UpdateOnlyDispatch::Skipped { kind };
     }
     UpdateOnlyDispatch::Dispatch(EntryAdmission::from_hint(hint))
 }
@@ -2077,12 +2057,11 @@ async fn link_dir_contents(
             let decision =
                 select_source_for_dispatch(hint, &entry_rel, settings, update_dir.is_some());
             let admission = match decision {
-                SourceEntryDecision::Filtered { kind, result } => {
-                    let entry_path = walk::join_path(src_path, std::path::Path::new(&entry_name));
-                    if let Some(mode) = settings.dry_run {
-                        crate::dry_run::report_skip(&entry_path, &result, mode, kind.label());
-                    }
-                    tracing::debug!("skipping {:?} due to filter", &entry_path);
+                SourceEntryDecision::Filtered { kind } => {
+                    tracing::debug!(
+                        "skipping {:?} due to filter",
+                        walk::join_path(src_path, std::path::Path::new(&entry_name))
+                    );
                     link_summary = link_summary + skipped_summary_for(kind);
                     kind.inc_skipped(prog_track);
                     continue;
@@ -2156,7 +2135,7 @@ async fn link_dir_contents(
             .with_context(|| {
                 format!(
                     "cannot open directory {:?} for reading",
-                    update_path_dbg(update_root, rel_path)
+                    walk::join_rel(update_root, rel_path)
                 )
             })?;
             // iterate through update entries and copy names absent from src. reliable excluded hints
@@ -2170,20 +2149,11 @@ async fn link_dir_contents(
                     continue;
                 }
                 let entry_rel = walk::join_path(rel_path, std::path::Path::new(&entry_name));
-                let update_entry_path = walk::join_path(update_root, &entry_rel);
                 let admission = match select_update_only_for_dispatch(hint, &entry_rel, settings) {
-                    UpdateOnlyDispatch::Skipped { kind, result } => {
-                        if let Some(mode) = settings.dry_run {
-                            crate::dry_run::report_skip(
-                                &update_entry_path,
-                                &result,
-                                mode,
-                                kind.label(),
-                            );
-                        }
+                    UpdateOnlyDispatch::Skipped { kind } => {
                         tracing::debug!(
                             "skipping update entry {:?} due to filter",
-                            &update_entry_path
+                            walk::join_rel(update_root, &entry_rel)
                         );
                         link_summary = link_summary + skipped_summary_for(kind);
                         kind.inc_skipped(prog_track);
@@ -2191,6 +2161,7 @@ async fn link_dir_contents(
                     }
                     UpdateOnlyDispatch::Dispatch(admission) => admission,
                 };
+                let update_entry_path = walk::join_rel(update_root, &entry_rel);
                 let admission = ensure_link_admission(
                     admission,
                     &mut join_set,
@@ -2408,18 +2379,6 @@ async fn link_dir_contents(
         .with_context(|| format!("failed setting directory metadata on {:?}", dst_path))
         .map_err(|err| Error::new(err, link_summary))?;
     Ok(link_summary)
-}
-
-/// Reconstruct an update entry's path purely for a diagnostic message.
-fn update_path_dbg(
-    update_root: &std::path::Path,
-    rel_path: &std::path::Path,
-) -> std::path::PathBuf {
-    if rel_path.as_os_str().is_empty() {
-        update_root.to_path_buf()
-    } else {
-        walk::join_path(update_root, rel_path)
-    }
 }
 
 #[cfg(test)]
@@ -2745,6 +2704,80 @@ mod link_tests {
             tokio::fs::read_to_string(dst.join("protected.txt")).await?,
             "PROTECTED DESTINATION"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn renamed_non_utf8_file_roots_keep_destination_basename() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        for with_update in [false, true] {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join(std::ffi::OsStr::from_bytes(b"source\xff"));
+            let dst = root.join(std::ffi::OsStr::from_bytes(b"renamed\xfe"));
+            let update = root.join(std::ffi::OsStr::from_bytes(b"update\xfd"));
+            tokio::fs::write(&src, b"source").await?;
+            tokio::fs::write(&update, b"updated contents").await?;
+            let summary = link(
+                &PROGRESS,
+                &root,
+                &src,
+                &dst,
+                &with_update.then_some(update),
+                &common_settings(false, false),
+                false,
+            )
+            .await?;
+            assert_eq!(
+                tokio::fs::read(&dst).await?,
+                if with_update {
+                    b"updated contents".as_slice()
+                } else {
+                    b"source"
+                }
+            );
+            assert_eq!(summary.hard_links_created, usize::from(!with_update));
+            assert_eq!(summary.copy_summary.files_copied, usize::from(with_update));
+            let src_meta = tokio::fs::metadata(&src).await?;
+            let dst_meta = tokio::fs::metadata(&dst).await?;
+            assert_eq!(
+                (src_meta.dev(), src_meta.ino()) == (dst_meta.dev(), dst_meta.ino()),
+                !with_update
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_destination_root_is_rejected_before_source_classification()
+    -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let source = root.join("missing-source");
+        let destination = std::path::Path::new("/");
+        let result = link_internal(
+            &PROGRESS,
+            &dir,
+            None,
+            None,
+            std::ffi::OsStr::new("missing-source"),
+            &source,
+            destination,
+            None,
+            std::path::Path::new(""),
+            UpdateRootRequirement::Optional,
+            &common_settings(false, false),
+            false,
+            EntryAdmission::RootOrDelegated.into(),
+            copy::DeleteScanAnchor::new(destination, std::path::Path::new("")),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("invalid destination must fail"),
+            Err(error) => error,
+        };
+        assert!(format!("{:#}", error.source).contains("has no file name"));
+        assert!(!source.exists());
         Ok(())
     }
 
