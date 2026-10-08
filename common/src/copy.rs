@@ -1811,11 +1811,11 @@ async fn copy_current_regular(
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(copied);
     tracing::debug!("setting permissions");
-    safedir::set_file_metadata_fd(
+    safedir::set_file_metadata_owned(
         preserve,
         &src_meta,
         src_acls.as_ref(),
-        dst_file.as_fd(),
+        dst_file.into(),
         congestion::Side::Destination,
     )
     .await
@@ -6837,6 +6837,7 @@ mod copy_tests {
         #[tokio::test]
         async fn cancelled_copy_file_fd_retains_capacity_until_its_fds_close() -> anyhow::Result<()>
         {
+            use std::os::unix::fs::PermissionsExt as _;
             let root = testutils::create_temp_dir().await?;
             let src = root.join("source");
             let dst = root.join("destination");
@@ -6844,6 +6845,13 @@ mod copy_tests {
                 let _ = tokio::fs::remove_dir_all(&root).await;
                 return Err(error.into());
             }
+            if let Err(error) =
+                tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await
+            {
+                let _ = tokio::fs::remove_dir_all(&root).await;
+                return Err(error.into());
+            }
+            let observed_dst = dst.clone();
             let gate = testutils::BlockingPathGate::install(dst.clone());
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_files_in_flight(1);
@@ -6861,10 +6869,17 @@ mod copy_tests {
                 .await
             });
             let observations =
-                testutils::cancel_at_blocking_path(admission, gate, task, timeout, |_| ()).await;
+                testutils::cancel_at_blocking_path(admission, gate, task, timeout, |_| {
+                    std::fs::metadata(&observed_dst).map(|meta| meta.permissions().mode() & 0o7777)
+                })
+                .await;
+            let final_mode =
+                std::fs::metadata(&observed_dst).map(|meta| meta.permissions().mode() & 0o7777);
             let cleanup_result = tokio::fs::remove_dir_all(root).await;
-            let (observations, ()) = observations?;
+            let (observations, mode_while_gated) = observations?;
             cleanup_result?;
+            assert_eq!(mode_while_gated?, 0o600);
+            assert_eq!(final_mode?, 0o600);
 
             assert!(observations.waiter_was_cancelled);
             assert!(
@@ -8667,6 +8682,56 @@ mod copy_tests {
             error.summary.rm_summary.files_removed, 0,
             "nothing was removed, and the summary must say so"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_data_copy_keeps_the_created_file_owner_only() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::write(&source, b"payload")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))?;
+        let source_parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
+        let destination_parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?);
+        let mut current =
+            CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
+        // retain valid regular-file metadata but force the data read to fail after creation
+        current.file = std::fs::OpenOptions::new().write(true).open(&source)?;
+        let settings = Settings {
+            reflink: crate::copy_data::ReflinkMode::Never,
+            ..settings_with_delete(None)
+        };
+        let error = copy_current_regular(
+            &PROGRESS,
+            &source_parent,
+            &destination_parent,
+            OsStr::new("destination"),
+            &destination,
+            &source,
+            current,
+            FilePlan::Vacant,
+            &settings,
+            &preserve::preserve_all(),
+        )
+        .await
+        .expect_err("an unreadable payload descriptor must fail the data copy");
+        assert_eq!(
+            error
+                .source
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EBADF),
+        );
+        assert_eq!(error.summary.files_copied, 0);
+        assert_eq!(error.summary.bytes_copied, 0);
+        let metadata = std::fs::metadata(&destination)?;
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.len(), 0);
         Ok(())
     }
 

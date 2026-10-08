@@ -2392,9 +2392,20 @@ async fn set_or_remove_acl_fd(
     name: &'static CStr,
     blob: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
-    let owned = fd.try_clone_to_owned()?;
+    set_or_remove_acl_owned(fd.try_clone_to_owned()?, side, name, blob)
+        .await
+        .map(drop)
+}
+
+async fn set_or_remove_acl_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    name: &'static CStr,
+    blob: Option<Vec<u8>>,
+) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
-        apply_one_acl(owned.as_raw_fd(), name, blob.as_deref())
+        apply_one_acl(owned.as_raw_fd(), name, blob.as_deref())?;
+        Ok(owned)
     })
     .await
 }
@@ -2835,15 +2846,27 @@ async fn fchown_fd(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> std::io::Result<()> {
-    // BorrowedFd is not 'static, so dup it into an owned fd the closure can hold.
-    let owned = fd.try_clone_to_owned()?;
+    fchown_owned(fd.try_clone_to_owned()?, side, uid, gid)
+        .await
+        .map(drop)
+}
+
+async fn fchown_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
+        #[cfg(test)]
+        let _visit = resource_tests::gate_opened_descriptor(owned.as_raw_fd());
         fchown(
             owned.as_fd(),
             uid.map(Uid::from_raw),
             gid.map(Gid::from_raw),
         )
-        .map_err(nix_to_io)
+        .map_err(nix_to_io)?;
+        Ok(owned)
     })
     .await
 }
@@ -2856,9 +2879,19 @@ async fn fchown_fd(
 /// writable file / directory fd. For an `O_PATH` [`Handle`] (e.g. rchm's classified
 /// entry), use [`chmod_via_proc_fd`] instead.
 async fn fchmod_fd(fd: BorrowedFd<'_>, side: congestion::Side, mode: u32) -> std::io::Result<()> {
-    let owned = fd.try_clone_to_owned()?;
+    fchmod_owned(fd.try_clone_to_owned()?, side, mode)
+        .await
+        .map(drop)
+}
+
+async fn fchmod_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    mode: u32,
+) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
-        fchmod(owned.as_fd(), Mode::from_bits_truncate(mode)).map_err(nix_to_io)
+        fchmod(owned.as_fd(), Mode::from_bits_truncate(mode)).map_err(nix_to_io)?;
+        Ok(owned)
     })
     .await
 }
@@ -2872,11 +2905,31 @@ async fn futimens_fd(
     mtime: i64,
     mtime_nsec: i64,
 ) -> std::io::Result<()> {
-    let owned = fd.try_clone_to_owned()?;
+    futimens_owned(
+        fd.try_clone_to_owned()?,
+        side,
+        atime,
+        atime_nsec,
+        mtime,
+        mtime_nsec,
+    )
+    .await
+    .map(drop)
+}
+
+async fn futimens_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    atime: i64,
+    atime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
         let atime_spec = TimeSpec::new(atime, atime_nsec);
         let mtime_spec = TimeSpec::new(mtime, mtime_nsec);
-        futimens(owned.as_fd(), &atime_spec, &mtime_spec).map_err(nix_to_io)
+        futimens(owned.as_fd(), &atime_spec, &mtime_spec).map_err(nix_to_io)?;
+        Ok(owned)
     })
     .await
 }
@@ -3086,6 +3139,8 @@ async fn symlink_utimes_fd(
 /// `fd` must be the destination file's own fd (typically the write fd returned
 /// by [`Dir::create_file`]); this avoids the redundant `File::open` re-open a
 /// path-based applier would need, and closes the TOCTOU window in the process.
+/// This borrowed adapter duplicates once; callers that can transfer ownership use
+/// `set_file_metadata_owned` without duplicating the descriptor.
 /// Gating on `settings.file`: chown only when uid or gid is requested, chmod
 /// always (the masked mode honors `mode_mask`), timestamps only when requested, ACLs only when
 /// `settings.file.acl` is on — in which case `acls` must carry what was read from the source, or
@@ -3133,14 +3188,31 @@ pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
     fd: BorrowedFd<'_>,
     side: congestion::Side,
 ) -> std::io::Result<()> {
+    set_file_metadata_owned(settings, meta, acls, fd.try_clone_to_owned()?, side).await
+}
+
+/// Apply file metadata while consuming the destination's existing writable descriptor.
+///
+/// The same descriptor moves through individually gated metadata operations, without duplication
+/// or reopening. Each blocking output owns it until consumed or dropped, including cancellation.
+/// The ordering and final widening invariant are shared with [`set_file_metadata_fd`].
+pub(crate) async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
+    settings: &crate::preserve::Settings,
+    meta: &Meta,
+    acls: Option<&Acls>,
+    fd: OwnedFd,
+    side: congestion::Side,
+) -> std::io::Result<()> {
     let ut = &settings.file.user_and_time;
-    if ut.uid || ut.gid {
+    let fd = if ut.uid || ut.gid {
         let uid = if ut.uid { Some(meta.uid()) } else { None };
         let gid = if ut.gid { Some(meta.gid()) } else { None };
-        fchown_fd(fd, side, uid, gid).await?;
-    }
-    if ut.time {
-        futimens_fd(
+        fchown_owned(fd, side, uid, gid).await?
+    } else {
+        fd
+    };
+    let fd = if ut.time {
+        futimens_owned(
             fd,
             side,
             meta.atime(),
@@ -3148,20 +3220,24 @@ pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
             meta.mtime(),
             meta.mtime_nsec(),
         )
-        .await?;
-    }
+        .await?
+    } else {
+        fd
+    };
     let acls = acls_to_apply(settings.file.acl, acls)?;
     let mode = crate::preserve::masked_mode(settings.file.mode_mask, meta);
     if let Some(acls) = acls.filter(|acls| acls.access.is_some()) {
         // the ACL is the widening step; this chmod carries only the special bits
-        fchmod_fd(fd, side, (mode & 0o7000) | DST_FILE_CREATE_MODE).await?;
-        apply_acls_fd(fd, side, acls, false).await?;
+        let fd = fchmod_owned(fd, side, (mode & 0o7000) | DST_FILE_CREATE_MODE).await?;
+        set_or_remove_acl_owned(fd, side, ACL_ACCESS_XATTR, acls.access.clone()).await?;
     } else {
         // clearing an inherited ACL can only narrow, so it is safe before the widening chmod
-        if let Some(acls) = acls {
-            apply_acls_fd(fd, side, acls, false).await?;
-        }
-        fchmod_fd(fd, side, mode).await?;
+        let fd = if let Some(acls) = acls {
+            set_or_remove_acl_owned(fd, side, ACL_ACCESS_XATTR, acls.access.clone()).await?
+        } else {
+            fd
+        };
+        fchmod_owned(fd, side, mode).await?;
     }
     Ok(())
 }
@@ -5313,6 +5389,231 @@ mod tests {
     }
 
     // ── fd-based metadata application ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn owned_file_metadata_follows_the_created_inode_after_name_replacement()
+    -> anyhow::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"source")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
+        filetime::set_file_times(
+            &source,
+            filetime::FileTime::from_unix_time(1_000_000_000, 123_456_789),
+            filetime::FileTime::from_unix_time(1_000_000_500, 987_654_321),
+        )?;
+        let source_meta = std::fs::metadata(&source)?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+        let path = tmp.path().join("destination");
+        let saved = tmp.path().join("saved-destination");
+        let mut file = root.create_file(OsStr::new("destination")).await?;
+        file.write_all(b"copied payload")?;
+        let created = file.metadata()?;
+        let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+        std::fs::rename(&path, &saved)?;
+        std::fs::write(&path, b"replacement")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        let replacement_before = std::fs::metadata(&path)?;
+        set_file_metadata_owned(
+            &crate::preserve::preserve_all(),
+            &source_meta,
+            None,
+            file.into(),
+            congestion::Side::Destination,
+        )
+        .await?;
+        assert!(
+            identity.original_is_closed()?,
+            "metadata retained its consumed descriptor"
+        );
+        let applied = std::fs::metadata(&saved)?;
+        assert_eq!(
+            (applied.dev(), applied.ino()),
+            (created.dev(), created.ino())
+        );
+        assert_eq!(applied.permissions().mode() & 0o7777, 0o751);
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(&applied),
+            std::os::unix::fs::MetadataExt::uid(&source_meta)
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::gid(&applied),
+            std::os::unix::fs::MetadataExt::gid(&source_meta)
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::atime(&applied),
+            1_000_000_000
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::atime_nsec(&applied),
+            123_456_789
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mtime(&applied),
+            1_000_000_500
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mtime_nsec(&applied),
+            987_654_321
+        );
+        let replacement_after = std::fs::metadata(&path)?;
+        assert_eq!(
+            (replacement_after.dev(), replacement_after.ino()),
+            (replacement_before.dev(), replacement_before.ino())
+        );
+        assert_eq!(
+            replacement_after.permissions().mode(),
+            replacement_before.permissions().mode()
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mtime(&replacement_after),
+            std::os::unix::fs::MetadataExt::mtime(&replacement_before)
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mtime_nsec(&replacement_after),
+            std::os::unix::fs::MetadataExt::mtime_nsec(&replacement_before)
+        );
+        assert_eq!(std::fs::read(&saved)?, b"copied payload");
+        assert_eq!(std::fs::read(&path)?, b"replacement");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_owned_metadata_waiting_for_admission_closes_the_file_without_widening()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"source")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))?;
+        let source_meta = std::fs::metadata(&source)?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+        let path = tmp.path().join("destination");
+        let file = root.create_file(OsStr::new("destination")).await?;
+        let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+        let limits = testutils::AdmissionLimit::new().await;
+        limits.set_files_in_flight(1);
+        let resource =
+            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod);
+        limits.set_max_ops_in_flight(resource, 1);
+        let occupied = throttle::ops_in_flight_permit(resource).await;
+        let guard = throttle::open_file_permit().await;
+        let admission = guard.admission();
+        let mut work = Box::pin(with_fd_admission(admission, async move {
+            let _guard = guard;
+            set_file_metadata_owned(
+                &crate::preserve::preserve_all(),
+                &source_meta,
+                None,
+                file.into(),
+                congestion::Side::Destination,
+            )
+            .await
+        }));
+        let waiting = futures::poll!(work.as_mut()).is_pending();
+        let fd_retained = !identity.original_is_closed()?;
+        let mut next_file = Box::pin(throttle::open_file_permit());
+        assert!(
+            futures::poll!(next_file.as_mut()).is_pending(),
+            "waiting metadata released file admission"
+        );
+        drop(work);
+        let closed = identity.original_is_closed()?;
+        let file_permit =
+            tokio::time::timeout(std::time::Duration::from_secs(5), next_file).await?;
+        drop(file_permit);
+        drop(occupied);
+        assert!(
+            waiting,
+            "metadata did not wait for its occupied operation permit"
+        );
+        assert!(fd_retained);
+        assert!(
+            closed,
+            "cancelled metadata admission retained its owned descriptor"
+        );
+        assert_eq!(
+            std::fs::metadata(path)?.permissions().mode() & 0o7777,
+            DST_FILE_CREATE_MODE
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_owned_metadata_retains_the_file_and_permits_until_started_work_finishes()
+    -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"source")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))?;
+        let source_meta = std::fs::metadata(&source)?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+        let path = tmp.path().join("destination");
+        let file = root.create_file(OsStr::new("destination")).await?;
+        let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+        let gate = testutils::BlockingPathGate::install(&path);
+        let limits = testutils::AdmissionLimit::new().await;
+        limits.set_files_in_flight(1);
+        let resource =
+            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod);
+        limits.set_max_ops_in_flight(resource, 1);
+        let guard = throttle::open_file_permit().await;
+        let admission = guard.admission();
+        let task = tokio::spawn(with_fd_admission(admission, async move {
+            let _guard = guard;
+            set_file_metadata_owned(
+                &crate::preserve::preserve_all(),
+                &source_meta,
+                None,
+                file.into(),
+                congestion::Side::Destination,
+            )
+            .await
+        }));
+        let mut next_operation = Box::pin(throttle::ops_in_flight_permit(resource));
+        let (observations, (acquired_operation, mode_while_gated)) =
+            testutils::cancel_at_blocking_path(
+                limits,
+                gate,
+                task,
+                std::time::Duration::from_secs(20),
+                |_| {
+                    (
+                        next_operation.as_mut().now_or_never(),
+                        std::fs::metadata(&path).map(|meta| meta.permissions().mode() & 0o7777),
+                    )
+                },
+            )
+            .await?;
+        let operation_retained = acquired_operation.is_none();
+        let permit = match acquired_operation {
+            Some(permit) => permit,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), next_operation).await?,
+        };
+        drop(permit);
+        assert!(observations.waiter_was_cancelled);
+        assert!(observations.admission_was_retained_while_work_gated);
+        assert!(observations.fd_was_open_while_work_gated);
+        assert!(
+            operation_retained,
+            "started metadata released its operation permit after cancellation"
+        );
+        assert_eq!(mode_while_gated?, DST_FILE_CREATE_MODE);
+        assert_eq!(observations.final_hit_count, 1);
+        assert!(
+            identity.original_is_closed()?,
+            "metadata returned capacity before closing its owned descriptor"
+        );
+        assert_eq!(
+            std::fs::metadata(path)?.permissions().mode() & 0o7777,
+            DST_FILE_CREATE_MODE
+        );
+        Ok(())
+    }
 
     // set_file_metadata_fd: applying owner/mode/time from a source FileMeta to an
     // already-open destination fd must reflect on the destination file: masked

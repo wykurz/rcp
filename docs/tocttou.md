@@ -634,7 +634,11 @@ so the security-relevant invariants each live in exactly one place:
   transition is centralized in the driver and releases provisional leaf admission before recursion.
   The canonical safedir blocking runner attempts to upgrade any live ambient weak admission
   reference; if none is live, it adds no lease. If its async waiter is abandoned after an upgrade,
-  any descriptor-bearing output drops before that lease.
+  any descriptor-bearing output drops before that lease. Local regular-file finalization transfers
+  the created destination descriptor through each individually gated metadata operation; it neither
+  duplicates nor reopens the file. The borrowed metadata adapter used by the remote receiver makes
+  one owned duplicate for that same sequence. Ownership changes do not combine operation gates or
+  move the final permission-widening step.
 - **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
