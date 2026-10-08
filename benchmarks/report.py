@@ -361,12 +361,23 @@ def load_result_records(path):
     return sorted(by_id.values(), key=lambda run: (dt.datetime.fromisoformat(run["timestamp"].replace("Z", "+00:00")), run["run_id"])), sources
 
 
+def _dashboard_run(record):
+    trials = []
+    for trial in record["trials"]:
+        observation = trial.get("command_clocks")
+        trials.append(trial if observation is None else dict(trial, command_clocks=dict(
+            observation, comparison=clocks.comparison(observation))))
+    return dict(record, trials=trials)
+
+
 def render(input_path, output):
     """Write history.json and a self-contained dashboard after validation."""
     runs, sources = load_result_records(input_path)
     evidence = changes.build(runs, sources)
     history = {"schema_version": 1, "runs": runs}
-    embedded = json.dumps(history, ensure_ascii=True, separators=(",", ":"))
+    # derive epoch differences in Python before JavaScript can round nanosecond integers
+    dashboard = dict(history, runs=[_dashboard_run(record) for record in runs])
+    embedded = json.dumps(dashboard, ensure_ascii=True, separators=(",", ":"))
     for literal, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e")):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")

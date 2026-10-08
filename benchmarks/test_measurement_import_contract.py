@@ -13,6 +13,7 @@ from benchmarks.test_measurements import build
 from benchmarks.test_report import sample_run
 from benchmarks.test_pair_boundaries import paired_record
 from benchmarks.test_resource_boundaries import resource_record
+from benchmarks.test_command_clocks import observed_record
 
 
 def complete_resources():
@@ -181,7 +182,7 @@ class MeasurementImportContractTests(unittest.TestCase):
         provenance["context"].update(topology="local", measurement_environment={}, build_provenance=dict(
             qualification="caller-declared; executable hashes verified, source claims not attested",
             input_sha256="b" * 64, builds=dict(rcp=build("a" * 64))))
-        for original in (resource, provenance, paired_record()):
+        for original in (resource, provenance, paired_record(), observed_record()):
             report.validate_result(original)
             record = copy.deepcopy(original)
             record["context"].pop("measurement_environment")

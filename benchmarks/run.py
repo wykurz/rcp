@@ -266,8 +266,8 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
     finished = {}
     condition = threading.Condition()
     child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale or resource_time is not None else None
-    started = time.monotonic()
     clock_start = clocks.sample() if command_clocks else None
+    started = time.monotonic()
     clock_finishes = {}
     launch_error = None
     timed_out = False
@@ -315,7 +315,11 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
                             finished[i] = (code, stamp)
                             condition.notify_all()
                         if command_clocks:
-                            clock_finish = clocks.sample()
+                            try:
+                                clock_finish = clocks.sample()
+                            except Exception:
+                                # optional diagnostics cannot erase a completed child
+                                clock_finish = clocks.unavailable_sample()
                             with condition:
                                 clock_finishes[i] = clock_finish
                     waiter = threading.Thread(target=wait_child, daemon=True)
@@ -506,7 +510,7 @@ def _persist(output, record):
             observed = clocks.project(trial["command_clocks"])
             def bounds(key):
                 values = observed[key + "_minus_monotonic_bounds_seconds"]
-                return "unavailable" if values is None else f"[{values[0]:.9f}, {values[1]:.9f}]"
+                return ("unavailable" if observed["status"] == "bounded" else "no bounds") if values is None else f"[{values[0]:.9f}, {values[1]:.9f}]"
             lines.append(f"| {trial['case_id']} | {trial['variant_id']} | {trial['iteration']} | {observed['status']} | {bounds('raw')} | {bounds('realtime')} |")
     if "local_resources" in record["context"]:
         lines += ["", "## Local process resources", "", measurements.SCOPE + ". RSS is a per-command peak, never a sum of simultaneous resident memory.", "", "| Case | Variant | Repeat | Trial status | User CPU s | System CPU s | Peak RSS KiB |", "| --- | --- | ---: | --- | ---: | ---: | ---: |"]
@@ -629,7 +633,6 @@ def main(argv=None):
     record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
     if args.command_clocks:
         record["context"]["command_clocks"] = clocks.POLICY
-    if collect_costs or args.build_provenance is not None or args.command_clocks:
         record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
     record["context"]["operation_contract_revision"] = operations.CONTRACT_REVISION
     record["context"]["summary_locale"] = operations.SUMMARY_LOCALE
@@ -654,6 +657,8 @@ def main(argv=None):
             if not args.no_timings:
                 raise ValueError("paired v1 requires --no-timings for identical role instrumentation")
             record["context"]["pairing"] = pairs.configuration(args.paired_seed, args.repetitions)
+        if (collect_costs or args.build_provenance is not None) and not args.command_clocks:
+            record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
         all_directory_files = any("files_per_directory" in case for case in cases)

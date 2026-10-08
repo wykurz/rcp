@@ -128,24 +128,28 @@ every trial position once.
 
 `--command-clocks` adds local command-boundary MONOTONIC, MONOTONIC_RAW and REALTIME observations.
 It changes neither `elapsed_seconds` nor the monotonic timeout policy. Loopback and owned remote
-execution are rejected before probing tools. The option is independent of pairing and resources; its
-policy distinguishes historical series. Omitting it preserves the existing record shape.
+execution are rejected before probing tools. The option is independent of pairing and resources, but
+like them it records the environment allowlist; its policy and allowlisted values distinguish
+historical series. Omitting it preserves the existing record shape.
 
-After the existing start timestamp, but before launching commands, the runner reads MONOTONIC, RAW,
-REALTIME and MONOTONIC in that order. Each child waiter takes the same observation after its
-existing completion timestamp. The end observation belongs to the child with the last completion
-timestamp, even if another waiter's clock reads finish later. These are nearby observations, not
-replacement timestamps for the exact command interval. A resource-wrapped command observes the GNU
-time supervisor's completion. A launch failure without a completed child has no end observation;
-failures before execution and interruptions that cannot return an outcome may lack observations.
+Immediately before the existing start timestamp, the runner reads MONOTONIC, RAW, REALTIME and
+MONOTONIC in that order. Each child waiter takes the same observation after its existing completion
+timestamp. The end observation belongs to the child with the last completion timestamp, even if
+another waiter's clock reads finish later. These are nearby observations, not replacement timestamps
+for the exact command interval. A resource-wrapped command observes the GNU time supervisor's
+completion. A launch failure without a completed child has no end observation; failures before
+execution and interruptions that cannot return an outcome may lack observations.
 
-Raw JSON retains integer nanoseconds, explicit unsupported/read-failed states, signed read skew,
-clock deltas and derived differences. Ordered monotonic brackets bound the elapsed monotonic
-interval between the sequential clock reads. These bounds describe read skew, not clock accuracy.
-Backwards or overlapping monotonic brackets retain their observations but provide no such bounds;
-RAW/REALTIME discontinuities remain signed. Imports recompute derived values and reject
-disagreement. Reports and sanitized exports show qualification and numeric differences; exports omit
-absolute clock epochs. Clock data never accepts or rejects a performance result automatically.
+Raw JSON retains only the boundary readings as integer nanoseconds or explicit
+unsupported/read-failed states, plus the completing child's index. Reports and sanitized exports
+derive signed read skew, clock deltas and differences when read. Acquisition policies version the
+sampling contract; derived diagnostics can evolve without changing stored observations. Ordered
+monotonic brackets bound the elapsed monotonic interval between the sequential clock reads. These
+bounds describe read skew, not clock accuracy. Any reversal in the ordered MONOTONIC reads is
+reported as a regression and provides no such bounds; RAW/REALTIME discontinuities remain signed.
+Imports validate the primitive readings and completion evidence. Reports and sanitized exports show
+qualification and numeric differences; exports omit absolute clock epochs. Clock data never accepts
+or rejects a performance result automatically.
 
 RAW is not an external elapsed-time reference. Rate differences or clock adjustments qualify the
 observed durations; do not rescale results, attribute a cause from endpoints alone, or assume that
@@ -243,13 +247,13 @@ Each declaration requires `binary_sha256`, `source_revision` (full commit ID), `
 `flake_lock_sha256`, `target`, `profile`, `features` (distinct strings), `rustflags` (argument
 strings), and `rustc` (version text). Record the effective build configuration, not just the working
 checkout: executable digests are checked, but source/configuration claims remain caller-declared and
-are not build attestations. Sidecar bytes are fingerprinted. Any of the pairing, resource or
-provenance options records an allowlist of allocator/loader/runtime environment variables; this is
-not a complete environment capture. Keep raw results private if their paths, flags or declarations
-contain private details. Linux environment bytes represented by Python surrogate escapes remain
-lossless in ASCII-escaped JSON. The report stages encoded outputs before replacing each file
-atomically; this protects existing files from validation, encoding and staging failures, but is not
-a transaction across all files.
+are not build attestations. Sidecar bytes are fingerprinted. Any of the pairing, resource,
+provenance or command-clock options records an allowlist of allocator/loader/runtime environment
+variables; this is not a complete environment capture. Keep raw results private if their paths,
+flags or declarations contain private details. Linux environment bytes represented by Python
+surrogate escapes remain lossless in ASCII-escaped JSON. The report stages encoded outputs before
+replacing each file atomically; this protects existing files from validation, encoding and staging
+failures, but is not a transaction across all files.
 
 Sanitized exports retain pair/order/phase metadata, accepted numeric resource metrics, historical
 series IDs and composite artifact fingerprints. Supervisor version text, build configuration text
@@ -262,8 +266,9 @@ Experiment policy, resource supervisor, observed environment allowlist and decla
 configuration distinguish new historical series; seeds and repetition counts do not. Feature names
 are canonicalized as a set for series identity, while `rustflags` retain their order because
 argument order can change the build. Existing result schemas and identities remain unchanged when
-these options are absent. Imports with any pairing, resource or build-provenance context require the
-captured environment object, including an empty object when no allowlisted variables were present.
+these options are absent. Imports with any pairing, resource, build-provenance or command-clock
+context require the captured environment object, including an empty object when no allowlisted
+variables were present.
 
 ## Cases and variants
 
