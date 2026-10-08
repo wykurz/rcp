@@ -1637,6 +1637,47 @@ async fn copy_file_fd(
     })
 }
 
+// the destination precedes the test visit token so abandoned output closes its fd before the
+// token witnesses admission release, matching the canonical blocking-output ownership contract
+struct FileDataOutput {
+    result: std::io::Result<u64>,
+    destination: std::fs::File,
+    #[cfg(test)]
+    gate_visit: Option<crate::testutils::BlockingPathGateVisit>,
+}
+
+enum FileCopyStart {
+    CreatedAndCopied(FileDataOutput),
+    CreateResult {
+        source: std::fs::File,
+        destination: std::io::Result<std::fs::File>,
+    },
+}
+
+fn copy_file_payload(
+    source: std::fs::File,
+    destination: std::fs::File,
+    len: u64,
+    reflink: crate::copy_data::ReflinkMode,
+    #[cfg(test)] data_gate_path: &std::path::Path,
+) -> FileDataOutput {
+    #[cfg(test)]
+    let gate_visit = {
+        use std::os::fd::AsRawFd as _;
+        crate::testutils::wait_on_blocking_path_gate(
+            data_gate_path,
+            destination.as_fd().as_raw_fd(),
+        )
+    };
+    let result = copy_file_data(&source, &destination, len, reflink);
+    FileDataOutput {
+        result,
+        destination,
+        #[cfg(test)]
+        gate_visit,
+    }
+}
+
 /// Copies one already-open current regular source after destination-only preflight has completed.
 #[allow(clippy::too_many_arguments)]
 async fn copy_current_regular(
@@ -1696,6 +1737,14 @@ async fn copy_current_regular(
     // rcp accepts that rather than staging and renaming. `execute_dst_plan` removes by name through
     // the pinned parent; a compatible replacement since planning may be removed, but the operation
     // cannot escape that directory.
+    let combine_create_and_copy = matches!(&plan, FilePlan::Vacant);
+    #[cfg(test)]
+    let combine_create_and_copy =
+        combine_create_and_copy && !crate::testutils::separate_copy_jobs();
+    let len = src_meta.size();
+    let reflink = settings.reflink;
+    #[cfg(test)]
+    let data_gate_path = dst_path.to_path_buf();
     execute_dst_plan(
         prog_track,
         dst_parent,
@@ -1706,102 +1755,130 @@ async fn copy_current_regular(
         &mut copy_summary,
     )
     .await?;
-    let dst_file = match dst_parent.create_file(dst_name).await {
-        Ok(dst_file) => dst_file,
-        // the destination slot is occupied. `create_file`'s `O_EXCL` is the only way either route
-        // finds out that a writer got here between our last look and now: on the known-fresh route
-        // there was no earlier look at all (freshness is an optimization hint, not an enforceable
-        // invariant — see `resolve_dst_dir` — so a concurrent writer can populate a directory we
-        // just created), and on the other route the slot was planned but has been refilled since.
-        // both cases are the same conflict, so resolve it here and honor --overwrite /
-        // --ignore-existing rather than failing the copy on EEXIST. Planning and executing are
-        // back-to-back here, unlike the route above: the source and the tokens are already held, so
-        // there is nothing left that could abandon the copy after the removal.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let preflight =
-                preflight_dst_file(prog_track, dst_parent, dst_name, dst_path, settings)
-                    .await
-                    // rebuild from `err.source`, never from a stringified error: the chain must survive.
-                    .map_err(|err| Error::new(err.source, err.summary + copy_summary))?;
-            let plan = match preflight {
-                DestinationPreflight::Vacant => FilePlan::Vacant,
-                DestinationPreflight::Skip(summary) => {
-                    return Ok(skip_summary(summary, &copy_summary));
-                }
-                DestinationPreflight::OverwriteCandidate(dst_handle) => {
-                    match plan_overwrite_candidate(prog_track, &dst_handle, &src_meta, settings) {
-                        OverwriteCandidateDecision::Skip(summary) => {
-                            return Ok(skip_summary(summary, &copy_summary));
-                        }
-                        OverwriteCandidateDecision::Replace => {
-                            FilePlan::Replace(dst_handle.into_removal_snapshot())
-                        }
-                    }
-                }
-            };
-            execute_dst_plan(
-                prog_track,
-                dst_parent,
-                dst_name,
-                dst_path,
-                plan,
-                settings,
-                &mut copy_summary,
-            )
-            .await?;
-            // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
-            // another writer refilled it — report that rather than looping, which against a live
-            // competing writer would never terminate.
-            dst_parent
-                .create_file(dst_name)
-                .await
-                .with_context(|| format!("failed creating {:?}", dst_path))
-                .map_err(|err| Error::new(err, copy_summary))?
-        }
-        Err(error) => {
-            return Err(Error::new(
-                anyhow::Error::new(error).context(format!("failed creating {:?}", dst_path)),
-                copy_summary,
-            ));
+    // keep source opening, IOPS reservation, and ACL capture ahead of creation. Only the first
+    // vacant-slot attempt combines creation and payload; conflict recovery keeps the source fd and
+    // the existing single retry. The create probe/permit end before the cancellable payload claim.
+    let started = if combine_create_and_copy {
+        #[cfg(test)]
+        let data_gate_path = data_gate_path.clone();
+        dst_parent
+            .create_file_and_then(dst_name, move |destination| match destination {
+                Ok(destination) => FileCopyStart::CreatedAndCopied(copy_file_payload(
+                    src_file,
+                    destination,
+                    len,
+                    reflink,
+                    #[cfg(test)]
+                    &data_gate_path,
+                )),
+                Err(error) => FileCopyStart::CreateResult {
+                    source: src_file,
+                    destination: Err(error),
+                },
+            })
+            .await
+            .with_context(|| format!("failed creating or copying {:?}", dst_path))
+            .map_err(|err| Error::new(err, copy_summary))?
+    } else {
+        FileCopyStart::CreateResult {
+            source: src_file,
+            destination: dst_parent.create_file(dst_name).await,
         }
     };
-    tracing::debug!("copying data");
-    let len = src_meta.size();
-    let reflink = settings.reflink;
-    // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
-    // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
-    // never pollutes the per-metadata-op controller baseline. backpressure comes from the
-    // open-file admission is retained by the canonical non-cancellable blocking boundary. the
-    // destination file is returned so it remains live through metadata application, closing the
-    // path-based re-open and cancellation-lifetime gaps.
-    #[cfg(test)]
-    let data_gate_path = dst_path.to_path_buf();
-    let data_output = safedir::run_fd_admitted_blocking(move || {
-        #[cfg(test)]
-        let gate_visit = {
-            use std::os::fd::AsRawFd as _;
-            crate::testutils::wait_on_blocking_path_gate(
-                &data_gate_path,
-                dst_file.as_fd().as_raw_fd(),
-            )
-        };
-        let copy_result = copy_file_data(&src_file, &dst_file, len, reflink);
-        #[cfg(test)]
-        {
-            Ok((copy_result, dst_file, gate_visit))
+    let data_output = match started {
+        FileCopyStart::CreatedAndCopied(output) => output,
+        FileCopyStart::CreateResult {
+            source,
+            destination,
+        } => {
+            let dst_file = match destination {
+                Ok(dst_file) => dst_file,
+                // the destination slot is occupied. `create_file`'s `O_EXCL` is the only way either route
+                // finds out that a writer got here between our last look and now: on the known-fresh route
+                // there was no earlier look at all (freshness is an optimization hint, not an enforceable
+                // invariant — see `resolve_dst_dir` — so a concurrent writer can populate a directory we
+                // just created), and on the other route the slot was planned but has been refilled since.
+                // both cases are the same conflict, so resolve it here and honor --overwrite /
+                // --ignore-existing rather than failing the copy on EEXIST. Planning and executing are
+                // back-to-back here, unlike the route above: the source and the tokens are already held, so
+                // there is nothing left that could abandon the copy after the removal.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let preflight =
+                        preflight_dst_file(prog_track, dst_parent, dst_name, dst_path, settings)
+                            .await
+                            // rebuild from `err.source`, never from a stringified error: the chain must survive.
+                            .map_err(|err| Error::new(err.source, err.summary + copy_summary))?;
+                    let plan = match preflight {
+                        DestinationPreflight::Vacant => FilePlan::Vacant,
+                        DestinationPreflight::Skip(summary) => {
+                            return Ok(skip_summary(summary, &copy_summary));
+                        }
+                        DestinationPreflight::OverwriteCandidate(dst_handle) => {
+                            match plan_overwrite_candidate(
+                                prog_track,
+                                &dst_handle,
+                                &src_meta,
+                                settings,
+                            ) {
+                                OverwriteCandidateDecision::Skip(summary) => {
+                                    return Ok(skip_summary(summary, &copy_summary));
+                                }
+                                OverwriteCandidateDecision::Replace => {
+                                    FilePlan::Replace(dst_handle.into_removal_snapshot())
+                                }
+                            }
+                        }
+                    };
+                    execute_dst_plan(
+                        prog_track,
+                        dst_parent,
+                        dst_name,
+                        dst_path,
+                        plan,
+                        settings,
+                        &mut copy_summary,
+                    )
+                    .await?;
+                    // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
+                    // another writer refilled it — report that rather than looping, which against a live
+                    // competing writer would never terminate.
+                    dst_parent
+                        .create_file(dst_name)
+                        .await
+                        .with_context(|| format!("failed creating {:?}", dst_path))
+                        .map_err(|err| Error::new(err, copy_summary))?
+                }
+                Err(error) => {
+                    return Err(Error::new(
+                        anyhow::Error::new(error)
+                            .context(format!("failed creating {:?}", dst_path)),
+                        copy_summary,
+                    ));
+                }
+            };
+            // payload latency is deliberately outside metadata congestion probes. The canonical
+            // boundary retains descriptor admission through work and abandoned output destruction.
+            safedir::run_fd_admitted_blocking(move || {
+                Ok(copy_file_payload(
+                    source,
+                    dst_file,
+                    len,
+                    reflink,
+                    #[cfg(test)]
+                    &data_gate_path,
+                ))
+            })
+            .await
+            .with_context(|| format!("failed copying data to {:?}", dst_path))
+            .map_err(|err| Error::new(err, copy_summary))?
         }
-        #[cfg(not(test))]
-        {
-            Ok((copy_result, dst_file))
-        }
-    })
-    .await
-    .with_context(|| format!("failed copying data to {:?}", dst_path))
-    .map_err(|err| Error::new(err, copy_summary))?;
-    #[cfg(test)]
-    let (copy_result, dst_file, _gate_visit) = data_output;
-    #[cfg(not(test))]
-    let (copy_result, dst_file) = data_output;
+    };
+    let FileDataOutput {
+        result: copy_result,
+        destination: dst_file,
+        #[cfg(test)]
+            gate_visit: _gate_visit,
+    } = data_output;
     let copied = copy_result
         .with_context(|| format!("failed copying data to {:?}", dst_path))
         .map_err(|err| Error::new(err, copy_summary))?;
@@ -8681,6 +8758,103 @@ mod copy_tests {
         assert_eq!(
             error.summary.rm_summary.files_removed, 0,
             "nothing was removed, and the summary must say so"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_copy_handoff_removes_one_submission_per_file() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .max_blocking_threads(32)
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let limits = testutils::AdmissionLimit::new().await;
+                let tmp = tempfile::tempdir()?;
+                let source = tmp.path().join("source");
+                std::fs::create_dir(&source)?;
+                let mut config = crate::filegen::FileGenConfig::new(&source, vec![4], 32, 1000);
+                config.leaf_files = true;
+                let generated = crate::filegen::filegen(&PROGRESS, &config).await?;
+                assert_eq!(generated.files_created, 128);
+                let settings = Settings {
+                    reflink: crate::copy_data::ReflinkMode::Never,
+                    ..settings_with_delete(None)
+                };
+                for concurrency in [8, 32] {
+                    limits.set_files_in_flight(concurrency);
+                    let mut counts = [0; 2];
+                    // rotate which path runs first; no timing or cache-state conclusion follows
+                    for separate in if concurrency == 8 { [true, false] } else { [false, true] } {
+                        let destination = tmp.path().join(format!("copy-{concurrency}-{separate}"));
+                        let observer = testutils::BlockingSubmissions::start(separate);
+                        let summary = limits.run_with_timeout(std::time::Duration::from_secs(30), copy(
+                            &PROGRESS, &source, &destination, &settings, &NO_PRESERVE_SETTINGS, false,
+                        )).await??;
+                        counts[usize::from(!separate)] = observer.count();
+                        drop(observer);
+                        assert_eq!(summary.files_copied, 128);
+                        assert_eq!(summary.bytes_copied, 128_000);
+                        assert_eq!(std::fs::read_dir(&destination)?.count(), 4);
+                        for dir in 0..4 {
+                            assert_eq!(std::fs::read_dir(destination.join(format!("dir{dir}")))?.count(), 32);
+                            for file in 0..32 {
+                                let relative = format!("dir{dir}/file{file}");
+                                assert_eq!(std::fs::read(source.join(&relative))?, std::fs::read(destination.join(&relative))?);
+                                assert_eq!(std::fs::metadata(source.join(&relative))?.permissions(), std::fs::metadata(destination.join(&relative))?.permissions());
+                            }
+                        }
+                    }
+                    assert_eq!(counts[0] - counts[1], 128, "one saved submission per copied file");
+                    println!("handoff submission fixture: files=128 bytes_per_file=1000 workers=4 blocking=32 concurrency={concurrency} separate={} combined={}", counts[0], counts[1]);
+                }
+                anyhow::Ok(())
+            })
+    }
+
+    #[tokio::test]
+    async fn handoff_conflict_retry_keeps_the_original_source_descriptor() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        std::fs::write(&source, b"original payload")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
+        std::fs::write(&destination, b"old")?;
+        let source_parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
+        let destination_parent =
+            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?);
+        let current = CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
+        std::fs::rename(&source, tmp.path().join("original"))?;
+        std::fs::write(&source, b"replacement")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))?;
+        let settings = Settings {
+            overwrite: true,
+            reflink: crate::copy_data::ReflinkMode::Never,
+            ..settings_with_delete(None)
+        };
+        let summary = copy_current_regular(
+            &PROGRESS,
+            &source_parent,
+            &destination_parent,
+            OsStr::new("destination"),
+            &destination,
+            &source,
+            current,
+            FilePlan::Vacant,
+            &settings,
+            &preserve::preserve_all(),
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(summary.bytes_copied, 16);
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(std::fs::read(&destination)?, b"original payload");
+        assert_eq!(
+            std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
+            0o751
         );
         Ok(())
     }
