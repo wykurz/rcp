@@ -26,6 +26,8 @@ use crate::walk::EntryKind;
 #[cfg(test)]
 mod resource_tests;
 #[cfg(test)]
+pub(crate) use resource_tests::AclReadFailure;
+#[cfg(test)]
 mod timing_tests;
 
 // ── Destination creation modes ───────────────────────────────────────────────
@@ -2363,6 +2365,8 @@ pub(crate) async fn read_acls_owned<F: AsRawFd + Send + 'static>(
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             #[cfg(test)]
             let _visit = resource_tests::gate_opened_descriptor(owned.as_raw_fd());
+            #[cfg(test)]
+            resource_tests::fail_acl_read_if_requested(owned.as_raw_fd())?;
             let names = flistxattr_names(owned.as_raw_fd())?;
             Ok((owned, names))
         })

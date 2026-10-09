@@ -8959,16 +8959,10 @@ mod copy_tests {
             let destination_parent = Arc::new(
                 Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?,
             );
-            let mut current =
+            let current =
                 CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
-            // the O_PATH descriptor pins the same inode but rejects flistxattr with EBADF
-            current.file = source_parent
-                .child(OsStr::new("source"))
-                .await?
-                .as_fd()
-                .try_clone_to_owned()?
-                .into();
             let identity = testutils::FdIdentityProbe::capture(current.file.as_raw_fd())?;
+            let _failure = safedir::AclReadFailure::install(current.file.as_raw_fd());
             let plan = FilePlan::Replace(
                 destination_parent
                     .child(OsStr::new("destination"))
@@ -8996,14 +8990,17 @@ mod copy_tests {
             )
             .await
             .expect_err("ACL failure must precede destination removal");
-            assert!(error.source.to_string().contains("failed reading ACLs"));
+            assert!(
+                error.source.to_string().contains("failed reading ACLs"),
+                "unexpected copy error: {error:?}"
+            );
             assert_eq!(
                 error
                     .source
                     .root_cause()
                     .downcast_ref::<std::io::Error>()
                     .and_then(std::io::Error::raw_os_error),
-                Some(libc::EBADF)
+                Some(libc::EIO)
             );
             assert_eq!(error.summary.files_copied, 0);
             assert_eq!(error.summary.bytes_copied, 0);
