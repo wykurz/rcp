@@ -1,6 +1,49 @@
 use super::*;
 use anyhow::Context as _;
 
+// process-global fixture: nextest isolation or libtest --test-threads=1 is required
+static ACL_READ_FAILURE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Injects one ACL-read error for an owned descriptor without changing its file type or access.
+pub(crate) struct AclReadFailure;
+
+impl AclReadFailure {
+    pub(crate) fn install(fd: RawFd) -> Self {
+        assert!(fd >= 0);
+        ACL_READ_FAILURE_FD
+            .compare_exchange(
+                -1,
+                fd,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .expect("an ACL read failure fixture is already installed");
+        Self
+    }
+}
+
+impl Drop for AclReadFailure {
+    fn drop(&mut self) {
+        ACL_READ_FAILURE_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(super) fn fail_acl_read_if_requested(fd: RawFd) -> std::io::Result<()> {
+    // -2 disarms the error while keeping the fixture reserved until its guard drops
+    if ACL_READ_FAILURE_FD
+        .compare_exchange(
+            fd,
+            -2,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(())
+}
+
 pub(super) fn gate_opened_descriptor(fd: RawFd) -> Option<crate::testutils::BlockingPathGateVisit> {
     let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
     crate::testutils::wait_on_blocking_path_gate(&path, fd)
