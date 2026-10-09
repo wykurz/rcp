@@ -1,5 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1684,7 +1683,7 @@ fn copy_file_payload(
 ) -> FileDataOutput {
     #[cfg(test)]
     let gate_visit = {
-        use std::os::fd::AsRawFd as _;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
         crate::testutils::wait_on_blocking_path_gate(
             data_gate_path,
             destination.as_fd().as_raw_fd(),
@@ -1741,15 +1740,14 @@ async fn copy_current_regular(
     // docs/tocttou.md), and before the destination is touched — an unreadable source must not cost
     // the user the file being overwritten. Only when `acl` was requested: the probe is a syscall per
     // entry that `stat` cannot fold in, so an ordinary copy must not pay for it.
-    let src_acls = if preserve.file.acl {
-        Some(
-            safedir::read_acls_fd(src_file.as_fd(), src_parent.side(), false)
-                .await
-                .with_context(|| format!("failed reading ACLs from {:?}", src_path))
-                .map_err(|err| Error::new(err, copy_summary))?,
-        )
+    let (src_file, src_acls) = if preserve.file.acl {
+        let (src_file, acls) = safedir::read_acls_owned(src_file, src_parent.side(), false)
+            .await
+            .with_context(|| format!("failed reading ACLs from {:?}", src_path))
+            .map_err(|err| Error::new(err, copy_summary))?;
+        (src_file, Some(acls))
     } else {
-        None
+        (src_file, None)
     };
     // the source fd is held and the throttle budget is reserved, so the destination can now be
     // replaced: the failure that would most often abandon this copy before any byte exists is behind
@@ -8893,49 +8891,133 @@ mod copy_tests {
     }
 
     #[tokio::test]
-    async fn handoff_conflict_retry_keeps_the_original_source_descriptor() -> anyhow::Result<()> {
+    async fn conflict_retry_keeps_the_original_source_descriptor_with_acl_preservation()
+    -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir()?;
-        let source = tmp.path().join("source");
-        let destination = tmp.path().join("destination");
-        std::fs::write(&source, b"original payload")?;
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
-        std::fs::write(&destination, b"old")?;
-        let source_parent =
-            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
-        let destination_parent =
-            Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?);
-        let current = CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
-        std::fs::rename(&source, tmp.path().join("original"))?;
-        std::fs::write(&source, b"replacement")?;
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))?;
-        let settings = Settings {
-            local_copy_handoff: LocalCopyHandoff::Fresh,
-            overwrite: true,
-            reflink: crate::copy_data::ReflinkMode::Never,
-            ..settings_with_delete(None)
-        };
-        let summary = copy_current_regular(
-            &PROGRESS,
-            &source_parent,
-            &destination_parent,
-            OsStr::new("destination"),
-            &destination,
-            &source,
-            current,
-            FilePlan::Vacant,
-            &settings,
-            &preserve::preserve_all(),
-        )
-        .await?;
-        assert_eq!(summary.files_copied, 1);
-        assert_eq!(summary.bytes_copied, 16);
-        assert_eq!(summary.rm_summary.files_removed, 1);
-        assert_eq!(std::fs::read(&destination)?, b"original payload");
-        assert_eq!(
-            std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
-            0o751
-        );
+        for handoff in [LocalCopyHandoff::Never, LocalCopyHandoff::Fresh] {
+            let tmp = tempfile::tempdir()?;
+            let source = tmp.path().join("source");
+            let destination = tmp.path().join("destination");
+            std::fs::write(&source, b"original payload")?;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
+            std::fs::write(&destination, b"old")?;
+            let source_parent =
+                Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
+            let destination_parent = Arc::new(
+                Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?,
+            );
+            let current =
+                CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
+            std::fs::rename(&source, tmp.path().join("original"))?;
+            std::fs::write(&source, b"replacement")?;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))?;
+            let settings = Settings {
+                local_copy_handoff: handoff,
+                overwrite: true,
+                reflink: crate::copy_data::ReflinkMode::Never,
+                ..settings_with_delete(None)
+            };
+            let mut preservation = preserve::preserve_all();
+            preservation.file.acl = true;
+            let summary = copy_current_regular(
+                &PROGRESS,
+                &source_parent,
+                &destination_parent,
+                OsStr::new("destination"),
+                &destination,
+                &source,
+                current,
+                FilePlan::Vacant,
+                &settings,
+                &preservation,
+            )
+            .await?;
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.bytes_copied, 16);
+            assert_eq!(summary.rm_summary.files_removed, 1);
+            assert_eq!(std::fs::read(&destination)?, b"original payload");
+            assert_eq!(
+                std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
+                0o751
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_source_acl_read_keeps_the_existing_destination_intact() -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        for handoff in [LocalCopyHandoff::Never, LocalCopyHandoff::Fresh] {
+            let tmp = tempfile::tempdir()?;
+            let source = tmp.path().join("source");
+            let destination = tmp.path().join("destination");
+            std::fs::write(&source, b"new payload")?;
+            std::fs::write(&destination, b"old payload")?;
+            let original_destination = std::fs::metadata(&destination)?;
+            let source_parent =
+                Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
+            let destination_parent = Arc::new(
+                Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?,
+            );
+            let mut current =
+                CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
+            // the O_PATH descriptor pins the same inode but rejects flistxattr with EBADF
+            current.file = source_parent
+                .child(OsStr::new("source"))
+                .await?
+                .as_fd()
+                .try_clone_to_owned()?
+                .into();
+            let identity = testutils::FdIdentityProbe::capture(current.file.as_raw_fd())?;
+            let plan = FilePlan::Replace(
+                destination_parent
+                    .child(OsStr::new("destination"))
+                    .await?
+                    .into_removal_snapshot(),
+            );
+            let settings = Settings {
+                local_copy_handoff: handoff,
+                overwrite: true,
+                ..settings_with_delete(None)
+            };
+            let mut preservation = preserve::preserve_all();
+            preservation.file.acl = true;
+            let error = copy_current_regular(
+                &PROGRESS,
+                &source_parent,
+                &destination_parent,
+                OsStr::new("destination"),
+                &destination,
+                &source,
+                current,
+                plan,
+                &settings,
+                &preservation,
+            )
+            .await
+            .expect_err("ACL failure must precede destination removal");
+            assert!(error.source.to_string().contains("failed reading ACLs"));
+            assert_eq!(
+                error
+                    .source
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(libc::EBADF)
+            );
+            assert_eq!(error.summary.files_copied, 0);
+            assert_eq!(error.summary.bytes_copied, 0);
+            assert_eq!(error.summary.rm_summary.files_removed, 0);
+            assert!(identity.original_is_closed()?);
+            assert_eq!(std::fs::read(&destination)?, b"old payload");
+            let remaining = std::fs::metadata(&destination)?;
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::ino(&remaining),
+                std::os::unix::fs::MetadataExt::ino(&original_destination)
+            );
+            assert_eq!(remaining.permissions(), original_destination.permissions());
+            assert_eq!(remaining.modified()?, original_destination.modified()?);
+        }
         Ok(())
     }
 
