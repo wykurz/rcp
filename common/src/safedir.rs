@@ -2351,7 +2351,10 @@ pub async fn read_acls_fd(
         .map(|(_, acls)| acls)
 }
 
-async fn read_acls_owned<F: AsRawFd + Send + 'static>(
+/// Read ACLs without duplicating the descriptor, returning the same owner on success.
+///
+/// Errors and cancellation drop the owner through the existing blocking-job lifetime rules.
+pub(crate) async fn read_acls_owned<F: AsRawFd + Send + 'static>(
     owned: F,
     side: congestion::Side,
     want_default: bool,
@@ -4211,6 +4214,12 @@ mod tests {
             _completion: crate::testutils::CompletionSignal,
         }
 
+        impl AsRawFd for BlockingDropFd {
+            fn as_raw_fd(&self) -> RawFd {
+                self._file.as_raw_fd()
+            }
+        }
+
         impl Drop for BlockingDropFd {
             fn drop(&mut self) {
                 if let Some(drop_started) = self.drop_started.take() {
@@ -4234,6 +4243,15 @@ mod tests {
             observation: Arc<std::sync::Mutex<Option<std::io::Result<QueuedFdDropObservation>>>>,
         }
 
+        impl AsRawFd for QueuedFdCapture {
+            fn as_raw_fd(&self) -> RawFd {
+                self.file
+                    .as_ref()
+                    .expect("captured file must be present")
+                    .as_raw_fd()
+            }
+        }
+
         impl Drop for QueuedFdCapture {
             fn drop(&mut self) {
                 drop(self.file.take());
@@ -4249,6 +4267,118 @@ mod tests {
                         }
                     }));
             }
+        }
+
+        #[test]
+        fn cancelled_queued_owned_acl_read_closes_source_before_returning_admission()
+        -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let source = tempfile::tempfile()?;
+                let probe = testutils::FdIdentityProbe::capture(source.as_raw_fd())?;
+                let observation = Arc::new(std::sync::Mutex::new(None));
+                let capture = QueuedFdCapture {
+                    file: Some(source),
+                    probe,
+                    observation: Arc::clone(&observation),
+                };
+                let limits = testutils::AdmissionLimit::new().await;
+                limits.set_files_in_flight(1);
+                let guard = throttle::open_file_permit().await;
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                started_rx.await?;
+                let mut work = Box::pin(with_fd_admission(
+                    guard.admission(),
+                    read_acls_owned(capture, congestion::Side::Source, false),
+                ));
+                let queued = futures::poll!(work.as_mut()).is_pending();
+                drop(guard);
+                drop(work);
+                let closed_before_release = probe.original_is_closed();
+                let drop_observation = observation.lock().unwrap().take().transpose();
+                let mut next_file = Box::pin(throttle::open_file_permit());
+                let returned = next_file.as_mut().now_or_never();
+                let capacity_returned_before_release = returned.is_some();
+                drop(release_tx);
+                blocker.await?;
+                tokio::task::spawn_blocking(|| ()).await?;
+                let permit = match returned {
+                    Some(permit) => permit,
+                    None => {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), next_file).await?
+                    }
+                };
+                drop(permit);
+                assert!(queued);
+                assert!(closed_before_release?);
+                assert!(capacity_returned_before_release);
+                assert_eq!(
+                    drop_observation?,
+                    Some(QueuedFdDropObservation {
+                        fd_was_closed: true,
+                        admission_was_retained: true,
+                    })
+                );
+                Ok(())
+            })
+        }
+
+        #[tokio::test]
+        async fn abandoned_owned_acl_output_closes_source_before_returning_admission()
+        -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("source");
+            std::fs::write(&path, b"payload")?;
+            let file = std::fs::File::open(&path)?;
+            let probe = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+            let mut gate = testutils::BlockingPathGate::install(&path);
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let guard = throttle::open_file_permit().await;
+            let (drop_started_tx, drop_started_rx) = tokio::sync::oneshot::channel();
+            let (release_drop_tx, release_drop_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = testutils::CompletionSignal::new();
+            let owner = BlockingDropFd {
+                _file: file,
+                drop_started: Some(drop_started_tx),
+                release_drop: release_drop_rx,
+                _completion: completion,
+            };
+            let task = tokio::spawn(with_fd_admission(guard.admission(), async move {
+                let _guard = guard;
+                read_acls_owned(owner, congestion::Side::Source, false).await
+            }));
+            let started = gate.wait_started().await;
+            task.abort();
+            let cancelled = matches!(task.await, Err(error) if error.is_cancelled());
+            gate.release_all();
+            let dropping = drop_started_rx.await;
+            let admission_retained = throttle::open_file_permit().now_or_never().is_none();
+            let fd_retained = probe.original_is_closed().map(|closed| !closed);
+            let released = release_drop_tx.send(());
+            let (completed, permit) = testutils::await_completion_and_capacity(
+                completion_rx,
+                throttle::open_file_permit(),
+            )
+            .await;
+            drop(permit);
+            started?;
+            dropping?;
+            released?;
+            completed?;
+            assert!(cancelled);
+            assert!(admission_retained);
+            assert!(fd_retained?);
+            assert!(probe.original_is_closed()?);
+            Ok(())
         }
 
         #[test]
@@ -6182,6 +6312,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_owned_acl_read_retains_source_and_permits_until_started_work_finishes()
+    -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("source");
+        std::fs::write(&path, b"payload")?;
+        let file = std::fs::File::open(&path)?;
+        let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+        let gate = testutils::BlockingPathGate::install(&path);
+        let limits = testutils::AdmissionLimit::new().await;
+        limits.set_files_in_flight(1);
+        let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+        limits.set_max_ops_in_flight(resource, 1);
+        let guard = throttle::open_file_permit().await;
+        let task = tokio::spawn(with_fd_admission(guard.admission(), async move {
+            let _guard = guard;
+            read_acls_owned(file, congestion::Side::Source, false).await
+        }));
+        let mut next_operation = Box::pin(throttle::ops_in_flight_permit(resource));
+        let (observations, acquired_operation) = testutils::cancel_at_blocking_path(
+            limits,
+            gate,
+            task,
+            std::time::Duration::from_secs(20),
+            |_| next_operation.as_mut().now_or_never(),
+        )
+        .await?;
+        let operation_retained = acquired_operation.is_none();
+        let permit = match acquired_operation {
+            Some(permit) => permit,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), next_operation).await?,
+        };
+        drop(permit);
+        assert!(observations.waiter_was_cancelled);
+        assert!(observations.admission_was_retained_while_work_gated);
+        assert!(observations.fd_was_open_while_work_gated);
+        assert!(operation_retained);
+        assert_eq!(observations.final_hit_count, 1);
+        assert!(identity.original_is_closed()?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelled_owned_metadata_waiting_for_admission_closes_the_file_without_widening()
     -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6914,6 +7087,31 @@ mod tests {
     fn mode_of(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn read_acls_owned_returns_the_same_source_descriptor_after_name_replacement()
+    -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("source");
+        std::fs::write(&path, b"original")?;
+        let blob = restrictive_access_acl();
+        set_xattr_at(&path, ACL_ACCESS_XATTR, &blob);
+        let file = std::fs::File::open(&path)?;
+        let raw_fd = file.as_raw_fd();
+        std::fs::rename(&path, tmp.path().join("original"))?;
+        std::fs::write(&path, b"replacement")?;
+        set_xattr_at(&path, ACL_ACCESS_XATTR, &permissive_acl());
+        let (mut file, acls) = read_acls_owned(file, congestion::Side::Source, false).await?;
+        assert_eq!(file.as_raw_fd(), raw_fd);
+        assert_eq!(acls.access.as_deref(), Some(blob.as_slice()));
+        assert_eq!(acls.default, None);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"original");
+        Ok(())
     }
 
     #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
