@@ -32,7 +32,7 @@ mod timing_tests;
 
 /// The mode a destination FILE is created with, before it has any contents.
 ///
-/// Owner-only. The source mode is applied by [`set_file_metadata_fd`] once the last byte has been
+/// Owner-only. The source mode is applied by [`set_file_metadata_owned`] once the last byte has been
 /// written, so the file is never visible to anyone but the copier while it is being filled in —
 /// the file counterpart of the directory split-chmod (see [`DST_DIR_CREATE_MODE`]).
 ///
@@ -1610,7 +1610,7 @@ impl Dir {
     ///
     /// The file is ALWAYS created at [`DST_FILE_CREATE_MODE`] — there is deliberately no mode
     /// parameter, so a caller cannot publish a destination file at its final (possibly setuid)
-    /// mode before its contents exist. [`set_file_metadata_fd`] widens it to the source mode after
+    /// mode before its contents exist. [`set_file_metadata_owned`] widens it to the source mode after
     /// the last byte. Returns the open writable `File` on success; the returned fd is writable
     /// whatever the mode says, having been opened `O_WRONLY` at creation.
     ///
@@ -2396,7 +2396,7 @@ pub(crate) async fn read_acls_owned<F: AsRawFd + Send + 'static>(
 /// needs an explicit removal or the copy silently ends up more permissive than what it copied.
 ///
 /// The access ACL is applied LAST because it is the step that WIDENS the destination — see
-/// [`set_file_metadata_fd`]. The default ACL is mode-neutral, so it goes first and constrains
+/// [`set_file_metadata_owned`]. The default ACL is mode-neutral, so it goes first and constrains
 /// nothing.
 ///
 /// Gated as `MetadataOp::Chmod`, the bucket for single-inode permission writes.
@@ -2862,7 +2862,7 @@ pub async fn warn_if_root_acl_unpreserved_at(
 //
 // Every applier does chown BEFORE chmod: an unprivileged `fchown` clears
 // setuid/setgid on a regular file, so the chmod has to come after to restore
-// them. `set_file_metadata_fd` additionally puts the widening step LAST, after
+// them. `set_file_metadata_owned` additionally puts the widening step LAST, after
 // utimens — it is what takes a destination file from the owner-only mode it was
 // created at (`DST_FILE_CREATE_MODE`) to the source mode, so it must not land
 // until every other fallible step has succeeded. Ordering the two is free:
@@ -3168,14 +3168,14 @@ async fn symlink_utimes_fd(
     .await
 }
 
-/// Apply file metadata (owner, timestamps, mode, ACL) to an already-open writable
-/// file descriptor, in the chown → utimens → mode order.
+/// Apply file metadata (owner, timestamps, mode, ACL) while consuming the destination's
+/// existing writable descriptor, in the chown → utimens → mode order.
 ///
-/// `fd` must be the destination file's own fd (typically the write fd returned
-/// by [`Dir::create_file`]); this avoids the redundant `File::open` re-open a
-/// path-based applier would need, and closes the TOCTOU window in the process.
-/// This borrowed adapter duplicates once; callers that can transfer ownership use
-/// `set_file_metadata_owned` without duplicating the descriptor.
+/// `fd` must be the destination file's own fd (typically the write fd returned by
+/// [`Dir::create_file`]). The same descriptor moves through individually gated metadata
+/// operations, without duplication or reopening. Each blocking output owns it until consumed
+/// or dropped, including cancellation. Callers must finish pending writes and check their errors
+/// before transferring the descriptor so later writes cannot overwrite the applied timestamps.
 /// Gating on `settings.file`: chown only when uid or gid is requested, chmod
 /// always (the masked mode honors `mode_mask`), timestamps only when requested, ACLs only when
 /// `settings.file.acl` is on — in which case `acls` must carry what was read from the source, or
@@ -3216,22 +3216,7 @@ async fn symlink_utimes_fd(
 /// and the source's mtime land in the same whole second. See `docs/tocttou.md`.
 ///
 /// [`metadata_equal`]: crate::filecmp::metadata_equal
-pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
-    settings: &crate::preserve::Settings,
-    meta: &Meta,
-    acls: Option<&Acls>,
-    fd: BorrowedFd<'_>,
-    side: congestion::Side,
-) -> std::io::Result<()> {
-    set_file_metadata_owned(settings, meta, acls, fd.try_clone_to_owned()?, side).await
-}
-
-/// Apply file metadata while consuming the destination's existing writable descriptor.
-///
-/// The same descriptor moves through individually gated metadata operations, without duplication
-/// or reopening. Each blocking output owns it until consumed or dropped, including cancellation.
-/// The ordering and final widening invariant are shared with [`set_file_metadata_fd`].
-pub(crate) async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
+pub async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
     settings: &crate::preserve::Settings,
     meta: &Meta,
     acls: Option<&Acls>,
@@ -3281,7 +3266,7 @@ pub(crate) async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
 /// following the chown → mode → utimens ordering. Gates on `settings.dir` and
 /// uses the directory's own congestion side.
 ///
-/// The mode step is the same two-branch shape as [`set_file_metadata_fd`] — see the widening
+/// The mode step is the same two-branch shape as [`set_file_metadata_owned`] — see the widening
 /// invariant there — with [`DST_DIR_CREATE_MODE`] as the create mode. It stays in the directory
 /// applier's existing chmod slot rather than moving to the end: `futimens` is last for a directory
 /// because a directory's mtime is bumped by every child created in it, and unlike a file's mode a
@@ -6232,11 +6217,11 @@ mod tests {
         Ok(())
     }
 
-    // set_file_metadata_fd: applying owner/mode/time from a source FileMeta to an
+    // set_file_metadata_owned: applying owner/mode/time from a source FileMeta to an
     // already-open destination fd must reflect on the destination file: masked
     // mode, mtime, and (where testable) uid/gid all match the source.
     #[tokio::test]
-    async fn set_file_metadata_fd_applies_owner_mode_time() -> anyhow::Result<()> {
+    async fn set_file_metadata_owned_applies_owner_mode_time() -> anyhow::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let tmp = testutils::setup_test_dir().await?;
@@ -6264,15 +6249,14 @@ mod tests {
 
         // apply source metadata to the already-open dst fd; preserve everything
         let settings = crate::preserve::preserve_all();
-        set_file_metadata_fd(
+        set_file_metadata_owned(
             &settings,
             &src_meta,
             None,
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await?;
-        drop(dst_file);
 
         // re-stat the destination and assert mode (masked to 0o7777), mtime
         let dst_md = std::fs::metadata(tmp.join("foo/dst_meta.txt"))?;
@@ -6299,7 +6283,7 @@ mod tests {
         Ok(())
     }
 
-    // set_file_metadata_fd: chown before chmod must preserve a setuid bit.
+    // set_file_metadata_owned: chown before chmod must preserve a setuid bit.
     // An unprivileged fchown (even to the current uid) clears setuid/setgid; doing
     // chown FIRST and chmod AFTER restores it. This test proves that ordering.
     #[cfg_attr(
@@ -6307,7 +6291,7 @@ mod tests {
         ignore = "Nix sandbox cannot change ownership or set-id modes"
     )]
     #[tokio::test]
-    async fn set_file_metadata_fd_ordering_preserves_setuid() -> anyhow::Result<()> {
+    async fn set_file_metadata_owned_ordering_preserves_setuid() -> anyhow::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let tmp = testutils::setup_test_dir().await?;
@@ -6334,15 +6318,14 @@ mod tests {
         // preserve_all keeps the full mode (mask 0o7777) AND preserves uid/gid, so
         // the chown runs before the chmod; the setuid bit must survive.
         let settings = crate::preserve::preserve_all();
-        set_file_metadata_fd(
+        set_file_metadata_owned(
             &settings,
             &src_meta,
             None,
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await?;
-        drop(dst_file);
 
         let dst_md = std::fs::metadata(tmp.join("foo/setuid_dst"))?;
         assert_eq!(
@@ -6353,13 +6336,13 @@ mod tests {
         Ok(())
     }
 
-    // set_file_metadata_fd: the widening chmod must be the LAST step. A destination file is created
+    // set_file_metadata_owned: the widening chmod must be the LAST step. A destination file is created
     // owner-only and this call is the only thing that widens it to the source mode, so a fallible
     // step running AFTER the chmod would publish that final mode — here a setuid one — on a file the
     // copy is about to report as failed. `futimens` is that step. An out-of-range nanosecond field
     // makes it fail deterministically, with no privileged uid or hostile filesystem needed.
     #[tokio::test]
-    async fn set_file_metadata_fd_keeps_the_file_owner_only_when_utimens_fails()
+    async fn set_file_metadata_owned_keeps_the_file_owner_only_when_utimens_fails()
     -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6405,17 +6388,16 @@ mod tests {
 
         // preserve_all: uid/gid so the chown runs first, time so the futimens is reached, and
         // mode_mask 0o7777 so the chmod that must NOT run would have set the setuid bit.
-        let error = set_file_metadata_fd(
+        let error = set_file_metadata_owned(
             &crate::preserve::preserve_all(),
             &RejectedTimestamps,
             None,
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await
         .expect_err("an out-of-range nanosecond field must fail futimens");
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
-        drop(dst_file);
 
         assert_eq!(
             std::fs::metadata(&dst_path)?.permissions().mode() & 0o7777,
@@ -6907,7 +6889,8 @@ mod tests {
         ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
     )]
     #[tokio::test]
-    async fn set_file_metadata_fd_applies_a_setuid_source_mode_and_its_acl() -> anyhow::Result<()> {
+    async fn set_file_metadata_owned_applies_a_setuid_source_mode_and_its_acl() -> anyhow::Result<()>
+    {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let tmp = testutils::setup_test_dir().await?;
@@ -6926,18 +6909,17 @@ mod tests {
         let mut dst_file = root.create_file(OsStr::new("acl_setuid_dst")).await?;
         dst_file.write_all(b"x")?;
         dst_file.flush()?;
-        set_file_metadata_fd(
+        set_file_metadata_owned(
             &crate::preserve::preserve_all_with_acls(),
             &src_meta,
             Some(&Acls {
                 access: Some(blob.clone()),
                 default: None,
             }),
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await?;
-        drop(dst_file);
         let dst_path = tmp.join("foo/acl_setuid_dst");
         assert_eq!(
             mode_of(&dst_path),
@@ -6962,7 +6944,7 @@ mod tests {
         ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
     )]
     #[tokio::test]
-    async fn set_file_metadata_fd_keeps_the_file_owner_only_when_the_acl_fails()
+    async fn set_file_metadata_owned_keeps_the_file_owner_only_when_the_acl_fails()
     -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let tmp = testutils::setup_test_dir().await?;
@@ -6974,20 +6956,19 @@ mod tests {
         let src_meta = root.child(OsStr::new("acl_fail_src")).await?.meta().clone();
         let dst_file = root.create_file(OsStr::new("acl_fail_dst")).await?;
         let dst_path = tmp.join("foo/acl_fail_dst");
-        let error = set_file_metadata_fd(
+        let error = set_file_metadata_owned(
             &crate::preserve::preserve_all_with_acls(),
             &src_meta,
             Some(&Acls {
                 access: Some(rejected_access_acl()),
                 default: None,
             }),
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await
         .expect_err("an ACL the kernel rejects must fail the entry");
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
-        drop(dst_file);
         assert_eq!(
             mode_of(&dst_path),
             0o4000 | DST_FILE_CREATE_MODE,
@@ -7005,7 +6986,7 @@ mod tests {
         ignore = "Nix sandbox cannot write POSIX ACL xattrs or set-id modes"
     )]
     #[tokio::test]
-    async fn set_file_metadata_fd_clears_an_inherited_acl_and_still_applies_the_full_mode()
+    async fn set_file_metadata_owned_clears_an_inherited_acl_and_still_applies_the_full_mode()
     -> anyhow::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -7026,15 +7007,14 @@ mod tests {
         let dst_path = tmp.join("foo/plain_setuid_dst");
         // stand in for what a permissive destination directory's default ACL would have left here
         set_xattr_at(&dst_path, ACL_ACCESS_XATTR, &permissive_acl());
-        set_file_metadata_fd(
+        set_file_metadata_owned(
             &crate::preserve::preserve_all_with_acls(),
             &src_meta,
             Some(&Acls::default()),
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await?;
-        drop(dst_file);
         assert_eq!(
             get_xattr_at(&dst_path, ACL_ACCESS_XATTR),
             None,
@@ -7214,22 +7194,23 @@ mod tests {
         let dst_file = root.create_file(OsStr::new("no_acls_carried")).await?;
         // `acl` on but no payload: neither "leave it alone" nor "clear it" reproduces the source,
         // so the applier must refuse rather than silently pick one.
-        let error = set_file_metadata_fd(
+        let error = set_file_metadata_owned(
             &crate::preserve::preserve_all_with_acls(),
             &src_meta,
             None,
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await
         .expect_err("requesting ACL preservation on a path that carries no ACLs must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         // with `acl` off the same call site is correct and must stay silent
-        set_file_metadata_fd(
+        let dst_file = root.create_file(OsStr::new("acls_not_requested")).await?;
+        set_file_metadata_owned(
             &crate::preserve::preserve_all(),
             &src_meta,
             None,
-            dst_file.as_fd(),
+            dst_file.into(),
             congestion::Side::Destination,
         )
         .await?;
