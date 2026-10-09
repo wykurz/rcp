@@ -4386,6 +4386,7 @@ mod teardown_tests {
     fn test_copy_settings() -> common::copy::Settings {
         common::copy::Settings {
             reflink: Default::default(),
+            local_copy_handoff: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: false,
@@ -5447,6 +5448,7 @@ mod removal_tests {
     fn settings() -> common::copy::Settings {
         common::copy::Settings {
             reflink: Default::default(),
+            local_copy_handoff: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: true,

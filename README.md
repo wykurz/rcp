@@ -339,6 +339,25 @@ It can be revisited when a concrete requirement exists.
 Remote transfers already stream file bytes between `rcpd` processes, so `auto` and `never` have the
 same effect for remote copies. The option does not change the remote wire protocol.
 
+### Local copy scheduling (`--local-copy-handoff`)
+
+`--local-copy-handoff=never|fresh` controls destination-create to payload-copy scheduling in `rcp`
+and files copied by `rlink --update`. The default is `never`: creation and payload copying remain
+separate blocking jobs, retaining the queue boundary between them.
+
+`fresh` is experimental. After a successful first vacant-slot create, the same blocking worker can
+continue into the payload, saving one submission per fresh file. Large copies can occupy workers
+that would otherwise return to queued metadata work. Throughput and CPU benefits remain unverified;
+compare representative workloads before enabling it. Creation's operation gates and probe still
+finish before the cancellable payload claim, and EEXIST retries retain the separate-job path.
+
+This policy is independent of `--reflink`, worker counts, and logical concurrency. It does not
+affect remote transfers or which files `rlink` hard-links. For example:
+
+```sh
+rcp --local-copy-handoff=fresh --reflink=never SOURCE DESTINATION
+```
+
 ## Path handling (tilde `~` support)
 
 - Local paths: leading `~` or `~/...` expands to your local `$HOME`.

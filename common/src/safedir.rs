@@ -4652,7 +4652,7 @@ mod tests {
             limits.set_max_ops_in_flight(resource, 1);
             let occupied = throttle::ops_in_flight_permit(resource).await;
             let guard = throttle::open_file_permit().await;
-            let submissions = testutils::BlockingSubmissions::start(false);
+            let submissions = testutils::BlockingSubmissions::start();
             let samples = Arc::new(congestion::testing::CollectingSink::new());
             congestion::install_sample_sink(samples.clone());
             let mut work = Box::pin(with_fd_admission(guard.admission(), async move {

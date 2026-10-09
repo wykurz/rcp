@@ -92,10 +92,31 @@ where
 
 pub use crate::delete::DeleteSettings;
 
+/// Scheduling policy for the first vacant-slot creation of a local regular file.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum LocalCopyHandoff {
+    /// Submit creation and payload copying as separate blocking jobs.
+    #[default]
+    Never,
+    /// Let a successful first vacant-slot create hand the worker to its payload.
+    Fresh,
+}
+
+impl std::fmt::Display for LocalCopyHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Never => "never",
+            Self::Fresh => "fresh",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Reflink policy for local file data copies.
     pub reflink: crate::copy_data::ReflinkMode,
+    /// Local create-to-copy scheduling policy; defaults to separate jobs.
+    pub local_copy_handoff: LocalCopyHandoff,
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
@@ -1737,10 +1758,8 @@ async fn copy_current_regular(
     // rcp accepts that rather than staging and renaming. `execute_dst_plan` removes by name through
     // the pinned parent; a compatible replacement since planning may be removed, but the operation
     // cannot escape that directory.
-    let combine_create_and_copy = matches!(&plan, FilePlan::Vacant);
-    #[cfg(test)]
     let combine_create_and_copy =
-        combine_create_and_copy && !crate::testutils::separate_copy_jobs();
+        settings.local_copy_handoff == LocalCopyHandoff::Fresh && matches!(&plan, FilePlan::Vacant);
     let len = src_meta.size();
     let reflink = settings.reflink;
     #[cfg(test)]
@@ -2591,6 +2610,7 @@ mod copy_tests {
     fn settings_with_delete(delete: Option<DeleteSettings>) -> Settings {
         Settings {
             reflink: Default::default(),
+            local_copy_handoff: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: delete.is_some(), // --delete implies --overwrite
@@ -3427,6 +3447,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3479,6 +3500,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3562,6 +3584,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3633,6 +3656,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3684,6 +3708,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -3783,6 +3808,7 @@ mod copy_tests {
             &["-r"],
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3813,6 +3839,7 @@ mod copy_tests {
             &["-r", "-p"],
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3843,6 +3870,7 @@ mod copy_tests {
             &["-r", "-L"],
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -3873,6 +3901,7 @@ mod copy_tests {
             &["-r", "-p", "-L"],
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -3905,6 +3934,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -3980,6 +4010,7 @@ mod copy_tests {
             output_path,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -4067,6 +4098,7 @@ mod copy_tests {
             output_path,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -4153,6 +4185,7 @@ mod copy_tests {
             output_path,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -4242,6 +4275,7 @@ mod copy_tests {
             output_path,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -4292,6 +4326,7 @@ mod copy_tests {
             &test_path.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4342,6 +4377,7 @@ mod copy_tests {
             output_path,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -4414,6 +4450,7 @@ mod copy_tests {
             &test_path.join("dst_with_deref"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4488,6 +4525,7 @@ mod copy_tests {
             &test_path.join("copied_dir"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4555,6 +4593,7 @@ mod copy_tests {
             &test_path.join("copied_file1.txt"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4578,6 +4617,7 @@ mod copy_tests {
             &test_path.join("copied_file2.txt"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -4633,6 +4673,7 @@ mod copy_tests {
             &tmp_dir.join("bar"),
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4693,6 +4734,7 @@ mod copy_tests {
                 &tmp_dir.join("dest.txt"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -4739,6 +4781,7 @@ mod copy_tests {
                 &tmp_dir.join("dest"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -4791,6 +4834,7 @@ mod copy_tests {
                 &readonly_parent.join("copy"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -4844,6 +4888,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: true,
@@ -4988,6 +5033,7 @@ mod copy_tests {
             &dst_dir,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -5051,6 +5097,7 @@ mod copy_tests {
             &dst_dir,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -5114,6 +5161,7 @@ mod copy_tests {
             &dst_dir,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: true,
                 overwrite: false,
@@ -5173,6 +5221,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5273,6 +5322,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5335,6 +5385,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5374,6 +5425,7 @@ mod copy_tests {
                 &test_path.join("dst.txt"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5419,6 +5471,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5798,6 +5851,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5847,6 +5901,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5907,6 +5962,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5968,6 +6024,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6035,6 +6092,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6099,6 +6157,7 @@ mod copy_tests {
                 &test_path.join("dst"),
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6163,6 +6222,7 @@ mod copy_tests {
                 &dst_path,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: true, // enable overwrite mode
@@ -6229,6 +6289,7 @@ mod copy_tests {
                 &dst_path,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6278,6 +6339,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6325,6 +6387,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6377,6 +6440,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6448,6 +6512,7 @@ mod copy_tests {
                 &sealed,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6504,6 +6569,7 @@ mod copy_tests {
                 &dst_path,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6555,6 +6621,7 @@ mod copy_tests {
                 &dst_path,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7005,6 +7072,7 @@ mod copy_tests {
                         &dst,
                         &Settings {
                             reflink: Default::default(),
+                            local_copy_handoff: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -7069,6 +7137,7 @@ mod copy_tests {
                         &dst,
                         &Settings {
                             reflink: Default::default(),
+                            local_copy_handoff: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -7146,6 +7215,7 @@ mod copy_tests {
                         &dst,
                         &Settings {
                             reflink: Default::default(),
+                            local_copy_handoff: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: true,
@@ -7200,6 +7270,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7244,6 +7315,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7284,6 +7356,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7325,6 +7398,7 @@ mod copy_tests {
                 &dst,
                 &Settings {
                     reflink: Default::default(),
+                    local_copy_handoff: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7573,6 +7647,7 @@ mod copy_tests {
             &dst_file,
             &Settings {
                 reflink: Default::default(),
+                local_copy_handoff: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- exercises the overwrite removal path
@@ -8011,6 +8086,7 @@ mod copy_tests {
     fn toctou_settings() -> Settings {
         Settings {
             reflink: Default::default(),
+            local_copy_handoff: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: true,
@@ -8784,15 +8860,17 @@ mod copy_tests {
                 };
                 for concurrency in [8, 32] {
                     limits.set_files_in_flight(concurrency);
-                    let mut counts = [0; 2];
-                    // rotate which path runs first; no timing or cache-state conclusion follows
-                    for separate in if concurrency == 8 { [true, false] } else { [false, true] } {
-                        let destination = tmp.path().join(format!("copy-{concurrency}-{separate}"));
-                        let observer = testutils::BlockingSubmissions::start(separate);
+                    let policies = [LocalCopyHandoff::default(), LocalCopyHandoff::Never, LocalCopyHandoff::Fresh];
+                    let mut counts = [0; 3];
+                    // rotate the production policies; no timing or cache-state conclusion follows
+                    for index in if concurrency == 8 { [0, 1, 2] } else { [2, 1, 0] } {
+                        let settings = Settings { local_copy_handoff: policies[index], ..settings.clone() };
+                        let destination = tmp.path().join(format!("copy-{concurrency}-{index}"));
+                        let observer = testutils::BlockingSubmissions::start();
                         let summary = limits.run_with_timeout(std::time::Duration::from_secs(30), copy(
                             &PROGRESS, &source, &destination, &settings, &NO_PRESERVE_SETTINGS, false,
                         )).await??;
-                        counts[usize::from(!separate)] = observer.count();
+                        counts[index] = observer.count();
                         drop(observer);
                         assert_eq!(summary.files_copied, 128);
                         assert_eq!(summary.bytes_copied, 128_000);
@@ -8806,8 +8884,9 @@ mod copy_tests {
                             }
                         }
                     }
-                    assert_eq!(counts[0] - counts[1], 128, "one saved submission per copied file");
-                    println!("handoff submission fixture: files=128 bytes_per_file=1000 workers=4 blocking=32 concurrency={concurrency} separate={} combined={}", counts[0], counts[1]);
+                    assert_eq!(counts[0], counts[1], "the default retains separate jobs");
+                    assert_eq!(counts[1] - counts[2], 128, "one saved submission per copied file");
+                    println!("handoff submission fixture: files=128 bytes_per_file=1000 workers=4 blocking=32 concurrency={concurrency} default={} never={} fresh={}", counts[0], counts[1], counts[2]);
                 }
                 anyhow::Ok(())
             })
@@ -8831,6 +8910,7 @@ mod copy_tests {
         std::fs::write(&source, b"replacement")?;
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))?;
         let settings = Settings {
+            local_copy_handoff: LocalCopyHandoff::Fresh,
             overwrite: true,
             reflink: crate::copy_data::ReflinkMode::Never,
             ..settings_with_delete(None)
@@ -8876,6 +8956,7 @@ mod copy_tests {
         // retain valid regular-file metadata but force the data read to fail after creation
         current.file = std::fs::OpenOptions::new().write(true).open(&source)?;
         let settings = Settings {
+            local_copy_handoff: LocalCopyHandoff::Fresh,
             reflink: crate::copy_data::ReflinkMode::Never,
             ..settings_with_delete(None)
         };
