@@ -87,6 +87,21 @@ struct Args {
     )]
     reflink: common::copy_data::ReflinkMode,
 
+    /// Control local destination-create to payload-copy handoff (experimental)
+    ///
+    /// Never (default) uses separate blocking jobs. Fresh reuses the worker after the first
+    /// vacant-slot create, saving one submission per fresh file but removing a queue boundary.
+    /// Large copies may delay queued metadata work; throughput and CPU benefits are unverified.
+    /// Only files copied during --update are affected; hard-link selection is unchanged.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        value_name = "WHEN",
+        help_heading = "Linking options"
+    )]
+    local_copy_handoff: common::copy::LocalCopyHandoff,
+
     /// Allow --update even when --preserve-settings does not cover all attributes
     /// used by --update-compare
     ///
@@ -278,6 +293,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     let settings = common::link::Settings {
         copy_settings: common::copy::Settings {
             reflink: args.reflink,
+            local_copy_handoff: args.local_copy_handoff,
             dereference: false, // currently not supported
             fail_early: args.fail_early,
             overwrite: args.overwrite || args.delete,

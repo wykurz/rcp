@@ -78,6 +78,7 @@ async fn spend_root_acl_probe() {
 fn default_copy_settings() -> copy::Settings {
     copy::Settings {
         reflink: Default::default(),
+        local_copy_handoff: Default::default(),
         dereference: false,
         fail_early: false,
         overwrite: false,

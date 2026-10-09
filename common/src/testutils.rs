@@ -33,10 +33,9 @@ static BLOCKING_SUBMISSIONS: std::sync::LazyLock<
 #[cfg(test)]
 struct SubmissionState {
     count: std::sync::atomic::AtomicUsize,
-    separate_copy_jobs: bool,
 }
 
-/// Observes canonical blocking submissions in one runtime and optionally exercises separate jobs.
+/// Observes canonical blocking submissions in one runtime.
 #[cfg(test)]
 pub(crate) struct BlockingSubmissions {
     runtime: tokio::runtime::Id,
@@ -45,11 +44,10 @@ pub(crate) struct BlockingSubmissions {
 
 #[cfg(test)]
 impl BlockingSubmissions {
-    pub(crate) fn start(separate_copy_jobs: bool) -> Self {
+    pub(crate) fn start() -> Self {
         let runtime = tokio::runtime::Handle::current().id();
         let state = std::sync::Arc::new(SubmissionState {
             count: std::sync::atomic::AtomicUsize::new(0),
-            separate_copy_jobs,
         });
         assert!(
             lock_unpoisoned(&BLOCKING_SUBMISSIONS)
@@ -79,14 +77,6 @@ pub(crate) fn record_blocking_submission() {
             .count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-#[cfg(test)]
-pub(crate) fn separate_copy_jobs() -> bool {
-    let runtime = tokio::runtime::Handle::current().id();
-    lock_unpoisoned(&BLOCKING_SUBMISSIONS)
-        .get(&runtime)
-        .is_some_and(|state| state.separate_copy_jobs)
 }
 
 /// A positioned-I/O fixture that interrupts once and limits successful writes.

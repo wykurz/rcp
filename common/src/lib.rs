@@ -57,6 +57,7 @@
 //!
 //! let settings = common::copy::Settings {
 //!     reflink: Default::default(),
+//!     local_copy_handoff: Default::default(),
 //!     dereference: false,
 //!     fail_early: false,
 //!     overwrite: false,

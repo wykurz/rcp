@@ -121,3 +121,35 @@ async fn copies_updates_without_copy_file_range_when_reflink_is_disabled() {
         assert_updated_tree(&src, &update, &dst);
     }
 }
+
+#[tokio::test]
+async fn local_copy_handoff_policies_keep_update_copy_and_hard_link_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, update) = update_tree(tmp.path()).await;
+    for (index, policy) in [None, Some("never"), Some("fresh")].into_iter().enumerate() {
+        let dst = tmp.path().join(format!("handoff-{index}"));
+        let mut cmd = update_command(&src, &update, &dst, Some("--reflink=never"));
+        if let Some(policy) = policy {
+            cmd.arg(format!("--local-copy-handoff={policy}"));
+        }
+        Command::from_std(cmd).assert().success();
+        assert_updated_tree(&src, &update, &dst);
+    }
+}
+
+#[tokio::test]
+async fn local_copy_handoff_rejects_unknown_policy_before_updating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, update) = update_tree(tmp.path()).await;
+    let dst = tmp.path().join("destination");
+    Command::from_std(update_command(
+        &src,
+        &update,
+        &dst,
+        Some("--local-copy-handoff=always"),
+    ))
+    .assert()
+    .code(2)
+    .stderr(predicates::str::contains("possible values: never, fresh"));
+    assert!(!dst.exists());
+}

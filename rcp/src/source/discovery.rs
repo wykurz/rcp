@@ -2304,6 +2304,7 @@ mod tests {
     fn settings(dereference: bool) -> common::copy::Settings {
         common::copy::Settings {
             reflink: Default::default(),
+            local_copy_handoff: Default::default(),
             dereference,
             fail_early: false,
             overwrite: false,

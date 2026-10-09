@@ -144,3 +144,45 @@ async fn copies_files_without_resetting_their_cursors() {
         );
     }
 }
+
+#[tokio::test]
+async fn local_copy_handoff_policies_preserve_file_contents_and_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let src = source_file(tmp.path()).await;
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let expected = std::fs::read(&src).unwrap();
+    for (index, policy) in [None, Some("never"), Some("fresh")].into_iter().enumerate() {
+        let dst = tmp.path().join(format!("handoff-{index}"));
+        let mut cmd = Command::cargo_bin("rcp").unwrap();
+        if let Some(policy) = policy {
+            cmd.arg(format!("--local-copy-handoff={policy}"));
+        }
+        cmd.args(["--reflink=never", "--preserve-settings=all"])
+            .arg(&src)
+            .arg(&dst)
+            .assert()
+            .success();
+        assert_eq!(std::fs::read(&dst).unwrap(), expected);
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777,
+            0o751
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_copy_handoff_rejects_unknown_policy_before_copying() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = source_file(tmp.path()).await;
+    let dst = tmp.path().join("destination");
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--local-copy-handoff=always")
+        .arg(&src)
+        .arg(&dst)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("possible values: never, fresh"));
+    assert!(!dst.exists());
+}

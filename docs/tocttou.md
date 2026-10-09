@@ -700,16 +700,17 @@ so the security-relevant invariants each live in exactly one place:
   payload-leaf residual requires a separate bounded remote-I/O abstraction; the guarantee does not
   cover every Tokio filesystem operation. This boundary is local to endpoint I/O and requires no
   wire state.
-- **Local create-to-payload handoff**: a regular file's first vacant-slot create and data copy may
-  share one canonical blocking job. Creation remains exclusive and owner-only, including strict ACL
-  sanitation. Its OpenCreate probe, operation permit, and execution span finish before the worker
-  claims the payload continuation. Cancellation that wins this claim closes the captured source and
-  prevents the payload from starting, even when creation has already begun; sanitation still
-  finishes and the empty destination may remain. Once the worker claims the payload, the existing
-  non-cancellable data-copy boundary applies. Pending captures and abandoned descriptor-bearing
-  outputs are destroyed before their blocking admission lease. Source-open validation, IOPS
-  reservation, source ACL capture, final metadata, and the single EEXIST conflict retry keep their
-  existing ordering; retry uses the original held source descriptor.
+- **Local create-to-payload handoff**: with the experimental `--local-copy-handoff=fresh` policy, a
+  regular file's first vacant-slot create and data copy may share one canonical blocking job. The
+  default `never` retains separate jobs. Creation remains exclusive and owner-only, including strict
+  ACL sanitation. Its OpenCreate probe, operation permit, and execution span finish before the
+  worker claims the payload continuation. Cancellation that wins this claim closes the captured
+  source and prevents the payload from starting, even when creation has already begun; sanitation
+  still finishes and the empty destination may remain. Once the worker claims the payload, the
+  existing non-cancellable data-copy boundary applies. Pending captures and abandoned
+  descriptor-bearing outputs are destroyed before their blocking admission lease. Source-open
+  validation, IOPS reservation, source ACL capture, final metadata, and the single EEXIST conflict
+  retry keep their existing ordering; retry uses the original held source descriptor.
 
 `rlink` is the documented exception: it walks two correlated trees (source plus `--update`) and so
 keeps its own dual-tree enumeration, but it shares the same substrate — the `TrustedDir` boundary,

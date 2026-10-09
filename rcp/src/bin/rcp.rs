@@ -55,6 +55,21 @@ struct Args {
     )]
     reflink: common::copy_data::ReflinkMode,
 
+    /// Control local destination-create to payload-copy handoff (experimental)
+    ///
+    /// Never (default) uses separate blocking jobs. Fresh reuses the worker after the first
+    /// vacant-slot create, saving one submission per fresh file but removing a queue boundary.
+    /// Large copies may delay queued metadata work; throughput and CPU benefits are unverified.
+    /// Remote transfers are unaffected.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        value_name = "WHEN",
+        help_heading = "Copy options"
+    )]
+    local_copy_handoff: common::copy::LocalCopyHandoff,
+
     /// File attributes to compare when deciding if files are identical (used with --overwrite)
     ///
     /// Comma-separated list. Available: uid, gid, mode, size, mtime, ctime
@@ -1740,6 +1755,7 @@ async fn async_main(
     };
     let settings = common::copy::Settings {
         reflink: args.reflink,
+        local_copy_handoff: args.local_copy_handoff,
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite || args.delete,
