@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[cfg(test)]
+pub(crate) mod acl;
+
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
@@ -425,9 +428,21 @@ pub struct BlockingPathGate {
 /// Holds an abandoned output when its call site places this token after the file owner.
 #[cfg(test)]
 pub struct BlockingPathGateVisit {
+    error: Option<i32>,
     output_drop_started: Option<tokio::sync::oneshot::Sender<()>>,
     output_drop_barrier: std::sync::Arc<BlockingPathDropBarrier>,
     _completion: CompletionSignal,
+}
+
+#[cfg(test)]
+impl BlockingPathGateVisit {
+    /// Returns the injected error when a fallible descriptor operation consumes this visit.
+    pub fn into_result(self) -> std::io::Result<Self> {
+        match self.error {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            None => Ok(self),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +488,7 @@ impl BlockingPathGate {
             allocation_count: std::sync::atomic::AtomicUsize::new(0),
             allocation_thread: std::sync::Mutex::new(None),
             visit: std::sync::Mutex::new(Some(BlockingPathGateVisit {
+                error: None,
                 output_drop_started: Some(output_drop_started_tx),
                 output_drop_barrier: output_drop_barrier.clone(),
                 _completion: completion,
@@ -488,6 +504,18 @@ impl BlockingPathGate {
             output_drop_started: Some(output_drop_started_rx),
             completed: Some(completion_rx),
         }
+    }
+
+    /// Installs a released gate whose first fallible descriptor visit returns `errno`.
+    pub fn fail_once(path: impl Into<std::path::PathBuf>, errno: i32) -> Self {
+        assert!(errno > 0);
+        let gate = Self::install(path);
+        lock_unpoisoned(&gate.state.visit)
+            .as_mut()
+            .expect("a newly installed gate has its first visit")
+            .error = Some(errno);
+        gate.release_all();
+        gate
     }
 
     /// Waits until production blocking work enters this path's gate.
