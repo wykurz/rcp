@@ -8890,16 +8890,21 @@ mod copy_tests {
             })
     }
 
-    #[tokio::test]
-    async fn conflict_retry_keeps_the_original_source_descriptor_with_acl_preservation()
-    -> anyhow::Result<()> {
+    async fn assert_conflict_retry_keeps_the_original_source(acl: bool) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
+        use testutils::acl::{get_xattr_at, permissive_acl, restrictive_access_acl, set_xattr_at};
+        let acl_name = c"system.posix_acl_access";
         for handoff in [LocalCopyHandoff::Never, LocalCopyHandoff::Fresh] {
             let tmp = tempfile::tempdir()?;
             let source = tmp.path().join("source");
             let destination = tmp.path().join("destination");
             std::fs::write(&source, b"original payload")?;
             std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
+            let original_acl = acl.then(restrictive_access_acl);
+            if let Some(blob) = &original_acl {
+                set_xattr_at(&source, acl_name, blob);
+            }
+            let original_mode = std::fs::metadata(&source)?.permissions().mode() & 0o7777;
             std::fs::write(&destination, b"old")?;
             let source_parent =
                 Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
@@ -8911,6 +8916,10 @@ mod copy_tests {
             std::fs::rename(&source, tmp.path().join("original"))?;
             std::fs::write(&source, b"replacement")?;
             std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))?;
+            if acl {
+                set_xattr_at(&source, acl_name, &permissive_acl());
+                assert_ne!(get_xattr_at(&source, acl_name), original_acl);
+            }
             let settings = Settings {
                 local_copy_handoff: handoff,
                 overwrite: true,
@@ -8918,7 +8927,7 @@ mod copy_tests {
                 ..settings_with_delete(None)
             };
             let mut preservation = preserve::preserve_all();
-            preservation.file.acl = true;
+            preservation.file.acl = acl;
             let summary = copy_current_regular(
                 &PROGRESS,
                 &source_parent,
@@ -8938,10 +8947,26 @@ mod copy_tests {
             assert_eq!(std::fs::read(&destination)?, b"original payload");
             assert_eq!(
                 std::fs::metadata(&destination)?.permissions().mode() & 0o7777,
-                0o751
+                original_mode
             );
+            if let Some(blob) = original_acl {
+                assert_eq!(get_xattr_at(&destination, acl_name), Some(blob));
+            }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflict_retry_keeps_the_original_source_descriptor_without_acl_preservation()
+    -> anyhow::Result<()> {
+        assert_conflict_retry_keeps_the_original_source(false).await
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn conflict_retry_keeps_the_original_source_descriptor_with_acl_preservation()
+    -> anyhow::Result<()> {
+        assert_conflict_retry_keeps_the_original_source(true).await
     }
 
     #[tokio::test]
@@ -8962,7 +8987,7 @@ mod copy_tests {
             let current =
                 CurrentRegular::open(&source_parent, OsStr::new("source"), &source).await?;
             let identity = testutils::FdIdentityProbe::capture(current.file.as_raw_fd())?;
-            let _failure = safedir::AclReadFailure::install(current.file.as_raw_fd());
+            let failure = testutils::BlockingPathGate::fail_once(&source, libc::EIO);
             let plan = FilePlan::Replace(
                 destination_parent
                     .child(OsStr::new("destination"))
@@ -9014,6 +9039,16 @@ mod copy_tests {
             );
             assert_eq!(remaining.permissions(), original_destination.permissions());
             assert_eq!(remaining.modified()?, original_destination.modified()?);
+            assert_eq!(failure.hit_count(), 1);
+            // the same path succeeds after the one-shot error, while its gate remains installed
+            let (file, _) = safedir::read_acls_owned(
+                std::fs::File::open(&source)?,
+                congestion::Side::Source,
+                false,
+            )
+            .await?;
+            drop(file);
+            assert_eq!(failure.hit_count(), 2);
         }
         Ok(())
     }

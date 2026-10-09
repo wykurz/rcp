@@ -508,15 +508,16 @@ Specific invariants enforced:
   sent source object, the data and the metadata applied/sent for it are read from one open file
   description, so a same-name swap cannot pair one inode's bytes/target with another inode's
   mode/owner/timestamps — or, under `acl`, with another inode's ACL, which is read from that same fd
-  (`read_acls_fd` on a file's data fd, `Dir::read_acls` on the enumerated directory fd): a regular
-  file via `open_file_read` → `(File, FileMeta)`; a symlink via the `O_PATH` handle's `read_symlink`
-  (target + metadata off the one fd); a directory via its held, enumerated `Dir` fd. Remote source
-  discovery uses one fd-relative cursor per directory in bounded batches; each discovered name is
-  classified once for filtering and dispatch. A subsequently opened file data fd is checked again
-  and supplies the wire header's metadata and ACLs for the bytes it sends. The remote *destination*
-  is fidelity-safe by construction — it writes the received bytes and applies the received metadata
-  to its single created fd, so there are no two source fds to mismatch.
-  `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
+  (`read_acls_owned` transfers the local file's data-fd owner and returns it with the ACLs; the
+  remote source still uses `read_acls_fd` on its held data fd; `Dir::read_acls` uses the enumerated
+  directory fd): a regular file via `open_file_read` → `(File, FileMeta)`; a symlink via the
+  `O_PATH` handle's `read_symlink` (target + metadata off the one fd); a directory via its held,
+  enumerated `Dir` fd. Remote source discovery uses one fd-relative cursor per directory in bounded
+  batches; each discovered name is classified once for filtering and dispatch. A subsequently opened
+  file data fd is checked again and supplies the wire header's metadata and ACLs for the bytes it
+  sends. The remote *destination* is fidelity-safe by construction — it writes the received bytes
+  and applies the received metadata to its single created fd, so there are no two source fds to
+  mismatch. `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
   source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
   `-L`/`--dereference` path.
 
@@ -634,11 +635,14 @@ so the security-relevant invariants each live in exactly one place:
   transition is centralized in the driver and releases provisional leaf admission before recursion.
   The canonical safedir blocking runner attempts to upgrade any live ambient weak admission
   reference; if none is live, it adds no lease. If its async waiter is abandoned after an upgrade,
-  any descriptor-bearing output drops before that lease. Local regular-file finalization transfers
-  the created destination descriptor through each individually gated metadata operation; it neither
-  duplicates nor reopens the file. The borrowed metadata adapter used by the remote receiver makes
-  one owned duplicate for that same sequence. Ownership changes do not combine operation gates or
-  move the final permission-widening step.
+  any descriptor-bearing output drops before that lease. Local regular-file ACL capture transfers
+  the source data-fd owner through each individually gated ACL read and returns that same owner for
+  payload copying, without duplicating or reopening it. ACL errors still precede destination
+  mutation, and queued, started, or abandoned work retains the same descriptor-before-admission drop
+  rules. Local regular-file finalization transfers the created destination descriptor through each
+  individually gated metadata operation; it neither duplicates nor reopens the file. The borrowed
+  metadata adapter used by the remote receiver makes one owned duplicate for that same sequence.
+  Ownership changes do not combine operation gates or move the final permission-widening step.
 - **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
