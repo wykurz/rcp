@@ -639,10 +639,12 @@ so the security-relevant invariants each live in exactly one place:
   the source data-fd owner through each individually gated ACL read and returns that same owner for
   payload copying, without duplicating or reopening it. ACL errors still precede destination
   mutation, and queued, started, or abandoned work retains the same descriptor-before-admission drop
-  rules. Local regular-file finalization transfers the created destination descriptor through each
-  individually gated metadata operation; it neither duplicates nor reopens the file. The borrowed
-  metadata adapter used by the remote receiver makes one owned duplicate for that same sequence.
-  Ownership changes do not combine operation gates or move the final permission-widening step.
+  rules. Local and remote regular-file finalization transfer the created destination descriptor
+  through each individually gated metadata operation; neither duplicates nor reopens the file. The
+  remote receiver first explicitly flushes its Tokio file and checks for delayed write errors, then
+  converts that same owner for metadata application. The Tokio payload cancellation residual remains
+  as described in the remote protocol. Ownership changes do not combine operation gates or move the
+  final permission-widening step.
 - **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd

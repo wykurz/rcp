@@ -637,11 +637,15 @@ strip every ACL instead of copying it. This is a wire-format change, not a spawn
 **Application (destination).** File ACLs are applied through the created file's own fd in
 `process_single_file`, directory ACLs through the directory's own held fd when it completes
 (`DirectoryFinalization::execute`). Both go through the shared appliers
-(`common::safedir::set_file_metadata_fd` / `set_reused_dir_metadata_fd`), so the remote path
+(`common::safedir::set_file_metadata_owned` / `set_reused_dir_metadata_fd`), so the remote path
 inherits the local one's ordering rule: an access ACL is the step that WIDENS the destination from
 its owner-only create mode, so it runs last and the `fchmod` before it is narrowed to carry only the
-special bits (see §5 and [tocttou.md](tocttou.md)). Neither is a new protocol message: the wire
-change is confined to the two `Metadata` fields and the `capture` field.
+special bits (see §5 and [tocttou.md](tocttou.md)). The receiver explicitly flushes its Tokio file
+and checks the result before converting it back to the same standard-file owner and consuming that
+owner in the metadata applier. Conversion does not replace flush-error handling. A flush failure
+remains a consumed-stream error without adding copied counts; metadata failures retain the
+already-copied counts and the stream's next-file boundary. Neither is a new protocol message: the
+wire change is confined to the two `Metadata` fields and the `capture` field.
 
 **Not on the wire: the destination's own containment.** Under `--require-toctou-safe` the
 destination `rcpd` also strips the ACLs of every directory it creates and snapshots/restores the

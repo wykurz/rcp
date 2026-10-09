@@ -2,7 +2,6 @@ use anyhow::Context;
 use common::safedir::{Dir, RemovalSnapshot};
 use futures::{FutureExt, StreamExt};
 use std::ffi::OsStr;
-use std::os::fd::AsFd;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{Instrument, instrument};
@@ -10,6 +9,8 @@ use tracing::{Instrument, instrument};
 use super::directory_tracker;
 use crate::receiver_shutdown::ReceiverShutdown;
 
+#[cfg(test)]
+mod file_tests;
 mod resources;
 
 fn progress() -> &'static common::progress::Progress {
@@ -236,7 +237,6 @@ async fn process_single_file(
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
 ) -> Result<(), ProcessFileError> {
-    let prog = progress();
     // errors before we start reading data - stream can be recovered by draining
     let err_needs_drain = |e: anyhow::Error| ProcessFileError {
         source: e,
@@ -296,7 +296,7 @@ async fn process_single_file(
     }
     // create the destination file fresh through the parent's pinned fd (O_CREAT|O_EXCL|
     // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. it is created owner-only
-    // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_fd`
+    // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_owned`
     // below, after the last byte, mirroring copy.rs.
     let std_file = match common::timing_scope!(trace, "destination.file.create")
         .measure(dst_parent.create_file(dst_name))
@@ -375,13 +375,26 @@ async fn process_single_file(
             copied
         )));
     }
+    finalize_received_file(file, file_header, preserve)
+        .await
+        .map_err(err_data_consumed)
+}
+
+/// Finish an already-consumed payload before applying metadata and recording copied counts.
+async fn finalize_received_file(
+    mut file: tokio::fs::File,
+    file_header: &remote::protocol::File,
+    preserve: &common::preserve::Settings,
+) -> anyhow::Result<()> {
+    let prog = progress();
     // flush before metadata to ensure all data reaches the kernel before we set mtime.
     // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
     // may complete after we set mtime, causing the file to appear modified.
     common::timing_scope!(trace, "destination.file.flush")
         .measure(file.flush())
-        .await
-        .map_err(|e| err_data_consumed(e.into()))?;
+        .await?;
+    // conversion preserves the descriptor, but cannot report delayed write errors: flush first
+    let file = file.into_std().await;
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
         file_header.src.display(),
@@ -390,7 +403,7 @@ async fn process_single_file(
     );
     // Count the file BEFORE applying metadata: its bytes are already on disk, so a metadata
     // failure below must not erase it from the summary. This mirrors the local path
-    // (`common::copy`, which increments its progress counters before `set_file_metadata_fd`) —
+    // (`common::copy`, which increments its progress counters before `set_file_metadata_owned`) —
     // the remote summary is built from these counters, so incrementing after would report
     // "files copied: 0" for a tree whose data transferred completely and only failed to be
     // chowned. The metadata error is still recorded and still fails the copy.
@@ -407,17 +420,15 @@ async fn process_single_file(
     // `Unknown` here is never a degraded read.)
     let src_acls = file_header.metadata.captured_acls();
     common::timing_scope!(trace, "destination.file.metadata")
-        .measure(common::safedir::set_file_metadata_fd(
+        .measure(common::safedir::set_file_metadata_owned(
             preserve,
             &file_header.metadata,
             src_acls.as_ref(),
-            file.as_fd(),
+            file.into(),
             common::Side::Destination,
         ))
         .await
-        .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))
-        .map_err(err_data_consumed)?;
-    drop(file);
+        .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))?;
     Ok(())
 }
 
@@ -2111,6 +2122,7 @@ fn choose_final_result(
 
 #[cfg(test)]
 mod teardown_tests {
+    use std::os::fd::AsFd as _;
     mod resource_tests;
 
     use super::*;
