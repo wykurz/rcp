@@ -91,6 +91,112 @@ fn one_worker_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+struct GatedPayload {
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    resume: Option<tokio::sync::oneshot::Receiver<()>>,
+    remaining: usize,
+    read: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for GatedPayload {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(started) = self.started.take() {
+            started.send(()).unwrap();
+        }
+        if let Some(resume) = &mut self.resume {
+            std::task::ready!(std::future::Future::poll(
+                std::pin::Pin::new(resume),
+                context
+            ))
+            .unwrap();
+            self.resume = None;
+        }
+        let count = self.remaining.min(buffer.remaining());
+        buffer.initialize_unfilled_to(count).fill(0x5a);
+        buffer.advance(count);
+        self.remaining -= count;
+        self.read
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn receiver_uses_configured_file_write_limits() {
+    const TEST_NAME: &str = "destination::file_tests::receiver_uses_configured_file_write_limits";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
+    one_worker_runtime().block_on(async {
+        for configured in [
+            remote::TcpConfig::default().effective_buffer_size(),
+            32 * 1024 * 1024,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = temp.path().join("fixture");
+            drop(create_file(&fixture));
+            let mut header = file_header(&fixture);
+            header.dst = temp.path().join("destination");
+            header.size = configured as u64 + 1;
+            let parent = Arc::new(
+                Dir::open_root_dir(temp.path(), false, common::Side::Destination)
+                    .await
+                    .unwrap(),
+            );
+            let (started, first_read) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut stream = remote::streams::RecvStream::new(Box::new(GatedPayload {
+                started: Some(started),
+                resume: Some(resumed),
+                remaining: configured + 1,
+                read: read.clone(),
+            })
+                as remote::streams::BoxedRead);
+            let settings = common::copy::Settings {
+                remote_copy_buffer_size: configured,
+                ..testutils::copy_settings()
+            };
+            let preservation = common::preserve::preserve_all();
+            let mut receive = Box::pin(process_single_file(
+                &settings,
+                &preservation,
+                &mut stream,
+                &header,
+                &parent,
+                OsStr::new("destination"),
+            ));
+            tokio::select! {
+                _ = &mut receive => panic!("receiver finished before its first payload read"),
+                ready = first_read => ready.unwrap(),
+            }
+            // creation has finished; hold the sole worker before allowing the first payload read
+            let worker = OccupiedWorker::start().await;
+            resume.send(()).unwrap();
+            let pending = futures::poll!(receive.as_mut()).is_pending();
+            let read_before_write_completed = read.load(std::sync::atomic::Ordering::Relaxed);
+            worker.finish().await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), receive)
+                .await
+                .unwrap()
+                .map_err(|error| error.source)
+                .unwrap();
+            assert!(pending, "the final write must wait for the occupied worker");
+            // a hidden smaller File limit blocks inside the first write_all, before the next read
+            assert_eq!(read_before_write_completed, configured + 1);
+            assert_eq!(
+                std::fs::read(&header.dst).unwrap(),
+                vec![0x5a; configured + 1]
+            );
+        }
+    });
+    crate::test_process::completed(TEST_NAME);
+}
+
 #[test]
 fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() {
     const TEST_NAME: &str = "destination::file_tests::receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode";

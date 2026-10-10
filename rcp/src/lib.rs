@@ -186,6 +186,67 @@ pub mod path;
 mod receiver_shutdown;
 pub mod source;
 
+// outer transfer requests and Tokio file I/O share this per-file maximum
+fn configure_remote_file_buffer(file: &mut tokio::fs::File, size: u64, configured: usize) -> usize {
+    // clamp before narrowing: byte buffers must fit within isize::MAX on this host
+    let file_size = size.min(isize::MAX as u64) as usize;
+    let buffer_size = configured.min(file_size).max(1);
+    file.set_max_buf_size(buffer_size);
+    buffer_size
+}
+
+#[cfg(test)]
+mod file_buffer_tests {
+    #[test]
+    fn remote_file_limit_follows_configuration_and_file_size() -> anyhow::Result<()> {
+        let mut file = tokio::fs::File::from_std(tempfile::tempfile()?);
+        let default = remote::TcpConfig::default().effective_buffer_size();
+        let larger = 32 * 1024 * 1024;
+        for (size, configured, expected) in [
+            (0, default, 1),
+            (1, default, 1),
+            (4095, 4096, 4095),
+            (4096, 4096, 4096),
+            (4097, 4096, 4096),
+            (16384, 0, 1),
+            (16384, 1, 1),
+            (0, 0, 1),
+            (default as u64 - 1, default, default - 1),
+            (default as u64, default, default),
+            (default as u64 + 1, default, default),
+            (larger as u64 + 1, larger, larger),
+            (u64::MAX, default, default),
+            (u64::MAX, larger, larger),
+        ] {
+            file.set_max_buf_size(1);
+            let size = super::configure_remote_file_buffer(&mut file, size, configured);
+            assert_eq!(size, expected);
+            assert_eq!(file.max_buf_size(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_file_limit_caps_sizes_before_narrowing() -> anyhow::Result<()> {
+        let mut file = tokio::fs::File::from_std(tempfile::tempfile()?);
+        let maximum = isize::MAX as usize;
+        for (size, configured, expected) in [
+            (maximum as u64 - 1, usize::MAX, maximum - 1),
+            (maximum as u64, usize::MAX, maximum),
+            (maximum as u64 + 1, usize::MAX, maximum),
+            (u64::MAX, usize::MAX, maximum),
+            (u64::MAX, 7, 7),
+            (7, usize::MAX, 7),
+        ] {
+            // setting a limit does not allocate, so integer boundaries need no huge fixture
+            let actual = super::configure_remote_file_buffer(&mut file, size, configured);
+            assert_eq!(actual, expected);
+            assert_eq!(file.max_buf_size(), expected);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test_process {
     const CHILD_TEST: &str = "RCP_ISOLATED_LIBRARY_TEST";

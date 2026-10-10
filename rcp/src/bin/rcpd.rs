@@ -191,10 +191,14 @@ struct Args {
     )]
     network_profile: remote::NetworkProfile,
 
-    /// Buffer size for remote copy file transfer operations in bytes.
+    /// Maximum transfer buffer and file I/O request size, in bytes.
     ///
-    /// Controls the buffer used when copying data between files and network streams.
-    /// Larger buffers can improve throughput but use more memory per concurrent transfer.
+    /// Sets source reader capacity, file I/O limits, and receiver scratch request sizes.
+    /// Per-file limits are capped for small files and each host's addressable buffer size.
+    /// Zero is normalized to one byte. Individual disk/network operations can be shorter;
+    /// this does not set TCP packet or TLS record sizes.
+    /// Tokio's internal file buffers and outer transfer buffers can coexist, so larger
+    /// limits allow more working memory. Receiver scratch retention is controlled separately.
     ///
     /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
