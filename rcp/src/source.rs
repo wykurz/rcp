@@ -42,6 +42,12 @@ enum FileRead {
     Path,
 }
 
+fn source_buffer_capacity(file: &tokio::fs::File, size: u64, configured: usize) -> usize {
+    // a buffered fill performs one file read; capacity beyond that read's limit cannot be used
+    let file_size = size.min(usize::MAX as u64) as usize;
+    configured.min(file_size).min(file.max_buf_size()).max(1)
+}
+
 #[instrument(skip(error_collector, control_send_stream, stream_pool, file_read, fatal))]
 #[allow(clippy::too_many_arguments)]
 async fn send_file_tcp(
@@ -188,11 +194,7 @@ async fn send_file_tcp(
             Some(acls) => metadata.with_acls(acls),
             None => metadata,
         };
-        // wrap file in a buffered reader for better network throughput
-        // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
-        // but capped at file size to avoid over-allocation for small files
-        let file_size = size.min(usize::MAX as u64) as usize;
-        let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+        let buffer_size = source_buffer_capacity(&file, size, settings.remote_copy_buffer_size);
         let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
         let file_header = remote::protocol::File {
             src: src.to_path_buf(),

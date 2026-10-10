@@ -92,6 +92,72 @@ fn require_local_ssh() {
 }
 
 #[tokio::test]
+async fn remote_source_buffer_cap_preserves_files_over_tcp_and_tls() {
+    require_local_ssh();
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    let fixture = tempfile::tempdir().unwrap();
+    let src = fixture.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    let read_limit = tokio::fs::File::from_std(tempfile::tempfile().unwrap()).max_buf_size();
+    let sizes = [
+        0,
+        17,
+        read_limit - 1,
+        read_limit,
+        read_limit + 1,
+        2 * read_limit + 17,
+    ];
+    for (index, size) in sizes.into_iter().enumerate() {
+        common::filegen::write_file(&PROGRESS, src.join(index.to_string()), size, 65536, 0)
+            .await
+            .unwrap();
+    }
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    for (index, (plaintext, dereference, buffer)) in [
+        (false, false, None),
+        (false, true, Some("64KiB")),
+        (true, false, Some("4MiB")),
+        (true, true, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dst = fixture.path().join(format!("destination-{index}"));
+        let source_arg = format!("localhost:{}", src.display());
+        let destination_arg = format!("localhost:{}", dst.display());
+        let buffer_arg = buffer.map(|value| format!("--remote-copy-buffer-size={value}"));
+        let mut args = vec![
+            daemon.as_str(),
+            "--max-connections=1",
+            "--max-files-in-flight=1",
+        ];
+        if plaintext {
+            args.push("--no-encryption");
+        }
+        if dereference {
+            args.push("--dereference");
+        }
+        if let Some(buffer_arg) = &buffer_arg {
+            args.push(buffer_arg);
+        }
+        args.extend([source_arg.as_str(), destination_arg.as_str()]);
+        run_rcp_and_expect_success(&args);
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), sizes.len());
+        for index in 0..sizes.len() {
+            let name = index.to_string();
+            assert_eq!(
+                std::fs::read(src.join(&name)).unwrap(),
+                std::fs::read(dst.join(&name)).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn remote_buffer_retention_overrides_copy_multiple_files_in_both_directions() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
