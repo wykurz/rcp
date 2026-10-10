@@ -2175,7 +2175,7 @@ mod teardown_tests {
         );
         process_control_stream(
             None,
-            &testutils::copy_settings(false, 0),
+            &testutils::copy_settings(),
             10,
             std::num::NonZeroUsize::new(4).unwrap(),
             std::num::NonZeroUsize::new(8).unwrap(),
@@ -2253,7 +2253,7 @@ mod teardown_tests {
             errors.clone(),
         );
         let held = send.lock().await;
-        let settings = testutils::copy_settings(false, 0);
+        let settings = testutils::copy_settings();
         let preserve = common::preserve::preserve_none();
         let mut control = Box::pin(process_control_stream(
             None,
@@ -2414,7 +2414,7 @@ mod teardown_tests {
             let (job_tracker, job_send, job_pool, job_errors) =
                 (tracker.clone(), send.clone(), pool.clone(), errors.clone());
             let task = tokio::spawn(async move {
-                let mut settings = testutils::copy_settings(false, 0);
+                let mut settings = testutils::copy_settings();
                 settings.fail_early = fail_early;
                 process_control_stream(
                     None,
@@ -2906,7 +2906,7 @@ mod teardown_tests {
         let task = tokio::spawn(async move {
             process_control_stream(
                 None,
-                &testutils::copy_settings(false, 0),
+                &testutils::copy_settings(),
                 0,
                 std::num::NonZeroUsize::MIN,
                 std::num::NonZeroUsize::new(2).unwrap(),
@@ -2994,7 +2994,7 @@ mod teardown_tests {
             errors.clone(),
         );
         common::task_scope::scope_tasks(async {
-            let settings = testutils::copy_settings(false, 0);
+            let settings = testutils::copy_settings();
             let preserve = common::preserve::preserve_none();
             let control = process_control_stream(
                 None,
@@ -3102,7 +3102,7 @@ mod teardown_tests {
             &tracker,
             &errors,
             prepare_and_announce_directory(
-                &testutils::copy_settings(false, 0),
+                &testutils::copy_settings(),
                 &tracker,
                 &send,
                 &pool,
@@ -3244,7 +3244,7 @@ mod teardown_tests {
         }
         let control_result = process_control_stream(
             None,
-            &testutils::copy_settings(false, 0),
+            &testutils::copy_settings(),
             10,
             std::num::NonZeroUsize::MIN,
             std::num::NonZeroUsize::new(8).unwrap(),
@@ -3408,7 +3408,7 @@ mod teardown_tests {
                 .await
                 .unwrap();
             let pool = test_pool(&tracker);
-            let settings = testutils::copy_settings(false, 0);
+            let settings = testutils::copy_settings();
             let preserve = common::preserve::preserve_none();
             let mut control = Box::pin(process_control_stream(
                 None,
@@ -3492,7 +3492,7 @@ mod teardown_tests {
         );
         let control_result = process_control_stream(
             None,
-            &testutils::copy_settings(false, 0),
+            &testutils::copy_settings(),
             0,
             std::num::NonZeroUsize::MIN,
             std::num::NonZeroUsize::new(2).unwrap(),
@@ -3778,7 +3778,7 @@ mod teardown_tests {
             );
             let result = process_control_stream(
                 None,
-                &testutils::copy_settings(false, 0),
+                &testutils::copy_settings(),
                 0,
                 std::num::NonZeroUsize::MIN,
                 std::num::NonZeroUsize::new(2).unwrap(),
@@ -3966,7 +3966,7 @@ mod teardown_tests {
             .await
             .unwrap();
         let held = send.lock().await;
-        let settings = testutils::copy_settings(false, 0);
+        let settings = testutils::copy_settings();
         let preserve = common::preserve::preserve_none();
         let mut control = Box::pin(process_control_stream(
             None,
@@ -4065,7 +4065,7 @@ mod teardown_tests {
             }
             let control_result = process_control_stream(
                 None,
-                &testutils::copy_settings(false, 0),
+                &testutils::copy_settings(),
                 10,
                 std::num::NonZeroUsize::MIN,
                 std::num::NonZeroUsize::new(8).unwrap(),
@@ -4190,7 +4190,7 @@ mod teardown_tests {
                 std::time::Duration::from_secs(2),
                 process_control_stream(
                     None,
-                    &testutils::copy_settings(false, 0),
+                    &testutils::copy_settings(),
                     10,
                     std::num::NonZeroUsize::MIN,
                     std::num::NonZeroUsize::new(8).unwrap(),
@@ -4541,7 +4541,7 @@ mod teardown_tests {
         source.close().await?;
         process_control_stream(
             None,
-            &testutils::copy_settings(false, 0),
+            &testutils::copy_settings(),
             10,
             std::num::NonZeroUsize::MIN,
             std::num::NonZeroUsize::new(8).unwrap(),
@@ -4749,7 +4749,7 @@ mod teardown_tests {
                 source.close().await.unwrap();
             };
             let receiver = process_incoming_file_streams_tcp(
-                testutils::copy_settings(false, 0),
+                testutils::copy_settings(),
                 common::preserve::preserve_none(),
                 pool,
                 tracker.clone(),
@@ -4831,7 +4831,7 @@ mod teardown_tests {
             .await
             .unwrap();
         let pool = test_pool(&tracker);
-        let settings = testutils::copy_settings(false, 0);
+        let settings = testutils::copy_settings();
         let preserve = common::preserve::preserve_none();
         let control = process_control_stream(
             None,
@@ -4934,7 +4934,7 @@ mod teardown_tests {
             false,
             errors.clone(),
         );
-        let mut settings = testutils::copy_settings(false, 0);
+        let mut settings = testutils::copy_settings();
         settings.ignore_existing = true;
         process_control_stream(
             None,
@@ -5025,7 +5025,7 @@ mod teardown_tests {
             );
             let result = process_control_stream(
                 None,
-                &testutils::copy_settings(false, 0),
+                &testutils::copy_settings(),
                 10,
                 std::num::NonZeroUsize::MIN,
                 std::num::NonZeroUsize::new(8).unwrap(),
@@ -5107,7 +5107,7 @@ mod teardown_tests {
             })
             .await
             .unwrap();
-        let mut settings = testutils::copy_settings(false, 0);
+        let mut settings = testutils::copy_settings();
         settings.overwrite = true;
         let preserve = common::preserve::preserve_none();
         let receive = process_control_stream(
@@ -5166,7 +5166,7 @@ mod teardown_tests {
     ) -> anyhow::Result<()> {
         let recv = remote::streams::RecvStream::new(reader);
         handle_file_stream(
-            testutils::copy_settings(false, 0),
+            testutils::copy_settings(),
             common::preserve::Settings::default(),
             recv,
             tracker,
@@ -5248,7 +5248,7 @@ mod teardown_tests {
             std::time::Duration::from_secs(5),
             common::task_scope::scope_tasks(async move {
                 let receiver = process_incoming_file_streams_tcp(
-                    testutils::copy_settings(false, 0),
+                    testutils::copy_settings(),
                     common::preserve::preserve_none(),
                     pool,
                     tracker,
@@ -5398,6 +5398,10 @@ mod manifest_tests {
 
     #[tokio::test]
     async fn manifest_lookup_releases_admission_after_completion_or_cancellation() {
+        const TEST_NAME: &str = "destination::manifest_tests::manifest_lookup_releases_admission_after_completion_or_cancellation";
+        if crate::test_process::run_in_child(TEST_NAME) {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("present"), "data").unwrap();
         let dir = open_dir(tmp.path()).await;
@@ -5421,6 +5425,7 @@ mod manifest_tests {
             "owned metadata must not retain fd admission"
         );
         assert_eq!(entry.size, 4);
+        crate::test_process::completed(TEST_NAME);
     }
 
     #[tokio::test]
@@ -5459,7 +5464,10 @@ mod removal_tests {
             victim,
             &victim_path,
             planned.into_removal_snapshot(),
-            &testutils::copy_settings(true, 0),
+            &common::copy::Settings {
+                overwrite: true,
+                ..testutils::copy_settings()
+            },
         )
         .await?;
 
