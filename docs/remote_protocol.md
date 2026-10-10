@@ -1243,7 +1243,8 @@ destination adopts it. Explicit unlimited leaves the connection ceiling in force
 **Cancellation-lifetime residual:** admitted remote payload streaming uses `tokio::fs::File`. A
 private Tokio blocking read or write can retain the same regular-file fd after its high-level future
 drops its OpenFile guard. This does not change the fd-relative containment or the wire protocol, but
-the OpenFile pool does not cover that private job's full lifetime.
+the OpenFile pool does not cover that private job's full lifetime. The owned-file payload I/O
+follow-up is tracked in [#349](https://github.com/wykurz/rcp/issues/349).
 
 ### 7.9 Skipping Identical Files
 

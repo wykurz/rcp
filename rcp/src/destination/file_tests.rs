@@ -1,3 +1,6 @@
+//! Finalization assertions inspect process-global counters and admission state. Each test runs in
+//! its own child process so these checks also remain exact under parallel libtest execution.
+
 use super::*;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -90,6 +93,10 @@ fn one_worker_runtime() -> tokio::runtime::Runtime {
 
 #[test]
 fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() {
+    const TEST_NAME: &str = "destination::file_tests::receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
@@ -146,10 +153,16 @@ fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() 
         assert_eq!(progress().files_copied.get(), counts.0 + 1);
         assert_eq!(progress().bytes_copied.get(), counts.1 + header.size);
     });
+    crate::test_process::completed(TEST_NAME);
 }
 
 #[test]
 fn receiver_flush_failure_keeps_the_file_private_and_uncounted() {
+    const TEST_NAME: &str =
+        "destination::file_tests::receiver_flush_failure_keeps_the_file_private_and_uncounted";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
@@ -193,10 +206,16 @@ fn receiver_flush_failure_keeps_the_file_private_and_uncounted() {
         );
         assert!(identity.original_is_closed().unwrap());
     });
+    crate::test_process::completed(TEST_NAME);
 }
 
 #[test]
 fn receiver_conversion_failure_keeps_the_file_private_and_uncounted() {
+    const TEST_NAME: &str =
+        "destination::file_tests::receiver_conversion_failure_keeps_the_file_private_and_uncounted";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
@@ -241,10 +260,15 @@ fn receiver_conversion_failure_keeps_the_file_private_and_uncounted() {
         assert_eq!(std::fs::read(path).unwrap(), PAYLOAD);
         assert!(identity.original_is_closed().unwrap());
     });
+    crate::test_process::completed(TEST_NAME);
 }
 
 #[test]
 fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs() {
+    const TEST_NAME: &str = "destination::file_tests::cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
@@ -285,10 +309,15 @@ fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs(
         );
         assert_eq!(std::fs::read(path).unwrap(), PAYLOAD);
     });
+    crate::test_process::completed(TEST_NAME);
 }
 
 #[tokio::test]
 async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame() {
+    const TEST_NAME: &str = "destination::file_tests::receiver_metadata_failure_counts_payload_and_preserves_the_next_frame";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("fixture");
     drop(create_file(&fixture));
@@ -311,7 +340,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
             .await
             .unwrap(),
     );
-    let settings = testutils::copy_settings(false, 1024);
+    let settings = testutils::copy_settings();
     let preservation = common::preserve::preserve_all();
     let counts = (progress().files_copied.get(), progress().bytes_copied.get());
     let error = process_single_file(
@@ -368,4 +397,5 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         progress().bytes_copied.get(),
         counts.1 + header.size + next.size
     );
+    crate::test_process::completed(TEST_NAME);
 }
