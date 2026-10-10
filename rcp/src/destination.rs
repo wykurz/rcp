@@ -353,10 +353,11 @@ async fn process_single_file(
     // wrap the std file for async writes; the underlying fd is retained so its metadata
     // can be applied through the held fd (no path re-open).
     let mut file = tokio::fs::File::from_std(std_file);
-    // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
-    // but capped at file size to avoid over-allocation for small files
-    let file_size = file_header.size.min(usize::MAX as u64) as usize;
-    let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+    let buffer_size = crate::configure_remote_file_buffer(
+        &mut file,
+        file_header.size,
+        settings.remote_copy_buffer_size,
+    );
     // once we start reading from the stream, any error means the stream is corrupted
     let copied = common::timing_scope!(trace, "destination.file.receive")
         .measure(

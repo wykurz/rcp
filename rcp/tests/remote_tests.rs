@@ -92,21 +92,21 @@ fn require_local_ssh() {
 }
 
 #[tokio::test]
-async fn remote_source_buffer_cap_preserves_files_over_tcp_and_tls() {
+async fn remote_buffer_configuration_preserves_files_over_tcp_and_tls() {
     require_local_ssh();
     static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
         std::sync::LazyLock::new(common::progress::Progress::new);
     let fixture = tempfile::tempdir().unwrap();
     let src = fixture.path().join("source");
     std::fs::create_dir(&src).unwrap();
-    let read_limit = tokio::fs::File::from_std(tempfile::tempfile().unwrap()).max_buf_size();
+    let default_chunk = remote::TcpConfig::default().effective_buffer_size();
     let sizes = [
         0,
         17,
-        read_limit - 1,
-        read_limit,
-        read_limit + 1,
-        2 * read_limit + 17,
+        default_chunk - 1,
+        default_chunk,
+        default_chunk + 1,
+        32 * 1024 * 1024 + 17,
     ];
     for (index, size) in sizes.into_iter().enumerate() {
         common::filegen::write_file(&PROGRESS, src.join(index.to_string()), size, 65536, 0)
@@ -119,8 +119,8 @@ async fn remote_source_buffer_cap_preserves_files_over_tcp_and_tls() {
     );
     for (index, (plaintext, dereference, buffer)) in [
         (false, false, None),
-        (false, true, Some("64KiB")),
-        (true, false, Some("4MiB")),
+        (false, true, Some("32MiB")),
+        (true, false, Some("64KiB")),
         (true, true, None),
     ]
     .into_iter()

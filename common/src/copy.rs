@@ -125,11 +125,12 @@ pub struct Settings {
     pub chunk_size: u64,
     /// Skip special files (sockets, FIFOs, devices) without error.
     pub skip_specials: bool,
-    /// Buffer size for remote copy file transfer operations in bytes.
+    /// Maximum remote transfer buffer and file I/O request size in bytes.
     ///
-    /// This is only used for remote copy operations and controls the buffer size
-    /// when copying data between files and network streams. The actual buffer is
-    /// capped to the file size to avoid over-allocation for small files.
+    /// Source reader capacity, Tokio file I/O limits, and receiver scratch requests are
+    /// capped to the file size and the host's byte-buffer limit, with a one-byte minimum.
+    /// Individual operations can be shorter. Internal and outer buffers can coexist;
+    /// previously retained receiver scratch follows its independent retention limit.
     pub remote_copy_buffer_size: usize,
     /// filter settings for include/exclude patterns
     pub filter: Option<crate::filter::FilterSettings>,

@@ -601,8 +601,15 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 | `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                          |
 | `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                               |
 | `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default) or `internet`                                         |
-| `--remote-copy-buffer-size=SIZE`            | File-transfer chunk size (default: 16 MiB datacenter, 2 MiB internet)                       |
+| `--remote-copy-buffer-size=SIZE`            | Maximum transfer buffer/file I/O request size (default: 16 MiB datacenter, 2 MiB internet)  |
 | `--remote-copy-buffer-retention-limit=SIZE` | Per-connection receiver scratch retention (default: min(copy chunk, 2 MiB); 0 disables)     |
+
+The limit applies to source reader capacity, source/destination Tokio file I/O limits, and receiver
+scratch requests. These per-file limits are capped to the file size and each host's `isize::MAX`,
+with a one-byte minimum. Individual disk and network operations can be shorter; it does not set TCP
+packet or TLS record sizes. Internal and outer buffers can coexist, so larger values allow more
+working memory per active transfer. Previously retained receiver scratch can be larger than a later
+file's request; retention remains an independent limit.
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.
