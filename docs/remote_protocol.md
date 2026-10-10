@@ -1034,11 +1034,19 @@ ignored; a short read fails the transfer and discards the stream. The stream bec
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
+Each source file owns a buffered reader whose capacity is the minimum of the configured
+`--remote-copy-buffer-size`, the file's header size, and that Tokio file's `max_buf_size()`, with a
+one-byte minimum. The source leaves the file's read limit unchanged. Each buffered fill performs one
+underlying read, so a larger outer allocation cannot increase the slice sent by `copy_buf`. With the
+pinned Tokio version's default 2 MiB read limit, a large datacenter-profile source file uses at most
+2 MiB of outer buffer capacity. Source buffers remain per-file allocations; receiver copy chunks and
+per-connection retention are configured separately below.
+
 The destination lazily retains initialized copy scratch per data connection, growing only to the
 chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
 reader need no scratch allocation. The default retention limit is the smaller of
 `--remote-copy-buffer-size` and 2 MiB. The I/O chunks remain 16 MiB for datacenter and 2 MiB for
-internet. Source reader buffers are unchanged.
+internet.
 
 Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
 example, `16MiB` to reuse full datacenter chunks); `0` disables retention. The shared daemon
