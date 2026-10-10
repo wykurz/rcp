@@ -60,7 +60,7 @@ impl LifetimeReceiver {
                     normal: NonZeroUsize::new(2).unwrap(),
                     reserve: NonZeroUsize::new(2).unwrap(),
                 }),
-                &test_copy_settings(),
+                &testutils::copy_settings(false, 0),
                 0,
                 NonZeroUsize::MIN,
                 NonZeroUsize::new(2).unwrap(),

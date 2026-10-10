@@ -29,14 +29,6 @@ impl FdIdentityProbe {
     }
 }
 
-struct ResetFileAdmission;
-
-impl Drop for ResetFileAdmission {
-    fn drop(&mut self) {
-        throttle::set_admission_limits(None);
-    }
-}
-
 fn file_header(path: &std::path::Path) -> remote::protocol::File {
     let mut metadata = remote::protocol::Metadata::from(&std::fs::metadata(path).unwrap());
     metadata.mode = 0o751;
@@ -180,6 +172,7 @@ fn receiver_flush_failure_keeps_the_file_private_and_uncounted() {
             .unwrap()
             .unwrap_err();
         assert!(pending);
+        assert_eq!(error.to_string(), format!("failed flushing {:?}", path));
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()
@@ -203,6 +196,54 @@ fn receiver_flush_failure_keeps_the_file_private_and_uncounted() {
 }
 
 #[test]
+fn receiver_conversion_failure_keeps_the_file_private_and_uncounted() {
+    one_worker_runtime().block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("destination");
+        let file = create_file(&path);
+        let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
+        let header = file_header(&path);
+        let preservation = common::preserve::preserve_all();
+        let counts = (progress().files_copied.get(), progress().bytes_copied.get());
+        let mut file = tokio::fs::File::from_std(file);
+        file.write_all(PAYLOAD).await.unwrap();
+        file.flush().await.unwrap();
+        let worker = OccupiedWorker::start().await;
+        // inject an extra Tokio reference to exercise defensive conversion failure; the receiver
+        // does not issue this untracked metadata operation in its normal write/flush flow
+        let mut metadata = Box::pin(file.metadata());
+        let pending = futures::poll!(metadata.as_mut()).is_pending();
+        drop(metadata);
+        let result = finalize_received_file(file, &header, &preservation).now_or_never();
+        let retained_before_release = !identity.original_is_closed().unwrap();
+        worker.finish().await;
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(pending);
+        assert!(retained_before_release);
+        let error = result
+            .expect("conversion must fail without waiting")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed converting flushed destination {:?}: Tokio still retains a file reference",
+                path
+            )
+        );
+        assert_eq!(
+            (progress().files_copied.get(), progress().bytes_copied.get()),
+            counts
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o7777,
+            common::safedir::DST_FILE_CREATE_MODE
+        );
+        assert_eq!(std::fs::read(path).unwrap(), PAYLOAD);
+        assert!(identity.original_is_closed().unwrap());
+    });
+}
+
+#[test]
 fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs() {
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
@@ -211,18 +252,21 @@ fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs(
         let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
         let header = file_header(&path);
         let preservation = common::preserve::preserve_none();
-        let _reset_admission = ResetFileAdmission;
+        let _reset_admission = testutils::ResetAdmission;
         throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
         let guard = throttle::open_file_permit().await;
         let mut file = tokio::fs::File::from_std(file);
         file.write_all(PAYLOAD).await.unwrap();
         file.flush().await.unwrap();
         let worker = OccupiedWorker::start().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let queued_before = metrics.blocking_queue_depth();
         let mut finalize = Box::pin(common::safedir::with_fd_admission(
             guard.admission(),
             finalize_received_file(file, &header, &preservation),
         ));
         let pending = futures::poll!(finalize.as_mut()).is_pending();
+        let queued_after = metrics.blocking_queue_depth();
         drop(guard);
         drop(finalize);
         let closed_before_release = identity.original_is_closed();
@@ -230,6 +274,9 @@ fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs(
         worker.finish().await;
         tokio::task::spawn_blocking(|| ()).await.unwrap();
         assert!(pending);
+        // the sole worker is occupied, so only the metadata submission can grow this queue
+        assert_eq!(queued_before, 0);
+        assert_eq!(queued_after, 1, "metadata must reach the blocking queue");
         assert!(closed_before_release.unwrap());
         assert!(capacity_before_release.is_some());
         assert_eq!(
@@ -264,22 +311,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
             .await
             .unwrap(),
     );
-    let settings = common::copy::Settings {
-        reflink: Default::default(),
-        local_copy_handoff: Default::default(),
-        dereference: false,
-        fail_early: false,
-        overwrite: false,
-        overwrite_compare: Default::default(),
-        overwrite_filter: None,
-        ignore_existing: false,
-        chunk_size: 0,
-        skip_specials: false,
-        remote_copy_buffer_size: 1024,
-        filter: None,
-        dry_run: None,
-        delete: None,
-    };
+    let settings = testutils::copy_settings(false, 1024);
     let preservation = common::preserve::preserve_all();
     let counts = (progress().files_copied.get(), progress().bytes_copied.get());
     let error = process_single_file(
