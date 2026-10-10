@@ -1476,11 +1476,10 @@ pub const DATACENTER_REMOTE_COPY_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub const INTERNET_REMOTE_COPY_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 impl NetworkProfile {
-    /// Returns the default buffer size for remote copy operations for this profile
+    /// Returns the default maximum transfer buffer and file I/O request size for this profile.
     ///
-    /// Datacenter profile uses a large buffer (16 MiB) matching the per-stream receive window
-    /// to maximize throughput on high-bandwidth networks.
-    /// Internet profile uses a smaller buffer (2 MiB) suitable for internet connections.
+    /// Datacenter uses 16 MiB and internet uses 2 MiB. Per-file I/O limits are capped for
+    /// small files; individual disk and network operations can be shorter.
     pub fn default_remote_copy_buffer_size(&self) -> usize {
         match self {
             Self::Datacenter => DATACENTER_REMOTE_COPY_BUFFER_SIZE,
@@ -1500,7 +1499,7 @@ pub struct TcpConfig {
     pub conn_timeout_sec: u64,
     /// Network profile for tuning (default: Datacenter)
     pub network_profile: NetworkProfile,
-    /// Buffer size for file transfers (defaults to profile-specific value)
+    /// Maximum transfer buffer and file I/O request size (defaults to profile-specific value).
     pub buffer_size: Option<usize>,
     /// Maximum retained receiver scratch per data connection; defaults to min(chunk, 2 MiB).
     /// Zero disables retention without changing I/O chunk sizes.

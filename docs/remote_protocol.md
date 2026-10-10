@@ -1034,11 +1034,24 @@ ignored; a short read fails the transfer and discards the stream. The stream bec
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
+`--remote-copy-buffer-size` is the maximum transfer buffer and file I/O request size: 16 MiB by
+default for datacenter and 2 MiB for internet. Both source adapters and the destination set their
+Tokio file's `max_buf_size` to the minimum of the configured value, the file's header size, and the
+host's `isize::MAX`, with a one-byte minimum. The representability cap is applied before narrowing
+the header's `u64` size. The source allocates its per-file `BufReader` with that same capacity, and
+the destination uses it as the maximum copy-scratch request. Tokio's untouched default no longer
+imposes a separate 2 MiB file limit.
+
+Individual file reads, writes, and network operations can be shorter; this setting does not promise
+TCP packet or TLS record sizes. The receiver forwards each available short read to the file without
+waiting to aggregate a full configured chunk. Tokio's internal file buffers and the outer transfer
+buffers can coexist, so larger settings allow more working memory per active transfer. The setting
+is not a process RSS bound or a throughput guarantee. Source buffers remain per-file allocations.
+
 The destination lazily retains initialized copy scratch per data connection, growing only to the
 chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
 reader need no scratch allocation. The default retention limit is the smaller of
-`--remote-copy-buffer-size` and 2 MiB. The I/O chunks remain 16 MiB for datacenter and 2 MiB for
-internet. Source reader buffers are unchanged.
+`--remote-copy-buffer-size` and 2 MiB. Retention does not change the configured I/O maximum.
 
 Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
 example, `16MiB` to reuse full datacenter chunks); `0` disables retention. The shared daemon

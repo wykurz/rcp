@@ -146,7 +146,7 @@ async fn send_file_tcp(
             Ok((file, size, meta)) => Ok((file, size, meta, None)),
             Err(e) => Err(e),
         };
-        let (file, size, metadata, src_acls) = match open_result {
+        let (mut file, size, metadata, src_acls) = match open_result {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("Failed to read file {src:?} for sending: {e:#}");
@@ -188,11 +188,8 @@ async fn send_file_tcp(
             Some(acls) => metadata.with_acls(acls),
             None => metadata,
         };
-        // wrap file in a buffered reader for better network throughput
-        // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
-        // but capped at file size to avoid over-allocation for small files
-        let file_size = size.min(usize::MAX as u64) as usize;
-        let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+        let buffer_size =
+            crate::configure_remote_file_buffer(&mut file, size, settings.remote_copy_buffer_size);
         let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
         let file_header = remote::protocol::File {
             src: src.to_path_buf(),

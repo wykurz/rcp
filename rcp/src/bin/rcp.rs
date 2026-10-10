@@ -281,10 +281,14 @@ struct Args {
     )]
     network_profile: remote::NetworkProfile,
 
-    /// Buffer size for remote copy file transfer operations.
+    /// Maximum transfer buffer and file I/O request size for remote copies.
     ///
-    /// Controls the buffer used when copying data between files and network streams.
-    /// Larger buffers can improve throughput but use more memory per concurrent transfer.
+    /// Sets source reader capacity, file I/O limits, and receiver scratch request sizes.
+    /// Per-file limits are capped for small files and each host's addressable buffer size.
+    /// Zero is normalized to one byte. Individual disk/network operations can be shorter;
+    /// this does not set TCP packet or TLS record sizes.
+    /// Tokio's internal file buffers and outer transfer buffers can coexist, so larger
+    /// limits allow more working memory. Receiver scratch retention is controlled separately.
     /// Accepts byte sizes like "256KiB", "1MiB", or plain numbers in bytes.
     ///
     /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
@@ -2246,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn master_forwards_buffer_retention_to_both_daemon_roles() {
+    fn master_forwards_buffer_configuration_to_both_daemon_roles() {
         for (options, chunk, limit) in [
             (vec![], 16 * 1024 * 1024, None),
             (vec!["--network-profile=internet"], 2 * 1024 * 1024, None),
@@ -2292,6 +2296,22 @@ mod tests {
                 build_destination_remote_config(&request, &readiness(files.limit(), 4)).unwrap();
             for config in [&source, &destination] {
                 assert_eq!(config.tcp.effective_buffer_size(), chunk);
+                assert_eq!(config.rcpd.buffer_size, config.tcp.buffer_size);
+                let buffer_args: Vec<_> = config
+                    .rcpd
+                    .to_args()
+                    .into_iter()
+                    .filter(|arg| arg.starts_with("--buffer-size="))
+                    .collect();
+                assert_eq!(
+                    buffer_args,
+                    config
+                        .tcp
+                        .buffer_size
+                        .map(|value| format!("--buffer-size={value}"))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                );
                 assert_eq!(
                     config.tcp.effective_buffer_retention_limit(),
                     limit.unwrap_or(chunk.min(2 * 1024 * 1024))
@@ -2310,6 +2330,30 @@ mod tests {
                         .into_iter()
                         .collect::<Vec<_>>()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn master_checks_buffer_size_representability_before_forwarding() {
+        for size in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let option = format!("--remote-copy-buffer-size={size}");
+            let args = master_args(&[&option]);
+            let files =
+                common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(4).unwrap());
+            let request = build_master_remote_request(&args, files, None);
+            match usize::try_from(size) {
+                Ok(expected) => {
+                    let config = build_source_remote_config(&request.unwrap());
+                    assert_eq!(config.tcp.buffer_size, Some(expected));
+                    assert_eq!(config.rcpd.buffer_size, Some(expected));
+                }
+                Err(_) => {
+                    let Err(error) = request else {
+                        panic!("unrepresentable size was accepted");
+                    };
+                    assert!(format!("{error:#}").contains("addressable size"));
+                }
             }
         }
     }

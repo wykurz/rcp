@@ -136,9 +136,9 @@ fn pool(writer: remote::streams::BoxedWrite) -> Arc<AcceptingSendStreamPool> {
 async fn send(
     pool: Arc<AcceptingSendStreamPool>,
     path: &std::path::Path,
-    dereference: bool,
+    settings: &common::copy::Settings,
 ) -> anyhow::Result<()> {
-    let read = if dereference {
+    let read = if settings.dereference {
         FileRead::Path
     } else {
         let (parent, name) = open_root_parent(path).await?;
@@ -146,7 +146,7 @@ async fn send(
     };
     let fatal = discovery::Fatal::new(Default::default());
     let result = send_file_tcp(
-        &settings(dereference),
+        settings,
         Default::default(),
         path,
         std::path::Path::new("/destination/file"),
@@ -167,13 +167,83 @@ async fn send(
     }
 }
 
+struct PayloadRequests {
+    header_flushed: bool,
+    sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl tokio::io::AsyncWrite for PayloadRequests {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.header_flushed {
+            self.sizes.lock().unwrap().push(bytes.len());
+        }
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.header_flushed = true;
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn source_adapters_use_configured_file_read_limits() -> anyhow::Result<()> {
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
+    for configured in [
+        remote::TcpConfig::default().effective_buffer_size(),
+        32 * 1024 * 1024,
+    ] {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("larger-than-chunk");
+        let size = configured + 17;
+        common::filegen::write_file(&PROGRESS, path.clone(), size, 65536, 0).await?;
+        for dereference in [false, true] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pool = pool(Box::new(PayloadRequests {
+                header_flushed: false,
+                sizes: requests.clone(),
+            }));
+            let settings = common::copy::Settings {
+                remote_copy_buffer_size: configured,
+                ..settings(dereference)
+            };
+            send(pool.clone(), &path, &settings).await?;
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.iter().sum::<usize>(), size);
+            assert_eq!(requests.iter().copied().max(), Some(configured));
+            assert_eq!(pool.recv.len(), 1);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn shrinking_file_discards_its_incomplete_data_frame() -> anyhow::Result<()> {
+    static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+        std::sync::LazyLock::new(common::progress::Progress::new);
     let replacement = b"new";
+    let file_size = remote::TcpConfig::default().effective_buffer_size() + 1;
     for dereference in [false, true] {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("changing-file");
-        std::fs::write(&path, b"original")?;
+        common::filegen::write_file(&PROGRESS, path.clone(), file_size, 65536, 0).await?;
+        let settings = common::copy::Settings {
+            remote_copy_buffer_size: remote::TcpConfig::default().effective_buffer_size(),
+            ..settings(dereference)
+        };
         let (writer, mut reader) = tokio::io::duplex(4096);
         let pool = pool(Box::new(HeaderMutation {
             stream: writer,
@@ -184,7 +254,7 @@ async fn shrinking_file_discards_its_incomplete_data_frame() -> anyhow::Result<(
         }));
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            send(pool.clone(), &path, dereference),
+            send(pool.clone(), &path, &settings),
         )
         .await?
         .expect_err("a changed payload was reported as a successful file transfer");
@@ -201,13 +271,21 @@ async fn shrinking_file_discards_its_incomplete_data_frame() -> anyhow::Result<(
             .recv_object::<remote::protocol::File>()
             .await?
             .unwrap();
-        assert_eq!(header.size, 8);
+        assert_eq!(header.size, file_size as u64);
         let payload = &bytes[4 + header_size..];
         assert!(
-            payload.len() <= 8,
+            payload.len() <= file_size,
             "bytes beyond the header size reached the wire"
         );
-        assert_eq!(payload, &replacement[..replacement.len().min(8)]);
+        assert_eq!(payload, replacement);
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
     Ok(())
 }
@@ -230,11 +308,11 @@ async fn growing_file_sends_its_snapshot_length_and_reuses_the_stream() -> anyho
         }));
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            send(pool.clone(), &path, dereference),
+            send(pool.clone(), &path, &settings(dereference)),
         )
         .await??;
         assert_eq!(pool.recv.len(), 1);
-        send(pool.clone(), &next, dereference).await?;
+        send(pool.clone(), &next, &settings(dereference)).await?;
         let mut receive = remote::streams::RecvStream::new(reader);
         for (path, expected) in [(&path, b"replacem".as_slice()), (&next, b"next")] {
             let header = receive
@@ -265,11 +343,11 @@ async fn size_zero_proc_file_sends_an_empty_frame_and_reuses_the_stream() -> any
         let pool = pool(Box::new(writer));
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            send(pool.clone(), path, dereference),
+            send(pool.clone(), path, &settings(dereference)),
         )
         .await??;
         assert_eq!(pool.recv.len(), 1);
-        send(pool.clone(), &next, dereference).await?;
+        send(pool.clone(), &next, &settings(dereference)).await?;
         let mut receive = remote::streams::RecvStream::new(reader);
         let empty = receive
             .recv_object::<remote::protocol::File>()
@@ -300,9 +378,9 @@ async fn unchanged_files_reuse_one_stream_with_exact_frame_boundaries() -> anyho
         std::fs::write(&second, b"second")?;
         let (writer, reader) = tokio::io::duplex(4096);
         let pool = pool(Box::new(writer));
-        send(pool.clone(), &first, dereference).await?;
+        send(pool.clone(), &first, &settings(dereference)).await?;
         assert_eq!(pool.recv.len(), 1);
-        send(pool.clone(), &second, dereference).await?;
+        send(pool.clone(), &second, &settings(dereference)).await?;
         assert_eq!(pool.recv.len(), 1);
         let mut receive = remote::streams::RecvStream::new(reader);
         for (path, expected) in [(&first, b"first payload".as_slice()), (&second, b"second")] {

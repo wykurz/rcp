@@ -843,11 +843,17 @@ rcp --max-workers=4 /source /dest
 
 ### Remote Copy Buffer Size
 
-For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over
-TCP:
+For remote copies, `--remote-copy-buffer-size` sets the maximum transfer buffer and file I/O request
+size (default: 16 MiB for datacenter, 2 MiB for internet). Both endpoints use this value for their
+Tokio file I/O limits. Source reader capacity and receiver scratch requests use the same per-file
+limit, capped to the file size and the host's `isize::MAX`, with a one-byte minimum. Individual disk
+and network operations can be shorter; this does not set TCP packet or TLS record sizes.
+
+Tokio's internal file buffers and outer transfer buffers can coexist. Larger settings therefore
+allow more working memory per active transfer; the configured size is not a process memory bound.
 
 ```bash
-# Larger buffers for high-bandwidth links (default: 16 MiB for datacenter)
+# Allow up to 32 MiB per transfer buffer/file I/O request
 rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
 
 # Smaller buffers for constrained memory
@@ -856,12 +862,13 @@ rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
 
 Receivers lazily reuse initialized scratch per data connection, retaining up to the smaller of the
 copy chunk size and 2 MiB by default. This avoids repeated allocation and initialization for
-eligible files, at the cost of memory held until the connection closes. Use
-`--remote-copy-buffer-retention-limit=16MiB` to retain full datacenter chunks, a smaller limit to
-reduce idle memory, or `0` to disable reuse. Chunks above the limit still use the configured I/O
-size with temporary storage. At 100 connections the default retained-scratch ceiling is 200 MiB for
-either profile; see [connection reuse](docs/remote_protocol.md#75-data-connection-pooling) for the
-full memory accounting.
+eligible files, at the cost of memory held until the connection closes. Retained storage can be
+larger than a later file's scratch request. Use `--remote-copy-buffer-retention-limit=16MiB` to
+retain full datacenter chunks, a smaller limit to reduce idle memory, or `0` to disable reuse.
+Chunks above the limit still use the configured I/O size with temporary storage. At 100 connections
+the default retained-scratch ceiling is 200 MiB for either profile; see
+[connection reuse](docs/remote_protocol.md#75-data-connection-pooling) for the full memory
+accounting.
 
 ### Network Profile
 
