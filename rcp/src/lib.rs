@@ -188,7 +188,7 @@ pub mod source;
 
 // outer transfer requests and Tokio file I/O share this per-file maximum
 fn configure_remote_file_buffer(file: &mut tokio::fs::File, size: u64, configured: usize) -> usize {
-    // clamp before narrowing: byte buffers must fit within isize::MAX on this host
+    // clamp before narrowing: isize::MAX bounds representable byte lengths, not available memory
     let file_size = size.min(isize::MAX as u64) as usize;
     let buffer_size = configured.min(file_size).max(1);
     file.set_max_buf_size(buffer_size);

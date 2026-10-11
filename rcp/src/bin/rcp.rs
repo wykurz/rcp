@@ -284,8 +284,11 @@ struct Args {
     /// Maximum transfer buffer and file I/O request size for remote copies.
     ///
     /// Sets source reader capacity, file I/O limits, and receiver scratch request sizes.
-    /// Per-file limits are capped for small files and each host's addressable buffer size.
-    /// Zero is normalized to one byte. Individual disk/network operations can be shorter;
+    /// The configured value must fit usize on the master and each daemon; otherwise
+    /// argument validation or daemon startup fails. Accepted per-file limits are capped
+    /// to the file size and the host's isize::MAX, with a one-byte minimum.
+    /// These are representability limits, not available-memory checks; oversized settings
+    /// can still exhaust memory and abort a daemon. Individual disk/network operations can be shorter;
     /// this does not set TCP packet or TLS record sizes.
     /// Tokio's internal file buffers and outer transfer buffers can coexist, so larger
     /// limits allow more working memory. Receiver scratch retention is controlled separately.
@@ -655,6 +658,15 @@ fn remote_stream_clamp_notice(
     ))
 }
 
+fn remote_buffer_size_for_host(size: u64, host_max: usize) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        size <= host_max as u64,
+        "remote copy buffer size exceeds this platform's addressable size ({host_max} bytes)"
+    );
+    // the supplied host limit is a usize, so the accepted value can be narrowed losslessly
+    Ok(size as usize)
+}
+
 fn build_master_remote_request(
     args: &Args,
     files_in_flight: common::ResolvedFilesInFlight,
@@ -709,9 +721,8 @@ fn build_master_remote_request(
     };
     let buffer_size = args
         .remote_copy_buffer_size
-        .map(|size| usize::try_from(size.0))
-        .transpose()
-        .context("remote copy buffer size exceeds this platform's addressable size")?;
+        .map(|size| remote_buffer_size_for_host(size.0, usize::MAX))
+        .transpose()?;
     let buffer_retention_limit = args
         .remote_copy_buffer_retention_limit
         .map(|size| usize::try_from(size.0))
@@ -2335,26 +2346,22 @@ mod tests {
     }
 
     #[test]
-    fn master_checks_buffer_size_representability_before_forwarding() {
-        for size in [u64::from(u32::MAX) + 1, u64::MAX] {
-            let option = format!("--remote-copy-buffer-size={size}");
-            let args = master_args(&[&option]);
-            let files =
-                common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(4).unwrap());
-            let request = build_master_remote_request(&args, files, None);
-            match usize::try_from(size) {
-                Ok(expected) => {
-                    let config = build_source_remote_config(&request.unwrap());
-                    assert_eq!(config.tcp.buffer_size, Some(expected));
-                    assert_eq!(config.rcpd.buffer_size, Some(expected));
-                }
-                Err(_) => {
-                    let Err(error) = request else {
-                        panic!("unrepresentable size was accepted");
-                    };
-                    assert!(format!("{error:#}").contains("addressable size"));
-                }
-            }
+    fn remote_buffer_size_conversion_checks_the_supplied_host_limit() {
+        // exercise the rejection path on 64-bit CI as well as on a 32-bit host
+        let host_max = u32::MAX as usize;
+        for size in [0, 1, host_max as u64 - 1, host_max as u64] {
+            assert_eq!(
+                remote_buffer_size_for_host(size, host_max).unwrap(),
+                size as usize
+            );
+        }
+        for size in [host_max as u64 + 1, u64::MAX] {
+            let error = remote_buffer_size_for_host(size, host_max).unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains("remote copy buffer size exceeds this platform's addressable size")
+            );
+            assert!(format!("{error:#}").contains(&host_max.to_string()));
         }
     }
 

@@ -194,8 +194,11 @@ struct Args {
     /// Maximum transfer buffer and file I/O request size, in bytes.
     ///
     /// Sets source reader capacity, file I/O limits, and receiver scratch request sizes.
-    /// Per-file limits are capped for small files and each host's addressable buffer size.
-    /// Zero is normalized to one byte. Individual disk/network operations can be shorter;
+    /// The configured value must fit usize on the master and each daemon; otherwise
+    /// argument validation or daemon startup fails. Accepted per-file limits are capped
+    /// to the file size and the host's isize::MAX, with a one-byte minimum.
+    /// These are representability limits, not available-memory checks; oversized settings
+    /// can still exhaust memory and abort a daemon. Individual disk/network operations can be shorter;
     /// this does not set TCP packet or TLS record sizes.
     /// Tokio's internal file buffers and outer transfer buffers can coexist, so larger
     /// limits allow more working memory. Receiver scratch retention is controlled separately.
@@ -1144,6 +1147,19 @@ mod tests {
                         .remote_copy_buffer_size,
                     chunk
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_rejects_buffer_sizes_outside_its_usize_range() {
+        let too_large = (usize::MAX as u128 + 1).to_string();
+        for role in ["--role=source", "--role=destination"] {
+            for value in ["-1", "nonsense", too_large.as_str()] {
+                let error = Args::try_parse_from(["rcpd", role, &format!("--buffer-size={value}")])
+                    .unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                assert!(error.to_string().contains("--buffer-size"));
             }
         }
     }

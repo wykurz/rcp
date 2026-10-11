@@ -844,13 +844,17 @@ rcp --max-workers=4 /source /dest
 ### Remote Copy Buffer Size
 
 For remote copies, `--remote-copy-buffer-size` sets the maximum transfer buffer and file I/O request
-size (default: 16 MiB for datacenter, 2 MiB for internet). Both endpoints use this value for their
-Tokio file I/O limits. Source reader capacity and receiver scratch requests use the same per-file
-limit, capped to the file size and the host's `isize::MAX`, with a one-byte minimum. Individual disk
-and network operations can be shorter; this does not set TCP packet or TLS record sizes.
+size (default: 16 MiB for datacenter, 2 MiB for internet). The configured value must fit `usize` on
+the master and each daemon; otherwise argument validation or daemon startup fails. Both endpoints
+use accepted values for their Tokio file I/O limits. Source reader capacity and receiver scratch
+requests use the same per-file limit, capped to the file size and the host's `isize::MAX`, with a
+one-byte minimum. Individual disk and network operations can be shorter; this does not set TCP
+packet or TLS record sizes.
 
-Tokio's internal file buffers and outer transfer buffers can coexist. Larger settings therefore
-allow more working memory per active transfer; the configured size is not a process memory bound.
+These integer bounds ensure representable sizes, not available memory. There is no practical
+allocation budget check: excessively large settings can exhaust memory and abort a daemon. Tokio's
+internal file buffers and outer transfer buffers can coexist, so choose the size with available
+memory and concurrent transfers in mind. The configured size is not a process memory bound.
 
 ```bash
 # Allow up to 32 MiB per transfer buffer/file I/O request
