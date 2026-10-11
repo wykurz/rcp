@@ -77,7 +77,7 @@ async fn send_file_tcp(
     // keep the large file future in one pinned place. Async admission/supervision wrappers borrow
     // it instead of embedding it again and pushing each spawned file task over Tokio's boxing limit.
     let transfer = std::pin::pin!(async {
-        let _open_file_guard = open_file_guard;
+        let file_guard = open_file_guard;
         common::timing_scope!(trace, "source.file.wait_iops")
             .measure(
                 throttle::get_file_iops_tokens(settings.chunk_size, size)
@@ -187,7 +187,13 @@ async fn send_file_tcp(
         let send_result = async {
             let bytes_sent = pooled_stream
                 .stream_mut()
-                .send_message_with_file(&file_header, file, size, buffer_size)
+                .send_message_with_file(
+                    &file_header,
+                    file,
+                    size,
+                    settings.remote_copy_buffer_size,
+                    &file_guard,
+                )
                 .await?;
             if bytes_sent != size {
                 let error = std::io::Error::new(

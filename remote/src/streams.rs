@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use bytes::Buf;
 use futures::SinkExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -58,64 +59,66 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
 
     /// Send a header and at most its snapshot byte count from an owned source descriptor.
     ///
-    /// One initialized payload allocation moves through admitted blocking reads, then stays
-    /// borrowed until each network write finishes. The caller retains its admission guard through
-    /// this future and must discard the stream on failure or a returned count below `size`.
-    #[instrument(level = "trace", skip(self, obj, file))]
-    pub async fn send_message_with_file<T: serde::Serialize>(
-        &mut self,
-        obj: &T,
-        file: std::fs::File,
-        size: u64,
-        configured: usize,
-    ) -> anyhow::Result<u64> {
-        self.send_owned_reader(obj, file, size, configured).await
-    }
-
-    async fn send_owned_reader<T: serde::Serialize, R: std::io::Read + Send + 'static>(
+    /// After the header flush, one initialized payload allocation moves through admitted blocking
+    /// reads, then stays borrowed until each network write finishes. Borrowing the caller's guard
+    /// retains admission through this future; each read also retains admission for detached work.
+    /// The caller must discard the stream on failure or a returned count below `size`.
+    #[instrument(level = "trace", skip(self, obj, file, admission))]
+    pub async fn send_message_with_file<T: serde::Serialize, R: std::io::Read + Send + 'static>(
         &mut self,
         obj: &T,
         mut file: R,
         size: u64,
         configured: usize,
+        admission: &throttle::OpenFileGuard,
     ) -> anyhow::Result<u64> {
-        self.send_batch_message(obj).await?;
-        let buffer_size = file_buffer_size(size, configured);
-        let mut buffer = None;
-        let mut sent = 0;
-        while sent < size {
-            let read_size = (size - sent).min(buffer_size as u64) as usize;
-            let (read_result, returned_file, returned_buffer) =
-                common::safedir::run_fd_admitted_blocking(move || {
-                    // allocate only for a nonempty payload, on the first admitted worker
-                    let mut buffer = buffer.unwrap_or_else(|| vec![0; buffer_size]);
-                    let result = loop {
-                        match file.read(&mut buffer[..read_size]) {
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                            result => break result,
-                        }
-                    };
-                    Ok((result, file, buffer))
-                })
-                .await?;
-            file = returned_file;
-            #[cfg(test)]
-            owned_source_tests::record_buffer(&returned_buffer);
-            let count = read_result?;
-            if count == 0 {
-                break;
+        common::safedir::with_fd_admission(admission.admission(), async {
+            self.send_batch_message(obj).await?;
+            let buffer_size = file_buffer_size(size, configured);
+            let mut buffer = if size == 0 {
+                Vec::new()
+            } else {
+                vec![0; buffer_size]
+            };
+            let mut sent = 0;
+            while sent < size {
+                let read_size = (size - sent).min(buffer_size as u64) as usize;
+                let (read_result, returned_file, returned_buffer) =
+                    common::safedir::run_fd_admitted_blocking(move || {
+                        let result = loop {
+                            match file.read(&mut buffer[..read_size]) {
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                result => break result,
+                            }
+                        };
+                        Ok((result, file, buffer))
+                    })
+                    .await?;
+                file = returned_file;
+                buffer = returned_buffer;
+                #[cfg(test)]
+                owned_source_tests::record_buffer(&buffer);
+                let count = read_result.context("failed to read source payload")?;
+                if count == 0 {
+                    break;
+                }
+                self.framed
+                    .get_mut()
+                    .write_all(&buffer[..count])
+                    .await
+                    .context("failed to write source payload")?;
+                sent += count as u64;
             }
+            // copy_buf flushed on completion, including premature EOF and empty payloads. preserve
+            // that ordering so a flush error precedes the caller's snapshot-length check.
             self.framed
                 .get_mut()
-                .write_all(&returned_buffer[..count])
-                .await?;
-            sent += count as u64;
-            buffer = Some(returned_buffer);
-        }
-        // copy_buf flushed on completion, including premature EOF and empty payloads. preserve
-        // that ordering so a flush error precedes the caller's snapshot-length check.
-        self.framed.get_mut().flush().await?;
-        Ok(sent)
+                .flush()
+                .await
+                .context("failed to flush source payload")?;
+            Ok(sent)
+        })
+        .await
     }
 
     pub async fn close(&mut self) -> anyhow::Result<()> {
