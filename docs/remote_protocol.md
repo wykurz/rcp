@@ -1048,15 +1048,15 @@ limit.
 Both source adapters keep the opened standard file whose metadata and ACL describe the header. For a
 nonempty file, the async sender allocates one initialized `Vec` after flushing the header; every
 read reuses it without resizing or reinitializing it. The sender borrows the caller's admission
-guard and establishes its own admission scope. The same file and buffer move into each unprobed
-blocking job and return together. Interrupted reads retry; positive short reads are sent
-immediately. Each read is bounded by the remaining advertised bytes. The async writer borrows that
-buffer until `write_all` completes, before another read can overwrite it. There is no source Tokio
-file buffer or copy from such a buffer into an outer reader. Source buffers remain per-file
-allocations, with no cross-file retention or read-ahead. Empty payloads allocate and read nothing.
-After the header is flushed, payload completion (including empty payloads and premature EOF)
-explicitly flushes the transport before the source checks the byte count and returns the stream to
-the pool. Read, write, flush, and length errors leave the stream poisoned.
+guard and passes it explicitly to each blocking read; payload reads need no ambient admission scope.
+The same file and buffer move into each unprobed blocking job and return together. Interrupted reads
+retry; positive short reads are sent immediately. Each read is bounded by the remaining advertised
+bytes. The async writer borrows that buffer until `write_all` completes, before another read can
+overwrite it. There is no source Tokio file buffer or copy from such a buffer into an outer reader.
+Source buffers remain per-file allocations, with no cross-file retention or read-ahead. Empty
+payloads allocate and read nothing. After the header is flushed, payload completion (including empty
+payloads and premature EOF) explicitly flushes the transport before the source checks the byte count
+and returns the stream to the pool. Read, write, flush, and length errors leave the stream poisoned.
 
 Individual file reads, writes, and network operations can be shorter; this setting does not promise
 TCP packet or TLS record sizes. The receiver forwards each available short read to the file without
@@ -1273,10 +1273,10 @@ recursive removal even when copy discovery stays within its modeled bound.
 `--max-files-in-flight` is omitted, the source chooses `max(available_parallelism(), 4)` and the
 destination adopts it. Explicit unlimited leaves the connection ceiling in force.
 
-Source payload reads use the repository's fd-admitted blocking runner. Queued cancellation destroys
-the file and buffer before releasing the job's admission; started reads and abandoned returned
-outputs retain admission until their owned resources are dropped. The outer OpenFile guard remains
-held through network writes and final flush.
+Source payload reads pass their borrowed OpenFile guard to the repository's explicit-admission
+blocking runner. Queued cancellation destroys the file and buffer before releasing the job's
+admission; started reads and abandoned returned outputs retain admission until their owned resources
+are dropped. The outer OpenFile guard remains held through network writes and final flush.
 
 **Cancellation-lifetime residual:** destination payload streaming still uses `tokio::fs::File`. A
 private Tokio blocking write can retain the regular-file fd after its high-level future drops its
