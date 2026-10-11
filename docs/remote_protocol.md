@@ -1046,9 +1046,10 @@ its maximum copy-scratch request. Tokio's untouched default no longer imposes a 
 limit.
 
 Both source adapters keep the opened standard file whose metadata and ACL describe the header. For a
-nonempty file, the first admitted blocking read allocates one initialized `Vec`; each subsequent
-read reuses it without resizing or reinitializing it. The same file and buffer move into each
-unprobed blocking job and return together. Interrupted reads retry; positive short reads are sent
+nonempty file, the async sender allocates one initialized `Vec` after flushing the header; every
+read reuses it without resizing or reinitializing it. The sender borrows the caller's admission
+guard and establishes its own admission scope. The same file and buffer move into each unprobed
+blocking job and return together. Interrupted reads retry; positive short reads are sent
 immediately. Each read is bounded by the remaining advertised bytes. The async writer borrows that
 buffer until `write_all` completes, before another read can overwrite it. There is no source Tokio
 file buffer or copy from such a buffer into an outer reader. Source buffers remain per-file

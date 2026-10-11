@@ -148,6 +148,7 @@ fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>
 
 #[tokio::test]
 async fn one_allocation_reaches_partial_pending_writes_without_overwrite() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
     let bytes: Vec<_> = (0..29).collect();
     let (reader, mut stream, observed) = fixture(&bytes);
     stream.framed.get_mut().partial = 2;
@@ -156,7 +157,7 @@ async fn one_allocation_reaches_partial_pending_writes_without_overwrite() -> an
         BUFFERS
             .scope(
                 observed.clone(),
-                stream.send_owned_reader(&17_u64, reader, bytes.len() as u64, 8)
+                stream.send_message_with_file(&17_u64, reader, bytes.len() as u64, 8, &admission)
             )
             .await?,
         29
@@ -183,10 +184,16 @@ async fn one_allocation_reaches_partial_pending_writes_without_overwrite() -> an
 
 #[tokio::test]
 async fn short_reads_are_forwarded_immediately_and_interrupted_reads_retry() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
     let (mut reader, mut stream, observed) = fixture(b"abcdefghij");
     reader.short = 3;
     reader.interrupted = true;
-    assert_eq!(stream.send_owned_reader(&1_u64, reader, 8, 5).await?, 8);
+    assert_eq!(
+        stream
+            .send_message_with_file(&1_u64, reader, 8, 5, &admission)
+            .await?,
+        8
+    );
     let observed = observed.lock().unwrap();
     let pointer = observed.reads[0].0;
     assert_eq!(
@@ -207,11 +214,12 @@ async fn short_reads_are_forwarded_immediately_and_interrupted_reads_retry() -> 
 
 #[tokio::test]
 async fn empty_and_short_payloads_flush_and_zero_configuration_normalizes() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
     for (size, configured, expected) in [(0, usize::MAX, 0), (3, 0, 3), (12, 4, 6)] {
         let (reader, mut stream, observed) = fixture(b"abcdef");
         assert_eq!(
             stream
-                .send_owned_reader(&1_u64, reader, size, configured)
+                .send_message_with_file(&1_u64, reader, size, configured, &admission)
                 .await?,
             expected
         );
@@ -235,6 +243,7 @@ async fn empty_and_short_payloads_flush_and_zero_configuration_normalizes() -> a
 
 #[tokio::test]
 async fn read_write_and_final_flush_errors_preserve_their_causes() {
+    let admission = throttle::open_file_permit().await;
     for expected in [
         ErrorKind::PermissionDenied,
         ErrorKind::BrokenPipe,
@@ -248,12 +257,24 @@ async fn read_write_and_final_flush_errors_preserve_their_causes() {
             kind => stream.framed.get_mut().failure = Some(kind),
         }
         let error = stream
-            .send_owned_reader(&1_u64, reader, 6, 4)
+            .send_message_with_file(&1_u64, reader, 6, 4, &admission)
             .await
             .unwrap_err();
         assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
             expected
+        );
+        assert_eq!(
+            error.to_string(),
+            match expected {
+                ErrorKind::PermissionDenied => "failed to read source payload",
+                ErrorKind::ConnectionReset => "failed to flush source payload",
+                _ => "failed to write source payload",
+            }
         );
         let observed = observed.lock().unwrap();
         assert_eq!(
@@ -270,11 +291,15 @@ async fn read_write_and_final_flush_errors_preserve_their_causes() {
     let (reader, mut stream, _) = fixture(b"abc");
     stream.framed.get_mut().flush_failure = true;
     let error = stream
-        .send_owned_reader(&1_u64, reader, 8, 4)
+        .send_message_with_file(&1_u64, reader, 8, 4, &admission)
         .await
         .unwrap_err();
     assert_eq!(
-        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
         ErrorKind::ConnectionReset
     );
 }
@@ -286,6 +311,7 @@ fn cancelling_a_queued_read_drops_its_owner_without_reading() -> anyhow::Result<
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        let admission = throttle::open_file_permit().await;
         let (started, start) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let blocker = tokio::task::spawn_blocking(move || {
@@ -294,7 +320,7 @@ fn cancelling_a_queued_read_drops_its_owner_without_reading() -> anyhow::Result<
         });
         start.await?;
         let (reader, mut stream, observed) = fixture(b"abc");
-        let mut send = Box::pin(stream.send_owned_reader(&1_u64, reader, 3, 3));
+        let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
         assert!(futures::poll!(send.as_mut()).is_pending());
         drop(send);
         let (dropped, unread) = {
@@ -310,15 +336,43 @@ fn cancelling_a_queued_read_drops_its_owner_without_reading() -> anyhow::Result<
 
 #[tokio::test]
 async fn cancelling_a_started_read_leaves_its_owner_with_the_worker() -> anyhow::Result<()> {
+    // isolate the process-wide admission limit from concurrently running tests
+    const TEST: &str =
+        "streams::owned_source_tests::cancelling_a_started_read_leaves_its_owner_with_the_worker";
+    const ENV: &str = "RCP_REMOTE_SOURCE_ADMISSION_TEST";
+    const DONE: &str = "source admission regression completed";
+    if std::env::var(ENV).as_deref() != Ok(TEST) {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ENV, TEST)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(DONE),
+            "child did not complete the admission regression: {stdout}"
+        );
+        return Ok(());
+    }
+    throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
+    let admission = throttle::open_file_permit().await;
     let (mut reader, mut stream, observed) = fixture(b"abc");
     let (started, start) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     reader.gate = Some((started, wait));
-    let mut send = Box::pin(stream.send_owned_reader(&1_u64, reader, 3, 3));
+    // no ambient admission scope: the public sender must establish its own
+    let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
     assert!(futures::poll!(send.as_mut()).is_pending());
     tokio::time::timeout(std::time::Duration::from_secs(5), start).await??;
     drop(send);
+    drop(admission);
     let held = !observed.lock().unwrap().dropped;
+    let mut next = Box::pin(throttle::open_file_permit());
+    let admitted_early = futures::poll!(next.as_mut()).is_ready();
     release.send(())?;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !observed.lock().unwrap().dropped {
@@ -327,7 +381,13 @@ async fn cancelling_a_started_read_leaves_its_owner_with_the_worker() -> anyhow:
     })
     .await?;
     assert!(held);
+    assert!(
+        !admitted_early,
+        "cancelled read returned admission before its owner dropped"
+    );
+    let _next = tokio::time::timeout(std::time::Duration::from_secs(5), next).await?;
     assert!(observed.lock().unwrap().writes.is_empty());
+    println!("{DONE}");
     Ok(())
 }
 
@@ -343,6 +403,7 @@ impl futures::task::ArcWake for CompletionWake {
 
 #[tokio::test]
 async fn cancelling_completed_unobserved_output_drops_its_owner() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
     let (mut reader, mut stream, observed) = fixture(b"abc");
     let (started, start) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
@@ -350,7 +411,7 @@ async fn cancelling_completed_unobserved_output_drops_its_owner() -> anyhow::Res
     let (ready, completed) = tokio::sync::oneshot::channel();
     let waker = futures::task::waker(Arc::new(CompletionWake(Mutex::new(Some(ready)))));
     let mut context = Context::from_waker(&waker);
-    let mut send = Box::pin(stream.send_owned_reader(&1_u64, reader, 3, 3));
+    let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
     assert!(std::future::Future::poll(send.as_mut(), &mut context).is_pending());
     tokio::time::timeout(std::time::Duration::from_secs(5), start).await??;
     release.send(())?;

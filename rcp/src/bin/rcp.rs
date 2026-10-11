@@ -283,7 +283,7 @@ struct Args {
 
     /// Maximum transfer buffer and file I/O request size for remote copies.
     ///
-    /// Sets source buffer size, file I/O limits, and receiver scratch request sizes.
+    /// Sets the source buffer size, destination file I/O limit, and receiver scratch request sizes.
     /// The configured value must fit usize on the master and each daemon; otherwise
     /// argument validation or daemon startup fails. Accepted per-file limits are capped
     /// to the file size and the host's isize::MAX, with a one-byte minimum.
