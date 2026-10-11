@@ -33,6 +33,7 @@ struct Reader {
     short: usize,
     interrupted: bool,
     fail_at: Option<u64>,
+    panic_on_read: bool,
     gate: Option<(
         tokio::sync::oneshot::Sender<()>,
         std::sync::mpsc::Receiver<()>,
@@ -58,6 +59,7 @@ impl Read for Reader {
         if self.fail_at == Some(self.bytes.position()) {
             return Err(ErrorKind::PermissionDenied.into());
         }
+        assert!(!self.panic_on_read, "injected source read panic");
         let size = bytes.len().min(self.short);
         Read::read(&mut self.bytes, &mut bytes[..size])
     }
@@ -76,6 +78,7 @@ struct Writer {
     pending_bytes: Option<(usize, Vec<u8>)>,
     failure: Option<ErrorKind>,
     flush_failure: bool,
+    header_failure: bool,
 }
 
 impl AsyncWrite for Writer {
@@ -85,7 +88,11 @@ impl AsyncWrite for Writer {
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if self.observations.lock().unwrap().flushes == 0 {
-            return Poll::Ready(Ok(bytes.len()));
+            return Poll::Ready(if self.header_failure {
+                Err(ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            });
         }
         if let Some(kind) = self.failure {
             return if kind == ErrorKind::WriteZero {
@@ -133,6 +140,7 @@ fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>
         short: usize::MAX,
         interrupted: false,
         fail_at: None,
+        panic_on_read: false,
         gate: None,
     };
     let writer = Writer {
@@ -142,6 +150,7 @@ fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>
         pending_bytes: None,
         failure: None,
         flush_failure: false,
+        header_failure: false,
     };
     (reader, SendStream::new(writer), observations)
 }
@@ -287,6 +296,51 @@ async fn read_write_and_final_flush_errors_preserve_their_causes() {
         );
         assert!(observed.dropped);
     }
+    let (reader, mut stream, observed) = fixture(b"abc");
+    stream.framed.get_mut().header_failure = true;
+    let error = BUFFERS
+        .scope(
+            observed.clone(),
+            stream.send_message_with_file(&1_u64, reader, 3, 3, &admission),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "failed to send source header");
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        ErrorKind::BrokenPipe
+    );
+    {
+        let observed = observed.lock().unwrap();
+        assert!(observed.dropped && observed.reads.is_empty() && observed.buffers.is_empty());
+        assert_eq!(observed.flushes, 0);
+    }
+    let (mut reader, mut stream, observed) = fixture(b"abc");
+    reader.panic_on_read = true;
+    let error = stream
+        .send_message_with_file(&1_u64, reader, 3, 3, &admission)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "failed to read source payload");
+    assert!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<tokio::task::JoinError>()
+            .unwrap()
+            .is_panic()
+    );
+    {
+        let observed = observed.lock().unwrap();
+        assert!(observed.dropped && observed.writes.is_empty());
+        assert_eq!(observed.flushes, 1);
+    }
     // EOF does not hide an error flushing the bytes that were sent before it.
     let (reader, mut stream, _) = fixture(b"abc");
     stream.framed.get_mut().flush_failure = true;
@@ -304,8 +358,39 @@ async fn read_write_and_final_flush_errors_preserve_their_causes() {
     );
 }
 
+// these tests change process-wide admission; keep the parent test process untouched.
+fn run_in_child(test: &str) -> anyhow::Result<bool> {
+    const ENV: &str = "RCP_REMOTE_SOURCE_ADMISSION_TEST";
+    if std::env::var(ENV).as_deref() == Ok(test) {
+        return Ok(false);
+    }
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", test, "--nocapture"])
+        .env(ENV, test)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let done = format!("completed: {test}");
+    assert!(
+        stdout.contains(&done) || stderr.contains(&done),
+        "child did not complete {test}: {stdout}\n{stderr}"
+    );
+    Ok(true)
+}
+
+fn completed(test: &str) {
+    println!("completed: {test}");
+}
+
 #[test]
 fn cancelling_a_queued_read_drops_its_owner_without_reading() -> anyhow::Result<()> {
+    const TEST: &str =
+        "streams::owned_source_tests::cancelling_a_queued_read_drops_its_owner_without_reading";
+    if run_in_child(TEST)? {
+        return Ok(());
+    }
+    throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
@@ -322,40 +407,30 @@ fn cancelling_a_queued_read_drops_its_owner_without_reading() -> anyhow::Result<
         let (reader, mut stream, observed) = fixture(b"abc");
         let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
         assert!(futures::poll!(send.as_mut()).is_pending());
+        let mut next = Box::pin(throttle::open_file_permit());
+        assert!(futures::poll!(next.as_mut()).is_pending());
         drop(send);
         let (dropped, unread) = {
             let observed = observed.lock().unwrap();
             (observed.dropped, observed.reads.is_empty())
         };
+        drop(admission);
+        // capacity must return while the only blocking worker is still occupied
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(5), next).await;
         drop(release);
         blocker.await?;
         assert!(dropped && unread);
+        let _replacement = replacement?;
+        completed(TEST);
         anyhow::Ok(())
     })
 }
 
 #[tokio::test]
 async fn cancelling_a_started_read_leaves_its_owner_with_the_worker() -> anyhow::Result<()> {
-    // isolate the process-wide admission limit from concurrently running tests
     const TEST: &str =
         "streams::owned_source_tests::cancelling_a_started_read_leaves_its_owner_with_the_worker";
-    const ENV: &str = "RCP_REMOTE_SOURCE_ADMISSION_TEST";
-    const DONE: &str = "source admission regression completed";
-    if std::env::var(ENV).as_deref() != Ok(TEST) {
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", TEST, "--nocapture"])
-            .env(ENV, TEST)
-            .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains(DONE),
-            "child did not complete the admission regression: {stdout}"
-        );
+    if run_in_child(TEST)? {
         return Ok(());
     }
     throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
@@ -364,7 +439,7 @@ async fn cancelling_a_started_read_leaves_its_owner_with_the_worker() -> anyhow:
     let (started, start) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     reader.gate = Some((started, wait));
-    // no ambient admission scope: the public sender must establish its own
+    // no ambient admission scope: each read must use the explicit guard
     let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
     assert!(futures::poll!(send.as_mut()).is_pending());
     tokio::time::timeout(std::time::Duration::from_secs(5), start).await??;
@@ -387,7 +462,7 @@ async fn cancelling_a_started_read_leaves_its_owner_with_the_worker() -> anyhow:
     );
     let _next = tokio::time::timeout(std::time::Duration::from_secs(5), next).await?;
     assert!(observed.lock().unwrap().writes.is_empty());
-    println!("{DONE}");
+    completed(TEST);
     Ok(())
 }
 
@@ -403,24 +478,37 @@ impl futures::task::ArcWake for CompletionWake {
 
 #[tokio::test]
 async fn cancelling_completed_unobserved_output_drops_its_owner() -> anyhow::Result<()> {
+    const TEST: &str =
+        "streams::owned_source_tests::cancelling_completed_unobserved_output_drops_its_owner";
+    if run_in_child(TEST)? {
+        return Ok(());
+    }
+    throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
     let admission = throttle::open_file_permit().await;
     let (mut reader, mut stream, observed) = fixture(b"abc");
     let (started, start) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     reader.gate = Some((started, wait));
-    let (ready, completed) = tokio::sync::oneshot::channel();
+    let (ready, completion) = tokio::sync::oneshot::channel();
     let waker = futures::task::waker(Arc::new(CompletionWake(Mutex::new(Some(ready)))));
     let mut context = Context::from_waker(&waker);
     let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
     assert!(std::future::Future::poll(send.as_mut(), &mut context).is_pending());
     tokio::time::timeout(std::time::Duration::from_secs(5), start).await??;
     release.send(())?;
-    tokio::time::timeout(std::time::Duration::from_secs(5), completed).await??;
+    tokio::time::timeout(std::time::Duration::from_secs(5), completion).await??;
     assert!(!observed.lock().unwrap().dropped);
+    let mut next = Box::pin(throttle::open_file_permit());
+    assert!(futures::poll!(next.as_mut()).is_pending());
     drop(send);
-    let observed = observed.lock().unwrap();
-    assert!(observed.dropped);
-    assert_eq!(observed.reads.len(), 1);
-    assert!(observed.writes.is_empty());
+    {
+        let observed = observed.lock().unwrap();
+        assert!(observed.dropped);
+        assert_eq!(observed.reads.len(), 1);
+        assert!(observed.writes.is_empty());
+    }
+    drop(admission);
+    let _replacement = tokio::time::timeout(std::time::Duration::from_secs(5), next).await?;
+    completed(TEST);
     Ok(())
 }

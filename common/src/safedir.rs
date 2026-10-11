@@ -3614,18 +3614,8 @@ impl<F, T> Drop for BlockingJobWaiter<F, T> {
     }
 }
 
-/// Run fd-owning blocking work while retaining any task-scoped admission through cancellation.
-///
-/// The strong lease lives in the blocking task's output, after `result`, so an abandoned returned
-/// [`Dir`], [`Handle`], or file is dropped before the admission slot is released. This lower-level
-/// boundary intentionally adds no rate or congestion gating; directory enumeration uses it after
-/// consuming its static rate token, while metadata syscalls layer their congestion lifecycle on
-/// top in [`run_metadata_probed_blocking_no_rate`].
-///
-/// Until the worker takes the shared job, dropping the waiter synchronously destroys its user work
-/// before its lease. Once the worker takes it, the job is considered started and runs detached if
-/// the waiter is cancelled.
-pub async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
+/// Internal entry point for work that inherits any live task-scoped admission.
+pub(crate) async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -3636,10 +3626,45 @@ where
     let blocking_admission = FD_ADMISSION
         .try_with(throttle::FdAdmission::blocking_lease)
         .ok();
-    let shared_job = Arc::new(std::sync::Mutex::new(Some(BlockingJob {
+    run_blocking_job(BlockingJob {
         work: f,
         admission: blocking_admission,
-    })));
+    })
+    .await
+}
+
+/// Run fd-owning blocking work with an explicitly borrowed OpenFile admission guard.
+///
+/// The borrow ensures the guard is live when its blocking lease is acquired. No ambient admission
+/// scope is needed. Unlimited admission remains a no-op, matching the guard's configured policy.
+/// The strong lease lives in the blocking task's output, after `result`, so an abandoned returned
+/// descriptor owner is dropped before the admission slot is released. This boundary adds no rate
+/// or congestion gating.
+///
+/// Until the worker takes the shared job, dropping the waiter synchronously destroys its user work
+/// before its lease. Once the worker takes it, the job is considered started and runs detached if
+/// the waiter is cancelled.
+pub async fn run_fd_admitted_blocking_with<F, T>(
+    admission: &throttle::OpenFileGuard,
+    f: F,
+) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking_job(BlockingJob {
+        work: f,
+        admission: Some(admission.admission().blocking_lease()),
+    })
+    .await
+}
+
+async fn run_blocking_job<F, T>(job: BlockingJob<F>) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let shared_job = Arc::new(std::sync::Mutex::new(Some(job)));
     let worker_job = Arc::clone(&shared_job);
     #[cfg(test)]
     crate::testutils::record_blocking_submission();

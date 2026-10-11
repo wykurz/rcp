@@ -690,22 +690,23 @@ so the security-relevant invariants each live in exactly one place:
   `(dev, ino)` differs from the admitted snapshot, the overwrite candidate is recomputed from the
   payload fd's paired metadata before any mutation. A metadata-only skip may therefore accept a
   later same-parent, same-type replacement. Exact inode freezing remains out of scope.
-- **Cancellation boundary**: repository-owned blocking jobs routed through the canonical safedir
-  runner attempt to upgrade a live ambient weak admission reference and retain it when present. If
-  the async waiter is cancelled after an upgrade, work that has not started is discarded; for work
-  whose blocking job already won the start/cancel race, an abandoned descriptor-bearing output drops
-  before the strong lease. Fail-early task scopes wait for every recursively spawned **async**
-  descendant to finish dropping, but do not await an already-started blocking job: the job keeps its
-  lease while the operation returns and may still contain later filesystem calls, leaving the
-  runtime's bounded shutdown able to abandon work stuck indefinitely on dead storage. With no live
-  ambient admission, the runner adds no lease. Local copy's synchronous data move and filegen's
-  one-buffer synchronous chunks use this boundary. A weak scope alone is passive: admitted remote
-  source/destination payload-leaf streaming still uses `tokio::fs::File`, whose private blocking
-  jobs can retain an `Arc<StdFile>` owning the same fd after high-level cancellation without
-  inheriting admission. The fd is retained, not cloned or duplicated. Extending the boundary to that
-  payload-leaf residual requires a separate bounded remote-I/O abstraction; the guarantee does not
-  cover every Tokio filesystem operation. This boundary is local to endpoint I/O and requires no
-  wire state.
+- **Cancellation boundary**: repository-owned blocking jobs share the canonical safedir runner. Its
+  internal entry point attempts to upgrade a live ambient weak admission reference and retains it
+  when present; the public entry point requires a borrowed OpenFile guard and acquires its lease
+  explicitly. If the async waiter is cancelled after an upgrade, work that has not started is
+  discarded; for work whose blocking job already won the start/cancel race, an abandoned
+  descriptor-bearing output drops before the strong lease. Fail-early task scopes wait for every
+  recursively spawned **async** descendant to finish dropping, but do not await an already-started
+  blocking job: the job keeps its lease while the operation returns and may still contain later
+  filesystem calls, leaving the runtime's bounded shutdown able to abandon work stuck indefinitely
+  on dead storage. With no live ambient admission, the internal entry point adds no lease. Local
+  copy's synchronous data move, filegen's one-buffer synchronous chunks, and remote source payload
+  reads use this boundary. A weak scope alone is passive: remote destination payload streaming still
+  uses `tokio::fs::File`, whose private blocking writes can retain an `Arc<StdFile>` owning the same
+  fd after high-level cancellation without inheriting admission. The fd is retained, not cloned or
+  duplicated. That destination payload-lifetime residual is tracked in
+  [#349](https://github.com/wykurz/rcp/issues/349); the guarantee does not cover every Tokio
+  filesystem operation. This boundary is local to endpoint I/O and requires no wire state.
 - **Local create-to-payload handoff**: with the experimental `--local-copy-handoff=fresh` policy, a
   regular file's first vacant-slot create and data copy may share one canonical blocking job. The
   default `never` retains separate jobs. Creation remains exclusive and owner-only, including strict
