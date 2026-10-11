@@ -127,10 +127,10 @@ pub struct Settings {
     pub skip_specials: bool,
     /// Maximum remote transfer buffer and file I/O request size in bytes.
     ///
-    /// Source reader capacity, Tokio file I/O limits, and receiver scratch requests are
+    /// Source buffer size, destination Tokio file I/O limits, and receiver scratch requests are
     /// capped to the file size and isize::MAX, with a one-byte minimum. These bounds ensure
     /// representability, not allocation success or an available-memory budget.
-    /// Individual operations can be shorter. Internal and outer buffers can coexist;
+    /// Individual operations can be shorter. Destination internal and outer buffers can coexist;
     /// previously retained receiver scratch follows its independent retention limit.
     pub remote_copy_buffer_size: usize,
     /// filter settings for include/exclude patterns

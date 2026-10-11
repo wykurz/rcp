@@ -10,7 +10,6 @@ use common::safedir::Dir;
 use remote::protocol::ExtendedMetadataCapture;
 use std::os::fd::AsFd as _;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt as _;
 use tracing::{Instrument, instrument};
 
 fn progress() -> &'static common::progress::Progress {
@@ -95,13 +94,7 @@ async fn send_file_tcp(
                 .open_file_read(name)
                 .instrument(tracing::trace_span!("file_open"))
                 .await
-                .map(|(file, meta)| {
-                    (
-                        tokio::fs::File::from_std(file),
-                        meta.size(),
-                        remote::protocol::Metadata::from(&meta),
-                    )
-                }),
+                .map(|(file, meta)| (file, meta.size(), remote::protocol::Metadata::from(&meta))),
             FileRead::Path => {
                 let src = src.to_owned();
                 common::safedir::run_metadata_probed_blocking(
@@ -120,13 +113,7 @@ async fn send_file_tcp(
                 )
                 .instrument(tracing::trace_span!("file_open"))
                 .await
-                .map(|(file, meta)| {
-                    (
-                        tokio::fs::File::from_std(file),
-                        meta.len(),
-                        remote::protocol::Metadata::from(&meta),
-                    )
-                })
+                .map(|(file, meta)| (file, meta.len(), remote::protocol::Metadata::from(&meta)))
             }
         };
         file_open.finish();
@@ -146,7 +133,7 @@ async fn send_file_tcp(
             Ok((file, size, meta)) => Ok((file, size, meta, None)),
             Err(e) => Err(e),
         };
-        let (mut file, size, metadata, src_acls) = match open_result {
+        let (file, size, metadata, src_acls) = match open_result {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("Failed to read file {src:?} for sending: {e:#}");
@@ -188,9 +175,7 @@ async fn send_file_tcp(
             Some(acls) => metadata.with_acls(acls),
             None => metadata,
         };
-        let buffer_size =
-            crate::configure_remote_file_buffer(&mut file, size, settings.remote_copy_buffer_size);
-        let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
+        let buffer_size = remote::streams::file_buffer_size(size, settings.remote_copy_buffer_size);
         let file_header = remote::protocol::File {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
@@ -202,7 +187,7 @@ async fn send_file_tcp(
         let send_result = async {
             let bytes_sent = pooled_stream
                 .stream_mut()
-                .send_message_with_data_buffered(&file_header, &mut (&mut buffered_file).take(size))
+                .send_message_with_file(&file_header, file, size, buffer_size)
                 .await?;
             if bytes_sent != size {
                 let error = std::io::Error::new(

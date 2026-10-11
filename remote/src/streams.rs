@@ -1,9 +1,15 @@
 use bytes::Buf;
 use futures::SinkExt;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::instrument;
+
+/// Bound a transfer chunk by configuration, snapshot length, and representable byte lengths.
+pub fn file_buffer_size(size: u64, configured: usize) -> usize {
+    // clamp before narrowing; this is a representability bound, not an available-memory limit
+    configured.min(size.min(isize::MAX as u64) as usize).max(1)
+}
 
 /// Framed send stream for length-delimited messages.
 ///
@@ -50,21 +56,66 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
         Ok(())
     }
 
-    /// Sends an object followed by data from a buffered reader.
+    /// Send a header and at most its snapshot byte count from an owned source descriptor.
     ///
-    /// This method uses `copy_buf` which avoids internal buffer allocation by using
-    /// the reader's existing buffer. Wrap your reader in `BufReader::with_capacity(size, reader)`
-    /// to control the buffer size.
-    #[instrument(level = "trace", skip(self, obj, reader))]
-    pub async fn send_message_with_data_buffered<T: serde::Serialize, R: AsyncBufRead + Unpin>(
+    /// One initialized payload allocation moves through admitted blocking reads, then stays
+    /// borrowed until each network write finishes. The caller retains its admission guard through
+    /// this future and must discard the stream on failure or a returned count below `size`.
+    #[instrument(level = "trace", skip(self, obj, file))]
+    pub async fn send_message_with_file<T: serde::Serialize>(
         &mut self,
         obj: &T,
-        reader: &mut R,
+        file: std::fs::File,
+        size: u64,
+        configured: usize,
+    ) -> anyhow::Result<u64> {
+        self.send_owned_reader(obj, file, size, configured).await
+    }
+
+    async fn send_owned_reader<T: serde::Serialize, R: std::io::Read + Send + 'static>(
+        &mut self,
+        obj: &T,
+        mut file: R,
+        size: u64,
+        configured: usize,
     ) -> anyhow::Result<u64> {
         self.send_batch_message(obj).await?;
-        let data_stream = self.framed.get_mut();
-        let bytes_copied = tokio::io::copy_buf(reader, data_stream).await?;
-        Ok(bytes_copied)
+        let buffer_size = file_buffer_size(size, configured);
+        let mut buffer = None;
+        let mut sent = 0;
+        while sent < size {
+            let read_size = (size - sent).min(buffer_size as u64) as usize;
+            let (read_result, returned_file, returned_buffer) =
+                common::safedir::run_fd_admitted_blocking(move || {
+                    // allocate only for a nonempty payload, on the first admitted worker
+                    let mut buffer = buffer.unwrap_or_else(|| vec![0; buffer_size]);
+                    let result = loop {
+                        match file.read(&mut buffer[..read_size]) {
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            result => break result,
+                        }
+                    };
+                    Ok((result, file, buffer))
+                })
+                .await?;
+            file = returned_file;
+            #[cfg(test)]
+            owned_source_tests::record_buffer(&returned_buffer);
+            let count = read_result?;
+            if count == 0 {
+                break;
+            }
+            self.framed
+                .get_mut()
+                .write_all(&returned_buffer[..count])
+                .await?;
+            sent += count as u64;
+            buffer = Some(returned_buffer);
+        }
+        // copy_buf flushed on completion, including premature EOF and empty payloads. preserve
+        // that ordering so a flush error precedes the caller's snapshot-length check.
+        self.framed.get_mut().flush().await?;
+        Ok(sent)
     }
 
     pub async fn close(&mut self) -> anyhow::Result<()> {
@@ -300,3 +351,6 @@ mod coalescing_tests;
 
 #[cfg(test)]
 mod copy_buffer_tests;
+
+#[cfg(test)]
+mod owned_source_tests;
