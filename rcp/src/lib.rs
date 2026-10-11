@@ -186,11 +186,9 @@ pub mod path;
 mod receiver_shutdown;
 pub mod source;
 
-// outer transfer requests and Tokio file I/O share this per-file maximum
+// destination transfer requests and Tokio file I/O share the source chunk bound
 fn configure_remote_file_buffer(file: &mut tokio::fs::File, size: u64, configured: usize) -> usize {
-    // clamp before narrowing: isize::MAX bounds representable byte lengths, not available memory
-    let file_size = size.min(isize::MAX as u64) as usize;
-    let buffer_size = configured.min(file_size).max(1);
+    let buffer_size = remote::streams::file_buffer_size(size, configured);
     file.set_max_buf_size(buffer_size);
     buffer_size
 }

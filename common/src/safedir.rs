@@ -3625,7 +3625,7 @@ impl<F, T> Drop for BlockingJobWaiter<F, T> {
 /// Until the worker takes the shared job, dropping the waiter synchronously destroys its user work
 /// before its lease. Once the worker takes it, the job is considered started and runs detached if
 /// the waiter is cancelled.
-pub(crate) async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
+pub async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,

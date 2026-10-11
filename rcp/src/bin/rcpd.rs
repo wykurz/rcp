@@ -193,14 +193,14 @@ struct Args {
 
     /// Maximum transfer buffer and file I/O request size, in bytes.
     ///
-    /// Sets source reader capacity, file I/O limits, and receiver scratch request sizes.
+    /// Sets source buffer size, file I/O limits, and receiver scratch request sizes.
     /// The configured value must fit usize on the master and each daemon; otherwise
     /// argument validation or daemon startup fails. Accepted per-file limits are capped
     /// to the file size and the host's isize::MAX, with a one-byte minimum.
     /// These are representability limits, not available-memory checks; oversized settings
     /// can still exhaust memory and abort a daemon. Individual disk/network operations can be shorter;
     /// this does not set TCP packet or TLS record sizes.
-    /// Tokio's internal file buffers and outer transfer buffers can coexist, so larger
+    /// Destination Tokio file buffers and outer transfer scratch can coexist, so larger
     /// limits allow more working memory. Receiver scratch retention is controlled separately.
     ///
     /// Default: 16 MiB for datacenter, 2 MiB for internet profile.

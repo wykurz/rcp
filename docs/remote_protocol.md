@@ -1030,7 +1030,7 @@ Data connections are pooled for efficiency:
 - Avoids connection creation overhead per file
 
 The source sends exactly the header's size from the held data fd. Growth beyond that size is
-ignored; a short read fails the transfer and discards the stream. The stream becomes reusable only
+ignored; premature EOF fails the transfer and discards the stream. The stream becomes reusable only
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
@@ -1038,21 +1038,34 @@ opened file, not a consistent snapshot of its contents.
 default for datacenter and 2 MiB for internet. The configured value must first fit `usize` on the
 master and each daemon. The master rejects values outside its range before connecting; a daemon with
 a smaller range rejects an oversized `--buffer-size` during argument parsing rather than clamping
-it. For accepted values, both source adapters and the destination set their Tokio file's
-`max_buf_size` to the minimum of the configured value, the file's header size, and the host's
-`isize::MAX`, with a one-byte minimum. This representability cap is applied before narrowing the
-header's `u64` size. The source allocates its per-file `BufReader` with that same capacity, and the
-destination uses it as the maximum copy-scratch request. Tokio's untouched default no longer imposes
-a separate 2 MiB file limit.
+it. For accepted values, both source adapters and the destination use the minimum of the configured
+value, the file's header size, and the host's `isize::MAX`, with a one-byte minimum. This
+representability cap is applied before narrowing the header's `u64` size. The source uses that limit
+for its owned payload buffer. The destination uses it for both its Tokio file's `max_buf_size` and
+its maximum copy-scratch request. Tokio's untouched default no longer imposes a separate 2 MiB file
+limit.
+
+Both source adapters keep the opened standard file whose metadata and ACL describe the header. For a
+nonempty file, the first admitted blocking read allocates one initialized `Vec`; each subsequent
+read reuses it without resizing or reinitializing it. The same file and buffer move into each
+unprobed blocking job and return together. Interrupted reads retry; positive short reads are sent
+immediately. Each read is bounded by the remaining advertised bytes. The async writer borrows that
+buffer until `write_all` completes, before another read can overwrite it. There is no source Tokio
+file buffer or copy from such a buffer into an outer reader. Source buffers remain per-file
+allocations, with no cross-file retention or read-ahead. Empty payloads allocate and read nothing.
+After the header is flushed, payload completion (including empty payloads and premature EOF)
+explicitly flushes the transport before the source checks the byte count and returns the stream to
+the pool. Read, write, flush, and length errors leave the stream poisoned.
 
 Individual file reads, writes, and network operations can be shorter; this setting does not promise
 TCP packet or TLS record sizes. The receiver forwards each available short read to the file without
-waiting to aggregate a full configured chunk. Tokio's internal file buffers and the outer transfer
-buffers can coexist, so larger settings allow more working memory per active transfer. The setting
-is not a process RSS bound or a throughput guarantee. Neither the argument checks nor the per-file
-cap check available memory or bound the combined allocation across active transfers. Excessively
-large settings can exhaust memory and abort a daemon; `isize::MAX` prevents unrepresentable byte
-buffer lengths, not allocation failure. Source buffers remain per-file allocations.
+waiting to aggregate a full configured chunk. At the destination, Tokio's internal file buffer and
+outer transfer scratch can coexist. Larger settings allow more working memory per active transfer.
+The setting is not a process RSS bound or a throughput guarantee. Neither the argument checks nor
+the per-file cap check available memory or bound the combined allocation across active transfers.
+Excessively large settings can exhaust memory and abort a daemon; `isize::MAX` prevents
+unrepresentable byte buffer lengths, not allocation failure. RSS, CPU, and throughput effects of the
+source buffer change are unmeasured.
 
 The destination lazily retains initialized copy scratch per data connection, growing only to the
 chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
@@ -1116,7 +1129,7 @@ before converting it back to the same standard-file owner with `try_into_std` an
 owner in the metadata applier. Conversion does not replace flush-error handling. A flush failure or
 unexpected retained Tokio reference remains a `DataConsumed` error without adding copied counts;
 metadata failures retain the already-copied counts. All these errors preserve the stream's next-file
-boundary. The cancellation-lifetime residual in §7.8 still applies to Tokio payload I/O.
+boundary. The cancellation-lifetime residual in §7.8 still applies to destination Tokio payload I/O.
 
 Recoverable file errors are collected while other files continue unless `--fail-early` is set. A
 failed drain corrupts the stream and aborts the session. Corruption or fail-early latches teardown
@@ -1259,11 +1272,16 @@ recursive removal even when copy discovery stays within its modeled bound.
 `--max-files-in-flight` is omitted, the source chooses `max(available_parallelism(), 4)` and the
 destination adopts it. Explicit unlimited leaves the connection ceiling in force.
 
-**Cancellation-lifetime residual:** admitted remote payload streaming uses `tokio::fs::File`. A
-private Tokio blocking read or write can retain the same regular-file fd after its high-level future
-drops its OpenFile guard. This does not change the fd-relative containment or the wire protocol, but
-the OpenFile pool does not cover that private job's full lifetime. The owned-file payload I/O
-follow-up is tracked in [#349](https://github.com/wykurz/rcp/issues/349).
+Source payload reads use the repository's fd-admitted blocking runner. Queued cancellation destroys
+the file and buffer before releasing the job's admission; started reads and abandoned returned
+outputs retain admission until their owned resources are dropped. The outer OpenFile guard remains
+held through network writes and final flush.
+
+**Cancellation-lifetime residual:** destination payload streaming still uses `tokio::fs::File`. A
+private Tokio blocking write can retain the regular-file fd after its high-level future drops its
+OpenFile guard. This does not change the fd-relative containment or the wire protocol, but the
+OpenFile pool does not cover that private job's full lifetime. The destination owned-file payload
+I/O follow-up is tracked in [#349](https://github.com/wykurz/rcp/issues/349).
 
 ### 7.9 Skipping Identical Files
 

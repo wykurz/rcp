@@ -1,4 +1,5 @@
 use super::*;
+use futures::FutureExt as _;
 use tokio::io::AsyncReadExt as _;
 
 struct HeaderMutation {
@@ -625,5 +626,199 @@ async fn completion_panic_is_published_before_the_poisoned_stream_drops() -> any
         observed.load(std::sync::atomic::Ordering::SeqCst),
         "stream dropped before completion panic was published"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_after_header_keeps_the_opened_inode() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for dereference in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("source");
+        let held = temp.path().join("held");
+        std::fs::write(&path, b"held inode payload")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        let metadata = std::fs::metadata(&path)?;
+        let expected = remote::protocol::Metadata::from(&metadata);
+        let (writer, reader) = tokio::io::duplex(4096);
+        let pool = pool(Box::new(HeaderMutation {
+            stream: writer,
+            mutation: Some(Box::new({
+                let path = path.clone();
+                move || {
+                    std::fs::rename(&path, held)?;
+                    std::fs::write(&path, b"replacement")?;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                }
+            })),
+        }));
+        send(pool.clone(), &path, &settings(dereference)).await?;
+        assert_eq!(pool.recv.len(), 1);
+        let mut receive = remote::streams::RecvStream::new(reader);
+        let header = receive
+            .recv_object::<remote::protocol::File>()
+            .await?
+            .unwrap();
+        assert_eq!(header.size, metadata.len());
+        assert_eq!(
+            serde_json::to_value(&header.metadata)?,
+            serde_json::to_value(&expected)?
+        );
+        let mut bytes = Vec::new();
+        receive
+            .copy_exact_to_buffered(&mut bytes, header.size, 4)
+            .await?;
+        assert_eq!(bytes, b"held inode payload");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PayloadBoundary {
+    Write,
+    Flush,
+    FlushError,
+}
+
+struct BoundaryWriter {
+    boundary: PayloadBoundary,
+    flushed_header: bool,
+    reached: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl tokio::io::AsyncWrite for BoundaryWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.flushed_header && matches!(self.boundary, PayloadBoundary::Write) {
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+            }
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.flushed_header {
+            self.flushed_header = true;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if let Some(reached) = self.reached.take() {
+            let _ = reached.send(());
+        }
+        if matches!(self.boundary, PayloadBoundary::FlushError) {
+            std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(libc::EIO)))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+fn open_payload_descriptors(metadata: &std::fs::Metadata) -> std::io::Result<usize> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut count = 0;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        if let Ok(opened) = std::fs::metadata(entry?.path()) {
+            count += usize::from(opened.dev() == metadata.dev() && opened.ino() == metadata.ino());
+        }
+    }
+    Ok(count)
+}
+
+#[tokio::test]
+async fn cancelled_network_write_or_flush_closes_source_and_returns_admission() -> anyhow::Result<()>
+{
+    const NAME: &str =
+        "source::tests::cancelled_network_write_or_flush_closes_source_and_returns_admission";
+    if crate::test_process::run_in_child(NAME) {
+        return Ok(());
+    }
+    struct ResetAdmission;
+    impl Drop for ResetAdmission {
+        fn drop(&mut self) {
+            throttle::set_admission_limits(None);
+        }
+    }
+    let _reset = ResetAdmission;
+    throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
+    for dereference in [false, true] {
+        for boundary in [PayloadBoundary::Write, PayloadBoundary::Flush] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("held-payload");
+            std::fs::write(&path, b"payload")?;
+            let metadata = std::fs::metadata(&path)?;
+            let (reached, observed) = tokio::sync::oneshot::channel();
+            let pool = pool(Box::new(BoundaryWriter {
+                boundary,
+                flushed_header: false,
+                reached: Some(reached),
+            }));
+            let settings = settings(dereference);
+            let files_before = common::get_progress().files_copied.get();
+            let bytes_before = common::get_progress().bytes_copied.get();
+            let mut send = Box::pin(send(pool.clone(), &path, &settings));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut send => panic!("send completed before cancellation: {result:?}"),
+                    result = observed => result.unwrap(),
+                }
+            })
+            .await?;
+            assert_eq!(open_payload_descriptors(&metadata)?, 1);
+            assert!(throttle::open_file_permit().now_or_never().is_none());
+            drop(send);
+            assert_eq!(open_payload_descriptors(&metadata)?, 0);
+            assert_eq!(pool.recv.len(), 0, "incomplete stream returned to pool");
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                throttle::open_file_permit(),
+            )
+            .await?;
+            drop(permit);
+            assert_eq!(common::get_progress().files_copied.get(), files_before);
+            assert_eq!(common::get_progress().bytes_copied.get(), bytes_before);
+        }
+    }
+    crate::test_process::completed(NAME);
+    Ok(())
+}
+
+#[tokio::test]
+async fn final_flush_failure_discards_complete_and_empty_frames() -> anyhow::Result<()> {
+    for dereference in [false, true] {
+        for bytes in [b"payload".as_slice(), b""] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("flush-failure");
+            std::fs::write(&path, bytes)?;
+            let pool = pool(Box::new(BoundaryWriter {
+                boundary: PayloadBoundary::FlushError,
+                flushed_header: false,
+                reached: None,
+            }));
+            let error = send(pool.clone(), &path, &settings(dereference))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(libc::EIO)
+            );
+            assert!(format!("{error:#}").contains("flush-failure"));
+            assert_eq!(pool.recv.len(), 0);
+        }
+    }
     Ok(())
 }
