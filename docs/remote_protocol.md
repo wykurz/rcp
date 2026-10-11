@@ -1035,18 +1035,24 @@ after exactly that size is sent and message completion succeeds. The size is a s
 opened file, not a consistent snapshot of its contents.
 
 `--remote-copy-buffer-size` is the maximum transfer buffer and file I/O request size: 16 MiB by
-default for datacenter and 2 MiB for internet. Both source adapters and the destination set their
-Tokio file's `max_buf_size` to the minimum of the configured value, the file's header size, and the
-host's `isize::MAX`, with a one-byte minimum. The representability cap is applied before narrowing
-the header's `u64` size. The source allocates its per-file `BufReader` with that same capacity, and
-the destination uses it as the maximum copy-scratch request. Tokio's untouched default no longer
-imposes a separate 2 MiB file limit.
+default for datacenter and 2 MiB for internet. The configured value must first fit `usize` on the
+master and each daemon. The master rejects values outside its range before connecting; a daemon with
+a smaller range rejects an oversized `--buffer-size` during argument parsing rather than clamping
+it. For accepted values, both source adapters and the destination set their Tokio file's
+`max_buf_size` to the minimum of the configured value, the file's header size, and the host's
+`isize::MAX`, with a one-byte minimum. This representability cap is applied before narrowing the
+header's `u64` size. The source allocates its per-file `BufReader` with that same capacity, and the
+destination uses it as the maximum copy-scratch request. Tokio's untouched default no longer imposes
+a separate 2 MiB file limit.
 
 Individual file reads, writes, and network operations can be shorter; this setting does not promise
 TCP packet or TLS record sizes. The receiver forwards each available short read to the file without
 waiting to aggregate a full configured chunk. Tokio's internal file buffers and the outer transfer
 buffers can coexist, so larger settings allow more working memory per active transfer. The setting
-is not a process RSS bound or a throughput guarantee. Source buffers remain per-file allocations.
+is not a process RSS bound or a throughput guarantee. Neither the argument checks nor the per-file
+cap check available memory or bound the combined allocation across active transfers. Excessively
+large settings can exhaust memory and abort a daemon; `isize::MAX` prevents unrepresentable byte
+buffer lengths, not allocation failure. Source buffers remain per-file allocations.
 
 The destination lazily retains initialized copy scratch per data connection, growing only to the
 chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
