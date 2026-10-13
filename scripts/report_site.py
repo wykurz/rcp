@@ -27,6 +27,23 @@ def walk(tokens):
             yield from walk(token.children)
 
 
+def heading_ids(tokens, reserved=()):
+    """Use the same heading slugs for rendered navigation and Markdown link checks."""
+    seen = set(reserved)
+    for index, token in enumerate(tokens):
+        if token.type != 'heading_open':
+            continue
+        text = ''.join(child.content for child in tokens[index + 1].children
+                       if child.type in {'text', 'code_inline'})
+        base = re.sub(r'[^\w\s-]', '', text.lower()).replace(' ', '-')
+        slug, suffix = base, 0
+        while slug in seen:
+            suffix += 1
+            slug = f'{base}-{suffix}'
+        seen.add(slug)
+        yield token, text, slug
+
+
 def render(source, root, route, routes, has_dashboard):
     """Resolve Markdown references and render a page with working heading navigation."""
     parser = MarkdownIt('commonmark', {'html': False}).enable('table')
@@ -36,21 +53,14 @@ def render(source, root, route, routes, has_dashboard):
     toc = []
     seen = {'report-content'}
     title = None
+    for token, text, slug in heading_ids(tokens, seen):
+        seen.add(slug)
+        token.attrSet('id', slug)
+        if token.tag == 'h1' and title is None:
+            title = text
+        if token.tag in {'h2', 'h3'}:
+            toc.append(f'<li class="level-{token.tag}"><a href="#{html.escape(slug)}">{html.escape(text)}</a></li>')
     for index, token in enumerate(tokens):
-        if token.type == 'heading_open':
-            text = ''.join(child.content for child in tokens[index + 1].children
-                           if child.type in {'text', 'code_inline'})
-            base = re.sub(r'[^\w\s-]', '', text.lower()).replace(' ', '-')
-            slug, suffix = base, 0
-            while slug in seen:
-                suffix += 1
-                slug = f'{base}-{suffix}'
-            seen.add(slug)
-            token.attrSet('id', slug)
-            if token.tag == 'h1' and title is None:
-                title = text
-            if token.tag in {'h2', 'h3'}:
-                toc.append(f'<li class="level-{token.tag}"><a href="#{html.escape(slug)}">{html.escape(text)}</a></li>')
         if token.type == 'paragraph_open' and tokens[index + 1].type == 'inline':
             if any(child.type == 'image' for child in tokens[index + 1].children):
                 token.attrSet('class', 'figure')
@@ -66,7 +76,7 @@ def render(source, root, route, routes, has_dashboard):
             continue
         if not url.path:
             if url.fragment:
-                sections.append((route, unquote(url.fragment), value))
+                sections.append((source, unquote(url.fragment), value))
             continue
         target = (source.parent / unquote(url.path)).resolve()
         if not target.is_relative_to(root) or not target.exists():
@@ -80,10 +90,12 @@ def render(source, root, route, routes, has_dashboard):
         elif target in routes:
             rewritten = relative_url(routes[target], route)
             if url.fragment:
-                sections.append((routes[target], unquote(url.fragment), value))
+                sections.append((target, unquote(url.fragment), value))
         else:
             kind = 'tree' if target.is_dir() else 'blob'
             rewritten = f'{REPOSITORY}/{kind}/main/{quote(target.relative_to(root).as_posix())}'
+            if url.fragment and target.suffix.lower() == '.md':
+                sections.append((target, unquote(url.fragment), value))
         parsed = urlsplit(rewritten)
         token.attrSet(attribute, urlunsplit((parsed.scheme, parsed.netloc, parsed.path, url.query, url.fragment)))
     if not title:
@@ -121,13 +133,17 @@ def build(root, output):
     has_dashboard = index.exists() and 'rcp-report-index' not in index.read_text(encoding='utf-8')
     pages, assets, headings, sections = {}, {}, {}, {}
     for source, route in routes.items():
-        page, referenced, headings[route], sections[source] = render(source, root, route, routes, has_dashboard)
+        page, referenced, headings[source], sections[source] = render(source, root, route, routes, has_dashboard)
         pages[route] = page
         assets.update(referenced)
     for source, references in sections.items():
-        for route, fragment, value in references:
-            if fragment not in headings[route]:
-                raise ValueError(f'Missing report section in {source.name}: {value}')
+        for target, fragment, value in references:
+            if target not in headings:
+                tokens = MarkdownIt('commonmark').parse(target.read_text(encoding='utf-8'))
+                headings[target] = {slug for _, _, slug in heading_ids(tokens)}
+            if fragment not in headings[target]:
+                kind = 'report' if target in routes else 'repository'
+                raise ValueError(f'Missing {kind} section in {source.name}: {value}')
     assets[Path('assets/report.css')] = ASSETS / 'report.css'
     assets[Path('assets/logo.svg')] = root / 'assets/logo.svg'
     for destination, source in assets.items():

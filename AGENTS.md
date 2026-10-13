@@ -30,7 +30,8 @@ nix develop  # automatically includes just and all dev tools
 **Without nix:**
 
 Install `jq` and the Python PyYAML package (often named `python3-yaml`) with your system package
-manager; both are required by `just lint`. Then install the remaining tools:
+manager, and install the report dependencies from `scripts/report-site-requirements.txt` in your
+Python environment. These are required by `just lint`. Then install the remaining tools:
 
 ```bash
 ./scripts/cargo-install-host.sh just

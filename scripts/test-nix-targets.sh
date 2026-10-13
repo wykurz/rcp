@@ -309,8 +309,8 @@ check_realized_linux_shell() { # $1 = shell name, $2 = expected target
             fail "CC_FOR_TARGET resolves to mismatched $resolved_cc"
         [[ "$resolved_ar" == */bin/"$target-ar" ]] ||
             fail "AR_FOR_TARGET resolves to mismatched $resolved_ar"
-        python3 -c '"'"'import yaml'"'"' ||
-            fail "Python cannot import PyYAML"
+        python3 -c '"'"'import yaml, markdown_it'"'"' ||
+            fail "Python cannot import PyYAML and markdown-it-py"
     ' bash "$shell_name" "$expected_target"
 }
 

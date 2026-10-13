@@ -768,22 +768,25 @@ against the full baseline; these are comparison screens, not performance guarant
 
 The same Pages site hosts [RCP reports](reports/README.md) under `reports/`; the performance report
 is at `reports/performance/`. The dashboard remains at the site root. Reports are generated from the
-maintained Markdown files and SVG figures in `docs/reports/`. Updates to those files rebuild the
-combined site through the Pages workflow. Other repository documentation remains on GitHub.
+maintained Markdown files and SVG figures in `docs/reports/`. Pushes to main rebuild the combined
+site through the Pages workflow. Other repository documentation remains on GitHub.
 
-To preview reports locally, install `scripts/report-site-requirements.txt` in a Python virtual
-environment, then run:
+To preview reports locally, enter `nix develop`, or install `scripts/report-site-requirements.txt`
+in a Python virtual environment, then run:
 
 ```bash
-just report-site
-just report-site-test
+just report-check
 python3 -m http.server 8000 --directory target/report-site
 ```
 
 Open `http://localhost:8000/reports/performance/`. Figures link to their full-size SVGs. The build
-checks local references and copies only the referenced SVG figures; the full measurement packet
-remains available in the repository. Generated HTML is written under the ignored `target/`
-directory.
+checks local references, including sections in linked Markdown documents, and copies only the
+referenced SVG figures; the full measurement packet remains available in the repository. These
+checks run in `just lint` and required CI on every pull request. Generated HTML is written under the
+ignored `target/` directory.
+
+The dashboard and reports publish together. If either build fails, the previously published site
+remains available until a successful build replaces it.
 
 To preview a combined site with existing history, render the dashboard first with
 `just benchmark-report /path/to/history --output target/report-site --reports-url reports/index.html`,

@@ -124,6 +124,20 @@ console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id),
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertIn('<a href="reports/index.html">Performance reports</a>', (output / "index.html").read_text())
 
+    def test_template_markers_in_metadata_remain_literal_and_dashboard_loads(self):
+        run = sample_run()
+        label = "__REPORTS_LINK__ __CLOCK_QUALIFICATION_JSON__ __HISTORY_JSON__"
+        run["context"]["runner_label"] = label
+        source = self.root / "results.json"
+        self.write(source, run)
+        process, output = self.render(source, "--reports-url", "reports/index.html")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        page = (output / "index.html").read_text()
+        self.assertIn(label, page)
+        dashboard = self.dashboard_state(output)
+        self.assertEqual(dashboard["runIds"], ["run-" + run["run_id"]])
+        self.assertIn(label, dashboard["table"])
+
     def test_history_keeps_incompatible_series_and_failed_runs_visible(self):
         first = sample_run()
         second = sample_run("b" * 32, "2026-09-27T12:00:00Z")

@@ -38,7 +38,7 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq musl-tools pkg-config python3-yaml
+        sudo apt-get install -y jq musl-tools pkg-config python3-yaml python3-venv
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Install just
@@ -61,6 +61,11 @@ jobs:
 
     - name: Check markdown formatting
       run: ./scripts/check-doc-format.sh
+
+    - uses: ./.depot/actions/setup-report-python
+
+    - name: Check report publishing, links, and preserved measurement hashes
+      run: just report-check
 
     # Runs BEFORE the linter it tests, so a linter that has stopped detecting anything fails here
     # rather than passing quietly below. The fixtures pin both directions — every marked violation

@@ -1785,7 +1785,7 @@ L 1030.790891 313.078264
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 364.300172)">Points = means of 3 runs; whiskers = observed min–max.</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 378.287437)">Curves: rcp file limits and dcp MPI ranks. Horizontal lines: separate cp/rsync recipes; dashed = scripted 10-process copies.</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 392.687437)">Larger points identify automatic rcp and the benchmark's 32-rank dcp default. Marker shape identifies the tool, not parallelism.</text>
-   <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 407.087437)">ZFS: ARC effects could not be fully excluded. The faster equivalent 32-rank dcp trial set is shown (all 3 repetitions).</text>
+   <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 407.087437)">ZFS: ARC effects could not be fully excluded. The latest equivalent 32-rank dcp set also had the lower mean (all 3 runs).</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 421.487437)">Block cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still affect timings.</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(56.828906 435.887437)">Settings on the x-axis are categories; automatic rcp is shown separately. Sizes are decimal; the 1 kB workload has ~100× fewer bytes.</text>
   </g>

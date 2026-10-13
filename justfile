@@ -40,6 +40,7 @@ _lint-targets:
 lint: _lint-build _lint-targets
     @echo "🔍 Testing the benchmark harness..."
     just benchmark-test
+    just report-check
     @echo "🔍 Testing the Depot CI helper..."
     ./scripts/test-depot-ci.sh
     @echo "🔍 Testing the Docker helper..."
@@ -171,6 +172,13 @@ report-site *ARGS:
 # Check report links, SVG publishing, navigation, and dashboard coexistence
 report-site-test:
     python3 -m unittest discover -s scripts -p 'test_report_site.py'
+
+# Validate both publishing behavior and links in the maintained reports
+report-check: report-site-test report-site
+
+# Check preserved analysis and report figures (use nix develop .#reports)
+analysis-test:
+    python3 -m unittest discover -s analysis/2026-10-11 -p 'test_*.py'
 
 # Run the benchmark job remotely without publishing history.
 depot-benchmark:

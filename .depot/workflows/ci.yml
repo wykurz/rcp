@@ -24,6 +24,7 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-dprint: "true"
+    - uses: ./.depot/actions/setup-report-python
     - name: Run lints
       run: just lint
     - name: Verify Nix build targets

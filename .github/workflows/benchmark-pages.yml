@@ -6,54 +6,17 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - 'docs/reports/**'
-      - 'analysis/**'
-      - 'scripts/report_site.py'
-      - 'scripts/test_report_site.py'
-      - 'scripts/report-site/**'
-      - 'scripts/report-site-requirements.txt'
-      - 'benchmarks/report.py'
-      - 'benchmarks/dashboard.html'
-      - 'assets/logo.svg'
-      - '.github/workflows/benchmark-pages.yml'
-  pull_request:
-    paths:
-      - 'docs/reports/**'
-      - 'analysis/**'
-      - 'scripts/report_site.py'
-      - 'scripts/test_report_site.py'
-      - 'scripts/report-site/**'
-      - 'scripts/report-site-requirements.txt'
-      - 'benchmarks/report.py'
-      - 'benchmarks/dashboard.html'
-      - 'assets/logo.svg'
-      - '.github/workflows/benchmark-pages.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  group: benchmark-pages-publish
   cancel-in-progress: false
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Check report publishing and preserved measurement hashes
-        run: |
-          python3 -m venv "$RUNNER_TEMP/report-site-venv"
-          "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install -r scripts/report-site-requirements.txt
-          "$RUNNER_TEMP/report-site-venv/bin/python" -m unittest discover -s scripts -p 'test_report_site.py'
-          "$RUNNER_TEMP/report-site-venv/bin/python" -m unittest benchmarks.test_report
-          "$RUNNER_TEMP/report-site-venv/bin/python" scripts/report_site.py --output _site
+  # report tests and link validation run on every PR through the required lint job
   publish:
-    needs: check
     # enable after selecting GitHub Actions as the repository's Pages source
     if: github.event_name != 'pull_request' && vars.RCP_BENCHMARK_PAGES == 'true'
     runs-on: ubuntu-latest
@@ -75,14 +38,12 @@ jobs:
           ref: benchmark-history
           path: benchmark-history-data
           persist-credentials: false
+      - uses: ./.depot/actions/setup-report-python
       - name: Render history using trusted main-branch code
         id: render
         run: python3 -m benchmarks.report benchmark-history-data --output _site --reports-url reports/index.html
       - name: Render maintained reports from Markdown and SVG
-        run: |
-          python3 -m venv "$RUNNER_TEMP/report-site-venv"
-          "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install -r scripts/report-site-requirements.txt
-          "$RUNNER_TEMP/report-site-venv/bin/python" scripts/report_site.py --output _site
+        run: python3 scripts/report_site.py --output _site
       # package directly because upload-pages-artifact pins its nested action to a tag
       - name: Package dashboard and reports for Pages
         id: package

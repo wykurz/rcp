@@ -1,0 +1,14 @@
+name: Set up report Python
+description: Install the pinned Markdown renderer while retaining CI's system Python packages
+
+# shared by GitHub and Depot; Depot remaps local .github action paths to .depot
+
+runs:
+  using: composite
+  steps:
+  - name: Install report dependencies
+    shell: bash
+    run: |
+      python3 -m venv --system-site-packages "$RUNNER_TEMP/report-site-venv"
+      "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install -r scripts/report-site-requirements.txt
+      echo "$RUNNER_TEMP/report-site-venv/bin" >> "$GITHUB_PATH"
