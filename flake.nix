@@ -47,7 +47,10 @@
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
-        pythonWithPyYAML = pkgs.python3.withPackages (pythonPackages: [ pythonPackages.pyyaml ]);
+        pythonForChecks = pkgs.python3.withPackages (pythonPackages: [
+          pythonPackages.pyyaml
+          pythonPackages.markdown-it-py
+        ]);
 
         depotPlatform = {
           "x86_64-linux" = {
@@ -359,7 +362,7 @@
                 pkgs.jq
                 pkgs.just
                 pkgs.llvmPackages.bintools
-                pythonWithPyYAML
+                pythonForChecks
                 pkgs.time
                 pkgs.tokio-console
                 depot
@@ -474,6 +477,16 @@
           default = mkDevShell targetPlatform;
           x86_64-musl = mkDevShell x86_64MuslPlatform;
           aarch64-musl = mkDevShell aarch64MuslPlatform;
+          reports = pkgs.mkShellNoCC {
+            packages = [
+              pkgs.just
+              (pkgs.python3.withPackages (pythonPackages: [
+                pythonPackages.numpy
+                pythonPackages.matplotlib
+                pythonPackages.markdown-it-py
+              ]))
+            ];
+          };
         };
       });
 }

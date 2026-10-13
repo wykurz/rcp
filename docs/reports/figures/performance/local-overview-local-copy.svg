@@ -1514,7 +1514,7 @@ L 1063.475867 268.491501
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 417.472172)">Points = means of 3 runs; whiskers = observed min–max.</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 431.459437)">Shaded 1 kB workload contains 10.24 GB, versus ~1 TB elsewhere. Sizes are decimal. Recipes: plain rcp; dcp -p.</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 445.859437)">XFS: tools were measured on equivalent hosts. Reflinking is included as a default feature.</text>
-   <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 460.259437)">ZFS: ARC effects could not be fully excluded. The faster equivalent 32-rank dcp trial set is shown (all 3 repetitions).</text>
+   <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 460.259437)">ZFS: ARC effects could not be fully excluded. The latest equivalent 32-rank dcp set also had the lower mean (all 3 runs).</text>
    <text style="font-size: 9px; font-family: 'DejaVu Sans'" transform="translate(47.288281 474.659437)">Block cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still affect timings.</text>
   </g>
   <g id="legend_1">

@@ -6,6 +6,9 @@ Requires matplotlib and numpy. Defaults to the preserved raw/ packet.
 All statistics are recomputed from raw records; inputs are never modified.
 """
 
+if not __debug__:
+    raise SystemExit("The measurement audit requires enabled assertions; run without -O, -OO, or PYTHONOPTIMIZE.")
+
 import argparse
 from collections import Counter
 import copy
@@ -48,7 +51,7 @@ OVERVIEW_FILESYSTEMS = {"network": ["lustre", "weka", "nfs"], "local": ["xfs", "
 METRICS = ["copy_seconds", "completion_seconds"]
 METRIC_LABELS = {"completion_seconds": "Copy + destination sync + validation (s)", "copy_seconds": "Copy command wall time (s)"}
 ZFS_ARC_CAPTION = (
-    "ZFS: ARC effects could not be fully excluded. The faster equivalent 32-rank dcp trial set is shown (all 3 repetitions).\n"
+    "ZFS: ARC effects could not be fully excluded. The latest equivalent 32-rank dcp set also had the lower mean (all 3 runs).\n"
     "Block cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still affect timings."
 )
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10, "axes.spines.top": False,
@@ -513,23 +516,23 @@ def linux_source(results, output, png_output=None):
     save(fig, output, "linux-source", png_output)
 
 
-def default_ratios(results, output, png_output=None):
+def default_ratios(comparison_rows, output, png_output=None):
     cohorts = [("local", fs) for fs in ["lustre", "weka", "nfs", "xfs", "zfs"]] + [("remote", "xfs")]
     fig, ax = plt.subplots(figsize=(10, 7.7))
     cmap = LinearSegmentedColormap.from_list("default_overhead", ["#ffffff", "#555555"])
     norm = Normalize(vmin=0, vmax=1.31)
     metric = "copy_seconds"
+    by_path = {row["source_path"]: row["default_over_best_tested_rcp"][metric] for row in comparison_rows}
     values = []
     best_names = []
     for scope, fs in cohorts:
         row = []
         names = []
         for case in CASES:
-            vv = [v for v in find(results, scope, fs, case)["variants"] if v["variant"].startswith("rcp-")]
-            best = min(vv, key=lambda v: v["statistics"][metric]["mean"])
-            default = next(v for v in vv if v["variant"] == "rcp-default")
-            row.append(default["statistics"][metric]["mean"] / best["statistics"][metric]["mean"] - 1)
-            names.append(best["variant"].removeprefix("rcp-"))
+            path = f"local/{fs}/{case}.json" if scope == "local" else f"remote/{case}.json"
+            comparison = by_path[path]
+            row.append(comparison["ratio"] - 1)
+            names.append(comparison["best_variant"].removeprefix("rcp-"))
         values.append(row)
         best_names.append(names)
     ax.imshow(values, cmap=cmap, norm=norm, aspect="auto")
@@ -602,7 +605,7 @@ def main():
         "reflink": "XFS cloning used by rcp and cp is a fair, intended default feature. Dcp copies data. Elapsed time is measured, not physical byte throughput.",
         "zfs_arc": {
             "caveat": "We could not fully eliminate ZFS ARC effects from these measurements.",
-            "dcp_selection": "For each fileset, the later of two equivalent 32-rank dcp trial sets also had the lower mean command wall time. All three repetitions from that set are retained; no individual minimum or different rank count is substituted.",
+            "dcp_selection": "For each ZFS fileset, the latest of two equivalent 32-rank dcp trial sets also had the lower mean command wall time. All three repetitions from that set are retained; selection is by recency, not speed, and no individual minimum or different rank count is substituted.",
             "rcp_expectation": "ZFS block cloning is the reflink equivalent: cloned files share existing data blocks. When cloning succeeds, rcp avoids reading and copying the file payload and is expected to be less sensitive to source-data ARC state. Metadata caching can still affect timings.",
             "evidence_limit": "Cache effects were not isolated experimentally. The supplied archive does not include clone-success counters or syscall traces; the block-cloning explanation is consistent with the copy path and observed timings.",
             "figure_caption": ZFS_ARC_CAPTION,
@@ -638,14 +641,14 @@ def main():
                "selection_policy": policy, "presentation": presentation, "coverage": coverage, "superseded_equivalent_samples": superseded,
                "censored": censored, "results": results, "comparisons": comparisons(results)}
     (args.output / "analysis.json").write_text(json.dumps(payload, indent=2) + "\n")
-    for metric in METRICS:
-        for group in OVERVIEW_FILESYSTEMS:
-            local_overview(results, figure_dir, metric, group, args.png_output)
-        for fs in ["lustre", "weka", "nfs", "xfs", "zfs"]:
-            scaling(results, censored, figure_dir, "local", fs, metric, args.png_output)
-        scaling(results, censored, figure_dir, "remote", "xfs", metric, args.png_output)
+    metric = "copy_seconds"
+    for group in OVERVIEW_FILESYSTEMS:
+        local_overview(results, figure_dir, metric, group, args.png_output)
+    for fs in ["lustre", "weka", "nfs", "xfs", "zfs"]:
+        scaling(results, censored, figure_dir, "local", fs, metric, args.png_output)
+    scaling(results, censored, figure_dir, "remote", "xfs", metric, args.png_output)
     linux_source(results, figure_dir, args.png_output)
-    default_ratios(results, figure_dir, args.png_output)
+    default_ratios(payload["comparisons"], figure_dir, args.png_output)
     print(json.dumps(audit, indent=2))
     print("Coverage:", json.dumps(coverage["status_counts"]))
     print(f"Wrote {len(list(figure_dir.glob('*.svg')))} SVG figures to {figure_dir}")

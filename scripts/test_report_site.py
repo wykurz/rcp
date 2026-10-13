@@ -102,6 +102,23 @@ class ReportSiteTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Missing report reference', result.stderr)
 
+    def test_renamed_repository_heading_fails_build(self):
+        (self.repo / 'README.md').write_text('# Getting started\n')
+        result = self.build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Missing repository section', result.stderr)
+        self.assertIn('../../README.md#usage', result.stderr)
+        self.assertFalse((self.output / 'reports/performance/index.html').exists())
+
+    def test_repository_section_links_support_formatting_and_duplicate_headings(self):
+        (self.repo / 'README.md').write_text(
+            '# Usage\n\n## Local copy acceleration (`--reflink`)\n\n'
+            '## Local copy acceleration (`--reflink`)\n')
+        with (self.docs / 'performance.md').open('a') as document:
+            document.write('\n[Reflink](../../README.md#local-copy-acceleration---reflink-1)\n')
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_fragment_only_images(self):
         with (self.docs / 'performance.md').open('a') as document:
             document.write('\n\n![Missing](#missing-figure)\n')

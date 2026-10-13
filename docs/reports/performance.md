@@ -191,10 +191,11 @@ file payload. This explains why we expect less sensitivity to source-data cachin
 path.
 [OpenZFS block cloning documentation](https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Data%20Storage/Block%20Cloning.html).
 
-**ZFS cache caveat.** We could not fully eliminate ARC effects from these measurements. For each
-fileset, we retain the faster of the two equivalent 32-rank dcp trial sets, including all three
-repetitions. Block cloning is expected to reduce rcp's sensitivity to source-data ARC state, but
-metadata caching can still affect its time. Cache effects were not isolated experimentally.
+**ZFS cache caveat.** We could not fully eliminate ARC effects from these measurements. For each ZFS
+fileset, we retain the latest of the two equivalent 32-rank dcp trial sets, including all three
+repetitions; that set also had the lower mean command wall time. Block cloning is expected to reduce
+rcp's sensitivity to source-data ARC state, but metadata caching can still affect its time. Cache
+effects were not isolated experimentally.
 [OpenZFS caching documentation](https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Pool%20Structure/Caching.html).
 
 ### Generated filesets and scripted copies
@@ -406,11 +407,12 @@ omitted.*
 
 ### ZFS
 
-![ZFS command wall time including the ARC caveat and faster retained 32-rank dcp trials](figures/performance/parallelism-local-zfs-copy.svg)
+![ZFS command wall time including the ARC caveat and latest retained 32-rank dcp trials](figures/performance/parallelism-local-zfs-copy.svg)
 
-*Figure A5. ZFS. ARC effects could not be fully excluded. The faster equivalent 32-rank dcp trial
-set is retained with all three repetitions. Block cloning is expected to reduce rcp's sensitivity to
-source-data caching; metadata caching can still affect its time.*
+*Figure A5. ZFS. ARC effects could not be fully excluded. The latest equivalent 32-rank dcp trial
+set is retained with all three repetitions and also had the lower mean command wall time. Block
+cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still
+affect its time.*
 
 ## Appendix B Reproducing the analysis
 
@@ -453,18 +455,24 @@ records, and superseded measurements. Its original `SHA256SUMS` is retained. The
 [packet identity](../../analysis/2026-10-11/packet-origin.json) records the source archive hash and
 the checksum-manifest hash; the unpacked files are preserved byte for byte.
 
-With Python, NumPy, and Matplotlib installed, regenerate the analysis and figures from the
-repository root using the preserved packet:
+Regenerate the analysis and figures from the repository root using the preserved packet and the
+locked Nix reporting environment:
 
 ```bash
-python3 analysis/2026-10-11/analyze.py
+nix develop .#reports --command python3 analysis/2026-10-11/analyze.py
 ```
 
+The reference environment uses Python 3.14.7, NumPy 2.5.2, and Matplotlib 3.11.1. For installation
+without Nix, see the [reproduction guide](../../analysis/2026-10-11/README.md) and pinned
+[Python requirements](../../analysis/2026-10-11/requirements.txt). Those Python pins alone do not
+guarantee byte-identical SVG output across platforms; fonts and native libraries can affect
+rendering. The audit requires enabled Python assertions and rejects optimized execution.
+
 The script verifies the archive, recomputes statistics, resolves equivalent configurations, and
-writes SVG figures. The inputs are not modified. It also accepts the original archive as a
-positional argument. Optional raster exports can be written outside the repository with
-`--png-output /tmp/rcp-figures`. The report embeds only the command-wall-time figures; supplemental
-timing fields remain available in the JSON.
+writes the ten SVG figures used by this report. The inputs are not modified. It also accepts the
+original archive as a positional argument. Optional raster exports can be written outside the
+repository with `--png-output /tmp/rcp-figures`. The report embeds only the command-wall-time
+figures; supplemental timing fields remain available in the JSON.
 
 Supporting files include the [analysis and plotting script](../../analysis/2026-10-11/analyze.py),
 [ZFS command-stage audit](../../analysis/2026-10-11/zfs-stage-audit.json),

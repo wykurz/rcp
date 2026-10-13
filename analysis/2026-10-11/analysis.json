@@ -47,10 +47,10 @@
     "reflink": "XFS cloning used by rcp and cp is a fair, intended default feature. Dcp copies data. Elapsed time is measured, not physical byte throughput.",
     "zfs_arc": {
       "caveat": "We could not fully eliminate ZFS ARC effects from these measurements.",
-      "dcp_selection": "For each fileset, the later of two equivalent 32-rank dcp trial sets also had the lower mean command wall time. All three repetitions from that set are retained; no individual minimum or different rank count is substituted.",
+      "dcp_selection": "For each ZFS fileset, the latest of two equivalent 32-rank dcp trial sets also had the lower mean command wall time. All three repetitions from that set are retained; selection is by recency, not speed, and no individual minimum or different rank count is substituted.",
       "rcp_expectation": "ZFS block cloning is the reflink equivalent: cloned files share existing data blocks. When cloning succeeds, rcp avoids reading and copying the file payload and is expected to be less sensitive to source-data ARC state. Metadata caching can still affect timings.",
       "evidence_limit": "Cache effects were not isolated experimentally. The supplied archive does not include clone-success counters or syscall traces; the block-cloning explanation is consistent with the copy path and observed timings.",
-      "figure_caption": "ZFS: ARC effects could not be fully excluded. The faster equivalent 32-rank dcp trial set is shown (all 3 repetitions).\nBlock cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still affect timings.",
+      "figure_caption": "ZFS: ARC effects could not be fully excluded. The latest equivalent 32-rank dcp set also had the lower mean (all 3 runs).\nBlock cloning is expected to reduce rcp's sensitivity to source-data caching; metadata caching can still affect timings.",
       "references": [
         "https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Data%20Storage/Block%20Cloning.html",
         "https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Pool%20Structure/Caching.html"
