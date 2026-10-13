@@ -1,0 +1,31 @@
+{
+  "base_verifier_selection_problem_waived": "missing 18 selected successful run IDs",
+  "complete": true,
+  "configuration_fingerprint": "93f761293a5a8df30a1484de8b12e2d86a3c98816a476be3d5625f2159214b1b",
+  "evidence_snapshot_entries": 9921,
+  "evidence_snapshot_sha256": "1915ac8b230b5bb5fe2b8dfd3f4bba0c92a51e0a820057bb8cae45bf2dda49f9",
+  "excluded_diagnostic_run_ids": [],
+  "excluded_diagnostic_successes": 0,
+  "excluded_run_ids_sha256": "b55ae08e0e565f1c8008121bdfcee50c3027fbe455cacf73e4651dfac82c7281",
+  "failed_attempts": 34,
+  "harness_version": "1.20.0",
+  "live_identity_snapshot_entries": 17,
+  "live_identity_snapshot_sha256": "cc2a28b076736e595146da002e631238cf1cc378748744e8d5d97bf479b7d04f",
+  "mode": "campaign",
+  "problems": [],
+  "recorded_utc": "2026-10-02T05:32:22.003440+00:00",
+  "records": 280,
+  "results_jsonl_sha256": "5f72bc282949c287a547bc79cf93923a2fdb0e04e07c795eddd01bdb0eccfd67",
+  "schema_version": 6,
+  "selected_run_ids_sha256": "f6e2a1e85f97706556582f811b339adf4eae6753738a84137f418c9a148468a5",
+  "selection_amendment": {
+    "path": "results/campaign/amendments/2026-09-24-weka-million-serial-exclusions.json",
+    "sha256": "67867b150cbf11677fc6e60c1b7a2a26f3a84e572356dd30e4bd4eb0f6fddcef"
+  },
+  "status": "ok",
+  "successful_rows": 246,
+  "successful_rows_selected": 246,
+  "successful_rows_selected_completed": 246,
+  "unique_successful_run_ids": 246,
+  "verified_attempt_ids_hash": "0cbe905b3be88237e42f4ff044bd742d721685a9cb6ae8c75b501c2a77c4407c"
+}

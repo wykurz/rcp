@@ -62,10 +62,10 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ssh_transport_profile.*loopback"):
             report.validate_result(result)
 
-    def render(self, input_path):
+    def render(self, input_path, *args):
         output = self.root / "site"
         result = subprocess.run(
-            [sys.executable, "-m", "benchmarks.report", str(input_path), "--output", str(output)],
+            [sys.executable, "-m", "benchmarks.report", str(input_path), "--output", str(output), *args],
             capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent,
         )
         return result, output
@@ -116,6 +116,13 @@ console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id),
         self.assertNotIn("<script src=", page)
         self.assertNotIn("<link href=", page)
         self.assertEqual(self.dashboard_state(output)["runIds"], ["run-" + run["run_id"]])
+
+    def test_links_to_reports_when_publishing_history(self):
+        source = self.root / "results.json"
+        self.write(source, sample_run())
+        process, output = self.render(source, "--reports-url", "reports/index.html")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn('<a href="reports/index.html">Performance reports</a>', (output / "index.html").read_text())
 
     def test_history_keeps_incompatible_series_and_failed_runs_visible(self):
         first = sample_run()

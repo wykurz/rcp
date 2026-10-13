@@ -1,0 +1,21 @@
+checked_utc=2026-09-12T03:28:34Z
+hostname=awhpcfilerrcpdev1.aws.x.pdtpartners.com
+kernel=Linux awhpcfilerrcpdev1 6.12.0-211.16.1.el10_2.x86_64 #1 SMP PREEMPT_DYNAMIC Mon May 18 10:23:57 EDT 2026 x86_64 GNU/Linux
+src_root=/d/phscratch/public/user/mateusz/filesets
+source_mount=rcp-dev-d/d /d zfs ro,nosuid,nodev,noatime,xattr,posixacl,casesensitive
+source_device=42
+zfs_root=/d/phscratch/rschinfra/user/mateusz/scratch/rcp-perf-zfs-work-20260902
+mount=rcp-dev-d/d[/phscratch/rschinfra/user/mateusz/scratch] /d/phscratch/rschinfra/user/mateusz/scratch zfs ro,nosuid,nodev,noatime,xattr,posixacl,casesensitive
+rcp-dev-d/d[/phscratch/rschinfra/user/mateusz/scratch] /d/phscratch/rschinfra/user/mateusz/scratch zfs rw,nosuid,nodev,noatime,xattr,posixacl,casesensitive
+destination_device=42
+available_bytes=2091144314880
+required_available_bytes=1200000000000
+cache_eviction=fadvise
+cache_eviction_clears_page_cache=true
+cache_eviction_clears_dentry_inode_cache=false
+planned_rows=144
+binary=/u/mateusz/src/rcp/target/x86_64-unknown-linux-musl/release/rcp sha256=162ff072dfd199cdf648edd738f98cac47660ad3671c7d7b4754b3eee3a6d8f6
+binary=/u/mateusz/src/rcp/target/x86_64-unknown-linux-musl/release/rcpd sha256=6ab40cfc841ecb603d5b80d77fa84f693d2b4543237e823fa900425389372962
+binary=/u/mateusz/src/rcp/target/x86_64-unknown-linux-musl/release/rrm sha256=a325f71f494a46e5ab97f8700e8b497152d9d62364187e546e44315d0085e369
+binary=/opt/hpcc-infra/bin/dcp sha256=8c52ae25dfe80b72648f18b51ccefdd55f9362eb85e6877e1c9c900e8e1df7c2
+binary=/opt/hpcc-infra/bin/mpirun sha256=365275d0eccb869e5a6c62a41d4075b82b36e69788d522fac8688d49ad87d2ae

@@ -35,6 +35,11 @@ across remote hosts.
 
 # Benchmarks
 
+The [performance report](docs/reports/performance.md) compares rcp with dcp, GNU cp, and rsync
+across Lustre, Weka, NFS, XFS, and ZFS, remote transfers, and a Linux source tree. It includes
+default settings, concurrency sweeps, SVG figures, and the complete measurement evidence. See
+[RCP reports](docs/reports/README.md) for the report index.
+
 [Benchmark dashboard and run results](docs/benchmarking.md#view-results) compare rcp with GNU cp and
 rsync for local and loopback remote copies. PRs and main pushes run small correctness smoke checks;
 weekly and manual runs measure larger filesets for performance history. Timing is informational and
@@ -69,6 +74,7 @@ API documentation for the command-line tools is available on docs.rs:
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 - [Benchmarking](docs/benchmarking.md) - Copy performance measurements, CI and historical trends
+- [Reports](docs/reports/README.md) - Performance results and supporting measurement evidence
 - [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
 - [POSIX ACLs](docs/acls.md) - what `acl` preserves, why it is opt-in, and the two ways a copy can
   widen

@@ -1,0 +1,12 @@
+captured_utc=2026-10-11T04:26:36Z
+repository=/w/home/mateusz/src/rcp
+branch=pdtnix
+commit=27c089508c13cc2a87101df4798930070f9fc509
+commit_date=2026-10-10T13:29:21-04:00
+subject=Add rcp copy-performance harness
+parent=83d8715b0aa1bc6f73c8b381d244fb18fd5e11ab
+worktree_status=clean
+rcp_version=rcp 0.41.0
+rrm_version=rrm 0.41.0
+rcp_sha256=edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8
+rrm_sha256=d9559e595bf015bc07b662f7e03c3582be80773944434a0602c29b8700f92e39

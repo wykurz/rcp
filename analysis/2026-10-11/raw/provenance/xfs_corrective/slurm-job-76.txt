@@ -1,0 +1,29 @@
+JobId=76 JobName=rcp-run7-xfs
+   UserId=mateusz(123500074) GroupId=mateusz(123500074) MCS_label=N/A
+   Priority=100 Nice=0 Account=tech QOS=normal WCKey=*
+   JobState=RUNNING Reason=None Dependency=(null)
+   Requeue=1 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+   RunTime=00:00:58 TimeLimit=4-00:00:00 TimeMin=N/A
+   SubmitTime=2026-10-11T00:31:20 EligibleTime=2026-10-11T00:31:20
+   AccrueTime=2026-10-11T00:31:20
+   StartTime=2026-10-11T00:31:23 EndTime=2026-10-15T00:31:23 Deadline=N/A
+   SuspendTime=None SecsPreSuspend=0 LastSchedEval=2026-10-11T00:31:23 Scheduler=Main
+   Partition=perf_copy_m8idn_16xl-on-demand AllocNode:Sid=awhpcsubmitrcp1dev1:1
+   ReqNodeList=compute003125 ExcNodeList=(null)
+   NodeList=compute003125
+   BatchHost=compute003125
+   NumNodes=1 NumCPUs=32 NumTasks=1 CPUs/Task=32 ReqB:S:C:T=0:0:*:*
+   ReqTRES=cpu=32,mem=200G,node=1,billing=32
+   AllocTRES=cpu=32,mem=200G,node=1,billing=32
+   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+   MinCPUsNode=32 MinMemoryNode=200G MinTmpDiskNode=0
+   Features=(null) DelayBoot=00:00:00
+   OverSubscribe=OK Contiguous=0 Licenses=(null) LicensesAlloc=(null) Network=(null)
+   Command=/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/campaign-slurm-job.sh
+   WorkDir=/w/home/mateusz/projects/rcp-perf-results-20260902
+   StdErr=/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/control/slurm-76.log
+   StdIn=/dev/null
+   StdOut=/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/control/slurm-76.log
+   TresPerTask=cpu=32
+   
+

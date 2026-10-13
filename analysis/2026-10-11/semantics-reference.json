@@ -1,0 +1,146 @@
+{
+  "schema": "rcp-semantics-reference-v1",
+  "purpose": "Verify same regular-file tree/content operation and distinguish modification-time preservation for plain rcp versus archive cp.",
+  "fixture_root": "/tmp/rcp-recipe-check-8mqafd25",
+  "fixture": {
+    "bytes": 1000,
+    "construction": "file0 contains bytes(range(250)) repeated four times; file mode 0644; directory mode 0755; source atime/mtime originally set to 946684800123456789 ns.",
+    "source_original_time_ns": 946684800123456789,
+    "reproducer_python": "import hashlib, os, pathlib, subprocess, tempfile\nroot = pathlib.Path(tempfile.mkdtemp(prefix=\"rcp-recipe-check-\", dir=\"/tmp\"))\nsource = root / \"source\"\nsource.mkdir()\nfile = source / \"file0\"\nfile.write_bytes(bytes(range(250)) * 4)\nos.chmod(source, 0o755)\nos.chmod(file, 0o644)\nstamp = 946684800123456789\nos.utime(file, ns=(stamp, stamp))\nos.utime(source, ns=(stamp, stamp))\nrcp = \"/home/mateusz/projects/rcp/main/target/x86_64-unknown-linux-musl/release/rcp\"\nsubprocess.run([rcp, str(source), str(root / \"rcp-default\")], check=True)\nsubprocess.run([\"cp\", \"--reflink=auto\", \"-a\", str(source), str(root / \"cp-archive\")], check=True)\nfor name in [\"source\", \"rcp-default\", \"cp-archive\"]:\n    tree = root / name\n    file = tree / \"file0\"\n    print(name, hashlib.sha256(file.read_bytes()).hexdigest(),\n          \"file_mtime_ns\", file.stat().st_mtime_ns,\n          \"directory_mtime_ns\", tree.stat().st_mtime_ns)\nprint(\"fixture:\", root)\n"
+  },
+  "tools": {
+    "rcp": {
+      "path": "/home/mateusz/projects/rcp/main/target/x86_64-unknown-linux-musl/release/rcp",
+      "version": "rcp 0.41.0",
+      "sha256": "2e63ce8c147898ef9b9621f097d7a85be1446f8fa24d9f3ebd946d5d001cf3e0",
+      "benchmark_build_match": false
+    },
+    "cp": {
+      "path": "/nix/store/833invqvsk7anqnqrki5hqncrcllj825-coreutils-9.11/bin/cp",
+      "version_first_line": "cp (GNU coreutils) 9.11"
+    }
+  },
+  "executed_commands": [
+    {
+      "argv": [
+        "/home/mateusz/projects/rcp/main/target/x86_64-unknown-linux-musl/release/rcp",
+        "/tmp/rcp-recipe-check-8mqafd25/source",
+        "/tmp/rcp-recipe-check-8mqafd25/rcp-default"
+      ]
+    },
+    {
+      "argv": [
+        "cp",
+        "--reflink=auto",
+        "-a",
+        "/tmp/rcp-recipe-check-8mqafd25/source",
+        "/tmp/rcp-recipe-check-8mqafd25/cp-archive"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "recipe": "source",
+      "path": "/tmp/rcp-recipe-check-8mqafd25/source",
+      "entries": [
+        {
+          "relative_path": ".",
+          "type": "directory",
+          "size_bytes": 4096,
+          "mode": "0o755",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778600022849052,
+          "mtime_ns": 946684800123456789,
+          "ctime_ns": 1791778600020931297,
+          "nlink": 2,
+          "sha256": null
+        },
+        {
+          "relative_path": "file0",
+          "type": "regular_file",
+          "size_bytes": 1000,
+          "mode": "0o644",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778600022849052,
+          "mtime_ns": 946684800123456789,
+          "ctime_ns": 1791778600020931297,
+          "nlink": 1,
+          "sha256": "5d4b1b13f0daa86380d0ac6912a60a307cc9719115ecadb10a06d2d3603bd35c"
+        }
+      ]
+    },
+    {
+      "recipe": "rcp-default",
+      "path": "/tmp/rcp-recipe-check-8mqafd25/rcp-default",
+      "entries": [
+        {
+          "relative_path": ".",
+          "type": "directory",
+          "size_bytes": 4096,
+          "mode": "0o755",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778946443283284,
+          "mtime_ns": 1791778600022849052,
+          "ctime_ns": 1791778600022849052,
+          "nlink": 2,
+          "sha256": null
+        },
+        {
+          "relative_path": "file0",
+          "type": "regular_file",
+          "size_bytes": 1000,
+          "mode": "0o644",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778600027085646,
+          "mtime_ns": 1791778600022849052,
+          "ctime_ns": 1791778600022849052,
+          "nlink": 1,
+          "sha256": "5d4b1b13f0daa86380d0ac6912a60a307cc9719115ecadb10a06d2d3603bd35c"
+        }
+      ]
+    },
+    {
+      "recipe": "cp-archive",
+      "path": "/tmp/rcp-recipe-check-8mqafd25/cp-archive",
+      "entries": [
+        {
+          "relative_path": ".",
+          "type": "directory",
+          "size_bytes": 4096,
+          "mode": "0o755",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778946443283284,
+          "mtime_ns": 946684800123456789,
+          "ctime_ns": 1791778600027085646,
+          "nlink": 2,
+          "sha256": null
+        },
+        {
+          "relative_path": "file0",
+          "type": "regular_file",
+          "size_bytes": 1000,
+          "mode": "0o644",
+          "uid": 1000,
+          "gid": 1000,
+          "atime_ns": 1791778600027408793,
+          "mtime_ns": 946684800123456789,
+          "ctime_ns": 1791778600027085646,
+          "nlink": 1,
+          "sha256": "5d4b1b13f0daa86380d0ac6912a60a307cc9719115ecadb10a06d2d3603bd35c"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Existing local reference binary, not any archived private pdtnix benchmark binary.",
+    "Single simple regular-file fixture; no archive benchmark rerun.",
+    "Observed file content digest, size, ordinary mode, UID/GID, and tree names match; file and directory modification times differ.",
+    "Reading files for inspection may update access times; recorded atime is inspection-time metadata, not a captured command-boundary value.",
+    "Does not test remote transport, actual reflink success, hardlink topology, ACLs, xattrs, or varied ownership."
+  ]
+}

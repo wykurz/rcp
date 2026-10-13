@@ -1,0 +1,129 @@
+{
+  "amendment_id": "2026-09-24-weka-million-serial-exclusions",
+  "campaign_manifest_fingerprint": "93f761293a5a8df30a1484de8b12e2d86a3c98816a476be3d5625f2159214b1b",
+  "effective_utc": "2026-09-24T16:39:33Z",
+  "execution_policy": {
+    "attempt_failure_handling_changed": false,
+    "attempt_timeouts_changed": false,
+    "blackout_and_weekend_policy_changed": false,
+    "cache_copy_sync_validation_and_cleanup_changed": false,
+    "excluded_attempts_are_not_fabricated_as_successes": true,
+    "load_memory_capacity_and_quota_guards_changed": false,
+    "manifest_changed": false,
+    "measured_commands_changed": false,
+    "reconciliation_changed": false
+  },
+  "harness_source": {
+    "path": "harness/campaign.py",
+    "preserved_unchanged": true,
+    "sha256": "598d414100b610f766bff39c591610a02745b4605187e5e52ea6843ed34933ff"
+  },
+  "immutable_prior_policy": {
+    "path": "results/campaign/amendments/2026-09-22-blackout-restoration.json",
+    "sha256": "685450caafed76f0ada7b0811781a5e2adc06ee6993d87b4b7c6aa43bbb84e89"
+  },
+  "operator_instruction": {
+    "added_excluded_fileset": "10x10x10x1024x1M",
+    "added_excluded_filesystem": "weka",
+    "added_excluded_variants": [
+      "cp-1x",
+      "rsync-1x"
+    ],
+    "reason": "The first Weka cp-1x attempt copied only 385,036 of 1,024,000 files before the unchanged 12-hour timeout. A linear projection is about 32 hours per successful copy, so unchanged cp-1x and rsync-1x retries are not operationally useful.",
+    "scope": "Weka only and all three iterations"
+  },
+  "prior_report": {
+    "path": "results/campaign/recovery/report-with-1k-serial-exclusions.py",
+    "sha256": "007127465a2d4f801e2e0cb37d2e58c5891205961ed26de4072707ea5b4c7acf"
+  },
+  "prior_runner": {
+    "path": "results/campaign/recovery/run-with-2026-09-22-blackout-restoration.py",
+    "sha256": "53c18ba73a6faf08e9895bfc01efdae7de56eba7ba8c127dac36025362267519"
+  },
+  "prior_selection": {
+    "path": "results/campaign/amendments/2026-09-17-1k-serial-exclusions.json",
+    "sha256": "5a94f9be5f37a93674fc80c99e0e5a498fff9d8cdda79f81b192db191a2cc80c"
+  },
+  "prior_watchdog": {
+    "path": "results/campaign/recovery/2026-09-22-blackout-restoration-watchdog.py",
+    "sha256": "ceb045124e2c38528e73abbdc21abd4cabbc7abae3785d1480a1d06d80c0b438"
+  },
+  "report": {
+    "path": "results/campaign/recovery/report-with-2026-09-24-weka-million-serial-exclusions.py",
+    "sha256": "dfdae7cd52176ce367df5282cd295b351bfc319af774d747e1b6e9d6ab48b0a7"
+  },
+  "runner": {
+    "path": "results/campaign/recovery/run-with-2026-09-24-weka-million-serial-exclusions.py",
+    "sha256": "b604dcaa2e73dbe05eeb90471299f966d40869345122ae58e708eac5aeca7f2b"
+  },
+  "schema_version": 1,
+  "selection": {
+    "added_excluded_rows": 6,
+    "added_excluded_run_ids": [
+      "local/weka/10x10x10x1024x1M/cp-1x/1",
+      "local/weka/10x10x10x1024x1M/cp-1x/2",
+      "local/weka/10x10x10x1024x1M/cp-1x/3",
+      "local/weka/10x10x10x1024x1M/rsync-1x/1",
+      "local/weka/10x10x10x1024x1M/rsync-1x/2",
+      "local/weka/10x10x10x1024x1M/rsync-1x/3"
+    ],
+    "added_excluded_run_ids_sha256": "bcb5f2d9cdb44319cef4bd2b893ab9b34e00b3c5cd2b9e4c436d425b11f1196d",
+    "excluded_rows": 18,
+    "excluded_run_ids": [
+      "local/lustre/10x10x10x10x1024x1K/cp-1x/1",
+      "local/lustre/10x10x10x10x1024x1K/cp-1x/2",
+      "local/lustre/10x10x10x10x1024x1K/cp-1x/3",
+      "local/lustre/10x10x10x10x1024x1K/rsync-1x/1",
+      "local/lustre/10x10x10x10x1024x1K/rsync-1x/2",
+      "local/lustre/10x10x10x10x1024x1K/rsync-1x/3",
+      "local/weka/10x10x10x1024x1M/cp-1x/1",
+      "local/weka/10x10x10x1024x1M/cp-1x/2",
+      "local/weka/10x10x10x1024x1M/cp-1x/3",
+      "local/weka/10x10x10x1024x1M/rsync-1x/1",
+      "local/weka/10x10x10x1024x1M/rsync-1x/2",
+      "local/weka/10x10x10x1024x1M/rsync-1x/3",
+      "local/weka/10x10x10x10x1024x1K/cp-1x/1",
+      "local/weka/10x10x10x10x1024x1K/cp-1x/2",
+      "local/weka/10x10x10x10x1024x1K/cp-1x/3",
+      "local/weka/10x10x10x10x1024x1K/rsync-1x/1",
+      "local/weka/10x10x10x10x1024x1K/rsync-1x/2",
+      "local/weka/10x10x10x10x1024x1K/rsync-1x/3"
+    ],
+    "excluded_run_ids_sha256": "b55ae08e0e565f1c8008121bdfcee50c3027fbe455cacf73e4651dfac82c7281",
+    "immutable_manifest_rows": 264,
+    "prior_selected_rows": 252,
+    "selected_rows": 246,
+    "selected_run_ids_sha256": "f6e2a1e85f97706556582f811b339adf4eae6753738a84137f418c9a148468a5",
+    "successful_excluded_attempts": "retain as excluded diagnostics, never selected evidence",
+    "unsuccessful_excluded_attempts": "retain as attempt evidence, never retry for selection"
+  },
+  "tests": {
+    "path": "results/campaign/recovery/test_2026_09_24_weka_million_serial_exclusions.py",
+    "sha256": "73a945db8e44c4af162a769f69e550a6921106e2378358498d4b3d0db1f3a542"
+  },
+  "triggering_attempt": {
+    "attempt_record": {
+      "path": "results/campaign/runs/local/weka/10x10x10x1024x1M/cp-1x/1/attempt-001/record.json",
+      "sha256": "fcf1cb86aa87625b3fc6346bed73ed34ea8cd2e0de0be794cffa937efed5d5c7"
+    },
+    "copy_plus_sync_seconds": 43208.397377567,
+    "copy_seconds": 43200.155433661,
+    "destination_validation": {
+      "path": "results/campaign/runs/local/weka/10x10x10x1024x1M/cp-1x/1/attempt-001/destination-validation.json",
+      "sha256": "7071aa5ac8afee59cf4f14b1963a641b07f4cdacc89f6b99bdb97989263070d1"
+    },
+    "exit_code": 124,
+    "failure_class": "policy",
+    "failure_phase": "copy_timeout",
+    "partial_destination_apparent_bytes": 385036000000,
+    "partial_destination_files": 385036,
+    "run_id": "local/weka/10x10x10x1024x1M/cp-1x/1",
+    "status": "failed"
+  },
+  "watchdog": {
+    "check_command": "python3 results/campaign/recovery/2026-09-24-weka-million-serial-exclusions-watchdog.py check",
+    "path": "results/campaign/recovery/2026-09-24-weka-million-serial-exclusions-watchdog.py",
+    "sha256": "55dd1853be2bf10971782b429d51d2d0de797df5ec4710fb83a755482603a504",
+    "start_command": "python3 results/campaign/recovery/2026-09-24-weka-million-serial-exclusions-watchdog.py run"
+  }
+}

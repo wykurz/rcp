@@ -1,0 +1,242 @@
+{
+  "provenance": "Data extracted from embedded dcp command logs in the supplied archive. Earlier dcp-default and later dcp-32 commands are equivalent; see analysis.json selection audit.",
+  "interpretation": "Most of the earlier/later elapsed-time difference occurs in the data-copy phase. ARC effects could not be fully excluded, but their contribution was not isolated experimentally. The later equivalent 32-rank dcp trial set is also the faster set on every fileset; all three repetitions are retained in the figures. See analysis.json selection_policy.zfs_arc for the presentation caveat and block-cloning explanation.",
+  "results": [
+    {
+      "fileset": "10x100x1G",
+      "stages": {
+        "dcp-32": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T04:19:41.599033+00:00",
+              "record_sha256": "f760aede736eaa4481ff49bea178b929e2a5f531ff31ca02db2e0d1f4d6044ec",
+              "data_copy_seconds": 748.151,
+              "preserve_seconds": 0.004
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T05:57:41.085216+00:00",
+              "record_sha256": "a0b7f6a74a11a804f769fc7e3f37c08c34e2273fb7fd709a3fcfc03cbcc7aa1d",
+              "data_copy_seconds": 721.775,
+              "preserve_seconds": 0.003
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T07:34:50.515862+00:00",
+              "record_sha256": "36350474505734342c01efb03b33e6eaec68b4a6e65b9f02ede4a07f5822d698",
+              "data_copy_seconds": 704.455,
+              "preserve_seconds": 0.003
+            }
+          ],
+          "mean_data_copy_seconds": 724.7936666666667,
+          "mean_preserve_seconds": 0.0033333333333333335
+        },
+        "dcp-default": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T03:52:24.274490+00:00",
+              "record_sha256": "7e723dbcda55621eaedbeee1dc124b572d4fb2c1027ae28bf31e2a039f93e8e8",
+              "data_copy_seconds": 1352.868,
+              "preserve_seconds": 0.005
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T05:31:46.225018+00:00",
+              "record_sha256": "7ba0dbdec47c4bdfc74e6d80c35441e562d83695bb75c7c94ee112fbf9ab5cd4",
+              "data_copy_seconds": 1322.727,
+              "preserve_seconds": 0.003
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T07:09:09.265002+00:00",
+              "record_sha256": "552bcf983768a3d4dbcf3a63ebf9f27aeec991ce1d70b0a49c7b4e3a49934ee7",
+              "data_copy_seconds": 1334.452,
+              "preserve_seconds": 0.003
+            }
+          ],
+          "mean_data_copy_seconds": 1336.6823333333334,
+          "mean_preserve_seconds": 0.0036666666666666666
+        }
+      }
+    },
+    {
+      "fileset": "10x1024x100M",
+      "stages": {
+        "dcp-32": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T09:14:08.342699+00:00",
+              "record_sha256": "30bc9e739a6c2e958062e9ec387f2730d5f0275b8fc5f3ba5b3217e28992eaa7",
+              "data_copy_seconds": 726.231,
+              "preserve_seconds": 0.026
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T10:49:12.390694+00:00",
+              "record_sha256": "56c28dd7c316e07f3675892468afc5d0c3676c8ebb5c6a396c7dd01613b8566f",
+              "data_copy_seconds": 760.207,
+              "preserve_seconds": 0.024
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T12:24:22.774853+00:00",
+              "record_sha256": "98efa9f4063613c7f25bcdb4ba139fc9bb1a5d908c7dbe9eea888df687f8ae43",
+              "data_copy_seconds": 781.643,
+              "preserve_seconds": 0.027
+            }
+          ],
+          "mean_data_copy_seconds": 756.027,
+          "mean_preserve_seconds": 0.025666666666666667
+        },
+        "dcp-default": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T08:47:39.244536+00:00",
+              "record_sha256": "ad5de5b2eb3e091d66d49461b5d6d1fd331f9b77249aea231418b81f0c0ea52f",
+              "data_copy_seconds": 1386.543,
+              "preserve_seconds": 0.024
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T10:22:42.751896+00:00",
+              "record_sha256": "53f784b7dc8afd3dede7ac9f5cb863d2a267a8e74243615e7943ebb9b391e192",
+              "data_copy_seconds": 1194.687,
+              "preserve_seconds": 0.025
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T11:57:57.174657+00:00",
+              "record_sha256": "1a374ad15dcefb605900f8d1393e9b712d2c8bc8849c1df1c3d8f2065fb90f0d",
+              "data_copy_seconds": 1146.096,
+              "preserve_seconds": 0.024
+            }
+          ],
+          "mean_data_copy_seconds": 1242.442,
+          "mean_preserve_seconds": 0.024333333333333335
+        }
+      }
+    },
+    {
+      "fileset": "10x10x10x1024x1M",
+      "stages": {
+        "dcp-32": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T14:15:27.435656+00:00",
+              "record_sha256": "762404acd3b9e091739265c2eb95e7f31bf88c6f2d11a240f938b8e538d9afa8",
+              "data_copy_seconds": 720.943,
+              "preserve_seconds": 2.399
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T16:49:41.886228+00:00",
+              "record_sha256": "87914635411d8ab19983d8608a63f55344f0ee0fecd8aa8754e02fa98612925c",
+              "data_copy_seconds": 726.395,
+              "preserve_seconds": 2.345
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T19:23:29.811552+00:00",
+              "record_sha256": "aa5347e32f5c36ec825a62b3f9c1fa6d5f4f530c3148121d201709d4136cc64f",
+              "data_copy_seconds": 716.604,
+              "preserve_seconds": 2.347
+            }
+          ],
+          "mean_data_copy_seconds": 721.314,
+          "mean_preserve_seconds": 2.3636666666666666
+        },
+        "dcp-default": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T13:48:25.060262+00:00",
+              "record_sha256": "6910d23daf780a5997be0f5c7a1e8fef295b2b4862398c6aca0c4ca774ac2ef2",
+              "data_copy_seconds": 1310.659,
+              "preserve_seconds": 2.324
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-12T16:22:27.492405+00:00",
+              "record_sha256": "2653f7c100e4db5114649fdaeb976272ba0788548d0822a87fd7bb49dbeebac4",
+              "data_copy_seconds": 1310.82,
+              "preserve_seconds": 2.35
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-12T18:56:38.270272+00:00",
+              "record_sha256": "096e3a13f4e3697fe7e1874c9862833d5c69e6c710f5a9c672bd8e27fedab24e",
+              "data_copy_seconds": 1310.777,
+              "preserve_seconds": 2.35
+            }
+          ],
+          "mean_data_copy_seconds": 1310.752,
+          "mean_preserve_seconds": 2.3413333333333335
+        }
+      }
+    },
+    {
+      "fileset": "10x10x10x10x1024x1K",
+      "stages": {
+        "dcp-32": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T22:03:03.802150+00:00",
+              "record_sha256": "ccd2361445170f6220574c364bddf820f162172dfb288d08587218cc29b30562",
+              "data_copy_seconds": 33.932,
+              "preserve_seconds": 24.436
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-13T01:34:35.387779+00:00",
+              "record_sha256": "6339abcb4706cf13a81c5c9bd3b7f842dc68b80c8d0df562923557419acc2d28",
+              "data_copy_seconds": 33.82,
+              "preserve_seconds": 24.54
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-13T05:05:47.726618+00:00",
+              "record_sha256": "cf5ccf9a0d060df4db011e7fddf3ac7b8c4ed707610e6c3afbeb2def51cb93f8",
+              "data_copy_seconds": 34.345,
+              "preserve_seconds": 26.611
+            }
+          ],
+          "mean_data_copy_seconds": 34.032333333333334,
+          "mean_preserve_seconds": 25.195666666666668
+        },
+        "dcp-default": {
+          "samples": [
+            {
+              "iteration": 1,
+              "recorded_utc": "2026-09-12T21:48:30.371152+00:00",
+              "record_sha256": "f0cf7c88797a7f9692a39570d9dc99792c9a82014d58ffa9eb96ee20edf2ad61",
+              "data_copy_seconds": 295.196,
+              "preserve_seconds": 24.373
+            },
+            {
+              "iteration": 2,
+              "recorded_utc": "2026-09-13T01:19:52.153726+00:00",
+              "record_sha256": "240f30fa49da20cb5e2a4748b3b9992f6c87433bf8d27390a98c4f2e44c11e40",
+              "data_copy_seconds": 292.84,
+              "preserve_seconds": 24.513
+            },
+            {
+              "iteration": 3,
+              "recorded_utc": "2026-09-13T04:51:05.161156+00:00",
+              "record_sha256": "888a5dd191c466b4d9e2dff5f1fce1463a24b9206071c38007ce9c01b44ffa4e",
+              "data_copy_seconds": 293.893,
+              "preserve_seconds": 24.835
+            }
+          ],
+          "mean_data_copy_seconds": 293.97633333333334,
+          "mean_preserve_seconds": 24.573666666666668
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,2021 @@
+{
+  "schema": "rcp-results-packet-v1",
+  "measurement_contexts": {
+    "xfs_corrective": {
+      "machine": {
+        "source_host": "compute003125",
+        "destination_host_local": "compute003125",
+        "observed_hostname": "10-74-3-125.aws.x.pdtpartners.com",
+        "slurm_partition": "perf_copy_m8idn_16xl-on-demand",
+        "allocated_cpus": 32,
+        "memory_request": "200G",
+        "aws_instance_type": "m8idn.16xlarge",
+        "aws_instance_type_basis": "inferred from Slurm partition name; EC2 metadata not retained"
+      },
+      "storage": "source and destination on local XFS /instance-store",
+      "source_staging": "rsync -a from /d to /instance-store, outside the copy timer; staged file count and apparent bytes validated",
+      "cache_policy": "sync, then client drop_caches=3, then 5 second settle before every timed copy",
+      "rcp_reflink_policy": "default auto; extent sharing may accelerate local copies, so apparent bytes are not physical bytes transferred",
+      "rcp_build": {
+        "version": "0.41.0",
+        "git_hash": "27c089508c13cc2a87101df4798930070f9fc509",
+        "sha256": "edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8"
+      },
+      "recorded_utc_first": "2026-10-11T04:49:19.493232+00:00",
+      "recorded_utc_last": "2026-10-11T09:50:10.082843+00:00",
+      "source_ledger_sha256": "5512fdd5e89be2fa2677ead442b7a3b34e0a47e81b712bc42aac671452ed741b"
+    },
+    "compute_september": {
+      "machine": {
+        "source_host": "compute003200",
+        "destination_host_local": "compute003200",
+        "slurm_partition": "perf_copy_m8idn_16xl-on-demand",
+        "requested_cpus": 32,
+        "memory_request": "200G",
+        "aws_instance_type": "m8idn.16xlarge",
+        "aws_instance_type_basis": "inferred from Slurm partition name; EC2 metadata not retained"
+      },
+      "storage": "source and destination on local XFS /instance-store",
+      "cache_policy": "source-host sync, then client drop_caches=3, then 5 second settle before every timed copy",
+      "selection": "September cp, dcp and rsync reference rows only; September rcp rows excluded in favor of October corrective rcp",
+      "tool_versions": {
+        "mpirun": "Open MPI 5.0.9",
+        "dcp": "version not reported by binary",
+        "cp": "version not captured",
+        "rsync": "version not captured"
+      },
+      "recorded_utc_first": "2026-09-02T20:58:03.732199+00:00",
+      "recorded_utc_last": "2026-09-06T15:21:09.741419+00:00",
+      "source_ledger_sha256": "aba49641f8f01cbac5f0631e4282c9b23729979039e5b5371ba8a78fb721acd9"
+    }
+  },
+  "scope": "local",
+  "filesystem": "xfs",
+  "fileset": {
+    "name": "10x100x1G",
+    "files": 1000,
+    "directories_including_root": 11,
+    "apparent_bytes": 1000000000000
+  },
+  "wall_time_primary": "completion_seconds: copy start through destination sync and validation",
+  "variants": [
+    {
+      "variant": "rcp-default",
+      "source_campaign": "xfs_corrective",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.177562256,
+          "mean": 0.184179914,
+          "median": 0.185246489,
+          "max": 0.189730997
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.227953978,
+          "mean": 0.23533444633333334,
+          "median": 0.236718908,
+          "max": 0.241330453
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.06,
+          "mean": 0.06666666666666667,
+          "median": 0.07,
+          "max": 0.07
+        },
+        "system_cpu_seconds": {
+          "min": 0.13,
+          "mean": 0.14666666666666667,
+          "median": 0.15,
+          "max": 0.16
+        },
+        "max_rss_kib": {
+          "min": 8200,
+          "mean": 9765.333333333334,
+          "median": 8580,
+          "max": 12516
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "c90317ec325eaee25c0ca6b8e6dd36d62527884f935b1daa122fdb7298bece49",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/1",
+            "copy_seconds": 0.185246489,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-1.attempt-1.log",
+            "max_rss_kib": 8580,
+            "recorded_utc": "2026-10-11T04:49:19.493232+00:00",
+            "run_id": "xfs/10x100x1G/rcp-default/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.236718908,
+            "system_cpu_seconds": 0.13,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-1.attempt-1.time.txt",
+            "sha256": "8f32cdb88bb394faef15f771bcc248f582627f9a64bb33a53b61edf49718130f",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/1\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.13\n\tPercent of CPU this job got: 123%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.16\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8580\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2151\n\tVoluntary context switches: 20631\n\tInvoluntary context switches: 65\n\tSwaps: 0\n\tFile system inputs: 2669\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "0da48d4996d66a41f0e08e113e30cdf42cc45984817484cf0d3d98abe72b4bb6",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/2",
+            "copy_seconds": 0.177562256,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-2.attempt-1.log",
+            "max_rss_kib": 8200,
+            "recorded_utc": "2026-10-11T04:49:42.125136+00:00",
+            "run_id": "xfs/10x100x1G/rcp-default/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.227953978,
+            "system_cpu_seconds": 0.15,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-2.attempt-1.time.txt",
+            "sha256": "d6868d6d3c37c0a15f83a2192f3666edad51f120090068cbf33d32edadad9835",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/2\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.15\n\tPercent of CPU this job got: 143%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.15\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8200\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2112\n\tVoluntary context switches: 19977\n\tInvoluntary context switches: 216\n\tSwaps: 0\n\tFile system inputs: 2531\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "a5a5904b160a9d76e166064c7acba85aa79ba28d6541a9a1b1da5ff50da88ff4",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/3",
+            "copy_seconds": 0.189730997,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-3.attempt-1.log",
+            "max_rss_kib": 12516,
+            "recorded_utc": "2026-10-11T04:50:04.742133+00:00",
+            "run_id": "xfs/10x100x1G/rcp-default/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.241330453,
+            "system_cpu_seconds": 0.16,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-default-3.attempt-1.time.txt",
+            "sha256": "190d95deefe8680a2cf9fa8b17c526df9648dd47ad6453a640e50f38842ca978",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-default/3\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.16\n\tPercent of CPU this job got: 131%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.16\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 12516\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2128\n\tVoluntary context switches: 20437\n\tInvoluntary context switches: 52\n\tSwaps: 0\n\tFile system inputs: 2835\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-8",
+      "source_campaign": "xfs_corrective",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.1608666,
+          "mean": 0.16190923966666668,
+          "median": 0.160944127,
+          "max": 0.163916992
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.212002187,
+          "mean": 0.21339428666666668,
+          "median": 0.212592442,
+          "max": 0.215588231
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.06,
+          "mean": 0.06666666666666667,
+          "median": 0.07,
+          "max": 0.07
+        },
+        "system_cpu_seconds": {
+          "min": 0.08,
+          "mean": 0.08,
+          "median": 0.08,
+          "max": 0.08
+        },
+        "max_rss_kib": {
+          "min": 10004,
+          "mean": 10117.333333333334,
+          "median": 10164,
+          "max": 10184
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "195f3c8768dd71f0091f7555f92dfe906053c24636e9fdb4f76a7a7c096fdb18",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/1",
+            "copy_seconds": 0.1608666,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-1.attempt-1.log",
+            "max_rss_kib": 10004,
+            "recorded_utc": "2026-10-11T04:49:25.151404+00:00",
+            "run_id": "xfs/10x100x1G/rcp-8/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.212592442,
+            "system_cpu_seconds": 0.08,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-1.attempt-1.time.txt",
+            "sha256": "38ac306239164acf8d8525d13ef70eaada231544aa7b84a7799b89716a9f777c",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/1\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.08\n\tPercent of CPU this job got: 111%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10004\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 1921\n\tVoluntary context switches: 17860\n\tInvoluntary context switches: 7\n\tSwaps: 0\n\tFile system inputs: 2769\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "70bff3b32b76e1d232690200a7c78913a74c16d7b071f535c12a786eb2a184c5",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/2",
+            "copy_seconds": 0.163916992,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-2.attempt-1.log",
+            "max_rss_kib": 10164,
+            "recorded_utc": "2026-10-11T04:49:47.739616+00:00",
+            "run_id": "xfs/10x100x1G/rcp-8/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.215588231,
+            "system_cpu_seconds": 0.08,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-2.attempt-1.time.txt",
+            "sha256": "d04a70b2eee41f47f930ac063053f67d6badf7dba735e92aa0ec4c6c1972f500",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/2\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.08\n\tPercent of CPU this job got: 106%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10164\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 1950\n\tVoluntary context switches: 16386\n\tInvoluntary context switches: 12\n\tSwaps: 0\n\tFile system inputs: 2841\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "50b99317432bf564203e1dedb6dcf74ed9303dfc1dfc220303f6dd1474654623",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/3",
+            "copy_seconds": 0.160944127,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-3.attempt-1.log",
+            "max_rss_kib": 10184,
+            "recorded_utc": "2026-10-11T04:50:10.381492+00:00",
+            "run_id": "xfs/10x100x1G/rcp-8/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.212002187,
+            "system_cpu_seconds": 0.08,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-8-3.attempt-1.time.txt",
+            "sha256": "386328ce6dd85211c7167204c21664b8d17f24c89c5234353662f5dfcb3794e4",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-8 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-8/3\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.08\n\tPercent of CPU this job got: 110%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10184\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2112\n\tVoluntary context switches: 16959\n\tInvoluntary context switches: 10\n\tSwaps: 0\n\tFile system inputs: 2957\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-32",
+      "source_campaign": "xfs_corrective",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.182709762,
+          "mean": 0.18902814766666665,
+          "median": 0.188643029,
+          "max": 0.195731652
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.232894014,
+          "mean": 0.24082485499999998,
+          "median": 0.242520899,
+          "max": 0.247059652
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.07,
+          "mean": 0.07666666666666667,
+          "median": 0.07,
+          "max": 0.09
+        },
+        "system_cpu_seconds": {
+          "min": 0.12,
+          "mean": 0.13333333333333333,
+          "median": 0.13,
+          "max": 0.15
+        },
+        "max_rss_kib": {
+          "min": 7700,
+          "mean": 8076.0,
+          "median": 8008,
+          "max": 8520
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "adcb3baca1561cc5be75388ce544035e4e91d2ac8402a8622858714405ec73e9",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/1",
+            "copy_seconds": 0.188643029,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-1.attempt-1.log",
+            "max_rss_kib": 8520,
+            "recorded_utc": "2026-10-11T04:49:30.806155+00:00",
+            "run_id": "xfs/10x100x1G/rcp-32/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.242520899,
+            "system_cpu_seconds": 0.13,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-1.attempt-1.time.txt",
+            "sha256": "959bb8513eb88dc36fe4ed79797acdadd4c46a35d91036dcb1ab50b0a488882c",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/1\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.13\n\tPercent of CPU this job got: 124%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.16\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8520\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2133\n\tVoluntary context switches: 20642\n\tInvoluntary context switches: 107\n\tSwaps: 0\n\tFile system inputs: 2693\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "918302db7af37a38e87894b2430825eff267f8d628b86673603a926ce512cd44",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/2",
+            "copy_seconds": 0.195731652,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-2.attempt-1.log",
+            "max_rss_kib": 8008,
+            "recorded_utc": "2026-10-11T04:49:53.402462+00:00",
+            "run_id": "xfs/10x100x1G/rcp-32/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.247059652,
+            "system_cpu_seconds": 0.12,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.09,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-2.attempt-1.time.txt",
+            "sha256": "95ea38f5fc606e56ca82461d1c32c52226ccf66bd3408336f67d491cbca1c4ca",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/2\"\n\tUser time (seconds): 0.09\n\tSystem time (seconds): 0.12\n\tPercent of CPU this job got: 122%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.17\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8008\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2184\n\tVoluntary context switches: 20606\n\tInvoluntary context switches: 44\n\tSwaps: 0\n\tFile system inputs: 2925\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "cffe13636aec968b8c59e8b1e47a62bfd192e11bad8eee361cd2679e3d23e4fe",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/3",
+            "copy_seconds": 0.182709762,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-3.attempt-1.log",
+            "max_rss_kib": 7700,
+            "recorded_utc": "2026-10-11T04:50:16.061004+00:00",
+            "run_id": "xfs/10x100x1G/rcp-32/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.232894014,
+            "system_cpu_seconds": 0.15,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.07,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-32-3.attempt-1.time.txt",
+            "sha256": "307630bd13847c8ab38de1aa436d571466884545de7a32bb260012f5c11708a6",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-32 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-32/3\"\n\tUser time (seconds): 0.07\n\tSystem time (seconds): 0.15\n\tPercent of CPU this job got: 138%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.16\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7700\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2108\n\tVoluntary context switches: 20033\n\tInvoluntary context switches: 254\n\tSwaps: 0\n\tFile system inputs: 2351\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-128",
+      "source_campaign": "xfs_corrective",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.197551765,
+          "mean": 0.20126896933333335,
+          "median": 0.200709978,
+          "max": 0.205545165
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.248115489,
+          "mean": 0.2529438653333333,
+          "median": 0.253869772,
+          "max": 0.256846335
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.06,
+          "mean": 0.06666666666666667,
+          "median": 0.06,
+          "max": 0.08
+        },
+        "system_cpu_seconds": {
+          "min": 0.16,
+          "mean": 0.18000000000000002,
+          "median": 0.17,
+          "max": 0.21
+        },
+        "max_rss_kib": {
+          "min": 9096,
+          "mean": 9998.666666666666,
+          "median": 9268,
+          "max": 11632
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "e7b6383b07f48dd09ea67fd646d8a2c530891302ec5e2070e1278cae90beda84",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/1",
+            "copy_seconds": 0.200709978,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-1.attempt-1.log",
+            "max_rss_kib": 9096,
+            "recorded_utc": "2026-10-11T04:49:36.484457+00:00",
+            "run_id": "xfs/10x100x1G/rcp-128/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.253869772,
+            "system_cpu_seconds": 0.17,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.08,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-1.attempt-1.time.txt",
+            "sha256": "29c0b2c1de29e5a034f59fd43e8b33e50091d7410aba2ae2def02fbd50997c29",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/1\"\n\tUser time (seconds): 0.08\n\tSystem time (seconds): 0.17\n\tPercent of CPU this job got: 146%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.18\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9096\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2898\n\tVoluntary context switches: 20116\n\tInvoluntary context switches: 238\n\tSwaps: 0\n\tFile system inputs: 2893\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "c4143cd9e4c1d94c7568cdde7a9fa7a096f8132ccad7b1dcf2bf6702eb61b68e",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/2",
+            "copy_seconds": 0.205545165,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-2.attempt-1.log",
+            "max_rss_kib": 9268,
+            "recorded_utc": "2026-10-11T04:49:59.057198+00:00",
+            "run_id": "xfs/10x100x1G/rcp-128/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.256846335,
+            "system_cpu_seconds": 0.21,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-2.attempt-1.time.txt",
+            "sha256": "3898041d1e27aa87f81ed4a6a35643a5a16a625b80ad41167bcff54341c22b66",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/2\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.21\n\tPercent of CPU this job got: 150%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.18\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9268\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 3463\n\tVoluntary context switches: 17571\n\tInvoluntary context switches: 264\n\tSwaps: 0\n\tFile system inputs: 2441\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "xfs_corrective",
+          "source_record_sha256": "e141e347ff150a32ba0b0e750c194d0567b5a0052e8f3eff2cac12fc2f333f20",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/tools/../artifacts/bin/rcp --max-files-in-flight=128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/3",
+            "copy_seconds": 0.197551765,
+            "destination": "/instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-3.attempt-1.log",
+            "max_rss_kib": 11632,
+            "recorded_utc": "2026-10-11T04:50:21.726411+00:00",
+            "run_id": "xfs/10x100x1G/rcp-128/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.248115489,
+            "system_cpu_seconds": 0.16,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/logs/xfs-10x100x1G-rcp-128-3.attempt-1.time.txt",
+            "sha256": "70d60af02043ce20f8fdd4c6c545cc3102cb2a9fad5ac0ade1e7141204b51e25",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-128 /instance-store/rcp-copy-bench-run7-20261011/stage/10x100x1G /instance-store/rcp-copy-bench-run7-20261011/dest/xfs/10x100x1G/rcp-128/3\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.16\n\tPercent of CPU this job got: 131%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.17\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 11632\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 2947\n\tVoluntary context switches: 18340\n\tInvoluntary context switches: 183\n\tSwaps: 0\n\tFile system inputs: 2803\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "dcp-default",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 300.885606653,
+          "mean": 309.5963971856667,
+          "median": 303.644480934,
+          "max": 324.25910397
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 300.951340478,
+          "mean": 309.659778304,
+          "median": 303.710004902,
+          "max": 324.317989532
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.02,
+          "median": 0.02,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 8680,
+          "mean": 8902.666666666666,
+          "median": 8728,
+          "max": 9300
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "e3054310bdc920279dd699514f9ecb2b81414fa033e43195dadf5e15e8a403ed",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/1",
+            "copy_seconds": 300.885606653,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-default-1.log",
+            "max_rss_kib": 8728,
+            "recorded_utc": "2026-09-02T20:58:03.732199+00:00",
+            "run_id": "xfs/10x100x1G/dcp-default/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 300.951340478,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-1.log",
+            "sha256": "cc74a08b6a88e6155a975be22e70753d72970dca0cab4c7d21cb435c7448c09c",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T16:53:04] Preserving file attributes.\n[2026-09-02T16:53:04] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T16:53:04] Walked 1011 items in 0.016 secs (63055.690 items/sec) ...\n[2026-09-02T16:53:04] Walked 1011 items in 0.016 seconds (62443.220 items/sec)\n[2026-09-02T16:53:04] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/1\n[2026-09-02T16:53:04] Items: 1011\n[2026-09-02T16:53:04]   Directories: 11\n[2026-09-02T16:53:04]   Files: 1000\n[2026-09-02T16:53:04]   Links: 0\n[2026-09-02T16:53:04] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T16:53:04] Creating 11 directories\n[2026-09-02T16:53:04] Creating 1000 files.\n[2026-09-02T16:53:04] Copying data.\n[2026-09-02T16:53:32] Copied 50.503 GiB (5%) in 28.500 secs (1.772 GiB/s) 497 secs left ...\n[2026-09-02T16:53:51] Copied 112.143 GiB (12%) in 47.544 secs (2.359 GiB/s) 347 secs left ...\n[2026-09-02T16:54:11] Copied 172.455 GiB (19%) in 67.352 secs (2.560 GiB/s) 296 secs left ...\n[2026-09-02T16:54:40] Copied 233.336 GiB (25%) in 96.258 secs (2.424 GiB/s) 288 secs left ...\n[2026-09-02T16:55:00] Copied 328.326 GiB (35%) in 115.743 secs (2.837 GiB/s) 213 secs left ...\n[2026-09-02T16:55:20] Copied 384.020 GiB (41%) in 136.432 secs (2.815 GiB/s) 194 secs left ...\n[2026-09-02T16:55:24] Copied 439.539 GiB (47%) in 140.154 secs (3.136 GiB/s) 157 secs left ...\n[2026-09-02T16:55:35] Copied 477.619 GiB (51%) in 150.736 secs (3.169 GiB/s) 143 secs left ...\n[2026-09-02T16:56:06] Copied 516.719 GiB (55%) in 181.680 secs (2.844 GiB/s) 146 secs left ...\n[2026-09-02T16:56:24] Copied 583.186 GiB (63%) in 200.255 secs (2.912 GiB/s) 120 secs left ...\n[2026-09-02T16:56:34] Copied 640.287 GiB (69%) in 209.966 secs (3.049 GiB/s) 95 secs left ...\n[2026-09-02T16:56:46] Copied 679.587 GiB (73%) in 221.657 secs (3.066 GiB/s) 82 secs left ...\n[2026-09-02T16:57:03] Copied 722.885 GiB (78%) in 239.551 secs (3.018 GiB/s) 69 secs left ...\n[2026-09-02T16:57:24] Copied 772.047 GiB (83%) in 259.788 secs (2.972 GiB/s) 54 secs left ...\n[2026-09-02T16:57:40] Copied 830.201 GiB (89%) in 276.239 secs (3.005 GiB/s) 34 secs left ...\n[2026-09-02T16:58:03] Copied 888.407 GiB (95%) in 299.028 secs (2.971 GiB/s) 14 secs left ...\n[2026-09-02T16:58:03] Copied 931.323 GiB (100%) in 299.028 secs (3.115 GiB/s) done\n[2026-09-02T16:58:03] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T16:58:03] Copy rate: 3.115 GiB/s (1000000000000 bytes in 299.028 seconds)\n[2026-09-02T16:58:03] Syncing data to disk.\n[2026-09-02T16:58:03] Sync completed in 0.019 seconds.\n[2026-09-02T16:58:03] Setting ownership, permissions, and timestamps.\n[2026-09-02T16:58:03] Updated 1011 items in 0.024 seconds (42114.843 items/sec)\n[2026-09-02T16:58:03] Syncing directory updates to disk.\n[2026-09-02T16:58:03] Sync completed in 0.005 seconds.\n[2026-09-02T16:58:03] Started: Sep-02-2026,16:53:04\n[2026-09-02T16:58:03] Completed: Sep-02-2026,16:58:03\n[2026-09-02T16:58:03] Seconds: 299.092\n[2026-09-02T16:58:03] Items: 1011\n[2026-09-02T16:58:03]   Directories: 11\n[2026-09-02T16:58:03]   Files: 1000\n[2026-09-02T16:58:03]   Links: 0\n[2026-09-02T16:58:03] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T16:58:03] Rate: 3.114 GiB/s (1000000000000 bytes in 299.092 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-1.time.txt",
+            "sha256": "eb7326196d6b5e6a4e959286955a01a713848074a92e2bbb2bf79f29a046f645",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:00.81\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8728\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 35\n\tMinor (reclaiming a frame) page faults: 2396\n\tVoluntary context switches: 392\n\tInvoluntary context switches: 34\n\tSwaps: 0\n\tFile system inputs: 7798\n\tFile system outputs: 384\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "2f1d404618cbe246c67c85a2a34456dc0e65f2f75e2120f09fc0918ac580f855",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/2",
+            "copy_seconds": 324.25910397,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-default-2.log",
+            "max_rss_kib": 9300,
+            "recorded_utc": "2026-09-02T21:40:09.820162+00:00",
+            "run_id": "xfs/10x100x1G/dcp-default/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 324.317989532,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-2.log",
+            "sha256": "4a63ff3839f5de26fdf976f4171a79d10e9c49f5e8ab66e7034a379f06d7043b",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:34:47] Preserving file attributes.\n[2026-09-02T17:34:47] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:34:47] Walked 1011 items in 0.016 secs (63309.779 items/sec) ...\n[2026-09-02T17:34:47] Walked 1011 items in 0.016 seconds (62434.721 items/sec)\n[2026-09-02T17:34:47] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/2\n[2026-09-02T17:34:47] Items: 1011\n[2026-09-02T17:34:47]   Directories: 11\n[2026-09-02T17:34:47]   Files: 1000\n[2026-09-02T17:34:47]   Links: 0\n[2026-09-02T17:34:47] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:34:47] Creating 11 directories\n[2026-09-02T17:34:47] Creating 1000 files.\n[2026-09-02T17:34:47] Copying data.\n[2026-09-02T17:35:19] Copied 51.640 GiB (6%) in 32.510 secs (1.588 GiB/s) 554 secs left ...\n[2026-09-02T17:35:39] Copied 112.229 GiB (12%) in 52.763 secs (2.127 GiB/s) 385 secs left ...\n[2026-09-02T17:36:00] Copied 172.056 GiB (18%) in 73.859 secs (2.330 GiB/s) 326 secs left ...\n[2026-09-02T17:36:21] Copied 233.551 GiB (25%) in 94.408 secs (2.474 GiB/s) 282 secs left ...\n[2026-09-02T17:36:42] Copied 294.347 GiB (32%) in 115.009 secs (2.559 GiB/s) 249 secs left ...\n[2026-09-02T17:37:12] Copied 357.087 GiB (38%) in 145.537 secs (2.454 GiB/s) 234 secs left ...\n[2026-09-02T17:37:33] Copied 439.058 GiB (47%) in 165.961 secs (2.646 GiB/s) 186 secs left ...\n[2026-09-02T17:37:53] Copied 498.195 GiB (53%) in 186.481 secs (2.672 GiB/s) 162 secs left ...\n[2026-09-02T17:38:14] Copied 557.398 GiB (60%) in 207.356 secs (2.688 GiB/s) 139 secs left ...\n[2026-09-02T17:38:35] Copied 628.010 GiB (67%) in 228.495 secs (2.748 GiB/s) 110 secs left ...\n[2026-09-02T17:38:56] Copied 688.548 GiB (74%) in 249.126 secs (2.764 GiB/s) 88 secs left ...\n[2026-09-02T17:39:17] Copied 749.431 GiB (80%) in 270.227 secs (2.773 GiB/s) 66 secs left ...\n[2026-09-02T17:39:38] Copied 810.374 GiB (87%) in 291.352 secs (2.781 GiB/s) 43 secs left ...\n[2026-09-02T17:39:59] Copied 869.123 GiB (93%) in 312.228 secs (2.784 GiB/s) 22 secs left ...\n[2026-09-02T17:40:09] Copied 921.892 GiB (99%) in 322.435 secs (2.859 GiB/s) 3 secs left ...\n[2026-09-02T17:40:09] Copied 931.323 GiB (100%) in 322.435 secs (2.888 GiB/s) done\n[2026-09-02T17:40:09] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:40:09] Copy rate: 2.888 GiB/s (1000000000000 bytes in 322.435 seconds)\n[2026-09-02T17:40:09] Syncing data to disk.\n[2026-09-02T17:40:09] Sync completed in 0.010 seconds.\n[2026-09-02T17:40:09] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:40:09] Updated 1011 items in 0.001 seconds (1033335.548 items/sec)\n[2026-09-02T17:40:09] Syncing directory updates to disk.\n[2026-09-02T17:40:09] Sync completed in 0.005 seconds.\n[2026-09-02T17:40:09] Started: Sep-02-2026,17:34:47\n[2026-09-02T17:40:09] Completed: Sep-02-2026,17:40:09\n[2026-09-02T17:40:09] Seconds: 322.456\n[2026-09-02T17:40:09] Items: 1011\n[2026-09-02T17:40:09]   Directories: 11\n[2026-09-02T17:40:09]   Files: 1000\n[2026-09-02T17:40:09]   Links: 0\n[2026-09-02T17:40:09] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:40:09] Rate: 2.888 GiB/s (1000000000000 bytes in 322.456 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-2.time.txt",
+            "sha256": "ddb451dbcc9030b02c1cd61605e458d24911693e8ff05e4362d85028be8a3398",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:24.18\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9300\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 38\n\tMinor (reclaiming a frame) page faults: 2401\n\tVoluntary context switches: 403\n\tInvoluntary context switches: 34\n\tSwaps: 0\n\tFile system inputs: 7910\n\tFile system outputs: 368\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "a2f319329e3000ac102b6e4f67eb3f6b77aa5989ce5a5bc1095d2bc517ff7faa",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/3",
+            "copy_seconds": 303.644480934,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-default-3.log",
+            "max_rss_kib": 8680,
+            "recorded_utc": "2026-09-02T22:19:56.838674+00:00",
+            "run_id": "xfs/10x100x1G/dcp-default/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 303.710004902,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-3.log",
+            "sha256": "5717681dfbe12c376db53218666b749e1dff6176cdadc4cef32df17d12b272f9",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T18:14:54] Preserving file attributes.\n[2026-09-02T18:14:54] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T18:14:54] Walked 1011 items in 0.016 secs (64270.976 items/sec) ...\n[2026-09-02T18:14:54] Walked 1011 items in 0.016 seconds (63612.887 items/sec)\n[2026-09-02T18:14:54] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/3\n[2026-09-02T18:14:54] Items: 1011\n[2026-09-02T18:14:54]   Directories: 11\n[2026-09-02T18:14:54]   Files: 1000\n[2026-09-02T18:14:54]   Links: 0\n[2026-09-02T18:14:54] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T18:14:54] Creating 11 directories\n[2026-09-02T18:14:54] Creating 1000 files.\n[2026-09-02T18:14:54] Copying data.\n[2026-09-02T18:15:23] Copied 51.394 GiB (6%) in 28.840 secs (1.782 GiB/s) 494 secs left ...\n[2026-09-02T18:15:42] Copied 113.018 GiB (12%) in 47.708 secs (2.369 GiB/s) 345 secs left ...\n[2026-09-02T18:16:01] Copied 175.740 GiB (19%) in 66.876 secs (2.628 GiB/s) 288 secs left ...\n[2026-09-02T18:16:21] Copied 229.523 GiB (25%) in 86.502 secs (2.653 GiB/s) 264 secs left ...\n[2026-09-02T18:16:32] Copied 288.063 GiB (31%) in 98.238 secs (2.932 GiB/s) 219 secs left ...\n[2026-09-02T18:16:51] Copied 338.630 GiB (36%) in 116.464 secs (2.908 GiB/s) 204 secs left ...\n[2026-09-02T18:17:11] Copied 391.246 GiB (42%) in 136.860 secs (2.859 GiB/s) 189 secs left ...\n[2026-09-02T18:17:39] Copied 454.876 GiB (49%) in 165.256 secs (2.753 GiB/s) 173 secs left ...\n[2026-09-02T18:17:59] Copied 527.687 GiB (57%) in 184.555 secs (2.859 GiB/s) 141 secs left ...\n[2026-09-02T18:18:18] Copied 589.293 GiB (63%) in 203.777 secs (2.892 GiB/s) 118 secs left ...\n[2026-09-02T18:18:37] Copied 647.220 GiB (69%) in 223.044 secs (2.902 GiB/s) 98 secs left ...\n[2026-09-02T18:18:57] Copied 708.184 GiB (76%) in 242.909 secs (2.915 GiB/s) 77 secs left ...\n[2026-09-02T18:19:17] Copied 770.666 GiB (83%) in 262.876 secs (2.932 GiB/s) 55 secs left ...\n[2026-09-02T18:19:44] Copied 847.867 GiB (91%) in 289.759 secs (2.926 GiB/s) 29 secs left ...\n[2026-09-02T18:19:56] Copied 911.629 GiB (98%) in 301.763 secs (3.021 GiB/s) 7 secs left ...\n[2026-09-02T18:19:56] Copied 931.323 GiB (100%) in 301.766 secs (3.086 GiB/s) done\n[2026-09-02T18:19:56] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:19:56] Copy rate: 3.086 GiB/s (1000000000000 bytes in 301.770 seconds)\n[2026-09-02T18:19:56] Syncing data to disk.\n[2026-09-02T18:19:56] Sync completed in 0.016 seconds.\n[2026-09-02T18:19:56] Setting ownership, permissions, and timestamps.\n[2026-09-02T18:19:56] Updated 1011 items in 0.036 seconds (28096.257 items/sec)\n[2026-09-02T18:19:56] Syncing directory updates to disk.\n[2026-09-02T18:19:56] Sync completed in 0.005 seconds.\n[2026-09-02T18:19:56] Started: Sep-02-2026,18:14:54\n[2026-09-02T18:19:56] Completed: Sep-02-2026,18:19:56\n[2026-09-02T18:19:56] Seconds: 301.852\n[2026-09-02T18:19:56] Items: 1011\n[2026-09-02T18:19:56]   Directories: 11\n[2026-09-02T18:19:56]   Files: 1000\n[2026-09-02T18:19:56]   Links: 0\n[2026-09-02T18:19:56] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:19:56] Rate: 3.085 GiB/s (1000000000000 bytes in 301.852 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-default-3.time.txt",
+            "sha256": "435c7c06ea93f49605d8c9669e84ad18d80844061a8763664a771cf1e1a96c3d",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-default/3\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:03.56\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8680\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 38\n\tMinor (reclaiming a frame) page faults: 2409\n\tVoluntary context switches: 425\n\tInvoluntary context switches: 33\n\tSwaps: 0\n\tFile system inputs: 7910\n\tFile system outputs: 384\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "dcp-8",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 290.424376352,
+          "mean": 312.63031488133333,
+          "median": 303.538668561,
+          "max": 343.927899731
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 290.491444961,
+          "mean": 312.693824617,
+          "median": 303.601142639,
+          "max": 343.988886251
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.02,
+          "median": 0.02,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 8484,
+          "mean": 8749.333333333334,
+          "median": 8692,
+          "max": 9072
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "1f616e60e07fbb202ffef40f668f18a0a7e2fa4bfbf180a8d2b928d9905af001",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 8 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/1",
+            "copy_seconds": 290.424376352,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-8-1.log",
+            "max_rss_kib": 8692,
+            "recorded_utc": "2026-09-02T21:07:03.011205+00:00",
+            "run_id": "xfs/10x100x1G/dcp-8/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 290.491444961,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-1.log",
+            "sha256": "3adcea01db371e42a2fb7fa45fe5ae0182572c09c4a6b112588583a0f329a7d5",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:02:14] Preserving file attributes.\n[2026-09-02T17:02:14] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:02:14] Walked 1011 items in 0.014 secs (71856.931 items/sec) ...\n[2026-09-02T17:02:14] Walked 1011 items in 0.014 seconds (71455.060 items/sec)\n[2026-09-02T17:02:14] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/1\n[2026-09-02T17:02:14] Items: 1011\n[2026-09-02T17:02:14]   Directories: 11\n[2026-09-02T17:02:14]   Files: 1000\n[2026-09-02T17:02:14]   Links: 0\n[2026-09-02T17:02:14] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:02:14] Creating 11 directories\n[2026-09-02T17:02:14] Creating 1000 files.\n[2026-09-02T17:02:14] Copying data.\n[2026-09-02T17:02:25] Copied 38.331 GiB (4%) in 11.202 secs (3.422 GiB/s) 261 secs left ...\n[2026-09-02T17:02:35] Copied 71.027 GiB (8%) in 21.210 secs (3.349 GiB/s) 257 secs left ...\n[2026-09-02T17:02:45] Copied 104.518 GiB (11%) in 31.627 secs (3.305 GiB/s) 250 secs left ...\n[2026-09-02T17:02:55] Copied 136.536 GiB (15%) in 41.628 secs (3.280 GiB/s) 242 secs left ...\n[2026-09-02T17:03:05] Copied 169.812 GiB (18%) in 51.850 secs (3.275 GiB/s) 233 secs left ...\n[2026-09-02T17:03:17] Copied 203.690 GiB (22%) in 63.101 secs (3.228 GiB/s) 225 secs left ...\n[2026-09-02T17:03:27] Copied 235.341 GiB (25%) in 73.368 secs (3.208 GiB/s) 217 secs left ...\n[2026-09-02T17:03:37] Copied 269.152 GiB (29%) in 83.072 secs (3.240 GiB/s) 204 secs left ...\n[2026-09-02T17:03:47] Copied 301.820 GiB (32%) in 93.309 secs (3.235 GiB/s) 195 secs left ...\n[2026-09-02T17:03:57] Copied 335.281 GiB (36%) in 103.311 secs (3.245 GiB/s) 184 secs left ...\n[2026-09-02T17:04:07] Copied 368.561 GiB (40%) in 113.319 secs (3.252 GiB/s) 173 secs left ...\n[2026-09-02T17:04:17] Copied 401.047 GiB (43%) in 123.316 secs (3.252 GiB/s) 163 secs left ...\n[2026-09-02T17:04:27] Copied 433.726 GiB (47%) in 133.316 secs (3.253 GiB/s) 153 secs left ...\n[2026-09-02T17:04:37] Copied 466.749 GiB (50%) in 143.615 secs (3.250 GiB/s) 143 secs left ...\n[2026-09-02T17:04:47] Copied 499.815 GiB (54%) in 153.628 secs (3.253 GiB/s) 133 secs left ...\n[2026-09-02T17:04:57] Copied 531.554 GiB (57%) in 163.843 secs (3.244 GiB/s) 123 secs left ...\n[2026-09-02T17:05:09] Copied 563.019 GiB (60%) in 174.958 secs (3.218 GiB/s) 114 secs left ...\n[2026-09-02T17:05:19] Copied 595.308 GiB (64%) in 185.317 secs (3.212 GiB/s) 105 secs left ...\n[2026-09-02T17:05:29] Copied 626.774 GiB (67%) in 195.192 secs (3.211 GiB/s) 95 secs left ...\n[2026-09-02T17:05:39] Copied 658.275 GiB (71%) in 205.482 secs (3.204 GiB/s) 85 secs left ...\n[2026-09-02T17:05:49] Copied 690.486 GiB (74%) in 215.445 secs (3.205 GiB/s) 75 secs left ...\n[2026-09-02T17:05:59] Copied 723.121 GiB (78%) in 225.450 secs (3.207 GiB/s) 65 secs left ...\n[2026-09-02T17:06:09] Copied 756.309 GiB (81%) in 235.527 secs (3.211 GiB/s) 55 secs left ...\n[2026-09-02T17:06:19] Copied 790.014 GiB (85%) in 245.456 secs (3.219 GiB/s) 44 secs left ...\n[2026-09-02T17:06:30] Copied 823.816 GiB (88%) in 256.628 secs (3.210 GiB/s) 33 secs left ...\n[2026-09-02T17:06:40] Copied 856.206 GiB (92%) in 266.667 secs (3.211 GiB/s) 23 secs left ...\n[2026-09-02T17:06:50] Copied 889.205 GiB (95%) in 276.565 secs (3.215 GiB/s) 13 secs left ...\n[2026-09-02T17:07:02] Copied 922.215 GiB (99%) in 288.675 secs (3.195 GiB/s) 3 secs left ...\n[2026-09-02T17:07:02] Copied 931.323 GiB (100%) in 288.675 secs (3.226 GiB/s) done\n[2026-09-02T17:07:02] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:07:02] Copy rate: 3.226 GiB/s (1000000000000 bytes in 288.675 seconds)\n[2026-09-02T17:07:02] Syncing data to disk.\n[2026-09-02T17:07:02] Sync completed in 0.013 seconds.\n[2026-09-02T17:07:02] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:07:02] Updated 1011 items in 0.001 seconds (866068.614 items/sec)\n[2026-09-02T17:07:02] Syncing directory updates to disk.\n[2026-09-02T17:07:02] Sync completed in 0.001 seconds.\n[2026-09-02T17:07:02] Started: Sep-02-2026,17:02:14\n[2026-09-02T17:07:02] Completed: Sep-02-2026,17:07:02\n[2026-09-02T17:07:02] Seconds: 288.697\n[2026-09-02T17:07:02] Items: 1011\n[2026-09-02T17:07:02]   Directories: 11\n[2026-09-02T17:07:02]   Files: 1000\n[2026-09-02T17:07:02]   Links: 0\n[2026-09-02T17:07:02] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:07:02] Rate: 3.226 GiB/s (1000000000000 bytes in 288.697 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-1.time.txt",
+            "sha256": "e26d9130d8fefe973d7b8dc14a075bdc40b8c7576fdc134f4305017c134eca96",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-8 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:50.34\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8692\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 39\n\tMinor (reclaiming a frame) page faults: 2316\n\tVoluntary context switches: 376\n\tInvoluntary context switches: 32\n\tSwaps: 0\n\tFile system inputs: 7926\n\tFile system outputs: 480\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "affdd70f081abe1be95a79e89a53a930c625c8b46abde5dfb0431e5b22d82b51",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 8 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/2",
+            "copy_seconds": 343.927899731,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-8-2.log",
+            "max_rss_kib": 8484,
+            "recorded_utc": "2026-09-02T21:46:02.420641+00:00",
+            "run_id": "xfs/10x100x1G/dcp-8/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 343.988886251,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-2.log",
+            "sha256": "63b6f9e9be89d8cd58e7e37f24233448370e44c237b22710114b828d345dec85",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:40:19] Preserving file attributes.\n[2026-09-02T17:40:19] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:40:19] Walked 1011 items in 0.017 secs (60954.589 items/sec) ...\n[2026-09-02T17:40:19] Walked 1011 items in 0.017 seconds (60686.576 items/sec)\n[2026-09-02T17:40:19] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/2\n[2026-09-02T17:40:19] Items: 1011\n[2026-09-02T17:40:19]   Directories: 11\n[2026-09-02T17:40:19]   Files: 1000\n[2026-09-02T17:40:19]   Links: 0\n[2026-09-02T17:40:19] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:40:19] Creating 11 directories\n[2026-09-02T17:40:20] Creating 1000 files.\n[2026-09-02T17:40:20] Copying data.\n[2026-09-02T17:40:30] Copied 31.941 GiB (3%) in 10.780 secs (2.963 GiB/s) 304 secs left ...\n[2026-09-02T17:40:42] Copied 62.238 GiB (7%) in 22.919 secs (2.716 GiB/s) 320 secs left ...\n[2026-09-02T17:40:52] Copied 91.280 GiB (10%) in 32.251 secs (2.830 GiB/s) 297 secs left ...\n[2026-09-02T17:41:02] Copied 121.151 GiB (13%) in 42.350 secs (2.861 GiB/s) 283 secs left ...\n[2026-09-02T17:41:12] Copied 150.350 GiB (16%) in 52.839 secs (2.845 GiB/s) 274 secs left ...\n[2026-09-02T17:41:24] Copied 181.966 GiB (20%) in 64.224 secs (2.833 GiB/s) 264 secs left ...\n[2026-09-02T17:41:34] Copied 211.091 GiB (23%) in 74.723 secs (2.825 GiB/s) 255 secs left ...\n[2026-09-02T17:41:44] Copied 241.678 GiB (26%) in 84.488 secs (2.861 GiB/s) 241 secs left ...\n[2026-09-02T17:41:54] Copied 271.738 GiB (29%) in 94.772 secs (2.867 GiB/s) 230 secs left ...\n[2026-09-02T17:42:04] Copied 302.048 GiB (32%) in 104.075 secs (2.902 GiB/s) 217 secs left ...\n[2026-09-02T17:42:14] Copied 332.108 GiB (36%) in 114.097 secs (2.911 GiB/s) 206 secs left ...\n[2026-09-02T17:42:24] Copied 361.344 GiB (39%) in 124.390 secs (2.905 GiB/s) 196 secs left ...\n[2026-09-02T17:42:34] Copied 389.588 GiB (42%) in 134.228 secs (2.902 GiB/s) 187 secs left ...\n[2026-09-02T17:42:44] Copied 418.207 GiB (45%) in 144.195 secs (2.900 GiB/s) 177 secs left ...\n[2026-09-02T17:42:54] Copied 448.220 GiB (48%) in 154.642 secs (2.898 GiB/s) 167 secs left ...\n[2026-09-02T17:43:05] Copied 478.157 GiB (51%) in 165.413 secs (2.891 GiB/s) 157 secs left ...\n[2026-09-02T17:43:15] Copied 507.747 GiB (55%) in 175.829 secs (2.888 GiB/s) 147 secs left ...\n[2026-09-02T17:43:26] Copied 536.948 GiB (58%) in 186.842 secs (2.874 GiB/s) 137 secs left ...\n[2026-09-02T17:43:37] Copied 566.024 GiB (61%) in 197.527 secs (2.866 GiB/s) 127 secs left ...\n[2026-09-02T17:43:48] Copied 595.229 GiB (64%) in 208.632 secs (2.853 GiB/s) 118 secs left ...\n[2026-09-02T17:43:59] Copied 621.804 GiB (67%) in 219.438 secs (2.834 GiB/s) 109 secs left ...\n[2026-09-02T17:44:09] Copied 648.570 GiB (70%) in 229.275 secs (2.829 GiB/s) 100 secs left ...\n[2026-09-02T17:44:19] Copied 675.766 GiB (73%) in 239.648 secs (2.820 GiB/s) 91 secs left ...\n[2026-09-02T17:44:29] Copied 702.167 GiB (75%) in 249.654 secs (2.813 GiB/s) 81 secs left ...\n[2026-09-02T17:44:40] Copied 729.212 GiB (78%) in 260.544 secs (2.799 GiB/s) 72 secs left ...\n[2026-09-02T17:44:51] Copied 758.019 GiB (81%) in 271.688 secs (2.790 GiB/s) 62 secs left ...\n[2026-09-02T17:45:02] Copied 784.641 GiB (84%) in 282.545 secs (2.777 GiB/s) 53 secs left ...\n[2026-09-02T17:45:12] Copied 811.454 GiB (87%) in 292.027 secs (2.779 GiB/s) 43 secs left ...\n[2026-09-02T17:45:22] Copied 836.934 GiB (90%) in 302.622 secs (2.766 GiB/s) 34 secs left ...\n[2026-09-02T17:45:35] Copied 864.194 GiB (93%) in 315.547 secs (2.739 GiB/s) 25 secs left ...\n[2026-09-02T17:45:44] Copied 889.168 GiB (95%) in 324.967 secs (2.736 GiB/s) 15 secs left ...\n[2026-09-02T17:45:54] Copied 914.619 GiB (98%) in 334.887 secs (2.731 GiB/s) 6 secs left ...\n[2026-09-02T17:46:02] Copied 931.323 GiB (100%) in 342.153 secs (2.722 GiB/s) done\n[2026-09-02T17:46:02] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:46:02] Copy rate: 2.722 GiB/s (1000000000000 bytes in 342.153 seconds)\n[2026-09-02T17:46:02] Syncing data to disk.\n[2026-09-02T17:46:02] Sync completed in 0.011 seconds.\n[2026-09-02T17:46:02] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:46:02] Updated 1011 items in 0.001 seconds (817696.538 items/sec)\n[2026-09-02T17:46:02] Syncing directory updates to disk.\n[2026-09-02T17:46:02] Sync completed in 0.001 seconds.\n[2026-09-02T17:46:02] Started: Sep-02-2026,17:40:19\n[2026-09-02T17:46:02] Completed: Sep-02-2026,17:46:02\n[2026-09-02T17:46:02] Seconds: 342.176\n[2026-09-02T17:46:02] Items: 1011\n[2026-09-02T17:46:02]   Directories: 11\n[2026-09-02T17:46:02]   Files: 1000\n[2026-09-02T17:46:02]   Links: 0\n[2026-09-02T17:46:02] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:46:02] Rate: 2.722 GiB/s (1000000000000 bytes in 342.176 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-2.time.txt",
+            "sha256": "5d2df959d3666e1728b20ffd52f98112f39b83bc49d0f2306b286b364572736c",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-8 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:43.85\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8484\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 36\n\tMinor (reclaiming a frame) page faults: 2322\n\tVoluntary context switches: 379\n\tInvoluntary context switches: 32\n\tSwaps: 0\n\tFile system inputs: 7678\n\tFile system outputs: 520\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "8325987471907e58e03c0e7784d219d1333f165b3ca8814c70060930cb2f8d75",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 8 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/3",
+            "copy_seconds": 303.538668561,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-8-3.log",
+            "max_rss_kib": 9072,
+            "recorded_utc": "2026-09-02T22:25:09.066338+00:00",
+            "run_id": "xfs/10x100x1G/dcp-8/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 303.601142639,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-3.log",
+            "sha256": "154cd8be57943a81b922ff008419207dd7ff17e84378d5753d49bb45fba247f9",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T18:20:07] Preserving file attributes.\n[2026-09-02T18:20:07] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T18:20:07] Walked 1011 items in 0.015 secs (67561.120 items/sec) ...\n[2026-09-02T18:20:07] Walked 1011 items in 0.015 seconds (67236.709 items/sec)\n[2026-09-02T18:20:07] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/3\n[2026-09-02T18:20:07] Items: 1011\n[2026-09-02T18:20:07]   Directories: 11\n[2026-09-02T18:20:07]   Files: 1000\n[2026-09-02T18:20:07]   Links: 0\n[2026-09-02T18:20:07] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T18:20:07] Creating 11 directories\n[2026-09-02T18:20:07] Creating 1000 files.\n[2026-09-02T18:20:07] Copying data.\n[2026-09-02T18:20:17] Copied 35.222 GiB (4%) in 10.015 secs (3.517 GiB/s) 255 secs left ...\n[2026-09-02T18:20:27] Copied 66.031 GiB (7%) in 20.018 secs (3.299 GiB/s) 262 secs left ...\n[2026-09-02T18:20:37] Copied 97.302 GiB (10%) in 30.305 secs (3.211 GiB/s) 260 secs left ...\n[2026-09-02T18:20:47] Copied 127.189 GiB (14%) in 40.799 secs (3.117 GiB/s) 258 secs left ...\n[2026-09-02T18:20:58] Copied 158.836 GiB (17%) in 51.600 secs (3.078 GiB/s) 251 secs left ...\n[2026-09-02T18:21:09] Copied 189.198 GiB (20%) in 62.487 secs (3.028 GiB/s) 245 secs left ...\n[2026-09-02T18:21:18] Copied 219.699 GiB (24%) in 71.597 secs (3.069 GiB/s) 232 secs left ...\n[2026-09-02T18:21:29] Copied 251.525 GiB (27%) in 82.207 secs (3.060 GiB/s) 222 secs left ...\n[2026-09-02T18:21:39] Copied 281.020 GiB (30%) in 92.018 secs (3.054 GiB/s) 213 secs left ...\n[2026-09-02T18:21:48] Copied 311.820 GiB (33%) in 101.770 secs (3.064 GiB/s) 202 secs left ...\n[2026-09-02T18:21:59] Copied 342.873 GiB (37%) in 112.050 secs (3.060 GiB/s) 192 secs left ...\n[2026-09-02T18:22:09] Copied 372.323 GiB (40%) in 122.061 secs (3.050 GiB/s) 183 secs left ...\n[2026-09-02T18:22:20] Copied 402.559 GiB (43%) in 133.481 secs (3.016 GiB/s) 175 secs left ...\n[2026-09-02T18:22:29] Copied 431.272 GiB (46%) in 142.658 secs (3.023 GiB/s) 165 secs left ...\n[2026-09-02T18:22:39] Copied 461.051 GiB (50%) in 152.662 secs (3.020 GiB/s) 156 secs left ...\n[2026-09-02T18:22:49] Copied 491.536 GiB (53%) in 162.662 secs (3.022 GiB/s) 146 secs left ...\n[2026-09-02T18:23:00] Copied 523.741 GiB (56%) in 173.745 secs (3.014 GiB/s) 135 secs left ...\n[2026-09-02T18:23:11] Copied 556.201 GiB (60%) in 184.098 secs (3.021 GiB/s) 124 secs left ...\n[2026-09-02T18:23:21] Copied 587.530 GiB (63%) in 194.756 secs (3.017 GiB/s) 114 secs left ...\n[2026-09-02T18:23:31] Copied 620.556 GiB (67%) in 204.639 secs (3.032 GiB/s) 102 secs left ...\n[2026-09-02T18:23:41] Copied 652.645 GiB (70%) in 214.883 secs (3.037 GiB/s) 92 secs left ...\n[2026-09-02T18:23:51] Copied 685.101 GiB (74%) in 224.885 secs (3.046 GiB/s) 81 secs left ...\n[2026-09-02T18:24:01] Copied 716.430 GiB (77%) in 234.899 secs (3.050 GiB/s) 70 secs left ...\n[2026-09-02T18:24:12] Copied 749.680 GiB (80%) in 245.183 secs (3.058 GiB/s) 59 secs left ...\n[2026-09-02T18:24:22] Copied 781.548 GiB (84%) in 255.182 secs (3.063 GiB/s) 49 secs left ...\n[2026-09-02T18:24:32] Copied 813.375 GiB (87%) in 265.176 secs (3.067 GiB/s) 38 secs left ...\n[2026-09-02T18:24:42] Copied 846.823 GiB (91%) in 275.967 secs (3.069 GiB/s) 28 secs left ...\n[2026-09-02T18:24:52] Copied 878.594 GiB (94%) in 285.594 secs (3.076 GiB/s) 17 secs left ...\n[2026-09-02T18:25:02] Copied 909.797 GiB (98%) in 295.661 secs (3.077 GiB/s) 7 secs left ...\n[2026-09-02T18:25:08] Copied 931.323 GiB (100%) in 301.774 secs (3.086 GiB/s) done\n[2026-09-02T18:25:08] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:25:08] Copy rate: 3.086 GiB/s (1000000000000 bytes in 301.774 seconds)\n[2026-09-02T18:25:08] Syncing data to disk.\n[2026-09-02T18:25:08] Sync completed in 0.008 seconds.\n[2026-09-02T18:25:08] Setting ownership, permissions, and timestamps.\n[2026-09-02T18:25:08] Updated 1011 items in 0.001 seconds (794331.100 items/sec)\n[2026-09-02T18:25:08] Syncing directory updates to disk.\n[2026-09-02T18:25:08] Sync completed in 0.001 seconds.\n[2026-09-02T18:25:08] Started: Sep-02-2026,18:20:07\n[2026-09-02T18:25:08] Completed: Sep-02-2026,18:25:08\n[2026-09-02T18:25:08] Seconds: 301.792\n[2026-09-02T18:25:08] Items: 1011\n[2026-09-02T18:25:08]   Directories: 11\n[2026-09-02T18:25:08]   Files: 1000\n[2026-09-02T18:25:08]   Links: 0\n[2026-09-02T18:25:08] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:25:08] Rate: 3.086 GiB/s (1000000000000 bytes in 301.792 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-8-3.time.txt",
+            "sha256": "0a82116056eb43cdc249c3d40880c73ee76c0a3e79aa5bcd1d20a90fbce19e81",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-8 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-8/3\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:03.46\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9072\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 34\n\tMinor (reclaiming a frame) page faults: 2326\n\tVoluntary context switches: 373\n\tInvoluntary context switches: 32\n\tSwaps: 0\n\tFile system inputs: 7336\n\tFile system outputs: 496\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "dcp-32",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 287.50622703,
+          "mean": 302.16160401133334,
+          "median": 302.100478273,
+          "max": 316.878106731
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 287.5691615,
+          "mean": 302.226337266,
+          "median": 302.17539658,
+          "max": 316.934453718
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.02,
+          "median": 0.02,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 8484,
+          "mean": 8764.0,
+          "median": 8608,
+          "max": 9200
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "d85123e0aac8675b2ed393cc45b3d0608d1a63c18a8445d2235af071b061f78a",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/1",
+            "copy_seconds": 287.50622703,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-32-1.log",
+            "max_rss_kib": 8484,
+            "recorded_utc": "2026-09-02T21:11:59.102791+00:00",
+            "run_id": "xfs/10x100x1G/dcp-32/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 287.5691615,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-1.log",
+            "sha256": "a0e10ae08cda4f4d93c6aaddd3d09ebcdfcdef2c0e5c413589048c929829cc04",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:07:13] Preserving file attributes.\n[2026-09-02T17:07:13] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:07:13] Walked 1011 items in 0.017 secs (61222.884 items/sec) ...\n[2026-09-02T17:07:13] Walked 1011 items in 0.017 seconds (60548.396 items/sec)\n[2026-09-02T17:07:13] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/1\n[2026-09-02T17:07:13] Items: 1011\n[2026-09-02T17:07:13]   Directories: 11\n[2026-09-02T17:07:13]   Files: 1000\n[2026-09-02T17:07:13]   Links: 0\n[2026-09-02T17:07:13] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:07:13] Creating 11 directories\n[2026-09-02T17:07:13] Creating 1000 files.\n[2026-09-02T17:07:13] Copying data.\n[2026-09-02T17:07:41] Copied 51.632 GiB (6%) in 28.750 secs (1.796 GiB/s) 490 secs left ...\n[2026-09-02T17:07:59] Copied 114.229 GiB (12%) in 46.373 secs (2.463 GiB/s) 332 secs left ...\n[2026-09-02T17:08:26] Copied 177.611 GiB (19%) in 72.890 secs (2.437 GiB/s) 309 secs left ...\n[2026-09-02T17:08:52] Copied 268.416 GiB (29%) in 99.294 secs (2.703 GiB/s) 245 secs left ...\n[2026-09-02T17:09:19] Copied 357.894 GiB (38%) in 126.824 secs (2.822 GiB/s) 203 secs left ...\n[2026-09-02T17:09:47] Copied 448.531 GiB (48%) in 154.197 secs (2.909 GiB/s) 166 secs left ...\n[2026-09-02T17:10:14] Copied 537.891 GiB (58%) in 181.295 secs (2.967 GiB/s) 133 secs left ...\n[2026-09-02T17:10:50] Copied 629.047 GiB (68%) in 217.365 secs (2.894 GiB/s) 104 secs left ...\n[2026-09-02T17:11:20] Copied 747.320 GiB (80%) in 247.727 secs (3.017 GiB/s) 61 secs left ...\n[2026-09-02T17:11:49] Copied 845.119 GiB (91%) in 276.442 secs (3.057 GiB/s) 28 secs left ...\n[2026-09-02T17:11:58] Copied 925.995 GiB (99%) in 285.635 secs (3.242 GiB/s) 2 secs left ...\n[2026-09-02T17:11:58] Copied 931.323 GiB (100%) in 285.637 secs (3.261 GiB/s) done\n[2026-09-02T17:11:58] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:11:58] Copy rate: 3.260 GiB/s (1000000000000 bytes in 285.640 seconds)\n[2026-09-02T17:11:58] Syncing data to disk.\n[2026-09-02T17:11:58] Sync completed in 0.020 seconds.\n[2026-09-02T17:11:58] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:11:58] Updated 1011 items in 0.028 seconds (36101.233 items/sec)\n[2026-09-02T17:11:58] Syncing directory updates to disk.\n[2026-09-02T17:11:58] Sync completed in 0.006 seconds.\n[2026-09-02T17:11:58] Started: Sep-02-2026,17:07:13\n[2026-09-02T17:11:58] Completed: Sep-02-2026,17:11:58\n[2026-09-02T17:11:58] Seconds: 285.720\n[2026-09-02T17:11:58] Items: 1011\n[2026-09-02T17:11:58]   Directories: 11\n[2026-09-02T17:11:58]   Files: 1000\n[2026-09-02T17:11:58]   Links: 0\n[2026-09-02T17:11:58] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:11:58] Rate: 3.260 GiB/s (1000000000000 bytes in 285.720 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-1.time.txt",
+            "sha256": "03f6e2d51b8135ff984afc38dfb29c43c3e9123b7d59fa8399c2f8c81fdecbd6",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-32 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:47.43\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8484\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 34\n\tMinor (reclaiming a frame) page faults: 2405\n\tVoluntary context switches: 398\n\tInvoluntary context switches: 34\n\tSwaps: 0\n\tFile system inputs: 7438\n\tFile system outputs: 352\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "9a032b8c185c942c227f020c307f09aefcb3e334ab65a34bf2e55e3f13e5451c",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/2",
+            "copy_seconds": 316.878106731,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-32-2.log",
+            "max_rss_kib": 9200,
+            "recorded_utc": "2026-09-02T21:51:27.862299+00:00",
+            "run_id": "xfs/10x100x1G/dcp-32/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 316.934453718,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-2.log",
+            "sha256": "68971f9241486a9645dae22c1296d4143d136e4ff4b0c659b17f741614daf8fa",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:46:12] Preserving file attributes.\n[2026-09-02T17:46:12] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:46:12] Walked 1011 items in 0.031 secs (32260.168 items/sec) ...\n[2026-09-02T17:46:12] Walked 1011 items in 0.032 seconds (32094.139 items/sec)\n[2026-09-02T17:46:12] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/2\n[2026-09-02T17:46:12] Items: 1011\n[2026-09-02T17:46:12]   Directories: 11\n[2026-09-02T17:46:12]   Files: 1000\n[2026-09-02T17:46:12]   Links: 0\n[2026-09-02T17:46:12] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:46:12] Creating 11 directories\n[2026-09-02T17:46:12] Creating 1000 files.\n[2026-09-02T17:46:12] Copying data.\n[2026-09-02T17:46:50] Copied 50.663 GiB (5%) in 37.700 secs (1.344 GiB/s) 655 secs left ...\n[2026-09-02T17:47:13] Copied 109.975 GiB (12%) in 60.583 secs (1.815 GiB/s) 452 secs left ...\n[2026-09-02T17:47:34] Copied 169.244 GiB (18%) in 82.278 secs (2.057 GiB/s) 370 secs left ...\n[2026-09-02T17:47:54] Copied 229.071 GiB (25%) in 101.945 secs (2.247 GiB/s) 313 secs left ...\n[2026-09-02T17:48:14] Copied 289.437 GiB (31%) in 121.443 secs (2.383 GiB/s) 269 secs left ...\n[2026-09-02T17:48:32] Copied 349.141 GiB (37%) in 140.303 secs (2.488 GiB/s) 234 secs left ...\n[2026-09-02T17:48:53] Copied 409.019 GiB (44%) in 160.916 secs (2.542 GiB/s) 205 secs left ...\n[2026-09-02T17:49:03] Copied 463.898 GiB (50%) in 171.330 secs (2.708 GiB/s) 173 secs left ...\n[2026-09-02T17:49:31] Copied 499.609 GiB (54%) in 198.848 secs (2.513 GiB/s) 172 secs left ...\n[2026-09-02T17:49:59] Copied 592.677 GiB (64%) in 227.012 secs (2.611 GiB/s) 130 secs left ...\n[2026-09-02T17:50:27] Copied 679.820 GiB (73%) in 255.076 secs (2.665 GiB/s) 94 secs left ...\n[2026-09-02T17:50:55] Copied 769.311 GiB (83%) in 283.188 secs (2.717 GiB/s) 60 secs left ...\n[2026-09-02T17:51:23] Copied 858.996 GiB (92%) in 311.194 secs (2.760 GiB/s) 26 secs left ...\n[2026-09-02T17:51:27] Copied 929.405 GiB (100%) in 315.010 secs (2.950 GiB/s) 1 secs left ...\n[2026-09-02T17:51:27] Copied 931.323 GiB (100%) in 315.016 secs (2.956 GiB/s) done\n[2026-09-02T17:51:27] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:51:27] Copy rate: 2.956 GiB/s (1000000000000 bytes in 315.022 seconds)\n[2026-09-02T17:51:27] Syncing data to disk.\n[2026-09-02T17:51:27] Sync completed in 0.018 seconds.\n[2026-09-02T17:51:27] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:51:27] Updated 1011 items in 0.001 seconds (961825.699 items/sec)\n[2026-09-02T17:51:27] Syncing directory updates to disk.\n[2026-09-02T17:51:27] Sync completed in 0.004 seconds.\n[2026-09-02T17:51:27] Started: Sep-02-2026,17:46:12\n[2026-09-02T17:51:27] Completed: Sep-02-2026,17:51:27\n[2026-09-02T17:51:27] Seconds: 315.061\n[2026-09-02T17:51:27] Items: 1011\n[2026-09-02T17:51:27]   Directories: 11\n[2026-09-02T17:51:27]   Files: 1000\n[2026-09-02T17:51:27]   Links: 0\n[2026-09-02T17:51:27] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:51:27] Rate: 2.956 GiB/s (1000000000000 bytes in 315.061 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-2.time.txt",
+            "sha256": "528ff0762cfe6229c43524b5903658259080dd7b135f802e69575f0c4b32f795",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-32 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:16.80\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9200\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 38\n\tMinor (reclaiming a frame) page faults: 2409\n\tVoluntary context switches: 401\n\tInvoluntary context switches: 32\n\tSwaps: 0\n\tFile system inputs: 7846\n\tFile system outputs: 376\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "eaf7dd6bd1891a50c5bafe31f3dd0c040965ed91868f5df10cf93e6cf4366880",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/3",
+            "copy_seconds": 302.100478273,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-32-3.log",
+            "max_rss_kib": 8608,
+            "recorded_utc": "2026-09-02T22:30:19.821796+00:00",
+            "run_id": "xfs/10x100x1G/dcp-32/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 302.17539658,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-3.log",
+            "sha256": "721c79e8d1f2dcc76029101891bf0ae05630a64e5d99bdd4fbe1ef24a95e91f7",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T18:25:19] Preserving file attributes.\n[2026-09-02T18:25:19] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T18:25:19] Walked 1011 items in 0.021 secs (47948.317 items/sec) ...\n[2026-09-02T18:25:19] Walked 1011 items in 0.021 seconds (47543.866 items/sec)\n[2026-09-02T18:25:19] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/3\n[2026-09-02T18:25:19] Items: 1011\n[2026-09-02T18:25:19]   Directories: 11\n[2026-09-02T18:25:19]   Files: 1000\n[2026-09-02T18:25:19]   Links: 0\n[2026-09-02T18:25:19] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T18:25:19] Creating 11 directories\n[2026-09-02T18:25:19] Creating 1000 files.\n[2026-09-02T18:25:19] Copying data.\n[2026-09-02T18:25:48] Copied 50.917 GiB (5%) in 29.521 secs (1.725 GiB/s) 510 secs left ...\n[2026-09-02T18:26:17] Copied 112.996 GiB (12%) in 58.554 secs (1.930 GiB/s) 424 secs left ...\n[2026-09-02T18:26:46] Copied 204.291 GiB (22%) in 87.048 secs (2.347 GiB/s) 310 secs left ...\n[2026-09-02T18:27:05] Copied 284.558 GiB (31%) in 106.254 secs (2.678 GiB/s) 242 secs left ...\n[2026-09-02T18:27:24] Copied 345.038 GiB (37%) in 125.181 secs (2.756 GiB/s) 213 secs left ...\n[2026-09-02T18:27:43] Copied 405.299 GiB (44%) in 143.916 secs (2.816 GiB/s) 187 secs left ...\n[2026-09-02T18:28:01] Copied 464.358 GiB (50%) in 162.685 secs (2.854 GiB/s) 164 secs left ...\n[2026-09-02T18:28:20] Copied 523.786 GiB (56%) in 181.688 secs (2.883 GiB/s) 141 secs left ...\n[2026-09-02T18:28:40] Copied 579.197 GiB (62%) in 201.157 secs (2.879 GiB/s) 122 secs left ...\n[2026-09-02T18:29:00] Copied 641.828 GiB (69%) in 221.092 secs (2.903 GiB/s) 100 secs left ...\n[2026-09-02T18:29:20] Copied 700.956 GiB (75%) in 240.749 secs (2.912 GiB/s) 79 secs left ...\n[2026-09-02T18:29:39] Copied 772.482 GiB (83%) in 259.855 secs (2.973 GiB/s) 53 secs left ...\n[2026-09-02T18:29:58] Copied 822.772 GiB (88%) in 279.464 secs (2.944 GiB/s) 37 secs left ...\n[2026-09-02T18:30:19] Copied 893.336 GiB (96%) in 300.272 secs (2.975 GiB/s) 13 secs left ...\n[2026-09-02T18:30:19] Copied 931.323 GiB (100%) in 300.272 secs (3.102 GiB/s) done\n[2026-09-02T18:30:19] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:30:19] Copy rate: 3.102 GiB/s (1000000000000 bytes in 300.272 seconds)\n[2026-09-02T18:30:19] Syncing data to disk.\n[2026-09-02T18:30:19] Sync completed in 0.009 seconds.\n[2026-09-02T18:30:19] Setting ownership, permissions, and timestamps.\n[2026-09-02T18:30:19] Updated 1011 items in 0.001 seconds (990923.882 items/sec)\n[2026-09-02T18:30:19] Syncing directory updates to disk.\n[2026-09-02T18:30:19] Sync completed in 0.005 seconds.\n[2026-09-02T18:30:19] Started: Sep-02-2026,18:25:19\n[2026-09-02T18:30:19] Completed: Sep-02-2026,18:30:19\n[2026-09-02T18:30:19] Seconds: 300.294\n[2026-09-02T18:30:19] Items: 1011\n[2026-09-02T18:30:19]   Directories: 11\n[2026-09-02T18:30:19]   Files: 1000\n[2026-09-02T18:30:19]   Links: 0\n[2026-09-02T18:30:19] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:30:19] Rate: 3.101 GiB/s (1000000000000 bytes in 300.294 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-32-3.time.txt",
+            "sha256": "523180bfd9e3082cc9b4f174492f629856ad3439c04ce0fd52c25160315e3024",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-32 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-32/3\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:02.01\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8608\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 36\n\tMinor (reclaiming a frame) page faults: 2402\n\tVoluntary context switches: 393\n\tInvoluntary context switches: 32\n\tSwaps: 0\n\tFile system inputs: 7664\n\tFile system outputs: 368\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "dcp-128",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 304.127611919,
+          "mean": 314.37986021866664,
+          "median": 316.001434922,
+          "max": 323.010533815
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 304.190171561,
+          "mean": 314.44809130766663,
+          "median": 316.08012192,
+          "max": 323.073980442
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.02,
+          "median": 0.02,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 10228,
+          "mean": 10260.0,
+          "median": 10268,
+          "max": 10284
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "87e7ffdbe82ca014aadf974b73065272154207a98f3b6a092a4333d8a8ac5dc1",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 128 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/1",
+            "copy_seconds": 304.127611919,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-128-1.log",
+            "max_rss_kib": 10228,
+            "recorded_utc": "2026-09-02T21:17:11.883770+00:00",
+            "run_id": "xfs/10x100x1G/dcp-128/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 304.190171561,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-1.log",
+            "sha256": "f51d4ca7f64dc6575b763b1bb9497858d195c50618c59aaa8c56fc9e2a3ba236",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:12:09] Preserving file attributes.\n[2026-09-02T17:12:09] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:12:10] Walked 1011 items in 0.630 secs (1604.668 items/sec) ...\n[2026-09-02T17:12:11] Walked 1011 items in 1.587 seconds (637.038 items/sec)\n[2026-09-02T17:12:11] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/1\n[2026-09-02T17:12:11] Items: 1011\n[2026-09-02T17:12:11]   Directories: 11\n[2026-09-02T17:12:11]   Files: 1000\n[2026-09-02T17:12:11]   Links: 0\n[2026-09-02T17:12:11] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:12:14] Creating 11 directories\n[2026-09-02T17:12:15] Creating 1000 files.\n[2026-09-02T17:12:15] Copying data.\n[2026-09-02T17:12:50] Copied 71.141 GiB (8%) in 34.528 secs (2.060 GiB/s) 417 secs left ...\n[2026-09-02T17:13:26] Copied 169.345 GiB (18%) in 71.097 secs (2.382 GiB/s) 320 secs left ...\n[2026-09-02T17:14:02] Copied 286.435 GiB (31%) in 106.400 secs (2.692 GiB/s) 240 secs left ...\n[2026-09-02T17:14:38] Copied 400.988 GiB (43%) in 142.353 secs (2.817 GiB/s) 188 secs left ...\n[2026-09-02T17:15:15] Copied 518.928 GiB (56%) in 179.279 secs (2.895 GiB/s) 142 secs left ...\n[2026-09-02T17:15:51] Copied 637.485 GiB (68%) in 215.688 secs (2.956 GiB/s) 99 secs left ...\n[2026-09-02T17:16:27] Copied 757.710 GiB (81%) in 251.975 secs (3.007 GiB/s) 58 secs left ...\n[2026-09-02T17:17:09] Copied 878.356 GiB (94%) in 294.033 secs (2.987 GiB/s) 18 secs left ...\n[2026-09-02T17:17:09] Copied 931.323 GiB (100%) in 294.108 secs (3.167 GiB/s) done\n[2026-09-02T17:17:10] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:17:10] Copy rate: 3.164 GiB/s (1000000000000 bytes in 294.349 seconds)\n[2026-09-02T17:17:10] Syncing data to disk.\n[2026-09-02T17:17:10] Sync completed in 0.262 seconds.\n[2026-09-02T17:17:10] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:17:11] Updated 1011 items in 0.540 seconds (1872.189 items/sec)\n[2026-09-02T17:17:11] Syncing directory updates to disk.\n[2026-09-02T17:17:11] Sync completed in 0.304 seconds.\n[2026-09-02T17:17:11] Started: Sep-02-2026,17:12:11\n[2026-09-02T17:17:11] Completed: Sep-02-2026,17:17:11\n[2026-09-02T17:17:11] Seconds: 299.562\n[2026-09-02T17:17:11] Items: 1011\n[2026-09-02T17:17:11]   Directories: 11\n[2026-09-02T17:17:11]   Files: 1000\n[2026-09-02T17:17:11]   Links: 0\n[2026-09-02T17:17:11] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:17:11] Rate: 3.109 GiB/s (1000000000000 bytes in 299.562 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-1.time.txt",
+            "sha256": "8487feb510470804dff23a98abc0f08fa9d038bb219d876a5bd81dc60871c8a0",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-128 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:04.05\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10228\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 35\n\tMinor (reclaiming a frame) page faults: 2824\n\tVoluntary context switches: 599\n\tInvoluntary context switches: 221\n\tSwaps: 0\n\tFile system inputs: 7694\n\tFile system outputs: 336\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "d3b9346081c08da6871e6dd015055609de20684c7a16fcf80df5bb95573263fe",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 128 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/2",
+            "copy_seconds": 323.010533815,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-128-2.log",
+            "max_rss_kib": 10268,
+            "recorded_utc": "2026-09-02T21:56:59.525799+00:00",
+            "run_id": "xfs/10x100x1G/dcp-128/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 323.073980442,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-2.log",
+            "sha256": "15a902a3dbac2b17526b50ed34e718e5cde44859ba9693d31dec3e2b8e7328b9",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T17:51:38] Preserving file attributes.\n[2026-09-02T17:51:38] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T17:51:38] Walked 1011 items in 0.455 secs (2221.978 items/sec) ...\n[2026-09-02T17:51:39] Walked 1011 items in 1.319 seconds (766.494 items/sec)\n[2026-09-02T17:51:39] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/2\n[2026-09-02T17:51:40] Items: 1011\n[2026-09-02T17:51:40]   Directories: 11\n[2026-09-02T17:51:40]   Files: 1000\n[2026-09-02T17:51:40]   Links: 0\n[2026-09-02T17:51:40] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T17:51:42] Creating 11 directories\n[2026-09-02T17:51:43] Creating 1000 files.\n[2026-09-02T17:51:44] Copying data.\n[2026-09-02T17:52:20] Copied 61.931 GiB (7%) in 36.076 secs (1.717 GiB/s) 506 secs left ...\n[2026-09-02T17:52:59] Copied 178.714 GiB (19%) in 75.427 secs (2.369 GiB/s) 318 secs left ...\n[2026-09-02T17:53:38] Copied 295.811 GiB (32%) in 114.029 secs (2.594 GiB/s) 245 secs left ...\n[2026-09-02T17:54:17] Copied 403.996 GiB (43%) in 152.968 secs (2.641 GiB/s) 200 secs left ...\n[2026-09-02T17:54:56] Copied 518.482 GiB (56%) in 191.855 secs (2.702 GiB/s) 153 secs left ...\n[2026-09-02T17:55:35] Copied 636.031 GiB (68%) in 230.846 secs (2.755 GiB/s) 107 secs left ...\n[2026-09-02T17:56:33] Copied 754.491 GiB (81%) in 289.479 secs (2.606 GiB/s) 68 secs left ...\n[2026-09-02T17:56:57] Copied 909.054 GiB (98%) in 313.130 secs (2.903 GiB/s) 8 secs left ...\n[2026-09-02T17:56:57] Copied 931.323 GiB (100%) in 313.181 secs (2.974 GiB/s) done\n[2026-09-02T17:56:57] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:56:57] Copy rate: 2.971 GiB/s (1000000000000 bytes in 313.453 seconds)\n[2026-09-02T17:56:57] Syncing data to disk.\n[2026-09-02T17:56:58] Sync completed in 0.363 seconds.\n[2026-09-02T17:56:58] Setting ownership, permissions, and timestamps.\n[2026-09-02T17:56:58] Updated 1011 items in 0.470 seconds (2151.009 items/sec)\n[2026-09-02T17:56:58] Syncing directory updates to disk.\n[2026-09-02T17:56:59] Sync completed in 0.357 seconds.\n[2026-09-02T17:56:59] Started: Sep-02-2026,17:51:40\n[2026-09-02T17:56:59] Completed: Sep-02-2026,17:56:59\n[2026-09-02T17:56:59] Seconds: 318.745\n[2026-09-02T17:56:59] Items: 1011\n[2026-09-02T17:56:59]   Directories: 11\n[2026-09-02T17:56:59]   Files: 1000\n[2026-09-02T17:56:59]   Links: 0\n[2026-09-02T17:56:59] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T17:56:59] Rate: 2.922 GiB/s (1000000000000 bytes in 318.745 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-2.time.txt",
+            "sha256": "7580b1aa9b60f05dd9e22390ca42170c91960b89cbc3c0ddcd53290a9c794b62",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-128 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:22.93\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10268\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 37\n\tMinor (reclaiming a frame) page faults: 2822\n\tVoluntary context switches: 616\n\tInvoluntary context switches: 246\n\tSwaps: 0\n\tFile system inputs: 7854\n\tFile system outputs: 336\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "05131dc44969686703e818b830d867b0e50fa145b825fe7c8d801e5e1ed9b9a9",
+          "record": {
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 128 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/3",
+            "copy_seconds": 316.001434922,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-dcp-128-3.log",
+            "max_rss_kib": 10284,
+            "recorded_utc": "2026-09-02T22:35:44.595511+00:00",
+            "run_id": "xfs/10x100x1G/dcp-128/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 316.08012192,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-3.log",
+            "sha256": "c293556f497cfa09ef5a952dabb7026ecbc3db9e06951409d88a4c724760f969",
+            "encoding": "utf-8",
+            "text": "[2026-09-02T18:30:30] Preserving file attributes.\n[2026-09-02T18:30:30] Walking /instance-store/rcp-copy-bench/stage/10x100x1G\n[2026-09-02T18:30:31] Walked 1011 items in 0.660 secs (1531.827 items/sec) ...\n[2026-09-02T18:30:31] Walked 1011 items in 1.320 seconds (765.911 items/sec)\n[2026-09-02T18:30:31] Copying to /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/3\n[2026-09-02T18:30:32] Items: 1011\n[2026-09-02T18:30:32]   Directories: 11\n[2026-09-02T18:30:32]   Files: 1000\n[2026-09-02T18:30:32]   Links: 0\n[2026-09-02T18:30:32] Data: 931.323 GiB (953.674 MiB per file)\n[2026-09-02T18:30:34] Creating 11 directories\n[2026-09-02T18:30:35] Creating 1000 files.\n[2026-09-02T18:30:35] Copying data.\n[2026-09-02T18:30:55] Copied 61.756 GiB (7%) in 19.495 secs (3.168 GiB/s) 275 secs left ...\n[2026-09-02T18:31:49] Copied 110.111 GiB (12%) in 73.993 secs (1.488 GiB/s) 552 secs left ...\n[2026-09-02T18:32:27] Copied 299.344 GiB (32%) in 111.618 secs (2.682 GiB/s) 236 secs left ...\n[2026-09-02T18:33:06] Copied 395.674 GiB (42%) in 150.901 secs (2.622 GiB/s) 204 secs left ...\n[2026-09-02T18:33:44] Copied 525.421 GiB (56%) in 189.054 secs (2.779 GiB/s) 146 secs left ...\n[2026-09-02T18:34:23] Copied 633.053 GiB (68%) in 227.910 secs (2.778 GiB/s) 107 secs left ...\n[2026-09-02T18:35:01] Copied 750.583 GiB (81%) in 265.342 secs (2.829 GiB/s) 64 secs left ...\n[2026-09-02T18:35:42] Copied 867.886 GiB (93%) in 306.579 secs (2.831 GiB/s) 22 secs left ...\n[2026-09-02T18:35:42] Copied 931.323 GiB (100%) in 306.633 secs (3.037 GiB/s) done\n[2026-09-02T18:35:42] Copy data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:35:42] Copy rate: 3.035 GiB/s (1000000000000 bytes in 306.849 seconds)\n[2026-09-02T18:35:42] Syncing data to disk.\n[2026-09-02T18:35:42] Sync completed in 0.318 seconds.\n[2026-09-02T18:35:42] Setting ownership, permissions, and timestamps.\n[2026-09-02T18:35:43] Updated 1011 items in 0.544 seconds (1859.039 items/sec)\n[2026-09-02T18:35:43] Syncing directory updates to disk.\n[2026-09-02T18:35:44] Sync completed in 0.395 seconds.\n[2026-09-02T18:35:44] Started: Sep-02-2026,18:30:32\n[2026-09-02T18:35:44] Completed: Sep-02-2026,18:35:44\n[2026-09-02T18:35:44] Seconds: 311.745\n[2026-09-02T18:35:44] Items: 1011\n[2026-09-02T18:35:44]   Directories: 11\n[2026-09-02T18:35:44]   Files: 1000\n[2026-09-02T18:35:44]   Links: 0\n[2026-09-02T18:35:44] Data: 931.323 GiB (1000000000000 bytes)\n[2026-09-02T18:35:44] Rate: 2.987 GiB/s (1000000000000 bytes in 311.745 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-dcp-128-3.time.txt",
+            "sha256": "02db9b7c16b8d722817428e94df601a8f399611fff6a69dacce0226a32b843ab",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs dcp-128 /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/dcp-128/3\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:15.91\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10284\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 37\n\tMinor (reclaiming a frame) page faults: 2822\n\tVoluntary context switches: 601\n\tInvoluntary context switches: 156\n\tSwaps: 0\n\tFile system inputs: 7742\n\tFile system outputs: 336\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "cp-1x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.069266934,
+          "mean": 0.070672726,
+          "median": 0.070428408,
+          "max": 0.072322836
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.142776657,
+          "mean": 0.143893823,
+          "median": 0.143482008,
+          "max": 0.145422804
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "max": 0.0
+        },
+        "system_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "max_rss_kib": {
+          "min": 3536,
+          "mean": 3636.0,
+          "median": 3544,
+          "max": 3828
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "34528086948b936cede293435c88782cba92c94136bc38d873f16165c894f015",
+          "record": {
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench/stage/10x100x1G/. /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/1/",
+            "copy_seconds": 0.069266934,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-1x-1.log",
+            "max_rss_kib": 3828,
+            "recorded_utc": "2026-09-02T21:17:21.314272+00:00",
+            "run_id": "xfs/10x100x1G/cp-1x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.142776657,
+            "system_cpu_seconds": 0.01,
+            "user_cpu_seconds": 0.0,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-1.time.txt",
+            "sha256": "26495e1c7f94432007b06eac9c0706bdbbf223130a2982dd7fae14c156fd502f",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/1\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 47%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 3828\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 5\n\tMinor (reclaiming a frame) page faults: 756\n\tVoluntary context switches: 291\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 3803\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "ebdfd8dd6e4102c8f2d7b58459a596f491c7524ddf5d39e45e84d1e162962abf",
+          "record": {
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench/stage/10x100x1G/. /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/2/",
+            "copy_seconds": 0.070428408,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-1x-2.log",
+            "max_rss_kib": 3544,
+            "recorded_utc": "2026-09-02T21:57:08.527571+00:00",
+            "run_id": "xfs/10x100x1G/cp-1x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.143482008,
+            "system_cpu_seconds": 0.01,
+            "user_cpu_seconds": 0.0,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-2.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-2.time.txt",
+            "sha256": "57313e52a067f7bb8613a08909e3daef4753bf10004cfc69cbf5ea937816c198",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/2\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 46%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 3544\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 5\n\tMinor (reclaiming a frame) page faults: 751\n\tVoluntary context switches: 240\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 3085\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "97106663a53aac0b1b85ff79cdd8600c73412c25cd86ba652ba55cdbe10ce3d0",
+          "record": {
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench/stage/10x100x1G/. /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/3/",
+            "copy_seconds": 0.072322836,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-1x-3.log",
+            "max_rss_kib": 3536,
+            "recorded_utc": "2026-09-02T22:35:54.030147+00:00",
+            "run_id": "xfs/10x100x1G/cp-1x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.145422804,
+            "system_cpu_seconds": 0.01,
+            "user_cpu_seconds": 0.0,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-3.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-1x-3.time.txt",
+            "sha256": "c5d8bc4b067519c569a40d2d31c7a53019f03c3c6e18feb38e3620970cdeb769",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-1x/3\"\n\tUser time (seconds): 0.00\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 46%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 3536\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 5\n\tMinor (reclaiming a frame) page faults: 757\n\tVoluntary context switches: 295\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 3773\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "cp-10x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 0.051355208,
+          "mean": 0.05349778533333333,
+          "median": 0.052145443,
+          "max": 0.056992705
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 0.123261016,
+          "mean": 0.12948808866666667,
+          "median": 0.129905427,
+          "max": 0.135297823
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.013333333333333334,
+          "median": 0.01,
+          "max": 0.02
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.03,
+          "median": 0.03,
+          "max": 0.04
+        },
+        "max_rss_kib": {
+          "min": 4320,
+          "mean": 4352.0,
+          "median": 4356,
+          "max": 4380
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "8fae7692e1161edebb1bf29b5609fc8dd3675c1c60512dcf7f701588a2473151",
+          "record": {
+            "command": "10 concurrent: cp --reflink=auto -a SOURCE/dirN DEST/",
+            "copy_seconds": 0.052145443,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-10x-1.log",
+            "max_rss_kib": 4356,
+            "recorded_utc": "2026-09-02T21:17:26.924826+00:00",
+            "run_id": "xfs/10x100x1G/cp-10x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.129905427,
+            "system_cpu_seconds": 0.04,
+            "user_cpu_seconds": 0.01,
+            "variant": "cp-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-1.time.txt",
+            "sha256": "4530f60792249fbf7a2a0e64f92c669f2c28b8b67d2799998f4ebe64caff3ad2",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.04\n\tPercent of CPU this job got: 200%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4356\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 8\n\tMinor (reclaiming a frame) page faults: 3938\n\tVoluntary context switches: 369\n\tInvoluntary context switches: 2\n\tSwaps: 0\n\tFile system inputs: 2879\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "dc0733ea89d5a9f53257a4a1ce24e55ad7e557e8194709eb0e9923b87b048216",
+          "record": {
+            "command": "10 concurrent: cp --reflink=auto -a SOURCE/dirN DEST/",
+            "copy_seconds": 0.056992705,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-10x-2.log",
+            "max_rss_kib": 4320,
+            "recorded_utc": "2026-09-02T21:57:14.137968+00:00",
+            "run_id": "xfs/10x100x1G/cp-10x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.135297823,
+            "system_cpu_seconds": 0.03,
+            "user_cpu_seconds": 0.01,
+            "variant": "cp-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-2.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-2.time.txt",
+            "sha256": "2d67b17c34a7c4b252e5b1bf6b6064419c95012f1ab87f5475020bfec72bb726",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.03\n\tPercent of CPU this job got: 192%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4320\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 7\n\tMinor (reclaiming a frame) page faults: 4036\n\tVoluntary context switches: 415\n\tInvoluntary context switches: 4\n\tSwaps: 0\n\tFile system inputs: 3715\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "252a2927c1174974d2732b984dcfae029e344b9b6866fdf6bdf16ff64c687584",
+          "record": {
+            "command": "10 concurrent: cp --reflink=auto -a SOURCE/dirN DEST/",
+            "copy_seconds": 0.051355208,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-cp-10x-3.log",
+            "max_rss_kib": 4380,
+            "recorded_utc": "2026-09-02T22:35:59.615600+00:00",
+            "run_id": "xfs/10x100x1G/cp-10x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 0.123261016,
+            "system_cpu_seconds": 0.02,
+            "user_cpu_seconds": 0.02,
+            "variant": "cp-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-3.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-cp-10x-3.time.txt",
+            "sha256": "1331a1d4d5c3938b5d7a9da76a74f6726be52985101bb8f101e8b4790e15da64",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs cp-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/cp-10x/3\"\n\tUser time (seconds): 0.02\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 200%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.02\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 4380\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 5\n\tMinor (reclaiming a frame) page faults: 3971\n\tVoluntary context switches: 400\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 3387\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rsync-1x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 664.690724117,
+          "mean": 679.86488858,
+          "median": 681.43806677,
+          "max": 693.465874853
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 669.481083064,
+          "mean": 684.2384582563333,
+          "median": 685.653631904,
+          "max": 697.580659801
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 146.16,
+          "mean": 147.03333333333333,
+          "median": 147.24,
+          "max": 147.7
+        },
+        "system_cpu_seconds": {
+          "min": 389.12,
+          "mean": 389.9266666666667,
+          "median": 389.87,
+          "max": 390.79
+        },
+        "max_rss_kib": {
+          "min": 8124,
+          "mean": 8177.333333333333,
+          "median": 8176,
+          "max": 8232
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "5e227c85a0c2d070c3ca95af43e34953618da6a36209e281b0273b4adb649720",
+          "record": {
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x100x1G/ /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/1/",
+            "copy_seconds": 664.690724117,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-1x-1.log",
+            "max_rss_kib": 8176,
+            "recorded_utc": "2026-09-02T21:28:41.876372+00:00",
+            "run_id": "xfs/10x100x1G/rsync-1x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 669.481083064,
+            "system_cpu_seconds": 390.79,
+            "user_cpu_seconds": 146.16,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-1.time.txt",
+            "sha256": "a2c0408a63d5ed5033b6917d21ffa1c13dc951f0f64580bc5d1a9f6673009f7a",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/1\"\n\tUser time (seconds): 146.16\n\tSystem time (seconds): 390.79\n\tPercent of CPU this job got: 80%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 11:04.62\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8176\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 83\n\tMinor (reclaiming a frame) page faults: 1798\n\tVoluntary context switches: 8081379\n\tInvoluntary context switches: 32796\n\tSwaps: 0\n\tFile system inputs: 1953149173\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "7e4cac16733b725293dde6bb0d04697699d5912d6988ca367d48963e05c3f7ec",
+          "record": {
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x100x1G/ /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/2/",
+            "copy_seconds": 693.465874853,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-1x-2.log",
+            "max_rss_kib": 8124,
+            "recorded_utc": "2026-09-02T22:08:57.167367+00:00",
+            "run_id": "xfs/10x100x1G/rsync-1x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 697.580659801,
+            "system_cpu_seconds": 389.87,
+            "user_cpu_seconds": 147.7,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-2.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-2.time.txt",
+            "sha256": "025e48540d02ac94dae52c06e5541dd3faba0c4605766a926190d8bcaf7d0c18",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/2\"\n\tUser time (seconds): 147.70\n\tSystem time (seconds): 389.87\n\tPercent of CPU this job got: 77%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 11:33.40\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8124\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 84\n\tMinor (reclaiming a frame) page faults: 1783\n\tVoluntary context switches: 8106212\n\tInvoluntary context switches: 32410\n\tSwaps: 0\n\tFile system inputs: 1953148971\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "7850d8a6eecf1f06253cf16def312dee7b38d491d98ce72d0e72a88625f29d00",
+          "record": {
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x100x1G/ /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/3/",
+            "copy_seconds": 681.43806677,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-1x-3.log",
+            "max_rss_kib": 8232,
+            "recorded_utc": "2026-09-02T22:47:30.733717+00:00",
+            "run_id": "xfs/10x100x1G/rsync-1x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 685.653631904,
+            "system_cpu_seconds": 389.12,
+            "user_cpu_seconds": 147.24,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-3.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-1x-3.time.txt",
+            "sha256": "40b60c64427e1f23ac7e2b6d5b621e9d3a78171842543b5182d10b2b4a2f3d6e",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-1x/3\"\n\tUser time (seconds): 147.24\n\tSystem time (seconds): 389.12\n\tPercent of CPU this job got: 78%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 11:21.37\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8232\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 84\n\tMinor (reclaiming a frame) page faults: 1791\n\tVoluntary context switches: 8094826\n\tInvoluntary context switches: 32533\n\tSwaps: 0\n\tFile system inputs: 1953148533\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rsync-10x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 296.919677592,
+          "mean": 304.05512550633335,
+          "median": 306.477344147,
+          "max": 308.76835478
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 316.102075888,
+          "mean": 322.738276923,
+          "median": 323.903409824,
+          "max": 328.209345057
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 145.69,
+          "mean": 147.03666666666666,
+          "median": 147.49,
+          "max": 147.93
+        },
+        "system_cpu_seconds": {
+          "min": 466.18,
+          "mean": 470.6233333333333,
+          "median": 469.28,
+          "max": 476.41
+        },
+        "max_rss_kib": {
+          "min": 7724,
+          "mean": 7825.333333333333,
+          "median": 7788,
+          "max": 7964
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "04eadd646fbf696c42f30881b7e242ace7c696c686ee5aed112640dcaa5cb68a",
+          "record": {
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 306.477344147,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/1",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-10x-1.log",
+            "max_rss_kib": 7964,
+            "recorded_utc": "2026-09-02T21:34:13.981144+00:00",
+            "run_id": "xfs/10x100x1G/rsync-10x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 323.903409824,
+            "system_cpu_seconds": 476.41,
+            "user_cpu_seconds": 147.93,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-1.time.txt",
+            "sha256": "4619d130e6d392f2898d56f0fb23a93e36586fc257433fcf3890d21c0d87fcb9",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/1\"\n\tUser time (seconds): 147.93\n\tSystem time (seconds): 476.41\n\tPercent of CPU this job got: 203%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:06.41\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7964\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 467\n\tMinor (reclaiming a frame) page faults: 16123\n\tVoluntary context switches: 5107481\n\tInvoluntary context switches: 19686\n\tSwaps: 0\n\tFile system inputs: 1953148291\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "b6aed93555989946ea44c7770c3319c8f4823797c3f437e91ce6ffe24b133359",
+          "record": {
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 296.919677592,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/2",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-10x-2.log",
+            "max_rss_kib": 7724,
+            "recorded_utc": "2026-09-02T22:14:21.518408+00:00",
+            "run_id": "xfs/10x100x1G/rsync-10x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 316.102075888,
+            "system_cpu_seconds": 469.28,
+            "user_cpu_seconds": 147.49,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-2.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-2.time.txt",
+            "sha256": "2349b11d31e1d03717a0f5c86726341698f70ec4cd54556e0148a089f9f585e6",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/2\"\n\tUser time (seconds): 147.49\n\tSystem time (seconds): 469.28\n\tPercent of CPU this job got: 207%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:56.86\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7724\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 510\n\tMinor (reclaiming a frame) page faults: 16065\n\tVoluntary context switches: 5170454\n\tInvoluntary context switches: 19981\n\tSwaps: 0\n\tFile system inputs: 1953148219\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "d76c3418417c6b29809e43c711643b9c108570fcc5e12101e6b220370355953a",
+          "record": {
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 308.76835478,
+            "destination": "/instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/3",
+            "destination_bytes": 1000000000000,
+            "destination_files": 1000,
+            "exit_code": 0,
+            "fileset": "10x100x1G",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/xfs-10x100x1G-rsync-10x-3.log",
+            "max_rss_kib": 7788,
+            "recorded_utc": "2026-09-02T22:53:07.143609+00:00",
+            "run_id": "xfs/10x100x1G/rsync-10x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench/stage/10x100x1G",
+            "source_bytes": 1000000000000,
+            "source_files": 1000,
+            "status": "ok",
+            "sync_seconds": 328.209345057,
+            "system_cpu_seconds": 466.18,
+            "user_cpu_seconds": 145.69,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-3.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/xfs-10x100x1G-rsync-10x-3.time.txt",
+            "sha256": "064ba87da0b3011822553484561ec9881494f3631c651f9e736d92f9ba15a2c4",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"bash -c run_variant \"$@\" -- xfs rsync-10x /instance-store/rcp-copy-bench/stage/10x100x1G /instance-store/rcp-copy-bench/dest/xfs/10x100x1G/rsync-10x/3\"\n\tUser time (seconds): 145.69\n\tSystem time (seconds): 466.18\n\tPercent of CPU this job got: 198%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:08.69\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 7788\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 469\n\tMinor (reclaiming a frame) page faults: 16155\n\tVoluntary context switches: 5232888\n\tInvoluntary context switches: 19805\n\tSwaps: 0\n\tFile system inputs: 1953148723\n\tFile system outputs: 1953128000\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    }
+  ],
+  "right_censored_outcomes": [],
+  "selection_note": "October 11 corrective rcp rows and September cp, dcp, rsync reference rows; different hosts and dates; invalid run5 and September rcp excluded"
+}

@@ -1,0 +1,1484 @@
+{
+  "schema": "rcp-results-packet-v1",
+  "measurement_contexts": {
+    "compute_september": {
+      "machine": {
+        "source_host": "compute003200",
+        "destination_host_local": "compute003200",
+        "destination_host_remote_rsync": "compute027148",
+        "slurm_partition": "perf_copy_m8idn_16xl-on-demand",
+        "allocated_cpus": 32,
+        "memory_request": "200G",
+        "aws_instance_type": "m8idn.16xlarge",
+        "aws_instance_type_basis": "inferred from Slurm partition name; EC2 metadata not retained"
+      },
+      "storage": "local XFS /instance-store, local NFS /d, or remote XFS /instance-store; see scope and filesystem fields",
+      "cache_policy": "source compute sync, then client drop_caches=3, then 5 second settle; storage-server caches not controlled",
+      "rcp_build": {
+        "version": "0.41.0",
+        "protocol": "0.41.0+w6",
+        "git_hash": "e68a5adf05e5b06393c7a332f2f4e33e32a5e06e",
+        "sha256": null
+      },
+      "recorded_utc_first": "2026-09-11T21:41:45.493831+00:00",
+      "recorded_utc_last": "2026-09-12T00:01:51.754989+00:00",
+      "source_ledger_sha256": "aba49641f8f01cbac5f0631e4282c9b23729979039e5b5371ba8a78fb721acd9"
+    },
+    "remote_october": {
+      "machine": {
+        "source_host": "compute017153",
+        "destination_host": "compute017203",
+        "slurm_partition": "perf_copy_m8idn_16xl-on-demand",
+        "allocated_cpus_per_host": 32,
+        "allocated_memory_per_host": "200G",
+        "aws_instance_type": "m8idn.16xlarge",
+        "aws_instance_type_basis": "inferred from Slurm partition name; EC2 metadata not retained"
+      },
+      "storage": "XFS /instance-store on two separate computes",
+      "cache_policy": "source compute sync, then client drop_caches=3, then 5 second settle; destination host cache not documented as dropped",
+      "rcp_build": {
+        "version": "0.41.0",
+        "protocol": "0.41.0+w11",
+        "git_hash": "27c089508c13cc2a87101df4798930070f9fc509",
+        "sha256": "edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8"
+      },
+      "recorded_utc_first": "2026-10-11T01:16:16.617083+00:00",
+      "recorded_utc_last": "2026-10-11T02:59:59.258485+00:00",
+      "source_ledger_sha256": "e0e0774d369a336922e9a2f171717e718604780a6e354d76896308f297f50be9"
+    }
+  },
+  "scope": "remote",
+  "filesystem": "xfs",
+  "fileset": {
+    "name": "10x10x10x10x1024x1K",
+    "files": 10240000,
+    "directories_including_root": 11111,
+    "apparent_bytes": 10240000000
+  },
+  "wall_time_primary": "completion_seconds: copy start through destination sync and validation",
+  "variants": [
+    {
+      "variant": "rsync-10x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 73.549998899,
+          "mean": 73.78800652700001,
+          "median": 73.892812324,
+          "max": 73.921208358
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 94.240121261,
+          "mean": 94.62912324766667,
+          "median": 94.342478929,
+          "max": 95.304769553
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 41.31,
+          "mean": 41.58,
+          "median": 41.68,
+          "max": 41.75
+        },
+        "system_cpu_seconds": {
+          "min": 69.16,
+          "mean": 69.46666666666667,
+          "median": 69.35,
+          "max": 69.89
+        },
+        "max_rss_kib": {
+          "min": 10812.0,
+          "mean": 10868.0,
+          "median": 10872.0,
+          "max": 10920.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "0160486945bd0fe7188e1b75bbfe505ab110bf70fb3dbecec8f486fd794ebfc9",
+          "record": {
+            "attempt": 1,
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 73.549998899,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-1.attempt-1.log",
+            "max_rss_kib": 10812,
+            "recorded_utc": "2026-09-11T21:47:47.301712+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-10x/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 94.240121261,
+            "system_cpu_seconds": 69.16,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-1.attempt-1.time.txt",
+            "user_cpu_seconds": 41.68,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-1.attempt-1.log",
+            "sha256": "37ae1e8d169c094be2dd3bc101a41bd28e384dd7af99cc33f61fce526ee87c3f",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-1.attempt-1.time.txt",
+            "sha256": "d898f7a4a52024a151f12ba6acb18e811db9753c8f403374bbe62b446e7591bc",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-10x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/1\"\n\tUser time (seconds): 41.68\n\tSystem time (seconds): 69.16\n\tPercent of CPU this job got: 150%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:13.48\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10812\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 319\n\tMinor (reclaiming a frame) page faults: 26686\n\tVoluntary context switches: 10906788\n\tInvoluntary context switches: 372\n\tSwaps: 0\n\tFile system inputs: 93072544\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "b8f190b2aa383fe722c176299ce6f1bb9c3d6a3d603066d5acffcdb6563373b0",
+          "record": {
+            "attempt": 1,
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 73.892812324,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-2.attempt-1.log",
+            "max_rss_kib": 10872,
+            "recorded_utc": "2026-09-11T22:55:20.466262+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-10x/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 94.342478929,
+            "system_cpu_seconds": 69.89,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-2.attempt-1.time.txt",
+            "user_cpu_seconds": 41.31,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-2.attempt-1.log",
+            "sha256": "37ae1e8d169c094be2dd3bc101a41bd28e384dd7af99cc33f61fce526ee87c3f",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-2.attempt-1.time.txt",
+            "sha256": "e25f43de182810d2464e31696f27bb3fa357141dbe6876c11924b16b3eb9e73d",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-10x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/2\"\n\tUser time (seconds): 41.31\n\tSystem time (seconds): 69.89\n\tPercent of CPU this job got: 150%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:13.84\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10872\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 359\n\tMinor (reclaiming a frame) page faults: 27611\n\tVoluntary context switches: 10907725\n\tInvoluntary context switches: 385\n\tSwaps: 0\n\tFile system inputs: 93072640\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "b7b7be3bcbca824dd37e9648094cc8b2a5f6abd3c78f936c105598b62b3b983a",
+          "record": {
+            "attempt": 1,
+            "command": "10 concurrent: rsync -a SOURCE/dirN/ DEST/dirN/",
+            "copy_seconds": 73.921208358,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-3.attempt-1.log",
+            "max_rss_kib": 10920,
+            "recorded_utc": "2026-09-12T00:01:51.754989+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-10x/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 95.304769553,
+            "system_cpu_seconds": 69.35,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-3.attempt-1.time.txt",
+            "user_cpu_seconds": 41.75,
+            "variant": "rsync-10x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-3.attempt-1.log",
+            "sha256": "37ae1e8d169c094be2dd3bc101a41bd28e384dd7af99cc33f61fce526ee87c3f",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-10x-3.attempt-1.time.txt",
+            "sha256": "6e48553cefe20f58744f7e902931e408db3ca12a42972db1436f5ecfb3112f55",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-10x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-10x/3\"\n\tUser time (seconds): 41.75\n\tSystem time (seconds): 69.35\n\tPercent of CPU this job got: 150%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:13.85\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10920\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 393\n\tMinor (reclaiming a frame) page faults: 28260\n\tVoluntary context switches: 10908226\n\tInvoluntary context switches: 411\n\tSwaps: 0\n\tFile system inputs: 93072240\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-8",
+      "source_campaign": "remote_october",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 282.064437675,
+          "mean": 291.6367086576667,
+          "median": 293.760838815,
+          "max": 299.084849483
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 315.234043678,
+          "mean": 322.5292260243333,
+          "median": 324.208882434,
+          "max": 328.144751961
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.05,
+          "mean": 0.056666666666666664,
+          "median": 0.06,
+          "max": 0.06
+        },
+        "system_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "max_rss_kib": {
+          "min": 9284.0,
+          "mean": 9337.333333333334,
+          "median": 9364.0,
+          "max": 9364.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "3d75303947b334172744c09bfc781738331fdea1f1cabd9f3c6deac4f4703ec4",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=8 --max-connections=8 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/1",
+            "copy_seconds": 282.064437675,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-1.attempt-1.log",
+            "max_rss_kib": 9364,
+            "recorded_utc": "2026-10-11T01:24:50.812349+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-8/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 315.234043678,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-1.attempt-1.log",
+            "sha256": "1523ff3e2d30461b7d522c6be83be076ab70c7d1dc4c18ae006c0026a2fa2e00",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 281.91s\n\nDESTINATION (10.74.17.203):\n  cpu time : 927.78s | k: 480.03s | u: 447.75s\n  peak RSS : 10.1 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.1 MiB\n  source cpu time : 2529.80s | k: 1535.50s | u: 994.30s\n  source peak RSS : 16.0 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-1.attempt-1.time.txt",
+            "sha256": "0b6d68c897605c76481400b4dcaa246f1b27ea6f70c8a6c1d247488fa348d617",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-8 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/1\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:42.03\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9364\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 64\n\tMinor (reclaiming a frame) page faults: 3632\n\tVoluntary context switches: 906\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 2740\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-1.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 480.03,
+                "cpu_total_seconds": 927.78,
+                "cpu_user_seconds": 447.75,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 10590618,
+                "peak_rss_display": "10.1 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9542042,
+                "peak_rss_display": "9.1 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 1535.5,
+                "cpu_total_seconds": 2529.8,
+                "cpu_user_seconds": 994.3,
+                "host": "localhost",
+                "peak_rss_bytes": 16777216,
+                "peak_rss_display": "16.0 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 281.91
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "74f544b3db21395acaa5cfff040ff1bccfb4e69e6d48edfee761524176637e6f",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=8 --max-connections=8 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/2",
+            "copy_seconds": 299.084849483,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-2.attempt-1.log",
+            "max_rss_kib": 9284,
+            "recorded_utc": "2026-10-11T02:02:17.167649+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-8/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 328.144751961,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-2.attempt-1.log",
+            "sha256": "049b141ae072f332a8e227cf80207c56d7c20f953a96e5401442916dbdcf4e00",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 298.93s\n\nDESTINATION (10.74.17.203):\n  cpu time : 912.64s | k: 471.94s | u: 440.70s\n  peak RSS : 10.1 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.3 MiB\n  source cpu time : 2849.06s | k: 1961.60s | u: 887.46s\n  source peak RSS : 14.3 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-2.attempt-1.time.txt",
+            "sha256": "5e22e8bafd0848f26ad06f58e935b497ab7841c7f78852c9bef9e2601ca24777",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-8 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/2\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:59.05\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9284\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 65\n\tMinor (reclaiming a frame) page faults: 3649\n\tVoluntary context switches: 952\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 3052\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-2.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 471.94,
+                "cpu_total_seconds": 912.64,
+                "cpu_user_seconds": 440.7,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 10590618,
+                "peak_rss_display": "10.1 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9751757,
+                "peak_rss_display": "9.3 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 1961.6,
+                "cpu_total_seconds": 2849.06,
+                "cpu_user_seconds": 887.46,
+                "host": "localhost",
+                "peak_rss_bytes": 14994637,
+                "peak_rss_display": "14.3 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 298.93
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "2f8f8e06fcd080953573c2690cab197a523565af8e13f80e3d2e9284d5cae167",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=8 --max-connections=8 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/3",
+            "copy_seconds": 293.760838815,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-3.attempt-1.log",
+            "max_rss_kib": 9364,
+            "recorded_utc": "2026-10-11T02:40:14.975924+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-8/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 324.208882434,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.05,
+            "variant": "rcp-8"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-3.attempt-1.log",
+            "sha256": "6e76d83d37fbe3e6402299bdab341857b09944ce040d73a46596c3261d29ea9e",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 293.60s\n\nDESTINATION (10.74.17.203):\n  cpu time : 932.27s | k: 482.74s | u: 449.53s\n  peak RSS : 10.0 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.3 MiB\n  source cpu time : 2710.95s | k: 1764.04s | u: 946.91s\n  source peak RSS : 13.9 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-3.attempt-1.time.txt",
+            "sha256": "fa77607a1c2d19b6b6597140feb1dbf8fcaf525b831dd221088d3c286f9c5b18",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-8 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-8/3\"\n\tUser time (seconds): 0.05\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 4:53.73\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9364\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 63\n\tMinor (reclaiming a frame) page faults: 3633\n\tVoluntary context switches: 878\n\tInvoluntary context switches: 2\n\tSwaps: 0\n\tFile system inputs: 2740\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-8-3.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 482.74,
+                "cpu_total_seconds": 932.27,
+                "cpu_user_seconds": 449.53,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 10485760,
+                "peak_rss_display": "10.0 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9751757,
+                "peak_rss_display": "9.3 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 1764.04,
+                "cpu_total_seconds": 2710.95,
+                "cpu_user_seconds": 946.91,
+                "host": "localhost",
+                "peak_rss_bytes": 14575206,
+                "peak_rss_display": "13.9 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 293.6
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-default",
+      "source_campaign": "remote_october",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 333.926555508,
+          "mean": 349.45249264666666,
+          "median": 353.44936288,
+          "max": 360.981559552
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 362.442257859,
+          "mean": 376.858854273,
+          "median": 380.538244365,
+          "max": 387.596060595
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.05,
+          "mean": 0.056666666666666664,
+          "median": 0.06,
+          "max": 0.06
+        },
+        "system_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.013333333333333334,
+          "median": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 9368.0,
+          "mean": 9837.333333333334,
+          "median": 9368.0,
+          "max": 10776.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "5f3a87854fa616e5f876508820847a2c7331cab4d06d0488ab3794855e44f5de",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/1",
+            "copy_seconds": 360.981559552,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-1.attempt-1.log",
+            "max_rss_kib": 9368,
+            "recorded_utc": "2026-10-11T01:16:16.617083+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-default/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 387.596060595,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.05,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-1.attempt-1.log",
+            "sha256": "2fce8e9bdb8279896664b9d96e10d3e22c11d1eb9158a86c8e8e461e9fcb9ec8",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 360.81s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1051.19s | k: 596.05s | u: 455.14s\n  peak RSS : 17.3 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.1 MiB\n  source cpu time : 8052.09s | k: 7179.28s | u: 872.81s\n  source peak RSS : 28.7 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-1.attempt-1.time.txt",
+            "sha256": "fc219eb81b38a961266bc453e6934f70fb7432b682fc80f02b535d5c7720596c",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-default /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/1\"\n\tUser time (seconds): 0.05\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:00.94\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9368\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 61\n\tMinor (reclaiming a frame) page faults: 3645\n\tVoluntary context switches: 941\n\tInvoluntary context switches: 2\n\tSwaps: 0\n\tFile system inputs: 3068\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-1.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 596.05,
+                "cpu_total_seconds": 1051.19,
+                "cpu_user_seconds": 455.14,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 18140365,
+                "peak_rss_display": "17.3 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9542042,
+                "peak_rss_display": "9.1 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7179.28,
+                "cpu_total_seconds": 8052.09,
+                "cpu_user_seconds": 872.81,
+                "host": "localhost",
+                "peak_rss_bytes": 30094131,
+                "peak_rss_display": "28.7 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 360.81
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "dbb89638886ab6a427ff5b32c77c69470483ff5b5c89e93c8069b3eacbd86bfc",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/2",
+            "copy_seconds": 333.926555508,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-2.attempt-1.log",
+            "max_rss_kib": 10776,
+            "recorded_utc": "2026-10-11T01:53:35.011045+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-default/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 362.442257859,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-2.attempt-1.log",
+            "sha256": "3f9dd2004871df45d5c4b1426b47e9f53dfc37a63073d006b35e42db669bbb95",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 333.77s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1169.54s | k: 711.84s | u: 457.70s\n  peak RSS : 13.9 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 11.4 MiB\n  source cpu time : 7311.18s | k: 6366.11s | u: 945.07s\n  source peak RSS : 23.9 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-2.attempt-1.time.txt",
+            "sha256": "bb8bc12719006ada84bc1d075e9b0c625bd9ece2f2d0ce419065bf98ffc4d80d",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-default /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/2\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:33.89\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10776\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 64\n\tMinor (reclaiming a frame) page faults: 3641\n\tVoluntary context switches: 945\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 3092\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-2.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 711.84,
+                "cpu_total_seconds": 1169.54,
+                "cpu_user_seconds": 457.7,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 14575206,
+                "peak_rss_display": "13.9 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 11953766,
+                "peak_rss_display": "11.4 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 6366.11,
+                "cpu_total_seconds": 7311.18,
+                "cpu_user_seconds": 945.07,
+                "host": "localhost",
+                "peak_rss_bytes": 25060966,
+                "peak_rss_display": "23.9 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 333.77
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "457dec71a896008a8f17036eeff719b2038b4ba59a611cc249fe9b9e97c32e82",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/3",
+            "copy_seconds": 353.44936288,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-3.attempt-1.log",
+            "max_rss_kib": 9368,
+            "recorded_utc": "2026-10-11T02:31:39.908488+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-default/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 380.538244365,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-3.attempt-1.log",
+            "sha256": "ca3f7ab9ecc1c21659eabcba369753ea9306878aade5e2ceff1cd1051c2bf154",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 353.28s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1116.56s | k: 654.89s | u: 461.67s\n  peak RSS : 13.6 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.3 MiB\n  source cpu time : 8203.84s | k: 7255.45s | u: 948.39s\n  source peak RSS : 22.2 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-3.attempt-1.time.txt",
+            "sha256": "07ea1757676580641d8f2bf2ccce48a1e5ec76ceb3671d8e6d6defa7f6d6f2a9",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-default /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-default/3\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:53.41\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9368\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 64\n\tMinor (reclaiming a frame) page faults: 3650\n\tVoluntary context switches: 961\n\tInvoluntary context switches: 2\n\tSwaps: 0\n\tFile system inputs: 3172\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-default-3.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 654.89,
+                "cpu_total_seconds": 1116.56,
+                "cpu_user_seconds": 461.67,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 14260634,
+                "peak_rss_display": "13.6 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9751757,
+                "peak_rss_display": "9.3 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7255.45,
+                "cpu_total_seconds": 8203.84,
+                "cpu_user_seconds": 948.39,
+                "host": "localhost",
+                "peak_rss_bytes": 23278387,
+                "peak_rss_display": "22.2 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 353.28
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-32",
+      "source_campaign": "remote_october",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 352.72604286,
+          "mean": 361.445537483,
+          "median": 365.453972831,
+          "max": 366.156596758
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 379.390109028,
+          "mean": 388.205644768,
+          "median": 392.431962182,
+          "max": 392.794863094
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.05,
+          "mean": 0.056666666666666664,
+          "median": 0.06,
+          "max": 0.06
+        },
+        "system_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.013333333333333334,
+          "median": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 9300.0,
+          "mean": 9321.333333333334,
+          "median": 9308.0,
+          "max": 9356.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "445f42b5036957baf6e29152404b42e40888d06b7d3a6f1b90715d13ba84f115",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=32 --max-connections=32 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/1",
+            "copy_seconds": 366.156596758,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-1.attempt-1.log",
+            "max_rss_kib": 9356,
+            "recorded_utc": "2026-10-11T01:34:31.486273+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-32/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 392.794863094,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-1.attempt-1.log",
+            "sha256": "8b298e00e93da3e3cfe3ba46e5c1524b542e707f5c2ad068c9f05c5b3650abd3",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 365.99s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1058.04s | k: 607.80s | u: 450.24s\n  peak RSS : 14.8 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.1 MiB\n  source cpu time : 8247.08s | k: 7324.64s | u: 922.44s\n  source peak RSS : 23.9 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-1.attempt-1.time.txt",
+            "sha256": "8f3e3866bcfbddafef78fbaf3f6c1c9a0dc60869b8ccfa6a87b1935047915e43",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-32 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/1\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:06.12\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9356\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 66\n\tMinor (reclaiming a frame) page faults: 3627\n\tVoluntary context switches: 937\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 2772\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-1.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 607.8,
+                "cpu_total_seconds": 1058.04,
+                "cpu_user_seconds": 450.24,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 15518925,
+                "peak_rss_display": "14.8 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9542042,
+                "peak_rss_display": "9.1 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7324.64,
+                "cpu_total_seconds": 8247.08,
+                "cpu_user_seconds": 922.44,
+                "host": "localhost",
+                "peak_rss_bytes": 25060966,
+                "peak_rss_display": "23.9 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 365.99
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "1ae45f1ea8a9196c9fd0b402d312b0227f0e481b5d6ddb7442a3468c28959689",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=32 --max-connections=32 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/2",
+            "copy_seconds": 352.72604286,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-2.attempt-1.log",
+            "max_rss_kib": 9308,
+            "recorded_utc": "2026-10-11T02:11:51.000667+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-32/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 379.390109028,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.05,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-2.attempt-1.log",
+            "sha256": "861fcbfcc15aef2f2902808496118e6f9a224b4ba97b2dd4ebbd3c3dcd0b28ad",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 352.56s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1093.69s | k: 641.17s | u: 452.52s\n  peak RSS : 14.8 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.3 MiB\n  source cpu time : 8193.10s | k: 7198.37s | u: 994.73s\n  source peak RSS : 24.1 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-2.attempt-1.time.txt",
+            "sha256": "4e11a3173106a49362a10915fcbda003b4877e5e5f3333cc37a02ddec45188f8",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-32 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/2\"\n\tUser time (seconds): 0.05\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 5:52.69\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9308\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 64\n\tMinor (reclaiming a frame) page faults: 3635\n\tVoluntary context switches: 925\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 3188\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-2.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 641.17,
+                "cpu_total_seconds": 1093.69,
+                "cpu_user_seconds": 452.52,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 15518925,
+                "peak_rss_display": "14.8 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9751757,
+                "peak_rss_display": "9.3 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7198.37,
+                "cpu_total_seconds": 8193.1,
+                "cpu_user_seconds": 994.73,
+                "host": "localhost",
+                "peak_rss_bytes": 25270682,
+                "peak_rss_display": "24.1 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 352.56
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "aff11102e54896407e0ff987f1546c84c0e054c8231ef2098cf29200aee772e0",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=32 --max-connections=32 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/3",
+            "copy_seconds": 365.453972831,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-3.attempt-1.log",
+            "max_rss_kib": 9300,
+            "recorded_utc": "2026-10-11T02:49:55.990100+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-32/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 392.431962182,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-32"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-3.attempt-1.log",
+            "sha256": "f7b917e22e79c6c83ee16b0a257b51c30a8a63bbd9c30fecff028396c5f3bd36",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 365.28s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1089.04s | k: 633.94s | u: 455.10s\n  peak RSS : 15.2 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.1 MiB\n  source cpu time : 8524.38s | k: 7585.96s | u: 938.42s\n  source peak RSS : 22.2 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-3.attempt-1.time.txt",
+            "sha256": "7e22c43f98928df11f0685feee964477cc15356bd3601b1848882ba61bf03221",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-32 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-32/3\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:05.42\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9300\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 61\n\tMinor (reclaiming a frame) page faults: 3637\n\tVoluntary context switches: 877\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 2844\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-32-3.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 633.94,
+                "cpu_total_seconds": 1089.04,
+                "cpu_user_seconds": 455.1,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 15938355,
+                "peak_rss_display": "15.2 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9542042,
+                "peak_rss_display": "9.1 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7585.96,
+                "cpu_total_seconds": 8524.38,
+                "cpu_user_seconds": 938.42,
+                "host": "localhost",
+                "peak_rss_bytes": 23278387,
+                "peak_rss_display": "22.2 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 365.28
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rcp-128",
+      "source_campaign": "remote_october",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 373.003600771,
+          "mean": 381.416202399,
+          "median": 378.942073377,
+          "max": 392.302933049
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 405.890585358,
+          "mean": 412.852460519,
+          "median": 409.928006478,
+          "max": 422.738789721
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.04,
+          "mean": 0.05333333333333333,
+          "median": 0.06,
+          "max": 0.06
+        },
+        "system_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.013333333333333334,
+          "median": 0.01,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 9396.0,
+          "mean": 9417.333333333334,
+          "median": 9404.0,
+          "max": 9452.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "a89b2a17e6e6ff95a2d0402770cf09bdd31ddd7afc02fa50f8e4eb55b2529f61",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=128 --max-connections=128 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/1",
+            "copy_seconds": 373.003600771,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-1.attempt-1.log",
+            "max_rss_kib": 9396,
+            "recorded_utc": "2026-10-11T01:44:25.019871+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-128/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 405.890585358,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-1.attempt-1.log",
+            "sha256": "b512a0f370528a2095ce8202abe2de75c3211bfaa28a88dd3b3eade499bfc3c7",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 372.84s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1098.30s | k: 634.11s | u: 464.19s\n  peak RSS : 20.1 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.4 MiB\n  source cpu time : 9087.35s | k: 8173.09s | u: 914.26s\n  source peak RSS : 60.0 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-1.attempt-1.time.txt",
+            "sha256": "596a0db21ed1d666fe3ade9ae8de34287a26c83b072b2b622a4753cab0a2ee0e",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-128 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/1\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:12.96\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9396\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 61\n\tMinor (reclaiming a frame) page faults: 3658\n\tVoluntary context switches: 889\n\tInvoluntary context switches: 1\n\tSwaps: 0\n\tFile system inputs: 2732\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-1.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 634.11,
+                "cpu_total_seconds": 1098.3,
+                "cpu_user_seconds": 464.19,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 21076378,
+                "peak_rss_display": "20.1 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9856614,
+                "peak_rss_display": "9.4 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 8173.09,
+                "cpu_total_seconds": 9087.35,
+                "cpu_user_seconds": 914.26,
+                "host": "localhost",
+                "peak_rss_bytes": 62914560,
+                "peak_rss_display": "60.0 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 372.84
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "f42eaea71d1471e69491581e99a4a7baec4f693e1db21207bcb0b79da0299f4f",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=128 --max-connections=128 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/2",
+            "copy_seconds": 392.302933049,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-2.attempt-1.log",
+            "max_rss_kib": 9452,
+            "recorded_utc": "2026-10-11T02:22:05.374600+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-128/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 422.738789721,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.04,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-2.attempt-1.log",
+            "sha256": "9af22a5c007b9857f8bae2e63a9bf9a3d5d2682859a6cb7b07329415a4fbbb70",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 392.14s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1095.76s | k: 636.85s | u: 458.91s\n  peak RSS : 20.5 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.2 MiB\n  source cpu time : 9431.55s | k: 8529.11s | u: 902.44s\n  source peak RSS : 59.5 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-2.attempt-1.time.txt",
+            "sha256": "8f36c49751cac0bcf81bed583e26c830b59ebaff6dbac04a3f547460680aa4e8",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-128 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/2\"\n\tUser time (seconds): 0.04\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:32.26\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9452\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 67\n\tMinor (reclaiming a frame) page faults: 3639\n\tVoluntary context switches: 907\n\tInvoluntary context switches: 0\n\tSwaps: 0\n\tFile system inputs: 2772\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-2.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 636.85,
+                "cpu_total_seconds": 1095.76,
+                "cpu_user_seconds": 458.91,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 21495808,
+                "peak_rss_display": "20.5 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9646899,
+                "peak_rss_display": "9.2 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 8529.11,
+                "cpu_total_seconds": 9431.55,
+                "cpu_user_seconds": 902.44,
+                "host": "localhost",
+                "peak_rss_bytes": 62390272,
+                "peak_rss_display": "59.5 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 392.14
+          }
+        },
+        {
+          "source_campaign": "remote_october",
+          "source_record_sha256": "0041f7c6dd7ee334db8856a5c5fbbdd759761400b35ee7d53b842336df74feb3",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcp --summary --max-files-in-flight=128 --max-connections=128 --rcpd-path /w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/tools/../artifacts/bin/rcpd --remote-copy-conn-timeout-sec 60 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K 10.74.17.203:/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/3",
+            "copy_seconds": 378.942073377,
+            "destination": "/instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-3.attempt-1.log",
+            "max_rss_kib": 9404,
+            "recorded_utc": "2026-10-11T02:59:59.258485+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rcp-128/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 409.928006478,
+            "system_cpu_seconds": 0.01,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.06,
+            "variant": "rcp-128"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-3.attempt-1.log",
+            "sha256": "2a36f07d34b6c563d2c8e5033bdec35a63c300fec398f21cc5428ba078c08c12",
+            "encoding": "utf-8",
+            "text": "copy:\n-----\nbytes copied: 9.5 GiB\nfiles copied: 10240000\nsymlinks created: 0\ndirectories created: 11111\nfiles unchanged: 0\nsymlinks unchanged: 0\ndirectories unchanged: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\nspecials skipped: 0\n\ndelete:\n-------\nbytes removed: 0 B\nfiles removed: 0\nsymlinks removed: 0\ndirectories removed: 0\nfiles skipped: 0\nsymlinks skipped: 0\ndirectories skipped: 0\n\nwalltime : 378.78s\n\nDESTINATION (10.74.17.203):\n  cpu time : 1096.04s | k: 647.01s | u: 449.03s\n  peak RSS : 17.9 MiB\n\nMASTER + SOURCE (localhost):\n  master cpu time : 0.00ns | k: 0.00ns | u: 0.00ns\n  master peak RSS : 9.3 MiB\n  source cpu time : 8837.62s | k: 7893.25s | u: 944.37s\n  source peak RSS : 61.0 MiB\nWarning: Permanently added '10.74.17.203' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-3.attempt-1.time.txt",
+            "sha256": "41f6991548a99e9243af99cd76a565edeafc73af97af2ec9c1cd17a9a396f7dc",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rcp-128 /instance-store/rcp-copy-bench-run6-20261010/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench-run6-20261010/dest/remote/10x10x10x10x1024x1K/rcp-128/3\"\n\tUser time (seconds): 0.06\n\tSystem time (seconds): 0.01\n\tPercent of CPU this job got: 0%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 6:18.90\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 9404\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 64\n\tMinor (reclaiming a frame) page faults: 3645\n\tVoluntary context switches: 908\n\tInvoluntary context switches: 2\n\tSwaps: 0\n\tFile system inputs: 2796\n\tFile system outputs: 24\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          },
+          "rcp_runtime_stats": {
+            "log_file": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run6-20261010-remote-rcp/logs/remote-10x10x10x10x1024x1K-rcp-128-3.attempt-1.log",
+            "roles": {
+              "destination": {
+                "cpu_system_seconds": 647.01,
+                "cpu_total_seconds": 1096.04,
+                "cpu_user_seconds": 449.03,
+                "host": "10.74.17.203",
+                "peak_rss_bytes": 18769510,
+                "peak_rss_display": "17.9 MiB",
+                "peak_rss_exact": false
+              },
+              "master": {
+                "cpu_system_seconds": 0.0,
+                "cpu_total_seconds": 0.0,
+                "cpu_user_seconds": 0.0,
+                "host": "localhost",
+                "peak_rss_bytes": 9751757,
+                "peak_rss_display": "9.3 MiB",
+                "peak_rss_exact": false
+              },
+              "source": {
+                "cpu_system_seconds": 7893.25,
+                "cpu_total_seconds": 8837.62,
+                "cpu_user_seconds": 944.37,
+                "host": "localhost",
+                "peak_rss_bytes": 63963136,
+                "peak_rss_display": "61.0 MiB",
+                "peak_rss_exact": false
+              }
+            },
+            "walltime_seconds": 378.78
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rsync-1x",
+      "source_campaign": "compute_september",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 527.313125965,
+          "mean": 527.709663087,
+          "median": 527.540504917,
+          "max": 528.275358379
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 546.596751749,
+          "mean": 547.0006756296667,
+          "median": 546.625127139,
+          "max": 547.780148001
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 40.95,
+          "mean": 41.410000000000004,
+          "median": 41.44,
+          "max": 41.84
+        },
+        "system_cpu_seconds": {
+          "min": 66.53,
+          "mean": 66.63,
+          "median": 66.55,
+          "max": 66.81
+        },
+        "max_rss_kib": {
+          "min": 10856.0,
+          "mean": 10890.666666666666,
+          "median": 10904.0,
+          "max": 10912.0
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "f540d25455269f96ec82eab1b42e4a5ababf66d5816fbdb8af409a6fa1fb36ec",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K/ /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/1/",
+            "copy_seconds": 528.275358379,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/1",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-1.attempt-1.log",
+            "max_rss_kib": 10856,
+            "recorded_utc": "2026-09-11T21:41:45.493831+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-1x/1",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 547.780148001,
+            "system_cpu_seconds": 66.53,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-1.attempt-1.time.txt",
+            "user_cpu_seconds": 41.84,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-1.attempt-1.log",
+            "sha256": "8ffc0f8aef2ffc8b5b3c80af52e163f34bd150527f1cec69453e6a2e1401c8d5",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-1.attempt-1.time.txt",
+            "sha256": "09bc2398fed72d47f96e73cea2df29740a86a88f9950eb90c987c0e91573aa51",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-1x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/1\"\n\tUser time (seconds): 41.84\n\tSystem time (seconds): 66.53\n\tPercent of CPU this job got: 20%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 8:48.20\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10856\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 82\n\tMinor (reclaiming a frame) page faults: 4835\n\tVoluntary context switches: 10896196\n\tInvoluntary context switches: 113\n\tSwaps: 0\n\tFile system inputs: 93072896\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "d9c47ccd57768131e54a92962267fdc9af25ddc32684a7dbc9f11cc05447cc1e",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K/ /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/2/",
+            "copy_seconds": 527.313125965,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/2",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-2.attempt-1.log",
+            "max_rss_kib": 10912,
+            "recorded_utc": "2026-09-11T22:49:23.308509+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-1x/2",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 546.596751749,
+            "system_cpu_seconds": 66.81,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-2.attempt-1.time.txt",
+            "user_cpu_seconds": 40.95,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-2.attempt-1.log",
+            "sha256": "8ffc0f8aef2ffc8b5b3c80af52e163f34bd150527f1cec69453e6a2e1401c8d5",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-2.attempt-1.time.txt",
+            "sha256": "9cac000d53ddfc0c063e70c7a2268c0271c91d882ff39074531f57b774405665",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-1x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/2\"\n\tUser time (seconds): 40.95\n\tSystem time (seconds): 66.81\n\tPercent of CPU this job got: 20%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 8:47.23\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10912\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 83\n\tMinor (reclaiming a frame) page faults: 4845\n\tVoluntary context switches: 10896356\n\tInvoluntary context switches: 109\n\tSwaps: 0\n\tFile system inputs: 93072584\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "compute_september",
+          "source_record_sha256": "ede20970104fee17a96381e3da217463840e43a9b17c6c616a00ee2924381440",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K/ /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/3/",
+            "copy_seconds": 527.540504917,
+            "destination": "/instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/3",
+            "destination_bytes": 10240000000,
+            "destination_files": 10240000,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "10x10x10x10x1024x1K",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-3.attempt-1.log",
+            "max_rss_kib": 10904,
+            "recorded_utc": "2026-09-11T23:55:48.606774+00:00",
+            "run_id": "remote/10x10x10x10x1024x1K/rsync-1x/3",
+            "scope": "remote",
+            "source": "/instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K",
+            "source_bytes": 10240000000,
+            "source_files": 10240000,
+            "status": "ok",
+            "sync_seconds": 546.625127139,
+            "system_cpu_seconds": 66.55,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-3.attempt-1.time.txt",
+            "user_cpu_seconds": 41.44,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-3.attempt-1.log",
+            "sha256": "8ffc0f8aef2ffc8b5b3c80af52e163f34bd150527f1cec69453e6a2e1401c8d5",
+            "encoding": "utf-8",
+            "text": "Warning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\nWarning: Permanently added '10.74.27.148' (ED25519) to the list of known hosts.\r\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/logs/remote-10x10x10x10x1024x1K-rsync-1x-3.attempt-1.time.txt",
+            "sha256": "408fdf950fff938770c5f8e02ec66ee832289662ac2e8a85a693fb5f32ffe54d",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- remote rsync-1x /instance-store/rcp-copy-bench/stage/10x10x10x10x1024x1K /instance-store/rcp-copy-bench/dest/remote/10x10x10x10x1024x1K/rsync-1x/3\"\n\tUser time (seconds): 41.44\n\tSystem time (seconds): 66.55\n\tPercent of CPU this job got: 20%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 8:47.46\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 10904\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 83\n\tMinor (reclaiming a frame) page faults: 4904\n\tVoluntary context switches: 10896232\n\tInvoluntary context switches: 112\n\tSwaps: 0\n\tFile system inputs: 93072928\n\tFile system outputs: 16\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    }
+  ],
+  "right_censored_outcomes": []
+}

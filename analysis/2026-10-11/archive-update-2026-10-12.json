@@ -1,0 +1,176 @@
+{
+  "previous_archive_sha256": "e966e5352170979146de6381570abcf4c840c14aa43ff98ae75743d6db52e504",
+  "updated_archive_sha256": "507e1cc9c49fd6cd3a1f7db37221828bcebabc17afdf953484d8692943ffcff4",
+  "added_successful_samples": 96,
+  "previous_successful_samples_unchanged": 666,
+  "removed_or_modified_successful_samples": 0,
+  "added_configurations": [
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "cp-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "cp-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "dcp-128",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "dcp-32",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "dcp-8",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "dcp-default",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "rsync-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x100x1G.json",
+      "variant": "rsync-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "cp-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "cp-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "dcp-128",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "dcp-32",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "dcp-8",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "dcp-default",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "rsync-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x1024x100M.json",
+      "variant": "rsync-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "cp-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "cp-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "dcp-128",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "dcp-32",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "dcp-8",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "dcp-default",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "rsync-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x1024x1M.json",
+      "variant": "rsync-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "cp-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "cp-1x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "dcp-128",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "dcp-32",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "dcp-8",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "dcp-default",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "rsync-10x",
+      "n": 3
+    },
+    {
+      "source_path": "local/xfs/10x10x10x10x1024x1K.json",
+      "variant": "rsync-1x",
+      "n": 3
+    }
+  ],
+  "coverage_status_counts": {
+    "complete": 254,
+    "documented_exclusion": 14,
+    "timed_out": 2
+  },
+  "unexplained_missing": [],
+  "independent_selected_statistics_verified": 1872
+}

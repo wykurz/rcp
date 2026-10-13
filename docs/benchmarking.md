@@ -1,5 +1,10 @@
 # Copy benchmarks
 
+For the measured comparison across shared and local filesystems, remote transfers, and a Linux
+source tree, see the [performance report](reports/performance.md). Its
+[original measurement packet and analysis](../analysis/2026-10-11/README.md) are preserved
+separately from the continuous benchmark suite described here.
+
 The benchmark suite measures complete command invocations on generated filesets. Timing is
 informational: a slower copy does not fail CI. Failed commands, timeouts, incorrect copies, and
 broken measurement infrastructure do fail. The suite covers tiny, medium, and large regular files;
@@ -24,7 +29,7 @@ PR and push reports list smoke runs; their timings are in `summary.md` and `resu
 from performance trends and ratios. Scheduled and manual performance runs on main also save durable
 JSON records to the `benchmark-history` branch. After
 [enabling the historical site](#enable-the-historical-site), the
-[Benchmark history workflow](https://github.com/wykurz/rcp/actions/workflows/benchmark-pages.yml)
+[Benchmark history and reports workflow](https://github.com/wykurz/rcp/actions/workflows/benchmark-pages.yml)
 publishes those records as a GitHub Pages dashboard. Follow its `github-pages` deployment URL, also
 shown in the repository's Settings → Pages, to open the site. Until publication is enabled, use the
 downloadable reports or render the history branch locally.
@@ -761,23 +766,46 @@ against the full baseline; these are comparison screens, not performance guarant
 
 ## Enable the historical site
 
+The same Pages site hosts [RCP reports](reports/README.md) under `reports/`; the performance report
+is at `reports/performance/`. The dashboard remains at the site root. Reports are generated from the
+maintained Markdown files and SVG figures in `docs/reports/`. Updates to those files rebuild the
+combined site through the Pages workflow. Other repository documentation remains on GitHub.
+
+To preview reports locally, install `scripts/report-site-requirements.txt` in a Python virtual
+environment, then run:
+
+```bash
+just report-site
+just report-site-test
+python3 -m http.server 8000 --directory target/report-site
+```
+
+Open `http://localhost:8000/reports/performance/`. Figures link to their full-size SVGs. The build
+checks local references and copies only the referenced SVG figures; the full measurement packet
+remains available in the repository. Generated HTML is written under the ignored `target/`
+directory.
+
+To preview a combined site with existing history, render the dashboard first with
+`just benchmark-report /path/to/history --output target/report-site --reports-url reports/index.html`,
+then run `just report-site`. The report build preserves the dashboard and its history files.
+
 Scheduled and manual Depot runs on main publish performance history. Push and PR smoke jobs do not
 publish history. PR jobs have read-only repository permissions and never publish. The history job
 needs the Depot GitHub App to permit repository `contents: write`. It then sends a
 `benchmark-history-updated` repository dispatch.
 
-The native [Pages workflow](../.github/workflows/benchmark-pages.yml) renders with code from `main`
-and treats the history branch only as data. It does not run code from a PR or the history branch.
-Native GitHub Actions provides the Pages deployment environment and GitHub OIDC; benchmark
-computation stays on Depot.
+The native [Pages workflow](../.github/workflows/benchmark-pages.yml) publishes with code from
+`main` and treats the history branch only as data. Pull requests run read-only validation;
+publication does not run code from a PR or the history branch. Native GitHub Actions provides the
+Pages deployment environment and GitHub OIDC; benchmark computation stays on Depot.
 
 One-time repository setup:
 
 1. Allow the Depot GitHub App repository Contents write access for the history job.
 2. In Settings → Pages, choose **GitHub Actions** as the source.
 3. Set repository Actions variable `RCP_BENCHMARK_PAGES` to `true`.
-4. Dispatch **Copy benchmarks** on main to verify history publication, then run **Benchmark
-   history** manually if needed.
+4. Dispatch **Copy benchmarks** on main to verify history publication, then run **Benchmark history
+   and reports** manually if needed.
 
 Until Pages is enabled, run artifacts and durable history remain usable. This PR prepares the
 workflow; a successful remote measurement is not proof that Pages publication has occurred. Inspect

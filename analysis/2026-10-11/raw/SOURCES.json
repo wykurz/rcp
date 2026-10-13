@@ -1,0 +1,258 @@
+{
+  "lustre_weka": {
+    "label": "Lustre/Weka campaign (rcp 0.40.0, 5a1601f4)",
+    "selected_success_rows": 246,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-local-20260905-final/results/campaign/results.jsonl",
+        "packet_path": null,
+        "sha256": "5f72bc282949c287a547bc79cf93923a2fdb0e04e07c795eddd01bdb0eccfd67"
+      },
+      {
+        "archive_path": "rcp-perf-local-20260905-final/results/campaign/manifest.json",
+        "packet_path": "provenance/lustre_weka/manifest.json",
+        "sha256": "de6143caaede4346f00ece301b45cbaf6d30b5c6153297aa40cf7a39303d7631"
+      },
+      {
+        "archive_path": "rcp-perf-local-20260905-final/results/campaign/verification.json",
+        "packet_path": "provenance/lustre_weka/verification.json",
+        "sha256": "c7ed23227aeddde8f133503143217f7944e7a5ac21d0313776d6e707f40731c2"
+      },
+      {
+        "archive_path": "rcp-perf-local-20260905-final/results/campaign/amendments/2026-09-24-weka-million-serial-exclusions.json",
+        "packet_path": "provenance/lustre_weka/amendments/2026-09-24-weka-million-serial-exclusions.json",
+        "sha256": "67867b150cbf11677fc6e60c1b7a2a26f3a84e572356dd30e4bd4eb0f6fddcef"
+      }
+    ]
+  },
+  "compute_september": {
+    "label": "September NFS, local XFS cp/dcp/rsync references, and remote rsync references (rcp campaign build 0.41.0, e68a5adf)",
+    "selected_success_rows": 258,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/results.jsonl",
+        "packet_path": null,
+        "sha256": "aba49641f8f01cbac5f0631e4282c9b23729979039e5b5371ba8a78fb721acd9"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/manifest.txt",
+        "packet_path": "provenance/compute_september/manifest.txt",
+        "sha256": "c1276b81019c695c3df8bc951623fc1296d71d3daeec864c53a491f70eb4fa4b"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902/audit.txt",
+        "packet_path": "provenance/compute_september/audit.txt",
+        "sha256": "651ef86d09d654b3824a06c5ad230186825bcb6dda7672e887775aba7016f062"
+      }
+    ]
+  },
+  "filer_zfs": {
+    "label": "September ZFS filer campaign (rcp 0.41.0, e68a5adf)",
+    "selected_success_rows": 144,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902-zfs/results.jsonl",
+        "packet_path": null,
+        "sha256": "125ff3cb4077266621e0e544296746ebf528a37b50c93da3dd5a93aa3581053c"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902-zfs/manifest.txt",
+        "packet_path": "provenance/filer_zfs/manifest.txt",
+        "sha256": "eecc95bbd137b8f0b5e0cb8944341e08d1892f0adcae8261a28551653a794351"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902-zfs/audit.txt",
+        "packet_path": "provenance/filer_zfs/audit.txt",
+        "sha256": "4c5d8e12b25f01b02c6ba32cdcc7792a8c3d824726f56d5f3deed67f5d0ec4b7"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run1-20260902-zfs/zfs-environment.txt",
+        "packet_path": "provenance/filer_zfs/zfs-environment.txt",
+        "sha256": "345eed216d3d264f5653e01dcb4787c2b3d66ba8249249aa45e35c1d474ead60"
+      }
+    ]
+  },
+  "remote_october": {
+    "label": "October 10 remote rcp rerun (rcp 0.41.0, 27c08950)",
+    "selected_success_rows": 48,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/results.jsonl",
+        "packet_path": null,
+        "sha256": "e0e0774d369a336922e9a2f171717e718604780a6e354d76896308f297f50be9"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/manifest.txt",
+        "packet_path": "provenance/remote_october/manifest.txt",
+        "sha256": "525ca93920d3bb81ab4bc4717c773f002c82411600545faa95abcee99535a7c3"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/audit.txt",
+        "packet_path": "provenance/remote_october/audit.txt",
+        "sha256": "007173e2d1973de5ae5a50ffdaba9b57b825a792ab014e1c84a5fde7cc8376e5"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/runtime-audit.txt",
+        "packet_path": "provenance/remote_october/runtime-audit.txt",
+        "sha256": "a252cdf739e6d7a4d78ebd70cff2e75895cbd74464e4881e064c8d1e8d3ace32"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run6-20261010-remote-rcp/runtime-stats.jsonl",
+        "packet_path": "provenance/remote_october/runtime-stats.jsonl",
+        "sha256": "db9b460f77cfd219f22699d1a5d6d46ade307f08f6e82bf9aa966a82d29d8e0b"
+      }
+    ]
+  },
+  "xfs_corrective": {
+    "label": "October 11 corrective local XFS rcp-only run (rcp 0.41.0, 27c08950)",
+    "selected_success_rows": 48,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/results.jsonl",
+        "packet_path": null,
+        "sha256": "5512fdd5e89be2fa2677ead442b7a3b34e0a47e81b712bc42aac671452ed741b"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/README.md",
+        "packet_path": "provenance/xfs_corrective/README.md",
+        "sha256": "c22fc2b54a2a50ebd2dbe956146dbf96e23dcd001d5f9109080353f77a0b0d37"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/manifest.txt",
+        "packet_path": "provenance/xfs_corrective/manifest.txt",
+        "sha256": "30411b7bb44e05613701abcb60f6ccda47bb535274bb688bd31c0ee343514d1d"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/audit.txt",
+        "packet_path": "provenance/xfs_corrective/audit.txt",
+        "sha256": "b68dfcbe53b66614470f9804d807325708e25db6be3f6e351be87efbfdc3ebf2"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/summary.md",
+        "packet_path": "provenance/xfs_corrective/summary.md",
+        "sha256": "735397af00bf299a27cd19343cf17de28b6354c9351b7e190108fb7c02582af7"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/control/interactive-environment.txt",
+        "packet_path": "provenance/xfs_corrective/interactive-environment.txt",
+        "sha256": "ff128586972713d39a9963e841f3e641cb8ab0d7bf56f5232efad2a3f0800c1d"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/control/slurm-job-76.txt",
+        "packet_path": "provenance/xfs_corrective/slurm-job-76.txt",
+        "sha256": "d2d3e9d8466751b9421c33fb7904f44c7941a895487efdb63a987378dbc7e73a"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/artifacts/build-provenance.txt",
+        "packet_path": "provenance/xfs_corrective/build-provenance.txt",
+        "sha256": "da0e3a15bcc18584738f3b5f209cc86f07df8c667edec036d9f0e627eeb62dd3"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/tools/rcp-copy-bench.sh",
+        "packet_path": "provenance/xfs_corrective/rcp-copy-bench.sh",
+        "sha256": "15f20fa89d7f2d7b411ed3b6de9ef737d4c3cf51965785bcb4f565903c2214c1"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/SHA256SUMS",
+        "packet_path": "provenance/xfs_corrective/source-SHA256SUMS.txt",
+        "sha256": "8f80908f47a0d666c3d8dc719ab1140936b52c7ec5fa376136c4d620eee16462"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run7-20261011-xfs-rcp-corrective/artifacts/bin/rcp",
+        "packet_path": null,
+        "sha256": "edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8"
+      }
+    ]
+  },
+  "linux_source_run9": {
+    "label": "October 11/12 Linux 7.2.9 source tree local XFS four-tool and remote XFS rcp/rsync run",
+    "selected_success_rows": 18,
+    "artifacts": [
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/results.jsonl",
+        "packet_path": null,
+        "sha256": "b573a3517dd20f94e84f5a95e20dca78d3b20f2cd3ecd507ca089a2c79a8cf10"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/README.md",
+        "packet_path": "provenance/linux_source_run9/README.md",
+        "sha256": "f17793dc292cb551df3a32aa75250f7edd7076d6eafef2b8b162ca9d26fece9d"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/manifest.txt",
+        "packet_path": "provenance/linux_source_run9/manifest.txt",
+        "sha256": "72e12252cc886968b3d9e6fd1240f8aefef01f316bd7491b77563d3f317d96d7"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/audit.txt",
+        "packet_path": "provenance/linux_source_run9/audit.txt",
+        "sha256": "090fcf59193a455042ff70796cd02e1da3f04b7731c851ce8b21f25dae202a32"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/summary.md",
+        "packet_path": "provenance/linux_source_run9/summary.md",
+        "sha256": "d70761aaaf682a1f5ca75539e799552fe8f985c77d3680267b051f3c2b56be75"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/control/source-interactive-environment.txt",
+        "packet_path": "provenance/linux_source_run9/source-environment.txt",
+        "sha256": "94e436d36146c4baaefbdd38ceee9d6c68d4dbd1b8c45ffc7a5bf1896b6fe94e"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/control/peer-interactive-environment.txt",
+        "packet_path": "provenance/linux_source_run9/peer-environment.txt",
+        "sha256": "9b0b69b290d7d30b3cd1bac3cdbf74eb105ad5b7bf5742bcd9b253b899e410d0"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/control/stage-validation.txt",
+        "packet_path": "provenance/linux_source_run9/stage-validation.txt",
+        "sha256": "b5b0aac9df21a9ed600cb6883dfb26b5cc6b954a8e3c12fa3f741353c2cc077d"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/control/jobs.txt",
+        "packet_path": "provenance/linux_source_run9/jobs.txt",
+        "sha256": "2ad3712355150177ede3bfdf6271d08d90a6b018776add7565fb19ef6c3411c2"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/artifacts/build-provenance.txt",
+        "packet_path": "provenance/linux_source_run9/build-provenance.txt",
+        "sha256": "3bd29aadd5a27b2f1967a83800c039dd99e7f1ed4aceb1ea62312752b0bdac51"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/tools/rcp-copy-bench.sh",
+        "packet_path": "provenance/linux_source_run9/rcp-copy-bench.sh",
+        "sha256": "4a3f4983ff8b5779abe94be9cd7fc15ed252ad7639b898e758a573ebaade911e"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/tools/campaign-slurm-job.sh",
+        "packet_path": "provenance/linux_source_run9/campaign-slurm-job.sh",
+        "sha256": "e059aa5e3383aa931856f6cff18f07b4d44f649283296eb0ae343647840ba38e"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/tools/campaign-slurm-peer.sh",
+        "packet_path": "provenance/linux_source_run9/campaign-slurm-peer.sh",
+        "sha256": "103290600b9e13dc834f114f20b870ad6557253eb195aaad196bb2a51627f6da"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/tools/extract-linux-source.sh",
+        "packet_path": "provenance/linux_source_run9/extract-linux-source.sh",
+        "sha256": "7b5b76b5e317bff3c4871d539b657f5c07833164e0a01243f93b703b6a752950"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/SHA256SUMS",
+        "packet_path": "provenance/linux_source_run9/source-SHA256SUMS.txt",
+        "sha256": "90d3252977f2b896e860b5f8ae946b56df8f675e429c6451804491f8405c6291"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/artifacts/bin/rcp",
+        "packet_path": null,
+        "sha256": "edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8"
+      },
+      {
+        "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/artifacts/bin/rcpd",
+        "packet_path": null,
+        "sha256": "be0802f4a033eec52a7f94fd8bbcacd9ceba517ffc1dc9baaf2e04f011f83b8b"
+      }
+    ]
+  }
+}

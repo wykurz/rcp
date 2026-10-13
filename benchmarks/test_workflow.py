@@ -207,7 +207,7 @@ class BenchmarkWorkflowTests(unittest.TestCase):
         self.assertEqual(render["id"], "render")
         deployment = next(step for step in steps if step.get("id") == "deployment")
         self.assertLess(steps.index(deployment), steps.index(summarize))
-        package = next(step for step in steps if step.get("name") == "Package dashboard for Pages")
+        package = next(step for step in steps if step.get("id") == "package")
         self.assertLess(steps.index(render), steps.index(package))
         self.assertLess(steps.index(package), steps.index(upload))
         with tempfile.TemporaryDirectory(prefix="rcp-pages-package-") as directory:

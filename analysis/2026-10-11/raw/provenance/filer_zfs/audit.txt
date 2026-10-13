@@ -1,0 +1,13 @@
+records=144
+requested_rows=144
+policy_skipped=0
+policy_censored=0
+expected_successes=144
+unique_successes=144
+failed_attempts=0
+missing_successes=0
+count.zfs.10x100x1G=36
+count.zfs.10x1024x100M=36
+count.zfs.10x10x10x1024x1M=36
+count.zfs.10x10x10x10x1024x1K=36
+audit=complete and valid

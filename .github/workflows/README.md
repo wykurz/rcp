@@ -25,10 +25,13 @@ security-sensitive change:
 
 ### benchmark-pages.yml
 
-Publishes the benchmark trend dashboard from the dedicated `benchmark-history` branch after a
-trusted Depot run dispatches `benchmark-history-updated`, or on manual request. Rendering code comes
-from `main`; historical records are data. The deployment is enabled with the repository variable
-`RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
+Publishes the benchmark trend dashboard from the dedicated `benchmark-history` branch together with
+the Markdown-based [reports](../../docs/reports/README.md). A trusted Depot run can dispatch
+`benchmark-history-updated`; report-source changes on `main` and manual requests also rebuild the
+combined site. Pull requests validate the report build and original measurement checksums without
+deploying. Published rendering code and report sources come from `main`; historical records are
+data. The deployment is enabled with the repository variable `RCP_BENCHMARK_PAGES=true` after
+configuring Pages to use GitHub Actions. See
 [Benchmark dashboard and run results](../../docs/benchmarking.md#view-results) for viewing
 instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
 publication.
