@@ -4,6 +4,7 @@ from html.parser import HTMLParser
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,81 @@ class ReportSiteTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.output / 'index.html').read_text(), 'existing dashboard')
         self.assertEqual((self.output / 'history.json').read_text(), '{"runs": []}')
+
+    def test_theme_choice_survives_navigation_and_blocked_storage(self):
+        if not shutil.which('node'):
+            self.skipTest('Node is unavailable for theme execution')
+        from benchmarks.report import render
+        from benchmarks.test_report import sample_run
+        source = self.root / 'results.json'
+        source.write_text(json.dumps(sample_run()))
+        render(source, self.output, 'reports/index.html')
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pages = [self.output / path for path in ('index.html', 'changes.html', 'reports/index.html',
+                                                'reports/performance/index.html')]
+        for page in pages:
+            controls = [attrs for tag, attrs in Elements(page.read_text()).tags
+                        if tag == 'button' and 'data-theme-toggle' in attrs]
+            self.assertEqual(len(controls), 1, page)
+            self.assertEqual(controls[0]['type'], 'button')
+            self.assertIn('hidden', controls[0])
+        script = r'''
+const fs = require('fs'), vm = require('vm'), assert = require('node:assert/strict');
+const pages = process.argv.slice(1).map(path => fs.readFileSync(path, 'utf8'));
+const saved = new Map();
+const storage = {getItem: key => saved.get(key), setItem: (key, value) => saved.set(key, value)};
+function open(html, localStorage) {
+  const code = html.match(/<script id="site-theme">([\s\S]*?)<\/script>/)[1];
+  const button = {hidden: true, attributes: {}, textContent: '',
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener(event, handler) { assert.equal(event, 'click'); this.click = handler; }};
+  const document = {documentElement: {dataset: {}},
+    querySelector: selector => { assert.equal(selector, '[data-theme-toggle]'); return button; },
+    addEventListener(event, handler) { assert.equal(event, 'DOMContentLoaded'); this.ready = handler; }};
+  const window = {addEventListener(event, handler) { assert.equal(event, 'pageshow'); this.restore = handler; }};
+  vm.runInNewContext(code, {document, window, localStorage});
+  const beforeReady = document.documentElement.dataset.theme;
+  document.ready();
+  assert.equal(button.hidden, false);
+  return {button, beforeReady, theme: () => document.documentElement.dataset.theme,
+    back: () => window.restore?.({persisted: true})};
+}
+const first = open(pages[0], storage);
+assert.equal(first.beforeReady, 'dark');
+assert.equal(first.button.attributes['aria-label'], 'Switch to light theme');
+first.button.click();
+assert.equal(first.theme(), 'light');
+assert.equal(first.button.attributes['aria-label'], 'Switch to dark theme');
+for (const html of pages) {
+  const page = open(html, storage);
+  const cached = open(html, storage);
+  assert.equal(page.beforeReady, 'light');
+  page.button.click();
+  assert.equal(page.theme(), 'dark');
+  cached.back();
+  assert.equal(cached.theme(), 'dark');
+  assert.equal(cached.button.attributes['aria-label'], 'Switch to light theme');
+  assert.equal(open(html, storage).beforeReady, 'dark');
+  page.button.click();
+}
+for (const value of ['invalid', 'system', '']) {
+  for (const key of saved.keys()) saved.set(key, value);
+  assert.equal(open(pages[0], storage).beforeReady, 'dark');
+}
+for (const localStorage of [undefined, {
+  getItem() { throw new Error('storage denied'); },
+  setItem() { throw new Error('storage denied'); }
+}, {getItem() { return 'light'; }, setItem() { throw new Error('quota exceeded'); }}]) {
+  for (const html of pages) {
+    const page = open(html, localStorage);
+    page.button.click();
+    assert.notEqual(page.theme(), page.beforeReady);
+  }
+}
+'''
+        result = subprocess.run(['node', '-e', script, *map(str, pages)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_figure_fails_build(self):
         (self.docs / 'figures/copy.svg').unlink()

@@ -3,6 +3,7 @@
 import datetime as dt
 import html
 import math
+from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
@@ -212,13 +213,17 @@ def markdown(evidence, limit=10, link_base=""):
 
 
 def html_report(evidence):
+    theme = (Path(__file__).resolve().parent.parent / "assets/site-theme.html").read_text(encoding="utf-8")
     return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>Benchmark changes</title><style>'
-            'body{font:16px/1.5 system-ui,sans-serif;margin:2rem;color:#182d36;background:#f5f7f5}'
-            'a{color:#086b70}table{border-collapse:collapse;display:block;overflow-x:auto;background:white}'
-            'th,td{padding:.6rem;border:1px solid #d8e3df;text-align:left;vertical-align:top}'
+            '<title>Benchmark changes</title>' + theme + '<style>'
+            'body{font:16px/1.5 system-ui,sans-serif;margin:2rem}'
+            'nav{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem}'
+            'nav .theme-toggle{margin-left:auto}'
+            'table{border-collapse:collapse;display:block;overflow-x:auto;background:var(--surface)}'
+            'th,td{padding:.6rem;border:1px solid var(--border);text-align:left;vertical-align:top}'
             'code{white-space:pre-wrap;overflow-wrap:anywhere}p{max-width:100ch}'
             '</style></head><body><nav><a href="index.html">History dashboard</a> · '
-            '<a href="changes.json">Comparison JSON</a> · <a href="changes.md" download>Job summary</a></nav>\n'
+            '<a href="changes.json">Comparison JSON</a> · <a href="changes.md" download>Job summary</a>'
+            '<button type="button" class="theme-toggle" data-theme-toggle hidden>Light theme</button></nav>\n'
             + markdown(evidence, limit=None) + '</body></html>\n')

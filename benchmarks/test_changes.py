@@ -206,6 +206,8 @@ class ChangeTests(unittest.TestCase):
         evidence = self.evidence(self.before, self.after)
         for source in (changes.markdown(evidence, limit=1), changes.html_report(evidence)):
             with self.subTest(source=source[:20]):
+                # the standalone page has trusted theme code in its head; metadata lives in the body
+                source = source.split('<body>', 1)[-1]
                 parsed = Fragment(source)
                 self.assertIn(value, [parsed.text(node) for node in parsed.elements("code")])
                 for tag in ("script", "em", "strong", "del"):

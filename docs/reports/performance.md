@@ -1,7 +1,5 @@
 # rcp performance across shared filesystems and everyday copies
 
-*Review draft.*
-
 ## Abstract
 
 We evaluate rcp on local copies across Lustre, Weka, NFS, XFS, and ZFS, on transfers between hosts,
