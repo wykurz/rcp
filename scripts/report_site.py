@@ -112,6 +112,7 @@ def render(source, root, route, routes, has_dashboard):
     history_url = relative_url(Path('index.html'), route) if has_dashboard else f'{REPOSITORY}/blob/main/docs/benchmarking.md#view-results'
     page = Template((ASSETS / 'page.html').read_text(encoding='utf-8')).substitute(
         title=html.escape(title), body=body, toc='\n'.join(toc),
+        theme=(ASSETS.parent.parent / 'assets/site-theme.html').read_text(encoding='utf-8'),
         stylesheet=relative_url(Path('assets/report.css'), route),
         logo=relative_url(Path('assets/logo.svg'), route),
         reports=relative_url(Path('reports/index.html'), route),

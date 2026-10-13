@@ -126,7 +126,7 @@ console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id),
 
     def test_template_markers_in_metadata_remain_literal_and_dashboard_loads(self):
         run = sample_run()
-        label = "__REPORTS_LINK__ __CLOCK_QUALIFICATION_JSON__ __HISTORY_JSON__"
+        label = "__REPORTS_LINK__ __CLOCK_QUALIFICATION_JSON__ __SITE_THEME__ __HISTORY_JSON__"
         run["context"]["runner_label"] = label
         source = self.root / "results.json"
         self.write(source, run)

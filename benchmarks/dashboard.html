@@ -3,62 +3,60 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
   <title>Copy benchmark history</title>
+  __SITE_THEME__
   <style>
-    :root { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #182d36; background: #f5f7f5; }
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
     body { margin: 0; }
-    header { background: #103b45; color: #f7faf7; padding: 2.25rem max(1.25rem, calc((100vw - 1160px) / 2)); }
-    header .eyebrow { color: #9ed8c5; font-size: .75rem; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+    header { border-bottom: 1px solid var(--border); padding: 2.25rem max(1.25rem, calc((100vw - 1160px) / 2)); }
+    header .eyebrow { color: var(--link); font-size: .75rem; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
     h1 { font-size: clamp(1.8rem, 4vw, 3rem); letter-spacing: -.04em; margin: .45rem 0 .4rem; }
-    header p { color: #d1e3dd; margin: 0; max-width: 65ch; line-height: 1.5; }
+    header p { color: var(--muted); margin: 0; max-width: 65ch; line-height: 1.5; }
     main { max-width: 1200px; margin: auto; padding: 1.5rem 1.25rem 4rem; }
     .topline { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: center; margin-bottom: 1.1rem; }
     .stats { display: flex; flex-wrap: wrap; gap: .6rem; }
-    .stat { border: 1px solid #d8e3df; background: #fff; border-radius: 9px; padding: .6rem .9rem; min-width: 110px; }
+    .stat { border: 1px solid var(--border); background: var(--surface); border-radius: 9px; padding: .6rem .9rem; min-width: 110px; }
     .stat b { display: block; font-size: 1.3rem; line-height: 1.1; }
-    .stat span { display: block; font-size: .75rem; color: #60747a; margin-top: .25rem; }
-    a { color: #086b70; }
+    .stat span { display: block; font-size: .75rem; color: var(--muted); margin-top: .25rem; }
     .download { font-size: .9rem; font-weight: 600; }
-    section { background: #fff; border: 1px solid #d8e3df; box-shadow: 0 8px 30px rgba(11,49,54,.04); border-radius: 12px; margin: 1rem 0; padding: 1.25rem; }
+    section { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin: 1rem 0; padding: 1.25rem; }
     section h2 { font-size: 1.15rem; margin: 0 0 .25rem; }
-    .subtle { color: #60747a; font-size: .85rem; margin: .2rem 0 1rem; line-height: 1.5; }
+    .subtle { color: var(--muted); font-size: .85rem; margin: .2rem 0 1rem; line-height: 1.5; }
     .controls { display: flex; flex-wrap: wrap; gap: .8rem; padding: .8rem 0 1rem; }
-    label { display: grid; gap: .3rem; color: #435e64; font-weight: 600; font-size: .78rem; }
-    select { min-width: 155px; max-width: 270px; padding: .55rem .7rem; border: 1px solid #b7cac5; border-radius: 6px; background: #fff; color: #18313a; font: inherit; font-weight: 400; }
-    select:focus-visible, a:focus-visible { outline: 3px solid #8ac5b4; outline-offset: 2px; }
+    label { display: grid; gap: .3rem; color: var(--muted); font-weight: 600; font-size: .78rem; }
+    select { min-width: 155px; max-width: 270px; padding: .55rem .7rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; font-weight: 400; }
     .chart-wrap { overflow-x: auto; }
     svg { display: block; width: 100%; min-width: 640px; height: auto; }
-    .grid { stroke: #e3ebe8; stroke-width: 1; }
-    .axis-label { fill: #677b7d; font-size: 12px; }
+    .grid { stroke: var(--border); stroke-width: 1; }
+    .axis-label { fill: var(--muted); font-size: 12px; }
     .plot-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
-    .range { stroke-width: 2; opacity: .64; }
-    .point { stroke: #fff; stroke-width: 2; cursor: crosshair; }
+    .range { stroke-width: 2; }
+    .point { stroke: var(--surface); stroke-width: 2; cursor: crosshair; }
     .legend { display: flex; flex-wrap: wrap; gap: .5rem 1.3rem; padding-top: .5rem; font-size: .8rem; }
     .legend-item { display: flex; gap: .45rem; align-items: center; }
     .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%; flex: none; }
-    .empty { padding: 3rem 1rem; text-align: center; color: #657a7b; }
+    .empty { padding: 3rem 1rem; text-align: center; color: var(--muted); }
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: .84rem; }
-    th { color: #60747a; font-size: .73rem; text-transform: uppercase; letter-spacing: .06em; }
-    th, td { padding: .75rem .65rem; border-bottom: 1px solid #e7edeb; vertical-align: top; }
+    th { color: var(--muted); font-size: .73rem; text-transform: uppercase; letter-spacing: .06em; }
+    th, td { padding: .75rem .65rem; border-bottom: 1px solid var(--border); vertical-align: top; }
     tbody tr:last-child td { border: 0; }
     .pill { display: inline-block; padding: .18rem .48rem; border-radius: 1rem; font-size: .7rem; font-weight: 700; text-transform: uppercase; }
-    .pill.complete { background: #dcf3e7; color: #17634c; }
-    .pill.failed { background: #fee5e0; color: #a43c31; }
-    .pill.running { background: #fff1cd; color: #815c05; }
-    .short-warning { color: #815c05; font-size: .75rem; font-weight: 600; }
+    .pill.complete { background: var(--success-background); color: var(--success-text); }
+    .pill.failed { background: var(--error-background); color: var(--error-text); }
+    .pill.running { background: var(--warning-background); color: var(--warning-text); }
+    .short-warning { color: var(--warning-text); font-size: .75rem; font-weight: 600; }
     code { font-size: .78rem; overflow-wrap: anywhere; }
     details { max-width: 70rem; }
-    summary { color: #086b70; cursor: pointer; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #425b61; background: #f3f6f4; padding: .7rem; border-radius: 6px; font-size: .75rem; }
-    .footnote { color: #60747a; font-size: .78rem; line-height: 1.5; }
+    summary { color: var(--link); cursor: pointer; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); background: var(--surface-raised); padding: .7rem; border-radius: 6px; font-size: .75rem; }
+    .footnote { color: var(--muted); font-size: .78rem; line-height: 1.5; }
   </style>
 </head>
 <body>
   <header>
-    <div class="eyebrow">rcp · performance lab</div>
+    <div class="topline"><div class="eyebrow">rcp · performance lab</div><button type="button" class="theme-toggle" data-theme-toggle hidden>Light theme</button></div>
     <h1>Copy benchmark history</h1>
     __REPORTS_LINK__
     <p>Wall clock completion time across performance runs. Lower is faster. Each color is one compatible workload and environment series; the vertical whisker shows the fastest and slowest repeat.</p>
@@ -90,7 +88,8 @@
     "use strict";
     const history = JSON.parse(document.getElementById("history-data").textContent);
     const runs = history.runs;
-    const colors = ["#087c83", "#ce6b39", "#7549a3", "#238151", "#ad3f6b", "#5269ba", "#9b7624", "#477b96"];
+    // opaque marks and this palette keep contrast on both light and dark chart backgrounds
+    const colors = ["#087c83", "#ce6b39", "#8053ac", "#238151", "#ad3f6b", "#5269ba", "#9b7624", "#477b96"];
     const svgNS = "http://www.w3.org/2000/svg";
     const $ = id => document.getElementById(id);
     const node = (tag, text, className) => {
