@@ -13,6 +13,7 @@
     "**/target",
     "CLAUDE.md", // symlink to AGENTS.md
     "LICENSE.md", // canonical license text, keep verbatim
+    "analysis/**/raw/**", // original measurement packet, preserve checksum-verified bytes
     "docs/superpowers" // gitignored session artifacts
   ],
   "plugins": [

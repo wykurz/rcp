@@ -164,6 +164,14 @@ benchmark-test:
 benchmark-report *ARGS:
     python3 -m benchmarks.report "$@"
 
+# Render maintained Markdown reports beside an optional benchmark dashboard
+report-site *ARGS:
+    python3 scripts/report_site.py "$@"
+
+# Check report links, SVG publishing, navigation, and dashboard coexistence
+report-site-test:
+    python3 -m unittest discover -s scripts -p 'test_report_site.py'
+
 # Run the benchmark job remotely without publishing history.
 depot-benchmark:
     ./scripts/depot-ci.sh --workflow .depot/workflows/benchmarks.yml benchmark

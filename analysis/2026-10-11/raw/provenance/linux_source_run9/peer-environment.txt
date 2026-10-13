@@ -1,0 +1,4 @@
+10-74-5-232.aws.x.pdtpartners.com
+TARGET          SOURCE               FSTYPE OPTIONS
+/instance-store /dev/mapper/tmp-data xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota
+instance-id: i-02fd7f0d6947eca0f

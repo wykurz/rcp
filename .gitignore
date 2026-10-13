@@ -8,3 +8,6 @@ __pycache__/
 /codex-review*/
 # session working artifacts (specs/plans) — never checked in
 /docs/superpowers/
+# optional raster exports; published report figures are SVG
+/analysis/**/*.png
+/docs/reports/**/*.png

@@ -1,0 +1,9 @@
+{
+  "archive_filename": "rcp-results-clean-20261011.tar.gz",
+  "archive_sha256": "507e1cc9c49fd6cd3a1f7db37221828bcebabc17afdf953484d8692943ffcff4",
+  "archive_bytes": 3115025,
+  "packet_checksums_sha256": "bc93920d1c3ad69af25c27eb1d9d0ae3c56e2e2bd6091decdb1c1c5fa71a0f66",
+  "files": 65,
+  "uncompressed_bytes": 30386368,
+  "preservation": "Every file from the supplied clean archive is preserved byte for byte under raw/. SHA256SUMS covers the other 64 packet files. This archive does not contain any underlying generated dataset payloads."
+}

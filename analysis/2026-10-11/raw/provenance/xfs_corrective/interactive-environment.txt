@@ -1,0 +1,82 @@
+captured_utc=2026-10-11T04:29:39Z
+hostname=10-74-3-125.aws.x.pdtpartners.com
+slurm_job_id=74
+slurm_nodelist=compute003125
+TARGET          SOURCE               FSTYPE OPTIONS
+/instance-store /dev/mapper/tmp-data xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota
+Filesystem           Type  Size  Used Avail Use% Mounted on
+/dev/mapper/tmp-data xfs   3.5T   68G  3.4T   2% /instance-store
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  64
+On-line CPU(s) list:                     0-31
+Off-line CPU(s) list:                    32-63
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) 6975P-C
+CPU family:                              6
+Model:                                   173
+Thread(s) per core:                      1
+Core(s) per socket:                      32
+Socket(s):                               1
+Stepping:                                1
+BogoMIPS:                                5400.00
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd ida arat avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq rdpid bus_lock_detect cldemote movdiri movdir64b md_clear serialize amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               1.5 MiB (32 instances)
+L1i cache:                               2 MiB (32 instances)
+L2 cache:                                64 MiB (32 instances)
+L3 cache:                                480 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-31
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Vulnerable
+Vulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers
+Vulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Vulnerable
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+               total        used        free      shared  buff/cache   available
+Mem:           247Gi        20Gi       237Gi       446Mi       2.9Gi       226Gi
+Swap:             0B          0B          0B
+JobId=74 JobName=rcp-run7-xfs-provision
+   UserId=mateusz(123500074) GroupId=mateusz(123500074) MCS_label=N/A
+   Priority=100 Nice=0 Account=tech QOS=normal WCKey=*
+   JobState=RUNNING Reason=None Dependency=(null)
+   Requeue=0 Restarts=0 BatchFlag=0 Reboot=0 ExitCode=0:0
+   RunTime=00:00:12 TimeLimit=4-00:00:00 TimeMin=N/A
+   SubmitTime=2026-10-11T00:26:46 EligibleTime=2026-10-11T00:26:46
+   AccrueTime=2026-10-11T00:26:46
+   StartTime=2026-10-11T00:29:27 EndTime=2026-10-15T00:29:27 Deadline=N/A
+   SuspendTime=None SecsPreSuspend=0 LastSchedEval=2026-10-11T00:29:27 Scheduler=Main
+   Partition=perf_copy_m8idn_16xl-on-demand AllocNode:Sid=awhpcsubmitrcp1dev1:1
+   ReqNodeList=(null) ExcNodeList=(null)
+   NodeList=compute003125
+   BatchHost=compute003125
+   NumNodes=1 NumCPUs=32 NumTasks=1 CPUs/Task=32 ReqB:S:C:T=0:0:*:*
+   ReqTRES=cpu=32,mem=200G,node=1,billing=32
+   AllocTRES=cpu=32,mem=200G,node=1,billing=32
+   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+   MinCPUsNode=32 MinMemoryNode=200G MinTmpDiskNode=0
+   Features=(null) DelayBoot=00:00:00
+   OverSubscribe=OK Contiguous=0 Licenses=(null) LicensesAlloc=(null) Network=(null)
+   Command=bash
+   WorkDir=/w/home/mateusz/projects/rcp-perf-results-20260902
+   TresPerTask=cpu=32
+   
+
+edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8  /w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/artifacts/bin/rcp
+d9559e595bf015bc07b662f7e03c3582be80773944434a0602c29b8700f92e39  /w/home/mateusz/projects/rcp-perf-results-20260902/results/run7-20261011-xfs-rcp-corrective/artifacts/bin/rrm

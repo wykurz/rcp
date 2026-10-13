@@ -1,0 +1,11 @@
+records=18
+requested_rows=18
+policy_skipped=0
+policy_censored=0
+expected_successes=18
+unique_successes=18
+failed_attempts=0
+missing_successes=0
+count.xfs.linux-source=12
+count.remote.linux-source=6
+audit=complete and valid

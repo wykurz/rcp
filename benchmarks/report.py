@@ -3,6 +3,7 @@
 import argparse
 import datetime as dt
 import hashlib
+import html
 import json
 import math
 import re
@@ -370,7 +371,7 @@ def _dashboard_run(record):
     return dict(record, trials=trials)
 
 
-def render(input_path, output):
+def render(input_path, output, reports_url=None):
     """Write history.json and a self-contained dashboard after validation."""
     runs, sources = load_result_records(input_path)
     evidence = changes.build(runs, sources)
@@ -382,6 +383,8 @@ def render(input_path, output):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
     page = template.replace("__CLOCK_QUALIFICATION_JSON__", json.dumps(clocks.QUALIFICATION)).replace("__HISTORY_JSON__", embedded)
+    reports_link = f'<p><a href="{html.escape(reports_url, quote=True)}">Performance reports</a></p>' if reports_url else ""
+    page = page.replace("__REPORTS_LINK__", reports_link)
     # serialize every representation before publishing any output files
     files = {
         "history.json": json.dumps(history, ensure_ascii=True, indent=2) + "\n",
@@ -406,12 +409,13 @@ def main(argv=None):
     parser.add_argument("input", type=Path, help="results.json, a result directory, or history with runs/*.json")
     parser.add_argument("--output", required=True, type=Path, help="output directory (sanitized JSON requires a new directory)")
     parser.add_argument("--format", choices=("html", "sanitized-json"), default="html")
+    parser.add_argument("--reports-url", help="optional link to reports when publishing the history dashboard")
     args = parser.parse_args(argv)
     try:
         if args.format == "sanitized-json":
             sanitized.export_results(args.input, args.output)
         else:
-            render(args.input, args.output)
+            render(args.input, args.output, args.reports_url)
     except (OSError, ValueError) as error:
         parser.exit(1, f"benchmark report: {error}\n")
 

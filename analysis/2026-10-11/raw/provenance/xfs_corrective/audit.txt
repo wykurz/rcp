@@ -1,0 +1,13 @@
+records=48
+requested_rows=48
+policy_skipped=0
+policy_censored=0
+expected_successes=48
+unique_successes=48
+failed_attempts=0
+missing_successes=0
+count.xfs.10x100x1G=12
+count.xfs.10x1024x100M=12
+count.xfs.10x10x10x1024x1M=12
+count.xfs.10x10x10x10x1024x1K=12
+audit=complete and valid

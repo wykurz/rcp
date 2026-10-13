@@ -1,0 +1,746 @@
+{
+  "schema": "rcp-results-packet-v1",
+  "measurement_contexts": {
+    "linux_source_run9": {
+      "machine": {
+        "source_host": "compute009206",
+        "local_destination_host": "compute009206",
+        "remote_destination_host": "compute005232",
+        "source_instance_id": "i-03adfcd80458c9c19",
+        "remote_instance_id": "i-02fd7f0d6947eca0f",
+        "slurm_partition": "perf_copy_m8idn_16xl-on-demand",
+        "requested_cpus_per_host": 32,
+        "requested_memory_per_host": "200G",
+        "aws_instance_type": "m8idn.16xlarge",
+        "aws_instance_type_basis": "inferred from Slurm partition name; instance IDs retained, EC2 type metadata not retained"
+      },
+      "storage": "local source and destination on source-host XFS /instance-store; remote destination on peer-host XFS /instance-store",
+      "dataset": {
+        "name": "Linux 7.2.9 source tree",
+        "source_archive": "linux-7.2.9.tar.gz",
+        "source_archive_sha256_recorded": "ba4996423cf38afc564f795be41d171495344ad6103c35bf2ce62918a1213ec6",
+        "regular_files": 94775,
+        "directories_reported": 6204,
+        "symlinks": 99,
+        "apparent_bytes_du_sb": 1616711010
+      },
+      "source_staging": "rsync -a from /d to source-host /instance-store outside the copy timer; source and staged file counts, symlink counts and apparent bytes matched",
+      "cache_policy": "source-host sync, then client drop_caches=3, then 5 second settle before each local or remote timed copy; remote destination cache not documented as dropped",
+      "rcp_build": {
+        "version": "0.41.0",
+        "git_hash": "27c089508c13cc2a87101df4798930070f9fc509",
+        "sha256": "edeb8b4bc2469814b0c4102538b31ce03a5a05b2650cd5fe39bb80d39efc09d8",
+        "rcpd_protocol": "0.41.0+w11",
+        "rcpd_sha256": "be0802f4a033eec52a7f94fd8bbcacd9ceba517ffc1dc9baaf2e04f011f83b8b"
+      },
+      "dcp": {
+        "path": "/opt/hpcc-infra/bin/dcp",
+        "ranks_default": 32,
+        "mpirun_version": "Open MPI 5.0.9",
+        "dcp_version": "not captured"
+      },
+      "recorded_utc_first": "2026-10-12T00:29:43.275337+00:00",
+      "recorded_utc_last": "2026-10-12T00:34:06.012751+00:00",
+      "source_ledger_sha256": "b573a3517dd20f94e84f5a95e20dca78d3b20f2cd3ecd507ca089a2c79a8cf10"
+    }
+  },
+  "scope": "local",
+  "filesystem": "xfs",
+  "fileset": {
+    "name": "linux-source",
+    "dataset": "Linux 7.2.9 source tree",
+    "files": 94775,
+    "directories_reported": 6204,
+    "symlinks": 99,
+    "apparent_bytes": 1616711010,
+    "apparent_bytes_basis": "du -sb --apparent-size on the tree"
+  },
+  "wall_time_primary": "completion_seconds: copy start through destination sync and validation",
+  "variants": [
+    {
+      "variant": "rcp-default",
+      "source_campaign": "linux_source_run9",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 2.461369919,
+          "mean": 2.484026378,
+          "median": 2.473059563,
+          "max": 2.517649652
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 2.834137419,
+          "mean": 2.859412904666667,
+          "median": 2.84940135,
+          "max": 2.894699945
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 6.37,
+          "mean": 6.456666666666667,
+          "median": 6.4,
+          "max": 6.6
+        },
+        "system_cpu_seconds": {
+          "min": 19.65,
+          "mean": 20.150000000000002,
+          "median": 20.12,
+          "max": 20.68
+        },
+        "max_rss_kib": {
+          "min": 160516,
+          "mean": 163920.0,
+          "median": 164672,
+          "max": 166572
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "98184a86cafdf757a82625ba83a90b510ce1944b0220a3f4739d196be7c60fa0",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run9-20261011-linux-source-local-4tool/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/1",
+            "copy_seconds": 2.461369919,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/1",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-1.attempt-1.log",
+            "max_rss_kib": 164672,
+            "recorded_utc": "2026-10-12T00:29:43.275337+00:00",
+            "run_id": "xfs/linux-source/rcp-default/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.834137419,
+            "system_cpu_seconds": 20.12,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-1.attempt-1.time.txt",
+            "user_cpu_seconds": 6.4,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-1.attempt-1.time.txt",
+            "sha256": "dbe5cd5d6711e32aa1ac5576e6af17694d84f7d449f56e45c4797d28ff7f71eb",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/1\"\n\tUser time (seconds): 6.40\n\tSystem time (seconds): 20.12\n\tPercent of CPU this job got: 1087%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.43\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 164672\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 52186\n\tVoluntary context switches: 1871406\n\tInvoluntary context switches: 24642\n\tSwaps: 0\n\tFile system inputs: 135600\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "a54ed17db88389ef2e9b7189ecd7850e57c7f983a74d3aa89b3398d78d2729b4",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run9-20261011-linux-source-local-4tool/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/2",
+            "copy_seconds": 2.517649652,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/2",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-2.attempt-1.log",
+            "max_rss_kib": 160516,
+            "recorded_utc": "2026-10-12T00:30:30.376094+00:00",
+            "run_id": "xfs/linux-source/rcp-default/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.894699945,
+            "system_cpu_seconds": 20.68,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-2.attempt-1.time.txt",
+            "user_cpu_seconds": 6.37,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-2.attempt-1.time.txt",
+            "sha256": "ed01f65e665fecdc6e11a3bcb81e9df61dc1617a97782fb38ad464b5a05ed39f",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/2\"\n\tUser time (seconds): 6.37\n\tSystem time (seconds): 20.68\n\tPercent of CPU this job got: 1084%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.49\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 160516\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 52124\n\tVoluntary context switches: 1874630\n\tInvoluntary context switches: 25761\n\tSwaps: 0\n\tFile system inputs: 135512\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "153e1c7f630898dc69c504f6a7df7626466db095f6cfeae7e9b495190ae20da4",
+          "record": {
+            "attempt": 1,
+            "command": "/w/home/mateusz/projects/rcp-perf-results-20260902/results/run9-20261011-linux-source-local-4tool/tools/../artifacts/bin/rcp /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/3",
+            "copy_seconds": 2.473059563,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/3",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-3.attempt-1.log",
+            "max_rss_kib": 166572,
+            "recorded_utc": "2026-10-12T00:31:15.649305+00:00",
+            "run_id": "xfs/linux-source/rcp-default/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.84940135,
+            "system_cpu_seconds": 19.65,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-3.attempt-1.time.txt",
+            "user_cpu_seconds": 6.6,
+            "variant": "rcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rcp-default-3.attempt-1.time.txt",
+            "sha256": "d4833eecbee469b5c66f941411666bac4ec68d9db3b462ec6431526e6c37fc9b",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rcp-default/3\"\n\tUser time (seconds): 6.60\n\tSystem time (seconds): 19.65\n\tPercent of CPU this job got: 1071%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.45\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 166572\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 40\n\tMinor (reclaiming a frame) page faults: 52433\n\tVoluntary context switches: 1876410\n\tInvoluntary context switches: 25213\n\tSwaps: 0\n\tFile system inputs: 135640\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "dcp-default",
+      "source_campaign": "linux_source_run9",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 3.023193636,
+          "mean": 3.1440878266666665,
+          "median": 3.120870265,
+          "max": 3.288199579
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 3.211043685,
+          "mean": 3.3320023016666664,
+          "median": 3.308713127,
+          "max": 3.476250093
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.01,
+          "mean": 0.01,
+          "median": 0.01,
+          "max": 0.01
+        },
+        "system_cpu_seconds": {
+          "min": 0.02,
+          "mean": 0.02,
+          "median": 0.02,
+          "max": 0.02
+        },
+        "max_rss_kib": {
+          "min": 8616,
+          "mean": 8733.333333333334,
+          "median": 8724,
+          "max": 8860
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "765d712531b8a40a16edf55cc7a3f4e91cef3fbc95257f156ad89650efbb71ae",
+          "record": {
+            "attempt": 1,
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/1",
+            "copy_seconds": 3.288199579,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/1",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-1.attempt-1.log",
+            "max_rss_kib": 8860,
+            "recorded_utc": "2026-10-12T00:29:53.821660+00:00",
+            "run_id": "xfs/linux-source/dcp-default/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 3.476250093,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-1.attempt-1.log",
+            "sha256": "79ddc0242b9b16c11dc5ec640d8eec717c10f3ebed41b7fd4ec168d2499bafb0",
+            "encoding": "utf-8",
+            "text": "[2026-10-11T20:29:51] Preserving file attributes.\n[2026-10-11T20:29:51] Walking /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source\n[2026-10-11T20:29:52] Walked 101078 items in 0.075 secs (1355926.565 items/sec) ...\n[2026-10-11T20:29:52] Walked 101078 items in 0.075 seconds (1348708.379 items/sec)\n[2026-10-11T20:29:52] Copying to /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/1\n[2026-10-11T20:29:52] Items: 101078\n[2026-10-11T20:29:52]   Directories: 6204\n[2026-10-11T20:29:52]   Files: 94775\n[2026-10-11T20:29:52]   Links: 99\n[2026-10-11T20:29:52] Data: 1.506 GiB (16.658 KiB per file)\n[2026-10-11T20:29:52] Creating 6204 directories\n[2026-10-11T20:29:52] Creating 94874 files.\n[2026-10-11T20:29:52] Copying data.\n[2026-10-11T20:29:53] Copy data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:29:53] Copy rate: 1.439 GiB/s (1616708068 bytes in 1.047 seconds)\n[2026-10-11T20:29:53] Syncing data to disk.\n[2026-10-11T20:29:53] Sync completed in 0.049 seconds.\n[2026-10-11T20:29:53] Setting ownership, permissions, and timestamps.\n[2026-10-11T20:29:53] Updated 101078 items in 0.111 seconds (913155.108 items/sec)\n[2026-10-11T20:29:53] Syncing directory updates to disk.\n[2026-10-11T20:29:53] Sync completed in 0.087 seconds.\n[2026-10-11T20:29:53] Started: Oct-11-2026,20:29:52\n[2026-10-11T20:29:53] Completed: Oct-11-2026,20:29:53\n[2026-10-11T20:29:53] Seconds: 1.466\n[2026-10-11T20:29:53] Items: 101078\n[2026-10-11T20:29:53]   Directories: 6204\n[2026-10-11T20:29:53]   Files: 94775\n[2026-10-11T20:29:53]   Links: 99\n[2026-10-11T20:29:53] Data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:29:53] Rate: 1.027 GiB/s (1616708068 bytes in 1.466 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-1.attempt-1.time.txt",
+            "sha256": "c8ee92729decfd69df7fb6003862c8dc9b2c2a534f3039099ba2caa541a8450a",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/1\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 1%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:03.26\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8860\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 29\n\tMinor (reclaiming a frame) page faults: 2568\n\tVoluntary context switches: 564\n\tInvoluntary context switches: 35\n\tSwaps: 0\n\tFile system inputs: 6702\n\tFile system outputs: 256\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "7c3bfa4d81c9eaa475bd46c0e33ff4bb0def917e9a6e28f020fbdb302d143983",
+          "record": {
+            "attempt": 1,
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/2",
+            "copy_seconds": 3.023193636,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/2",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-2.attempt-1.log",
+            "max_rss_kib": 8724,
+            "recorded_utc": "2026-10-12T00:30:40.656650+00:00",
+            "run_id": "xfs/linux-source/dcp-default/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 3.211043685,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-2.attempt-1.log",
+            "sha256": "83cd94b4989effdfee11fbf6ece0496cdf0ce7827cbb82fdd649661ca2b99b9d",
+            "encoding": "utf-8",
+            "text": "[2026-10-11T20:30:39] Preserving file attributes.\n[2026-10-11T20:30:39] Walking /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source\n[2026-10-11T20:30:39] Walked 101078 items in 0.071 secs (1425867.233 items/sec) ...\n[2026-10-11T20:30:39] Walked 101078 items in 0.071 seconds (1415594.938 items/sec)\n[2026-10-11T20:30:39] Copying to /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/2\n[2026-10-11T20:30:39] Items: 101078\n[2026-10-11T20:30:39]   Directories: 6204\n[2026-10-11T20:30:39]   Files: 94775\n[2026-10-11T20:30:39]   Links: 99\n[2026-10-11T20:30:39] Data: 1.506 GiB (16.658 KiB per file)\n[2026-10-11T20:30:39] Creating 6204 directories\n[2026-10-11T20:30:39] Creating 94874 files.\n[2026-10-11T20:30:39] Copying data.\n[2026-10-11T20:30:40] Copy data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:30:40] Copy rate: 1.804 GiB/s (1616708068 bytes in 0.835 seconds)\n[2026-10-11T20:30:40] Syncing data to disk.\n[2026-10-11T20:30:40] Sync completed in 0.053 seconds.\n[2026-10-11T20:30:40] Setting ownership, permissions, and timestamps.\n[2026-10-11T20:30:40] Updated 101078 items in 0.091 seconds (1111484.778 items/sec)\n[2026-10-11T20:30:40] Syncing directory updates to disk.\n[2026-10-11T20:30:40] Sync completed in 0.091 seconds.\n[2026-10-11T20:30:40] Started: Oct-11-2026,20:30:39\n[2026-10-11T20:30:40] Completed: Oct-11-2026,20:30:40\n[2026-10-11T20:30:40] Seconds: 1.203\n[2026-10-11T20:30:40] Items: 101078\n[2026-10-11T20:30:40]   Directories: 6204\n[2026-10-11T20:30:40]   Files: 94775\n[2026-10-11T20:30:40]   Links: 99\n[2026-10-11T20:30:40] Data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:30:40] Rate: 1.252 GiB/s (1616708068 bytes in 1.203 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-2.attempt-1.time.txt",
+            "sha256": "684ab9a94ffcccd7b4f9f736b69a0330da6aa89ae42b304f271a121cf0700e0b",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/2\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 1%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:03.00\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8724\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 27\n\tMinor (reclaiming a frame) page faults: 2568\n\tVoluntary context switches: 561\n\tInvoluntary context switches: 34\n\tSwaps: 0\n\tFile system inputs: 6518\n\tFile system outputs: 264\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "e82f0a22904d299384b8e4ece9fcf89ccbd9fe8dcab7357d54ae25c0545a6037",
+          "record": {
+            "attempt": 1,
+            "command": "/opt/hpcc-infra/bin/mpirun --map-by :OVERSUBSCRIBE -np 32 /opt/hpcc-infra/bin/dcp -p /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/3",
+            "copy_seconds": 3.120870265,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/3",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-3.attempt-1.log",
+            "max_rss_kib": 8616,
+            "recorded_utc": "2026-10-12T00:31:26.053712+00:00",
+            "run_id": "xfs/linux-source/dcp-default/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 3.308713127,
+            "system_cpu_seconds": 0.02,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.01,
+            "variant": "dcp-default"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-3.attempt-1.log",
+            "sha256": "8703af1788c882bf2f918364d619bf86870b9454d983881c4999f01cdc7f06f9",
+            "encoding": "utf-8",
+            "text": "[2026-10-11T20:31:24] Preserving file attributes.\n[2026-10-11T20:31:24] Walking /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source\n[2026-10-11T20:31:24] Walked 101078 items in 0.074 secs (1357882.803 items/sec) ...\n[2026-10-11T20:31:24] Walked 101078 items in 0.075 seconds (1351150.660 items/sec)\n[2026-10-11T20:31:24] Copying to /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/3\n[2026-10-11T20:31:24] Items: 101078\n[2026-10-11T20:31:24]   Directories: 6204\n[2026-10-11T20:31:24]   Files: 94775\n[2026-10-11T20:31:24]   Links: 99\n[2026-10-11T20:31:24] Data: 1.506 GiB (16.658 KiB per file)\n[2026-10-11T20:31:24] Creating 6204 directories\n[2026-10-11T20:31:24] Creating 94874 files.\n[2026-10-11T20:31:24] Copying data.\n[2026-10-11T20:31:25] Copy data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:31:25] Copy rate: 1.625 GiB/s (1616708068 bytes in 0.927 seconds)\n[2026-10-11T20:31:25] Syncing data to disk.\n[2026-10-11T20:31:25] Sync completed in 0.057 seconds.\n[2026-10-11T20:31:25] Setting ownership, permissions, and timestamps.\n[2026-10-11T20:31:25] Updated 101078 items in 0.133 seconds (761063.103 items/sec)\n[2026-10-11T20:31:25] Syncing directory updates to disk.\n[2026-10-11T20:31:25] Sync completed in 0.038 seconds.\n[2026-10-11T20:31:25] Started: Oct-11-2026,20:31:24\n[2026-10-11T20:31:25] Completed: Oct-11-2026,20:31:25\n[2026-10-11T20:31:25] Seconds: 1.290\n[2026-10-11T20:31:25] Items: 101078\n[2026-10-11T20:31:25]   Directories: 6204\n[2026-10-11T20:31:25]   Files: 94775\n[2026-10-11T20:31:25]   Links: 99\n[2026-10-11T20:31:25] Data: 1.506 GiB (1616708068 bytes)\n[2026-10-11T20:31:25] Rate: 1.168 GiB/s (1616708068 bytes in 1.290 seconds)\n"
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-dcp-default-3.attempt-1.time.txt",
+            "sha256": "61dacd740c224413dbd4b96b10ae6fe6831f0ba5c19ff3cac387e71b2b96e062",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs dcp-default /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/dcp-default/3\"\n\tUser time (seconds): 0.01\n\tSystem time (seconds): 0.02\n\tPercent of CPU this job got: 1%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:03.09\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 8616\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 29\n\tMinor (reclaiming a frame) page faults: 2568\n\tVoluntary context switches: 557\n\tInvoluntary context switches: 34\n\tSwaps: 0\n\tFile system inputs: 6702\n\tFile system outputs: 256\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "cp-1x",
+      "source_campaign": "linux_source_run9",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 2.49226515,
+          "mean": 2.496865213,
+          "median": 2.494705675,
+          "max": 2.503624814
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 2.728849947,
+          "mean": 2.738385397,
+          "median": 2.742618392,
+          "max": 2.743687852
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.11,
+          "mean": 0.11333333333333333,
+          "median": 0.11,
+          "max": 0.12
+        },
+        "system_cpu_seconds": {
+          "min": 1.72,
+          "mean": 1.7333333333333334,
+          "median": 1.74,
+          "max": 1.74
+        },
+        "max_rss_kib": {
+          "min": 2988,
+          "mean": 3052.0,
+          "median": 3076,
+          "max": 3092
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "af9bd3656d8e1a7e12e2ef00127c6e63daac701a872b1571d4792ab173097e69",
+          "record": {
+            "attempt": 1,
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/. /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/1/",
+            "copy_seconds": 2.49226515,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/1",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-1.attempt-1.log",
+            "max_rss_kib": 3076,
+            "recorded_utc": "2026-10-12T00:30:04.825116+00:00",
+            "run_id": "xfs/linux-source/cp-1x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.743687852,
+            "system_cpu_seconds": 1.74,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.11,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-1.attempt-1.time.txt",
+            "sha256": "a0937dc7e57471a16e91f1feb8c2e2964024dea86d9fd9e52e15d2d77c738113",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/1\"\n\tUser time (seconds): 0.11\n\tSystem time (seconds): 1.74\n\tPercent of CPU this job got: 75%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.47\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 3076\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 3\n\tMinor (reclaiming a frame) page faults: 785\n\tVoluntary context switches: 7488\n\tInvoluntary context switches: 97\n\tSwaps: 0\n\tFile system inputs: 135760\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "e43a19b61bf4a791a40c8cd57fe88a5bc50ff8bcd7740ef89d70d248ef550d78",
+          "record": {
+            "attempt": 1,
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/. /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/2/",
+            "copy_seconds": 2.503624814,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/2",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-2.attempt-1.log",
+            "max_rss_kib": 3092,
+            "recorded_utc": "2026-10-12T00:30:50.557234+00:00",
+            "run_id": "xfs/linux-source/cp-1x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.742618392,
+            "system_cpu_seconds": 1.74,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.11,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-2.attempt-1.time.txt",
+            "sha256": "da3ec21e11204a28118b2985c969c96e0c1eadf9172ece79c97bfde76314afc2",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/2\"\n\tUser time (seconds): 0.11\n\tSystem time (seconds): 1.74\n\tPercent of CPU this job got: 74%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.48\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 3092\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 3\n\tMinor (reclaiming a frame) page faults: 785\n\tVoluntary context switches: 7471\n\tInvoluntary context switches: 85\n\tSwaps: 0\n\tFile system inputs: 135768\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "1059e748b6d66d189d74d6b74893c76fdddbc6deb2726faddda545525bb1821b",
+          "record": {
+            "attempt": 1,
+            "command": "cp --reflink=auto -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/. /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/3/",
+            "copy_seconds": 2.494705675,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/3",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-3.attempt-1.log",
+            "max_rss_kib": 2988,
+            "recorded_utc": "2026-10-12T00:31:35.878139+00:00",
+            "run_id": "xfs/linux-source/cp-1x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 2.728849947,
+            "system_cpu_seconds": 1.72,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.12,
+            "variant": "cp-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-cp-1x-3.attempt-1.time.txt",
+            "sha256": "b1972998b4dbac18de1e123e052e5885c2c387e4caddb45227364446ae0c982e",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs cp-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/cp-1x/3\"\n\tUser time (seconds): 0.12\n\tSystem time (seconds): 1.72\n\tPercent of CPU this job got: 74%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:02.47\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 2988\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 3\n\tMinor (reclaiming a frame) page faults: 793\n\tVoluntary context switches: 7467\n\tInvoluntary context switches: 94\n\tSwaps: 0\n\tFile system inputs: 135824\n\tFile system outputs: 0\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    },
+    {
+      "variant": "rsync-1x",
+      "source_campaign": "linux_source_run9",
+      "summary": {
+        "n": 3,
+        "copy_seconds": {
+          "min": 6.241929194,
+          "mean": 6.250526116,
+          "median": 6.242831558,
+          "max": 6.266817596
+        },
+        "copy_through_sync_seconds": null,
+        "completion_seconds": {
+          "min": 7.725520927,
+          "mean": 7.837682962333333,
+          "median": 7.887174857,
+          "max": 7.900353103
+        },
+        "sync_only_seconds": null,
+        "validation_seconds": null,
+        "user_cpu_seconds": {
+          "min": 0.64,
+          "mean": 0.6666666666666666,
+          "median": 0.67,
+          "max": 0.69
+        },
+        "system_cpu_seconds": {
+          "min": 3.23,
+          "mean": 3.2466666666666666,
+          "median": 3.24,
+          "max": 3.27
+        },
+        "max_rss_kib": {
+          "min": 11364,
+          "mean": 11613.333333333334,
+          "median": 11644,
+          "max": 11832
+        }
+      },
+      "samples": [
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "93ff78d14614db969582227e05df999d59ba0287e868ba1019cc09a4fd73276f",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/ /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/1/",
+            "copy_seconds": 6.242831558,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/1",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 1,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-1.attempt-1.log",
+            "max_rss_kib": 11832,
+            "recorded_utc": "2026-10-12T00:30:20.116594+00:00",
+            "run_id": "xfs/linux-source/rsync-1x/1",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 7.887174857,
+            "system_cpu_seconds": 3.27,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-1.attempt-1.time.txt",
+            "user_cpu_seconds": 0.64,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-1.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-1.attempt-1.time.txt",
+            "sha256": "3c730e6d07682debf3971b736b847b27624dd9f20095e8203b50e646651708de",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/1\"\n\tUser time (seconds): 0.64\n\tSystem time (seconds): 3.27\n\tPercent of CPU this job got: 63%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:06.22\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 11832\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 79\n\tMinor (reclaiming a frame) page faults: 7907\n\tVoluntary context switches: 148779\n\tInvoluntary context switches: 286\n\tSwaps: 0\n\tFile system inputs: 3747256\n\tFile system outputs: 3599688\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "fbd81da146b4cc713093ca5f83805ab5a47cd95725021b45d634d2be32674bc2",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/ /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/2/",
+            "copy_seconds": 6.266817596,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/2",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 2,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-2.attempt-1.log",
+            "max_rss_kib": 11644,
+            "recorded_utc": "2026-10-12T00:31:05.358777+00:00",
+            "run_id": "xfs/linux-source/rsync-1x/2",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 7.725520927,
+            "system_cpu_seconds": 3.23,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-2.attempt-1.time.txt",
+            "user_cpu_seconds": 0.69,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-2.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-2.attempt-1.time.txt",
+            "sha256": "92d8ead8a9969359669b0419abc88d59857e6126d1443abe9d2a0c0fedea6861",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/2\"\n\tUser time (seconds): 0.69\n\tSystem time (seconds): 3.23\n\tPercent of CPU this job got: 62%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:06.24\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 11644\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 78\n\tMinor (reclaiming a frame) page faults: 7889\n\tVoluntary context switches: 148836\n\tInvoluntary context switches: 305\n\tSwaps: 0\n\tFile system inputs: 3747232\n\tFile system outputs: 3599688\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        },
+        {
+          "source_campaign": "linux_source_run9",
+          "source_record_sha256": "ed3aae47429eb96adc4fc16d3ddbd70c3823ded48ce250570d09536ccee175ed",
+          "record": {
+            "attempt": 1,
+            "command": "rsync -a /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source/ /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/3/",
+            "copy_seconds": 6.241929194,
+            "destination": "/instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/3",
+            "destination_bytes": 1616711010,
+            "destination_files": 94775,
+            "exit_code": 0,
+            "failure_phase": "",
+            "failure_reason": "",
+            "fileset": "linux-source",
+            "iteration": 3,
+            "log_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-3.attempt-1.log",
+            "max_rss_kib": 11364,
+            "recorded_utc": "2026-10-12T00:31:50.862249+00:00",
+            "run_id": "xfs/linux-source/rsync-1x/3",
+            "scope": "xfs",
+            "source": "/instance-store/rcp-copy-bench-run9-20261011/stage/linux-source",
+            "source_bytes": 1616711010,
+            "source_files": 94775,
+            "status": "ok",
+            "sync_seconds": 7.900353103,
+            "system_cpu_seconds": 3.24,
+            "time_file": "/d/phscratch/public/user/mateusz/rcp-perf-results-20260902/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-3.attempt-1.time.txt",
+            "user_cpu_seconds": 0.67,
+            "variant": "rsync-1x"
+          },
+          "command_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-3.attempt-1.log",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "encoding": "utf-8",
+            "text": ""
+          },
+          "gnu_time_output": {
+            "archive_path": "rcp-perf-results-20260902-final/results/run9-20261011-linux-source-local-4tool/logs/xfs-linux-source-rsync-1x-3.attempt-1.time.txt",
+            "sha256": "c26a08bae8cd02beeb171a84d72d97984ae87fdaee34c6dcbf15f226b807021c",
+            "encoding": "utf-8",
+            "text": "\tCommand being timed: \"timeout --kill-after=60s 48h bash -c run_variant \"$@\" -- xfs rsync-1x /instance-store/rcp-copy-bench-run9-20261011/stage/linux-source /instance-store/rcp-copy-bench-run9-20261011/dest/xfs/linux-source/rsync-1x/3\"\n\tUser time (seconds): 0.67\n\tSystem time (seconds): 3.24\n\tPercent of CPU this job got: 63%\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:06.22\n\tAverage shared text size (kbytes): 0\n\tAverage unshared data size (kbytes): 0\n\tAverage stack size (kbytes): 0\n\tAverage total size (kbytes): 0\n\tMaximum resident set size (kbytes): 11364\n\tAverage resident set size (kbytes): 0\n\tMajor (requiring I/O) page faults: 86\n\tMinor (reclaiming a frame) page faults: 7923\n\tVoluntary context switches: 148779\n\tInvoluntary context switches: 278\n\tSwaps: 0\n\tFile system inputs: 3747288\n\tFile system outputs: 3599688\n\tSocket messages sent: 0\n\tSocket messages received: 0\n\tSignals delivered: 0\n\tPage size (bytes): 4096\n\tExit status: 0\n"
+          }
+        }
+      ]
+    }
+  ],
+  "right_censored_outcomes": []
+}
