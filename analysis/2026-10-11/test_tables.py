@@ -22,12 +22,15 @@ class ResultsTableTests(unittest.TestCase):
 
     def test_renders_selected_statistics_without_recomputing_samples(self):
         payload = copy.deepcopy(self.payload)
-        variant = payload['results'][0]['variants'][0]
+        variant = next(v for v in payload['results'][0]['variants'] if v['variant'] == 'rcp-default')
         variant['statistics']['copy_seconds'].update(mean=2, min=1, max=4)
+        variant['statistics']['cpu_total_seconds'] = {'mean': 25, 'min': 21, 'max': 29}
         variant['statistics']['max_rss_kib'].update(mean=3072, min=1024, max=8192)
         rendered = tables.render_results(payload)
         self.assertIn('2.000 [1.000–4.000]', rendered)
+        self.assertIn('25.000 [21.000–29.000]', rendered)
         self.assertIn('3.0 [1.0–8.0]', rendered)
+        self.assertIn('25.000', tables.summary_blocks(payload)['network'])
 
     def test_covers_every_selected_configuration_in_stable_order(self):
         rendered = tables.render_results(self.payload)
@@ -68,16 +71,18 @@ class ResultsTableTests(unittest.TestCase):
         payload = copy.deepcopy(self.payload)
         payload['censored'][0]['measurements'] = {
             'user_cpu_seconds': 16.92, 'system_cpu_seconds': 464.41, 'max_rss_kib': 3104,
+            'cpu_total_seconds': 481.33,
         }
         payload['censored'][1]['measurements'] = {
             'user_cpu_seconds': None, 'system_cpu_seconds': None, 'max_rss_kib': None,
+            'cpu_total_seconds': None,
         }
         rendered = tables.render_results(payload)
         rows = [line for line in rendered.splitlines() if '**Timed out ≥43,200 s**' in line]
         self.assertEqual(len(rows), 2)
         cells = [[cell.strip() for cell in row.split('|')[1:-1]] for row in rows]
-        self.assertIn(['cp', '**Timed out ≥43,200 s**', '16.920', '464.410', '3.0'], cells)
-        self.assertIn(['rsync', '**Timed out ≥43,200 s**', '—', '—', '—'], cells)
+        self.assertIn(['cp', '**Timed out ≥43,200 s**', '481.330', '3.0'], cells)
+        self.assertIn(['rsync', '**Timed out ≥43,200 s**', '—', '—'], cells)
 
     def test_default_dcp_alias_is_included_in_local_and_network_summaries(self):
         payload = copy.deepcopy(self.payload)

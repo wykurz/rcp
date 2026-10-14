@@ -22,8 +22,7 @@ RECIPES = {
 }
 RESOURCE_COLUMNS = [
     ('copy_seconds', 'Wall time (s)', 1, 3),
-    ('user_cpu_seconds', 'CPU user (s)', 1, 3),
-    ('system_cpu_seconds', 'CPU system (s)', 1, 3),
+    ('cpu_total_seconds', 'CPU time (s)', 1, 3),
     ('max_rss_kib', 'Peak RSS (MiB)', 1024, 1),
 ]
 SUMMARY_IDS = ('network', 'local', 'remote', 'linux')
@@ -43,9 +42,10 @@ not confidence intervals. Peak RSS is the mean and range of the three recorded p
 average memory over the duration of a copy. Display rounding adds no measurement precision.
 
 Wall time is the complete copy command's elapsed time, including startup and the launcher where
-applicable. CPU time is split into user and system time; their sum is the accounted CPU time and can
-exceed wall time when multiple threads or processes run concurrently. The tables retain the original
-GNU-time accounting scope described below.
+applicable. CPU time is **user + system time**, summed within each repetition before calculating
+the mean and range. It can exceed wall time when multiple threads or processes run concurrently.
+The linked JSON retains the separate user/system measurements and statistics. The tables retain
+the original GNU-time accounting scope described below.
 
 **Timeout rows have one unfinished attempt.** Their wall time is a lower bound, with no mean or
 completion time. Any CPU/RSS value on that row describes only the interrupted attempt. A dash means
@@ -143,7 +143,7 @@ def role_statistics(variant):
     for role in ('master', 'source', 'destination'):
         records = [sample['rcp_runtime_stats']['roles'][role] for sample in samples]
         summary = {}
-        for key in ('cpu_total_seconds', 'cpu_user_seconds', 'cpu_system_seconds', 'peak_rss_bytes'):
+        for key in ('cpu_total_seconds', 'peak_rss_bytes'):
             values = [record[key] for record in records]
             summary[key] = {'mean': statistics.mean(values), 'min': min(values), 'max': max(values)}
         summary['peak_rss_exact'] = all(record['peak_rss_exact'] for record in records)
@@ -226,9 +226,8 @@ def render_results(payload):
                     if not summary['peak_rss_exact']:
                         memory = '≈' + memory
                     rows.append([recipe_label(variant['variant']), role,
-                                 *[measurement(summary[key]) for key in ('cpu_total_seconds', 'cpu_user_seconds', 'cpu_system_seconds')],
-                                 memory])
-            sections.append(markdown_table(['Recipe', 'Role', 'CPU total (s)', 'CPU user (s)', 'CPU system (s)', 'Peak RSS (MiB)'], rows, 2))
+                                 measurement(summary['cpu_total_seconds']), memory])
+            sections.append(markdown_table(['Recipe', 'Role', 'CPU time (s)', 'Peak RSS (MiB)'], rows, 2))
     sections.extend([
         '## Other recorded evidence',
         'The [original packet](../../analysis/2026-10-11/raw/) also retains GNU-time logs with major '

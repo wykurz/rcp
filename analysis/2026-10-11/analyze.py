@@ -73,6 +73,11 @@ def stats(values):
             "min": min(values), "max": max(values)}
 
 
+def cpu_total_seconds(measurements):
+    user, system = measurements.get("user_cpu_seconds"), measurements.get("system_cpu_seconds")
+    return user + system if user is not None and system is not None else None
+
+
 def verify_embedded_logs(sample, relative):
     log_keys = ("command_output", "gnu_time_output")
     for key in log_keys:
@@ -151,6 +156,7 @@ def audit_packet(archive):
                                    "source": record["source"], "destination": record["destination"],
                                    "measurements": {metric: record[end_field] if metric == "completion_seconds" else record[metric]
                                                     for metric, value in variant["summary"].items() if metric != "n" and value is not None}})
+                normalized[-1]["measurements"]["cpu_total_seconds"] = cpu_total_seconds(normalized[-1]["measurements"])
                 if "rcp_runtime_stats" in sample:
                     normalized[-1]["rcp_runtime_stats"] = sample["rcp_runtime_stats"]
             recalculated = {}
@@ -165,6 +171,8 @@ def audit_packet(archive):
                 for statistic, value in recalculated[metric].items():
                     assert math.isclose(value, reported[statistic], rel_tol=1e-10, abs_tol=1e-9), (relative, metric, statistic)
                     checked_stats += 1
+            cpu_totals = [s["measurements"]["cpu_total_seconds"] for s in normalized]
+            recalculated["cpu_total_seconds"] = stats(cpu_totals) if all(value is not None for value in cpu_totals) else None
             item["variants"].append({"variant": variant["variant"], "campaign": variant["source_campaign"],
                                      "n": len(samples), "statistics": recalculated, "samples": normalized,
                                      "command_example": samples[0]["record"]["command"]})
@@ -188,6 +196,7 @@ def audit_packet(archive):
                                               ["user_cpu_seconds", "system_cpu_seconds", "max_rss_kib"]},
                              "destination_files": record["destination_files"], "source_files": record["source_files"],
                              "n": 1, "interpretation": outcome["interpretation"]})
+            censored[-1]["measurements"]["cpu_total_seconds"] = cpu_total_seconds(censored[-1]["measurements"])
         results.append(item)
     audit = {"archive_sha256": archive_sha256, "packet_checksums_sha256": digest(blobs["SHA256SUMS"]),
              "archive_files_verified": len(seals),
@@ -661,6 +670,7 @@ def main():
     payload = {"audit": audit, "aggregation": "Arithmetic mean; median and observed min/max also retained; n=3 per successful variant.",
                "completion_definition": "Copy start through destination sync and count/size validation, including harness overhead.",
                "copy_definition": "Complete copy command invocation wall time, including command startup.",
+               "cpu_definition": "User + system CPU seconds within each repetition, then aggregated across repetitions. The original GNU-time accounting scope is retained; unavailable components yield no total. Individual user/system values and statistics are also retained.",
                "selection_policy": policy, "presentation": presentation, "coverage": coverage, "superseded_equivalent_samples": superseded,
                "censored": censored, "results": results, "comparisons": comparisons(results)}
     (args.output / "analysis.json").write_text(json.dumps(payload, indent=2) + "\n")
