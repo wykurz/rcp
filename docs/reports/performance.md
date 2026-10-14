@@ -566,7 +566,7 @@ has SHA-256:
 
 The packet contains 762 successful measurements. Resolving equivalent duplicate dcp measurements
 supersedes 60 of them, leaving 702 successes in the plotted analysis. The two NFS timeouts are
-retained separately. The audit verifies all 64 checksum-listed files, 1,524 embedded log hashes, and
+retained separately. The audit verifies all 64 checksum-listed files, 1,528 embedded log hashes, and
 6,064 recorded summary statistics. The expected coverage has 254 complete labeled configurations, 14
 documented exclusions, and two timeouts; combining equivalent dcp labels reduces the complete set to
 234 configurations.

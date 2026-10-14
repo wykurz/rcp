@@ -42,10 +42,10 @@ class ReportSiteTests(unittest.TestCase):
             '| Tool | Seconds |\n| --- | ---: |\n| rcp | 300 |\n\n'
             '## Local copies\n\n[Reports](README.md)\n')
 
-    def build(self):
+    def build(self, *flags):
         return subprocess.run(
             [sys.executable, str(Path(__file__).with_name('report_site.py')),
-             '--root', str(self.repo), '--output', str(self.output)],
+             '--root', str(self.repo), '--output', str(self.output), *flags],
             text=True, capture_output=True,
         )
 
@@ -85,10 +85,39 @@ class ReportSiteTests(unittest.TestCase):
         self.output.mkdir()
         (self.output / 'index.html').write_text('existing dashboard')
         (self.output / 'history.json').write_text('{"runs": []}')
-        result = self.build()
+        result = self.build('--with-benchmark-history')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.output / 'index.html').read_text(), 'existing dashboard')
         self.assertEqual((self.output / 'history.json').read_text(), '{"runs": []}')
+
+    def test_history_navigation_does_not_depend_on_dashboard_metadata(self):
+        from benchmarks.report import render
+        from benchmarks.test_report import sample_run
+        run = sample_run()
+        run['context']['runner_label'] = 'rcp-report-index'
+        source = self.root / 'results.json'
+        source.write_text(json.dumps(run))
+        render(source, self.output, 'reports/index.html')
+        dashboard = (self.output / 'index.html').read_bytes()
+        result = self.build('--with-benchmark-history')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = Elements((self.output / 'reports/performance/index.html').read_text())
+        self.assertIn('../../index.html', [attrs.get('href') for tag, attrs in page.tags if tag == 'a'])
+        self.assertEqual((self.output / 'index.html').read_bytes(), dashboard)
+
+    def test_standalone_rebuild_keeps_history_links_pointing_to_documentation(self):
+        for _ in range(2):
+            result = self.build()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            page = Elements((self.output / 'reports/performance/index.html').read_text())
+            self.assertIn('https://github.com/wykurz/rcp/blob/main/docs/benchmarking.md#view-results',
+                          [attrs.get('href') for tag, attrs in page.tags if tag == 'a'])
+
+    def test_combined_build_requires_an_existing_dashboard(self):
+        result = self.build('--with-benchmark-history')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Missing benchmark dashboard', result.stderr)
+        self.assertFalse(self.output.exists())
 
     def test_theme_choice_survives_navigation_and_blocked_storage(self):
         if not shutil.which('node'):
@@ -98,7 +127,7 @@ class ReportSiteTests(unittest.TestCase):
         source = self.root / 'results.json'
         source.write_text(json.dumps(sample_run()))
         render(source, self.output, 'reports/index.html')
-        result = self.build()
+        result = self.build('--with-benchmark-history')
         self.assertEqual(result.returncode, 0, result.stderr)
         pages = [self.output / path for path in ('index.html', 'changes.html', 'reports/index.html',
                                                 'reports/performance/index.html')]

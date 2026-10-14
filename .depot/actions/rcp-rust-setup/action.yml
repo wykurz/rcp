@@ -40,9 +40,6 @@ runs:
       set -euo pipefail
 
       packages=(jq musl-tools pkg-config python3-yaml)
-      if [[ "${{ inputs.install-dprint }}" == "true" ]]; then
-        packages+=(python3-venv)
-      fi
       if [[ "${{ inputs.install-test-deps }}" == "true" ]]; then
         packages+=(strace)
       fi

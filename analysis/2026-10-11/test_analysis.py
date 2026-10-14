@@ -1,9 +1,12 @@
 """Regression tests for auditing and rendering the preserved measurement packet."""
 
+import copy
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,6 +19,49 @@ ANALYSIS_DIR = Path(__file__).resolve().parent
 
 
 class AuditTests(unittest.TestCase):
+    @contextmanager
+    def changed_timeout_packet(self, change):
+        with tempfile.TemporaryDirectory() as temporary:
+            packet = Path(temporary) / 'raw'
+            shutil.copytree(ANALYSIS_DIR / 'raw', packet)
+            relative = 'local/nfs/10x10x10x10x1024x1K.json'
+            path = packet / relative
+            document = json.loads(path.read_text())
+            change(document['right_censored_outcomes'])
+            path.write_text(json.dumps(document))
+            manifest = packet / 'SHA256SUMS'
+            lines = manifest.read_text().splitlines()
+            manifest.write_text('\n'.join(
+                f'{analyze.digest(path.read_bytes())}  {relative}' if line.split()[-1] == relative else line
+                for line in lines) + '\n')
+            yield packet
+
+    def test_timeout_logs_are_verified_even_when_the_outer_packet_is_resealed(self):
+        for index in (0, 1):
+            for key in ('command_output', 'gnu_time_output'):
+                with self.subTest(index=index, key=key):
+                    def change(outcomes):
+                        outcomes[index][key]['text'] += 'modified log'
+                    with self.changed_timeout_packet(change) as packet:
+                        with self.assertRaisesRegex((AssertionError, ValueError), key):
+                            analyze.audit_packet(packet)
+
+    def test_timeout_records_must_support_the_documented_twelve_hour_lower_bound(self):
+        for field, value in [('copy_seconds', 43199), ('copy_seconds', float('nan')),
+                             ('copy_seconds', float('inf')), ('status', 'ok'), ('exit_code', 0),
+                             ('failure_phase', 'validation'), ('variant', 'rcp-default'),
+                             ('iteration', 2)]:
+            with self.subTest(field=field):
+                def change(outcomes):
+                    outcomes[0]['record'][field] = value
+                with self.changed_timeout_packet(change) as packet:
+                    with self.assertRaisesRegex((AssertionError, ValueError), 'timeout'):
+                        analyze.audit_packet(packet)
+
+    def test_counts_logs_from_both_successful_and_unfinished_attempts(self):
+        _, _, audit = analyze.audit_packet(ANALYSIS_DIR / 'raw')
+        self.assertEqual(audit['embedded_log_hashes_verified'], 1528)
+
     def test_timeout_resources_remain_observations_of_unfinished_attempts(self):
         _, censored, _ = analyze.audit_packet(ANALYSIS_DIR / 'raw')
         outcomes = {row['variant']: row for row in censored}
@@ -46,6 +92,46 @@ class AuditTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertFalse(output.exists())
                 self.assertFalse(figures.exists())
+
+
+class SelectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        results, _, _ = analyze.audit_packet(ANALYSIS_DIR / 'raw')
+        cls.document = next(d for d in results if d['source_path'] == 'local/zfs/10x100x1G.json')
+
+    def test_interleaved_repetitions_retain_one_complete_latest_trial_set(self):
+        document = copy.deepcopy(self.document)
+        variants = analyze.variants(document)
+        for name, seconds in [('dcp-default', (1, 4, 5)), ('dcp-32', (2, 3, 6))]:
+            for sample, second in zip(variants[name]['samples'], seconds):
+                sample['recorded_utc'] = f'2026-10-11T00:00:0{second}+00:00'
+        selected, superseded = analyze.select_latest_equivalent([document])
+        retained = analyze.variants(selected[0])['dcp-32']
+        self.assertEqual(retained['samples'], variants['dcp-32']['samples'])
+        self.assertEqual(retained['statistics'], variants['dcp-32']['statistics'])
+        self.assertEqual([row['kept']['source_variant'] for row in superseded], ['dcp-32'] * 3)
+
+    def test_latest_alias_wins_as_a_set_even_when_its_mean_is_slower(self):
+        document = copy.deepcopy(self.document)
+        variants = analyze.variants(document)
+        for sample in variants['dcp-default']['samples']:
+            sample['recorded_utc'] = f"2099-01-01T00:00:0{sample['iteration']}+00:00"
+        selected, _ = analyze.select_latest_equivalent([document])
+        retained = analyze.variants(selected[0])['dcp-32']
+        self.assertGreater(variants['dcp-default']['statistics']['copy_seconds']['mean'],
+                           variants['dcp-32']['statistics']['copy_seconds']['mean'])
+        self.assertEqual(retained['samples'], variants['dcp-default']['samples'])
+        self.assertEqual(retained['statistics'], variants['dcp-default']['statistics'])
+
+    def test_equally_recent_trial_sets_are_rejected_as_ambiguous(self):
+        document = copy.deepcopy(self.document)
+        variants = analyze.variants(document)
+        for variant in (variants['dcp-default'], variants['dcp-32']):
+            for sample in variant['samples']:
+                sample['recorded_utc'] = f"2026-10-11T00:00:0{sample['iteration']}+00:00"
+        with self.assertRaisesRegex(ValueError, 'Ambiguous'):
+            analyze.select_latest_equivalent([document])
 
 
 class FigureTests(unittest.TestCase):

@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from benchmarks.strict_json import parse_json
+from benchmarks.site import read_theme
 from benchmarks.timings import require_roles, validate_report
 from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks
 
@@ -383,7 +384,7 @@ def render(input_path, output, reports_url=None):
         embedded = embedded.replace(literal, escape)
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
     reports_link = f'<p><a href="{html.escape(reports_url, quote=True)}">Performance reports</a></p>' if reports_url else ""
-    theme = (Path(__file__).resolve().parent.parent / "assets/site-theme.html").read_text(encoding="utf-8")
+    theme = read_theme()
     page = template.replace("__SITE_THEME__", theme).replace("__CLOCK_QUALIFICATION_JSON__", json.dumps(clocks.QUALIFICATION)).replace("__REPORTS_LINK__", reports_link)
     page = page.replace("__HISTORY_JSON__", embedded)
     # serialize every representation before publishing any output files

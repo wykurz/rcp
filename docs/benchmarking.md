@@ -790,7 +790,8 @@ remains available until a successful build replaces it.
 
 To preview a combined site with existing history, render the dashboard first with
 `just benchmark-report /path/to/history --output target/report-site --reports-url reports/index.html`,
-then run `just report-site`. The report build preserves the dashboard and its history files.
+then run `just report-site --with-benchmark-history`. The report build preserves the dashboard and
+its history files.
 
 Scheduled and manual Depot runs on main publish performance history. Push and PR smoke jobs do not
 publish history. PR jobs have read-only repository permissions and never publish. The history job

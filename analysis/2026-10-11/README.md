@@ -62,6 +62,13 @@ archive hash is retained in `packet-origin.json`, but cannot be recomputed from 
 `packet_checksums_sha256` identifies the same checksum manifest for both directory and archive
 inputs.
 
+Equivalent dcp trial sets are selected as whole sets, ordered by their final recorded timestamp;
+tied timestamps are rejected. Repetitions from different sets are never mixed, and selection does
+not depend on speed. Timeout records receive the same embedded-log checks as successful samples. The
+12-hour NFS limit comes from the sealed packet's methodology and the experiment owner; the records
+store elapsed durations, not configured limits. The audit checks that these attempts failed during
+copying with termination exit codes and ran for at least that limit.
+
 The script also accepts the original `.tar.gz` archive. Use `--output` and `--figures-output` to put
 derived outputs elsewhere. `--png-output /tmp/rcp-figures` optionally exports PNG copies; SVG is the
 only figure format kept in the repository.

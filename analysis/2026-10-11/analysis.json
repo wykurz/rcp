@@ -7,7 +7,7 @@
     "variants": 254,
     "successful_samples": 762,
     "summary_statistics_verified": 6064,
-    "embedded_log_hashes_verified": 1524,
+    "embedded_log_hashes_verified": 1528,
     "censored_outcomes": 2,
     "campaign_sample_counts_verified": {
       "lustre_weka": 246,
@@ -26,7 +26,7 @@
   "copy_definition": "Complete copy command invocation wall time, including command startup.",
   "selection_policy": {
     "purpose": "Practical performance guide for HPC administrators, SREs and software developers, to live in the repository.",
-    "selection": "Use the latest successful sample per equivalent command configuration and repetition; never choose by speed.",
+    "selection": "Use the latest complete trial set per equivalent command configuration, ordered by its final recorded timestamp; retain all three repetitions together and never choose by speed. Reject tied final timestamps as ambiguous.",
     "dcp_aliases": "dcp-default and dcp-32 both mean 32 MPI ranks; select latest after verifying commands and sources match.",
     "remote_comparability": {
       "campaigns": [
@@ -56,7 +56,7 @@
         "https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Pool%20Structure/Caching.html"
       ]
     },
-    "timeouts": "Experiment owner confirmed the two NFS serial 1 kB attempts timed out at 12 hours. Plot as right-censored, not as completed-copy times.",
+    "timeouts": "The sealed METHODOLOGY.md and experiment owner establish a 12-hour cap for the two NFS serial 1 kB attempts. Records contain elapsed durations, not configured limits. Verify failed copy-phase termination and finite elapsed time at least as long as that cap, and plot as right-censored rather than completed-copy times.",
     "metadata": "Same fresh-destination tree-copy task; CLI preservation flags differ. Reference source and a local rcp 0.41.0 experiment show plain rcp does not preserve original timestamps; exact private benchmark source is unavailable.",
     "future_companion_topics": [
       "--auto-meta-throttle",

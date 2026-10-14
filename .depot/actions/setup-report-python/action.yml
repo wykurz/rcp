@@ -9,6 +9,9 @@ runs:
   - name: Install report dependencies
     shell: bash
     run: |
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends python3-venv
       python3 -m venv --system-site-packages "$RUNNER_TEMP/report-site-venv"
-      "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install -r scripts/report-site-requirements.txt
+      # reinstall even matching system packages so the wheel hashes are always checked
+      "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install --ignore-installed --require-hashes -r scripts/report-site-requirements.txt
       echo "$RUNNER_TEMP/report-site-venv/bin" >> "$GITHUB_PATH"
