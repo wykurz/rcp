@@ -3,9 +3,10 @@
 import datetime as dt
 import html
 import math
-from pathlib import Path
 import re
 from urllib.parse import urlsplit
+
+from benchmarks.site import read_theme
 
 
 POLICY = "previous-compatible-terminal-clean-run-v1"
@@ -213,7 +214,7 @@ def markdown(evidence, limit=10, link_base=""):
 
 
 def html_report(evidence):
-    theme = (Path(__file__).resolve().parent.parent / "assets/site-theme.html").read_text(encoding="utf-8")
+    theme = read_theme()
     return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>Benchmark changes</title>' + theme + '<style>'

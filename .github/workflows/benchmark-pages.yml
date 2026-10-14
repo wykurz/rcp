@@ -18,7 +18,7 @@ jobs:
   # report tests and link validation run on every PR through the required lint job
   publish:
     # enable after selecting GitHub Actions as the repository's Pages source
-    if: github.event_name != 'pull_request' && vars.RCP_BENCHMARK_PAGES == 'true'
+    if: vars.RCP_BENCHMARK_PAGES == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -43,7 +43,7 @@ jobs:
         id: render
         run: python3 -m benchmarks.report benchmark-history-data --output _site --reports-url reports/index.html
       - name: Render maintained reports from Markdown and SVG
-        run: python3 scripts/report_site.py --output _site
+        run: python3 scripts/report_site.py --output _site --with-benchmark-history
       # package directly because upload-pages-artifact pins its nested action to a tag
       - name: Package dashboard and reports for Pages
         id: package

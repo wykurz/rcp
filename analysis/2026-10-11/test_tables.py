@@ -79,6 +79,24 @@ class ResultsTableTests(unittest.TestCase):
         self.assertIn(['cp', '**Timed out ≥43,200 s**', '16.920', '464.410', '3.0'], cells)
         self.assertIn(['rsync', '**Timed out ≥43,200 s**', '—', '—', '—'], cells)
 
+    def test_default_dcp_alias_is_included_in_local_and_network_summaries(self):
+        payload = copy.deepcopy(self.payload)
+        for document in payload['results']:
+            for variant in document['variants']:
+                if variant['variant'] == 'dcp-32':
+                    variant['variant'] = 'dcp-default'
+        self.assertEqual(tables.summary_blocks(payload), tables.summary_blocks(self.payload))
+
+    def test_unresolved_dcp_aliases_are_rejected_instead_of_publishing_duplicate_labels(self):
+        payload = copy.deepcopy(self.payload)
+        document = next(d for d in payload['results'] if d['source_path'] == 'local/zfs/10x100x1G.json')
+        alias = copy.deepcopy(next(v for v in document['variants'] if v['variant'] == 'dcp-32'))
+        alias['variant'] = 'dcp-default'
+        document['variants'].append(alias)
+        for render in (tables.summary_blocks, tables.render_results):
+            with self.subTest(render=render.__name__), self.assertRaisesRegex(ValueError, 'Duplicate.*recipe'):
+                render(payload)
+
     def test_role_statistics_keep_each_process_separate(self):
         variant = next(v for d in self.payload['results'] if d['scope'] == 'remote'
                        and d['fileset']['name'] == '10x100x1G'

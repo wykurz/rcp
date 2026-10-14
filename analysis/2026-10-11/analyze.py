@@ -24,7 +24,9 @@ import statistics
 import tarfile
 import tempfile
 
-os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "rcp-perf-matplotlib"))
+if "MPLCONFIGDIR" not in os.environ:
+    _matplotlib_config = tempfile.TemporaryDirectory(prefix="rcp-perf-matplotlib-")
+    os.environ["MPLCONFIGDIR"] = _matplotlib_config.name
 import matplotlib
 
 matplotlib.use("Agg")
@@ -49,6 +51,8 @@ BASELINE_STYLES = {
 FS_LABELS = {"lustre": "Lustre", "weka": "Weka", "nfs": "NFS", "zfs": "ZFS", "xfs": "XFS"}
 OVERVIEW_FILESYSTEMS = {"network": ["lustre", "weka", "nfs"], "local": ["xfs", "zfs"]}
 METRICS = ["copy_seconds", "completion_seconds"]
+# the sealed METHODOLOGY.md and experiment owner establish this policy; records store elapsed time, not the configured limit
+NFS_SERIAL_COPY_LIMIT_SECONDS = 12 * 60 * 60
 METRIC_LABELS = {"completion_seconds": "Copy + destination sync + validation (s)", "copy_seconds": "Copy command wall time (s)"}
 ZFS_ARC_CAPTION = (
     "ZFS: ARC effects could not be fully excluded. The latest equivalent 32-rank dcp set also had the lower mean (all 3 runs).\n"
@@ -67,6 +71,15 @@ def digest(data):
 def stats(values):
     return {"mean": statistics.mean(values), "median": statistics.median(values),
             "min": min(values), "max": max(values)}
+
+
+def verify_embedded_logs(sample, relative):
+    log_keys = ("command_output", "gnu_time_output")
+    for key in log_keys:
+        log = sample[key]
+        if digest(log["text"].encode()) != log["sha256"]:
+            raise ValueError(f"Embedded {key} checksum mismatch: {relative}")
+    return len(log_keys)
 
 
 def audit_packet(archive):
@@ -128,10 +141,7 @@ def audit_packet(archive):
                 assert record["status"] == "ok" and record["exit_code"] == 0
                 assert record["source_files"] == record["destination_files"] == item["fileset"]["files"]
                 assert record["source_bytes"] == record["destination_bytes"] == item["fileset"]["apparent_bytes"]
-                for log_key in ["command_output", "gnu_time_output"]:
-                    log = sample[log_key]
-                    assert digest(log["text"].encode()) == log["sha256"], (relative, log_key)
-                    checked_logs += 1
+                checked_logs += verify_embedded_logs(sample, relative)
                 end_field = "copy_plus_sync_seconds" if variant["source_campaign"] == "lustre_weka" else "sync_seconds"
                 assert record[end_field] >= record["copy_seconds"] > 0
                 normalized.append({"iteration": record["iteration"], "recorded_utc": record["recorded_utc"],
@@ -160,8 +170,17 @@ def audit_packet(archive):
                                      "command_example": samples[0]["record"]["command"]})
         for outcome in document["right_censored_outcomes"]:
             record = outcome["record"]
+            checked_logs += verify_embedded_logs(outcome, relative)
+            if (item["scope"] != "local" or item["filesystem"] != "nfs" or item["fileset"]["name"] != CASES[-1]
+                    or record["scope"] != "nfs" or record["fileset"] != CASES[-1]
+                    or record["variant"] not in {"cp-1x", "rsync-1x"} or record["iteration"] != 1
+                    or record["status"] != "failed" or record["failure_phase"] != "copy"
+                    or record["exit_code"] not in {124, 143}
+                    or not math.isfinite(record["copy_seconds"])
+                    or record["copy_seconds"] < NFS_SERIAL_COPY_LIMIT_SECONDS):
+                raise ValueError(f"Record does not support the documented NFS timeout: {relative}")
             censored.append({"source_path": relative, "variant": record["variant"],
-                             "outcome": "timed_out", "time_limit_seconds": 43200,
+                             "outcome": "timed_out", "time_limit_seconds": NFS_SERIAL_COPY_LIMIT_SECONDS,
                              "recorded_utc": record["recorded_utc"], "iteration": record["iteration"],
                              "record_sha256": outcome["source_record_sha256"], "command": record["command"],
                              "copy_lower_bound_seconds": record["copy_seconds"],
@@ -232,37 +251,39 @@ def audit_coverage(results, censored):
 
 
 def select_latest_equivalent(results):
-    """Collapse equivalent 32-rank dcp labels, retaining the latest sample per repeat."""
+    """Collapse equivalent 32-rank dcp labels, retaining the complete set that finished last."""
     selected = copy.deepcopy(results)
     superseded = []
     for document in selected:
         vv = variants(document)
         if not {"dcp-default", "dcp-32"} <= vv.keys():
             continue
-        earlier, explicit = vv["dcp-default"], vv["dcp-32"]
-        assert earlier["campaign"] == explicit["campaign"]
+        trial_sets = [vv["dcp-default"], vv["dcp-32"]]
+        assert trial_sets[0]["campaign"] == trial_sets[1]["campaign"]
+        end_times = [max(datetime.fromisoformat(s["recorded_utc"]) for s in v["samples"]) for v in trial_sets]
+        if end_times[0] == end_times[1]:
+            raise ValueError(f"Ambiguous latest dcp trial set: {document['source_path']}")
+        latest = trial_sets[end_times.index(max(end_times))]
+        retained = {sample["iteration"]: sample for sample in latest["samples"]}
         groups = {}
-        for variant in [earlier, explicit]:
+        for variant in trial_sets:
+            assert variant["n"] == len(variant["samples"]) == 3
+            assert sorted(s["iteration"] for s in variant["samples"]) == [1, 2, 3]
             for sample in variant["samples"]:
                 groups.setdefault(sample["iteration"], []).append(sample)
-        retained = []
         for iteration, samples in sorted(groups.items()):
             commands = {tuple(token.replace(s["destination"], "{destination}") for token in shlex.split(s["command"])) for s in samples}
             assert len(commands) == 1, (document["source_path"], iteration, commands)
             assert len({s["source"] for s in samples}) == 1
             command = next(iter(commands))
             assert command[command.index("-np") + 1] == "32"
-            newest = max(samples, key=lambda s: datetime.fromisoformat(s["recorded_utc"]))
-            retained.append(newest)
+            newest = retained[iteration]
             superseded.append({"source_path": document["source_path"], "canonical_variant": "dcp-32",
                                "iteration": iteration, "normalized_command": list(command),
                                "kept": newest, "superseded": [s for s in samples if s is not newest]})
-        explicit["samples"] = retained
-        explicit["n"] = len(retained)
-        explicit["statistics"] = {metric: stats([s["measurements"][metric] for s in retained]) for metric in explicit["statistics"]}
-        explicit["command_example"] = retained[0]["command"]
-        explicit["equivalent_labels"] = ["dcp-default", "dcp-32"]
-        document["variants"] = [v for v in document["variants"] if v["variant"] != "dcp-default"]
+        canonical = dict(latest, variant="dcp-32", equivalent_labels=["dcp-default", "dcp-32"])
+        document["variants"] = [canonical if v["variant"] == "dcp-32" else v
+                                for v in document["variants"] if v["variant"] != "dcp-default"]
     return selected, superseded
 
 
@@ -596,7 +617,7 @@ def main():
     results, superseded = select_latest_equivalent(recorded_results)
     policy = {
         "purpose": "Practical performance guide for HPC administrators, SREs and software developers, to live in the repository.",
-        "selection": "Use the latest successful sample per equivalent command configuration and repetition; never choose by speed.",
+        "selection": "Use the latest complete trial set per equivalent command configuration, ordered by its final recorded timestamp; retain all three repetitions together and never choose by speed. Reject tied final timestamps as ambiguous.",
         "dcp_aliases": "dcp-default and dcp-32 both mean 32 MPI ranks; select latest after verifying commands and sources match.",
         "remote_comparability": {"campaigns": ["remote_october", "compute_september"],
                                  "basis": "Experiment owner confirmed equivalent hosts and authorized updated rcp results against existing baselines.",
@@ -616,7 +637,7 @@ def main():
                 "https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Pool%20Structure/Caching.html",
             ],
         },
-        "timeouts": "Experiment owner confirmed the two NFS serial 1 kB attempts timed out at 12 hours. Plot as right-censored, not as completed-copy times.",
+        "timeouts": "The sealed METHODOLOGY.md and experiment owner establish a 12-hour cap for the two NFS serial 1 kB attempts. Records contain elapsed durations, not configured limits. Verify failed copy-phase termination and finite elapsed time at least as long as that cap, and plot as right-censored rather than completed-copy times.",
         "metadata": "Same fresh-destination tree-copy task; CLI preservation flags differ. Reference source and a local rcp 0.41.0 experiment show plain rcp does not preserve original timestamps; exact private benchmark source is unavailable.",
         "future_companion_topics": ["--auto-meta-throttle", "TOCTOU prevention"]}
     presentation = {

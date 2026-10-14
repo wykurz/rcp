@@ -7,9 +7,14 @@ from pathlib import Path
 import re
 import shutil
 from string import Template
+import sys
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from markdown_it import MarkdownIt
+
+# support direct script execution as well as imports from the repository root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from benchmarks.site import read_theme
 
 
 REPOSITORY = 'https://github.com/wykurz/rcp'
@@ -112,7 +117,7 @@ def render(source, root, route, routes, has_dashboard):
     history_url = relative_url(Path('index.html'), route) if has_dashboard else f'{REPOSITORY}/blob/main/docs/benchmarking.md#view-results'
     page = Template((ASSETS / 'page.html').read_text(encoding='utf-8')).substitute(
         title=html.escape(title), body=body, toc='\n'.join(toc),
-        theme=(ASSETS.parent.parent / 'assets/site-theme.html').read_text(encoding='utf-8'),
+        theme=read_theme(),
         stylesheet=relative_url(Path('assets/report.css'), route),
         logo=relative_url(Path('assets/logo.svg'), route),
         reports=relative_url(Path('reports/index.html'), route),
@@ -122,7 +127,7 @@ def render(source, root, route, routes, has_dashboard):
     return page, assets, seen, sections
 
 
-def build(root, output):
+def build(root, output, *, has_dashboard=False):
     """Add reports and their SVG assets without replacing benchmark-history output."""
     root = root.resolve()
     sources = sorted((root / 'docs/reports').glob('*.md'))
@@ -131,7 +136,8 @@ def build(root, output):
     routes = {source: Path('reports/index.html') if source.name == 'README.md'
               else Path('reports') / source.stem / 'index.html' for source in sources}
     index = output / 'index.html'
-    has_dashboard = index.exists() and 'rcp-report-index' not in index.read_text(encoding='utf-8')
+    if has_dashboard and not index.is_file():
+        raise ValueError(f'Missing benchmark dashboard: {index}')
     pages, assets, headings, sections = {}, {}, {}, {}
     for source, route in routes.items():
         page, referenced, headings[source], sections[source] = render(source, root, route, routes, has_dashboard)
@@ -171,9 +177,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--output', type=Path, default=Path('target/report-site'))
+    parser.add_argument('--with-benchmark-history', action='store_true',
+                        help='link to the benchmark dashboard already rendered in the output directory')
     args = parser.parse_args()
     try:
-        count = build(args.root, args.output)
+        count = build(args.root, args.output, has_dashboard=args.with_benchmark_history)
     except (OSError, ValueError) as error:
         parser.exit(1, f'report site: {error}\n')
     print(f'Wrote {count} report pages to {args.output / "reports"}')

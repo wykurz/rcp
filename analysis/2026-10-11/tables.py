@@ -116,6 +116,9 @@ def resource_cells(variant, ranges=True):
 
 
 def ordered_variants(document):
+    labels = [recipe_label(v['variant']) for v in document['variants']]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"Duplicate selected recipe labels in {document['source_path']}; resolve equivalent variants in the analysis")
     return sorted(document['variants'], key=lambda v: list(RECIPES).index(v['variant']))
 
 
@@ -251,7 +254,7 @@ def summary_blocks(payload):
         rows = []
         for document in documents:
             for variant in ordered_variants(document):
-                if name in {'local', 'network'} and variant['variant'] not in {'rcp-default', 'dcp-32'}:
+                if name in {'local', 'network'} and variant['variant'] not in {'rcp-default', 'dcp-32', 'dcp-default'}:
                     continue
                 if name == 'remote' and variant['variant'] not in {'rcp-default', 'rsync-1x', 'rsync-10x'}:
                     continue
