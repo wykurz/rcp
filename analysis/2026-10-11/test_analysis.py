@@ -62,14 +62,31 @@ class AuditTests(unittest.TestCase):
         _, _, audit = analyze.audit_packet(ANALYSIS_DIR / 'raw')
         self.assertEqual(audit['embedded_log_hashes_verified'], 1528)
 
+    def test_cpu_statistics_preserve_paired_repetition_ranges(self):
+        results, _, _ = analyze.audit_packet(ANALYSIS_DIR / 'raw')
+        document = next(d for d in results if d['source_path'] == 'local/lustre/10x100x1G.json')
+        variant = analyze.variants(document)['dcp-32']
+        summary = variant['statistics'].get('cpu_total_seconds')
+        self.assertIsNotNone(summary)
+        for key, expected in {'mean': 1575.0333333333333, 'median': 1577.19,
+                              'min': 1559.30, 'max': 1588.61}.items():
+            self.assertAlmostEqual(summary[key], expected, msg=key)
+        for sample, expected in zip(variant['samples'], [1577.19, 1588.61, 1559.30]):
+            self.assertAlmostEqual(sample['measurements']['cpu_total_seconds'], expected)
+        self.assertEqual(variant['samples'][0]['measurements']['user_cpu_seconds'], 610.16)
+        self.assertEqual(variant['samples'][0]['measurements']['system_cpu_seconds'], 967.03)
+
     def test_timeout_resources_remain_observations_of_unfinished_attempts(self):
         _, censored, _ = analyze.audit_packet(ANALYSIS_DIR / 'raw')
         outcomes = {row['variant']: row for row in censored}
-        self.assertEqual(outcomes['cp-1x'].get('measurements'), {
+        cp_measurements = outcomes['cp-1x']['measurements'].copy()
+        self.assertAlmostEqual(cp_measurements.pop('cpu_total_seconds'), 481.33)
+        self.assertEqual(cp_measurements, {
             'user_cpu_seconds': 16.92, 'system_cpu_seconds': 464.41, 'max_rss_kib': 3104,
         })
         self.assertEqual(outcomes['rsync-1x'].get('measurements'), {
             'user_cpu_seconds': None, 'system_cpu_seconds': None, 'max_rss_kib': None,
+            'cpu_total_seconds': None,
         })
         self.assertTrue(all(row['outcome'] == 'timed_out' and row['n'] == 1 for row in censored))
 

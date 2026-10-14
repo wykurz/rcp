@@ -107,14 +107,15 @@ minimum-to-maximum whiskers. These whiskers describe the samples; they are not c
 Ratios use unrounded mean command wall times. “Faster by a factor of x” means the comparator's mean
 time divided by rcp's mean time.
 
-The summary tables give mean wall time, user and system CPU time, and peak resident memory (RSS) for
-the default/baseline comparisons. CPU time is split into user and system time; their sum is the
-accounted CPU time. RSS is the mean of the three per-run peaks, in MiB. CPU and memory come from GNU
+The summary tables give mean wall time, CPU time, and peak resident memory (RSS) for the
+default/baseline comparisons. CPU time is **user + system time**, summed within each repetition
+before aggregation. RSS is the mean of the three per-run peaks, in MiB. CPU and memory come from GNU
 `time -v` around the local command. They do not consistently cover MPI ranks or remote workers and
 are not whole-job resource totals. The [complete results](performance-results.md) give every tested
 setting, observed ranges, additional timings, and a
 [resource-accounting guide](performance-results.md#resource-accounting). The
-[JSON analysis](../../analysis/2026-10-11/analysis.json) retains full precision and individual runs.
+[JSON analysis](../../analysis/2026-10-11/analysis.json) retains full precision, individual runs,
+and the separate user/system CPU measurements and statistics.
 
 Timing includes command startup, MPI launch where applicable, and command completion. Source
 staging, destination cleanup, cache preparation, and the subsequent destination sync and validation
@@ -179,42 +180,42 @@ scope; aggregate resource accounting for dcp's MPI ranks was not validated.
 
 #### Local Lustre summary
 
-| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto       |       230.589 |        0.337 |      1,996.517 |            7.2 |
-| 1 GB      | dcp · 32 ranks |       217.206 |      636.447 |        938.587 |           22.8 |
-| 100 MB    | rcp auto       |       276.820 |        1.977 |      5,715.320 |            5.8 |
-| 100 MB    | dcp · 32 ranks |       218.431 |      335.010 |        950.247 |           23.2 |
-| 1 MB      | rcp auto       |       519.931 |      121.187 |     22,540.207 |           95.0 |
-| 1 MB      | dcp · 32 ranks |     5,966.359 |    2,325.883 |      5,631.580 |           48.7 |
-| 1 kB      | rcp auto       |     1,728.462 |      915.603 |      7,952.560 |        1,075.4 |
-| 1 kB      | dcp · 32 ranks |    13,987.649 |    6,773.630 |      6,871.570 |          379.1 |
+| File size | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto       |       230.589 |    1,996.853 |            7.2 |
+| 1 GB      | dcp · 32 ranks |       217.206 |    1,575.033 |           22.8 |
+| 100 MB    | rcp auto       |       276.820 |    5,717.297 |            5.8 |
+| 100 MB    | dcp · 32 ranks |       218.431 |    1,285.257 |           23.2 |
+| 1 MB      | rcp auto       |       519.931 |   22,661.393 |           95.0 |
+| 1 MB      | dcp · 32 ranks |     5,966.359 |    7,957.463 |           48.7 |
+| 1 kB      | rcp auto       |     1,728.462 |    8,868.163 |        1,075.4 |
+| 1 kB      | dcp · 32 ranks |    13,987.649 |   13,645.200 |          379.1 |
 
 #### Local Weka summary
 
-| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto       |       263.638 |        0.240 |        511.907 |            4.5 |
-| 1 GB      | dcp · 32 ranks |       274.983 |      525.943 |        619.743 |           22.5 |
-| 100 MB    | rcp auto       |       254.777 |        1.953 |        551.437 |            4.2 |
-| 100 MB    | dcp · 32 ranks |       277.223 |      173.533 |        748.150 |           22.3 |
-| 1 MB      | rcp auto       |       364.740 |       96.627 |        786.020 |           94.5 |
-| 1 MB      | dcp · 32 ranks |     3,848.908 |    5,196.713 |        808.597 |           79.0 |
-| 1 kB      | rcp auto       |       523.630 |      965.390 |      4,209.060 |        1,070.2 |
-| 1 kB      | dcp · 32 ranks |     1,994.002 |    4,295.377 |      1,747.790 |          422.2 |
+| File size | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto       |       263.638 |      512.147 |            4.5 |
+| 1 GB      | dcp · 32 ranks |       274.983 |    1,145.687 |           22.5 |
+| 100 MB    | rcp auto       |       254.777 |      553.390 |            4.2 |
+| 100 MB    | dcp · 32 ranks |       277.223 |      921.683 |           22.3 |
+| 1 MB      | rcp auto       |       364.740 |      882.647 |           94.5 |
+| 1 MB      | dcp · 32 ranks |     3,848.908 |    6,005.310 |           79.0 |
+| 1 kB      | rcp auto       |       523.630 |    5,174.450 |        1,070.2 |
+| 1 kB      | dcp · 32 ranks |     1,994.002 |    6,043.167 |          422.2 |
 
 #### Local NFS summary
 
-| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto       |     1,019.296 |        0.170 |        212.167 |            9.5 |
-| 1 GB      | dcp · 32 ranks |       973.904 |        0.013 |          0.020 |            8.8 |
-| 100 MB    | rcp auto       |       811.021 |        1.260 |        224.973 |            9.5 |
-| 100 MB    | dcp · 32 ranks |       935.166 |        0.010 |          0.030 |            8.8 |
-| 1 MB      | rcp auto       |       910.920 |       64.703 |        431.903 |          129.1 |
-| 1 MB      | dcp · 32 ranks |     1,201.788 |        0.013 |          0.027 |            8.8 |
-| 1 kB      | rcp auto       |     3,176.639 |      567.037 |      1,800.657 |        1,121.0 |
-| 1 kB      | dcp · 32 ranks |     5,189.635 |        0.030 |          0.037 |            8.4 |
+| File size | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto       |     1,019.296 |      212.337 |            9.5 |
+| 1 GB      | dcp · 32 ranks |       973.904 |        0.033 |            8.8 |
+| 100 MB    | rcp auto       |       811.021 |      226.233 |            9.5 |
+| 100 MB    | dcp · 32 ranks |       935.166 |        0.040 |            8.8 |
+| 1 MB      | rcp auto       |       910.920 |      496.607 |          129.1 |
+| 1 MB      | dcp · 32 ranks |     1,201.788 |        0.040 |            8.8 |
+| 1 kB      | rcp auto       |     3,176.639 |    2,367.693 |        1,121.0 |
+| 1 kB      | dcp · 32 ranks |     5,189.635 |        0.067 |            8.4 |
 
 [//]: # (END GENERATED: network-summary)
 
@@ -262,29 +263,29 @@ aggregate resource accounting for dcp's MPI ranks was not validated.
 
 #### Local XFS summary
 
-| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto       |         0.184 |        0.067 |          0.147 |            9.5 |
-| 1 GB      | dcp · 32 ranks |       302.162 |        0.010 |          0.020 |            8.6 |
-| 100 MB    | rcp auto       |         0.372 |        0.680 |          1.207 |            8.2 |
-| 100 MB    | dcp · 32 ranks |       346.086 |        0.010 |          0.023 |            8.7 |
-| 1 MB      | rcp auto       |        22.001 |       68.200 |        161.493 |           87.2 |
-| 1 MB      | dcp · 32 ranks |       381.995 |        0.010 |          0.020 |            8.8 |
-| 1 kB      | rcp auto       |       227.009 |      736.277 |      1,783.810 |          747.7 |
-| 1 kB      | dcp · 32 ranks |        84.537 |        0.010 |          0.020 |            8.5 |
+| File size | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto       |         0.184 |        0.213 |            9.5 |
+| 1 GB      | dcp · 32 ranks |       302.162 |        0.030 |            8.6 |
+| 100 MB    | rcp auto       |         0.372 |        1.887 |            8.2 |
+| 100 MB    | dcp · 32 ranks |       346.086 |        0.033 |            8.7 |
+| 1 MB      | rcp auto       |        22.001 |      229.693 |           87.2 |
+| 1 MB      | dcp · 32 ranks |       381.995 |        0.030 |            8.8 |
+| 1 kB      | rcp auto       |       227.009 |    2,520.087 |          747.7 |
+| 1 kB      | dcp · 32 ranks |        84.537 |        0.030 |            8.5 |
 
 #### Local ZFS summary
 
-| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto       |         0.860 |        0.040 |         41.077 |            7.5 |
-| 1 GB      | dcp · 32 ranks |       728.596 |      203.483 |        677.053 |           27.0 |
-| 100 MB    | rcp auto       |         1.116 |        0.443 |         48.297 |            7.5 |
-| 100 MB    | dcp · 32 ranks |       758.931 |       63.097 |        679.710 |           27.7 |
-| 1 MB      | rcp auto       |        65.899 |       78.610 |        927.123 |          112.7 |
-| 1 MB      | dcp · 32 ranks |       731.086 |      104.043 |        739.250 |           61.8 |
-| 1 kB      | rcp auto       |       303.003 |      767.103 |     14,322.783 |        1,092.9 |
-| 1 kB      | dcp · 32 ranks |        86.816 |      450.753 |      1,907.227 |          415.6 |
+| File size | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto       |         0.860 |       41.117 |            7.5 |
+| 1 GB      | dcp · 32 ranks |       728.596 |      880.537 |           27.0 |
+| 100 MB    | rcp auto       |         1.116 |       48.740 |            7.5 |
+| 100 MB    | dcp · 32 ranks |       758.931 |      742.807 |           27.7 |
+| 1 MB      | rcp auto       |        65.899 |    1,005.733 |          112.7 |
+| 1 MB      | dcp · 32 ranks |       731.086 |      843.293 |           61.8 |
+| 1 kB      | rcp auto       |       303.003 |   15,089.887 |        1,092.9 |
+| 1 kB      | dcp · 32 ranks |        86.816 |    2,357.980 |          415.6 |
 
 [//]: # (END GENERATED: local-summary)
 
@@ -354,20 +355,20 @@ receiver. These are not measurements of the complete transfer's resource use.
 
 [//]: # (BEGIN GENERATED: remote-summary)
 
-| File size | Recipe               | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| --------- | -------------------- | ------------: | -----------: | -------------: | -------------: |
-| 1 GB      | rcp auto             |       255.370 |        0.057 |          0.013 |            9.1 |
-| 1 GB      | rsync                |     1,789.548 |    2,003.453 |        502.350 |           16.2 |
-| 1 GB      | rsync · scripted ×10 |       258.607 |    1,961.753 |        560.743 |           16.2 |
-| 100 MB    | rcp auto             |       261.856 |        0.050 |          0.020 |            9.7 |
-| 100 MB    | rsync                |     1,832.147 |    2,039.697 |        477.443 |           16.1 |
-| 100 MB    | rsync · scripted ×10 |       264.740 |    2,012.683 |        572.687 |           16.3 |
-| 1 MB      | rcp auto             |       281.060 |        0.050 |          0.020 |            9.1 |
-| 1 MB      | rsync                |     1,937.598 |    2,046.920 |        500.477 |           14.2 |
-| 1 MB      | rsync · scripted ×10 |       277.290 |    2,026.500 |        576.663 |           14.3 |
-| 1 kB      | rcp auto             |       349.452 |        0.057 |          0.013 |            9.6 |
-| 1 kB      | rsync                |       527.710 |       41.410 |         66.630 |           10.6 |
-| 1 kB      | rsync · scripted ×10 |        73.788 |       41.580 |         69.467 |           10.6 |
+| File size | Recipe               | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| --------- | -------------------- | ------------: | -----------: | -------------: |
+| 1 GB      | rcp auto             |       255.370 |        0.070 |            9.1 |
+| 1 GB      | rsync                |     1,789.548 |    2,505.803 |           16.2 |
+| 1 GB      | rsync · scripted ×10 |       258.607 |    2,522.497 |           16.2 |
+| 100 MB    | rcp auto             |       261.856 |        0.070 |            9.7 |
+| 100 MB    | rsync                |     1,832.147 |    2,517.140 |           16.1 |
+| 100 MB    | rsync · scripted ×10 |       264.740 |    2,585.370 |           16.3 |
+| 1 MB      | rcp auto             |       281.060 |        0.070 |            9.1 |
+| 1 MB      | rsync                |     1,937.598 |    2,547.397 |           14.2 |
+| 1 MB      | rsync · scripted ×10 |       277.290 |    2,603.163 |           14.3 |
+| 1 kB      | rcp auto             |       349.452 |        0.070 |            9.6 |
+| 1 kB      | rsync                |       527.710 |      108.040 |           10.6 |
+| 1 kB      | rsync · scripted ×10 |        73.788 |      111.047 |           10.6 |
 
 [//]: # (END GENERATED: remote-summary)
 
@@ -394,14 +395,14 @@ for this tree. Dcp's aggregate MPI resource use was not validated.
 
 [//]: # (BEGIN GENERATED: linux-summary)
 
-| Scope  | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
-| ------ | -------------- | ------------: | -----------: | -------------: | -------------: |
-| Local  | rcp auto       |         2.484 |        6.457 |         20.150 |          160.1 |
-| Local  | dcp · 32 ranks |         3.144 |        0.010 |          0.020 |            8.5 |
-| Local  | cp             |         2.497 |        0.113 |          1.733 |            3.0 |
-| Local  | rsync          |         6.251 |        0.667 |          3.247 |           11.3 |
-| Remote | rcp auto       |         5.945 |        0.060 |          0.010 |            9.9 |
-| Remote | rsync          |         8.749 |        3.487 |          1.453 |           13.8 |
+| Scope  | Recipe         | Wall time (s) | CPU time (s) | Peak RSS (MiB) |
+| ------ | -------------- | ------------: | -----------: | -------------: |
+| Local  | rcp auto       |         2.484 |       26.607 |          160.1 |
+| Local  | dcp · 32 ranks |         3.144 |        0.030 |            8.5 |
+| Local  | cp             |         2.497 |        1.847 |            3.0 |
+| Local  | rsync          |         6.251 |        3.913 |           11.3 |
+| Remote | rcp auto       |         5.945 |        0.070 |            9.9 |
+| Remote | rsync          |         8.749 |        4.940 |           13.8 |
 
 [//]: # (END GENERATED: linux-summary)
 

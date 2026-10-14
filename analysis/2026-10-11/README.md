@@ -10,12 +10,14 @@ scripts, and provenance documentation. It does not contain the generated file pa
 - [Original checksums](raw/SHA256SUMS): hashes of the other 64 files in the packet.
 - [Source inventory](raw/SOURCES.json): source campaigns and measurement counts.
 - [Normalized analysis](analysis.json): per-repetition measurements, selected and superseded
-  configurations, command examples, computed statistics, coverage, and comparison ratios.
+  configurations, command examples, computed statistics, coverage, and comparison ratios. CPU totals
+  sum user + system time within each repetition before aggregation; the separate user/system values
+  and statistics are retained.
 - [Analysis script](analyze.py): audits the packet, recomputes the figures, and preserves the agreed
   selection rules. Original JSON documents retain the complete records and embedded logs beyond the
   fields used in the normalized analysis.
 - [Result tables](../../docs/reports/performance-results.md): all retained configurations with wall
-  time, user/system CPU time, peak RSS, ranges, supplemental timings, and remote rcp role summaries.
+  time, total CPU time, peak RSS, ranges, supplemental timings, and remote rcp role summaries.
   [Their generator](tables.py) uses the selected statistics in `analysis.json` without repeating
   selection or recomputing those aggregates. Remote role statistics are aggregated from the retained
   per-role records; timeout resource values remain separate observations of unfinished attempts.
