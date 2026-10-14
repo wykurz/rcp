@@ -107,6 +107,15 @@ minimum-to-maximum whiskers. These whiskers describe the samples; they are not c
 Ratios use unrounded mean command wall times. “Faster by a factor of x” means the comparator's mean
 time divided by rcp's mean time.
 
+The summary tables give mean wall time, user and system CPU time, and peak resident memory (RSS) for
+the default/baseline comparisons. CPU time is split into user and system time; their sum is the
+accounted CPU time. RSS is the mean of the three per-run peaks, in MiB. CPU and memory come from GNU
+`time -v` around the local command. They do not consistently cover MPI ranks or remote workers and
+are not whole-job resource totals. The [complete results](performance-results.md) give every tested
+setting, observed ranges, additional timings, and a
+[resource-accounting guide](performance-results.md#resource-accounting). The
+[JSON analysis](../../analysis/2026-10-11/analysis.json) retains full precision and individual runs.
+
 Timing includes command startup, MPI launch where applicable, and command completion. Source
 staging, destination cleanup, cache preparation, and the subsequent destination sync and validation
 are outside the reported command time. The latter measurements remain in the analysis data, but the
@@ -163,6 +172,56 @@ are unknown beyond the limit. Default rcp finishes in about 53 minutes, and the 
 finishes in about 23 minutes. The timeout arrows in the detailed NFS figure preserve that
 distinction.
 
+The following summaries compare automatic rcp and 32-rank dcp. CPU and peak RSS retain the GNU-time
+scope; aggregate resource accounting for dcp's MPI ranks was not validated.
+
+[//]: # (BEGIN GENERATED: network-summary)
+
+#### Local Lustre summary
+
+| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto       |       230.589 |        0.337 |      1,996.517 |            7.2 |
+| 1 GB      | dcp · 32 ranks |       217.206 |      636.447 |        938.587 |           22.8 |
+| 100 MB    | rcp auto       |       276.820 |        1.977 |      5,715.320 |            5.8 |
+| 100 MB    | dcp · 32 ranks |       218.431 |      335.010 |        950.247 |           23.2 |
+| 1 MB      | rcp auto       |       519.931 |      121.187 |     22,540.207 |           95.0 |
+| 1 MB      | dcp · 32 ranks |     5,966.359 |    2,325.883 |      5,631.580 |           48.7 |
+| 1 kB      | rcp auto       |     1,728.462 |      915.603 |      7,952.560 |        1,075.4 |
+| 1 kB      | dcp · 32 ranks |    13,987.649 |    6,773.630 |      6,871.570 |          379.1 |
+
+#### Local Weka summary
+
+| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto       |       263.638 |        0.240 |        511.907 |            4.5 |
+| 1 GB      | dcp · 32 ranks |       274.983 |      525.943 |        619.743 |           22.5 |
+| 100 MB    | rcp auto       |       254.777 |        1.953 |        551.437 |            4.2 |
+| 100 MB    | dcp · 32 ranks |       277.223 |      173.533 |        748.150 |           22.3 |
+| 1 MB      | rcp auto       |       364.740 |       96.627 |        786.020 |           94.5 |
+| 1 MB      | dcp · 32 ranks |     3,848.908 |    5,196.713 |        808.597 |           79.0 |
+| 1 kB      | rcp auto       |       523.630 |      965.390 |      4,209.060 |        1,070.2 |
+| 1 kB      | dcp · 32 ranks |     1,994.002 |    4,295.377 |      1,747.790 |          422.2 |
+
+#### Local NFS summary
+
+| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto       |     1,019.296 |        0.170 |        212.167 |            9.5 |
+| 1 GB      | dcp · 32 ranks |       973.904 |        0.013 |          0.020 |            8.8 |
+| 100 MB    | rcp auto       |       811.021 |        1.260 |        224.973 |            9.5 |
+| 100 MB    | dcp · 32 ranks |       935.166 |        0.010 |          0.030 |            8.8 |
+| 1 MB      | rcp auto       |       910.920 |       64.703 |        431.903 |          129.1 |
+| 1 MB      | dcp · 32 ranks |     1,201.788 |        0.013 |          0.027 |            8.8 |
+| 1 kB      | rcp auto       |     3,176.639 |      567.037 |      1,800.657 |        1,121.0 |
+| 1 kB      | dcp · 32 ranks |     5,189.635 |        0.030 |          0.037 |            8.4 |
+
+[//]: # (END GENERATED: network-summary)
+
+All values are means over three copies.
+[All tools and settings](performance-results.md#local-lustre) include the scripted recipes and NFS
+timeouts.
+
 ### Local filesystems
 
 ![Local copy command wall times for rcp and dcp on XFS and ZFS](figures/performance/local-overview-local-copy.svg)
@@ -195,6 +254,42 @@ repetitions; that set also had the lower mean command wall time. Block cloning i
 rcp's sensitivity to source-data ARC state, but metadata caching can still affect its time. Cache
 effects were not isolated experimentally.
 [OpenZFS caching documentation](https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Pool%20Structure/Caching.html).
+
+These summaries include filesystem-assisted copying. CPU and peak RSS retain the GNU-time scope;
+aggregate resource accounting for dcp's MPI ranks was not validated.
+
+[//]: # (BEGIN GENERATED: local-summary)
+
+#### Local XFS summary
+
+| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto       |         0.184 |        0.067 |          0.147 |            9.5 |
+| 1 GB      | dcp · 32 ranks |       302.162 |        0.010 |          0.020 |            8.6 |
+| 100 MB    | rcp auto       |         0.372 |        0.680 |          1.207 |            8.2 |
+| 100 MB    | dcp · 32 ranks |       346.086 |        0.010 |          0.023 |            8.7 |
+| 1 MB      | rcp auto       |        22.001 |       68.200 |        161.493 |           87.2 |
+| 1 MB      | dcp · 32 ranks |       381.995 |        0.010 |          0.020 |            8.8 |
+| 1 kB      | rcp auto       |       227.009 |      736.277 |      1,783.810 |          747.7 |
+| 1 kB      | dcp · 32 ranks |        84.537 |        0.010 |          0.020 |            8.5 |
+
+#### Local ZFS summary
+
+| File size | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto       |         0.860 |        0.040 |         41.077 |            7.5 |
+| 1 GB      | dcp · 32 ranks |       728.596 |      203.483 |        677.053 |           27.0 |
+| 100 MB    | rcp auto       |         1.116 |        0.443 |         48.297 |            7.5 |
+| 100 MB    | dcp · 32 ranks |       758.931 |       63.097 |        679.710 |           27.7 |
+| 1 MB      | rcp auto       |        65.899 |       78.610 |        927.123 |          112.7 |
+| 1 MB      | dcp · 32 ranks |       731.086 |      104.043 |        739.250 |           61.8 |
+| 1 kB      | rcp auto       |       303.003 |      767.103 |     14,322.783 |        1,092.9 |
+| 1 kB      | dcp · 32 ranks |        86.816 |      450.753 |      1,907.227 |          415.6 |
+
+[//]: # (END GENERATED: local-summary)
+
+All values are means over three copies. [All tools and settings](performance-results.md#local-xfs)
+include cp, rsync, and the scripted recipes.
 
 ### Generated filesets and scripted copies
 
@@ -253,6 +348,34 @@ The 10.24-million-file workload is an exception. Default rcp takes 349 seconds v
 for serial rsync, but scripted rsync takes 74 seconds. Reducing rcp copy concurrency to 8 reduces
 its time to 292 seconds.
 
+The table summarizes the automatic rcp and rsync recipes. **CPU and RSS cover the timed local
+command only:** rcp's numbers largely describe the master CLI, while rsync excludes its remote
+receiver. These are not measurements of the complete transfer's resource use.
+
+[//]: # (BEGIN GENERATED: remote-summary)
+
+| File size | Recipe               | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| --------- | -------------------- | ------------: | -----------: | -------------: | -------------: |
+| 1 GB      | rcp auto             |       255.370 |        0.057 |          0.013 |            9.1 |
+| 1 GB      | rsync                |     1,789.548 |    2,003.453 |        502.350 |           16.2 |
+| 1 GB      | rsync · scripted ×10 |       258.607 |    1,961.753 |        560.743 |           16.2 |
+| 100 MB    | rcp auto             |       261.856 |        0.050 |          0.020 |            9.7 |
+| 100 MB    | rsync                |     1,832.147 |    2,039.697 |        477.443 |           16.1 |
+| 100 MB    | rsync · scripted ×10 |       264.740 |    2,012.683 |        572.687 |           16.3 |
+| 1 MB      | rcp auto             |       281.060 |        0.050 |          0.020 |            9.1 |
+| 1 MB      | rsync                |     1,937.598 |    2,046.920 |        500.477 |           14.2 |
+| 1 MB      | rsync · scripted ×10 |       277.290 |    2,026.500 |        576.663 |           14.3 |
+| 1 kB      | rcp auto             |       349.452 |        0.057 |          0.013 |            9.6 |
+| 1 kB      | rsync                |       527.710 |       41.410 |         66.630 |           10.6 |
+| 1 kB      | rsync · scripted ×10 |        73.788 |       41.580 |         69.467 |           10.6 |
+
+[//]: # (END GENERATED: remote-summary)
+
+All values are means over three copies. Separate
+[rcp master, source, and destination measurements](performance-results.md#remote-rcp-role-measurements)
+are available for these generated workloads, alongside
+[every tested setting](performance-results.md#remote-xfs).
+
 ## 5 Linux source tree
 
 The Linux tree tests the everyday-copy part of the comparison. It has much less data than the large
@@ -264,6 +387,25 @@ with serial rsync on a physical pair of hosts.
 
 *Figure 4. Linux source tree copies. Bars show mean command wall time over three repetitions;
 whiskers show the observed range. The local and remote panels report separate copy operations.*
+
+The table gives means over three copies. Remote resource values cover the timed local command only;
+rcp's remote row largely describes its master CLI. Separate daemon measurements were not recorded
+for this tree. Dcp's aggregate MPI resource use was not validated.
+
+[//]: # (BEGIN GENERATED: linux-summary)
+
+| Scope  | Recipe         | Wall time (s) | CPU user (s) | CPU system (s) | Peak RSS (MiB) |
+| ------ | -------------- | ------------: | -----------: | -------------: | -------------: |
+| Local  | rcp auto       |         2.484 |        6.457 |         20.150 |          160.1 |
+| Local  | dcp · 32 ranks |         3.144 |        0.010 |          0.020 |            8.5 |
+| Local  | cp             |         2.497 |        0.113 |          1.733 |            3.0 |
+| Local  | rsync          |         6.251 |        0.667 |          3.247 |           11.3 |
+| Remote | rcp auto       |         5.945 |        0.060 |          0.010 |            9.9 |
+| Remote | rsync          |         8.749 |        3.487 |          1.453 |           13.8 |
+
+[//]: # (END GENERATED: linux-summary)
+
+[Complete Linux-source results with observed ranges](performance-results.md#linux-source).
 
 ### Local copies
 
@@ -355,8 +497,9 @@ archive checks file counts and apparent sizes rather than full content hashes.
 
 The Linux tree is one representative application workload. The generated trees are deliberately
 regular, and the ten-process recipes benefit from that structure. This report covers fresh copies;
-it does not evaluate incremental synchronization or resumed transfers. CPU and memory figures are
-omitted because the recorded accounting scopes differ across tools and remote roles.
+it does not evaluate incremental synchronization or resumed transfers. CPU and memory accounting
+scopes differ across tools and remote roles. The tables retain those recorded values with explicit
+scope qualifications; they do not establish a whole-job resource comparison.
 
 ## 9 Conclusion
 
@@ -458,6 +601,8 @@ locked Nix reporting environment:
 
 ```bash
 nix develop .#reports --command python3 analysis/2026-10-11/analyze.py
+nix develop .#reports --command just report-tables
+nix develop --command just fmt
 ```
 
 The reference environment uses Python 3.14.7, NumPy 2.5.2, and Matplotlib 3.11.1. For installation
@@ -470,7 +615,8 @@ The script verifies the archive, recomputes statistics, resolves equivalent conf
 writes the ten SVG figures used by this report. The inputs are not modified. It also accepts the
 original archive as a positional argument. Optional raster exports can be written outside the
 repository with `--png-output /tmp/rcp-figures`. The report embeds only the command-wall-time
-figures; supplemental timing fields remain available in the JSON.
+figures. The [complete tables](performance-results.md) include supplemental timings; their
+[generator](../../analysis/2026-10-11/tables.py) reads the selected JSON statistics directly.
 
 Supporting files include the [analysis and plotting script](../../analysis/2026-10-11/analyze.py),
 [ZFS command-stage audit](../../analysis/2026-10-11/zfs-stage-audit.json),
