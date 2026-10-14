@@ -5226,6 +5226,11 @@
       "record_sha256": "277011ba5662be8b753341a44810f8450205cd317a753ac7b938674e010851fc",
       "command": "cp --reflink=auto -a /d/phscratch/public/user/mateusz/filesets/10x10x10x10x1024x1K/. /d/phscratch/public/user/mateusz/rcp-perf-work-20260902/10x10x10x10x1024x1K/cp-1x/1/",
       "copy_lower_bound_seconds": 43200.200455839,
+      "measurements": {
+        "user_cpu_seconds": 16.92,
+        "system_cpu_seconds": 464.41,
+        "max_rss_kib": 3104
+      },
       "destination_files": 6608017,
       "source_files": 10240000,
       "n": 1,
@@ -5241,6 +5246,11 @@
       "record_sha256": "04a9e3d55fc6707a166a4b6d30ca49e7cb704d534320c8c73711f58b9b64d8b0",
       "command": "rsync -a /d/phscratch/public/user/mateusz/filesets/10x10x10x10x1024x1K/ /d/phscratch/public/user/mateusz/rcp-perf-work-20260902/10x10x10x10x1024x1K/rsync-1x/1/",
       "copy_lower_bound_seconds": 43200.072257873,
+      "measurements": {
+        "user_cpu_seconds": null,
+        "system_cpu_seconds": null,
+        "max_rss_kib": null
+      },
       "destination_files": 5062233,
       "source_files": 10240000,
       "n": 1,

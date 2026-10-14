@@ -16,6 +16,17 @@ ANALYSIS_DIR = Path(__file__).resolve().parent
 
 
 class AuditTests(unittest.TestCase):
+    def test_timeout_resources_remain_observations_of_unfinished_attempts(self):
+        _, censored, _ = analyze.audit_packet(ANALYSIS_DIR / 'raw')
+        outcomes = {row['variant']: row for row in censored}
+        self.assertEqual(outcomes['cp-1x'].get('measurements'), {
+            'user_cpu_seconds': 16.92, 'system_cpu_seconds': 464.41, 'max_rss_kib': 3104,
+        })
+        self.assertEqual(outcomes['rsync-1x'].get('measurements'), {
+            'user_cpu_seconds': None, 'system_cpu_seconds': None, 'max_rss_kib': None,
+        })
+        self.assertTrue(all(row['outcome'] == 'timed_out' and row['n'] == 1 for row in censored))
+
     def test_rejects_optimized_python_before_verifying_or_writing(self):
         for flags, optimize in [(["-O"], None), ([], "1"), (["-S", "-OO"], None)]:
             with self.subTest(flags=flags, optimize=optimize), tempfile.TemporaryDirectory() as temporary:

@@ -33,8 +33,9 @@ article .figure { max-width: none; margin: 1.8rem 0 .7rem; }
 .figure img { display: block; width: 100%; height: auto; }
 .figure + p { max-width: 100ch; color: var(--muted); font-size: .9rem; line-height: 1.6; margin-bottom: 2rem; }
 .table-scroll { max-width: 100%; overflow-x: auto; margin: 1.5rem 0; }
-table { border-collapse: collapse; font-size: .9rem; line-height: 1.5; }
+table { border-collapse: collapse; font-size: .9rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; vertical-align: top; padding: .7rem .9rem; border-bottom: 1px solid var(--border); }
+td[style*="text-align:right"] { white-space: nowrap; }
 th { border-top: 2px solid var(--rule); border-bottom: 2px solid var(--rule); background: var(--surface); }
 table code { white-space: normal; }
 footer { border-top: 1px solid var(--border); margin-top: 3rem; padding-top: 1rem; color: var(--muted); font-size: .85rem; }

@@ -174,7 +174,16 @@ report-site-test:
     python3 -m unittest discover -s scripts -p 'test_report_site.py'
 
 # Validate both publishing behavior and links in the maintained reports
-report-check: report-site-test report-site
+report-check: report-site-test report-tables-check report-site
+
+# Regenerate summary and complete result tables from the selected JSON analysis
+report-tables:
+    python3 analysis/2026-10-11/tables.py
+
+# Detect stale generated tables and test measurement presentation
+report-tables-check:
+    python3 -m unittest discover -s analysis/2026-10-11 -p 'test_tables.py'
+    python3 analysis/2026-10-11/tables.py --check
 
 # Check preserved analysis and report figures (use nix develop .#reports)
 analysis-test:

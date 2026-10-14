@@ -14,6 +14,11 @@ scripts, and provenance documentation. It does not contain the generated file pa
 - [Analysis script](analyze.py): audits the packet, recomputes the figures, and preserves the agreed
   selection rules. Original JSON documents retain the complete records and embedded logs beyond the
   fields used in the normalized analysis.
+- [Result tables](../../docs/reports/performance-results.md): all retained configurations with wall
+  time, user/system CPU time, peak RSS, ranges, supplemental timings, and remote rcp role summaries.
+  [Their generator](tables.py) uses the selected statistics in `analysis.json` without repeating
+  selection or recomputing those aggregates. Remote role statistics are aggregated from the retained
+  per-role records; timeout resource values remain separate observations of unfinished attempts.
 
 The raw files are evidence, including their historical labels and notes. The report explains the
 interpretation and selection agreed with the experiment owner. Do not format or edit the raw files.
@@ -30,6 +35,8 @@ figures:
 
 ```bash
 nix develop .#reports --command python3 analysis/2026-10-11/analyze.py
+nix develop .#reports --command just report-tables
+nix develop --command just fmt
 ```
 
 The reference environment uses Python 3.14.7, NumPy 2.5.2, and Matplotlib 3.11.1. Without Nix,
@@ -38,6 +45,8 @@ install the pinned [Python dependencies](requirements.txt) into a Python environ
 ```bash
 python3 -m pip install -r analysis/2026-10-11/requirements.txt
 python3 analysis/2026-10-11/analyze.py
+just report-tables
+just fmt
 ```
 
 The Python pins alone do not guarantee byte-identical SVGs across platforms: fonts and native
@@ -56,6 +65,13 @@ inputs.
 The script also accepts the original `.tar.gz` archive. Use `--output` and `--figures-output` to put
 derived outputs elsewhere. `--png-output /tmp/rcp-figures` optionally exports PNG copies; SVG is the
 only figure format kept in the repository.
+
+`just report-tables` regenerates the main report's marked summary tables and the complete results
+page from `analysis.json`, using only Python's standard library. It preserves the surrounding report
+prose. Run it after changing the analysis, then format the Markdown with `just fmt`.
+`just report-tables-check` detects stale table values without rewriting files and runs table tests;
+it is included in `just report-check` and required CI. For separate outputs, copy `performance.md`
+to another directory and use `python3 analysis/2026-10-11/tables.py --reports-dir DIRECTORY`.
 
 Run the audit and figure regression tests with:
 

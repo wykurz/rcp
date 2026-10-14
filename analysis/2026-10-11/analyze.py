@@ -165,6 +165,8 @@ def audit_packet(archive):
                              "recorded_utc": record["recorded_utc"], "iteration": record["iteration"],
                              "record_sha256": outcome["source_record_sha256"], "command": record["command"],
                              "copy_lower_bound_seconds": record["copy_seconds"],
+                             "measurements": {metric: record.get(metric) for metric in
+                                              ["user_cpu_seconds", "system_cpu_seconds", "max_rss_kib"]},
                              "destination_files": record["destination_files"], "source_files": record["source_files"],
                              "n": 1, "interpretation": outcome["interpretation"]})
         results.append(item)
