@@ -93,7 +93,8 @@ jobs:
   benchmark:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    # includes the maximum opening lead/window, teardown, and bounded final upload
+    timeout-minutes: 90
     # required reviewer arms the window only after both build jobs have completed
     environment: aws-benchmark
     permissions:
@@ -134,6 +135,7 @@ jobs:
             --binaries "$RUNNER_TEMP/binaries" --output "$RUNNER_TEMP/aws-results"
       - name: Preserve bounded results even when a comparison fails
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aws-benchmark-results
