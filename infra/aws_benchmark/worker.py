@@ -141,7 +141,8 @@ def collect(output, metadata, budget):
         result.writestr("worker.json", json.dumps(metadata, indent=2))
         def walk(fd, prefix, depth):
             nonlocal total, count
-            require(depth <= 4, "result directory nesting limit exceeded")
+            # results/logs/<case>/<variant>/<iteration>/ is the harness's normal layout.
+            require(depth <= 5, "result directory nesting limit exceeded")
             with os.scandir(fd) as entries:
                 walk_entries(entries, fd, prefix, depth)
         def walk_entries(entries, fd, prefix, depth):
@@ -169,7 +170,8 @@ def collect(output, metadata, budget):
                     os.close(child)
         fd = os.open(output, flags | os.O_DIRECTORY)
         try:
-            walk(fd, "", 0)
+            # Candidate-controlled names cannot duplicate the supervisor's worker.json.
+            walk(fd, "benchmark/", 0)
         finally:
             os.close(fd)
     data = archive.getvalue()
