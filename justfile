@@ -38,6 +38,7 @@ _lint-targets:
 
 # Run all lints (formatting, clippy, policy checks, and helper behavior tests)
 lint: _lint-build _lint-targets
+    just aws-benchmark-test
     @echo "🔍 Testing the benchmark harness..."
     just benchmark-test
     just report-check
@@ -160,6 +161,10 @@ benchmark-run *ARGS:
 # Test measurement, reporting, and history publishing behavior.
 benchmark-test:
     python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
+# Validate AWS window, IAM, and worker failure paths without AWS calls.
+aws-benchmark-test:
+    python3 -m unittest discover -s infra/aws_benchmark -p 'test_*.py'
 
 # Render a standalone dashboard from a result file or history directory.
 benchmark-report *ARGS:

@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Inert RCP benchmark worker; only a trusted operator can arm a window.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet with an Internet Gateway route; no NAT is created.
+  WorkerAmiId:
+    Type: AWS::EC2::Image::Id
+    AllowedPattern: 'ami-[0-9a-f]+'
+    Description: Pinned x86_64 Ubuntu 24.04 image prepared with install-worker.sh.
+  GitHubOidcProviderArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'
+    Description: Existing provider in this account; this stack does not create it.
+Resources:
+  Artifacts:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireMailbox
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+  ArtifactPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: {Ref: Artifacts}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - {Fn::GetAtt: [Artifacts, Arn]}
+              - {Fn::Sub: '${Artifacts.Arn}/*'}
+            Condition:
+              Bool: {aws:SecureTransport: 'false'}
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FixedMailboxOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - {Fn::Sub: '${Artifacts.Arn}/control/window.json'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/request.json'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcp'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcpd'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/filegen'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcp'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcpd'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/filegen'}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - {Fn::Sub: '${Artifacts.Arn}/output/results.zip'}
+                  - {Fn::Sub: '${Artifacts.Arn}/output/status.json'}
+  WorkerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [{Ref: WorkerRole}]
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access; S3 HTTPS egress for the trusted supervisor.
+      VpcId: {Ref: VpcId}
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: {Ref: WorkerAmiId}
+        InstanceType: c5d.24xlarge
+        IamInstanceProfile:
+          Arn: {Fn::GetAtt: [WorkerProfile, Arn]}
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 16
+              Encrypted: true
+              DeleteOnTermination: true
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            Groups: [{Ref: WorkerSecurityGroup}]
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -euo pipefail
+              # trusted, root-owned code is baked into the pinned AMI
+              cd /opt/rcp-benchmark
+              exec systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}'
+  WorkerGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '0'
+      DesiredCapacity: '0'
+      MaxSize: '0'
+      CapacityRebalance: false
+      NewInstancesProtectedFromScaleIn: false
+      HealthCheckType: EC2
+      VPCZoneIdentifier: [{Ref: SubnetId}]
+      LaunchTemplate:
+        LaunchTemplateId: {Ref: LaunchTemplate}
+        Version: {Fn::GetAtt: [LaunchTemplate, LatestVersionNumber]}
+      Tags:
+        - Key: Purpose
+          Value: rcp-disposable-benchmark
+          PropagateAtLaunch: true
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: {Ref: GitHubOidcProviderArn}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:wykurz/rcp:environment:aws-benchmark
+      Policies:
+        - PolicyName: BenchmarkRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: autoscaling:SetDesiredCapacity
+                Resource: {Fn::GetAtt: [WorkerGroup, AutoScalingGroupARN]}
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeScheduledActions
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - {Fn::Sub: '${Artifacts.Arn}/control/window.json'}
+                  - {Fn::Sub: '${Artifacts.Arn}/output/results.zip'}
+                  - {Fn::Sub: '${Artifacts.Arn}/output/status.json'}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - {Fn::Sub: '${Artifacts.Arn}/input/request.json'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcp'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcpd'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/filegen'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcp'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcpd'}
+                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/filegen'}
+Outputs:
+  AutoScalingGroupName:
+    Value: {Ref: WorkerGroup}
+  ArtifactBucket:
+    Value: {Ref: Artifacts}
+  RuntimeRoleArn:
+    Value: {Fn::GetAtt: [RuntimeRole, Arn]}
+  LaunchTemplateVersion:
+    Value: {Fn::GetAtt: [LaunchTemplate, LatestVersionNumber]}

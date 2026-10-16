@@ -1,0 +1,142 @@
+name: AWS benchmark (operator window required)
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Full 40-character lowercase baseline commit SHA
+        required: true
+        type: string
+      candidate:
+        description: Full 40-character lowercase candidate commit SHA
+        required: true
+        type: string
+      suite:
+        description: Start with identical revisions and aa-smoke
+        required: true
+        type: choice
+        default: aa-smoke
+        options: [aa-smoke, tiny, medium, large, deep]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-benchmark-single-mailbox
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main' && vars.RCP_AWS_BENCHMARK_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate pinned revisions and suite
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          CANDIDATE: ${{ inputs.candidate }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from infra.aws_benchmark.common import validate_identity
+          validate_identity(dict(run=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'],
+                                 baseline=os.environ['BASELINE'], candidate=os.environ['CANDIDATE'], suite=os.environ['SUITE']))
+          PY
+
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: --cfg tokio_unstable
+      PKG_CONFIG_ALLOW_CROSS: '1'
+    # no OIDC, environment secrets, AWS credentials, shared caches, or self-hosted runner
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        role: [baseline, candidate]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.role == 'baseline' && inputs.baseline || inputs.candidate }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: x86_64-unknown-linux-musl
+          cache: false
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: just
+      - name: Build before opening the expensive worker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+          sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+          just build-release
+          mkdir -p "$RUNNER_TEMP/binaries"
+          for name in rcp rcpd filegen; do
+            install -m 0755 "target/x86_64-unknown-linux-musl/release/$name" "$RUNNER_TEMP/binaries/$name"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aws-${{ matrix.role }}
+          path: ${{ runner.temp }}/binaries/
+          retention-days: 1
+          if-no-files-found: error
+
+  benchmark:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    # required reviewer arms the window only after both build jobs have completed
+    environment: aws-benchmark
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aws-baseline
+          path: ${{ runner.temp }}/binaries/baseline
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aws-candidate
+          path: ${{ runner.temp }}/binaries/candidate
+      - name: Install AWS SDK for trusted controller
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aws-sdk"
+          "$RUNNER_TEMP/aws-sdk/bin/pip" install -r infra/aws_benchmark/requirements.txt
+      - name: Run within the operator window and verify teardown
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          CANDIDATE: ${{ inputs.candidate }}
+          SUITE: ${{ inputs.suite }}
+          AWS_REGION: ${{ vars.RCP_AWS_REGION }}
+          ASG: ${{ vars.RCP_AWS_ASG }}
+          BUCKET: ${{ vars.RCP_AWS_BUCKET }}
+          ROLE: ${{ vars.RCP_AWS_ROLE_ARN }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          "$RUNNER_TEMP/aws-sdk/bin/python" -m infra.aws_benchmark.controller \
+            --region "$AWS_REGION" --asg "$ASG" --bucket "$BUCKET" --role-arn "$ROLE" \
+            --run "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --baseline "$BASELINE" --candidate "$CANDIDATE" --suite "$SUITE" \
+            --binaries "$RUNNER_TEMP/binaries" --output "$RUNNER_TEMP/aws-results"
+      - name: Preserve bounded results even when a comparison fails
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aws-benchmark-results
+          path: ${{ runner.temp }}/aws-results/
+          retention-days: 7
+          if-no-files-found: warn
