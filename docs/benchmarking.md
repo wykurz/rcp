@@ -1,5 +1,9 @@
 # Copy benchmarks
 
+For the opt-in, manually armed AWS worker and its setup checklist, see
+[AWS benchmarks](../infra/aws_benchmark/README.md). Its independent scheduled shutdown must be
+configured by a trusted operator; the ordinary benchmark workflows do not deploy AWS resources.
+
 For the measured comparison across shared and local filesystems, remote transfers, and a Linux
 source tree, see the [performance report](reports/performance.md). Its
 [original measurement packet and analysis](../analysis/2026-10-11/README.md) are preserved

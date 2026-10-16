@@ -140,6 +140,9 @@ jobs:
     - name: Test benchmark harness
       run: just benchmark-test
 
+    - name: Test AWS benchmark safety offline
+      run: just aws-benchmark-test
+
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 
