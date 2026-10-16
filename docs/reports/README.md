@@ -2,6 +2,8 @@
 
 Measurements and technical reports for people using and operating rcp.
 
+New to the tools? Start with the [RCP Tools project page](https://www.wykurz.org/rcp/).
+
 ## Performance across shared filesystems and everyday copies
 
 The [performance report](performance.md) compares rcp, dcp, GNU cp, and rsync on Lustre, Weka, NFS,

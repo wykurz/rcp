@@ -1,14 +1,6 @@
-:root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-* { box-sizing: border-box; }
-body { margin: 0; font-size: 16px; line-height: 1.7; }
-.skip-link { position: absolute; left: 1rem; top: -5rem; padding: .5rem 1rem; background: var(--surface); z-index: 10; }
-.skip-link:focus { top: .5rem; }
-.site-header { max-width: 1540px; margin: 0 auto; min-height: 88px; display: flex; align-items: center; justify-content: space-between; gap: 2rem; padding: 1rem 2.5rem; border-bottom: 1px solid var(--border); }
-.brand { display: flex; align-items: center; gap: .8rem; color: var(--text); font-size: 1.1rem; font-weight: 750; text-decoration: none; }
-.brand img { object-fit: contain; }
-.site-header nav { display: flex; flex-wrap: wrap; align-items: center; gap: 1.5rem; font-size: .9rem; }
-.site-header nav a { text-decoration: none; }
-.page-layout { display: grid; grid-template-columns: 215px minmax(0, 1fr); gap: 3rem; max-width: 1540px; margin: 0 auto; padding: 2.8rem 2.5rem 4rem; }
+body { line-height: 1.7; }
+/* leave room for wide tables and figures below the shared, narrower header */
+.page-layout { display: grid; grid-template-columns: 215px minmax(0, 1fr); gap: 3rem; max-width: 1540px; margin: 0 auto; padding: 2.8rem var(--site-gutter) 4rem; }
 .contents { position: sticky; top: 1.5rem; align-self: start; max-height: calc(100vh - 3rem); overflow-y: auto; font-size: .82rem; line-height: 1.5; padding-right: .7rem; }
 .contents summary { font-weight: 700; cursor: pointer; padding-bottom: .7rem; }
 .contents ul { margin: 0; padding: 0; list-style: none; }
@@ -25,7 +17,7 @@ article h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; line-height: 1.4; }
 article h1, article h2, article h3 { scroll-margin-top: 1.5rem; }
 article p { margin: .9rem 0 1.2rem; }
 article li { margin: .35rem 0; }
-article code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .88em; overflow-wrap: anywhere; background: var(--surface-raised); border-radius: 3px; padding: .12em .25em; }
+article code { font-size: .88em; overflow-wrap: anywhere; background: var(--surface-raised); border-radius: 3px; padding: .12em .25em; }
 article pre { overflow-x: auto; padding: 1rem 1.2rem; background: var(--surface-raised); border: 1px solid var(--border); border-radius: 5px; line-height: 1.5; }
 article pre code { padding: 0; overflow-wrap: normal; }
 article .figure { max-width: none; margin: 1.8rem 0 .7rem; }
@@ -40,16 +32,13 @@ th { border-top: 2px solid var(--rule); border-bottom: 2px solid var(--rule); ba
 table code { white-space: normal; }
 footer { border-top: 1px solid var(--border); margin-top: 3rem; padding-top: 1rem; color: var(--muted); font-size: .85rem; }
 @media (max-width: 960px) {
-  .page-layout { grid-template-columns: minmax(0, 1fr); gap: 2rem; padding: 1.5rem; }
-  .site-header { padding: 1rem 1.5rem; gap: 1rem; flex-wrap: wrap; }
-  .site-header nav { gap: 1rem; }
+  .page-layout { grid-template-columns: minmax(0, 1fr); gap: 2rem; padding-block: 1.5rem; }
   .contents { position: static; max-height: none; padding: .8rem 1rem; border: 1px solid var(--border); border-radius: 4px; }
   .contents nav { max-height: 16rem; overflow-y: auto; }
   .source-link { margin-top: .6rem; }
 }
 @media (max-width: 540px) {
-  .page-layout { padding: 1.2rem 1rem; }
-  .site-header { padding: .8rem 1rem; }
+  .page-layout { padding-block: 1.2rem; }
   body { font-size: 15px; }
   th, td { padding: .5rem .65rem; }
 }

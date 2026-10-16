@@ -1,9 +1,12 @@
-<img src="https://raw.githubusercontent.com/wykurz/rcp/main/assets/logo.svg" height="64" alt="RCP Tools Logo">
+[![RCP Tools — Fast file operations for Linux. Explore the tools and performance reports.](https://raw.githubusercontent.com/wykurz/rcp/main/assets/project-banner.svg)](https://www.wykurz.org/rcp/)
 
 # RCP TOOLS
 
 This repo contains tools to efficiently copy, remove and link large filesets, both locally and
 across remote hosts.
+
+[Website](https://www.wykurz.org/rcp/) · [Performance reports](https://www.wykurz.org/rcp/reports/)
+· [Installation](#installation)
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 [![Chaos Tests](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml/badge.svg)](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml)
@@ -35,19 +38,15 @@ across remote hosts.
 
 # Benchmarks
 
-The [performance report](docs/reports/performance.md) compares rcp with dcp, GNU cp, and rsync
-across Lustre, Weka, NFS, XFS, and ZFS, remote transfers, and a Linux source tree. It includes
-default settings, concurrency sweeps, SVG figures, and the complete measurement evidence. See
-[RCP reports](docs/reports/README.md) for the report index.
+The [performance report](https://www.wykurz.org/rcp/reports/performance/) compares rcp with dcp, GNU
+cp, and rsync across Lustre, Weka, NFS, XFS, and ZFS, remote transfers, and a Linux source tree. It
+includes default settings, concurrency sweeps, SVG figures, and the complete measurement evidence.
+See [RCP reports](https://www.wykurz.org/rcp/reports/) for the hosted report index, or browse the
+[reports in this repository](docs/reports/README.md), including the
+[performance report source](docs/reports/performance.md).
 
-[Benchmark dashboard and run results](docs/benchmarking.md#view-results) compare rcp with GNU cp and
-rsync for local and loopback remote copies. PRs and main pushes run small correctness smoke checks;
-weekly and manual runs measure larger filesets for performance history. Timing is informational and
-does not gate CI.
-
-Downloadable reports are available from each benchmark run. The hosted historical dashboard requires
-[GitHub Pages setup](docs/benchmarking.md#enable-the-historical-site). See the
-[benchmarking guide](docs/benchmarking.md) for datasets, measurement rules, and manual commands.
+For contributors running measurements, see the [benchmarking guide](docs/benchmarking.md) for
+datasets, measurement rules, CI history, and manual commands.
 
 # Documentation
 
@@ -74,7 +73,8 @@ API documentation for the command-line tools is available on docs.rs:
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 - [Benchmarking](docs/benchmarking.md) - Copy performance measurements, CI and historical trends
-- [Reports](docs/reports/README.md) - Performance results and supporting measurement evidence
+- [Reports](https://www.wykurz.org/rcp/reports/) ([repository index](docs/reports/README.md)) -
+  Performance results and supporting measurement evidence
 - [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
 - [POSIX ACLs](docs/acls.md) - what `acl` preserves, why it is opt-in, and the two ways a copy can
   widen

@@ -30,9 +30,11 @@ from performance trends and ratios. Scheduled and manual performance runs on mai
 JSON records to the `benchmark-history` branch. After
 [enabling the historical site](#enable-the-historical-site), the
 [Benchmark history and reports workflow](https://github.com/wykurz/rcp/actions/workflows/benchmark-pages.yml)
-publishes those records as a GitHub Pages dashboard. Follow its `github-pages` deployment URL, also
-shown in the repository's Settings → Pages, to open the site. Until publication is enabled, use the
-downloadable reports or render the history branch locally.
+publishes those records as a GitHub Pages dashboard under `ci-benchmarks/`. The
+[CI benchmark dashboard](https://www.wykurz.org/rcp/ci-benchmarks/) is a work in progress for
+contributors; the [project homepage](https://www.wykurz.org/rcp/) and
+[maintained reports](https://www.wykurz.org/rcp/reports/) are the public introduction. Until
+publication is enabled, use the downloadable reports or render the history branch locally.
 
 The historical dashboard plots median copy wall time over date, with minimum-to-maximum repeat
 ranges. Filter by case, variant, runner/topology/cache group, and series. Hover over a point for run
@@ -766,10 +768,11 @@ against the full baseline; these are comparison screens, not performance guarant
 
 ## Enable the historical site
 
-The same Pages site hosts [RCP reports](reports/README.md) under `reports/`; the performance report
-is at `reports/performance/`. The dashboard remains at the site root. Reports are generated from the
-maintained Markdown files and SVG figures in `docs/reports/`. Pushes to main rebuild the combined
-site through the Pages workflow. Other repository documentation remains on GitHub.
+The Pages site hosts the project landing page at its root and [RCP reports](reports/README.md) under
+`reports/`; the performance report is at `reports/performance/`. CI benchmark history and its JSON
+and change reports live under `ci-benchmarks/`. Reports are generated from the maintained Markdown
+files and SVG figures in `docs/reports/`. Pushes to main rebuild the combined site through the Pages
+workflow. Other repository documentation remains on GitHub.
 
 To preview reports locally, enter `nix develop`, or install `scripts/report-site-requirements.txt`
 in a Python virtual environment, then run:
@@ -779,19 +782,34 @@ just report-check
 python3 -m http.server 8000 --directory target/report-site
 ```
 
-Open `http://localhost:8000/reports/performance/`. Figures link to their full-size SVGs. The build
-checks local references, including sections in linked Markdown documents, and copies only the
-referenced SVG figures; the full measurement packet remains available in the repository. These
-checks run in `just lint` and required CI on every pull request. Generated HTML is written under the
-ignored `target/` directory.
+Open `http://localhost:8000/` for the landing page or `http://localhost:8000/reports/performance/`
+for the report. Figures link to their full-size SVGs. The build checks local references, including
+sections in linked Markdown documents, and copies only the referenced SVG figures; the full
+measurement packet remains available in the repository. These checks run in `just lint` and required
+CI on every pull request. Generated HTML is written under the ignored `target/` directory.
 
 The dashboard and reports publish together. If either build fails, the previously published site
 remains available until a successful build replaces it.
 
-To preview a combined site with existing history, render the dashboard first with
-`just benchmark-report /path/to/history --output target/report-site --reports-url reports/index.html`,
-then run `just report-site --with-benchmark-history`. The report build preserves the dashboard and
-its history files.
+To preview a combined site with existing history, render the dashboard first:
+
+```bash
+just benchmark-report /path/to/history --output target/report-site/ci-benchmarks --reports-url ../reports/index.html
+just report-site --with-benchmark-history
+```
+
+The project-site build preserves the dashboard and its history files under `ci-benchmarks/`. Old
+root-level `index.html#run-…` bookmarks forward to that dashboard; root `changes.html` redirects to
+the new changes page. Copies of `history.json`, `changes.json`, and `changes.md` keep existing data
+links working. These compatibility routes are generated with `--with-benchmark-history`.
+
+The shared header and stylesheet are in `scripts/report-site/header.html` and `site.css`; the
+landing page uses `landing.html`, `landing.css`, and `landing.js` in the same directory. The landing
+page reads its featured timings and fileset size from the tables in `docs/reports/performance.md`
+and derives both charts from one shared scale. The build rejects missing or ambiguous measurement
+rows and checks README section links in the landing page and shared header. The report content
+remains wider than the shared header to accommodate tables and figures; mobile gutters match
+throughout.
 
 Scheduled and manual Depot runs on main publish performance history. Push and PR smoke jobs do not
 publish history. PR jobs have read-only repository permissions and never publish. The history job

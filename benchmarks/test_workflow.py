@@ -232,9 +232,9 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             summary = (root / "job-summary").read_text()
             parsed = Fragment(summary)
             reference = parsed.rows()[0][4]
-            self.assertEqual(reference["children"][0]["attrs"]["href"], "https://example.test/rcp/index.html#run-" + before["run_id"])
+            self.assertEqual(reference["children"][0]["attrs"]["href"], "https://example.test/rcp/ci-benchmarks/index.html#run-" + before["run_id"])
             self.assertIn(before["timestamp"], parsed.text(reference))
-            self.assertTrue(all(link["attrs"]["href"].startswith("https://example.test/rcp/index.html#run-") for link in parsed.elements("a")))
+            self.assertTrue(all(link["attrs"]["href"].startswith("https://example.test/rcp/ci-benchmarks/index.html#run-") for link in parsed.elements("a")))
             self.assertIn("literal (index.html#run-metadata)", summary)
             # a failed deployment has no URL; the always() summary still retains the numeric evidence
             environment.update(REPORT_URL="", GITHUB_STEP_SUMMARY=str(root / "failed-deploy-summary"))
@@ -244,8 +244,15 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             self.assertIn(before["run_id"], fallback.text(fallback.rows()[0][4]))
             self.assertEqual(fallback.text(fallback.rows()[0][3]), "1.000x (+0.0%)")
             site = root / "_site"
-            (site / "linked-index.html").symlink_to("index.html")
-            os.link(site / "index.html", site / "hardlinked-index.html")
+            history_page = site / "ci-benchmarks/index.html"
+            self.assertIn('href="../reports/index.html"', history_page.read_text())
+            # the report suite covers rendering; packaging must include public pages alongside history
+            (site / "index.html").write_text('<!doctype html><title>Project landing page</title>')
+            (site / "reports").mkdir()
+            (site / "reports/index.html").write_text('<!doctype html><title>Reports</title>')
+            (site / "linked-index.html").symlink_to("ci-benchmarks/index.html")
+            os.link(history_page, site / "hardlinked-index.html")
+            expected_files = {path.relative_to(site).as_posix() for path in site.rglob('*') if path.is_file()}
             for excluded in (".git", ".github"):
                 (site / excluded).mkdir()
                 (site / excluded / "private").write_text("not published")
@@ -256,12 +263,10 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             with tarfile.open(root / "artifact.tar") as archive:
                 members = archive.getmembers()
                 self.assertTrue(all(not member.issym() and not member.islnk() for member in members))
-                self.assertEqual({member.name.removeprefix("./") for member in members if member.isfile()}, {
-                    "index.html", "history.json", "changes.json", "changes.md", "changes.html", "linked-index.html", "hardlinked-index.html",
-                })
-                for filename in ("index.html", "linked-index.html", "hardlinked-index.html"):
-                    self.assertEqual(archive.extractfile(f"./{filename}").read(), (site / "index.html").read_bytes())
-                self.assertEqual(json.load(archive.extractfile("./history.json")), {"schema_version": 1, "runs": [before, record]})
+                self.assertEqual({member.name.removeprefix("./") for member in members if member.isfile()}, expected_files)
+                for filename in ("ci-benchmarks/index.html", "linked-index.html", "hardlinked-index.html"):
+                    self.assertEqual(archive.extractfile(f"./{filename}").read(), history_page.read_bytes())
+                self.assertEqual(json.load(archive.extractfile("./ci-benchmarks/history.json")), {"schema_version": 1, "runs": [before, record]})
 
 
 if __name__ == "__main__":

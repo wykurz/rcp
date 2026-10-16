@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Fast Linux tools for copying, removing, and managing large filesets. Explore RCP Tools, performance reports, and installation options.">
+  <title>RCP Tools · Fast file operations for Linux</title>
+  $theme
+  $legacy_redirect
+  <link rel="stylesheet" href="assets/site.css">
+  <link rel="stylesheet" href="assets/landing.css">
+  <script src="assets/landing.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  $header
+  <main id="main" class="wrap">
+    <section class="hero" aria-labelledby="headline">
+      <div>
+        <p class="eyebrow">The Linux fileset toolkit</p>
+        <h1 id="headline">Fast file operations.<br><span>Built for scale.</span></h1>
+        <p class="intro">Copy files, remove directory trees, and manage permissions efficiently. For everyday work and millions of files on Linux.</p>
+        <div class="actions">
+          <a class="button primary" href="#get-started">Get started <span aria-hidden="true">→</span></a>
+          <a class="button" href="#performance">See the performance <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="hero-meta">Open source · MIT licensed · Linux x86_64 &amp; AArch64</p>
+      </div>
+      <div class="terminal">
+        <div class="terminal-top"><span class="terminal-title"><span class="terminal-dot" aria-hidden="true"></span> Familiar work. Larger scale.</span><span>~/datasets</span></div>
+        <div class="command-tabs" hidden role="tablist" aria-label="Command examples">
+          <button type="button" role="tab" id="tab-rcp" aria-controls="panel-rcp" aria-selected="true" tabindex="0">rcp</button>
+          <button type="button" role="tab" id="tab-rrm" aria-controls="panel-rrm" aria-selected="false" tabindex="-1">rrm</button>
+          <button type="button" role="tab" id="tab-rchm" aria-controls="panel-rchm" aria-selected="false" tabindex="-1">rchm</button>
+        </div>
+        <div class="terminal-body" role="tabpanel" id="panel-rcp" aria-labelledby="tab-rcp" tabindex="0">
+          <pre><span class="comment"># copy a directory tree</span>
+<span class="prompt">$$</span> <span class="command">rcp</span> ./dataset ./dataset-copy \
+    --progress --summary</pre>
+          <pre><span class="comment"># or send it to another host</span>
+<span class="prompt">$$</span> <span class="command">rcp</span> ./dataset host:/data/dataset \
+    --auto-deploy-rcpd --progress</pre>
+        </div>
+        <div class="terminal-body" role="tabpanel" id="panel-rrm" aria-labelledby="tab-rrm" tabindex="0">
+          <pre><span class="comment"># remove an old scratch directory</span>
+<span class="prompt">$$</span> <span class="command">rrm</span> ./scratch/old-run \
+    --progress --summary</pre>
+          <pre><span class="comment"># recursive removal, with progress
+# and a summary when the work is done</span></pre>
+        </div>
+        <div class="terminal-body" role="tabpanel" id="panel-rchm" aria-labelledby="tab-rchm" tabindex="0">
+          <pre><span class="comment"># set a tree's group and permissions</span>
+<span class="prompt">$$</span> <span class="command">rchm</span> --group data \
+    --mode "f:g+rw d:g+rwxs" \
+    ./dataset --progress --summary</pre>
+          <pre><span class="comment"># separate rules for files and directories</span></pre>
+        </div>
+        <div class="terminal-footer"><span>Local filesystems &amp; shared storage</span><a href="$repository#examples">Command guide ↗</a></div>
+      </div>
+    </section>
+    <div class="context"><strong>For sysadmins, SREs, and systems engineers.</strong><span>From source trees and scratch space to shared datasets.</span></div>
+    <section id="tools" class="section" aria-labelledby="tools-heading">
+      <div class="section-number">01 / THE ESSENTIALS</div>
+      <div class="section-heading"><h2 id="tools-heading">The work you do every day.</h2><p>Three fundamental operations, with tools built to handle large directory trees.</p></div>
+      <div class="tools">
+        <article class="tool"><div class="tool-title"><h3>rcp</h3><span class="tool-symbol" aria-hidden="true">↗</span></div><h4>Copy. Here or across hosts.</h4><p>Copy files and directory trees locally or between Linux hosts. Preserve metadata, track progress, and tune concurrency when you need to.</p><a href="$repository#examples">Copy examples <span aria-hidden="true">→</span></a></article>
+        <article class="tool"><div class="tool-title"><h3>rrm</h3><span class="tool-symbol" aria-hidden="true">−</span></div><h4>Remove large directory trees.</h4><p>Clear out scratch space, old datasets, and build output. Remove large filesets with progress reporting and a summary of the work.</p><a href="https://docs.rs/rcp-tools-rrm">Removal documentation <span aria-hidden="true">→</span></a></article>
+        <article class="tool"><div class="tool-title"><h3>rchm</h3><span class="tool-symbol" aria-hidden="true">±</span></div><h4>Put permissions in order.</h4><p>Change ownership, groups, and permissions recursively. Apply different rules to files and directories in the same operation.</p><a href="$repository#permissions-and-ownership-rchm">Permissions guide <span aria-hidden="true">→</span></a></article>
+      </div>
+    </section>
+    <section id="performance" class="section" aria-labelledby="performance-heading">
+      <div class="section-number">02 / MEASURED PERFORMANCE</div>
+      <h2 id="performance-heading">Less time waiting on a copy.</h2>
+      <p class="evidence-intro">A million files is a useful place to start. In these shared-filesystem measurements, default rcp completes the copy in minutes.</p>
+      <div class="charts">
+        <figure class="chart"><figcaption>Lustre</figcaption><div class="chart-label"><strong>rcp · automatic settings</strong><strong>$lustre_rcp min</strong></div><div class="chart-bar rcp" style="--bar-width: $lustre_rcp_width%" aria-hidden="true"></div><div class="chart-label"><span>dcp · 32 MPI ranks</span><span>$lustre_dcp min</span></div><div class="chart-bar" style="--bar-width: $lustre_dcp_width%" aria-hidden="true"></div><div class="chart-scale" aria-hidden="true"><span>0</span><span>$midpoint</span><span>$scale min</span></div></figure>
+        <figure class="chart"><figcaption>Weka</figcaption><div class="chart-label"><strong>rcp · automatic settings</strong><strong>$weka_rcp min</strong></div><div class="chart-bar rcp" style="--bar-width: $weka_rcp_width%" aria-hidden="true"></div><div class="chart-label"><span>dcp · 32 MPI ranks</span><span>$weka_dcp min</span></div><div class="chart-bar" style="--bar-width: $weka_dcp_width%" aria-hidden="true"></div><div class="chart-scale" aria-hidden="true"><span>0</span><span>$midpoint</span><span>$scale min</span></div></figure>
+      </div>
+      <p class="evidence-note">From the performance report. $files files × 1 MB ($total_bytes), copied within each filesystem. Mean command wall time; lower is faster. These are two workloads from the report, not a general speedup claim. Filesystems use different hardware; the charts compare tools within each setting.</p>
+      <div class="report-bottom"><a class="button primary" href="$performance">Read the performance report <span aria-hidden="true">→</span></a><a href="$results">Complete results &amp; measurement details ↗</a></div>
+      <div class="everyday"><strong>Useful for the smaller jobs, too.</strong><p>On the tested Linux source tree, $linux_comparison. The report also covers remote transfers, NFS, XFS, ZFS, and workloads where other settings or tools perform better.</p></div>
+    </section>
+    <section class="section" aria-labelledby="specialized-heading">
+      <div class="section-number">03 / ROUND OUT YOUR TOOLKIT</div>
+      <h2 id="specialized-heading">Compare, link, and generate.</h2>
+      <div class="specialized">
+        <article><h3><a href="https://docs.rs/rcp-tools-rcmp"><code>rcmp</code> <span aria-hidden="true">↗</span></a></h3><p>Compare filesets and report differences between directory trees.</p></article>
+        <article><h3><a href="https://docs.rs/rcp-tools-rlink"><code>rlink</code> <span aria-hidden="true">↗</span></a></h3><p>Build hard-linked filesets, with update options for datasets that change.</p></article>
+        <article><h3><a href="https://docs.rs/rcp-tools-filegen"><code>filegen</code> <span aria-hidden="true">↗</span></a></h3><p>Generate repeatable sample filesets for testing and benchmarking.</p></article>
+      </div>
+    </section>
+    <section id="get-started" class="get-started" aria-labelledby="start-heading">
+      <div><div class="section-number">04 / GET STARTED</div><h2 id="start-heading">Put the tools to work.</h2><p>Install on Linux with Cargo or Nix, or get a Debian or RPM package from the releases.</p><a class="button" href="$repository#installation">Installation guide <span aria-hidden="true">→</span></a></div>
+      <div class="install-block"><div class="install-label">Install the three core tools with Cargo</div><pre><code><span class="prompt">$$</span> cargo install rcp-tools-rcp \
+    rcp-tools-rrm rcp-tools-rchm</code></pre><div class="install-label">Make your first local copy</div><pre><code><span class="prompt">$$</span> rcp ./dataset ./dataset-copy --progress</code></pre><a href="$repository#copy-semantics">Read the destination-path and overwrite rules ↗</a></div>
+    </section>
+  </main>
+  <footer class="site-footer wrap"><span>RCP Tools · Open source under the MIT license</span><nav aria-label="Footer navigation"><a href="$repository">GitHub</a><a href="$reports">Reports</a><a href="$repository#documentation">Documentation</a></nav></footer>
+</body>
+</html>
