@@ -366,6 +366,17 @@ class WorkerTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_workflow_budget_covers_maximum_window_cleanup_and_upload(self):
+        import yaml
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/aws-benchmark.yml"
+        job = yaml.safe_load(path.read_text())["jobs"]["benchmark"]
+        upload = job["steps"][-1]["timeout-minutes"]
+        # Opening may be five minutes ahead; cleanup allows ten minutes. Leave
+        # five additional minutes of runner margin beyond the bounded upload.
+        required = 5 + common.MAX_WINDOW // 60 + 10 + upload + 5
+        self.assertLessEqual(upload, 5)
+        self.assertGreaterEqual(job["timeout-minutes"], required)
+
     def test_runtime_has_only_one_capacity_write_and_exact_mailbox_keys(self):
         import yaml
         root = Path(__file__).parent
