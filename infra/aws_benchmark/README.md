@@ -79,8 +79,8 @@ python -m infra.aws_benchmark.operator \
 4. After successful read-back, approve the waiting environment job. CI waits for the opening, checks
    the cutoff, uploads bounded binaries, and requests desired capacity 1. It never opens the ASG
    maximum. Download `aws-benchmark-results` afterward and inspect `status.json`, `worker.json`
-   inside the ZIP, the unchanged harness `results/results.json`, and partial logs. The ZIP is data;
-   review its contents before opening anything executable or HTML.
+   inside the ZIP, the unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP
+   is data; review its contents before opening anything executable or HTML.
 5. Confirm the controller reports physical teardown. At the cutoff, verify all three ASG capacities
    are zero and all instances tagged for this group are terminated. Normal CI cleanup sets desired
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
@@ -179,10 +179,12 @@ collected only after the service is stopped and its cgroup is empty, using held 
 descriptors, no symlink following, regular-file checks and bounded traversal.
 
 Output storage is a 128 MiB tmpfs; private temporary directories are each 64 MiB. A result archive
-is at most 64 MiB and 1000 files, with at most four directory levels. Standard service output is
-discarded; the harness's per-trial files are retained within the output bound. Oversized or unsafe
-results fail explicitly rather than silently truncating measurements. Failed/incomplete harness
-records can be downloaded but must not be treated as successful comparisons.
+is at most 64 MiB and 1000 candidate entries, with at most five directory levels below the output
+root, matching `results/logs/<case>/<variant>/<iteration>/`. Candidate files are archived under
+`benchmark/`; trusted supervisor metadata is the separate root `worker.json`. Standard service
+output is discarded; the harness's per-trial files are retained within the output bound. Oversized
+or unsafe results fail explicitly rather than silently truncating measurements. Failed/incomplete
+harness records can be downloaded but must not be treated as successful comparisons.
 
 The unversioned S3 mailbox has a fixed number of exact keys and seven-day expiration, plus one-day
 incomplete-multipart cleanup. GitHub build artifacts live one day; result artifacts live seven. Size

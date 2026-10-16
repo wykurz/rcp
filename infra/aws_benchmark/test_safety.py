@@ -297,8 +297,52 @@ class WorkerTests(unittest.TestCase):
             (root / "partial.json").write_text('{"status":"running"}')
             result = worker.collect(root, {"success": False}, Mock())
         with zipfile.ZipFile(io.BytesIO(result)) as archive:
-            self.assertEqual(archive.read("partial.json"), b'{"status":"running"}')
+            self.assertEqual(archive.read("benchmark/partial.json"), b'{"status":"running"}')
             self.assertFalse(json.loads(archive.read("worker.json"))["success"])
+
+    def test_complete_trial_tree_is_collected(self):
+        # run.py puts each command's logs/resources under case/variant/iteration.
+        # Include the worker's outer results/ directory, both paired roles and repetitions.
+        files = {
+            "results/results.json": b'{"status":"completed"}',
+            "results/summary.md": b"A/A smoke\n",
+            "results/logs/tiny-10k.filegen.stdout.log": b"generated\n",
+            "results/logs/tiny-10k.filegen.stderr.log": b"",
+        }
+        for variant in ("rcp-baseline", "rcp-default"):
+            for iteration in (1, 2):
+                trial = f"results/logs/tiny-10k/{variant}/{iteration}"
+                files.update({f"{trial}/0.stdout.log": b"copied\n",
+                              f"{trial}/0.stderr.log": b"",
+                              f"{trial}/resources.json": b'{"status":"complete"}'})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, content in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            result = worker.collect(root, {"success": True}, Mock())
+        with zipfile.ZipFile(io.BytesIO(result)) as archive:
+            self.assertEqual(set(archive.namelist()), {"worker.json", *("benchmark/" + name for name in files)})
+            for name, content in files.items():
+                self.assertEqual(archive.read("benchmark/" + name), content)
+
+    def test_result_collector_still_rejects_excessive_nesting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "results/logs/tiny-10k/rcp-default/1/extra").mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "nesting limit"):
+                worker.collect(root, {}, Mock())
+
+    def test_untrusted_metadata_name_cannot_duplicate_trusted_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "worker.json").write_text('{"success":true,"source":"candidate"}')
+            result = worker.collect(root, {"success": False, "source": "supervisor"}, Mock())
+        with zipfile.ZipFile(io.BytesIO(result)) as archive:
+            self.assertEqual(len(archive.namelist()), len(set(archive.namelist())))
+            self.assertEqual(json.loads(archive.read("worker.json")), {"success": False, "source": "supervisor"})
+            self.assertEqual(json.loads(archive.read("benchmark/worker.json"))["source"], "candidate")
 
     def test_result_collection_stops_at_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
