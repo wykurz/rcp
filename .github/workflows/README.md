@@ -25,16 +25,17 @@ security-sensitive change:
 
 ### benchmark-pages.yml
 
-Publishes the benchmark trend dashboard from the dedicated `benchmark-history` branch together with
-the Markdown-based [reports](../../docs/reports/README.md). A trusted Depot run can dispatch
-`benchmark-history-updated`; every push to `main` and manual requests also rebuild the combined
-site. The push trigger covers changes to linked documentation as well as report sources. Pull
-requests validate the report build and original measurement checksums without deploying. Published
-rendering code and report sources come from `main`; historical records are data. The deployment is
-enabled with the repository variable `RCP_BENCHMARK_PAGES=true` after configuring Pages to use
-GitHub Actions. See [Benchmark dashboard and run results](../../docs/benchmarking.md#view-results)
-for viewing instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site)
-to enable publication.
+Publishes the project landing page, a trend dashboard under `ci-benchmarks/` from the dedicated
+`benchmark-history` branch, and the Markdown-based [reports](../../docs/reports/README.md) under
+`reports/`. A trusted Depot run can dispatch `benchmark-history-updated`; every push to `main` and
+manual requests also rebuild the combined site. The push trigger covers changes to linked
+documentation as well as report sources. Pull requests validate the report build and original
+measurement checksums without deploying. Published rendering code and report sources come from
+`main`; historical records are data. The deployment is enabled with the repository variable
+`RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
+[Benchmark dashboard and run results](../../docs/benchmarking.md#view-results) for viewing
+instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
+publication.
 
 The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs and pushes run local and
 loopback smoke checks with artifacts. Scheduled and manual runs on main measure larger filesets and

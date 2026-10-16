@@ -41,11 +41,11 @@ jobs:
       - uses: ./.depot/actions/setup-report-python
       - name: Render history using trusted main-branch code
         id: render
-        run: python3 -m benchmarks.report benchmark-history-data --output _site --reports-url reports/index.html
-      - name: Render maintained reports from Markdown and SVG
+        run: python3 -m benchmarks.report benchmark-history-data --output _site/ci-benchmarks --reports-url ../reports/index.html
+      - name: Render project landing page and maintained reports
         run: python3 scripts/report_site.py --output _site --with-benchmark-history
       # package directly because upload-pages-artifact pins its nested action to a tag
-      - name: Package dashboard and reports for Pages
+      - name: Package project site for Pages
         id: package
         run: >-
           tar --dereference --hard-dereference --directory _site
@@ -56,7 +56,7 @@ jobs:
           path: ${{ runner.temp }}/artifact.tar
           retention-days: 1
           if-no-files-found: error
-      - name: Deploy dashboard and reports
+      - name: Deploy project site
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
       - name: Summarize historical changes
@@ -69,8 +69,10 @@ jobs:
           import os
           from pathlib import Path
           from benchmarks import changes
-          evidence = json.loads(Path("_site/changes.json").read_text(encoding="utf-8"))
-          report = changes.markdown(evidence, link_base=os.environ.get("REPORT_URL") or None)
+          evidence = json.loads(Path("_site/ci-benchmarks/changes.json").read_text(encoding="utf-8"))
+          site_url = os.environ.get("REPORT_URL")
+          history_url = site_url.rstrip("/") + "/ci-benchmarks/" if site_url else None
+          report = changes.markdown(evidence, link_base=history_url)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(report)
           PY
