@@ -18,6 +18,7 @@ import zipfile
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, clients,
                      digest, get_bytes, get_json, put_json, require, validate_window)
 from .cache_client import SOCKET
+from .maintenance import check_quiet
 
 ROOT = Path("/opt/rcp-benchmark")
 STATE = Path("/run/rcp-benchmark")
@@ -209,6 +210,9 @@ def run(s3, bucket):
     account = pwd.getpwnam("rcp-benchmark")
     stopped = True
     try:
+        metadata["apt_units"] = check_quiet(lambda argv, *, timeout: subprocess.run(
+            argv, check=True, text=True, capture_output=True,
+            timeout=min(timeout, budget.left(RESERVE))).stdout)
         for key in BINARIES:
             budget.left(RESERVE)
             data = get_bytes(s3, bucket, "input/" + key, MAX_BINARY)

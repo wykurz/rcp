@@ -88,8 +88,11 @@ python -m infra.aws_benchmark.operator \
 
 Only one trusted operator may arm this group at a time. The script refuses active capacities,
 live/terminating/stopped instances, pending schedules, and a control document whose deadline has not
-passed. A re-run needs a new GitHub attempt and a fresh window after the previous deadline and
-teardown. Do not manually rewrite the control document to extend a lease.
+passed. For every retry, start a **fresh workflow dispatch** with a new run ID so both revisions are
+rebuilt. Do not use GitHub's **Re-run failed jobs** or reuse artifacts from a previous attempt:
+reruns can lose artifacts from successful build jobs that are not rerun. Arm the new run only after
+the previous deadline and confirmed physical teardown. Do not manually rewrite the control document
+to extend a lease.
 
 The operator needs the following account permissions; none belong to CI: the ASG read APIs used by
 `operator.py`, `autoscaling:SuspendProcesses`, and `autoscaling:PutScheduledUpdateGroupAction` on
@@ -150,13 +153,20 @@ other jobs. Build jobs can execute arbitrary Rust build scripts, so pin and revi
 revisions; a revision string and digest provide traceability, not proof that a hostile build told
 the truth. There are no shared build caches or self-hosted GitHub runners in this workflow.
 
-The worker AMI contains the reviewed root-owned supervisor and harness. Six exact raw binary objects
-are accepted, each at most 128 MiB, with SHA-256 checked before use. No input archives, paths, shell
-commands or root scripts are accepted. A request must match the operator's run, revisions, suite and
-deadline. Disk preparation runs before candidate execution. It selects only four expected-size
-devices with the exact EC2 instance-store model, rejects filesystems, children, mountpoints and
-read-only devices, then formats two. EBS/root devices never qualify. Only this trusted supervisor
-has device access.
+The worker AMI contains the reviewed root-owned supervisor and harness. The installer persistently
+masks Ubuntu's `apt-daily` and `apt-daily-upgrade` timers and services, allowing active package work
+up to five minutes to drain without killing it. Every worker verifies the four units remain masked
+and inactive before downloading binaries or preparing disks; failure produces a failed run. APT
+state is recorded in `worker.json`. Rebuild from a current Canonical image for security updates
+outside benchmark windows; automatic APT maintenance is deliberately frozen in these disposable
+images. This does not eliminate every source of host noise.
+
+Six exact raw binary objects are accepted, each at most 128 MiB, with SHA-256 checked before use. No
+input archives, paths, shell commands or root scripts are accepted. A request must match the
+operator's run, revisions, suite and deadline. Disk preparation runs before candidate execution. It
+selects only four expected-size devices with the exact EC2 instance-store model, rejects
+filesystems, children, mountpoints and read-only devices, then formats two. EBS/root devices never
+qualify. Only this trusted supervisor has device access.
 
 The harness and binaries run as `rcp-benchmark` in a systemd cgroup with no capabilities, no new
 privileges, private networking/devices, read-only system files, protected control groups, a 180 GiB

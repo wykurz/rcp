@@ -76,6 +76,8 @@ def prepare(args):
     template = json.loads((HERE / "ami-builder.json").read_text())
     guest = (HERE / "ami-guest.sh").read_text().replace("__BUILD_ID__", build_id)
     guest = guest.replace("__REVISION__", args.revision)
+    guest = guest.replace("__MAINTENANCE_SOURCE__", (HERE / "maintenance.py").read_text())
+    require(len(guest.encode()) <= 16384, "generated user data exceeds EC2 limit")
     template["Resources"]["Builder"]["Properties"]["UserData"] = {
         "Fn::Base64": guest,
     }
