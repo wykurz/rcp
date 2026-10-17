@@ -91,6 +91,26 @@ retained predecessor; review and delete unwanted build artifacts after each atte
 
 ## Interrupted or failed builds
 
+`run` prints UTC timestamps, elapsed time and stage changes to stderr. While waiting it prints the
+latest observed stack, instance or capture status at most once every 30 seconds, between the
+existing bounded AWS calls. A slow request can delay an update. These messages do not reset any
+deadline.
+
+After discovering the builder, the helper prints a read-only `get-console-output` command for that
+instance. Run it in a second session for a boot-log snapshot. EC2 console snapshots can arrive late,
+be empty initially or truncate older output; they are not a live stream. An empty snapshot does not
+establish that the builder stalled. New builds send preparation and installer output to the console,
+including timestamped stages and failure stage/line/exit status, without shell tracing or command
+and environment dumps. No SSH, SSM, instance profile or inbound access is added. Older prepared
+templates keep their original logging behavior; changing the checkout cannot update an existing
+builder.
+
+Preserve the manifest and available console/stack-event evidence after a failure. A generic failure
+marker alone does not identify a cause. Keep the rollback deadline; do not retain a disk or launch a
+recovery host speculatively to retrieve its journal. Any separately approved recovery must account
+for its permissions, cost and cleanup. Cloud-init nonzero status remains a build failure, including
+exit 2 for recoverable errors, until the underlying errors are understood.
+
 A failure during local validation or read-only preflight leaves the manifest at `stage: prepared`,
 without `submitted_at`. That run submitted no stack request, so no rollback was armed. Correct the
 reported error before retrying the unchanged preparation. If changing inputs or the reviewed source
@@ -159,6 +179,9 @@ markers, incomplete/foreign snapshots, cutoff rollback, retained roots, the temp
 sanitation order. It never invokes AWS. Also validate the template with `cfn-lint` and the guest
 script with `bash -n`. A real account pilot remains necessary to verify regional image availability,
 networking, boot behavior and service cleanup; unit tests do not prove those integration behaviors.
+Tests also exercise bounded progress, disconnected output, guest/installer failure diagnostics and
+readability of harness modules copied from a private checkout. The installer verifies imports as the
+unprivileged benchmark user before the image can become ready.
 
 - [CloudFormation CreationPolicy](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html)
 - [CreateStack timeout and rollback](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html)
@@ -166,3 +189,5 @@ networking, boot behavior and service cleanup; unit tests do not prove those int
 - [EBS AMI creation and capture duration](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/creating-an-ami-ebs.html)
 - [Canonical image ownership and names](https://ubuntu.com/aws/docs/aws-how-to/instances/find-ubuntu-images/)
 - [cloud-init cleanup](https://docs.cloud-init.io/en/latest/reference/cli.html#clean)
+- [cloud-init failure states](https://docs.cloud-init.io/en/latest/explanation/failure_states.html)
+- [EC2 console output](https://docs.aws.amazon.com/cli/latest/reference/ec2/get-console-output.html)

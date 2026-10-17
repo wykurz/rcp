@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -116,8 +117,9 @@ class AmiBuildTests(unittest.TestCase):
         self.m["template_sha256"] = hashlib.sha256(body.encode()).hexdigest()
         self.aws = FakeAws(self.m)
 
-    def run_build(self):
-        ami.run(self.aws, self.directory, self.m, now=lambda: self.aws.clock, sleep=self.aws.sleep)
+    def run_build(self, progress=None):
+        ami.run(self.aws, self.directory, self.m, now=lambda: self.aws.clock, sleep=self.aws.sleep,
+                progress=progress or (lambda *args: None))
 
     def run_cli(self):
         with mock.patch.object(ami.sys, "argv", ["ami_build", "run", "--directory", str(self.directory)]), \
@@ -141,6 +143,50 @@ class AmiBuildTests(unittest.TestCase):
         capture = next(r for _, op, r in self.aws.calls if op == "create-image")
         self.assertTrue(capture["NoReboot"])
         self.assertEqual({t["ResourceType"] for t in capture["TagSpecifications"]}, {"image", "snapshot"})
+
+    def test_progress_reports_stages_and_bounded_heartbeats_without_extra_reads(self):
+        self.aws.pending_reads = 5
+        output = io.StringIO()
+        self.run_build(ami.Progress(output, clock=lambda: self.aws.clock))
+        lines = output.getvalue().splitlines()
+        guest = [line for line in lines if "[guest]" in line]
+        self.assertEqual(len(guest), 3)
+        for elapsed, line in zip([0, 30, 60], guest):
+            self.assertIn(f"+{elapsed}s", line)
+            self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ")
+            self.assertIn("builder=pending", line)
+        for stage in ["preflight", "launch", "console", "capture", "snapshot", "cleanup", "verify", "complete"]:
+            self.assertEqual(sum(f"[{stage}]" in line for line in lines), 1)
+        self.assertIn("--instance-id i-12345678901234567", output.getvalue())
+        self.assertEqual(self.operations().count("get-console-output"), 1)
+        self.assertEqual(self.operations().count("describe-instances"), 7)
+
+    def test_broken_progress_output_cannot_interrupt_capture_or_cleanup(self):
+        for error in [BrokenPipeError("closed"), ValueError("closed stream")]:
+            with self.subTest(error=error):
+                self.setUp()
+                stream = mock.Mock()
+                stream.write.side_effect = error
+                self.run_build(ami.Progress(stream, clock=lambda: self.aws.clock))
+                self.assertEqual(self.m["stage"], "complete")
+                self.assertEqual(self.operations().count("delete-stack"), 1)
+                self.assertEqual(stream.write.call_count, 1)
+
+    def test_progress_never_reports_complete_when_root_remains(self):
+        self.aws.root_remains = True
+        output = io.StringIO()
+        with self.assertRaisesRegex(ValueError, "root volume remains"):
+            self.run_build(ami.Progress(output, clock=lambda: self.aws.clock))
+        self.assertNotIn("[complete]", output.getvalue())
+
+    def test_progress_does_not_extend_guest_deadline(self):
+        self.aws.pending_reads = 1000
+        output = io.StringIO()
+        with self.assertRaisesRegex(ValueError, "guest not ready"):
+            self.run_build(ami.Progress(output, clock=lambda: self.aws.clock))
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + 2400)
+        self.assertNotIn("create-image", self.operations())
+        self.assertEqual(len([line for line in output.getvalue().splitlines() if "[guest]" in line]), 81)
 
     def test_wrong_account_cannot_launch(self):
         self.aws.account = "999999999999"
@@ -373,11 +419,66 @@ class AmiBuildTests(unittest.TestCase):
         self.assertIn("After=cloud-final.service", guest)
         self.assertIn("SuccessAction=poweroff", guest)
         self.assertIn("FailureAction=poweroff", guest)
+        self.assertIn("StandardOutput=journal+console", guest)
+        self.assertIn("StandardError=journal+console", guest)
         self.assertLess(guest.index("cloud-init status --wait"), guest.index("cloud-init clean"))
         self.assertLess(guest.index("git ca-certificates"), guest.index("bash infra/aws_benchmark/install-worker.sh"))
         self.assertLess(guest.index("cloud-init clean"), guest.index("echo RCP_AMI_READY:"))
         self.assertNotIn("signal-resource", guest)
         self.assertNotIn("cfn-signal", guest)
+
+    def test_guest_failure_diagnostics_preserve_exit_status_and_fail_closed(self):
+        guest = (ami.HERE / "ami-guest.sh").read_text().split("<<'PREPARE'\n", 1)[1]
+        # execute only the initial checks with fake commands; no installation or host changes
+        guest = guest.split("export DEBIAN_FRONTEND", 1)[0]
+        console = self.directory / "console"
+        release = self.directory / "os-release"
+        release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+        guest = guest.replace("/dev/console", str(console)).replace("/etc/os-release", str(release))
+        for cloud_status, python_status, stage in [(2, 0, "cloud-init"), (0, 31, "apt-quiesce")]:
+            with self.subTest(stage=stage):
+                stubs = (f"cloud-init() {{ return {cloud_status}; }}\n"
+                         f"python3() {{ echo maintenance-reached; return {python_status}; }}\n"
+                         "uname() { echo x86_64; }\n")
+                result = subprocess.run(["bash"], input=stubs + guest, text=True, capture_output=True)
+                self.assertEqual(result.returncode, cloud_status or python_status)
+                marker = console.read_text()
+                self.assertRegex(marker, f"RCP_AMI_FAILED:__BUILD_ID__ stage={stage} line=[0-9]+ exit={result.returncode}")
+                self.assertNotIn("RCP_AMI_READY", marker)
+                if cloud_status:
+                    self.assertNotIn("maintenance-reached", result.stdout)
+
+    def test_installer_reports_its_own_failed_stage_and_exit_status(self):
+        script = (ami.HERE / "install-worker.sh").read_text().split("apt-get update", 1)[0]
+        script = script.replace('cd "$(dirname "$0")/../.."', 'cd ' + str(self.directory))
+        script = script.replace("/opt/rcp-benchmark", str(self.directory / "absent"))
+        stubs = "id() { echo 0; }\nuname() { echo x86_64; }\npython3() { return 23; }\n"
+        result = subprocess.run(["bash"], input=stubs + script, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 23)
+        self.assertRegex(result.stderr, r"RCP_INSTALL_FAILED stage=apt-quiesce line=[0-9]+ exit=23")
+
+    def test_private_checkout_installs_readable_nonwritable_harness_modules(self):
+        source = self.directory / "source"
+        shutil.copytree(ami.HERE.parent.parent / "benchmarks", source / "benchmarks")
+        shutil.copytree(ami.HERE, source / "infra" / "aws_benchmark")
+        for path in source.rglob("*"):
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        destination = self.directory / "installed"
+        (destination / "infra" / "aws_benchmark").mkdir(parents=True)
+        (destination / "bin").mkdir()
+        script = (ami.HERE / "install-worker.sh").read_text()
+        script = script.split("cp -r benchmarks", 1)[1].split("progress complete", 1)[0]
+        script = ("cp -r benchmarks" + script).replace("/opt/rcp-benchmark", str(destination))
+        stubs = ("set -euo pipefail\numask 077\nprogress() { :; }\npython3() { :; }\n"
+                 "git() { echo pinned-revision; }\nchown() { :; }\n"
+                 'runuser() { shift 3; "$@"; }\n')
+        subprocess.run(["bash"], input=stubs + script, cwd=source, text=True, check=True)
+        for tree in [destination / "benchmarks", destination / "infra"]:
+            for path in [tree, *tree.rglob("*")]:
+                mode = path.stat().st_mode
+                self.assertEqual(mode & 0o022, 0, str(path))
+                self.assertEqual(mode & (0o005 if path.is_dir() else 0o004),
+                                 0o005 if path.is_dir() else 0o004, str(path))
 
     def test_prepare_is_offline_and_pins_source_into_reviewable_template(self):
         args = argparse.Namespace(account=self.m["account"], region=self.m["region"],
