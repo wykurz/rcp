@@ -2,7 +2,9 @@
 
 import argparse
 import copy
+from contextlib import redirect_stderr
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +13,10 @@ import unittest
 from unittest import mock
 
 from infra.aws_benchmark import ami_build as ami
+
+
+# fields supplied from the account owner's live describe-images response in us-east-1
+CANONICAL_IMAGE = json.loads((ami.HERE / "fixtures" / "canonical-ubuntu-20261017.json").read_text())
 
 
 class FakeAws:
@@ -27,6 +33,7 @@ class FakeAws:
         self.root_remains = False
         self.instance_boot_mode = "legacy-bios"
         self.pending_reads = 0
+        self.source_image = {}
         self.ami = dict(ImageId="ami-12345678901234567", OwnerId=self.account, Public=False,
                         State="available", Name=manifest["image_name"], Architecture="x86_64",
                         VirtualizationType="hvm", EnaSupport=True, RootDeviceType="ebs",
@@ -50,6 +57,7 @@ class FakeAws:
             image = copy.deepcopy(self.ami)
             if "ImageIds" in request:
                 image.update(OwnerId="099720109477", Name="ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20261001")
+                image.update(copy.deepcopy(self.source_image))
             return {"Images": [image]}
         if op == "describe-instance-types":
             return {"InstanceTypes": [{"SupportedBootModes": ["legacy-bios", "uefi"]}] * 2}
@@ -111,6 +119,11 @@ class AmiBuildTests(unittest.TestCase):
     def run_build(self):
         ami.run(self.aws, self.directory, self.m, now=lambda: self.aws.clock, sleep=self.aws.sleep)
 
+    def run_cli(self):
+        with mock.patch.object(ami.sys, "argv", ["ami_build", "run", "--directory", str(self.directory)]), \
+             mock.patch.object(ami, "Aws", return_value=self.aws):
+            ami.main()
+
     def operations(self):
         return [op for _, op, _ in self.aws.calls]
 
@@ -135,6 +148,40 @@ class AmiBuildTests(unittest.TestCase):
             self.run_build()
         self.assertNotIn("create-stack", self.operations())
 
+    def test_preflight_failure_reports_no_submission_and_preserves_safe_retry(self):
+        ami.save(self.directory, self.m)
+        self.aws.account = "999999999999"
+        message = io.StringIO()
+        with redirect_stderr(message), self.assertRaisesRegex(ValueError, "account differs"):
+            self.run_cli()
+        saved = json.loads((self.directory / "manifest.json").read_text())
+        self.assertEqual(saved["stage"], "prepared")
+        self.assertNotIn("submitted_at", saved)
+        self.assertNotIn("create-stack", self.operations())
+        self.assertIn("submitted no stack request", message.getvalue())
+        self.assertIn("no rollback was armed", message.getvalue())
+        self.assertNotIn("may remain and incur charges", message.getvalue())
+        self.aws.account = self.m["account"]
+        self.run_cli()
+        saved = json.loads((self.directory / "manifest.json").read_text())
+        self.assertEqual(saved["stage"], "complete")
+        self.assertEqual(self.operations().count("create-stack"), 1)
+
+    def test_uncertain_submission_warns_and_remains_nonretryable(self):
+        ami.save(self.directory, self.m)
+        self.aws.fail = "create-stack"
+        message = io.StringIO()
+        with redirect_stderr(message), self.assertRaises(TimeoutError):
+            self.run_cli()
+        saved = json.loads((self.directory / "manifest.json").read_text())
+        self.assertEqual(saved["stage"], "create_requested")
+        self.assertIn("submitted_at", saved)
+        self.assertIn("may have been submitted", message.getvalue())
+        self.assertNotIn("submitted no stack request", message.getvalue())
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(ValueError, "one-shot"):
+            self.run_cli()
+        self.assertEqual(self.operations().count("create-stack"), 1)
+
     def test_changed_template_cannot_launch(self):
         (self.directory / "template.json").write_text("{}")
         with self.assertRaisesRegex(ValueError, "template changed"):
@@ -146,6 +193,55 @@ class AmiBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds 16"):
             self.run_build()
         self.assertNotIn("create-stack", self.operations())
+
+    def test_live_canonical_image_with_legacy_instance_store_mappings_completes(self):
+        self.m["base_ami"] = CANONICAL_IMAGE["ImageId"]
+        self.aws.source_image = copy.deepcopy(CANONICAL_IMAGE)
+        self.run_build()
+        self.assertEqual(self.m["stage"], "complete")
+        source = {**self.aws.ami, **CANONICAL_IMAGE}
+        root = ami.image_shape(source)
+        self.assertEqual(root["VolumeSize"], 8)
+        self.assertFalse(root["Encrypted"])
+        source["BlockDeviceMappings"] = list(reversed(source["BlockDeviceMappings"]))
+        self.assertEqual(ami.image_shape(source), root)
+
+    def test_unsafe_source_mappings_are_rejected_before_launch(self):
+        original = CANONICAL_IMAGE["BlockDeviceMappings"]
+        variants = [
+            original + [{"DeviceName": "/dev/sdd", "Ebs": {"VolumeSize": 1}}],
+            original + [original[0]],
+            original + [{"DeviceName": "/dev/sdb", "VirtualName": "ephemeral2"}],
+            original + [{"DeviceName": "/dev/sdd", "VirtualName": "ephemeral0"}],
+            original + [{"DeviceName": "/dev/sdd", "NoDevice": ""}],
+            original + [{"DeviceName": "/dev/sdd", "VirtualName": "ephemeral2", "Ebs": {"VolumeSize": 1}}],
+            original + [{"DeviceName": "/dev/sdd", "VirtualName": "ephemeral24"}],
+            original + [{"DeviceName": "/dev/sda", "VirtualName": "ephemeral2"}],
+            original + [{"DeviceName": "/dev/xvda", "VirtualName": "ephemeral2"}],
+            [{**original[0], "NoDevice": ""}, *original[1:]],
+            original[1:],
+        ]
+        for mappings in variants:
+            with self.subTest(mappings=mappings):
+                self.aws.source_image = {**CANONICAL_IMAGE, "BlockDeviceMappings": copy.deepcopy(mappings)}
+                with self.assertRaises(ValueError):
+                    self.run_build()
+                self.assertEqual(self.m["stage"], "prepared")
+                self.assertNotIn("create-stack", self.operations())
+
+    def test_captured_image_can_retain_instance_store_references(self):
+        self.aws.ami["BlockDeviceMappings"].extend(copy.deepcopy(CANONICAL_IMAGE["BlockDeviceMappings"][1:]))
+        self.run_build()
+        self.assertEqual(self.m["stage"], "complete")
+        self.assertEqual(len(self.m["snapshot_ids"]), 1)
+
+    def test_extra_captured_ebs_volume_cannot_trigger_cleanup(self):
+        self.aws.source_image = copy.deepcopy(CANONICAL_IMAGE)
+        self.aws.ami["BlockDeviceMappings"].append({"DeviceName": "/dev/sdd", "Ebs": {"VolumeSize": 1}})
+        with self.assertRaisesRegex(ValueError, "exactly one EBS"):
+            self.run_build()
+        self.assertEqual(self.m["stage"], "capture_requested")
+        self.assertNotIn("delete-stack", self.operations())
 
     def test_observed_boot_mode_mismatch_cannot_capture(self):
         self.aws.instance_boot_mode = "uefi"

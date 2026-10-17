@@ -105,10 +105,27 @@ def image_shape(image):
             and image.get("EnaSupport") is True, "AMI must support x86_64 HVM and ENA")
     require(image.get("RootDeviceType") == "ebs" and image.get("RootDeviceName") == "/dev/sda1",
             "AMI must have an EBS /dev/sda1 root")
-    mapping = one(image["BlockDeviceMappings"], "AMI must contain only its root disk")
-    require(mapping["DeviceName"] == "/dev/sda1" and "Ebs" in mapping, "unexpected AMI disk")
-    require(0 < mapping["Ebs"]["VolumeSize"] <= 16, "AMI root exceeds 16 GiB")
-    return mapping["Ebs"]
+    root = None
+    devices, virtuals = set(), set()
+    for mapping in image["BlockDeviceMappings"]:
+        device = mapping.get("DeviceName")
+        require(isinstance(device, str) and device not in devices, "missing or duplicate AMI device")
+        devices.add(device)
+        if "Ebs" in mapping:
+            require(root is None and device == "/dev/sda1" and set(mapping) == {"DeviceName", "Ebs"},
+                    "AMI must contain exactly one EBS volume, its /dev/sda1 root")
+            root = mapping["Ebs"]
+        else:
+            # Canonical AMIs can retain legacy instance-store references; these are not EBS volumes
+            virtual = mapping.get("VirtualName")
+            require(set(mapping) == {"DeviceName", "VirtualName"}
+                    and re.fullmatch(r"/dev/sd[b-z]", device)
+                    and isinstance(virtual, str) and re.fullmatch(r"ephemeral(?:[0-9]|1[0-9]|2[0-3])", virtual)
+                    and virtual not in virtuals, "unexpected AMI instance-store mapping")
+            virtuals.add(virtual)
+    require(root is not None, "AMI root EBS mapping is missing")
+    require(0 < root["VolumeSize"] <= 16, "AMI root exceeds 16 GiB")
+    return root
 
 
 def preflight(aws, m):
@@ -325,9 +342,16 @@ def main():
             except BaseException as error:
                 m["last_error"] = type(error).__name__ + ": " + str(error)
                 save(args.directory, m)
-                print("Build did not complete. Keep this directory; inspect before any cleanup/retry. "
-                      "The unsignaled stack will attempt rollback independently. "
-                      "AMI/snapshots may remain and incur charges.", file=sys.stderr)
+                if m["stage"] == "prepared":
+                    print("Pre-launch checks failed. This run submitted no stack request; "
+                          "no rollback was armed. The manifest remains prepared. Correct the "
+                          "reported error before retrying. Use a fresh prepare directory if "
+                          "changing inputs or the reviewed source revision.", file=sys.stderr)
+                else:
+                    print("Build did not complete. Keep this directory and inspect before cleanup; "
+                          "do not rerun run. A stack request may have been submitted; any submitted "
+                          "stack is configured for independent rollback. AMI/snapshots may remain "
+                          "and incur charges.", file=sys.stderr)
                 raise
 
 
