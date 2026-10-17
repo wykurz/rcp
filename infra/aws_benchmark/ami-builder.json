@@ -1,0 +1,43 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Temporary unsignaled RCP image builder. Submit only with ami_build.py (60 minute stack timeout).",
+  "Parameters": {
+    "BaseAmiId": {"Type": "AWS::EC2::Image::Id"},
+    "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+    "SubnetId": {"Type": "AWS::EC2::Subnet::Id"}
+  },
+  "Resources": {
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Temporary image builder: no ingress, package downloads only",
+        "VpcId": {"Ref": "VpcId"},
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+          {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "CidrIp": "0.0.0.0/0"},
+          {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0"}
+        ]
+      }
+    },
+    "Builder": {
+      "Type": "AWS::EC2::Instance",
+      "CreationPolicy": {"ResourceSignal": {"Count": 1, "Timeout": "PT60M"}},
+      "Properties": {
+        "ImageId": {"Ref": "BaseAmiId"},
+        "InstanceType": "t3a.small",
+        "CreditSpecification": {"CPUCredits": "standard"},
+        "InstanceInitiatedShutdownBehavior": "stop",
+        "PropagateTagsToVolumeOnCreation": true,
+        "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1},
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {
+          "VolumeSize": 16, "VolumeType": "gp3", "Encrypted": true, "DeleteOnTermination": true
+        }}],
+        "NetworkInterfaces": [{
+          "DeviceIndex": "0", "AssociatePublicIpAddress": true,
+          "DeleteOnTermination": true, "SubnetId": {"Ref": "SubnetId"},
+          "GroupSet": [{"Ref": "SecurityGroup"}]
+        }]
+      }
+    }
+  }
+}
