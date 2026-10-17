@@ -7,6 +7,7 @@ import re
 import time
 
 MAX_WINDOW = 3600
+MAX_OPEN_LEAD = 300
 RESERVE = 180
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
@@ -47,7 +48,7 @@ def validate_window(value, now=None, minimum=RESERVE):
     start, deadline = utc(value["opens"]), utc(value["deadline"])
     now = now or datetime.now(timezone.utc)
     require(300 <= (deadline - start).total_seconds() <= MAX_WINDOW, "window must be 5–60 minutes")
-    require(minimum <= (deadline - now).total_seconds() <= MAX_WINDOW + 300,
+    require(minimum <= (deadline - now).total_seconds() <= MAX_WINDOW + MAX_OPEN_LEAD,
             "expired, too short, or excessively distant deadline")
     return deadline
 
@@ -57,7 +58,7 @@ class Budget:
 
     def __init__(self, deadline):
         self.deadline = utc(deadline).timestamp()
-        self.end = time.monotonic() + min(MAX_WINDOW, self.deadline - time.time())
+        self.end = time.monotonic() + min(MAX_WINDOW + MAX_OPEN_LEAD, self.deadline - time.time())
 
     def left(self, reserve=0):
         remaining = min(self.deadline - time.time(), self.end - time.monotonic()) - reserve

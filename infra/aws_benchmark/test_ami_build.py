@@ -294,6 +294,11 @@ class AmiBuildTests(unittest.TestCase):
         guest = template["Resources"]["Builder"]["Properties"]["UserData"]["Fn::Base64"]
         self.assertIn(args.revision, guest)
         self.assertNotIn("__REVISION__", guest)
+        self.assertNotIn("__MAINTENANCE_SOURCE__", guest)
+        self.assertIn((ami.HERE / "maintenance.py").read_text(), guest)
+        self.assertLess(guest.index("python3 /run/rcp-ami-build/maintenance.py --quiesce"),
+                        guest.index("apt-get update"))
+        subprocess.run(["bash", "-n"], input=guest, text=True, check=True)
         self.assertLess(len(guest.encode()), 16384)
 
 

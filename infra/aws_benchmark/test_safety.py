@@ -181,6 +181,23 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "unconfirmed"):
             controller.cleanup(cloud.api, "group", timeout=0)
 
+    def test_opening_lead_preserves_full_window_and_absolute_cutoff(self):
+        lease = window()
+        lease.update(opens=common.timestamp(NOW + timedelta(seconds=common.MAX_OPEN_LEAD)),
+                     deadline=common.timestamp(NOW + timedelta(seconds=common.MAX_OPEN_LEAD + common.MAX_WINDOW)))
+        deadline = common.validate_window(lease, NOW)
+        with patch.object(common.time, "time", return_value=NOW.timestamp()), \
+             patch.object(common.time, "monotonic", return_value=0):
+            budget = common.Budget(deadline)
+        for elapsed, expected in ((300, 3600), (3600, 300)):
+            with patch.object(common.time, "time", return_value=NOW.timestamp() + elapsed), \
+                 patch.object(common.time, "monotonic", return_value=elapsed):
+                self.assertEqual(budget.left(), expected)
+        with patch.object(common.time, "time", return_value=deadline.timestamp()), \
+             patch.object(common.time, "monotonic", return_value=3900):
+            with self.assertRaises(TimeoutError):
+                budget.left()
+
     def test_budget_cannot_be_extended_by_backward_wall_clock(self):
         with patch.object(common.time, "time", return_value=1000), patch.object(common.time, "monotonic", return_value=10):
             budget = common.Budget(datetime.fromtimestamp(1100, timezone.utc))
@@ -208,7 +225,7 @@ class WorkerTests(unittest.TestCase):
                     write.assert_not_called()
 
     def test_worker_failures_never_become_success_or_extend_deadline(self):
-        for phase in ("digest", "format", "measure", "stop", "collect", "upload"):
+        for phase in ("maintenance", "maintenance_budget", "digest", "format", "measure", "stop", "collect", "upload"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
                 cloud = FakeCloud()
                 lease = window(datetime.now(timezone.utc))
@@ -226,6 +243,14 @@ class WorkerTests(unittest.TestCase):
                 patches.enter_context(patch.object(worker.pwd, "getpwnam", return_value=Mock(pw_uid=123, pw_gid=123)))
                 patches.enter_context(patch.object(worker.signal, "signal"))
                 timer = patches.enter_context(patch.object(worker.signal, "setitimer"))
+                quiet = patches.enter_context(patch.object(worker, "check_quiet", return_value={}))
+                if phase == "maintenance":
+                    quiet.side_effect = ValueError("automatic APT maintenance is not inactive")
+                if phase == "maintenance_budget":
+                    budget = Mock()
+                    budget.left.side_effect = [600, TimeoutError("deadline"), 60, 60]
+                    patches.enter_context(patch.object(worker, "Budget", return_value=budget))
+                    quiet.side_effect = lambda command: command(["systemctl", "show"], timeout=10)
                 prepare = patches.enter_context(patch.object(worker, "prepare_storage", return_value=["disk1", "disk2"]))
                 patches.enter_context(patch.object(worker, "cache_server"))
                 measure = patches.enter_context(patch.object(worker.subprocess, "run", return_value=Mock(returncode=0)))
@@ -239,7 +264,10 @@ class WorkerTests(unittest.TestCase):
                 status = json.loads(cloud.objects["output/status.json"])
                 self.assertFalse(status["success"])
                 self.assertEqual(timer.call_count, 1)
-                if phase in ("digest", "format"):
+                if phase in ("maintenance", "maintenance_budget"):
+                    prepare.assert_not_called()
+                    self.assertFalse(any((root / "state").iterdir()))
+                if phase in ("maintenance", "maintenance_budget", "digest", "format"):
                     measure.assert_not_called()
                 if phase == "measure":
                     stop.assert_called_once()

@@ -3,6 +3,9 @@ set -euo pipefail
 # this outer script runs inside cloud-final; never wait here for the deferred unit
 trap 'systemctl poweroff' ERR
 install -d -m 0700 /run/rcp-ami-build
+cat >/run/rcp-ami-build/maintenance.py <<'RCP_APT_MAINTENANCE_PY'
+__MAINTENANCE_SOURCE__
+RCP_APT_MAINTENANCE_PY
 cat >/run/rcp-ami-build/prepare.sh <<'PREPARE'
 #!/bin/bash
 set -euo pipefail
@@ -13,6 +16,7 @@ source /etc/os-release
 test "$ID" = ubuntu
 test "$VERSION_ID" = 24.04
 test "$(uname -m)" = x86_64
+python3 /run/rcp-ami-build/maintenance.py --quiesce
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends git ca-certificates

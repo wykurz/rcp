@@ -4,7 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 
-from .common import (SUSPEND, clients, get_json, group, live_instances, put_json, require,
+from .common import (MAX_OPEN_LEAD, SUSPEND, clients, get_json, group, live_instances, put_json, require,
                      scheduled, timestamp, utc, validate_window, verify_close, verify_group)
 
 
@@ -37,7 +37,7 @@ def inspect_closed(api, name):
 
 def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
     validate_window(window, now(), minimum=600)
-    require(120 <= (utc(window["opens"]) - now()).total_seconds() <= 300,
+    require(120 <= (utc(window["opens"]) - now()).total_seconds() <= MAX_OPEN_LEAD,
             "opening must be 2–5 minutes in the future")
     inspect_closed(api, name)
     # a single operator is required; never overwrite a still-valid control document

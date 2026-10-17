@@ -60,12 +60,16 @@ retain its resources: those actions defeat the cleanup guard. Only the helper su
 generated template with the required timeout.
 
 User data schedules a transient systemd service after `cloud-final` finishes, using `--no-block` to
-avoid a dependency deadlock. It installs git and CA certificates before running the existing worker
-installer. After installation it resets cloud-init, machine identity, SSH keys, shell histories and
-logs. It emits a build-specific readiness marker only after sanitation, then powers off. Failure or
-the service's 30-minute runtime limit also requests poweroff. These guest actions are secondary
-guards; they do not replace CloudFormation rollback. The image installer is pinned by SHA; Ubuntu
-package updates are resolved at build time, so rebuilds are not bit-for-bit reproducible.
+avoid a dependency deadlock. Before its first package command, it persistently masks automatic APT
+timers and services and waits at most five minutes for any existing package operation to finish; it
+never kills active apt/dpkg work. It then installs git and CA certificates before running the worker
+installer, which verifies APT remains quiet. The same check runs before each benchmark. Rebuild the
+disposable AMI from a current Canonical image for security updates outside benchmark windows. After
+installation it resets cloud-init, machine identity, SSH keys, shell histories and logs. It emits a
+build-specific readiness marker only after sanitation, then powers off. Failure or the service's
+30-minute runtime limit also requests poweroff. These guest actions are secondary guards; they do
+not replace CloudFormation rollback. The image installer is pinned by SHA; Ubuntu package updates
+are resolved at build time, so rebuilds are not bit-for-bit reproducible.
 
 The helper requires both the matching UUID/SHA console marker and EC2's `stopped` state, then
 captures with `NoReboot` so sanitation is not undone by another boot. It refuses to start capture
