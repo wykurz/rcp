@@ -18,7 +18,11 @@ operator session, never secret keys in chat or source files. Supply only:
 - An explicitly chosen Canonical Ubuntu 24.04 amd64 **server release** AMI in that region. Verify
   owner `099720109477`; pin the ID, not a dynamic "latest" reference. The helper checks its owner,
   name, x86_64/HVM/ENA, EBS `/dev/sda1` root of at most 16 GiB, and boot compatibility with both
-  `t3a.small` and `c5d.24xlarge`. It rejects extra disks and Marketplace product codes.
+  `t3a.small` and `c5d.24xlarge`. It allows explicit legacy `ephemeralN` instance-store references
+  (such as Canonical's `/dev/sdb` and `/dev/sdc`) while requiring exactly one EBS volume: the root.
+  It rejects extra EBS volumes, ambiguous or duplicate mappings, and Marketplace product codes. The
+  source root may be unencrypted; the builder template explicitly creates an encrypted 16 GiB root,
+  and capture validation requires its owned encrypted snapshot.
 - A full reviewed public `wykurz/rcp` commit SHA containing this helper and the worker installer.
   Check out that exact commit locally. The guest fetches only that SHA without credentials.
 
@@ -87,9 +91,16 @@ retained predecessor; review and delete unwanted build artifacts after each atte
 
 ## Interrupted or failed builds
 
-Never rerun `run`, start another builder, or delete snapshots speculatively. The manifest records
-intent **before** each mutation, including the stable stack name/token and image name. A lost
-`CreateImage` response may still have created the image; that API has no idempotency token.
+A failure during local validation or read-only preflight leaves the manifest at `stage: prepared`,
+without `submitted_at`. That run submitted no stack request, so no rollback was armed. Correct the
+reported error before retrying the unchanged preparation. If changing inputs or the reviewed source
+revision, run `prepare` into a fresh directory instead of editing the manifest or template.
+
+Once launch intent is recorded (`create_requested` or any later stage), never rerun `run`, start
+another builder, or delete snapshots speculatively. The manifest records intent **before** each
+mutation, including the stable stack name/token and image name. A lost `CreateStack` response may
+have created the stack; inspect before cleanup. A lost `CreateImage` response may still have created
+the image; that API has no idempotency token. Never reset the manifest stage to bypass this guard.
 
 This command makes read-only AWS calls and refreshes the manifest, including owned orphan snapshots:
 

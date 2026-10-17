@@ -1,0 +1,20 @@
+{
+  "ImageId": "ami-02a9cdd4e98bc3c78",
+  "OwnerId": "099720109477",
+  "Name": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20261017",
+  "RootDeviceName": "/dev/sda1",
+  "BlockDeviceMappings": [
+    {
+      "Ebs": {
+        "DeleteOnTermination": true,
+        "SnapshotId": "snap-09313f954876f4e7e",
+        "VolumeSize": 8,
+        "VolumeType": "gp3",
+        "Encrypted": false
+      },
+      "DeviceName": "/dev/sda1"
+    },
+    {"DeviceName": "/dev/sdb", "VirtualName": "ephemeral0"},
+    {"DeviceName": "/dev/sdc", "VirtualName": "ephemeral1"}
+  ]
+}
