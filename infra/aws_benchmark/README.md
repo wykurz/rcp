@@ -24,13 +24,13 @@ put access keys in chat or GitHub settings for this workflow.
    If absent, the account owner creates it separately. This stack creates the two narrowly scoped
    roles, but never creates or changes the OIDC provider.
 4. Prepare and pin an Ubuntu 24.04 x86_64, EBS-backed AMI with `/dev/sda1` as its root device and a
-   root snapshot no larger than 16 GiB. On a trusted image-building machine, check out the reviewed
-   repository commit and run `sudo bash infra/aws_benchmark/install-worker.sh`. The script installs
-   the fixed harness and supervisor under `/opt/rcp-benchmark`, the pinned AWS SDK, and a dedicated
-   unprivileged user. It does not capture an AMI or launch anything. Before capturing the image,
-   remove image-builder credentials, SSH keys, shell history and previous cloud-init state, and
-   ensure cloud-init processes new user data. No SSH/SSM agent or credentials are needed on workers.
-   Record the source commit and AMI ID. AMI preparation/capture is an account-owner action.
+   root snapshot no larger than 16 GiB. The optional [AMI bootstrap helper](AMI.md) prepares an
+   offline plan, then lets the account owner launch one temporary `t3a.small` with an independent
+   CloudFormation rollback guard. It installs the fixed harness/supervisor, pinned AWS SDK and
+   unprivileged worker user, sanitizes the guest after cloud-init finishes, and captures a private
+   AMI. Review its costs, failure recovery and operator permissions before running it. Record the
+   source commit and AMI ID. AMI preparation/capture is separate from deployment and CI; no worker
+   credentials or future bucket configuration are baked into the image.
 
 Deploy the reviewed template using a trusted operator identity, while the group is closed:
 
