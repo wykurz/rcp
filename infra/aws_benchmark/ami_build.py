@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -16,6 +17,31 @@ HERE = Path(__file__).resolve().parent
 TAG = "rcp-ami-build"
 TIMEOUT = 3600
 POLL = 15
+
+
+class Progress:
+    """Best-effort status between existing bounded requests; never part of cleanup."""
+
+    def __init__(self, stream=None, clock=time.monotonic):
+        self.stream = sys.stderr if stream is None else stream
+        self.clock = clock
+        self.started = clock()
+        self.last = None
+        self.stage = None
+        self.enabled = True
+
+    def __call__(self, stage, detail):
+        current = self.clock()
+        if not self.enabled or (stage == self.stage and self.last is not None and current - self.last < 30):
+            return
+        self.stage, self.last = stage, current
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            print(f"{stamp} +{int(current - self.started)}s [{stage}] {detail}",
+                  file=self.stream, flush=True)
+        except (OSError, ValueError):
+            # a disconnected output stream must not prevent normal resource cleanup
+            self.enabled = False
 
 
 def require(condition, message):
@@ -245,24 +271,37 @@ def captured(aws, m):
     return True
 
 
-def run(aws, directory, m, now=time.time, sleep=time.sleep):
+def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None):
+    progress = Progress() if progress is None else progress
     require(m["stage"] == "prepared", "run is one-shot; use inspect, never retry a launch")
     body = (directory / "template.json").read_text()
     require(hashlib.sha256(body.encode()).hexdigest() == m["template_sha256"], "prepared template changed")
+    progress("preflight", "Checking account, source AMI, instance compatibility and subnet")
     preflight(aws, m)
     m.update(stage="create_requested", submitted_at=now())
     save(directory, m)  # persist intent before any paid request, even if its response is lost
     parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in
                   [("BaseAmiId", m["base_ami"]), ("VpcId", m["vpc"]), ("SubnetId", m["subnet"])]]
+    progress("launch", "Submitting " + m["stack_name"] + " with 60-minute rollback timeout")
     result = aws("cloudformation", "create-stack", StackName=m["stack_name"], TemplateBody=body,
                  Parameters=parameters, Tags=[{"Key": TAG, "Value": m["build_id"]}],
                  ClientRequestToken=m["build_id"], TimeoutInMinutes=60, OnFailure="ROLLBACK")
     m["stack_id"] = result["StackId"]
     save(directory, m)
+    log_hint_shown = False
     while True:
         active(aws, m, now)
         instance = builder(aws, m)
         save(directory, m)
+        if instance and not log_hint_shown:
+            command = shlex.join(["aws", "ec2", "get-console-output", "--region", m["region"],
+                                 "--instance-id", m["instance_id"], "--latest", "--query", "Output",
+                                 "--output", "text", "--no-cli-pager", "--no-cli-auto-prompt",
+                                 "--cli-connect-timeout", "5", "--cli-read-timeout", "20"])
+            progress("console", "Boot-log snapshot (may lag or be empty): AWS_MAX_ATTEMPTS=1 " + command)
+            log_hint_shown = True
+        state = instance["State"]["Name"] if instance else "not yet discovered"
+        progress("guest", f"stack={m['stack_status']} builder={state}; waiting for stopped + readiness marker")
         if ready(aws, m, instance):
             break
         require(now() < m["submitted_at"] + 2400, "guest not ready with 20 minutes left; reconcile")
@@ -272,6 +311,7 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep):
     require(now() < m["submitted_at"] + 2400, "insufficient capture time; reconcile")
     m["stage"] = "capture_requested"
     save(directory, m)
+    progress("capture", "Guest ready; requesting private AMI capture from " + m["instance_id"])
     ownership = [{"Key": TAG, "Value": m["build_id"]}, {"Key": "rcp-revision", "Value": m["revision"]}]
     result = aws("ec2", "create-image", InstanceId=m["instance_id"], Name=m["image_name"], NoReboot=True,
                  TagSpecifications=[{"ResourceType": kind, "Tags": ownership} for kind in ["image", "snapshot"]])
@@ -281,21 +321,27 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep):
         active(aws, m, now)
         complete = captured(aws, m)
         save(directory, m)
+        states = list(m.get("snapshot_states", {}).values())
+        progress("snapshot", f"AMI={m.get('image_state', 'not yet discovered')} "
+                 f"snapshots completed={states.count('completed')}/{len(states)}")
         if complete:
             break
         sleep(POLL)
     active(aws, m, now)
     m["stage"] = "delete_requested"
     save(directory, m)
+    progress("cleanup", "Capture verified; deleting temporary stack")
     aws("cloudformation", "delete-stack", StackName=m["stack_id"], ClientRequestToken="delete-" + m["build_id"])
     cleanup_end = now() + 600
     while True:
         status = stack(aws, m)["StackStatus"]
         save(directory, m)
+        progress("cleanup", "stack=" + status)
         if status == "DELETE_COMPLETE":
             break
         require(status == "DELETE_IN_PROGRESS" and now() < cleanup_end, "cleanup incomplete; reconcile")
         sleep(POLL)
+    progress("verify", "Checking instance termination and root-volume removal")
     instance = builder(aws, m)
     require(instance and instance["State"]["Name"] == "terminated", "builder is not terminated")
     volumes = aws("ec2", "describe-volumes", Filters=[
@@ -303,6 +349,7 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep):
     require(not volumes, "builder root volume remains; reconcile")
     m["stage"] = "complete"
     save(directory, m)
+    progress("complete", "Private AMI verified; temporary instance and root volume removed")
     print("Private AMI ready:", m["image_id"], "Snapshots:", ", ".join(m["snapshot_ids"]))
 
 
