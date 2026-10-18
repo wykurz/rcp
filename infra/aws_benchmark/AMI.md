@@ -24,7 +24,9 @@ operator session, never secret keys in chat or source files. Supply only:
   source root may be unencrypted; the builder template explicitly creates an encrypted 16 GiB root,
   and capture validation requires its owned encrypted snapshot.
 - A full reviewed public `wykurz/rcp` commit SHA containing this helper and the worker installer.
-  Check out that exact commit locally. The guest fetches only that SHA without credentials.
+  Check out that exact commit locally. Preparation reads the template, guest script and embedded
+  maintenance helper from that commit's Git blobs, so staged or unstaged edits cannot enter the
+  generated template. The guest fetches only that SHA without credentials.
 
 Review the source and generated template before the paid command. `prepare` does not contact AWS:
 
@@ -97,7 +99,12 @@ retained predecessor; review and delete unwanted build artifacts after each atte
 `run` prints UTC timestamps, elapsed time and stage changes to stderr. While waiting it prints the
 latest observed stack, instance or capture status at most once every 30 seconds, between the
 existing bounded AWS calls. A slow request can delay an update. These messages do not reset any
-deadline.
+deadline. Read-only AWS CLI operations use standard retry mode with at most three total attempts
+inside the existing 90-second subprocess timeout. All mutations remain single-attempt, especially
+`CreateImage`, which has no idempotency token. Initial EC2 instance discovery tolerates an empty
+response or `InvalidInstanceID.NotFound` until the original readiness cutoff; authorization and
+other permanent failures still stop the helper. Missing instances during cleanup never prove
+successful termination.
 
 After discovering the builder, the helper prints a read-only `get-console-output` command for that
 instance. Run it in a second session for a boot-log snapshot. EC2 console snapshots can arrive late,
@@ -106,7 +113,12 @@ establish that the builder stalled. New builds send preparation and installer ou
 including timestamped stages and failure stage/line/exit status, without shell tracing or command
 and environment dumps. No SSH, SSM, instance profile or inbound access is added. Older prepared
 templates keep their original logging behavior; changing the checkout cannot update an existing
-builder.
+builder. Once the instance is first observed stopped, the helper allows ten minutes of console lag
+(earlier account pilots observed about seven), measured monotonically and still bounded by the
+original 40-minute capture refusal. If no matching marker arrives, it fails with the last observed
+guest stage, or `unknown` if none was available. Bounded AWS requests can delay the next check; the
+grace never extends the capture deadline or rollback. Outer bootstrap failures and preparation
+SIGTERM emit failure markers; SIGKILL or an external stop may leave only the console-lag diagnostic.
 
 Preserve the manifest and available console/stack-event evidence after a failure. A generic failure
 marker alone does not identify a cause. Keep the rollback deadline; do not retain a disk or launch a
@@ -187,7 +199,9 @@ readability of harness modules copied from a private checkout. The installer ver
 unprivileged benchmark user before the image can become ready. APT tests cover active timers at
 startup, the systemd 255 mask-before-stop failure, failed timers, stop errors/timeouts and service
 draining. The timer failure and corrected ordering were also reproduced with disposable user units
-on Ubuntu systemd 255.4, without changing host APT units.
+on Ubuntu systemd 255.4, without changing host APT units. Builder regressions cover dirty checkout
+inputs, read/mutation retry separation, eventual instance discovery, bounded stopped-console lag,
+and shell error/TERM diagnostics without invoking installers or host service operations.
 
 - [CloudFormation CreationPolicy](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html)
 - [CreateStack timeout and rollback](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html)

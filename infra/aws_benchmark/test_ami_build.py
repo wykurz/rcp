@@ -35,6 +35,11 @@ class FakeAws:
         self.instance_boot_mode = "legacy-bios"
         self.pending_reads = 0
         self.source_image = {}
+        self.not_found_reads = 0
+        self.empty_reads = 0
+        self.instance_error = None
+        self.console_lag_reads = 0
+        self.guest_stage = ""
         self.ami = dict(ImageId="ami-12345678901234567", OwnerId=self.account, Public=False,
                         State="available", Name=manifest["image_name"], Architecture="x86_64",
                         VirtualizationType="hvm", EnaSupport=True, RootDeviceType="ebs",
@@ -73,6 +78,13 @@ class FakeAws:
         if op == "describe-stack-resources":
             return {"StackResources": [{"LogicalResourceId": "Builder", "PhysicalResourceId": "i-12345678901234567"}]}
         if op == "describe-instances":
+            if self.instance_error or self.not_found_reads:
+                self.not_found_reads = max(0, self.not_found_reads - 1)
+                code = self.instance_error or "InvalidInstanceID.NotFound"
+                raise ami.AwsError(service, op, "An error occurred (" + code + ") when calling DescribeInstances: example")
+            if self.empty_reads:
+                self.empty_reads -= 1
+                return {"Reservations": []}
             if self.pending_reads:
                 self.pending_reads -= 1
                 state, mode = "pending", None
@@ -85,7 +97,11 @@ class FakeAws:
                      "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {
                          "VolumeId": "vol-12345678901234567", "DeleteOnTermination": True}}]}]}]}
         if op == "get-console-output":
-            return {"Output": "boot logs\n" + self.marker + "\nshutdown logs"}
+            marker = self.marker
+            if self.console_lag_reads:
+                self.console_lag_reads -= 1
+                marker = ""
+            return {"Output": "boot logs\n" + self.guest_stage + "\n" + marker + "\nshutdown logs"}
         if op == "create-image":
             return {"ImageId": self.ami["ImageId"]}
         if op == "describe-snapshots":
@@ -119,7 +135,7 @@ class AmiBuildTests(unittest.TestCase):
 
     def run_build(self, progress=None):
         ami.run(self.aws, self.directory, self.m, now=lambda: self.aws.clock, sleep=self.aws.sleep,
-                progress=progress or (lambda *args: None))
+                progress=progress or (lambda *args: None), clock=lambda: self.aws.clock)
 
     def run_cli(self):
         with mock.patch.object(ami.sys, "argv", ["ami_build", "run", "--directory", str(self.directory)]), \
@@ -316,6 +332,64 @@ class AmiBuildTests(unittest.TestCase):
         self.assertEqual(process.call_args.kwargs["timeout"], 90)
         self.assertIn("--no-cli-auto-prompt", process.call_args.args[0])
 
+    def test_cli_reads_use_three_standard_attempts_within_the_same_timeout(self):
+        success = subprocess.CompletedProcess(["aws"], 0, stdout="{}", stderr="")
+        with mock.patch.dict(ami.os.environ, {"AWS_MAX_ATTEMPTS": "99", "AWS_RETRY_MODE": "adaptive"}):
+            for service, operation in sorted(ami.READ_OPERATIONS):
+                with self.subTest(operation=operation), mock.patch.object(ami.subprocess, "run", return_value=success) as process:
+                    self.assertEqual(ami.Aws("us-east-1")(service, operation), {})
+                    self.assertEqual(process.call_count, 1)
+                    self.assertEqual(process.call_args.kwargs["timeout"], 90)
+                    self.assertEqual(process.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "3")
+                    self.assertEqual(process.call_args.kwargs["env"]["AWS_RETRY_MODE"], "standard")
+
+    def test_cli_all_mutations_remain_single_attempt(self):
+        for service, operation in [("cloudformation", "create-stack"), ("ec2", "create-image"),
+                                   ("cloudformation", "delete-stack")]:
+            with self.subTest(operation=operation), mock.patch.object(
+                    ami.subprocess, "run", side_effect=subprocess.TimeoutExpired("aws", 90)) as process:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    ami.Aws("us-east-1")(service, operation)
+                self.assertEqual(process.call_count, 1)
+                self.assertEqual(process.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+
+    def test_initial_instance_discovery_tolerates_not_found_and_empty_results(self):
+        self.aws.not_found_reads = 2
+        self.aws.empty_reads = 1
+        self.run_build()
+        self.assertEqual(self.m["stage"], "complete")
+        self.assertEqual(self.operations().count("create-stack"), 1)
+        self.assertEqual(self.operations().count("create-image"), 1)
+        self.assertEqual(self.operations().count("describe-instances"), 5)
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + 3 * ami.POLL)
+
+    def test_initial_missing_instance_still_obeys_capture_cutoff(self):
+        self.aws.not_found_reads = 1000
+        with self.assertRaisesRegex(ValueError, "guest not ready"):
+            self.run_build()
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + 2400)
+        self.assertNotIn("create-image", self.operations())
+
+    def test_discovery_does_not_swallow_authorization_or_malformed_id_errors(self):
+        for code in ["UnauthorizedOperation", "InvalidInstanceID.Malformed", "ExpiredToken"]:
+            with self.subTest(code=code):
+                self.setUp()
+                self.aws.instance_error = code
+                with self.assertRaises(ami.AwsError) as error:
+                    self.run_build()
+                self.assertEqual(error.exception.code, code)
+                self.assertNotIn("create-image", self.operations())
+                self.assertEqual(self.operations().count("describe-instances"), 1)
+
+    def test_missing_instance_is_not_successful_cleanup_evidence(self):
+        self.run_build()
+        self.aws.not_found_reads = 1
+        with self.assertRaises(ami.AwsError):
+            ami.builder(self.aws, self.m)
+        self.aws.empty_reads = 1
+        with self.assertRaisesRegex(ValueError, "builder missing"):
+            ami.builder(self.aws, self.m)
+
     def test_cli_error_preserves_service_reason_for_operator_recovery(self):
         failure = subprocess.CompletedProcess(["aws"], 254, stdout="", stderr="AccessDenied: example reason")
         with mock.patch.object(ami.subprocess, "run", return_value=failure):
@@ -337,10 +411,62 @@ class AmiBuildTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.setUp()
                 self.aws.marker = marker
-                with self.assertRaisesRegex(ValueError, "guest not ready"):
+                with self.assertRaisesRegex(ValueError, "console-lag grace; last guest stage=unknown"):
                     self.run_build()
+                self.assertEqual(self.aws.clock, self.m["submitted_at"] + ami.CONSOLE_GRACE)
                 self.assertNotIn("create-image", self.operations())
                 self.assertNotIn("delete-stack", self.operations())
+
+    def test_empty_console_response_is_not_readiness_or_failure_evidence(self):
+        self.m["instance_id"] = "i-12345678901234567"
+        for console in [{}, {"Output": None}, {"Output": ""}]:
+            with self.subTest(console=console):
+                self.assertFalse(ami.ready(lambda *args, **kwargs: console, self.m,
+                                           {"State": {"Name": "stopped"}}))
+                self.assertNotIn("guest_stage", self.m)
+
+    def test_stopped_builder_can_receive_readiness_after_console_lag(self):
+        self.aws.console_lag_reads = 29  # more than the seven-minute lag observed in an account pilot
+        self.run_build()
+        self.assertEqual(self.m["stage"], "complete")
+        self.assertEqual(self.operations().count("get-console-output"), 30)
+        self.assertEqual(self.operations().count("create-image"), 1)
+
+    def test_missing_marker_reports_only_last_bounded_stage(self):
+        self.aws.marker = ""
+        self.aws.guest_stage = "[guest:cloud-init]\n[guest:worker-install]\nraw unrelated output"
+        with self.assertRaisesRegex(ValueError, "last guest stage=worker-install"):
+            self.run_build()
+        self.assertEqual(self.m["guest_stage"], "worker-install")
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + ami.CONSOLE_GRACE)
+        self.assertNotIn("create-image", self.operations())
+
+    def test_console_grace_never_extends_original_capture_cutoff(self):
+        self.aws.pending_reads = 130
+        self.aws.marker = ""
+        with self.assertRaisesRegex(ValueError, "guest not ready with 20 minutes left"):
+            self.run_build()
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + 2400)
+        self.assertNotIn("create-image", self.operations())
+
+    def test_console_grace_uses_monotonic_time_despite_wall_clock_rollback(self):
+        self.aws.marker = ""
+        wall = [self.aws.clock]
+        def sleep(seconds):
+            self.aws.sleep(seconds)
+            wall[0] -= seconds
+        with self.assertRaisesRegex(ValueError, "console-lag grace"):
+            ami.run(self.aws, self.directory, self.m, now=lambda: wall[0], sleep=sleep,
+                    progress=lambda *args: None, clock=lambda: self.aws.clock)
+        self.assertEqual(self.aws.clock, self.m["submitted_at"] + ami.CONSOLE_GRACE)
+        self.assertNotIn("create-image", self.operations())
+
+    def test_failure_marker_stage_is_preserved_without_raw_console(self):
+        self.aws.marker = "RCP_AMI_FAILED:" + self.m["build_id"] + " stage=worker-install line=42 exit=143"
+        with self.assertRaisesRegex(ValueError, "guest preparation failed; last guest stage=worker-install"):
+            self.run_build()
+        self.assertEqual(self.m["guest_failure"], dict(stage="worker-install", line=42, exit=143))
+        self.assertNotIn("create-image", self.operations())
 
     def test_guest_failure_cannot_capture(self):
         self.aws.marker += "\nRCP_AMI_FAILED:" + self.m["build_id"]
@@ -448,6 +574,29 @@ class AmiBuildTests(unittest.TestCase):
                 if cloud_status:
                     self.assertNotIn("maintenance-reached", result.stdout)
 
+    def test_guest_term_trap_emits_failed_marker_and_exit_143(self):
+        guest = (ami.HERE / "ami-guest.sh").read_text().split("<<'PREPARE'\n", 1)[1]
+        # execute only trap definitions and signal this test shell; no preparation or host operations
+        guest = guest.split("progress cloud-init", 1)[0]
+        console = self.directory / "term-console"
+        guest = guest.replace("/dev/console", str(console))
+        result = subprocess.run(["bash"], input=guest + 'progress term-test\nkill -TERM "$BASHPID"\n',
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 143)
+        self.assertRegex(console.read_text(), r"RCP_AMI_FAILED:__BUILD_ID__ stage=term-test line=[0-9]+ exit=143")
+        self.assertNotIn("RCP_AMI_READY", console.read_text())
+
+    def test_outer_bootstrap_failure_emits_marker_before_stubbed_poweroff(self):
+        guest = (ami.HERE / "ami-guest.sh").read_text().split("install -d", 1)[0]
+        console = self.directory / "bootstrap-console"
+        guest = guest.replace("/dev/console", str(console))
+        stubs = 'systemctl() { echo "stubbed-$*"; }\n'
+        result = subprocess.run(["bash"], input=stubs + guest + '(exit 37)\n',
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 37)
+        self.assertIn("stubbed-poweroff", result.stdout)
+        self.assertRegex(console.read_text(), r"RCP_AMI_FAILED:__BUILD_ID__ stage=bootstrap line=[0-9]+ exit=37")
+
     def test_installer_reports_its_own_failed_stage_and_exit_status(self):
         script = (ami.HERE / "install-worker.sh").read_text().split("apt-get update", 1)[0]
         script = script.replace('cd "$(dirname "$0")/../.."', 'cd ' + str(self.directory))
@@ -480,23 +629,52 @@ class AmiBuildTests(unittest.TestCase):
                 self.assertEqual(mode & (0o005 if path.is_dir() else 0o004),
                                  0o005 if path.is_dir() else 0o004, str(path))
 
-    def test_prepare_is_offline_and_pins_source_into_reviewable_template(self):
+    def test_prepare_uses_committed_blobs_despite_staged_and_unstaged_edits(self):
+        source = self.directory / "repository" / "infra" / "aws_benchmark"
+        source.mkdir(parents=True)
+        names = ["ami-builder.json", "ami-guest.sh", "maintenance.py"]
+        committed = {name: (ami.HERE / name).read_text() for name in names}
+        for name, body in committed.items():
+            (source / name).write_text(body)
+        def git(*arguments):
+            return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null",
+                                            "-c", "commit.gpgsign=false", "-c", "user.name=Offline Test",
+                                            "-c", "user.email=offline@example.invalid", *arguments],
+                                           cwd=source.parent.parent, text=True, stderr=subprocess.PIPE).strip()
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-qm", "Committed AMI fixture")
+        revision = git("rev-parse", "HEAD")
+        edited_template = json.loads(committed["ami-builder.json"])
+        edited_template["Resources"]["SecurityGroup"]["Properties"]["SecurityGroupIngress"] = [
+            {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": "0.0.0.0/0"}]
+        (source / "ami-builder.json").write_text(json.dumps(edited_template))
+        git("add", "infra/aws_benchmark/ami-builder.json")
+        (source / "ami-guest.sh").write_text("UNREVIEWED_GUEST\n")
+        (source / "maintenance.py").write_text("UNREVIEWED_MAINTENANCE\n")
+        self.assertTrue(git("status", "--porcelain"))
         args = argparse.Namespace(account=self.m["account"], region=self.m["region"],
                                   base_ami=self.m["base_ami"], vpc=self.m["vpc"], subnet=self.m["subnet"],
-                                  revision=self.m["revision"], directory=self.directory / "prepared")
-        with mock.patch.object(ami.subprocess, "check_output", return_value=args.revision + "\n"):
-            with mock.patch.object(ami.Aws, "__call__", side_effect=AssertionError("AWS forbidden")):
-                ami.prepare(args)
+                                  revision=revision, directory=self.directory / "prepared")
+        with mock.patch.object(ami, "HERE", source), mock.patch.object(
+                ami.Aws, "__call__", side_effect=AssertionError("AWS forbidden")):
+            ami.prepare(args)
         template = json.loads((args.directory / "template.json").read_text())
         guest = template["Resources"]["Builder"]["Properties"]["UserData"]["Fn::Base64"]
+        self.assertEqual(template["Resources"]["SecurityGroup"]["Properties"]["SecurityGroupIngress"], [])
         self.assertIn(args.revision, guest)
         self.assertNotIn("__REVISION__", guest)
         self.assertNotIn("__MAINTENANCE_SOURCE__", guest)
-        self.assertIn((ami.HERE / "maintenance.py").read_text(), guest)
+        self.assertNotIn("UNREVIEWED", guest)
+        self.assertIn(committed["maintenance.py"], guest)
         self.assertLess(guest.index("python3 /run/rcp-ami-build/maintenance.py --quiesce"),
                         guest.index("apt-get update"))
         subprocess.run(["bash", "-n"], input=guest, text=True, check=True)
         self.assertLess(len(guest.encode()), 16384)
+        manifest = json.loads((args.directory / "manifest.json").read_text())
+        self.assertEqual(manifest["revision"], revision)
+        self.assertEqual(manifest["template_sha256"],
+                         hashlib.sha256((args.directory / "template.json").read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":

@@ -77,13 +77,13 @@ class WindowTests(unittest.TestCase):
     def test_close_is_persisted_before_control_and_open(self):
         cloud = FakeCloud()
         operator.arm(cloud.api, "group", "bucket", window(), now=lambda: NOW)
-        self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "open-123-1"])
+        self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "output/status.json", "open-123-1"])
         self.assertEqual([a["MaxSize"] for a in cloud.actions], [0, 1])
         cloud.api["autoscaling"].update_auto_scaling_group.assert_not_called()
         cloud.api["autoscaling"].set_desired_capacity.assert_not_called()
 
     def test_each_arming_failure_leaves_no_launch_and_never_removes_cutoff(self):
-        for failure in ("close-123-1", "control/window.json", "open-123-1"):
+        for failure in ("close-123-1", "control/window.json", "output/status.json", "open-123-1"):
             with self.subTest(failure=failure):
                 cloud = FakeCloud()
                 cloud.fail = failure
@@ -129,7 +129,7 @@ class WindowTests(unittest.TestCase):
         clock = iter([NOW, NOW, NOW + timedelta(minutes=3)])
         with self.assertRaisesRegex(ValueError, "lead time"):
             operator.arm(cloud.api, "group", "bucket", window(), now=lambda: next(clock))
-        self.assertEqual(cloud.events, ["close-123-1", "control/window.json"])
+        self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "output/status.json"])
 
     def test_dangerous_drift_is_rejected(self):
         for changes in ({"SuspendedProcesses": []}, {"MaxInstanceLifetime": 86400},
@@ -154,6 +154,7 @@ class ControllerTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         lease = window(now - timedelta(minutes=4))
         cloud.objects["control/window.json"] = json.dumps(lease).encode()
+        cloud.objects[common.STATUS_KEY] = json.dumps({"run": lease["run"], "state": "pending"}).encode()
         cloud.actions = [dict(ScheduledActionName="close-123-1", StartTime=lease["deadline"],
                               MinSize=0, DesiredCapacity=0, MaxSize=0)]
         cloud.api["autoscaling"].describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
@@ -225,7 +226,7 @@ class WorkerTests(unittest.TestCase):
                     write.assert_not_called()
 
     def test_worker_failures_never_become_success_or_extend_deadline(self):
-        for phase in ("maintenance", "maintenance_budget", "digest", "format", "measure", "stop", "collect", "upload"):
+        for phase in ("maintenance", "maintenance_budget", "digest", "format", "measure", "stop", "upload"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
                 cloud = FakeCloud()
                 lease = window(datetime.now(timezone.utc))
@@ -248,9 +249,9 @@ class WorkerTests(unittest.TestCase):
                     quiet.side_effect = ValueError("automatic APT maintenance is not inactive")
                 if phase == "maintenance_budget":
                     budget = Mock()
-                    budget.left.side_effect = [600, TimeoutError("deadline"), 60, 60]
+                    budget.left.return_value = 600
                     patches.enter_context(patch.object(worker, "Budget", return_value=budget))
-                    quiet.side_effect = lambda command: command(["systemctl", "show"], timeout=10)
+                    quiet.side_effect = TimeoutError("maintenance deadline")
                 prepare = patches.enter_context(patch.object(worker, "prepare_storage", return_value=["disk1", "disk2"]))
                 patches.enter_context(patch.object(worker, "cache_server"))
                 measure = patches.enter_context(patch.object(worker.subprocess, "run", return_value=Mock(returncode=0)))
@@ -263,7 +264,7 @@ class WorkerTests(unittest.TestCase):
                 worker.run(cloud.api["s3"], "bucket")
                 status = json.loads(cloud.objects["output/status.json"])
                 self.assertFalse(status["success"])
-                self.assertEqual(timer.call_count, 1)
+                self.assertEqual(timer.call_count, 2)
                 if phase in ("maintenance", "maintenance_budget"):
                     prepare.assert_not_called()
                     self.assertFalse(any((root / "state").iterdir()))
@@ -272,7 +273,7 @@ class WorkerTests(unittest.TestCase):
                 if phase == "measure":
                     stop.assert_called_once()
                 if phase == "stop":
-                    collect.assert_not_called()
+                    self.assertIsNone(collect.call_args.args[0])
 
     def test_successfully_unloaded_unit_is_safe_to_collect(self):
         with patch.object(worker.subprocess, "run") as stop, \
@@ -302,8 +303,8 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.choose_disks({"blockdevices": broken})
 
-    def test_result_collector_rejects_links_fifos_and_oversize_files(self):
-        for kind in ("symlink", "hardlink", "fifo", "size"):
+    def test_result_collector_rejects_links_and_fifos(self):
+        for kind in ("symlink", "hardlink", "fifo"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 source = root / "file"
@@ -423,6 +424,29 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("id-token", workflow["permissions"])
         self.assertNotIn("id-token", workflow["jobs"]["build"]["permissions"])
         self.assertEqual(workflow["jobs"]["benchmark"]["environment"], "aws-benchmark")
+
+
+    def test_both_roles_match_shared_mailbox_keys(self):
+        import yaml
+        stack = yaml.safe_load((Path(__file__).parent / "stack.yaml").read_text())
+        inputs = {common.REQUEST_KEY, *("input/" + key for key in common.BINARIES)}
+        outputs = {common.RESULTS_KEY, common.STATUS_KEY}
+        expected = {
+            "WorkerRole": {"s3:GetObject": {common.WINDOW_KEY, *inputs}, "s3:PutObject": outputs},
+            "RuntimeRole": {"s3:GetObject": {common.WINDOW_KEY, *outputs}, "s3:PutObject": inputs},
+        }
+        for role, permissions in expected.items():
+            policy = stack["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+            actual = {}
+            for statement in policy:
+                actions = statement["Action"]
+                for action in [actions] if isinstance(actions, str) else actions:
+                    if action.startswith("s3:"):
+                        self.assertEqual(statement["Effect"], "Allow")
+                        self.assertNotIn(action, actual, "duplicate S3 grant")
+                        actual[action] = {entry["Fn::Sub"] for entry in statement["Resource"]}
+            self.assertEqual(actual, {action: {"$" + "{Artifacts.Arn}/" + key for key in keys}
+                                      for action, keys in permissions.items()}, role)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ useradd --system --no-create-home --shell /usr/sbin/nologin rcp-benchmark
 install -d -m 0755 /opt/rcp-benchmark/infra/aws_benchmark /opt/rcp-benchmark/bin
 progress python-environment
 python3 -m venv /opt/rcp-benchmark/venv
-/opt/rcp-benchmark/venv/bin/pip install -r infra/aws_benchmark/requirements.txt
+/opt/rcp-benchmark/venv/bin/pip install --require-hashes -r infra/aws_benchmark/requirements.txt
 progress harness
 cp -r benchmarks /opt/rcp-benchmark/
 cp infra/aws_benchmark/{__init__,common,worker,cache_client,maintenance}.py /opt/rcp-benchmark/infra/aws_benchmark/

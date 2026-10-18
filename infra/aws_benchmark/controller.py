@@ -9,8 +9,9 @@ import stat
 import time
 import urllib.request
 
-from .common import (BINARIES, MAX_BINARY, MAX_RESULT, Budget, checked_clients, digest, get_bytes,
-                     get_json, group, live_instances, put_json, require, scheduled, utc,
+from .common import (BINARIES, MAX_BINARY, MAX_RESULT, PREPARE_RESERVE, REQUEST_KEY, RESULTS_KEY,
+                     STATUS_KEY, WINDOW_KEY, Budget, checked_clients, digest, get_bytes, get_json,
+                     group, live_instances, put_json, require, retry_io, scheduled, utc,
                      validate_identity, validate_window, verify_close, verify_group)
 
 
@@ -64,12 +65,15 @@ def cleanup(api, name, timeout=600):
 
 def run(api, name, bucket, identity, binary_root, output):
     validate_identity(identity)
-    window = get_json(api["s3"], bucket, "control/window.json")
+    window = get_json(api["s3"], bucket, WINDOW_KEY)
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
-    budget = Budget(validate_window(window, minimum=300))
+    budget = Budget(validate_window(window, minimum=PREPARE_RESERVE))
+    initial = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, PREPARE_RESERVE)
+    require(initial == {"run": identity["run"], "state": "pending"},
+            "operator must initialize the pending status before launch")
     # do not touch a different/active run when the preflight fails
     while True:
-        budget.left(300)
+        budget.left(PREPARE_RESERVE)
         verify_close(scheduled(api["autoscaling"], name), window)
         g = group(api["autoscaling"], name)
         verify_group(g, g["MaxSize"])
@@ -80,7 +84,7 @@ def run(api, name, bucket, identity, binary_root, output):
         time.sleep(10)
     request = {**identity, "deadline": window["deadline"], "sha256": {}}
     for key in BINARIES:
-        budget.left(300)
+        budget.left(PREPARE_RESERVE)
         source = "baseline/" + key.split("/")[1] if identity["suite"] == "aa-smoke" else key
         data = read_binary(binary_root / source)
         request["sha256"][key] = digest(data)
@@ -88,8 +92,8 @@ def run(api, name, bucket, identity, binary_root, output):
     if identity["suite"] == "aa-smoke":
         require(all(request["sha256"]["baseline/" + name] == request["sha256"]["candidate/" + name]
                     for name in ("rcp", "rcpd", "filegen")), "A/A binary digests differ")
-    put_json(api["s3"], bucket, "input/request.json", request)
-    budget.left(300)
+    put_json(api["s3"], bucket, REQUEST_KEY, request)
+    budget.left(PREPARE_RESERVE)
     verify_close(scheduled(api["autoscaling"], name), window)
     verify_group(group(api["autoscaling"], name), 1)
     # enter the cleanup boundary before the API call, including uncertain outcomes
@@ -97,17 +101,14 @@ def run(api, name, bucket, identity, binary_root, output):
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)
         while True:
             budget.left(30)
-            try:
-                status = get_json(api["s3"], bucket, "output/status.json")
-            except Exception as error:
-                if getattr(error, "response", {}).get("Error", {}).get("Code") not in ("NoSuchKey", "AccessDenied"):
-                    raise
-                status = {}
-            if status.get("run") == identity["run"]:
+            status = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, 30)
+            require(status.get("run") == identity["run"], "worker status does not match this run")
+            require(status.get("state") in {"pending", "completed"}, "invalid worker status state")
+            if status["state"] == "completed":
                 output.mkdir(parents=True, exist_ok=True)
                 (output / "status.json").write_text(json.dumps(status, indent=2))
                 if status.get("sha256"):
-                    data = get_bytes(api["s3"], bucket, "output/results.zip", MAX_RESULT)
+                    data = retry_io(lambda: get_bytes(api["s3"], bucket, RESULTS_KEY, MAX_RESULT), budget, 30)
                     require(digest(data) == status["sha256"], "result archive digest mismatch")
                     # never extract or execute worker output on the credentialed job
                     (output / "results.zip").write_bytes(data)
