@@ -17,6 +17,15 @@ HERE = Path(__file__).resolve().parent
 TAG = "rcp-ami-build"
 TIMEOUT = 3600
 POLL = 15
+# observed EC2 console snapshots have lagged stopped builders by about seven minutes
+CONSOLE_GRACE = 600
+READ_OPERATIONS = {
+    ("sts", "get-caller-identity"),
+    ("cloudformation", "describe-stacks"), ("cloudformation", "describe-stack-resources"),
+    ("ec2", "describe-images"), ("ec2", "describe-instance-types"), ("ec2", "describe-subnets"),
+    ("ec2", "describe-instances"), ("ec2", "get-console-output"), ("ec2", "describe-snapshots"),
+    ("ec2", "describe-image-attribute"), ("ec2", "describe-volumes"),
+}
 
 
 class Progress:
@@ -58,20 +67,30 @@ def one(items, message):
     return items[0]
 
 
+class AwsError(ValueError):
+    def __init__(self, service, operation, reason):
+        super().__init__(service + " " + operation + " failed: " + reason)
+        match = re.search(r"An error occurred \(([A-Za-z0-9_.-]+)\) when calling ", reason)
+        self.code = match.group(1) if match else None
+
+
 class Aws:
     def __init__(self, region):
         self.region = region
 
     def __call__(self, service, operation, **request):
-        # never retry mutations whose outcome may be unknown (CreateImage has no token)
-        env = {**os.environ, "AWS_MAX_ATTEMPTS": "1", "AWS_PAGER": ""}
+        # reads tolerate transient faults within one bounded CLI process; mutations stay single-attempt
+        # CreateImage has no token, so retrying its unknown outcome could create duplicate paid artifacts
+        attempts = "3" if (service, operation) in READ_OPERATIONS else "1"
+        env = {**os.environ, "AWS_RETRY_MODE": "standard", "AWS_MAX_ATTEMPTS": attempts, "AWS_PAGER": ""}
         result = subprocess.run(
             ["aws", service, operation, "--region", self.region, "--output", "json",
              "--no-cli-pager", "--no-cli-auto-prompt", "--cli-connect-timeout", "5", "--cli-read-timeout", "20",
              "--cli-input-json", json.dumps(request)],
             check=False, text=True, capture_output=True, timeout=90, env=env,
         )
-        require(result.returncode == 0, service + " " + operation + " failed: " + result.stderr.strip())
+        if result.returncode:
+            raise AwsError(service, operation, result.stderr.strip())
         return json.loads(result.stdout or "{}")
 
 
@@ -99,10 +118,13 @@ def prepare(args):
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip()
     require(revision == args.revision, "check out the reviewed pinned revision before preparing")
     build_id = uuid.uuid4().hex
-    template = json.loads((HERE / "ami-builder.json").read_text())
-    guest = (HERE / "ami-guest.sh").read_text().replace("__BUILD_ID__", build_id)
+    def committed(name):
+        return subprocess.check_output(
+            ["git", "show", args.revision + ":infra/aws_benchmark/" + name], cwd=HERE, text=True)
+    template = json.loads(committed("ami-builder.json"))
+    guest = committed("ami-guest.sh").replace("__BUILD_ID__", build_id)
     guest = guest.replace("__REVISION__", args.revision)
-    guest = guest.replace("__MAINTENANCE_SOURCE__", (HERE / "maintenance.py").read_text())
+    guest = guest.replace("__MAINTENANCE_SOURCE__", committed("maintenance.py"))
     require(len(guest.encode()) <= 16384, "generated user data exceeds EC2 limit")
     template["Resources"]["Builder"]["Properties"]["UserData"] = {
         "Fn::Base64": guest,
@@ -197,15 +219,23 @@ def active(aws, m, now):
     require(stack(aws, m)["StackStatus"] == "CREATE_IN_PROGRESS", "stack is no longer creating; reconcile")
 
 
-def builder(aws, m):
+def builder(aws, m, discovering=False):
     resources = aws("cloudformation", "describe-stack-resources", StackName=m["stack_id"])["StackResources"]
     ids = [r["PhysicalResourceId"] for r in resources
            if r["LogicalResourceId"] == "Builder" and r.get("PhysicalResourceId")]
     if not ids:
         return None
     m["instance_id"] = one(ids, "multiple builders")
-    reservations = aws("ec2", "describe-instances", InstanceIds=[m["instance_id"]])["Reservations"]
-    instance = one([i for r in reservations for i in r["Instances"]], "builder missing")
+    try:
+        reservations = aws("ec2", "describe-instances", InstanceIds=[m["instance_id"]])["Reservations"]
+    except AwsError as error:
+        if discovering and error.code == "InvalidInstanceID.NotFound":
+            return None  # the outer guest loop bounds eventual discovery by the original capture cutoff
+        raise
+    instances = [i for r in reservations for i in r["Instances"]]
+    if discovering and not instances:
+        return None
+    instance = one(instances, "builder missing")
     require(tags(instance).get(TAG) == m["build_id"] and instance["ImageId"] == m["base_ami"]
             and instance["InstanceType"] == "t3a.small", "builder identity mismatch")
     if instance["State"]["Name"] in {"running", "stopping", "stopped"}:
@@ -221,8 +251,16 @@ def ready(aws, m, instance):
     if not instance or instance["State"]["Name"] != "stopped":
         return False
     # AWS CLI decodes this field; unlike the EC2 API, its output is already plain text
-    console = aws("ec2", "get-console-output", InstanceId=m["instance_id"], Latest=True).get("Output", "")
-    require("RCP_AMI_FAILED:" + m["build_id"] not in console, "guest preparation failed")
+    console = aws("ec2", "get-console-output", InstanceId=m["instance_id"], Latest=True).get("Output") or ""
+    stages = re.findall(r"\[guest:([a-z][a-z0-9-]{0,63})\]", console)
+    if stages:
+        m["guest_stage"] = stages[-1]
+    failure = "RCP_AMI_FAILED:" + m["build_id"]
+    detail = re.search(re.escape(failure) + r" stage=([a-z][a-z0-9-]{0,63}) line=([0-9]{1,6}) exit=([0-9]{1,3})", console)
+    if detail:
+        m["guest_stage"] = detail[1]
+        m["guest_failure"] = dict(stage=detail[1], line=int(detail[2]), exit=int(detail[3]))
+    require(failure not in console, "guest preparation failed; last guest stage=" + m.get("guest_stage", "unknown"))
     marker = "RCP_AMI_READY:" + m["build_id"] + ":" + m["revision"]
     return marker in console
 
@@ -271,7 +309,7 @@ def captured(aws, m):
     return True
 
 
-def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None):
+def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None, clock=time.monotonic):
     progress = Progress() if progress is None else progress
     require(m["stage"] == "prepared", "run is one-shot; use inspect, never retry a launch")
     body = (directory / "template.json").read_text()
@@ -289,9 +327,10 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None):
     m["stack_id"] = result["StackId"]
     save(directory, m)
     log_hint_shown = False
+    stopped_at = None
     while True:
         active(aws, m, now)
-        instance = builder(aws, m)
+        instance = builder(aws, m, discovering=True)
         save(directory, m)
         if instance and not log_hint_shown:
             command = shlex.join(["aws", "ec2", "get-console-output", "--region", m["region"],
@@ -302,9 +341,15 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None):
             log_hint_shown = True
         state = instance["State"]["Name"] if instance else "not yet discovered"
         progress("guest", f"stack={m['stack_status']} builder={state}; waiting for stopped + readiness marker")
+        if state == "stopped" and stopped_at is None:
+            stopped_at = clock()
         if ready(aws, m, instance):
             break
-        require(now() < m["submitted_at"] + 2400, "guest not ready with 20 minutes left; reconcile")
+        detail = "; last guest stage=" + m.get("guest_stage", "unknown") + "; reconcile"
+        require(state not in {"shutting-down", "terminated"}, "builder exited before readiness" + detail)
+        require(stopped_at is None or clock() - stopped_at < CONSOLE_GRACE,
+                "stopped builder has no matching readiness marker after console-lag grace" + detail)
+        require(now() < m["submitted_at"] + 2400, "guest not ready with 20 minutes left" + detail)
         sleep(POLL)
     require(m.get("root_volume_id"), "root volume ID missing")
     active(aws, m, now)

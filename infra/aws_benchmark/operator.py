@@ -4,8 +4,9 @@ import argparse
 from datetime import datetime, timezone
 import json
 
-from .common import (MAX_OPEN_LEAD, SUSPEND, clients, get_json, group, live_instances, put_json, require,
-                     scheduled, timestamp, utc, validate_window, verify_close, verify_group)
+from .common import (MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, clients, error_code,
+                     get_json, group, live_instances, put_json, require, scheduled, timestamp, utc,
+                     validate_window, verify_close, verify_group)
 
 
 def inspect_closed(api, name):
@@ -36,15 +37,15 @@ def inspect_closed(api, name):
 
 
 def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
-    validate_window(window, now(), minimum=600)
+    validate_window(window, now(), minimum=MIN_WINDOW)
     require(120 <= (utc(window["opens"]) - now()).total_seconds() <= MAX_OPEN_LEAD,
             "opening must be 2–5 minutes in the future")
     inspect_closed(api, name)
     # a single operator is required; never overwrite a still-valid control document
     try:
-        previous = get_json(api["s3"], bucket, "control/window.json")
+        previous = get_json(api["s3"], bucket, WINDOW_KEY)
     except Exception as error:
-        if getattr(error, "response", {}).get("Error", {}).get("Code") != "NoSuchKey":
+        if error_code(error) != "NoSuchKey":
             raise
     else:
         require(utc(previous["deadline"]) < now(), "previous window has not expired")
@@ -54,8 +55,11 @@ def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
         ScheduledActionName="close-" + window["run"], StartTime=utc(window["deadline"]),
         MinSize=0, DesiredCapacity=0, MaxSize=0)
     verify_close(scheduled(asg, name), window)
-    put_json(api["s3"], bucket, "control/window.json", window)
-    require(get_json(api["s3"], bucket, "control/window.json") == window, "window read-back mismatch")
+    put_json(api["s3"], bucket, WINDOW_KEY, window)
+    require(get_json(api["s3"], bucket, WINDOW_KEY) == window, "window read-back mismatch")
+    pending = {"run": window["run"], "state": "pending"}
+    put_json(api["s3"], bucket, STATUS_KEY, pending)
+    require(get_json(api["s3"], bucket, STATUS_KEY) == pending, "pending status read-back mismatch")
     require((utc(window["opens"]) - now()).total_seconds() >= 30, "opening lead time exhausted; leave shutdown armed")
     # scheduled open cannot arrive late and reopen an already closed lease: past
     # start times are rejected, and actions within one group execute in time order

@@ -63,11 +63,15 @@ environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`, `
    `tiny-10k`, and `source-warm`; it is labeled smoke. Builds finish on separate GitHub-hosted jobs
    before the environment approval gate. They have no OIDC or cloud credentials.
 2. Once both builds succeed, note the GitHub `run ID-attempt`, for example `123456789-1`. The
-   trusted operator chooses an absolute UTC opening 2–5 minutes ahead and a cutoff 5–60 minutes
-   after opening. Use about 15 minutes for the first pilot. All boot, download, formatting, file
-   generation, hashing, validation, cleanup and upload time must fit inside this window.
+   trusted operator chooses an absolute UTC opening 2–5 minutes ahead and a cutoff 15–60 minutes
+   after opening. Use about 20 minutes for the first pilot. The 15-minute minimum leaves room for
+   the five-minute pre-launch reserve, up to two minutes of scheduled-action delay, and additional
+   boot/preparation/measurement time. It is an admission minimum, not a guarantee that preparation
+   or a suite will complete. All boot, download, formatting, file generation, hashing, validation,
+   cleanup and upload time must fit inside this window.
 3. In a local Python 3.12 virtual environment with
-   `pip install -r infra/aws_benchmark/requirements.txt`, use an operator SSO/session identity:
+   `pip install --require-hashes -r infra/aws_benchmark/requirements.txt`, use an operator
+   SSO/session identity:
 
 ```bash
 python -m infra.aws_benchmark.operator \
@@ -94,14 +98,23 @@ reruns can lose artifacts from successful build jobs that are not rerun. Arm the
 the previous deadline and confirmed physical teardown. Do not manually rewrite the control document
 to extend a lease.
 
-The operator needs the following account permissions; none belong to CI: the ASG read APIs used by
-`operator.py`, `autoscaling:SuspendProcesses`, and `autoscaling:PutScheduledUpdateGroupAction` on
-this group; EC2 `DescribeInstances` and `DescribeLaunchTemplateVersions`; S3 `GetObject` and
-`PutObject` on `control/window.json`, plus `ListBucket` constrained to that key so its initial
-absence is distinguishable from access denial. Infrastructure deployment uses a separate trusted
-identity with permission to create the resources declared in the template and pass the worker role.
-There is no need to grant CI `PassRole`, SSM, direct EC2 launch, IAM, or infrastructure-deployment
-access.
+The operator needs the following account permissions; none of these operator mutation permissions
+belong to CI:
+
+- `autoscaling:SuspendProcesses`, `autoscaling:PutScheduledUpdateGroupAction`,
+  `autoscaling:DeleteScheduledAction` and `autoscaling:UpdateAutoScalingGroup`, scoped to the exact
+  stack-created ASG ARN. The latter two are required for the early-cancellation procedure below.
+- The ASG read APIs used by `operator.py`: `DescribeAutoScalingGroups`, `DescribeScheduledActions`,
+  `DescribePolicies`, `DescribeLifecycleHooks`, `DescribeWarmPool` and `DescribeInstanceRefreshes`;
+  EC2 `DescribeInstances` and `DescribeLaunchTemplateVersions`.
+- S3 `GetObject` and `PutObject` on exactly `control/window.json` and `output/status.json`, plus
+  `ListBucket` constrained to `control/window.json` so its initial absence is distinguishable from
+  access denial. The status object is initialized and read back before opening; CI needs no bucket
+  listing permission.
+
+Infrastructure deployment uses a separate trusted identity with permission to create the resources
+declared in the template and pass the worker role. There is no need to grant CI `PassRole`, SSM,
+direct EC2 launch, IAM, or infrastructure-deployment access.
 
 ## Cutoff and failure behavior
 
@@ -113,8 +126,9 @@ refreshes, custom termination policies and automatic maximum-lifetime replacemen
 
 The operator first creates and reads back `close-RUN_ID-ATTEMPT`, a one-time action setting minimum,
 desired and maximum to zero at the absolute deadline. It then writes the run-bound control document
-and schedules `open-RUN_ID-ATTEMPT` at the earlier absolute opening time, setting minimum/desired to
-zero and maximum to one. Scheduling the opening avoids a delayed direct
+and initializes `output/status.json` for this run with state `pending`, reading both objects back
+before scheduling `open-RUN_ID-ATTEMPT` at the earlier absolute opening time. The opening sets
+minimum/desired to zero and maximum to one. Scheduling the opening avoids a delayed direct
 `UpdateAutoScalingGroup(max=1)` arriving after the cutoff and reopening capacity. AWS orders
 scheduled actions within one group and rejects start times in the past. Neither action uses a
 recurrence or `EndTime`.
@@ -146,6 +160,12 @@ The runtime role trusts only `repo:wykurz/rcp:environment:aws-benchmark`. It may
 (those APIs do not support resource-level scoping), read the fixed control/output objects, and write
 seven exact input keys. It cannot edit launch templates, processes, schedules, IAM or the ASG
 limits. Do not attach extra policies to either role.
+
+The controller verifies the run-bound pending status before requesting capacity, then polls until
+the worker publishes state `completed`. Missing objects, access denial and invalid status fail
+explicitly; they are never interpreted as an unfinished run. Transient mailbox failures receive at
+most three attempts with one- and two-second backoff, bounded by the original deadline and cleanup
+reserve. The retry includes the full object-body read, including completed result downloads.
 
 The fresh controller executes only code checked out at the dispatched main commit. It never runs
 downloaded binaries, builds candidate source, extracts result ZIPs, or exports AWS credentials to
@@ -181,20 +201,34 @@ accepts no paths or commands. No sudoers grant is installed. All fixture generat
 validation, source reuse, pairing and cleanup stay in the existing harness. Its random-byte
 `filegen` fixture policy is unchanged; no sparse or all-zero replacements are introduced.
 
-The worker reserves three minutes for stop/collection/upload. The whole measurement cgroup,
-including preparation and descendants, has a remaining-window runtime limit and a ten-second kill
-grace. A wall-clock deadline plus monotonic ceiling prevents clock movement extending work; an outer
-supervisor alarm also interrupts a stalled upload. Failures never extend the lease. Results are
-collected only after the service is stopped and its cgroup is empty, using held directory/file
-descriptors, no symlink following, regular-file checks and bounded traversal.
+The initial worker control read has a separate 60-second bootstrap deadline and bounded retries.
+Once the control document arrives, its absolute cutoff replaces that bootstrap deadline. The worker
+reserves three minutes for stop/collection/upload. The whole measurement cgroup, including
+preparation and descendants, has a remaining-window runtime limit and a ten-second kill grace. A
+wall-clock deadline plus monotonic ceiling prevents clock movement extending work. The outer alarm
+raises a dedicated `BaseException` so SDK/socket `Exception` handlers cannot swallow the deadline.
+Failures never extend the lease. Candidate-owned results are collected only after the service is
+stopped and its cgroup is empty, using held directory/file descriptors, no symlink following,
+regular-file checks and bounded traversal. If stop verification or collection fails, a metadata-only
+archive preserves the trusted error and service outcome without traversing candidate-owned files.
 
-Output storage is a 128 MiB tmpfs; private temporary directories are each 64 MiB. A result archive
-is at most 64 MiB and 1000 candidate entries, with at most five directory levels below the output
-root, matching `results/logs/<case>/<variant>/<iteration>/`. Candidate files are archived under
-`benchmark/`; trusted supervisor metadata is the separate root `worker.json`. Standard service
-output is discarded; the harness's per-trial files are retained within the output bound. Oversized
-or unsafe results fail explicitly rather than silently truncating measurements. Failed/incomplete
-harness records can be downloaded but must not be treated as successful comparisons.
+An uncaught bootstrap failure, absolute deadline, or exhausted final-status upload makes the
+supervisor fail; its systemd unit requests poweroff. The EBS-backed worker uses the default
+stop-on-guest-shutdown behavior. This provides a compute-stop backstop, not verified physical
+termination: stopping is asynchronous and storage can still incur charges. Unhealthy replacement is
+suspended; the controller and scheduled cutoff remain responsible for desired zero and termination.
+
+Output storage is a 128 MiB tmpfs; private temporary directories are each 64 MiB with writable mode
+`1777`. A result archive is at most 64 MiB and 1000 candidate entries, with at most five directory
+levels below the output root, matching `results/logs/<case>/<variant>/<iteration>/`. Candidate files
+are archived under `benchmark/`; trusted supervisor metadata is the separate root `worker.json`. The
+collector reserves space for that trusted metadata and prioritizes `results.json` and `summary.md`
+before logs. Each log is capped at 1 MiB using its head and tail; oversized non-log files that
+exceed the remaining archive budget are omitted. `worker.json` records the total number of
+omissions/truncations and up to 128 entries with name, original size and archived bytes, so these
+limits are explicit. Standard service output is discarded. Unsafe files or failed traversal produce
+a metadata-only failure archive. Failed/incomplete harness records can be downloaded but must not be
+treated as successful comparisons.
 
 The unversioned S3 mailbox has a fixed number of exact keys and seven-day expiration, plus one-day
 incomplete-multipart cleanup. GitHub build artifacts live one day; result artifacts live seven. Size

@@ -6,11 +6,18 @@ import json
 import re
 import time
 
+PREPARE_RESERVE = 300
+# admission allows five minutes before launch, two for scheduling, and eight for host work
+MIN_WINDOW = PREPARE_RESERVE + 120 + 480
 MAX_WINDOW = 3600
 MAX_OPEN_LEAD = 300
 RESERVE = 180
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
+WINDOW_KEY = "control/window.json"
+REQUEST_KEY = "input/request.json"
+RESULTS_KEY = "output/results.zip"
+STATUS_KEY = "output/status.json"
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
                  for name in ("rcp", "rcpd", "filegen"))
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
@@ -47,7 +54,8 @@ def validate_window(value, now=None, minimum=RESERVE):
     validate_identity(value)
     start, deadline = utc(value["opens"]), utc(value["deadline"])
     now = now or datetime.now(timezone.utc)
-    require(300 <= (deadline - start).total_seconds() <= MAX_WINDOW, "window must be 5–60 minutes")
+    require(MIN_WINDOW <= (deadline - start).total_seconds() <= MAX_WINDOW,
+            f"window must be {MIN_WINDOW // 60}–{MAX_WINDOW // 60} minutes")
     require(minimum <= (deadline - now).total_seconds() <= MAX_WINDOW + MAX_OPEN_LEAD,
             "expired, too short, or excessively distant deadline")
     return deadline
@@ -65,6 +73,48 @@ class Budget:
         if remaining <= 0:
             raise TimeoutError("benchmark deadline exhausted")
         return remaining
+
+
+def error_code(error):
+    return (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+
+
+def retryable_io(error):
+    # the SDK is optional for stdlib-only offline tests, but always installed on AWS paths
+    transport_errors = (ConnectionError, TimeoutError)
+    try:
+        from botocore.exceptions import (ConnectionClosedError, ConnectTimeoutError,
+            EndpointConnectionError, IncompleteReadError, ReadTimeoutError, ResponseStreamingError)
+    except ImportError:
+        pass
+    else:
+        transport_errors += (ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError,
+                             IncompleteReadError, ReadTimeoutError, ResponseStreamingError)
+    response = getattr(error, "response", None) or {}
+    return (isinstance(error, transport_errors)
+            or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
+            or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
+                                    "RequestTimeout", "RequestTimeoutException", "Throttling",
+                                    "ThrottlingException", "RequestLimitExceeded"})
+
+
+def retry_io(operation, budget, reserve=0, attempts=3):
+    """Retry an idempotent mailbox operation, including its body, within the existing budget."""
+    require(1 <= attempts <= 3, "mailbox retries must use one to three attempts")
+    for attempt in range(attempts):
+        budget.left(reserve)
+        try:
+            result = operation()
+        except Exception as error:
+            if attempt + 1 == attempts or not retryable_io(error):
+                raise
+            delay = 2 ** attempt
+            if budget.left(reserve) <= delay:
+                raise TimeoutError("benchmark deadline leaves no time for a mailbox retry") from error
+            time.sleep(delay)
+        else:
+            budget.left(reserve)
+            return result
 
 
 def clients(region):

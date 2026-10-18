@@ -1,7 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 # this outer script runs inside cloud-final; never wait here for the deferred unit
-trap 'systemctl poweroff' ERR
+stage=bootstrap
+bootstrap_failed() {
+  local status=$1 line=$2
+  trap - ERR TERM
+  printf 'RCP_AMI_FAILED:__BUILD_ID__ stage=%s line=%s exit=%s\n' \
+    "$stage" "$line" "$status" >/dev/console || true
+  systemctl poweroff || true
+  exit "$status"
+}
+trap 'bootstrap_failed "$?" "$LINENO"' ERR
+trap 'bootstrap_failed 143 "$LINENO"' TERM
+printf '%s [guest:bootstrap]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
 install -d -m 0700 /run/rcp-ami-build
 cat >/run/rcp-ami-build/maintenance.py <<'RCP_APT_MAINTENANCE_PY'
 __MAINTENANCE_SOURCE__
@@ -17,11 +28,13 @@ progress() {
 }
 failed() {
   local status=$1 line=$2
+  trap - ERR TERM
   printf 'RCP_AMI_FAILED:__BUILD_ID__ stage=%s line=%s exit=%s\n' \
     "$stage" "$line" "$status" >/dev/console || true
   exit "$status"
 }
 trap 'failed "$?" "$LINENO"' ERR
+trap 'failed 143 "$LINENO"' TERM
 progress cloud-init
 cloud-init status --wait
 progress platform
@@ -65,6 +78,7 @@ echo RCP_AMI_READY:__BUILD_ID__:__REVISION__ >/dev/console
 PREPARE
 chmod 0700 /run/rcp-ami-build/prepare.sh
 # /run and transient units disappear on shutdown; nothing starts this job in the AMI
+stage=defer
 systemd-run --no-block --unit=rcp-ami-prepare \
   --property=After=cloud-final.service --property=Type=exec \
   --property=StandardOutput=journal+console --property=StandardError=journal+console \

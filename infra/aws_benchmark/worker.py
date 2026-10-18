@@ -1,7 +1,9 @@
 """Root-owned one-shot supervisor, baked into the AMI; never execute mailbox scripts."""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -16,7 +18,8 @@ import threading
 import zipfile
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, clients,
-                     digest, get_bytes, get_json, put_json, require, validate_window)
+                     digest, get_bytes, get_json, put_json, require, retry_io, utc, validate_window,
+                     WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
 
@@ -84,17 +87,20 @@ def cache_server(budget, uid):
             while True:
                 try:
                     budget.left(RESERVE)
+                except TimeoutError:
+                    return
+                try:
                     connection, _ = server.accept()
                 except socket.timeout:
                     continue
-                except TimeoutError:
-                    return
                 with connection:
                     try:
                         handle_cache(connection, budget, uid)
                     except (OSError, ValueError, TimeoutError):
                         pass
-    threading.Thread(target=serve, daemon=True).start()
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
 
 
 def command(window, seconds):
@@ -108,7 +114,7 @@ def command(window, seconds):
         "RestrictNamespaces": "yes", "LockPersonality": "yes", "RestrictAddressFamilies": "AF_UNIX",
         "MemoryMax": "180G", "TasksMax": "8192", "LimitNOFILE": "1048576",
         "LimitCORE": "0", "LimitFSIZE": "536870912", "UMask": "0077",
-        "TemporaryFileSystem": "/tmp:size=64m /var/tmp:size=64m",
+        "TemporaryFileSystem": "/tmp:size=64m,mode=1777 /var/tmp:size=64m,mode=1777",
         "ReadWritePaths": str(DATA), "InaccessiblePaths": "/root /home /var/lib/cloud",
         "WorkingDirectory": str(ROOT), "StandardOutput": "null", "StandardError": "null",
     }
@@ -134,47 +140,82 @@ def command(window, seconds):
 
 
 def collect(output, metadata, budget):
-    """Read only held, no-follow regular files after the entire candidate cgroup stops."""
+    """Read held no-follow files after cgroup teardown; preserve bounded diagnostics."""
     archive = io.BytesIO()
-    total, count = 0, 0
+    total, count, omitted = 0, 0, 0
+    omissions = []
+    # Reserve trusted metadata and its ZIP headers; every other entry is charged
+    # both local and central headers, including its UTF-8 name, before writing.
+    available = MAX_RESULT - 1024 * 1024
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    def omit(name, size, kept):
+        nonlocal omitted
+        omitted += 1
+        if len(omissions) < 128:
+            omissions.append(dict(name=name[:512], size=size, archived_bytes=kept))
+    def priority(entry):
+        return (entry.name not in ("results", "results.json", "summary.md"), entry.name)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as result:
-        result.writestr("worker.json", json.dumps(metadata, indent=2))
         def walk(fd, prefix, depth):
             nonlocal total, count
-            # results/logs/<case>/<variant>/<iteration>/ is the harness's normal layout.
+            # results/logs/<case>/<variant>/<iteration>/ is the harness's layout.
             require(depth <= 5, "result directory nesting limit exceeded")
             with os.scandir(fd) as entries:
-                walk_entries(entries, fd, prefix, depth)
-        def walk_entries(entries, fd, prefix, depth):
-            nonlocal total, count
-            for entry in entries:
+                batch = list(itertools.islice(entries, 1001 - count))
+            count += len(batch)
+            require(count <= 1000, "result entry limit exceeded")
+            for entry in sorted(batch, key=priority):
                 name = entry.name
                 budget.left(60)
-                count += 1
-                require(count <= 1000 and len(name) <= 200, "result entry limit exceeded")
+                require(len(name) <= 200, "result name limit exceeded")
                 require(name not in (".", "..") and "/" not in name and "\\" not in name, "unsafe result name")
                 child = os.open(name, flags, dir_fd=fd)
                 try:
                     info = os.fstat(child)
+                    member = prefix + name
                     if stat.S_ISDIR(info.st_mode):
-                        walk(child, prefix + name + "/", depth + 1)
-                    else:
-                        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "non-regular or linked result")
-                        require(info.st_size <= MAX_RESULT - total - 65536, "result byte limit exceeded")
-                        with os.fdopen(os.dup(child), "rb") as stream:
-                            data = stream.read(MAX_RESULT - total - 65536 + 1)
-                        total += len(data)
-                        require(total <= MAX_RESULT - 65536, "result byte limit exceeded")
-                        result.writestr(prefix + name, data)
+                        walk(child, member + "/", depth + 1)
+                        continue
+                    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "non-regular or linked result")
+                    overhead = 76 + 2 * len(member.encode("utf-8"))
+                    remaining = max(0, available - total - overhead)
+                    limit = min(1024 * 1024, remaining) if name.endswith(".log") else remaining
+                    if info.st_size > limit and not name.endswith(".log") or limit == 0:
+                        omit(member, info.st_size, 0)
+                        continue
+                    with os.fdopen(os.dup(child), "rb") as stream:
+                        if info.st_size > limit:
+                            # Logs retain their head and tail; the omission manifest
+                            # makes this explicit, including the original size.
+                            head = limit // 2
+                            data = stream.read(head)
+                            stream.seek(info.st_size - (limit - head))
+                            data += stream.read(limit - head)
+                            omit(member, info.st_size, len(data))
+                        else:
+                            data = stream.read(limit + 1)
+                            require(len(data) <= limit, "result grew beyond byte limit")
+                    total += overhead + len(data)
+                    result.writestr(member, data)
                 finally:
                     os.close(child)
-        fd = os.open(output, flags | os.O_DIRECTORY)
-        try:
-            # Candidate-controlled names cannot duplicate the supervisor's worker.json.
-            walk(fd, "benchmark/", 0)
-        finally:
-            os.close(fd)
+        if output is not None:
+            try:
+                fd = os.open(output, flags | os.O_DIRECTORY)
+            except FileNotFoundError:
+                fd = None
+            if fd is not None:
+                try:
+                    # Candidate names cannot duplicate trusted worker.json.
+                    walk(fd, "benchmark/", 0)
+                finally:
+                    os.close(fd)
+        record = dict(metadata)
+        if omitted:
+            record.update(omitted_or_truncated=omissions, omitted_or_truncated_count=omitted)
+        encoded = json.dumps(record, indent=2).encode()
+        require(len(encoded) < 1024 * 1024 - 256, "worker metadata limit exceeded")
+        result.writestr("worker.json", encoded)
     data = archive.getvalue()
     require(len(data) <= MAX_RESULT, "archive byte limit exceeded")
     return data
@@ -192,30 +233,50 @@ def stop_unit():
             "candidate cgroup still contains processes")
 
 
+class DeadlineExpired(BaseException):
+    """Escape SDK/socket Exception handlers at the worker's absolute deadline."""
+
+
+def expired(signum, frame):
+    raise DeadlineExpired("absolute worker deadline exhausted")
+
+
+def error_detail(error):
+    # Only application validation messages are copied; transport errors may carry
+    # request details. All records are bounded and contain no candidate stderr.
+    result = {"type": type(error).__name__}
+    if isinstance(error, ValueError):
+        result["message"] = str(error)[:512]
+    return result
+
+
 def run(s3, bucket):
-    window = get_json(s3, bucket, "control/window.json")
-    budget = Budget(validate_window(window))
-    def expired(signum, frame):
-        raise TimeoutError("absolute worker deadline exhausted")
+    # A failed initial control read has no trustworthy run identity to report.
+    # Bound it anyway; an uncaught failure powers off via the supervisor unit.
+    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
-    request = get_json(s3, bucket, "input/request.json")
-    require(all(request[k] == window[k] for k in ("run", "baseline", "candidate", "suite", "deadline")),
-            "mailbox request does not match the operator window")
-    require(set(request["sha256"]) == set(BINARIES), "unexpected binary list")
-    status = {"run": window["run"], "success": False}
-    metadata = {"window": window, "request": request,
-                "harness_revision": (ROOT / "revision.txt").read_text().strip()}
-    STATE.mkdir(mode=0o755, exist_ok=False)
-    account = pwd.getpwnam("rcp-benchmark")
+    window = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+    budget = Budget(utc(window["deadline"]))
+    signal.setitimer(signal.ITIMER_REAL, budget.left())
+    status = {"run": window["run"], "state": "completed", "success": False}
+    metadata = {"window": window}
     stopped = True
     try:
+        validate_window(window)
+        request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
+        require(all(request[k] == window[k] for k in ("run", "baseline", "candidate", "suite", "deadline")),
+                "mailbox request does not match the operator window")
+        require(set(request["sha256"]) == set(BINARIES), "unexpected binary list")
+        metadata["request"] = request
+        metadata["harness_revision"] = (ROOT / "revision.txt").read_text().strip()
+        STATE.mkdir(mode=0o755, exist_ok=False)
+        account = pwd.getpwnam("rcp-benchmark")
         metadata["apt_units"] = check_quiet(lambda argv, *, timeout: subprocess.run(
             argv, check=True, text=True, capture_output=True,
             timeout=min(timeout, budget.left(RESERVE))).stdout)
         for key in BINARIES:
-            budget.left(RESERVE)
-            data = get_bytes(s3, bucket, "input/" + key, MAX_BINARY)
+            data = retry_io(lambda: get_bytes(s3, bucket, "input/" + key, MAX_BINARY), budget, reserve=RESERVE)
             require(digest(data) == request["sha256"][key], "binary digest mismatch")
             path = STATE / key
             path.parent.mkdir(exist_ok=True)
@@ -229,26 +290,35 @@ def run(s3, bucket):
                 timeout=budget.left(RESERVE) + 15, check=False)
             status["success"] = completed.returncode == 0
             metadata["service_returncode"] = completed.returncode
+        except Exception as error:
+            status["error"] = error_detail(error)
         finally:
-            # stop all descendants even if the systemd-run client was interrupted
-            stop_unit()
-            stopped = True
-        # no disk cleanup traversal here: ephemeral disks die with the instance.
-        # harness-owned cleanup and verification ran inside the same cgroup deadline.
+            # Keep the measurement outcome even when stopping independently fails.
+            try:
+                stop_unit()
+                stopped = True
+            except Exception as error:
+                status.update(success=False, stop_error=error_detail(error))
+        # No disk traversal for cleanup: instance store dies with the instance.
     except Exception as error:
-        status["success"] = False
-        status["error"] = type(error).__name__
+        status.update(success=False, error=error_detail(error))
+    metadata["status"] = status.copy()
     try:
-        require(stopped, "refusing to collect while candidate descendants may be alive")
+        # Never read candidate-owned paths until all descendants are gone. Even
+        # failed teardown can report the trusted outcome without touching them.
+        data = collect(DATA / "output" if stopped else None, metadata, budget)
+    except Exception as error:
+        status.update(success=False, collection_error=error_detail(error))
         metadata["status"] = status.copy()
-        data = collect(DATA / "output", metadata, budget)
-        budget.left(30)
-        s3.put_object(Bucket=bucket, Key="output/results.zip", Body=data, ContentType="application/zip")
+        data = collect(None, metadata, budget)
+    try:
+        retry_io(lambda: s3.put_object(Bucket=bucket, Key=RESULTS_KEY, Body=data,
+                 ContentType="application/zip"), budget, reserve=30)
         status["sha256"] = digest(data)
     except Exception as error:
-        status.update(success=False, upload_error=type(error).__name__)
-    budget.left()
-    put_json(s3, bucket, "output/status.json", status)
+        status.update(success=False, upload_error=error_detail(error))
+    # Exhausted retries propagate to systemd's FailureAction=poweroff backstop.
+    retry_io(lambda: put_json(s3, bucket, STATUS_KEY, status), budget)
 
 
 def main():

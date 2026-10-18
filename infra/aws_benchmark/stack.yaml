@@ -128,7 +128,7 @@ Resources:
               set -euo pipefail
               # trusted, root-owned code is baked into the pinned AMI
               cd /opt/rcp-benchmark
-              exec systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}'
+              exec systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}'
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:

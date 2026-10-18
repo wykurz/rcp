@@ -30,11 +30,14 @@ jobs:
     if: github.ref == 'refs/heads/main' && vars.RCP_AWS_BENCHMARK_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      max-binary: ${{ steps.protocol.outputs.max-binary }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Validate pinned revisions and suite
+        id: protocol
         env:
           BASELINE: ${{ inputs.baseline }}
           CANDIDATE: ${{ inputs.candidate }}
@@ -42,9 +45,11 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
-          from infra.aws_benchmark.common import validate_identity
+          from infra.aws_benchmark.common import MAX_BINARY, validate_identity
           validate_identity(dict(run=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'],
                                  baseline=os.environ['BASELINE'], candidate=os.environ['CANDIDATE'], suite=os.environ['SUITE']))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'max-binary={MAX_BINARY}', file=output)
           PY
 
   build:
@@ -54,6 +59,7 @@ jobs:
     env:
       RUSTFLAGS: --cfg tokio_unstable
       PKG_CONFIG_ALLOW_CROSS: '1'
+      MAX_BINARY: ${{ needs.validate.outputs.max-binary }}
     # no OIDC, environment secrets, AWS credentials, shared caches, or self-hosted runner
     permissions:
       contents: read
@@ -76,12 +82,18 @@ jobs:
       - name: Build before opening the expensive worker
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          sudo apt-get install -y binutils musl-tools pkg-config
           sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
           just build-release
           mkdir -p "$RUNNER_TEMP/binaries"
           for name in rcp rcpd filegen; do
             install -m 0755 "target/x86_64-unknown-linux-musl/release/$name" "$RUNNER_TEMP/binaries/$name"
+            strip --strip-debug "$RUNNER_TEMP/binaries/$name"
+            size=$(stat -c %s "$RUNNER_TEMP/binaries/$name")
+            if [ "$size" -le 0 ] || [ "$size" -gt "$MAX_BINARY" ]; then
+              echo "::error::$name is $size bytes; required range is 1..$MAX_BINARY"
+              exit 1
+            fi
           done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -116,7 +128,7 @@ jobs:
       - name: Install AWS SDK for trusted controller
         run: |
           python3 -m venv "$RUNNER_TEMP/aws-sdk"
-          "$RUNNER_TEMP/aws-sdk/bin/pip" install -r infra/aws_benchmark/requirements.txt
+          "$RUNNER_TEMP/aws-sdk/bin/pip" install --require-hashes -r infra/aws_benchmark/requirements.txt
       - name: Run within the operator window and verify teardown
         env:
           BASELINE: ${{ inputs.baseline }}
