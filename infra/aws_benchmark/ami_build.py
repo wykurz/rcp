@@ -17,14 +17,16 @@ HERE = Path(__file__).resolve().parent
 TAG = "rcp-ami-build"
 TIMEOUT = 3600
 POLL = 15
-# observed EC2 console snapshots have lagged stopped builders by about seven minutes
+# emit a diagnostic after a long console lag; only the original capture cutoff ends the wait
 CONSOLE_GRACE = 600
+DHMC_SETTING = "/ssm/managed-instance/default-ec2-instance-management-role"
 READ_OPERATIONS = {
     ("sts", "get-caller-identity"),
     ("cloudformation", "describe-stacks"), ("cloudformation", "describe-stack-resources"),
     ("ec2", "describe-images"), ("ec2", "describe-instance-types"), ("ec2", "describe-subnets"),
     ("ec2", "describe-instances"), ("ec2", "get-console-output"), ("ec2", "describe-snapshots"),
     ("ec2", "describe-image-attribute"), ("ec2", "describe-volumes"),
+    ("ssm", "get-service-setting"), ("kms", "describe-key"),
 }
 
 
@@ -176,8 +178,18 @@ def image_shape(image):
     return root
 
 
+def dhmc_disabled(aws, m):
+    # no instance profile is not sufficient: DHMC can provide separate SSM credentials
+    arn = f"arn:aws:ssm:{m['region']}:{m['account']}:servicesetting{DHMC_SETTING}"
+    setting = aws("ssm", "get-service-setting", SettingId=arn)["ServiceSetting"]
+    require(setting.get("ARN") == arn and setting.get("SettingId") in {DHMC_SETTING, arn}
+            and setting.get("Status") == "Default" and setting.get("SettingValue") == "$None",
+            "Default Host Management Configuration must already be disabled; no settings were changed")
+
+
 def preflight(aws, m):
     identity(aws, m)
+    dhmc_disabled(aws, m)
     image = one(aws("ec2", "describe-images", ImageIds=[m["base_ami"]])["Images"], "AMI missing")
     require(image["OwnerId"] == "099720109477" and image["State"] == "available"
             and not image.get("ProductCodes") and re.fullmatch(
@@ -248,8 +260,9 @@ def builder(aws, m, discovering=False):
 
 
 def ready(aws, m, instance):
-    if not instance or instance["State"]["Name"] != "stopped":
+    if not instance or instance["State"]["Name"] not in {"running", "stopping", "stopped"}:
         return False
+    # latch exact markers before console rotation, but capture still requires stopped
     # AWS CLI decodes this field; unlike the EC2 API, its output is already plain text
     console = aws("ec2", "get-console-output", InstanceId=m["instance_id"], Latest=True).get("Output") or ""
     stages = re.findall(r"\[guest:([a-z][a-z0-9-]{0,63})\]", console)
@@ -260,9 +273,13 @@ def ready(aws, m, instance):
     if detail:
         m["guest_stage"] = detail[1]
         m["guest_failure"] = dict(stage=detail[1], line=int(detail[2]), exit=int(detail[3]))
-    require(failure not in console, "guest preparation failed; last guest stage=" + m.get("guest_stage", "unknown"))
+    if failure in console:
+        m["guest_failed"] = True
+    require(not m.get("guest_failed"), "guest preparation failed; last guest stage=" + m.get("guest_stage", "unknown"))
     marker = "RCP_AMI_READY:" + m["build_id"] + ":" + m["revision"]
-    return marker in console
+    if marker in console:
+        m["guest_ready"] = True
+    return instance["State"]["Name"] == "stopped" and m.get("guest_ready") is True
 
 
 def inventory(aws, m):
@@ -304,6 +321,16 @@ def captured(aws, m):
     require(snapshot["State"] != "error", "snapshot failed; reconcile")
     if snapshot["State"] != "completed":
         return False
+    key_arn = snapshot.get("KmsKeyId", "")
+    require(re.fullmatch(r"arn:aws:kms:" + re.escape(m["region"]) + ":" + m["account"]
+                         + r":key/[0-9a-f-]{36}", key_arn), "snapshot KMS key identity mismatch")
+    # describing an actual existing key cannot instantiate the predefined alias's first key
+    key = aws("kms", "describe-key", KeyId=key_arn)["KeyMetadata"]
+    require(key.get("Arn") == key_arn and key.get("AWSAccountId") == m["account"]
+            and key.get("KeyManager") == "AWS" and key.get("KeyState") == "Enabled"
+            and key.get("KeyUsage") == "ENCRYPT_DECRYPT" and key.get("KeySpec") == "SYMMETRIC_DEFAULT",
+            "captured snapshot must use an enabled AWS-managed EBS key; custom keys are unsupported")
+    m["snapshot_kms_key_arn"] = key_arn
     permissions = aws("ec2", "describe-image-attribute", ImageId=image["ImageId"], Attribute="launchPermission")
     require(permissions.get("LaunchPermissions") == [], "captured AMI is shared; reconcile")
     return True
@@ -314,9 +341,12 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None, clock
     require(m["stage"] == "prepared", "run is one-shot; use inspect, never retry a launch")
     body = (directory / "template.json").read_text()
     require(hashlib.sha256(body.encode()).hexdigest() == m["template_sha256"], "prepared template changed")
-    progress("preflight", "Checking account, source AMI, instance compatibility and subnet")
+    progress("preflight", "Checking account, disabled DHMC, source AMI, instance compatibility and subnet")
     preflight(aws, m)
     m.update(stage="create_requested", submitted_at=now())
+    capture_end = clock() + 2400
+    def capture_time_left():
+        return min(m["submitted_at"] + 2400 - now(), capture_end - clock())
     save(directory, m)  # persist intent before any paid request, even if its response is lost
     parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in
                   [("BaseAmiId", m["base_ami"]), ("VpcId", m["vpc"]), ("SubnetId", m["subnet"])]]
@@ -328,6 +358,7 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None, clock
     save(directory, m)
     log_hint_shown = False
     stopped_at = None
+    lag_noted = False
     while True:
         active(aws, m, now)
         instance = builder(aws, m, discovering=True)
@@ -343,17 +374,21 @@ def run(aws, directory, m, now=time.time, sleep=time.sleep, progress=None, clock
         progress("guest", f"stack={m['stack_status']} builder={state}; waiting for stopped + readiness marker")
         if state == "stopped" and stopped_at is None:
             stopped_at = clock()
-        if ready(aws, m, instance):
+        is_ready = ready(aws, m, instance)
+        save(directory, m)
+        if is_ready:
             break
         detail = "; last guest stage=" + m.get("guest_stage", "unknown") + "; reconcile"
         require(state not in {"shutting-down", "terminated"}, "builder exited before readiness" + detail)
-        require(stopped_at is None or clock() - stopped_at < CONSOLE_GRACE,
-                "stopped builder has no matching readiness marker after console-lag grace" + detail)
-        require(now() < m["submitted_at"] + 2400, "guest not ready with 20 minutes left" + detail)
+        if not lag_noted and stopped_at is not None and clock() - stopped_at >= CONSOLE_GRACE:
+            lag_noted = True
+            progress("console-lag", "Stopped builder still has no readiness marker" + detail
+                     + "; continuing only until the original capture cutoff")
+        require(capture_time_left() > 0, "guest not ready with 20 minutes left" + detail)
         sleep(POLL)
     require(m.get("root_volume_id"), "root volume ID missing")
     active(aws, m, now)
-    require(now() < m["submitted_at"] + 2400, "insufficient capture time; reconcile")
+    require(capture_time_left() > 0, "insufficient capture time; reconcile")
     m["stage"] = "capture_requested"
     save(directory, m)
     progress("capture", "Guest ready; requesting private AMI capture from " + m["instance_id"])

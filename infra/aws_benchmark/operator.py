@@ -1,49 +1,82 @@
 """Trusted operator only: arm a fresh, bounded window without launching an instance."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import re
 
-from .common import (MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, clients, error_code,
-                     get_json, group, live_instances, put_json, require, scheduled, timestamp, utc,
+from .common import (MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, Budget, checked_clients, error_code,
+                     get_json, group, live_instances, pending_status, put_json, require, retry_io, scheduled, timestamp, utc,
                      validate_window, verify_close, verify_group)
 
 
-def inspect_closed(api, name):
+def operator_clients(region):
+    import boto3
+    from botocore.config import Config
+    config = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 1})
+    session = boto3.Session(region_name=region)
+    api = checked_clients(session, config)
+    # ssm is an operator prerequisite read only; runtime and worker receive no client or grant
+    api["ssm"] = session.client("ssm", config=config)
+    return api
+
+
+def verify_instance_management_disabled(ssm, group_arn, budget):
+    parts = group_arn.split(":", 5)
+    require(len(parts) == 6 and parts[0] == "arn" and parts[2] == "autoscaling"
+            and parts[1] in {"aws", "aws-us-gov", "aws-cn"}
+            and re.fullmatch(r"[a-z0-9-]+", parts[3]) and re.fullmatch(r"[0-9]{12}", parts[4]),
+            "invalid ASG ARN for account prerequisite check")
+    path = "/ssm/managed-instance/default-ec2-instance-management-role"
+    setting_arn = f"arn:{parts[1]}:ssm:{parts[3]}:{parts[4]}:servicesetting{path}"
+    setting = retry_io(lambda: ssm.get_service_setting(SettingId=setting_arn), budget)["ServiceSetting"]
+    require(setting.get("SettingId") in {path, setting_arn} and setting.get("Status") == "Default"
+            and setting.get("SettingValue") == "$None",
+            "Default Host Management Configuration must be disabled before arming")
+
+
+def inspect_closed(api, name, budget):
+    def read(operation):
+        return retry_io(operation, budget)
     asg, ec2 = api["autoscaling"], api["ec2"]
-    g = group(asg, name)
+    g = read(lambda: group(asg, name))
     require((g["MinSize"], g["DesiredCapacity"], g["MaxSize"]) == (0, 0, 0)
             and not g["Instances"], "refusing to alter an active ASG")
-    require(not live_instances(ec2, name), "prior instances have not terminated")
-    require(not scheduled(asg, name), "refusing to replace or extend an existing window")
+    verify_instance_management_disabled(api["ssm"], g["AutoScalingGroupARN"], budget)
+    require(not read(lambda: live_instances(ec2, name)), "prior instances have not terminated")
+    require(not read(lambda: scheduled(asg, name)), "refusing to replace or extend an existing window")
     for operation, field in (("describe_policies", "ScalingPolicies"),
                              ("describe_lifecycle_hooks", "LifecycleHooks")):
-        result = getattr(asg, operation)(AutoScalingGroupName=name)
+        result = read(lambda: getattr(asg, operation)(AutoScalingGroupName=name))
         require(not result.get(field) and not result.get("NextToken"), f"unexpected {field}")
-    warm = asg.describe_warm_pool(AutoScalingGroupName=name)
+    warm = read(lambda: asg.describe_warm_pool(AutoScalingGroupName=name))
     require(not warm.get("WarmPoolConfiguration") and not warm.get("Instances"), "warm pool is forbidden")
-    refreshes = asg.describe_instance_refreshes(AutoScalingGroupName=name)["InstanceRefreshes"]
+    refreshes = read(lambda: asg.describe_instance_refreshes(AutoScalingGroupName=name))["InstanceRefreshes"]
     require(all(r["Status"] in {"Successful", "Failed", "Cancelled", "RollbackSuccessful", "RollbackFailed"}
                 for r in refreshes), "instance refresh is active")
     lt = g["LaunchTemplate"]
     require(lt["Version"].isdigit(), "launch template version must be numeric")
-    data = ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"],
-            Versions=[lt["Version"]])["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+    data = read(lambda: ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"],
+            Versions=[lt["Version"]]))["LaunchTemplateVersions"][0]["LaunchTemplateData"]
     require(data["InstanceType"] == "c5d.24xlarge" and data["ImageId"].startswith("ami-")
             and not data.get("InstanceMarketOptions") and not data.get("InstanceRequirements")
             and not data.get("DisableApiTermination"), "launch template is not a disposable fixed On-Demand VM")
+    budget.left()
     asg.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=sorted(SUSPEND))
-    verify_group(group(asg, name), 0)
+    verify_group(read(lambda: group(asg, name)), 0)
 
 
 def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
     validate_window(window, now(), minimum=MIN_WINDOW)
     require(120 <= (utc(window["opens"]) - now()).total_seconds() <= MAX_OPEN_LEAD,
             "opening must be 2–5 minutes in the future")
-    inspect_closed(api, name)
+    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
+    def read(operation):
+        return retry_io(operation, budget)
+    inspect_closed(api, name, budget)
     # a single operator is required; never overwrite a still-valid control document
     try:
-        previous = get_json(api["s3"], bucket, WINDOW_KEY)
+        previous = read(lambda: get_json(api["s3"], bucket, WINDOW_KEY))
     except Exception as error:
         if error_code(error) != "NoSuchKey":
             raise
@@ -51,22 +84,25 @@ def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
         require(utc(previous["deadline"]) < now(), "previous window has not expired")
         require(previous["run"] != window["run"], "a run attempt cannot be rearmed")
     asg = api["autoscaling"]
+    # never replay a schedule mutation after an uncertain response; reconcile the armed cutoff
+    budget.left()
     asg.put_scheduled_update_group_action(AutoScalingGroupName=name,
         ScheduledActionName="close-" + window["run"], StartTime=utc(window["deadline"]),
         MinSize=0, DesiredCapacity=0, MaxSize=0)
-    verify_close(scheduled(asg, name), window)
-    put_json(api["s3"], bucket, WINDOW_KEY, window)
-    require(get_json(api["s3"], bucket, WINDOW_KEY) == window, "window read-back mismatch")
-    pending = {"run": window["run"], "state": "pending"}
-    put_json(api["s3"], bucket, STATUS_KEY, pending)
-    require(get_json(api["s3"], bucket, STATUS_KEY) == pending, "pending status read-back mismatch")
+    verify_close(read(lambda: scheduled(asg, name)), window)
+    retry_io(lambda: put_json(api["s3"], bucket, WINDOW_KEY, window), budget)
+    require(read(lambda: get_json(api["s3"], bucket, WINDOW_KEY)) == window, "window read-back mismatch")
+    pending = pending_status(window["run"])
+    retry_io(lambda: put_json(api["s3"], bucket, STATUS_KEY, pending), budget)
+    require(read(lambda: get_json(api["s3"], bucket, STATUS_KEY)) == pending, "pending status read-back mismatch")
     require((utc(window["opens"]) - now()).total_seconds() >= 30, "opening lead time exhausted; leave shutdown armed")
     # scheduled open cannot arrive late and reopen an already closed lease: past
     # start times are rejected, and actions within one group execute in time order
+    budget.left()
     asg.put_scheduled_update_group_action(AutoScalingGroupName=name,
         ScheduledActionName="open-" + window["run"], StartTime=utc(window["opens"]),
         MinSize=0, DesiredCapacity=0, MaxSize=1)
-    actions = scheduled(asg, name)
+    actions = read(lambda: scheduled(asg, name))
     verify_close(actions, window)
     opening = [a for a in actions if a["ScheduledActionName"] == "open-" + window["run"]]
     require(len(opening) == 1 and utc(opening[0]["StartTime"]) == utc(window["opens"])
@@ -81,7 +117,7 @@ def main():
     args = parser.parse_args()
     window = {field: getattr(args, field) for field in ("run", "baseline", "candidate", "suite")}
     window.update(opens=timestamp(args.opens), deadline=timestamp(args.deadline))
-    arm(clients(args.region), args.asg, args.bucket, window)
+    arm(operator_clients(args.region), args.asg, args.bucket, window)
     print(json.dumps(window, indent=2))
     print("Armed. Keep both schedules; no instance was requested. Approve the waiting GitHub environment job.")
 

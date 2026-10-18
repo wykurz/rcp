@@ -11,7 +11,7 @@ bootstrap_failed() {
   exit "$status"
 }
 trap 'bootstrap_failed "$?" "$LINENO"' ERR
-trap 'bootstrap_failed 143 "$LINENO"' TERM
+trap 'bootstrap_failed 143 0' TERM
 printf '%s [guest:bootstrap]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
 install -d -m 0700 /run/rcp-ami-build
 cat >/run/rcp-ami-build/maintenance.py <<'RCP_APT_MAINTENANCE_PY'
@@ -34,7 +34,7 @@ failed() {
   exit "$status"
 }
 trap 'failed "$?" "$LINENO"' ERR
-trap 'failed 143 "$LINENO"' TERM
+trap 'failed 143 0' TERM
 progress cloud-init
 cloud-init status --wait
 progress platform
@@ -60,7 +60,8 @@ bash infra/aws_benchmark/install-worker.sh
 test "$(cat /opt/rcp-benchmark/revision.txt)" = __REVISION__
 cd /
 progress sanitize
-# no credentials, instance role or keypair ever enter this builder
+# no operator credentials, instance role or keypair are supplied to this builder
+# DHMC must remain disabled; the installer removes inherited SSM and registration state
 # sanitation is deferred until cloud-final is finished, including its final writes
 apt-get clean
 rm -rf /root/.aws /root/.ssh /home/ubuntu/.aws /home/ubuntu/.ssh

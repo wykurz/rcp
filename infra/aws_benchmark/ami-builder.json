@@ -30,7 +30,7 @@
         "PropagateTagsToVolumeOnCreation": true,
         "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1},
         "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {
-          "VolumeSize": 16, "VolumeType": "gp3", "Encrypted": true, "DeleteOnTermination": true
+          "VolumeSize": 16, "VolumeType": "gp3", "Encrypted": true, "KmsKeyId": "alias/aws/ebs", "DeleteOnTermination": true
         }}],
         "NetworkInterfaces": [{
           "DeviceIndex": "0", "AssociatePublicIpAddress": true,

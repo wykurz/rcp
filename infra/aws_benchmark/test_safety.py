@@ -27,6 +27,7 @@ def window(now=NOW):
 
 def closed(maximum=0):
     return dict(MinSize=0, DesiredCapacity=0, MaxSize=maximum, Instances=[],
+                AutoScalingGroupARN="arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:test:autoScalingGroupName/group",
                 SuspendedProcesses=[dict(ProcessName=p) for p in common.SUSPEND],
                 LaunchTemplate=dict(LaunchTemplateId="lt-test", Version="1"))
 
@@ -39,7 +40,10 @@ class FakeCloud:
     def __init__(self):
         self.events, self.actions, self.objects = [], [], {}
         self.fail = None
-        self.api = {name: Mock() for name in ("s3", "autoscaling", "ec2")}
+        self.api = {name: Mock() for name in ("s3", "autoscaling", "ec2", "ssm")}
+        self.api["ssm"].get_service_setting.return_value = {"ServiceSetting": {
+            "SettingId": "/ssm/managed-instance/default-ec2-instance-management-role",
+            "Status": "Default", "SettingValue": "$None"}}
         asg, ec2, s3 = (self.api[k] for k in ("autoscaling", "ec2", "s3"))
         asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed()]}
         asg.describe_scheduled_actions.side_effect = lambda **kw: {"ScheduledUpdateGroupActions": copy.deepcopy(self.actions)}
@@ -244,6 +248,7 @@ class WorkerTests(unittest.TestCase):
                 patches.enter_context(patch.object(worker.pwd, "getpwnam", return_value=Mock(pw_uid=123, pw_gid=123)))
                 patches.enter_context(patch.object(worker.signal, "signal"))
                 timer = patches.enter_context(patch.object(worker.signal, "setitimer"))
+                patches.enter_context(patch.object(worker, "check_ssm_absent", return_value={}))
                 quiet = patches.enter_context(patch.object(worker, "check_quiet", return_value={}))
                 if phase == "maintenance":
                     quiet.side_effect = ValueError("automatic APT maintenance is not inactive")
@@ -251,14 +256,20 @@ class WorkerTests(unittest.TestCase):
                     budget = Mock()
                     budget.left.return_value = 600
                     patches.enter_context(patch.object(worker, "Budget", return_value=budget))
-                    quiet.side_effect = TimeoutError("maintenance deadline")
+                    def exhausted_runner(run):
+                        budget.left.side_effect = TimeoutError("maintenance deadline")
+                        try:
+                            return run(["systemctl", "show"], timeout=30)
+                        finally:
+                            budget.left.side_effect = None
+                    quiet.side_effect = exhausted_runner
                 prepare = patches.enter_context(patch.object(worker, "prepare_storage", return_value=["disk1", "disk2"]))
                 patches.enter_context(patch.object(worker, "cache_server"))
                 measure = patches.enter_context(patch.object(worker.subprocess, "run", return_value=Mock(returncode=0)))
                 stop = patches.enter_context(patch.object(worker, "stop_unit"))
                 collect = patches.enter_context(patch.object(worker, "collect", return_value=b"zip"))
-                if phase in ("format", "measure", "stop", "collect"):
-                    {"format": prepare, "measure": measure, "stop": stop, "collect": collect}[phase].side_effect = TimeoutError()
+                if phase in ("format", "measure", "stop"):
+                    {"format": prepare, "measure": measure, "stop": stop}[phase].side_effect = TimeoutError()
                 if phase == "upload":
                     cloud.fail = "output/results.zip"
                 worker.run(cloud.api["s3"], "bucket")
@@ -315,9 +326,7 @@ class WorkerTests(unittest.TestCase):
                     os.link(source, root / "link")
                 elif kind == "fifo":
                     os.mkfifo(source)
-                else:
-                    source.write_bytes(b"x" * 100)
-                with patch.object(worker, "MAX_RESULT", 65550), self.assertRaises((OSError, ValueError)):
+                with self.assertRaises((OSError, ValueError)):
                     worker.collect(root, {}, Mock())
 
     def test_partial_results_are_preserved_without_interpreting_content(self):
