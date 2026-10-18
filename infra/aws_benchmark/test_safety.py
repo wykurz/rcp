@@ -29,6 +29,7 @@ def closed(maximum=0):
     return dict(MinSize=0, DesiredCapacity=0, MaxSize=maximum, Instances=[],
                 AutoScalingGroupARN="arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:test:autoScalingGroupName/group",
                 SuspendedProcesses=[dict(ProcessName=p) for p in common.SUSPEND],
+                InstanceLifecyclePolicy={"RetentionTriggers": {"TerminateHookAbandon": "terminate"}},
                 LaunchTemplate=dict(LaunchTemplateId="lt-test", Version="1"))
 
 
@@ -134,6 +135,29 @@ class WindowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lead time"):
             operator.arm(cloud.api, "group", "bucket", window(), now=lambda: next(clock))
         self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "output/status.json"])
+
+    def test_default_termination_is_accepted_in_closed_and_open_groups(self):
+        for maximum in (0, 1):
+            for representation in ("explicit", "absent", "empty"):
+                with self.subTest(maximum=maximum, representation=representation):
+                    group = closed(maximum)
+                    if representation == "absent":
+                        del group["InstanceLifecyclePolicy"]
+                    elif representation == "empty":
+                        group["InstanceLifecyclePolicy"] = {}
+                    common.verify_group(group, maximum)
+
+    def test_retention_and_unknown_lifecycle_policies_are_rejected(self):
+        for policy in (
+                {"RetentionTriggers": {"TerminateHookAbandon": "retain"}},
+                {"RetentionTriggers": {"TerminateHookAbandon": "unknown"}},
+                {"RetentionTriggers": {"TerminateHookAbandon": "terminate", "FutureTrigger": "retain"}},
+                {"RetentionTriggers": {"TerminateHookAbandon": "terminate"}, "FuturePolicy": True},
+                {"RetentionTriggers": {}}, {"FuturePolicy": True}):
+            for maximum in (0, 1):
+                with self.subTest(maximum=maximum, policy=policy):
+                    with self.assertRaisesRegex(ValueError, "retention configuration"):
+                        common.verify_group({**closed(maximum), "InstanceLifecyclePolicy": policy}, maximum)
 
     def test_dangerous_drift_is_rejected(self):
         for changes in ({"SuspendedProcesses": []}, {"MaxInstanceLifetime": 86400},

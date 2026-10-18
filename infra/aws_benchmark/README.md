@@ -63,12 +63,20 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
-Changes to `benchmarks/`, the baked modules in `infra/aws_benchmark/`, `requirements.txt`, or the
-installer require a new AMI from the reviewed commit and a closed-stack update of `WorkerAmiId`
-before dispatch. Updating the GitHub checkout does not update the baked harness or supervisor.
-Record source SHA and AMI together; retain predecessors only deliberately and do not use an old
-image with a newer controller protocol. A run-matching incompatible terminal status is saved with a
-protocol-mismatch diagnostic to help identify this case.
+Changes to `benchmarks/`, worker-executed code in the baked modules in `infra/aws_benchmark/`,
+`requirements.txt`, or the installer require a new AMI from the reviewed commit and a closed-stack
+update of `WorkerAmiId` before dispatch. Updating the GitHub checkout does not update the baked
+harness or supervisor. A change confined to operator/controller checks, such as `verify_group` in
+`common.py`, does not require an image rebuild when worker behavior and the mailbox protocol are
+unchanged. Record the actual image source SHA and AMI together, even when the controller revision
+differs; retain predecessors only deliberately and do not use an old image with a newer controller
+protocol. A run-matching incompatible terminal status is saved with a protocol-mismatch diagnostic
+to help identify this case.
+
+The group check accepts an absent lifecycle policy or the exact explicit default
+`RetentionTriggers.TerminateHookAbandon=terminate`, which AWS documents as
+[normal termination behavior](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RetentionTriggers.html).
+It rejects `retain` and unknown populated policy shapes; lifecycle hooks remain prohibited.
 
 Create a GitHub environment named `aws-benchmark` with a required trusted reviewer and deployment
 branch rules allowing **only main**. This is required: the OIDC environment subject does not encode
