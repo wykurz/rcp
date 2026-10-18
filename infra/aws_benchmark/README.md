@@ -6,14 +6,15 @@ are separate operations. Start with the A/A smoke pilot before using these resul
 
 The fixed On-Demand VM is `c5d.24xlarge`: 96 vCPU, 192 GiB RAM and four 900 GB local NVMe SSDs. It
 is not metal. Two disks provide separate ext4 source and destination filesystems; two remain unused.
-There is no RAID, Spot, fallback instance type, warm pool, NAT gateway, load balancer, remote shell,
-or monthly allowance service. Availability and the account's 96-vCPU On-Demand quota must be checked
-in the selected Availability Zone before the first window.
+There is no RAID, Spot, fallback instance type, warm pool, NAT gateway, load balancer, or monthly
+allowance service. No remote shell is provisioned; the SSM prerequisite below also excludes
+inherited account-level management. Availability and the account's 96-vCPU On-Demand quota must be
+checked in the selected Availability Zone before the first window.
 
 ## Essential setup inputs
 
-Only these account decisions are needed. Account IDs, subnet IDs and role ARNs are non-secret; never
-put access keys in chat or GitHub settings for this workflow.
+These account decisions and prerequisites are required. Account IDs, subnet IDs and role ARNs are
+non-secret; never put access keys in chat or GitHub settings for this workflow.
 
 1. Choose the AWS account and region. No region is hard-coded.
 2. Supply an existing VPC and **public subnet** with an Internet Gateway route. The worker receives
@@ -30,7 +31,20 @@ put access keys in chat or GitHub settings for this workflow.
    unprivileged worker user, sanitizes the guest after cloud-init finishes, and captures a private
    AMI. Review its costs, failure recovery and operator permissions before running it. Record the
    source commit and AMI ID. AMI preparation/capture is separate from deployment and CI; no worker
-   credentials or future bucket configuration are baked into the image.
+   credentials or future bucket configuration are baked into the image. Both templates explicitly
+   select the AWS-managed EBS key `alias/aws/ebs`, and capture verifies the actual snapshot key.
+   Customer-managed root snapshot keys are outside this initial setup: do not add KMS grants or
+   alter account defaults to make an incompatible image work. Auto Scaling can use the AWS-managed
+   EBS key without additional key-policy grants.
+5. The account and region must have Systems Manager **Default Host Management Configuration (DHMC)
+   disabled** before preparing an image or arming a window. Canonical images can contain an enabled
+   SSM agent, and DHMC can supply management credentials without an instance profile. The helper
+   checks the setting without changing it; future prepared images disable inherited agents and
+   workers verify that state. Disabling the agent in user data cannot prevent its initial boot
+   before user data, so the account prerequisite is still required. If DHMC is enabled, stop and
+   seek a separate account-security decision; never disable it automatically because it may manage
+   unrelated instances. Account administrators must keep this prerequisite true during the build and
+   window; a preflight observation cannot prevent a later administrator change.
 
 Deploy the reviewed template using a trusted operator identity, while the group is closed:
 
@@ -49,6 +63,13 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
+Changes to `benchmarks/`, the baked modules in `infra/aws_benchmark/`, `requirements.txt`, or the
+installer require a new AMI from the reviewed commit and a closed-stack update of `WorkerAmiId`
+before dispatch. Updating the GitHub checkout does not update the baked harness or supervisor.
+Record source SHA and AMI together; retain predecessors only deliberately and do not use an old
+image with a newer controller protocol. A run-matching incompatible terminal status is saved with a
+protocol-mismatch diagnostic to help identify this case.
+
 Create a GitHub environment named `aws-benchmark` with a required trusted reviewer and deployment
 branch rules allowing **only main**. This is required: the OIDC environment subject does not encode
 a branch. Keep environment protection and changes to trusted main under review. Configure these
@@ -65,10 +86,10 @@ environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`, `
 2. Once both builds succeed, note the GitHub `run ID-attempt`, for example `123456789-1`. The
    trusted operator chooses an absolute UTC opening 2–5 minutes ahead and a cutoff 15–60 minutes
    after opening. Use about 20 minutes for the first pilot. The 15-minute minimum leaves room for
-   the five-minute pre-launch reserve, up to two minutes of scheduled-action delay, and additional
-   boot/preparation/measurement time. It is an admission minimum, not a guarantee that preparation
-   or a suite will complete. All boot, download, formatting, file generation, hashing, validation,
-   cleanup and upload time must fit inside this window.
+   the ten-minute launch admission floor, up to two minutes of scheduled-action delay, and three
+   minutes of headroom. It is an admission minimum, not a guarantee that preparation or a suite will
+   complete. All boot, download, formatting, file generation, hashing, validation, cleanup and
+   upload time must fit inside this window.
 3. In a local Python 3.12 virtual environment with
    `pip install --require-hashes -r infra/aws_benchmark/requirements.txt`, use an operator
    SSO/session identity:
@@ -80,11 +101,15 @@ python -m infra.aws_benchmark.operator \
   --opens YYYY-MM-DDTHH:MM:SS+00:00 --deadline YYYY-MM-DDTHH:MM:SS+00:00
 ```
 
-4. After successful read-back, approve the waiting environment job. CI waits for the opening, checks
-   the cutoff, uploads bounded binaries, and requests desired capacity 1. It never opens the ASG
-   maximum. Download `aws-benchmark-results` afterward and inspect `status.json`, `worker.json`
-   inside the ZIP, the unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP
-   is data; review its contents before opening anything executable or HTML.
+4. After successful read-back, approve the waiting environment job **before the opening**. CI
+   refuses to request capacity with ten minutes or less remaining; the worker refuses preparation
+   with eight minutes or less remaining. These floors reserve time for boot/preparation and final
+   reporting, but cannot guarantee a suite completes. A late approval or delayed capacity must fail
+   within the existing lease, never extend it. CI waits for the opening, checks the cutoff, uploads
+   bounded binaries, and requests desired capacity 1. It never opens the ASG maximum. Download
+   `aws-benchmark-results` afterward and inspect `status.json`, `worker.json` inside the ZIP, the
+   unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP is data; review its
+   contents before opening anything executable or HTML.
 5. Confirm the controller reports physical teardown. At the cutoff, verify all three ASG capacities
    are zero and all instances tagged for this group are terminated. Normal CI cleanup sets desired
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
@@ -107,6 +132,10 @@ belong to CI:
 - The ASG read APIs used by `operator.py`: `DescribeAutoScalingGroups`, `DescribeScheduledActions`,
   `DescribePolicies`, `DescribeLifecycleHooks`, `DescribeWarmPool` and `DescribeInstanceRefreshes`;
   EC2 `DescribeInstances` and `DescribeLaunchTemplateVersions`.
+- `ssm:GetServiceSetting` on the account/region setting
+  `arn:PARTITION:ssm:REGION:ACCOUNT:servicesetting/ssm/managed-instance/default-ec2-instance-management-role`.
+  This read verifies that DHMC is disabled; it does not grant session, shell or setting-change
+  access.
 - S3 `GetObject` and `PutObject` on exactly `control/window.json` and `output/status.json`, plus
   `ListBucket` constrained to `control/window.json` so its initial absence is distinguishable from
   access denial. The status object is initialized and read back before opening; CI needs no bucket
@@ -163,9 +192,15 @@ limits. Do not attach extra policies to either role.
 
 The controller verifies the run-bound pending status before requesting capacity, then polls until
 the worker publishes state `completed`. Missing objects, access denial and invalid status fail
-explicitly; they are never interpreted as an unfinished run. Transient mailbox failures receive at
-most three attempts with one- and two-second backoff, bounded by the original deadline and cleanup
-reserve. The retry includes the full object-body read, including completed result downloads.
+explicitly; they are never interpreted as an unfinished run. Run-matching non-pending status is
+saved before terminal-schema validation, including diagnostics from an incompatible old image. Safe
+reads and fixed-key mailbox writes receive at most three attempts with one- and two-second backoff
+for transient transport/service faults, including TLS errors and short response bodies. Retries
+check the original deadline and phase reserve before each attempt; an already completed transfer is
+retained when it consumes its reserve. The next phase checks its own allowance. Initial
+authentication/control reads have a short bootstrap budget. The desired-one request and schedule
+mutations remain single-attempt: an uncertain response requires the existing cleanup or
+read-back/reconciliation path, not an automatic second launch or re-armed window.
 
 The fresh controller executes only code checked out at the dispatched main commit. It never runs
 downloaded binaries, builds candidate source, extracts result ZIPs, or exports AWS credentials to
@@ -176,14 +211,18 @@ the truth. There are no shared build caches or self-hosted GitHub runners in thi
 The worker AMI contains the reviewed root-owned supervisor and harness. The installer persistently
 masks Ubuntu's `apt-daily` and `apt-daily-upgrade` timers and services, allowing active package work
 up to five minutes to drain without killing it. Every worker verifies the four units remain masked
-and inactive before downloading binaries or preparing disks; failure produces a failed run. APT
-state is recorded in `worker.json`. Rebuild from a current Canonical image for security updates
-outside benchmark windows; automatic APT maintenance is deliberately frozen in these disposable
-images. This does not eliminate every source of host noise.
+and inactive before downloading binaries or preparing disks; failure produces a failed run. The
+installer also removes inherited snap/deb SSM agents and registration data, persistently masks both
+service names, and verifies absence. Each worker repeats that read-only verification with
+budget-clamped commands before disk preparation. APT and SSM state are recorded in `worker.json`.
+Rebuild from a current Canonical image for security updates outside benchmark windows; automatic APT
+maintenance is deliberately frozen in these disposable images. This does not eliminate every source
+of host noise.
 
 Six exact raw binary objects are accepted, each at most 128 MiB, with SHA-256 checked before use. No
 input archives, paths, shell commands or root scripts are accepted. A request must match the
-operator's run, revisions, suite and deadline. Disk preparation runs before candidate execution. It
+operator's run, revisions, suite and deadline, use exactly the defined fields, and provide one
+lowercase SHA-256 digest for each binary. Disk preparation runs before candidate execution. It
 selects only four expected-size devices with the exact EC2 instance-store model, rejects
 filesystems, children, mountpoints and read-only devices, then formats two. EBS/root devices never
 qualify. Only this trusted supervisor has device access.
@@ -202,21 +241,27 @@ validation, source reuse, pairing and cleanup stay in the existing harness. Its 
 `filegen` fixture policy is unchanged; no sparse or all-zero replacements are introduced.
 
 The initial worker control read has a separate 60-second bootstrap deadline and bounded retries.
-Once the control document arrives, its absolute cutoff replaces that bootstrap deadline. The worker
-reserves three minutes for stop/collection/upload. The whole measurement cgroup, including
-preparation and descendants, has a remaining-window runtime limit and a ten-second kill grace. A
-wall-clock deadline plus monotonic ceiling prevents clock movement extending work. The outer alarm
-raises a dedicated `BaseException` so SDK/socket `Exception` handlers cannot swallow the deadline.
-Failures never extend the lease. Candidate-owned results are collected only after the service is
-stopped and its cgroup is empty, using held directory/file descriptors, no symlink following,
-regular-file checks and bounded traversal. If stop verification or collection fails, a metadata-only
-archive preserves the trusted error and service outcome without traversing candidate-owned files.
+Once a complete, valid control document arrives, its absolute cutoff replaces that bootstrap
+deadline. The worker reserves three minutes for stop/collection/upload. The whole measurement
+cgroup, including preparation and descendants, has a remaining-window runtime limit and a ten-second
+kill grace. A wall-clock deadline plus monotonic ceiling prevents clock movement extending work. The
+outer alarm raises a dedicated `BaseException` so SDK/socket `Exception` handlers cannot swallow the
+deadline. Failures never extend the lease. Candidate-owned results are collected only after the
+service is stopped and its cgroup is empty, using held directory/file descriptors, no symlink
+following, regular-file checks and bounded traversal. If stop verification or collection fails, a
+metadata-only archive preserves the trusted error and service outcome without traversing
+candidate-owned files. If that fallback also fails, the worker skips the archive and still attempts
+bounded terminal status publication. Supervisor command diagnostics retain only command name, exit
+code or timeout, and bounded AWS error codes; they never copy candidate stderr or request
+credentials.
 
-An uncaught bootstrap failure, absolute deadline, or exhausted final-status upload makes the
-supervisor fail; its systemd unit requests poweroff. The EBS-backed worker uses the default
-stop-on-guest-shutdown behavior. This provides a compute-stop backstop, not verified physical
-termination: stopping is asynchronous and storage can still incur charges. Unhealthy replacement is
-suspended; the controller and scheduled cutoff remain responsible for desired zero and termination.
+Failure to start the supervisor requests poweroff directly from user data. Once started, the
+supervisor unit requests poweroff on both success and failure, including an exhausted final-status
+upload. Successful exit occurs after result/status publication. The EBS-backed worker uses the
+default stop-on-guest-shutdown behavior. This provides a compute-stop backstop, not verified
+physical termination: stopping is asynchronous and storage can still incur charges. Unhealthy
+replacement is suspended; the controller and scheduled cutoff remain responsible for desired zero
+and termination.
 
 Output storage is a 128 MiB tmpfs; private temporary directories are each 64 MiB with writable mode
 `1777`. A result archive is at most 64 MiB and 1000 candidate entries, with at most five directory
@@ -249,6 +294,11 @@ tests use fake AWS clients and local temporary files, never credentials or netwo
 template with `cfn-lint infra/aws_benchmark/stack.yaml` as well. No Rust or harness semantics
 change.
 
+If no worker status arrives, the trusted operator should inspect the exact ASG's activity history
+for launch failures (capacity, quota, AMI or KMS errors), alongside EC2 inventory and the scheduled
+cutoff. This uses operator `autoscaling:DescribeScalingActivities`; the runtime role is unchanged.
+Keep the cutoff armed and do not retry with a different type, key grant or extended deadline.
+
 Offline tests cannot establish account permissions, AMI boot behavior, instance availability, actual
 scheduled scaling, or physical teardown. The account owner should observe the initial A/A pilot,
 verify metadata/network isolation and the cold-cache helper in the prepared image, then test
@@ -263,3 +313,5 @@ cancellation and an unavailable-capacity/failure window before trusting unattend
 - [Scheduled-action API, including past-time rejection](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_PutScheduledUpdateGroupAction.html)
 - [CloudFormation ASG attributes](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-autoscaling-autoscalinggroup.html)
 - [EC2 compute instance specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/co.html)
+- [EBS encryption and Auto Scaling key access](https://docs.aws.amazon.com/autoscaling/ec2/userguide/key-policy-requirements-EBS-encryption.html)
+- [Default Host Management Configuration](https://docs.aws.amazon.com/systems-manager/latest/userguide/fleet-manager-default-host-management-configuration.html)

@@ -1,7 +1,7 @@
 """Worker regressions for sandbox startup, bounded reports and failure deadlines."""
 
 from contextlib import contextmanager, ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
@@ -15,8 +15,8 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from infra.aws_benchmark import common, worker
-from infra.aws_benchmark.test_safety import FakeCloud, window
+from infra.aws_benchmark import common, controller, operator, worker
+from infra.aws_benchmark.test_safety import FakeCloud, closed, window
 
 
 class Transient(Exception):
@@ -43,11 +43,29 @@ def worker_fixture():
         patches.enter_context(patch.object(worker.signal, "setitimer"))
         patches.enter_context(patch.object(common.time, "sleep"))
         patches.enter_context(patch.object(worker, "check_quiet", return_value={}))
+        patches.enter_context(patch.object(worker, "check_ssm_absent", return_value={}))
         patches.enter_context(patch.object(worker, "prepare_storage", return_value=["disk1", "disk2"]))
         patches.enter_context(patch.object(worker, "cache_server"))
         measure = patches.enter_context(patch.object(worker.subprocess, "run", return_value=Mock(returncode=0)))
         stop = patches.enter_context(patch.object(worker, "stop_unit"))
         yield root, cloud, measure, stop
+
+
+
+@contextmanager
+def frozen_worker_time(cloud):
+    deadline = common.utc(json.loads(cloud.objects[common.WINDOW_KEY])["deadline"])
+    clock = {"wall": (deadline - timedelta(minutes=20)).timestamp(), "monotonic": 100.0}
+    class ClockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(clock["wall"], tz)
+    with patch.object(common.time, "time", side_effect=lambda: clock["wall"]), \
+         patch.object(common.time, "monotonic", side_effect=lambda: clock["monotonic"]), \
+         patch.object(common, "datetime", ClockDatetime), \
+         patch.object(worker, "datetime", ClockDatetime), \
+         patch.object(controller, "datetime", ClockDatetime):
+        yield clock
 
 
 def report(cloud):
@@ -117,12 +135,10 @@ class WorkerReviewTests(unittest.TestCase):
             self.assertGreater(json.loads(archive.read("worker.json"))["omitted_or_truncated_count"], 0)
 
     def test_failures_before_measurement_publish_specific_terminal_report(self):
-        for phase in ("request", "validation", "revision", "state", "user"):
+        for phase in ("request", "revision", "state", "user"):
             with self.subTest(phase=phase), worker_fixture() as (root, cloud, measure, stop), ExitStack() as patches:
                 if phase == "request":
                     cloud.objects[common.REQUEST_KEY] = b"invalid JSON"
-                elif phase == "validation":
-                    patches.enter_context(patch.object(worker, "validate_window", side_effect=ValueError("window too short")))
                 elif phase == "revision":
                     (root / "revision.txt").unlink()
                 elif phase == "state":
@@ -213,6 +229,229 @@ class WorkerReviewTests(unittest.TestCase):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
+
+
+    def test_bootstrap_alarm_is_replaced_by_remaining_absolute_window(self):
+        with worker_fixture() as (_, cloud, _, _), frozen_worker_time(cloud) as clock:
+            original = cloud.get
+            def get(**kwargs):
+                if kwargs["Key"] == common.WINDOW_KEY:
+                    clock["wall"] += 7
+                    clock["monotonic"] += 7
+                return original(**kwargs)
+            cloud.api["s3"].get_object.side_effect = get
+            with patch.object(worker, "retry_io", wraps=common.retry_io) as retry:
+                worker.run(cloud.api["s3"], "bucket")
+            self.assertEqual(worker.signal.setitimer.call_args_list[0].args, (signal.ITIMER_REAL, 60))
+            self.assertEqual(worker.signal.setitimer.call_args_list[1].args, (signal.ITIMER_REAL, 1193))
+            self.assertEqual(retry.call_args_list[0].kwargs["reserve"], 5)
+            worker.signal.signal.assert_called_once_with(signal.SIGALRM, worker.expired)
+
+    def test_maintenance_runner_clamps_timeout_and_checks_actual_budget(self):
+        for remaining in (common.RESERVE + 3, common.RESERVE):
+            with self.subTest(remaining=remaining), worker_fixture() as (_, cloud, run, _), frozen_worker_time(cloud) as clock:
+                deadline = common.utc(json.loads(cloud.objects[common.WINDOW_KEY])["deadline"]).timestamp()
+                def quiet(runner):
+                    elapsed = deadline - remaining - clock["wall"]
+                    clock["wall"] += elapsed
+                    clock["monotonic"] += elapsed
+                    runner(["systemctl", "show", "apt-daily.timer"], timeout=10)
+                    return {}
+                with patch.object(worker, "check_quiet", side_effect=quiet):
+                    worker.run(cloud.api["s3"], "bucket")
+                status = json.loads(cloud.objects[common.STATUS_KEY])
+                if remaining > common.RESERVE:
+                    self.assertEqual(run.call_args_list[0].kwargs["timeout"], 3)
+                else:
+                    run.assert_not_called()
+                    self.assertFalse(status["success"])
+                    self.assertEqual(status["error"]["type"], "TimeoutError")
+
+    def test_worker_admission_reserves_boot_preparation_and_reports_rejection(self):
+        for remaining in (common.WORKER_START_RESERVE - 1, common.WORKER_START_RESERVE,
+                          common.WORKER_START_RESERVE + 1):
+            with self.subTest(remaining=remaining), worker_fixture() as (root, cloud, measure, _), frozen_worker_time(cloud) as clock:
+                elapsed = 1200 - remaining
+                clock["wall"] += elapsed
+                clock["monotonic"] += elapsed
+                worker.run(cloud.api["s3"], "bucket")
+                metadata, _ = report(cloud)
+                admission = metadata["admission"]
+                accepted = remaining > common.WORKER_START_RESERVE
+                self.assertEqual(admission["accepted"], accepted)
+                self.assertEqual(admission["remaining_seconds"], remaining)
+                self.assertEqual(admission["required_seconds"], common.WORKER_START_RESERVE)
+                self.assertEqual(metadata["status"]["success"], accepted)
+                if not accepted:
+                    measure.assert_not_called()
+                    worker.prepare_storage.assert_not_called()
+                    self.assertFalse((root / "state").exists())
+
+    def test_unbounded_request_fields_are_rejected_before_retention_or_preparation(self):
+        for placement in ("extra", "digest"):
+            with self.subTest(placement=placement), worker_fixture() as (root, cloud, measure, _):
+                request = json.loads(cloud.objects[common.REQUEST_KEY])
+                nested = 0
+                for _ in range(722):
+                    nested = [nested]
+                if placement == "extra":
+                    request["extra"] = nested
+                else:
+                    request["sha256"]["baseline/rcp"] = nested
+                cloud.objects[common.REQUEST_KEY] = json.dumps(request, separators=(",", ":")).encode()
+                worker.run(cloud.api["s3"], "bucket")
+                metadata, _ = report(cloud)
+                self.assertNotIn("request", metadata)
+                self.assertFalse(metadata["status"]["success"])
+                self.assertIn("error", metadata["status"])
+                self.assertIn(common.STATUS_KEY, cloud.objects)
+                measure.assert_not_called()
+                self.assertFalse((root / "state").exists())
+
+    def test_both_archive_failures_still_publish_terminal_status(self):
+        with worker_fixture() as (_, cloud, _, _):
+            with patch.object(worker, "collect", side_effect=[
+                    ValueError("worker metadata limit exceeded"), RecursionError("nested metadata")]) as collect:
+                worker.run(cloud.api["s3"], "bucket")
+            self.assertEqual(collect.call_count, 2)
+            self.assertIsNone(collect.call_args.args[0])
+            self.assertNotIn(common.RESULTS_KEY, cloud.objects)
+            status = json.loads(cloud.objects[common.STATUS_KEY])
+            self.assertEqual(status["state"], common.COMPLETED)
+            self.assertFalse(status["success"])
+            self.assertNotIn("sha256", status)
+            self.assertEqual(status["collection_error"]["message"], "worker metadata limit exceeded")
+            self.assertEqual(status["fallback_error"]["type"], "RecursionError")
+
+    def test_report_deadline_still_escapes_without_uploading_after_expiry(self):
+        with worker_fixture() as (_, cloud, _, _):
+            with patch.object(worker, "collect", side_effect=worker.DeadlineExpired("deadline")):
+                with self.assertRaises(worker.DeadlineExpired):
+                    worker.run(cloud.api["s3"], "bucket")
+            self.assertNotIn(common.RESULTS_KEY, cloud.objects)
+            self.assertNotIn(common.STATUS_KEY, cloud.objects)
+
+    def test_subprocess_and_sdk_details_distinguish_failures_without_exposing_payloads(self):
+        failures = [
+            (subprocess.CalledProcessError(1, ["/usr/bin/lsblk", "SECRET"], output="SECRET", stderr="SECRET"),
+             {"type": "CalledProcessError", "command": "lsblk", "returncode": 1}),
+            (subprocess.CalledProcessError(32, ["/usr/bin/mount", "SECRET"], stderr="SECRET"),
+             {"type": "CalledProcessError", "command": "mount", "returncode": 32}),
+            (subprocess.TimeoutExpired(["/usr/sbin/mkfs.ext4", "SECRET"], 60, output="SECRET", stderr="SECRET"),
+             {"type": "TimeoutExpired", "command": "mkfs.ext4", "timeout": 60}),
+        ]
+        for error, expected in failures:
+            with self.subTest(expected=expected):
+                self.assertEqual(worker.error_detail(error), expected)
+                self.assertNotIn("SECRET", json.dumps(worker.error_detail(error)))
+        error = RuntimeError("SECRET")
+        error.response = {"Error": {"Code": "ExpiredToken" + "x" * 200, "Message": "SECRET"},
+                          "ResponseMetadata": {"RequestId": "SECRET"}}
+        detail = worker.error_detail(error)
+        self.assertEqual(detail, {"type": "RuntimeError", "code": ("ExpiredToken" + "x" * 200)[:128]})
+        self.assertNotIn("SECRET", json.dumps(detail))
+
+    def test_oversized_non_log_is_omitted_whole_and_core_records_survive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "results").mkdir()
+            (root / "results/results.json").write_text("{}")
+            (root / "results/summary.md").write_text("summary")
+            (root / "results/oversized.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+            with patch.object(worker, "MAX_RESULT", 2 * 1024 * 1024):
+                data = worker.collect(root, {}, Mock())
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(set(archive.namelist()), {
+                "benchmark/results/results.json", "benchmark/results/summary.md", "worker.json"})
+            self.assertEqual(archive.read("benchmark/results/results.json"), b"{}")
+            self.assertEqual(archive.read("benchmark/results/summary.md"), b"summary")
+            metadata = json.loads(archive.read("worker.json"))
+            self.assertEqual(metadata["omitted_or_truncated_count"], 1)
+            self.assertEqual(metadata["omitted_or_truncated"], [
+                {"name": "benchmark/results/oversized.bin", "size": 2 * 1024 * 1024, "archived_bytes": 0}])
+
+    def test_operator_controller_worker_status_contract_end_to_end(self):
+        with worker_fixture() as (root, cloud, measure, _), frozen_worker_time(cloud) as clock:
+            lease = json.loads(cloud.objects[common.WINDOW_KEY])
+            cloud.objects.clear()
+            operator.arm(cloud.api, "group", "bucket", lease,
+                         now=lambda: datetime.fromtimestamp(clock["wall"], timezone.utc))
+            opening = common.utc(lease["opens"]).timestamp() + 1
+            clock["monotonic"] += opening - clock["wall"]
+            clock["wall"] = opening
+            asg = cloud.api["autoscaling"]
+            asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
+            def capacity(**kwargs):
+                if kwargs["DesiredCapacity"] == 1:
+                    worker.run(cloud.api["s3"], "bucket")
+                else:
+                    asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
+            asg.set_desired_capacity.side_effect = capacity
+            binaries = root / "controller-binaries"
+            for key in common.BINARIES:
+                binary = binaries / key
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(b"binary")
+            output = root / "controller-output"
+            identity = {key: lease[key] for key in ("run", "baseline", "candidate", "suite")}
+            controller.run(cloud.api, "group", "bucket", identity, binaries, output)
+            status = json.loads((output / "status.json").read_text())
+            self.assertEqual(status["run"], lease["run"])
+            self.assertTrue(status["success"])
+            self.assertEqual(status["sha256"], common.digest((output / "results.zip").read_bytes()))
+            self.assertEqual([call.kwargs["DesiredCapacity"] for call in asg.set_desired_capacity.call_args_list], [1, 0])
+            measure.assert_called_once()
+
+
+    def test_invalid_window_never_rearms_alarm_or_enters_reporting(self):
+        for kind in ("extra", "too_long"):
+            with self.subTest(kind=kind), worker_fixture() as (_, cloud, measure, _), frozen_worker_time(cloud):
+                lease = json.loads(cloud.objects[common.WINDOW_KEY])
+                if kind == "extra":
+                    nested = 0
+                    for _ in range(722):
+                        nested = [nested]
+                    lease["extra"] = nested
+                else:
+                    lease["deadline"] = common.timestamp(common.utc(lease["opens"]) + timedelta(seconds=common.MAX_WINDOW + 1))
+                cloud.objects[common.WINDOW_KEY] = json.dumps(lease).encode()
+                with patch.object(worker, "collect") as collect, self.assertRaises(ValueError):
+                    worker.run(cloud.api["s3"], "bucket")
+                self.assertEqual(worker.signal.setitimer.call_args_list[0].args, (signal.ITIMER_REAL, 60))
+                self.assertEqual(worker.signal.setitimer.call_count, 1)
+                measure.assert_not_called()
+                collect.assert_not_called()
+                self.assertNotIn(common.STATUS_KEY, cloud.objects)
+                self.assertNotIn(common.RESULTS_KEY, cloud.objects)
+
+    def test_late_valid_window_reports_admission_failure_within_remaining_time(self):
+        with worker_fixture() as (_, cloud, measure, _), frozen_worker_time(cloud) as clock:
+            clock["wall"] += 1100
+            clock["monotonic"] += 1100
+            worker.run(cloud.api["s3"], "bucket")
+            status = json.loads(cloud.objects[common.STATUS_KEY])
+            self.assertFalse(status["success"])
+            self.assertEqual(status["state"], common.COMPLETED)
+            self.assertEqual(status["error"]["type"], "TimeoutError")
+            self.assertEqual(worker.signal.setitimer.call_args_list[1].args, (signal.ITIMER_REAL, 100))
+            measure.assert_not_called()
+
+    def test_guest_security_preflight_uses_budget_and_reports_failures_before_storage(self):
+        with worker_fixture() as (_, cloud, measure, _), frozen_worker_time(cloud) as clock:
+            deadline = common.utc(json.loads(cloud.objects[common.WINDOW_KEY])["deadline"]).timestamp()
+            def security(*, timeout):
+                elapsed = deadline - common.RESERVE - 3 - clock["wall"]
+                clock["wall"] += elapsed
+                clock["monotonic"] += elapsed
+                self.assertEqual(timeout(30), 3)
+                raise ValueError("SSM Agent is installed")
+            with patch.object(worker, "check_ssm_absent", side_effect=security):
+                worker.run(cloud.api["s3"], "bucket")
+            metadata, _ = report(cloud)
+            self.assertFalse(metadata["status"]["success"])
+            self.assertEqual(metadata["status"]["error"]["message"], "SSM Agent is installed")
+            worker.prepare_storage.assert_not_called()
+            measure.assert_not_called()
 
 
 if __name__ == "__main__":

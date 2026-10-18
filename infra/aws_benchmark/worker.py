@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -17,11 +18,13 @@ import subprocess
 import threading
 import zipfile
 
-from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, clients,
-                     digest, get_bytes, get_json, put_json, require, retry_io, utc, validate_window,
+from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
+                     completed_status, digest, error_code, get_bytes, get_json, put_json, require, retry_io,
+                     timestamp, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
+from .guest_security import check_ssm_absent
 
 ROOT = Path("/opt/rcp-benchmark")
 STATE = Path("/run/rcp-benchmark")
@@ -242,33 +245,74 @@ def expired(signum, frame):
 
 
 def error_detail(error):
-    # Only application validation messages are copied; transport errors may carry
-    # request details. All records are bounded and contain no candidate stderr.
-    result = {"type": type(error).__name__}
+    # Supervisor-built command names and numeric outcomes are safe to retain.
+    # Never copy argv, subprocess output, or transport request/response bodies.
+    result = {"type": type(error).__name__[:128]}
     if isinstance(error, ValueError):
         result["message"] = str(error)[:512]
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        if isinstance(error.cmd, (list, tuple)) and error.cmd and isinstance(error.cmd[0], str):
+            result["command"] = Path(error.cmd[0]).name[:128]
+        if isinstance(error, subprocess.CalledProcessError):
+            result["returncode"] = error.returncode
+        elif isinstance(error.timeout, (int, float)) and math.isfinite(error.timeout):
+            result["timeout"] = error.timeout
+    code = error_code(error)
+    if isinstance(code, str):
+        result["code"] = code[:128]
     return result
+
+
+def publish_report(s3, bucket, output, metadata, status, budget):
+    """Attempt bounded archives independently, then always attempt terminal status."""
+    data = None
+    for index, candidate_output in enumerate((output, None)):
+        metadata["status"] = status.copy()
+        try:
+            data = collect(candidate_output, metadata, budget)
+            break
+        except Exception as error:
+            field = "collection_error" if index == 0 else "fallback_error"
+            status.update(success=False, **{field: error_detail(error)})
+    if data is not None:
+        try:
+            retry_io(lambda: s3.put_object(Bucket=bucket, Key=RESULTS_KEY, Body=data,
+                     ContentType="application/zip"), budget, reserve=30)
+            status["sha256"] = digest(data)
+        except Exception as error:
+            status.update(success=False, upload_error=error_detail(error))
+    # DeadlineExpired escapes both archive handlers. Ordinary archive failures
+    # never prevent status publication; exhausted status retries power off.
+    retry_io(lambda: put_json(s3, bucket, STATUS_KEY, status), budget)
 
 
 def run(s3, bucket):
     # A failed initial control read has no trustworthy run identity to report.
     # Bound it anyway; an uncaught failure powers off via the supervisor unit.
-    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
+    started = datetime.now(timezone.utc)
+    budget = Budget(started + timedelta(seconds=60))
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     window = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
-    budget = Budget(utc(window["deadline"]))
+    # Trust no retained metadata or extended alarm until the complete window is
+    # validated. Late valid windows still reach the admission failure report.
+    deadline = validate_window(window, minimum=0)
+    budget = Budget(deadline)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
-    status = {"run": window["run"], "state": "completed", "success": False}
-    metadata = {"window": window}
+    status = completed_status(window["run"])
+    metadata = {"window": window, "worker_started_at": timestamp(started)}
     stopped = True
     try:
-        validate_window(window)
         request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
-        require(all(request[k] == window[k] for k in ("run", "baseline", "candidate", "suite", "deadline")),
-                "mailbox request does not match the operator window")
-        require(set(request["sha256"]) == set(BINARIES), "unexpected binary list")
+        validate_request(request, window)
         metadata["request"] = request
+        remaining = budget.left()
+        metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
+            "remaining_seconds": round(remaining, 3), "required_seconds": WORKER_START_RESERVE,
+            "accepted": remaining > WORKER_START_RESERVE}
+        budget.left(WORKER_START_RESERVE)
+        metadata["guest_security"] = check_ssm_absent(
+            timeout=lambda maximum: min(maximum, budget.left(RESERVE)))
         metadata["harness_revision"] = (ROOT / "revision.txt").read_text().strip()
         STATE.mkdir(mode=0o755, exist_ok=False)
         account = pwd.getpwnam("rcp-benchmark")
@@ -302,23 +346,9 @@ def run(s3, bucket):
         # No disk traversal for cleanup: instance store dies with the instance.
     except Exception as error:
         status.update(success=False, error=error_detail(error))
-    metadata["status"] = status.copy()
-    try:
-        # Never read candidate-owned paths until all descendants are gone. Even
-        # failed teardown can report the trusted outcome without touching them.
-        data = collect(DATA / "output" if stopped else None, metadata, budget)
-    except Exception as error:
-        status.update(success=False, collection_error=error_detail(error))
-        metadata["status"] = status.copy()
-        data = collect(None, metadata, budget)
-    try:
-        retry_io(lambda: s3.put_object(Bucket=bucket, Key=RESULTS_KEY, Body=data,
-                 ContentType="application/zip"), budget, reserve=30)
-        status["sha256"] = digest(data)
-    except Exception as error:
-        status.update(success=False, upload_error=error_detail(error))
-    # Exhausted retries propagate to systemd's FailureAction=poweroff backstop.
-    retry_io(lambda: put_json(s3, bucket, STATUS_KEY, status), budget)
+    # Never read candidate-owned paths until all descendants are gone. Failed
+    # teardown still reports the trusted outcome without touching those paths.
+    publish_report(s3, bucket, DATA / "output" if stopped else None, metadata, status, budget)
 
 
 def main():

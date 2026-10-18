@@ -1,5 +1,6 @@
 """Offline contracts between the workflow, baked worker, harness, and mailbox."""
 
+import json
 import os
 from pathlib import Path
 import re
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import yaml
 
 from benchmarks import run as harness
-from infra.aws_benchmark import cache_client, common
+from infra.aws_benchmark import cache_client, common, worker
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -109,7 +110,8 @@ class BuildContractTests(unittest.TestCase):
         user_data = data["UserData"]["Fn::Base64"]["Fn::Sub"]
         self.assertIn("--property=FailureAction=poweroff", user_data)
         self.assertIn("--property=KillMode=control-group", user_data)
-        self.assertIn("--property=RuntimeMaxSec=3900", user_data)
+        self.assertIn(f"--property=RuntimeMaxSec={common.MAX_WINDOW + common.MAX_OPEN_LEAD}", user_data)
+        self.assertIn("--property=SuccessAction=poweroff", user_data)
 
     def test_cache_shim_accepts_the_real_harness_drop_invocation(self):
         with patch.object(harness.sys, "platform", "linux"), patch.object(harness.subprocess, "run") as run:
@@ -118,6 +120,55 @@ class BuildContractTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0], ["sync"])
         self.assertEqual(run.call_args.args[0], ["sudo", *cache_client.EXPECTED])
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+
+    def test_worker_argv_parses_and_resolves_every_allowlisted_suite(self):
+        manifest = json.loads((ROOT / "benchmarks/cases.json").read_text())
+        for suite, selected in common.SUITES.items():
+            with self.subTest(suite=suite):
+                command = worker.command(dict(suite=suite, baseline="a" * 40), 600)
+                args = harness._arguments(command[command.index("benchmarks.run") + 1:])
+                cases = harness._select(manifest["cases"], args.cases, "case")
+                variants = harness._select(manifest["variants"], args.variants, "variant")
+                self.assertEqual([case["id"] for case in cases], list(selected))
+                self.assertEqual([variant["id"] for variant in variants], ["rcp-default"])
+                self.assertTrue(args.local_resources)
+                self.assertTrue(args.no_timings)
+                self.assertEqual(args.mode, "local")
+
+    def test_userdata_submission_failure_powers_off_without_requiring_worker_directory(self):
+        stack = yaml.safe_load((ROOT / "infra/aws_benchmark/stack.yaml").read_text())
+        user_data = stack["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+        script = user_data.replace("$" + "{Artifacts}", "test-bucket").replace("$" + "{AWS::Region}", "us-east-1")
+        for launch_status in (None, 0, 7):
+            with self.subTest(launch_status=launch_status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                trace = root / "trace.jsonl"
+                stub = (f"#!{sys.executable}\n"
+                        "import json, os, pathlib, sys\n"
+                        "name = pathlib.Path(sys.argv[0]).name\n"
+                        "with open(os.environ['TRACE'], 'a') as stream:\n"
+                        "    print(json.dumps([name, *sys.argv[1:]]), file=stream)\n"
+                        "sys.exit(int(os.environ['LAUNCH_STATUS']) if name == 'systemd-run' else 0)\n")
+                for name in ("systemctl", "systemd-run"):
+                    if name == "systemd-run" and launch_status is None:
+                        continue
+                    executable = root / name
+                    executable.write_text(stub)
+                    executable.chmod(0o755)
+                env = dict(os.environ, PATH=str(root), TRACE=str(trace), LAUNCH_STATUS=str(launch_status))
+                result = subprocess.run(["/bin/bash", "-c", script], cwd=root, env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                if launch_status == 0:
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][0], "systemd-run")
+                    self.assertIn("--working-directory=/opt/rcp-benchmark", calls[0])
+                    self.assertIn("--property=SuccessAction=poweroff", calls[0])
+                    self.assertIn("--property=FailureAction=poweroff", calls[0])
+                else:
+                    self.assertEqual(calls[-1], ["systemctl", "poweroff"])
 
 
 if __name__ == "__main__":

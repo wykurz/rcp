@@ -5,19 +5,23 @@ import hashlib
 import json
 import re
 import time
+from urllib.error import HTTPError, URLError
 
-PREPARE_RESERVE = 300
-# admission allows five minutes before launch, two for scheduling, and eight for host work
-MIN_WINDOW = PREPARE_RESERVE + 120 + 480
+RESERVE = 180
+WORKER_START_RESERVE = RESERVE + 300
+LAUNCH_RESERVE = WORKER_START_RESERVE + 120
+# allow the launch floor, scheduled-action delay, and setup/polling headroom
+MIN_WINDOW = LAUNCH_RESERVE + 120 + 180
 MAX_WINDOW = 3600
 MAX_OPEN_LEAD = 300
-RESERVE = 180
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
 WINDOW_KEY = "control/window.json"
 REQUEST_KEY = "input/request.json"
 RESULTS_KEY = "output/results.zip"
 STATUS_KEY = "output/status.json"
+PENDING = "pending"
+COMPLETED = "completed"
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
                  for name in ("rcp", "rcpd", "filegen"))
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
@@ -51,6 +55,8 @@ def validate_identity(value):
 
 
 def validate_window(value, now=None, minimum=RESERVE):
+    require(isinstance(value, dict) and set(value) ==
+            {"run", "baseline", "candidate", "suite", "opens", "deadline"}, "unexpected window fields")
     validate_identity(value)
     start, deadline = utc(value["opens"]), utc(value["deadline"])
     now = now or datetime.now(timezone.utc)
@@ -59,6 +65,27 @@ def validate_window(value, now=None, minimum=RESERVE):
     require(minimum <= (deadline - now).total_seconds() <= MAX_WINDOW + MAX_OPEN_LEAD,
             "expired, too short, or excessively distant deadline")
     return deadline
+
+
+def validate_request(value, window):
+    require(isinstance(value, dict) and set(value) ==
+            {"run", "baseline", "candidate", "suite", "deadline", "sha256"}, "unexpected request fields")
+    require(all(value[key] == window[key] for key in ("run", "baseline", "candidate", "suite", "deadline")),
+            "mailbox request does not match the operator window")
+    hashes = value["sha256"]
+    require(isinstance(hashes, dict) and set(hashes) == set(BINARIES), "unexpected binary list")
+    require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in hashes.values()), "binary digests must be lowercase SHA-256")
+    return value
+
+
+def pending_status(run):
+    return {"run": run, "state": PENDING}
+
+
+def completed_status(run, success=False):
+    require(isinstance(success, bool), "status success must be boolean")
+    return {"run": run, "state": COMPLETED, "success": success}
 
 
 class Budget:
@@ -83,15 +110,17 @@ def retryable_io(error):
     # the SDK is optional for stdlib-only offline tests, but always installed on AWS paths
     transport_errors = (ConnectionError, TimeoutError)
     try:
-        from botocore.exceptions import (ConnectionClosedError, ConnectTimeoutError,
-            EndpointConnectionError, IncompleteReadError, ReadTimeoutError, ResponseStreamingError)
+        from botocore.exceptions import ConnectionError as SdkConnectionError
+        from botocore.exceptions import HTTPClientError, IncompleteReadError
+        from urllib3.exceptions import SSLError as BodySSLError
     except ImportError:
         pass
     else:
-        transport_errors += (ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError,
-                             IncompleteReadError, ReadTimeoutError, ResponseStreamingError)
+        transport_errors += (SdkConnectionError, HTTPClientError, IncompleteReadError, BodySSLError)
     response = getattr(error, "response", None) or {}
     return (isinstance(error, transport_errors)
+            or isinstance(error, URLError) and not isinstance(error, HTTPError)
+            or isinstance(error, HTTPError) and error.code in {429, 500, 502, 503, 504}
             or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
             or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
                                     "RequestTimeout", "RequestTimeoutException", "Throttling",
@@ -99,8 +128,8 @@ def retryable_io(error):
 
 
 def retry_io(operation, budget, reserve=0, attempts=3):
-    """Retry an idempotent mailbox operation, including its body, within the existing budget."""
-    require(1 <= attempts <= 3, "mailbox retries must use one to three attempts")
+    """Retry an explicitly safe operation, including its body, under the caller's admission budget."""
+    require(1 <= attempts <= 3, "operation retries must use one to three attempts")
     for attempt in range(attempts):
         budget.left(reserve)
         try:
@@ -110,10 +139,10 @@ def retry_io(operation, budget, reserve=0, attempts=3):
                 raise
             delay = 2 ** attempt
             if budget.left(reserve) <= delay:
-                raise TimeoutError("benchmark deadline leaves no time for a mailbox retry") from error
+                raise TimeoutError("benchmark deadline leaves no time for an operation retry") from error
             time.sleep(delay)
         else:
-            budget.left(reserve)
+            # the reserve admits new work; it must not discard an already-completed operation
             return result
 
 
@@ -138,6 +167,8 @@ def get_bytes(s3, bucket, key, limit):
         require(0 <= response["ContentLength"] <= limit, f"oversized object: {key}")
         data = response["Body"].read(limit + 1)
         require(len(data) <= limit, f"oversized body: {key}")
+        if len(data) != response["ContentLength"]:
+            raise ConnectionError(f"truncated body: {key}")
         return data
     finally:
         response["Body"].close()

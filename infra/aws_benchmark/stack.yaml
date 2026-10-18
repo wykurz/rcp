@@ -115,6 +115,7 @@ Resources:
               VolumeType: gp3
               VolumeSize: 16
               Encrypted: true
+              KmsKeyId: alias/aws/ebs
               DeleteOnTermination: true
         NetworkInterfaces:
           - DeviceIndex: 0
@@ -127,8 +128,7 @@ Resources:
               #!/bin/bash
               set -euo pipefail
               # trusted, root-owned code is baked into the pinned AMI
-              cd /opt/rcp-benchmark
-              exec systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}'
+              systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:

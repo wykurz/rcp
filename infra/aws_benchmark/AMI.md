@@ -7,9 +7,10 @@ fake responses; account pilots require separate authorization and incur charges.
 
 ## Inputs and review
 
-Use an authenticated AWS CloudShell session in your chosen **commercial AWS account and region**.
-CloudShell already provides Python 3 and AWS CLI v2; this helper needs no Python packages. Use an
-operator session, never secret keys in chat or source files. Supply only:
+Use an authenticated Linux workstation or attended standard AWS CloudShell session in your chosen
+**commercial AWS account and region**. Python 3, Git and AWS CLI v2 are required; CloudShell
+provides them, and the helper needs no Python packages. Use an existing operator session, never
+secret keys in chat or source files. Supply only:
 
 - The expected 12-digit account ID and explicit region.
 - An existing VPC and public subnet in that account, with an Internet Gateway route and working DNS.
@@ -22,11 +23,24 @@ operator session, never secret keys in chat or source files. Supply only:
   (such as Canonical's `/dev/sdb` and `/dev/sdc`) while requiring exactly one EBS volume: the root.
   It rejects extra EBS volumes, ambiguous or duplicate mappings, and Marketplace product codes. The
   source root may be unencrypted; the builder template explicitly creates an encrypted 16 GiB root,
-  and capture validation requires its owned encrypted snapshot.
+  using the AWS-managed `alias/aws/ebs` key, regardless of a custom account EBS default. Capture
+  validation reads the owned snapshot's actual KMS key and rejects customer-managed, disabled or
+  foreign keys. Customer-key images require a separate security design and approval; this helper
+  creates no grants or key policies.
 - A full reviewed public `wykurz/rcp` commit SHA containing this helper and the worker installer.
   Check out that exact commit locally. Preparation reads the template, guest script and embedded
   maintenance helper from that commit's Git blobs, so staged or unstaged edits cannot enter the
   generated template. The guest fetches only that SHA without credentials.
+
+The account/region must already have Systems Manager Default Host Management Configuration (DHMC)
+**disabled**. Before requesting a stack, the helper reads the exact service setting and requires
+`Status: Default` and the literal `SettingValue: "$None"`; unknown, enabled, pending or unreadable
+settings fail before launch. It never resets the setting. Canonical Ubuntu images include SSM Agent,
+and DHMC can register instances without an instance profile. The installer removes the inherited
+agent and data, but this runs after boot: trusted administrators must keep DHMC disabled through
+preparation and benchmark windows. A preflight read cannot prevent a later administrator change or
+prove that no pre-user-data registration occurred. An enabled account configuration is unsupported;
+do not turn it off for this task without separate account-owner approval.
 
 Review the source and generated template before the paid command. `prepare` does not contact AWS:
 
@@ -40,14 +54,33 @@ python3 -m infra.aws_benchmark.ami_build prepare \
   --directory "$HOME/rcp-ami-build-1"
 cat "$HOME/rcp-ami-build-1/manifest.json"
 cat "$HOME/rcp-ami-build-1/template.json"
-# Paid operation below: run yourself only after reviewing the two files.
+```
+
+Before the paid command, ensure the existing authenticated session has enough remaining lifetime for
+preparation, capture and cleanup (allow about 75 minutes). If it does not, obtain a fresh session
+using your existing access or use a stable Linux workstation with an existing credential-refresh
+configuration. Do not change IAM/session policies merely to run this helper.
+
+**CloudShell needs human attendance.** Keyboard or pointer inactivity for 20–30 minutes can end the
+session even while this helper prints progress. Keep interacting with the terminal (for example,
+press Enter every ten minutes); a background process, `tmux` or `nohup` does not guarantee survival,
+and AWS console-session expiry also ends CloudShell. If attendance or sufficient authentication
+lifetime is unavailable, do not start the paid run. CloudFormation rollback remains independent, but
+session loss during capture can leave paid AMI/snapshot artifacts requiring reconciliation. These
+limits are documented by
+[CloudShell](https://docs.aws.amazon.com/cloudshell/latest/userguide/limits.html) and its
+[FAQ](https://aws.amazon.com/cloudshell/faqs/).
+
+```bash
+# Paid operation: run yourself only after reviewing the files and session constraints above.
 python3 -m infra.aws_benchmark.ami_build run --directory "$HOME/rcp-ami-build-1"
 ```
 
-Keep the directory in persistent CloudShell home and download a copy of `manifest.json`. One process
-may operate on it at a time. `run` is one-shot after submitting a stack request, including an
-uncertain or failed request. It cannot resume or launch a replacement builder. A successful result
-prints the private AMI ID and snapshot IDs; retain the source SHA with them. Use that AMI as
+Keep the directory on persistent workstation storage or standard CloudShell home and download a copy
+of `manifest.json`. VPC CloudShell home is not persistent and is unsuitable for this manifest. One
+process may operate on it at a time. `run` is one-shot after submitting a stack request, including
+an uncertain or failed request. It cannot resume or launch a replacement builder. A successful
+result prints the private AMI ID and snapshot IDs; retain the source SHA with them. Use that AMI as
 `WorkerAmiId` in the separate [benchmark setup](README.md). No bucket configuration or runtime
 credentials are baked into the image.
 
@@ -72,13 +105,19 @@ operation to finish; it never kills active apt/dpkg work. The separate timer sto
 systemd 255 can reload an active masked timer into `failed/resources` before `mask --now` stops it.
 Stopping timers first avoids this failure without clearing failed states or relaxing the final
 masked-and-inactive checks. It then installs git and CA certificates before running the worker
-installer, which verifies APT remains quiet. The same check runs before each benchmark. Rebuild the
-disposable AMI from a current Canonical image for security updates outside benchmark windows. After
-installation it resets cloud-init, machine identity, SSH keys, shell histories and logs. It emits a
-build-specific readiness marker only after sanitation, then powers off. Failure or the service's
-30-minute runtime limit also requests poweroff. These guest actions are secondary guards; they do
-not replace CloudFormation rollback. The image installer is pinned by SHA; Ubuntu package updates
-are resolved at build time, so rebuilds are not bit-for-bit reproducible.
+installer, which verifies APT remains quiet. It also stops and removes the inherited SSM Agent snap
+with `--purge` (or its Debian package), persistently masks both known agent service names, and
+removes SSM registration/configuration/log data. Snap removal uses `--purge` to avoid saving
+registration data in an automatic snap snapshot. The installer and each worker verify that services
+are masked and inactive and agent packages, executables and state are absent. These checks make no
+SSM API calls from the instance; an unexpected agent causes the worker to fail before storage
+preparation. Rebuild the disposable AMI from a current Canonical image for security updates outside
+benchmark windows. After installation it resets cloud-init, machine identity, SSH keys, shell
+histories and logs. It emits a build-specific readiness marker only after sanitation, then powers
+off. Failure or the service's 30-minute runtime limit also requests poweroff. These guest actions
+are secondary guards; they do not replace CloudFormation rollback. The image installer is pinned by
+SHA; Ubuntu package updates are resolved at build time, so rebuilds are not bit-for-bit
+reproducible.
 
 The helper requires both the matching UUID/SHA console marker and EC2's `stopped` state, then
 captures with `NoReboot` so sanitation is not undone by another boot. It refuses to start capture
@@ -111,14 +150,18 @@ instance. Run it in a second session for a boot-log snapshot. EC2 console snapsh
 be empty initially or truncate older output; they are not a live stream. An empty snapshot does not
 establish that the builder stalled. New builds send preparation and installer output to the console,
 including timestamped stages and failure stage/line/exit status, without shell tracing or command
-and environment dumps. No SSH, SSM, instance profile or inbound access is added. Older prepared
-templates keep their original logging behavior; changing the checkout cannot update an existing
-builder. Once the instance is first observed stopped, the helper allows ten minutes of console lag
-(earlier account pilots observed about seven), measured monotonically and still bounded by the
-original 40-minute capture refusal. If no matching marker arrives, it fails with the last observed
-guest stage, or `unknown` if none was available. Bounded AWS requests can delay the next check; the
-grace never extends the capture deadline or rollback. Outer bootstrap failures and preparation
-SIGTERM emit failure markers; SIGKILL or an external stop may leave only the console-lag diagnostic.
+and environment dumps. No SSH/SSM execution channel, instance profile or inbound access is added.
+Older prepared templates keep their original logging behavior; changing the checkout cannot update
+an existing builder. The helper reads the latest console while the instance is running, stopping or
+stopped, latches matching UUID/SHA readiness and failure markers, and still requires `stopped`
+before capture. A later failure marker takes precedence over readiness. After ten minutes stopped
+without a marker, it emits a diagnostic and keeps waiting until the original 40-minute capture
+refusal; this grace is not a new failure deadline. Console buffering may still hide or truncate a
+marker, so the helper can fail with the last observed stage, or `unknown`. Wall-clock rollback
+cannot extend the original 40-minute wait. Bounded AWS requests can delay the next check but never
+authorize capture after that cutoff. Outer bootstrap failures and preparation SIGTERM emit failure
+markers; signal handlers use `line=0` to mean unknown, while command errors report their failing
+line. SIGKILL or an external stop may leave only the console-lag diagnostic.
 
 Preserve the manifest and available console/stack-event evidence after a failure. A generic failure
 marker alone does not identify a cause. Keep the rollback deadline; do not retain a disk or launch a
@@ -173,12 +216,17 @@ the operator reviews a failed attempt before using or removing its output.
 ## Operator permissions
 
 These permissions are for the human image builder, **never the GitHub runtime role**. No IAM/OIDC
-changes, `PassRole`, SSM or guest credentials are required. The caller needs STS
-`GetCallerIdentity`; the EC2 read operations used by the helper (`DescribeImages`,
+changes, `PassRole`, SSM execution permissions or guest credentials are required. The caller needs
+STS `GetCallerIdentity`; the EC2 read operations used by the helper (`DescribeImages`,
 `DescribeImageAttribute`, `DescribeInstanceTypes`, `DescribeSubnets`, `DescribeInstances`,
 `DescribeSnapshots`, `DescribeVolumes`, `GetConsoleOutput`); EC2 `CreateImage` and tagging for its
 own image/snapshots; and CloudFormation `CreateStack`, `DescribeStacks`, `DescribeStackResources`,
-`DeleteStack` for the temporary stack. Event inspection additionally uses `DescribeStackEvents`.
+`DeleteStack` for the temporary stack. It also needs read-only `ssm:GetServiceSetting` on
+`arn:aws:ssm:REGION:ACCOUNT_ID:servicesetting/ssm/managed-instance/default-ec2-instance-management-role`
+and `kms:DescribeKey` on the existing AWS-managed EBS key used by its captured snapshot. The helper
+describes the actual key ARN after capture, never a predefined alias that might instantiate its
+first key. These are operator prerequisites; no new grants are included for CI or the worker. Event
+inspection additionally uses `DescribeStackEvents`.
 
 CloudFormation runs with the caller's permissions (no service role is passed). That identity also
 needs the EC2 create/read/tag/delete permissions to provision and roll back the declared security
@@ -200,8 +248,10 @@ unprivileged benchmark user before the image can become ready. APT tests cover a
 startup, the systemd 255 mask-before-stop failure, failed timers, stop errors/timeouts and service
 draining. The timer failure and corrected ordering were also reproduced with disposable user units
 on Ubuntu systemd 255.4, without changing host APT units. Builder regressions cover dirty checkout
-inputs, read/mutation retry separation, eventual instance discovery, bounded stopped-console lag,
-and shell error/TERM diagnostics without invoking installers or host service operations.
+inputs, read/mutation retry separation, eventual instance discovery, console rotation and lag beyond
+ten minutes within the original cutoff, DHMC rejection before launch, actual captured-key
+validation, SSM removal/verification, and shell error/TERM diagnostics without invoking installers
+or host service operations.
 
 - [CloudFormation CreationPolicy](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html)
 - [CreateStack timeout and rollback](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html)
@@ -211,3 +261,10 @@ and shell error/TERM diagnostics without invoking installers or host service ope
 - [cloud-init cleanup](https://docs.cloud-init.io/en/latest/reference/cli.html#clean)
 - [cloud-init failure states](https://docs.cloud-init.io/en/latest/explanation/failure_states.html)
 - [EC2 console output](https://docs.aws.amazon.com/cli/latest/reference/ec2/get-console-output.html)
+
+- [Auto Scaling encryption key requirements](https://docs.aws.amazon.com/autoscaling/ec2/userguide/key-policy-requirements-EBS-encryption.html)
+- [CloudFormation EBS key selection](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-ec2-instance-ebs.html)
+- [KMS DescribeKey behavior](https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html)
+- [Default Host Management Configuration](https://docs.aws.amazon.com/systems-manager/latest/userguide/fleet-manager-default-host-management-configuration.html)
+- [Disabled DHMC setting value](https://repost.aws/knowledge-center/systems-manager-ec2-instance-not-appear)
+- [SSM Agent on Ubuntu](https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-ubuntu-64-snap.html)

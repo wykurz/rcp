@@ -1,7 +1,7 @@
 """Fresh trusted CI job: copy data, request capacity, collect data, and verify teardown."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -9,9 +9,9 @@ import stat
 import time
 import urllib.request
 
-from .common import (BINARIES, MAX_BINARY, MAX_RESULT, PREPARE_RESERVE, REQUEST_KEY, RESULTS_KEY,
+from .common import (BINARIES, COMPLETED, LAUNCH_RESERVE, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
                      STATUS_KEY, WINDOW_KEY, Budget, checked_clients, digest, get_bytes, get_json,
-                     group, live_instances, put_json, require, retry_io, scheduled, utc,
+                     group, live_instances, pending_status, put_json, require, retry_io, scheduled, utc,
                      validate_identity, validate_window, verify_close, verify_group)
 
 
@@ -21,12 +21,16 @@ def oidc_clients(region, role):
     url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        token = json.load(response)["value"]
+    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
+    def token_request():
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)["value"]
+    token = retry_io(token_request, budget, reserve=5)
     config = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 1})
-    credentials = boto3.client("sts", region_name=region, config=config).assume_role_with_web_identity(
+    sts = boto3.client("sts", region_name=region, config=config)
+    credentials = retry_io(lambda: sts.assume_role_with_web_identity(
         RoleArn=role, RoleSessionName="rcp-benchmark-" + os.environ["GITHUB_RUN_ID"],
-        WebIdentityToken=token, DurationSeconds=7200)["Credentials"]
+        WebIdentityToken=token, DurationSeconds=7200), budget, reserve=5)["Credentials"]
     session = boto3.Session(region_name=region, aws_access_key_id=credentials["AccessKeyId"],
         aws_secret_access_key=credentials["SecretAccessKey"], aws_session_token=credentials["SessionToken"])
     return checked_clients(session, config)
@@ -65,48 +69,55 @@ def cleanup(api, name, timeout=600):
 
 def run(api, name, bucket, identity, binary_root, output):
     validate_identity(identity)
-    window = get_json(api["s3"], bucket, WINDOW_KEY)
+    bootstrap = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
+    window = retry_io(lambda: get_json(api["s3"], bucket, WINDOW_KEY), bootstrap, reserve=5)
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
-    budget = Budget(validate_window(window, minimum=PREPARE_RESERVE))
-    initial = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, PREPARE_RESERVE)
-    require(initial == {"run": identity["run"], "state": "pending"},
+    budget = Budget(validate_window(window, minimum=LAUNCH_RESERVE))
+    initial = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, LAUNCH_RESERVE)
+    require(initial == pending_status(identity["run"]),
             "operator must initialize the pending status before launch")
     # do not touch a different/active run when the preflight fails
+    def read(operation):
+        return retry_io(operation, budget, LAUNCH_RESERVE)
     while True:
-        budget.left(PREPARE_RESERVE)
-        verify_close(scheduled(api["autoscaling"], name), window)
-        g = group(api["autoscaling"], name)
+        budget.left(LAUNCH_RESERVE)
+        verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)
+        g = read(lambda: group(api["autoscaling"], name))
         verify_group(g, g["MaxSize"])
         require(g["MaxSize"] in (0, 1), "unexpected maximum")
-        require(not live_instances(api["ec2"], name), "previous worker has not terminated")
+        require(not read(lambda: live_instances(api["ec2"], name)), "previous worker has not terminated")
         if g["MaxSize"] == 1 and datetime.now(timezone.utc) >= utc(window["opens"]):
             break
         time.sleep(10)
     request = {**identity, "deadline": window["deadline"], "sha256": {}}
     for key in BINARIES:
-        budget.left(PREPARE_RESERVE)
+        budget.left(LAUNCH_RESERVE)
         source = "baseline/" + key.split("/")[1] if identity["suite"] == "aa-smoke" else key
         data = read_binary(binary_root / source)
         request["sha256"][key] = digest(data)
-        api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data)
+        retry_io(lambda: api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data),
+                 budget, LAUNCH_RESERVE)
     if identity["suite"] == "aa-smoke":
         require(all(request["sha256"]["baseline/" + name] == request["sha256"]["candidate/" + name]
                     for name in ("rcp", "rcpd", "filegen")), "A/A binary digests differ")
-    put_json(api["s3"], bucket, REQUEST_KEY, request)
-    budget.left(PREPARE_RESERVE)
-    verify_close(scheduled(api["autoscaling"], name), window)
-    verify_group(group(api["autoscaling"], name), 1)
+    retry_io(lambda: put_json(api["s3"], bucket, REQUEST_KEY, request), budget, LAUNCH_RESERVE)
+    budget.left(LAUNCH_RESERVE)
+    verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)
+    verify_group(read(lambda: group(api["autoscaling"], name)), 1)
+    budget.left(LAUNCH_RESERVE)
     # enter the cleanup boundary before the API call, including uncertain outcomes
     try:
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)
         while True:
             budget.left(30)
             status = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, 30)
-            require(status.get("run") == identity["run"], "worker status does not match this run")
-            require(status.get("state") in {"pending", "completed"}, "invalid worker status state")
-            if status["state"] == "completed":
+            require(isinstance(status, dict) and status.get("run") == identity["run"],
+                    "worker status does not match this run")
+            if status.get("state") != PENDING:
                 output.mkdir(parents=True, exist_ok=True)
-                (output / "status.json").write_text(json.dumps(status, indent=2))
+                (output / "status.json").write_text(json.dumps(status, separators=(",", ":")))
+                require(status.get("state") == COMPLETED and isinstance(status.get("success"), bool),
+                        "worker status protocol mismatch; rebuild WorkerAmiId from this revision")
                 if status.get("sha256"):
                     data = retry_io(lambda: get_bytes(api["s3"], bucket, RESULTS_KEY, MAX_RESULT), budget, 30)
                     require(digest(data) == status["sha256"], "result archive digest mismatch")
