@@ -224,7 +224,8 @@ def verify_group(g, maximum):
     require(not g.get("MixedInstancesPolicy") and not g.get("CapacityRebalance")
             and not g.get("MaxInstanceLifetime") and not g.get("NewInstancesProtectedFromScaleIn")
             and not g.get("InstanceMaintenancePolicy") and not g.get("WarmPoolConfiguration")
-            and not g.get("InstanceLifecyclePolicy")
+            and g.get("InstanceLifecyclePolicy") in (
+                None, {}, {"RetentionTriggers": {"TerminateHookAbandon": "terminate"}})
             and g.get("TerminationPolicies", ["Default"]) == ["Default"],
             "unexpected replacement or retention configuration")
     require(re.fullmatch(r"[1-9][0-9]*", g["LaunchTemplate"]["Version"]), "launch template must use a numeric version")
