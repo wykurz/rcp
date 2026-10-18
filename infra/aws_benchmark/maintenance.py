@@ -34,8 +34,12 @@ def states(command=invoke, timeout=10):
 def check_quiet(command=invoke):
     result = states(command)
     if any(unit["ActiveState"] != "inactive" for unit in result.values()):
-        raise ValueError("automatic APT maintenance is not inactive")
+        raise ValueError("automatic APT maintenance is not inactive: " + activity_summary(result))
     return result
+
+
+def activity_summary(result):
+    return ", ".join(name + "=" + unit["ActiveState"] for name, unit in result.items())
 
 
 def quiesce(command=invoke, now=time.monotonic, sleep=time.sleep):
@@ -45,18 +49,19 @@ def quiesce(command=invoke, now=time.monotonic, sleep=time.sleep):
         if remaining <= 0:
             raise TimeoutError("automatic APT maintenance did not drain")
         return command(argv, timeout=min(timeout, remaining))
-    # masks persist in the AMI; never stop a service that may be running dpkg
-    bounded(["systemctl", "mask", "--now", *TIMERS])
-    bounded(["systemctl", "mask", *SERVICES])
+    # stop timers before masking: systemd 255 reloads masked timers before --now stops them,
+    # which can turn a waiting timer into failed/resources; never stop active apt/dpkg services
+    bounded(["systemctl", "stop", *TIMERS])
+    bounded(["systemctl", "mask", *UNITS])
     while True:
         result = states(bounded)
         if all(unit["ActiveState"] == "inactive" for unit in result.values()):
             return result
         if any(result[name]["ActiveState"] != "inactive" for name in TIMERS):
-            raise ValueError("automatic APT timer did not stop")
+            raise ValueError("automatic APT timer did not stop: " + activity_summary(result))
         if any(result[name]["ActiveState"] not in {"inactive", "active", "activating", "deactivating", "reloading"}
                for name in SERVICES):
-            raise ValueError("unexpected APT service activity state")
+            raise ValueError("unexpected APT service activity state: " + activity_summary(result))
         remaining = end - now()
         if remaining <= 0:
             raise TimeoutError("automatic APT maintenance did not drain")

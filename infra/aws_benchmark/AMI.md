@@ -2,8 +2,8 @@
 
 This optional helper is an **account-owner operation**, separate from the GitHub workflow and the
 benchmark ASG. Preparing files is offline. Running the helper launches a paid temporary `t3a.small`
-and captures a private AMI. The repository never invokes it automatically. No AWS resources were
-created to validate this helper; its tests use fake responses.
+and captures a private AMI. The repository never invokes it automatically. Its automated tests use
+fake responses; account pilots require separate authorization and incur charges.
 
 ## Inputs and review
 
@@ -64,9 +64,12 @@ retain its resources: those actions defeat the cleanup guard. Only the helper su
 generated template with the required timeout.
 
 User data schedules a transient systemd service after `cloud-final` finishes, using `--no-block` to
-avoid a dependency deadlock. Before its first package command, it persistently masks automatic APT
-timers and services and waits at most five minutes for any existing package operation to finish; it
-never kills active apt/dpkg work. It then installs git and CA certificates before running the worker
+avoid a dependency deadlock. Before its first package command, it stops automatic APT timers, then
+persistently masks the timers and services and waits at most five minutes for any existing package
+operation to finish; it never kills active apt/dpkg work. The separate timer stop is intentional:
+systemd 255 can reload an active masked timer into `failed/resources` before `mask --now` stops it.
+Stopping timers first avoids this failure without clearing failed states or relaxing the final
+masked-and-inactive checks. It then installs git and CA certificates before running the worker
 installer, which verifies APT remains quiet. The same check runs before each benchmark. Rebuild the
 disposable AMI from a current Canonical image for security updates outside benchmark windows. After
 installation it resets cloud-init, machine identity, SSH keys, shell histories and logs. It emits a
@@ -181,7 +184,10 @@ script with `bash -n`. A real account pilot remains necessary to verify regional
 networking, boot behavior and service cleanup; unit tests do not prove those integration behaviors.
 Tests also exercise bounded progress, disconnected output, guest/installer failure diagnostics and
 readability of harness modules copied from a private checkout. The installer verifies imports as the
-unprivileged benchmark user before the image can become ready.
+unprivileged benchmark user before the image can become ready. APT tests cover active timers at
+startup, the systemd 255 mask-before-stop failure, failed timers, stop errors/timeouts and service
+draining. The timer failure and corrected ordering were also reproduced with disposable user units
+on Ubuntu systemd 255.4, without changing host APT units.
 
 - [CloudFormation CreationPolicy](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html)
 - [CreateStack timeout and rollback](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html)
