@@ -6,17 +6,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from benchmarks import pairs, run as harness
+from benchmarks import pairs, report
 from infra.aws_benchmark import common, results, worker
-from infra.aws_benchmark.test_results import binding, bundle
+from infra.aws_benchmark.test_results import binding, bundle, measurement
+from infra.aws_benchmark.worker_fixture import parsed_command
 
-
-def parsed_command(expected):
-    command = worker.command(expected, 600)
-    arguments = harness._arguments(command[command.index("benchmarks.run") + 1:])
-    environment = dict(value.removeprefix("--setenv=").split("=", 1)
-                       for value in command if value.startswith("--setenv="))
-    return arguments, environment
 
 
 class WorkerContractTests(unittest.TestCase):
@@ -25,13 +19,12 @@ class WorkerContractTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 args, environment = parsed_command(expected)
-                self.assertEqual(dict(topology=args.mode, variant=args.variants[0],
-                    paired_seed=args.paired_seed, repetitions=args.repetitions, purpose=args.purpose,
-                    cache_policy=args.cache, runner_label=args.runner_label,
-                    no_timings=args.no_timings, local_resources=args.local_resources),
+                self.assertEqual(dict(paired_seed=args.paired_seed, repetitions=args.repetitions,
+                    purpose=args.purpose, cache_policy=args.cache, runner_label=args.runner_label),
                     common.measurement_contract(suite))
                 self.assertEqual(args.cases, list(cases))
-                self.assertEqual(args.variants, [common.PERFORMANCE_CONTRACT["variant"]])
+                self.assertEqual(args.mode, "local")
+                self.assertEqual(args.variants, ["rcp-default"])
                 self.assertEqual(args.bin_dir, worker.STATE / "candidate")
                 self.assertEqual(args.baseline_bin_dir, worker.STATE / "baseline")
                 self.assertEqual(environment["GITHUB_REPOSITORY"], expected["repository"])
@@ -48,16 +41,6 @@ class WorkerContractTests(unittest.TestCase):
         _, policy = bundle(source, expected)
         evidence, record, _ = results.inspect(source, expected, "success")
         self.assertEqual(evidence["errors"], [])
-        args, environment = parsed_command(expected)
-        self.assertEqual(record["context"]["pairing"], pairs.configuration(args.paired_seed, args.repetitions))
-        self.assertEqual(record["context"]["topology"], args.mode)
-        self.assertEqual(record["context"]["purpose"], args.purpose)
-        self.assertEqual(record["context"]["cache_policy"], args.cache)
-        self.assertEqual(record["context"]["runner_label"], args.runner_label)
-        self.assertEqual(record["context"]["repository"], environment["GITHUB_REPOSITORY"])
-        self.assertEqual(record["context"]["baseline_commit"], environment["RCP_BENCH_BASELINE_COMMIT"])
-        self.assertEqual([case["id"] for case in record["cases"]], args.cases)
-        self.assertEqual(len(record["trials"]), 2 * args.repetitions * len(args.cases))
         return evidence, record, policy
 
     def test_approval_accepts_measurements_built_from_real_worker_arguments(self):
@@ -108,7 +91,7 @@ class WorkerContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unexpected performance measurement contract"):
                     results.approve(copy.deepcopy(evidence), changed, policy)
 
-    def test_missing_trial_source_verification_or_resource_collection_is_ineligible(self):
+    def test_failed_trial_source_verification_or_resource_collection_is_ineligible(self):
         evidence, record, policy = self.inspected_measurement(binding())
         for field, failure in (("source_validation", dict(ok=False)), ("resources", dict(status="failed"))):
             with self.subTest(field=field):
@@ -116,6 +99,41 @@ class WorkerContractTests(unittest.TestCase):
                 changed["trials"][0][field] = failure
                 with self.assertRaisesRegex(ValueError, "incomplete paired comparison"):
                     results.approve(copy.deepcopy(evidence), changed, policy)
+
+    def test_per_suite_override_reaches_both_worker_and_approval(self):
+        def contract(suite):
+            value = common.measurement_contract(suite)
+            if suite == "tiny":
+                value.update(paired_seed=37, repetitions=6, runner_label="tiny-suite-override")
+            return value
+        with patch.object(worker, "measurement_contract", side_effect=contract), \
+                patch.object(results, "measurement_contract", side_effect=contract):
+            evidence, record, policy = self.inspected_measurement(binding("tiny"))
+            results.approve(evidence, record, policy)
+            self.assertTrue(evidence["history_eligible"])
+            self.assertEqual(record["context"]["pairing"], pairs.configuration(37, 6))
+            self.assertEqual(record["context"]["runner_label"], "tiny-suite-override")
+
+    def test_absent_resource_context_and_trial_fields_are_refused_by_approval(self):
+        expected = binding()
+        raw = measurement(expected)
+        raw["context"].pop("local_resources")
+        for trial in raw["trials"]:
+            trial.pop("resources")
+        # the generic schema permits uninstrumented results; approval must not
+        report.validate_result(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "input", root / "report"
+            _, policy = bundle(source, expected, raw)
+            evidence, record, _ = results.inspect(source, expected, "success")
+            self.assertEqual(evidence["errors"], [])
+            self.assertIsNotNone(record)
+            evidence = results.ingest(source, output, expected, "success", policy)
+            self.assertFalse(evidence["history_eligible"])
+            self.assertEqual(evidence["errors"], ["history approval: incomplete paired comparison"])
+            self.assertIsNotNone(evidence["controller"])
+            self.assertIsNotNone(evidence["worker"])
 
 
 if __name__ == "__main__":

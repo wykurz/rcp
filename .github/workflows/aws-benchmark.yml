@@ -21,10 +21,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: aws-benchmark-single-mailbox
-  cancel-in-progress: false
-
 jobs:
   validate:
     if: github.ref == 'refs/heads/main' && vars.RCP_AWS_BENCHMARK_ENABLED == 'true'
@@ -111,6 +107,10 @@ jobs:
 
   benchmark:
     needs: build
+    # only this job uses the mailbox; report-only retries must not queue or displace paid jobs
+    concurrency:
+      group: aws-benchmark-single-mailbox
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     # includes the maximum opening lead/window, teardown, and bounded final upload
     timeout-minutes: 90
@@ -140,6 +140,9 @@ jobs:
           from pathlib import Path
           from infra.aws_benchmark.identity import environment
           binding = json.dumps(environment(), sort_keys=True, separators=(',', ':'))
+          print('RCP_AWS_PRODUCER_IDENTITY=' + binding)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print('Benchmark producer identity\n\n```json\n' + binding + '\n```\n', file=summary)
           (Path(os.environ['RUNNER_TEMP']) / 'aws-identity.json').write_text(binding, encoding='utf-8')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print('run-identity=' + binding, file=output)
@@ -186,10 +189,10 @@ jobs:
           ARTIFACT_DIGEST: ${{ steps.raw-results.outputs.artifact-digest }}
         run: |
           if [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-            printf 'Trusted raw artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
+            printf '\nTrusted raw artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
               "$ARTIFACT_ID" "$GITHUB_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf 'No trusted raw artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
+            printf '\nNo trusted raw artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
 
   report:
@@ -242,8 +245,8 @@ jobs:
           ARTIFACT_DIGEST: ${{ steps.report-results.outputs.artifact-digest }}
         run: |
           if [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-            printf 'Trusted report artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
+            printf '\nTrusted report artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
               "$ARTIFACT_ID" "$GITHUB_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf 'No trusted report artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
+            printf '\nNo trusted report artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
           fi

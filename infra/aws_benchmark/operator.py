@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import re
 
-from .common import (MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, Budget, checked_clients, error_code,
-                     get_json, group, live_instances, pending_status, put_json, require, retry_io, scheduled, timestamp, utc,
+from .common import (INSTANCE_TYPE, MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, Budget,
+                     checked_clients, error_code, get_json, group, live_instances, pending_status, put_json,
+                     require, retry_io, scheduled, timestamp, utc,
                      validate_window, verify_close, verify_group)
 
 
@@ -58,7 +59,7 @@ def inspect_closed(api, name, budget):
     require(lt["Version"].isdigit(), "launch template version must be numeric")
     data = read(lambda: ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"],
             Versions=[lt["Version"]]))["LaunchTemplateVersions"][0]["LaunchTemplateData"]
-    require(data["InstanceType"] == "c5d.24xlarge" and data["ImageId"].startswith("ami-")
+    require(data["InstanceType"] == INSTANCE_TYPE and data["ImageId"].startswith("ami-")
             and not data.get("InstanceMarketOptions") and not data.get("InstanceRequirements")
             and not data.get("DisableApiTermination"), "launch template is not a disposable fixed On-Demand VM")
     budget.left()

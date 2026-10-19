@@ -92,10 +92,9 @@ class Receipt:
             print("Controller receipt could not be updated; provenance remains incomplete.")
 
 
-def run(api, name, bucket, identity, binary_root, output, provenance=None):
-    if provenance is not None:
-        workflow_identity.validate(provenance)
-        require(all(provenance[key] == identity[key] for key in identity), "controller input identity mismatch")
+def run(api, name, bucket, provenance, binary_root, output):
+    workflow_identity.validate(provenance)
+    identity = {field: provenance[field] for field in ("run", "baseline", "candidate", "suite")}
     receipt = Receipt(output, provenance)
     try:
         _run(api, name, bucket, identity, binary_root, output, receipt)
@@ -156,11 +155,15 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
         receipt.value["cleanup"] = "not-requested"
         raise
     observation_errors = 0
-    def observe_instance():
+    def observe_instance(reserve=30):
         nonlocal observation_errors
         if receipt.value["instance"] is not None or observation_errors >= 3:
             return
-        budget.left(30)
+        try:
+            budget.left(reserve)
+        except TimeoutError:
+            # optional provenance must not replace the terminal worker outcome
+            return
         try:
             observed = live_instances(api["ec2"], name)
             if len(observed) == 1:
@@ -172,14 +175,10 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
             # empty answers can precede a slow launch; only errors consume retries
             observation_errors += 1
             print("Worker image observation unavailable; leave provenance unknown.")
-        # optional provenance reads never extend the deadline or bypass cleanup
-        budget.left(30)
     # enter the cleanup boundary before the API call, including uncertain outcomes
     try:
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)
         while True:
-            budget.left(30)
-            observe_instance()
             status = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, 30)
             require(isinstance(status, dict) and status.get("run") == identity["run"],
                     "worker status does not match this run")
@@ -189,8 +188,6 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
                 (output / "status.json").write_bytes(status_bytes)
                 receipt.value["status_sha256"] = digest(status_bytes)
                 receipt.save()
-                # terminal status can become visible before EC2's instance read
-                observe_instance()
                 require(status.get("state") == COMPLETED and isinstance(status.get("success"), bool),
                         "worker status protocol mismatch; rebuild WorkerAmiId from this revision")
                 if status.get("sha256"):
@@ -200,8 +197,12 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
                     (output / "results.zip").write_bytes(data)
                     receipt.value["archive_sha256"] = digest(data)
                     receipt.save()
+                # retrieve mandatory evidence before spending time on optional provenance
+                observe_instance()
                 require(status.get("success") is True, "worker failed; see bounded partial results")
                 return
+            # retain 30s for mandatory reads, the configured 20s request bound and the 10s poll sleep
+            observe_instance(reserve=60)
             time.sleep(10)
     finally:
         cleanup(api, name)
@@ -219,9 +220,7 @@ def main():
     parser.add_argument("--role-arn", required=True)
     args = parser.parse_args()
     provenance = workflow_identity.load(args.identity)
-    identity = {field: provenance[field] for field in ("run", "baseline", "candidate", "suite")}
-    run(oidc_clients(args.region, args.role_arn), args.asg, args.bucket, identity, args.binaries, args.output,
-        provenance=provenance)
+    run(oidc_clients(args.region, args.role_arn), args.asg, args.bucket, provenance, args.binaries, args.output)
 
 
 if __name__ == "__main__":

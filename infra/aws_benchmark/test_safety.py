@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from infra.aws_benchmark import common, controller, operator, worker
+from infra.aws_benchmark.test_results import binding
 
 
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
@@ -193,7 +194,7 @@ class ControllerTests(unittest.TestCase):
                 (root / key).parent.mkdir(exist_ok=True)
                 (root / key).write_bytes(b"binary")
             with self.assertRaisesRegex(TimeoutError, "uncertain"):
-                controller.run(cloud.api, "group", "bucket", {k: lease[k] for k in ("run", "baseline", "candidate", "suite")}, root, root / "out")
+                controller.run(cloud.api, "group", "bucket", binding(lease["suite"]), root, root / "out")
         calls = cloud.api["autoscaling"].set_desired_capacity.call_args_list
         self.assertEqual([c.kwargs["DesiredCapacity"] for c in calls], [1, 0])
 
@@ -338,7 +339,7 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.choose_disks({"blockdevices": broken})
 
-    def test_result_collector_rejects_links_and_fifos(self):
+    def test_result_collector_omits_links_and_fifos_with_manifest(self):
         for kind in ("symlink", "hardlink", "fifo"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -350,8 +351,14 @@ class WorkerTests(unittest.TestCase):
                     os.link(source, root / "link")
                 elif kind == "fifo":
                     os.mkfifo(source)
-                with self.assertRaises((OSError, ValueError)):
-                    worker.collect(root, {}, Mock())
+                result = worker.collect(root, {}, Mock())
+                with zipfile.ZipFile(io.BytesIO(result)) as archive:
+                    self.assertEqual(archive.namelist(), ["worker.json"])
+                    metadata = json.loads(archive.read("worker.json"))
+                    expected = [dict(name="benchmark/" + path.name, size=path.lstat().st_size, archived_bytes=0)
+                                for path in sorted(root.iterdir())]
+                    self.assertEqual(metadata["omitted_or_truncated"], expected)
+                    self.assertEqual(metadata["omitted_or_truncated_count"], len(expected))
 
     def test_partial_results_are_preserved_without_interpreting_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -389,12 +396,17 @@ class WorkerTests(unittest.TestCase):
             for name, content in files.items():
                 self.assertEqual(archive.read("benchmark/" + name), content)
 
-    def test_result_collector_still_rejects_excessive_nesting(self):
+    def test_result_collector_omits_excessively_nested_subtree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "results/logs/tiny-10k/rcp-default/1/extra").mkdir(parents=True)
-            with self.assertRaisesRegex(ValueError, "nesting limit"):
-                worker.collect(root, {}, Mock())
+            excessive = root / "results/logs/tiny-10k/rcp-default/1/extra"
+            excessive.mkdir(parents=True)
+            result = worker.collect(root, {}, Mock())
+            with zipfile.ZipFile(io.BytesIO(result)) as archive:
+                self.assertEqual(archive.namelist(), ["worker.json"])
+                self.assertEqual(json.loads(archive.read("worker.json"))["omitted_or_truncated"],
+                                 [dict(name="benchmark/results/logs/tiny-10k/rcp-default/1/extra",
+                                       size=excessive.stat().st_size, archived_bytes=0)])
 
     def test_untrusted_metadata_name_cannot_duplicate_trusted_entry(self):
         with tempfile.TemporaryDirectory() as directory:

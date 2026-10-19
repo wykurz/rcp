@@ -63,6 +63,8 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
+### AMI updates
+
 Changes to worker-executed code or worker-read data in `benchmarks/` (including `cases.json`) or the
 baked modules in `infra/aws_benchmark/`, `requirements.txt`, or the installer require a new AMI from
 the reviewed commit and a closed-stack update of `WorkerAmiId` before dispatch. Updating the GitHub
@@ -74,16 +76,18 @@ predecessors only deliberately and do not use an old image with a newer controll
 run-matching incompatible terminal status is saved with a protocol-mismatch diagnostic to help
 identify this case.
 
-The current reporting review changes the baked shared measurement contract in `common.py` and its
-use by `worker.py`, while preserving the exact worker command. Bake a new pinned AMI before using
-that worker revision; this PR does not rebuild or deploy one. The previous live smoke covers the
-earlier reporting/debug heads, not these later fixes. Offline-only files such as `report.py`,
+`worker.py` builds its `benchmarks.run` arguments from `measurement_contract()` in the baked
+`common.py`, which offline approval also reads. The shared contract preserves the arguments of the
+preceding inline implementation for every allowlisted suite, but running the updated worker code
+still requires a new pinned AMI under the rule above. Offline-only files such as `report.py`,
 `changes.py` and `dashboard.html` do not by themselves require an AMI rebuild.
 
 The group check accepts an absent lifecycle policy or the exact explicit default
 `RetentionTriggers.TerminateHookAbandon=terminate`, which AWS documents as
 [normal termination behavior](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RetentionTriggers.html).
 It rejects `retain` and unknown populated policy shapes; lifecycle hooks remain prohibited.
+
+### GitHub environment
 
 Create a GitHub environment named `aws-benchmark` with a required trusted reviewer and deployment
 branch rules allowing **only main**. This is required: the OIDC environment subject does not encode
@@ -121,10 +125,13 @@ python -m infra.aws_benchmark.operator \
    with eight minutes or less remaining. These floors reserve time for boot/preparation and final
    reporting, but cannot guarantee a suite completes. A late approval or delayed capacity must fail
    within the existing lease, never extend it. CI waits for the opening, checks the cutoff, uploads
-   bounded binaries, and requests desired capacity 1. It never opens the ASG maximum. Download
-   `aws-benchmark-results` afterward and inspect `status.json`, `worker.json` inside the ZIP, the
-   unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP is data; review its
-   contents before opening anything executable or HTML.
+   bounded binaries, and requests desired capacity 1. It never opens the ASG maximum. Afterward, use
+   the raw artifact ID, SHA-256 digest and direct link from the trusted `benchmark` job's summary;
+   if its upload failed or no ID appears, there is no trusted raw artifact. Never select by artifact
+   name or rely on a candidate build job's summary. Inspect `status.json`, `worker.json` inside
+   `results.zip`, the unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP
+   is data; review its contents before opening anything executable or HTML. The trusted `report` job
+   similarly identifies its report artifact; see [result reporting](RESULTS.md).
 5. Confirm the controller reports physical teardown. At the cutoff, verify all three ASG capacities
    are zero and all instances tagged for this group are terminated. Normal CI cleanup sets desired
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
@@ -132,11 +139,18 @@ python -m infra.aws_benchmark.operator \
 
 Only one trusted operator may arm this group at a time. The script refuses active capacities,
 live/terminating/stopped instances, pending schedules, and a control document whose deadline has not
-passed. For every retry, start a **fresh workflow dispatch** with a new run ID so both revisions are
-rebuilt. Do not use GitHub's **Re-run failed jobs** or reuse artifacts from a previous attempt:
-reruns can lose artifacts from successful build jobs that are not rerun. Arm the new run only after
-the previous deadline and confirmed physical teardown. Do not manually rewrite the control document
-to extend a lease.
+passed. For every new benchmark attempt, start a **fresh workflow dispatch** with a new run ID so
+both revisions are rebuilt. Do not rerun the benchmark job or reuse build artifacts from a previous
+attempt: reruns can lose artifacts from successful build jobs that are not rerun. Arm the new run
+only after the previous deadline and confirmed physical teardown. Do not manually rewrite the
+control document to extend a lease.
+
+To retry only reporting, choose **Re-run job** on the `report` job itself, including when the
+`benchmark` job also failed. Do not choose **Re-run failed jobs** or **Re-run all jobs**, which can
+rerun the benchmark. A report-only retry uses the original benchmark job's identity, conclusion and
+artifact ID, needs no window, and does not acquire the benchmark job's mailbox concurrency lock. If
+reporting never started or no trusted raw upload exists, inspect available evidence offline instead;
+retrying reporting cannot recreate missing worker evidence.
 
 The operator needs the following account permissions; none of these operator mutation permissions
 belong to CI:

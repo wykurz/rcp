@@ -209,7 +209,7 @@ class ChangeTests(unittest.TestCase):
                 # the standalone page has trusted theme code in its head; metadata lives in the body
                 source = source.split('<body>', 1)[-1]
                 parsed = Fragment(source)
-                self.assertIn(value, [parsed.text(node) for node in parsed.elements("code")])
+                self.assertIn(value.replace("\n", r"\n"), [parsed.text(node) for node in parsed.elements("code")])
                 for tag in ("script", "em", "strong", "del"):
                     self.assertFalse(parsed.elements(tag))
                 self.assertTrue(all("example.com" not in node["attrs"]["href"] for node in parsed.elements("a")))
