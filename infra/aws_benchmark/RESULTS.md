@@ -9,14 +9,25 @@ Pages jobs while AWS coverage is evaluated separately.
 
 The trusted controller uploads `aws-benchmark-results`: `status.json`, `results.zip` when available,
 and a separate `controller.json` receipt. A fresh GitHub-hosted job downloads the exact artifact ID
-returned by that upload step, validates it, adds a job summary and uploads `aws-benchmark-report`.
-Both result artifacts have 90-day retention, subject to the repository's retention limit. Build
-artifacts remain at one day; the S3 mailbox remains at seven days. No new persistent AWS storage is
-created. Cancellation can prevent the controller upload or report job from running; these are
-best-effort diagnostics, not the shutdown safety boundary.
+returned by that upload step, validates it, adds a job summary and uploads
+`aws-benchmark-report-<reporting-attempt>`. Both result artifacts have 90-day retention, subject to
+the repository's retention limit. Build artifacts remain at one day; the S3 mailbox remains at seven
+days. No new persistent AWS storage is created. Cancellation can prevent the controller upload or
+report job from running; these are best-effort diagnostics, not the shutdown safety boundary.
 
-Download the report and open `index.html` locally. Its `dashboard/index.html` is the existing
-standalone measurement dashboard. The directory also contains:
+Use the artifact ID, SHA-256 digest and direct download link from the trusted `report` job's
+summary, then open `index.html` locally. The trusted `benchmark` job similarly identifies its raw
+upload. Check that job's upload succeeded; an absent ID means no trusted upload exists. Do not
+select an artifact by name, or use a candidate build job's summary as the authority. Candidate code
+can create a colliding name before a trusted upload; that collision can leave a forged named
+artifact alongside a failed trusted upload. Names, including the reporting-attempt suffix, establish
+no provenance. The suffix only lets report-only retries upload without colliding with prior reports.
+
+The report consumes the original benchmark producer's identity output. A report-only rerun therefore
+still identifies the original worker attempt, even when its own GitHub run-attempt number increases.
+This does not authorize rerunning a build or benchmark job, reopening a window or launching a
+worker. Its `dashboard/index.html` is the existing standalone measurement dashboard. The directory
+also contains:
 
 - `raw/`: byte-for-byte copies of the bounded input files, without extracting `results.zip`.
 - `provenance.json`: validation status, producer conclusion, controller/worker observations and
@@ -26,25 +37,29 @@ standalone measurement dashboard. The directory also contains:
 - `derived.json`: a separate validated dashboard record, when measurement data is available. Its
   deterministic AWS run identity replaces the worker UUID only in this derived copy; the original
   UUID and revision remain in provenance. Diagnostic records have purpose `diagnostic`, excluding
-  them from performance trends and historical change comparisons.
+  them from performance trends and historical change comparisons. Candidate-supplied revision roles
+  are discarded from diagnostic copies; the unchanged raw revision remains in provenance.
 
 Missing, malformed, oversize or digest-mismatched input produces a diagnostic report and a failed
-ingestion step. Available bounded raw files are retained. Oversize or special files are not copied.
-Worker failure can still produce a valid partial dashboard; it never implies a successful
-comparison. Producer cancellation overrides any apparently successful worker record for history
-eligibility. Unknown observations remain unknown.
+ingestion step. Available bounded raw files are retained. A valid controller receipt is recorded
+independently of missing status/archive files, preserving observed image and cleanup information on
+failure paths. After structural archive and digest validation, supervisor metadata remains available
+even when candidate-owned member names or measurement JSON exceed the reporting policy. Oversize or
+special files are not copied. Worker failure can still produce a valid partial dashboard; it never
+implies a successful comparison. Producer cancellation overrides any apparently successful worker
+record for history eligibility. Unknown observations remain unknown.
 
 ## Provenance and trust
 
 These revisions have different meanings:
 
-| Field                            | Source and meaning                                                                                                                                                  |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Candidate and baseline           | Pinned dispatch inputs, bound to the controller request and its binary hashes. They identify the requested builds.                                                  |
-| Controller and workflow SHA      | GitHub's exact dispatch checkout/workflow identity. Admission requires literal `refs/heads/main`, the expected repository/workflow, and `workflow_dispatch`.        |
-| Controller observed AMI          | `ImageId` and instance type observed through the already permitted `ec2:DescribeInstances`. At most three bounded observation attempts; missing data is null.       |
-| Supervisor reported baked source | `worker.json.harness_revision`, read by the root supervisor from the baked `revision.txt`. This is not an independently queried EC2 image tag or the candidate SHA. |
-| Raw harness checkout             | The unchanged measurement record's `revision`. The baked tree normally has no `.git`, so this is null. It must not be relabeled as the candidate.                   |
+| Field                            | Source and meaning                                                                                                                                                                                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Candidate and baseline           | Pinned dispatch inputs, bound to the controller request and its binary hashes. They identify the requested builds.                                                                                                                                       |
+| Controller and workflow SHA      | GitHub's exact dispatch checkout/workflow identity. Admission requires literal `refs/heads/main`, the expected repository/workflow, and `workflow_dispatch`.                                                                                             |
+| Controller observed AMI          | `ImageId` and instance type observed through the already permitted `ec2:DescribeInstances`. Empty observations retry within the existing deadline; three read errors cap optional reads, with a final terminal-status observation. Missing data is null. |
+| Supervisor reported baked source | `worker.json.harness_revision`, read by the root supervisor from the baked `revision.txt`. This is not an independently queried EC2 image tag or the candidate SHA.                                                                                      |
+| Raw harness checkout             | The unchanged measurement record's `revision`. The baked tree normally has no `.git`, so this is null. It must not be relabeled as the candidate.                                                                                                        |
 
 The receipt also records the operator window, binary request hashes, downloaded status/archive
 hashes, controller outcome and cleanup verification. It is written before launch and updated on
@@ -55,20 +70,28 @@ and termination remains asynchronous; the report makes no exact billing-cap clai
 The parser accepts only the worker's single-disk, stored, comment-free ZIP format. It checks the
 central directory count before allocating ZIP entries: at most 1001 members and 64 MiB total archive
 and expanded data. It rejects ZIP64/extra fields, encryption, overlap, hidden/trailing records,
-duplicates, non-ASCII or unsafe paths, symlinks/special files and CRC failures. It never extracts or
-executes a member. Worker/status/receipt JSON is at most 1 MiB; measurement JSON is at most 8 MiB.
-Strict JSON rejects duplicate keys/nonfinite numbers and limits depth to 40, nodes to 100000 and
-strings to 16384 characters. Measurement collections are bounded to 16 cases, 16 variants, 512
-trials and 256 summaries before the existing schema/proof validation runs. These are protocol
-limits, comfortably above the currently allowlisted one-case suites.
+duplicate exact paths, traversal paths, symlinks/special files and CRC failures. Non-ASCII/control
+characters, colons, case-only aliases and reporting name limits in candidate-owned `benchmark/`
+members make measurements unavailable while preserving validated `worker.json` and member hashes. It
+never extracts or executes a member. Worker/status/receipt JSON is at most 1 MiB; measurement JSON
+is at most 8 MiB. An oversized measurement also preserves supervisor evidence; malformed archive
+structure remains fatal. Strict JSON rejects duplicate keys/nonfinite numbers and limits depth to
+40, nodes to 100000 and strings to 16384 characters. Measurement collections are bounded to 16
+cases, 16 variants, 512 trials and 256 summaries before the existing schema/proof validation runs.
+These are offline reporting limits, comfortably above the currently allowlisted one-case suites.
+Diagnostics preserve fixed, stage-specific parser reasons; errors from generic parsers never echo
+untrusted input. Invalid trusted identities/conclusions are rejected before creating an output
+directory. Generated summaries use HTML table cells with escaped text and visible control escapes;
+the landing page embeds the same fragment without decoding it again.
 
 Candidate binaries share the unprivileged harness UID and can forge candidate-owned measurement
 files. Hashes and validation establish integrity and traceability, **not honest-measurement
 attestation**. Root supervisor metadata and controller observations are separate evidence. The
 controller never parses the ZIP and the report job has only `contents: read`: no protected
 environment, OIDC, AWS credentials, history write token, candidate checkout or candidate execution.
-Candidate artifact-name collisions fail closed; there is no fallback to names, newest artifacts,
-another workflow run or caller-supplied artifact IDs.
+The report input is bound to the trusted producer upload ID and fails closed on input substitution;
+there is no fallback to names, newest artifacts, another workflow run or caller-supplied artifact
+IDs.
 
 The cost boundary remains manual dispatch, reviewed exact main, the protected environment, explicit
 operator arming and independently scheduled closure. Reporting introduces no paid-launch trigger,
@@ -80,9 +103,14 @@ coordinated permission decision; this change neither edits nor relies on that ex
 
 ## Offline ingestion and future history staging
 
-No extra AWS information, credentials, account changes or AMI rebuild are needed for this reporting
-change. The existing setup checklist remains authoritative for a future live benchmark. To inspect
-downloaded evidence offline, supply the independently verified identity from the validation job's
+No extra AWS information, credentials or account changes are needed for offline reporting. This
+review revision consolidates the worker command and offline approval contract in baked
+`common.py`/`worker.py`. Their emitted benchmark arguments are unchanged, but deploying that worker
+revision requires a separately approved AMI rebuild. No rebuild or paid run is performed here. The
+earlier live reporting smoke tested reporting head `6167f266` through debug integration `a4a20d02`;
+it does not validate these later fixes. Their evidence is offline regression tests and CI. The
+existing setup checklist remains authoritative for a future live benchmark. To inspect downloaded
+evidence offline, supply the independently verified identity from the validation job's
 `RCP_AWS_RUN_IDENTITY` line, and the producer job's actual conclusion:
 
 ```bash

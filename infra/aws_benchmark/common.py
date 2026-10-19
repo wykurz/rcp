@@ -29,6 +29,20 @@ SUITES = {"aa-smoke": ("tiny-10k",), "tiny": ("tiny-1m",),
           "medium": ("medium-128k",), "large": ("large-120",), "deep": ("deep-20x80",)}
 
 
+# the baked worker and offline approval must describe the same measurement
+PERFORMANCE_CONTRACT = dict(topology="local", variant="rcp-default", paired_seed=0, repetitions=4,
+    purpose="performance", cache_policy="linux-drop-caches", runner_label="aws-c5d24-ext4-isolated-v1",
+    no_timings=True, local_resources=True)
+
+
+def measurement_contract(suite):
+    require(suite in SUITES, "suite is not allowlisted")
+    contract = PERFORMANCE_CONTRACT.copy()
+    if suite == "aa-smoke":
+        contract.update(repetitions=2, purpose="smoke", cache_policy="source-warm")
+    return contract
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)

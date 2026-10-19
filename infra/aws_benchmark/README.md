@@ -63,15 +63,22 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
-Changes to worker-executed code in `benchmarks/` or the baked modules in `infra/aws_benchmark/`,
-`requirements.txt`, or the installer require a new AMI from the reviewed commit and a closed-stack
-update of `WorkerAmiId` before dispatch. Updating the GitHub checkout does not update the baked
-harness or supervisor. A change confined to operator/controller checks, such as `verify_group` in
-`common.py`, or offline reporting does not require an image rebuild when worker behavior and the
-mailbox protocol are unchanged. Record the actual image source SHA and AMI together, even when the
-controller revision differs; retain predecessors only deliberately and do not use an old image with
-a newer controller protocol. A run-matching incompatible terminal status is saved with a
-protocol-mismatch diagnostic to help identify this case.
+Changes to worker-executed code or worker-read data in `benchmarks/` (including `cases.json`) or the
+baked modules in `infra/aws_benchmark/`, `requirements.txt`, or the installer require a new AMI from
+the reviewed commit and a closed-stack update of `WorkerAmiId` before dispatch. Updating the GitHub
+checkout does not update the baked harness or supervisor. A change confined to operator/controller
+checks, such as `verify_group` in `common.py`, or offline reporting does not require an image
+rebuild when worker behavior, worker-read data and the mailbox protocol are unchanged. Record the
+actual image source SHA and AMI together, even when the controller revision differs; retain
+predecessors only deliberately and do not use an old image with a newer controller protocol. A
+run-matching incompatible terminal status is saved with a protocol-mismatch diagnostic to help
+identify this case.
+
+The current reporting review changes the baked shared measurement contract in `common.py` and its
+use by `worker.py`, while preserving the exact worker command. Bake a new pinned AMI before using
+that worker revision; this PR does not rebuild or deploy one. The previous live smoke covers the
+earlier reporting/debug heads, not these later fixes. Offline-only files such as `report.py`,
+`changes.py` and `dashboard.html` do not by themselves require an AMI rebuild.
 
 The group check accepts an absent lifecycle policy or the exact explicit default
 `RetentionTriggers.TerminateHookAbandon=terminate`, which AWS documents as

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -130,10 +131,11 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_reporting_download_is_bound_to_trusted_producer_id_without_publication(self):
         jobs = self.workflow["jobs"]
         self.assertEqual(jobs["benchmark"]["outputs"],
-                         {"result-artifact-id": "${{ steps.raw-results.outputs.artifact-id }}"})
+                         {"run-identity": "${{ steps.identity.outputs.run-identity }}",
+                          "result-artifact-id": "${{ steps.raw-results.outputs.artifact-id }}"})
         job = jobs["report"]
         self.assertEqual(job["needs"], ["validate", "benchmark"])
-        self.assertEqual(job["if"], "always() && needs.validate.result == 'success' && needs.benchmark.outputs.result-artifact-id != ''")
+        self.assertEqual(job["if"], "always() && needs.validate.result == 'success' && needs.benchmark.outputs.result-artifact-id != '' && needs.benchmark.outputs.run-identity != ''")
         downloads = [step for step in job["steps"] if step.get("uses", "").startswith("actions/download-artifact@")]
         self.assertEqual([step["with"] for step in downloads], [{
             "artifact-ids": "${{ needs.benchmark.outputs.result-artifact-id }}", "path": "${{ runner.temp }}/aws-raw"}])
@@ -145,6 +147,122 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         self.assertEqual([step["with"]["retention-days"] for step in job["steps"]
                           if step.get("uses", "").startswith("actions/upload-artifact@")], ["90"])
+
+
+    def producer(self, root):
+        steps = self.workflow["jobs"]["benchmark"]["steps"]
+        step = next(step for step in steps if step.get("id") == "identity")
+        self.assertLess(steps.index(step), next(index for index, item in enumerate(steps)
+                        if item.get("uses", "").startswith("actions/download-artifact@")))
+        lines = step["run"].splitlines()
+        self.assertEqual((lines[0], lines[-1]), ("python3 - <<'PY'", "PY"))
+        env = dict(GITHUB_REF=identity.REF, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                   GITHUB_SHA="c" * 40, GITHUB_REPOSITORY=identity.REPOSITORY,
+                   GITHUB_WORKFLOW_REF=identity.WORKFLOW, GITHUB_WORKFLOW_SHA="c" * 40,
+                   BASELINE="a" * 40, CANDIDATE="a" * 40, SUITE="aa-smoke",
+                   GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_OUTPUT=str(root / "output"),
+                   RUNNER_TEMP=str(root))
+        with patch.dict(os.environ, env), patch.object(identity, "environment", wraps=identity.environment) as read:
+            exec(compile("\n".join(lines[1:-1]), "producer identity step", "exec"), {})
+            read.assert_called_once_with()
+        name, encoded = (root / "output").read_text().strip().split("=", 1)
+        self.assertEqual(name, "run-identity")
+        self.assertEqual((root / "aws-identity.json").read_text(), encoded)
+        return env, encoded
+
+    def test_controller_receives_the_producer_identity_file_without_duplicate_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, encoded = self.producer(root)
+            binding = identity.load(root / "aws-identity.json")
+            self.assertEqual(binding, json.loads(encoded))
+            self.assertEqual(binding["run"], "123-1")
+        step = next(step for step in self.workflow["jobs"]["benchmark"]["steps"]
+                    if step.get("name") == "Run within the operator window and verify teardown")
+        self.assertIn('--identity "$RUNNER_TEMP/aws-identity.json"', step["run"])
+        for field in ("run", "baseline", "candidate", "suite"):
+            self.assertNotIn("--" + field + " ", step["run"])
+            self.assertNotIn(field.upper(), step["env"])
+
+    def test_report_only_retry_keeps_original_producer_attempt_and_raw_evidence(self):
+        from infra.aws_benchmark.test_results import bundle
+        step = next(step for step in self.workflow["jobs"]["report"]["steps"]
+                    if step.get("name") == "Validate bounded evidence and render diagnostic report")
+        self.assertEqual(step["env"], {
+            "PRODUCER_IDENTITY": "${{ needs.benchmark.outputs.run-identity }}",
+            "PRODUCER_CONCLUSION": "${{ needs.benchmark.result }}"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env, encoded = self.producer(root)
+            expected = json.loads(encoded)
+            bundle(root / "aws-raw", expected)
+            before = {path.name: path.read_bytes() for path in (root / "aws-raw").iterdir()}
+            retry = dict(os.environ, **env)
+            retry.update(GITHUB_RUN_ATTEMPT="2", BASELINE="d" * 40, CANDIDATE="e" * 40,
+                         PRODUCER_IDENTITY=encoded, PRODUCER_CONCLUSION="success",
+                         PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"])
+            completed = subprocess.run(["bash", "-e", "-c", step["run"]], env=retry,
+                                       capture_output=True, text=True, timeout=20)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            report = root / "aws-report"
+            provenance = json.loads((report / "provenance.json").read_text())
+            self.assertEqual(provenance["identity"], expected)
+            self.assertEqual(provenance["errors"], [])
+            self.assertTrue((report / "dashboard/index.html").is_file())
+            for name, data in before.items():
+                self.assertEqual((root / "aws-raw" / name).read_bytes(), data)
+                self.assertEqual((report / "raw" / name).read_bytes(), data)
+        upload = next(step for step in self.workflow["jobs"]["report"]["steps"]
+                      if step.get("id") == "report-results")
+        name = upload["with"]["name"]
+        self.assertIn("${{ github.run_attempt }}", name)
+        self.assertNotEqual(name.replace("${{ github.run_attempt }}", "1"),
+                            name.replace("${{ github.run_attempt }}", "2"))
+        self.assertNotIn("overwrite", upload["with"])
+
+    def test_identity_file_rejects_oversize_duplicate_keys_and_other_attempt_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, encoded = self.producer(root)
+            path = root / "aws-identity.json"
+            for payload, message in (
+                    (" " * 4097, "exceeds its size limit"),
+                    (encoded[:-1] + ',"run":"123-2"}', "duplicate JSON key"),
+                    (encoded.replace("/attempts/1", "/attempts/2"), "run URL does not match"),
+                    (encoded.replace("refs/heads/main", "refs/heads/other"), "not the exact approved main branch")):
+                with self.subTest(message=message):
+                    path.write_text(payload)
+                    with self.assertRaisesRegex(ValueError, message):
+                        identity.load(path)
+
+    def test_trusted_upload_summaries_bind_ids_and_digests_and_warn_on_missing_upload(self):
+        for job_name, producer, label in (("benchmark", "raw-results", "raw"),
+                                         ("report", "report-results", "report")):
+            steps = self.workflow["jobs"][job_name]["steps"]
+            upload = next(step for step in steps if step.get("id") == producer)
+            summary = next(step for step in steps if step.get("name") == "Identify the trusted " + label + " artifact")
+            self.assertGreater(steps.index(summary), steps.index(upload))
+            self.assertEqual(summary["if"], "always()")
+            self.assertEqual(summary["env"], {
+                "ARTIFACT_ID": "${{ steps." + producer + ".outputs.artifact-id }}",
+                "ARTIFACT_DIGEST": "${{ steps." + producer + ".outputs.artifact-digest }}"})
+            for artifact_id, digest, valid in (("456", "a" * 64, True), ("", "", False),
+                    ("456", "", False), ("", "a" * 64, False), ("456", "forged", False),
+                    ("456\n::notice::forged", "a" * 64, False)):
+                with self.subTest(job=job_name, artifact_id=artifact_id), tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "summary.md"
+                    env = dict(os.environ, GITHUB_RUN_ID="123", GITHUB_STEP_SUMMARY=str(output),
+                               ARTIFACT_ID=artifact_id, ARTIFACT_DIGEST=digest)
+                    completed = subprocess.run(["bash", "-e", "-c", summary["run"]], env=env,
+                                               capture_output=True, text=True, timeout=5)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    text = output.read_text()
+                    if valid:
+                        self.assertIn("[ID 456](https://github.com/wykurz/rcp/actions/runs/123/artifacts/456)", text)
+                        self.assertIn("SHA-256: `" + digest + "`", text)
+                    else:
+                        self.assertEqual(text, "No trusted " + label + " artifact was uploaded. "
+                                              "Do not select an artifact by name.\n")
 
 
 if __name__ == "__main__":
