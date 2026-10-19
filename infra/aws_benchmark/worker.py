@@ -19,7 +19,7 @@ import threading
 import zipfile
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
-                     completed_status, digest, error_code, get_bytes, get_json, put_json, require, retry_io,
+                     completed_status, digest, error_code, get_bytes, get_json, measurement_contract, put_json, require, retry_io,
                      timestamp, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
@@ -107,6 +107,7 @@ def cache_server(budget, uid):
 
 
 def command(window, seconds):
+    contract = measurement_contract(window["suite"])
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -128,12 +129,12 @@ def command(window, seconds):
              "--setenv=RCP_BENCH_BASELINE_COMMIT=" + window["baseline"],
              "--setenv=GITHUB_REPOSITORY=wykurz/rcp", "/usr/bin/python3", "-m", "benchmarks.run",
              "--bin-dir", str(STATE / "candidate"), "--baseline-bin-dir", str(STATE / "baseline"),
-             "--mode", "local", "--variant", "rcp-default", "--paired-seed", "0",
-             "--repetitions", "2" if window["suite"] == "aa-smoke" else "4",
-             "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
-             "--purpose", "smoke" if window["suite"] == "aa-smoke" else "performance",
-             "--cache", "source-warm" if window["suite"] == "aa-smoke" else "linux-drop-caches",
-             "--timeout", "600", "--runner-label", "aws-c5d24-ext4-isolated-v1",
+             "--mode", contract["topology"], "--variant", contract["variant"],
+             "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
+             *(["--no-timings"] if contract["no_timings"] else []),
+             *(["--local-resources", "--resource-time", "/usr/bin/time"] if contract["local_resources"] else []),
+             "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
+             "--timeout", "600", "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
              "--source-storage-id", "c5d-local-ext4-source", "--destination-storage-id", "c5d-local-ext4-destination",
              "--output", str(DATA / "output" / "results")]

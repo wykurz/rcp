@@ -432,7 +432,7 @@ class PolicyTests(unittest.TestCase):
         import yaml
         path = Path(__file__).resolve().parents[2] / ".github/workflows/aws-benchmark.yml"
         job = yaml.safe_load(path.read_text())["jobs"]["benchmark"]
-        upload = job["steps"][-1]["timeout-minutes"]
+        upload = next(step for step in job["steps"] if step.get("id") == "raw-results")["timeout-minutes"]
         # Opening may be five minutes ahead; cleanup allows ten minutes. Leave
         # five additional minutes of runner margin beyond the bounded upload.
         required = 5 + common.MAX_WINDOW // 60 + 10 + upload + 5

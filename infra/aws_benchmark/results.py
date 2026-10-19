@@ -16,7 +16,7 @@ import zipfile
 from benchmarks import operations, pairs, report
 from benchmarks.strict_json import parse_json
 from . import identity
-from .common import (MAX_RESULT, SUITES, digest, require, utc,
+from .common import (MAX_RESULT, SUITES, PERFORMANCE_CONTRACT, digest, utc,
                      validate_request, validate_window)
 
 
@@ -25,6 +25,20 @@ MAX_JSON = 8 * 1024 * 1024
 MAX_ENTRIES = 1001
 RESULT = "benchmark/results/results.json"
 SERIES_CONTRACT = "aws-local-ext4-v1"
+
+
+class ValidationError(ValueError):
+    """A diagnostic whose text is a fixed message owned by this parser."""
+
+
+def require(condition, message):
+    if not condition:
+        raise ValidationError(message)
+
+
+def diagnostic(error):
+    # generic parsers may echo candidate-controlled input; only our constants are safe
+    return str(error) if isinstance(error, ValidationError) else type(error).__name__
 
 
 def encoded(value):
@@ -93,31 +107,39 @@ def members(data):
         require(data[offset:offset + 4] == b"PK\x01\x02" and offset + 46 <= len(data) - 22,
                 "invalid central record")
         name_size, extra_size, comment_size = struct.unpack_from("<3H", data, offset + 28)
-        require(0 < name_size <= 1200 and extra_size == comment_size == 0,
+        require(name_size > 0 and extra_size == comment_size == 0,
                 "unsupported ZIP extra fields or comments")
         require(10 <= struct.unpack_from("<H", data, offset + 6)[0] <= 20
                 and struct.unpack_from("<H", data, offset + 34)[0] == 0, "unsupported ZIP version or volume")
         offset += 46 + name_size
     require(offset == len(data) - 22, "archive entry count mismatch")
-    selected, hashes, seen, total, next_header = {}, {}, set(), 0, 0
+    # ZipFile honors this locator even when a central name absorbed its bytes
+    require(data[-42:-38] != b"PK\x06\x07", "unsupported ZIP64 records")
+    selected, hashes, seen, folded, issues, total, next_header = {}, {}, set(), set(), [], 0, 0
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         require(len(archive.infolist()) == end[4], "archive entry count mismatch")
         for member in archive.infolist():
             name = member.filename
             parts = name.split("/")
-            require(name == member.orig_filename and name.isascii()
-                    and all(32 <= ord(char) < 127 and char not in "\\:" for char in name)
-                    and all(part not in ("", ".", "..") and len(part) <= 200 for part in parts)
-                    and len(parts) <= 7 and name.casefold() not in seen
-                    and (name == "worker.json" or parts[0] == "benchmark"), "unsafe or duplicate member name")
-            seen.add(name.casefold())
+            require(name == member.orig_filename and "\\" not in name
+                    and all(part not in ("", ".", "..") for part in parts)
+                    and name not in seen and (name == "worker.json" or parts[0] == "benchmark"),
+                    "unsafe or duplicate archive path")
+            seen.add(name)
+            # candidate-owned names can make measurements unavailable, never erase worker.json
+            if (not name.isascii() or not all(32 <= ord(char) < 127 and char != ":" for char in name)
+                    or any(len(part) > 200 for part in parts) or len(parts) > 7
+                    or len(name.encode("utf-8")) > 1200 or name.casefold() in folded):
+                if "unsupported benchmark member names" not in issues:
+                    issues.append("unsupported benchmark member names")
+            folded.add(name.casefold())
             mode = member.external_attr >> 16
             require(not member.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG)
                     and not member.external_attr & 16 and member.flag_bits in (0, 0x800)
                     and member.compress_type == zipfile.ZIP_STORED
                     and member.compress_size == member.file_size, "unsupported member type or encoding")
             total += member.file_size
-            limit = MAX_METADATA if name == "worker.json" else MAX_JSON if name == RESULT else MAX_RESULT
+            limit = MAX_METADATA if name == "worker.json" else MAX_RESULT
             require(member.file_size <= limit and total <= MAX_RESULT, "archive expansion exceeds limit")
             # require contiguous local records: no prefix, overlaps, descriptors or hidden payloads
             require(member.header_offset == next_header and data[next_header:next_header + 4] == b"PK\x03\x04",
@@ -133,10 +155,12 @@ def members(data):
                 body = stream.read(limit + 1)
                 require(len(body) == member.file_size, "member size mismatch")
             hashes[name] = digest(body)
-            if name in ("worker.json", RESULT):
+            if name == RESULT and member.file_size > MAX_JSON:
+                issues.append("measurement JSON exceeds reporting byte limit")
+            elif name in ("worker.json", RESULT):
                 selected[name] = body
     require(next_header == end[6] and "worker.json" in selected, "missing worker metadata or extra data")
-    return selected, hashes
+    return selected, hashes, issues
 
 
 def inspect(source, expected, conclusion):
@@ -152,10 +176,11 @@ def inspect(source, expected, conclusion):
             snapshots[name] = read_file(source / name, limit)
             evidence["files"][name] = digest(snapshots[name])
         except (OSError, ValueError) as error:
-            evidence["errors"].append(name + ": " + type(error).__name__)
+            evidence["errors"].append(name + ": " + diagnostic(error))
     result = None
+    stage = "controller receipt"
     try:
-        require(set(snapshots) == {"controller.json", "status.json", "results.zip"}, "incomplete result bundle")
+        require("controller.json" in snapshots, "controller receipt unavailable")
         receipt = json_value(snapshots["controller.json"])
         require(isinstance(receipt, dict) and type(receipt.get("schema_version")) is int
                 and receipt["schema_version"] == 1 and receipt["identity"] == expected, "controller identity mismatch")
@@ -166,24 +191,33 @@ def inspect(source, expected, conclusion):
         require(receipt.get("outcome") in ("incomplete", "success", "failure")
                 and receipt.get("cleanup") in ("not-requested", "unconfirmed", "verified"), "invalid controller outcome")
         evidence["controller"] = receipt
+        require(set(snapshots) == {"controller.json", "status.json", "results.zip"}, "incomplete result bundle")
+        stage = "controller window/request"
         window, request = receipt["window"], receipt["request"]
         validate_window(window, now=utc(window["opens"]))
         require(all(window[key] == expected[key] for key in ("run", "baseline", "candidate", "suite")),
                 "window identity mismatch")
         validate_request(request, window)
+        stage = "terminal status"
         status = json_value(snapshots["status.json"])
         require(status["run"] == expected["run"] and status["state"] == "completed"
                 and type(status["success"]) is bool, "invalid terminal status")
         require(status["sha256"] == evidence["files"]["results.zip"] == receipt["archive_sha256"]
                 and receipt["status_sha256"] == evidence["files"]["status.json"], "bundle digest mismatch")
-        contents, evidence["members"] = members(snapshots["results.zip"])
+        stage = "worker archive"
+        contents, evidence["members"], issues = members(snapshots["results.zip"])
+        stage = "worker metadata"
         worker = json_value(contents["worker.json"])
         require(isinstance(worker, dict), "invalid worker metadata")
-        evidence["worker"] = worker
         require(worker["window"] == window, "worker window mismatch")
         require(worker.get("request", request) == request, "worker binary request mismatch")
         require(worker["status"] == {key: value for key, value in status.items() if key != "sha256"},
                 "worker status mismatch")
+        evidence["worker"] = worker
+        if issues:
+            evidence["errors"].extend(issues)
+            return evidence, None, snapshots
+        stage = "measurement record"
         if RESULT in contents:
             value = json_value(contents[RESULT], MAX_JSON)
             require(isinstance(value, dict) and all(isinstance(value.get(key), list) and len(value[key]) <= limit
@@ -195,7 +229,7 @@ def inspect(source, expected, conclusion):
             evidence["errors"].append("harness result unavailable")
     except Exception as error:
         # format/parser failures always leave diagnostics; never echo arbitrary worker strings
-        evidence["errors"].append("bundle validation: " + type(error).__name__)
+        evidence["errors"].append(stage + ": " + diagnostic(error))
         result = None
     return evidence, result, snapshots
 
@@ -221,14 +255,14 @@ def approve(evidence, result, policy):
     require(worker["status"]["success"] is True and worker.get("service_returncode") == 0
             and worker.get("admission", {}).get("accepted") is True
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
-    require(result["status"] == "complete" and result["context"].get("purpose") == "performance"
+    require(result["status"] == "complete" and result["context"].get("purpose") == PERFORMANCE_CONTRACT["purpose"]
             and result["context"].get("repository") == expected["repository"]
             and result["context"].get("baseline_commit") == expected["baseline"]
-            and result["context"].get("topology") == "local"
-            and result["context"].get("cache_policy") == "linux-drop-caches"
+            and result["context"].get("topology") == PERFORMANCE_CONTRACT["topology"]
+            and result["context"].get("cache_policy") == PERFORMANCE_CONTRACT["cache_policy"]
             and result["context"].get("operation_contract_revision") == operations.CONTRACT_REVISION
-            and result["context"].get("pairing") == pairs.configuration(0, 4)
-            and result["context"].get("runner_label") == "aws-c5d24-ext4-isolated-v1"
+            and result["context"].get("pairing") == pairs.configuration(PERFORMANCE_CONTRACT["paired_seed"], PERFORMANCE_CONTRACT["repetitions"])
+            and result["context"].get("runner_label") == PERFORMANCE_CONTRACT["runner_label"]
             and [case["id"] for case in result["cases"]] == list(SUITES[expected["suite"]]),
             "unexpected performance measurement contract")
     for tool, key in (("rcp", "candidate/rcp"), ("rcpd", "candidate/rcpd"), ("filegen", "candidate/filegen"),
@@ -236,7 +270,7 @@ def approve(evidence, result, policy):
         require(result["tools"].get(tool, {}).get("sha256") == receipt["request"]["sha256"][key],
                 "measured tool does not match approved binary digest")
     require({variant["id"] for variant in result["variants"]} == {"rcp-default", "rcp-baseline"}
-            and len(result["trials"]) == 8 * len(result["cases"])
+            and len(result["trials"]) == 2 * PERFORMANCE_CONTRACT["repetitions"] * len(result["cases"])
             and all(trial["status"] == "ok" and trial["validation"].get("ok") is True
                     and trial.get("source_validation", {}).get("ok") is True
                     and trial.get("resources", {}).get("status") == "complete"
@@ -254,6 +288,8 @@ def derived_record(evidence, raw):
     if eligible:
         result["revision"] = {"commit": expected["candidate"], "branch": None, "dirty": False,
                               "role": "approved candidate"}
+    else:
+        result["revision"] = {key: raw["revision"].get(key) for key in ("commit", "branch", "dirty")}
     result["context"].update(repository=expected["repository"], run_url=expected["run_url"],
                             purpose="performance" if eligible else "diagnostic")
     worker, controller = evidence["worker"], evidence["controller"]
@@ -294,18 +330,23 @@ def stage_history(record, destination):
 
 
 def literal(value):
-    # numeric entities cannot introduce Markdown, HTML or workflow command syntax
-    return "".join(char if char.isascii() and (char.isalnum() or char == " ") else f"&#{ord(char)};"
-                   for char in str(value)[:200])
+    # render controls visibly and keep untrusted text inside its HTML table cell
+    value = "".join(char if char.isprintable() else ascii(char)[1:-1] for char in str(value)[:200])
+    return "<code>" + html.escape(value) + "</code>"
+
+
+def table(headers, rows):
+    return "<table>\n<thead><tr>" + "".join("<th>" + html.escape(label) + "</th>" for label in headers) + "</tr></thead>\n<tbody>\n" + "\n".join(
+        "<tr>" + "".join("<td>" + literal(value) + "</td>" for value in row) + "</tr>" for row in rows) + "\n</tbody></table>"
 
 
 def summary(evidence, result):
     expected = evidence["identity"]
     worker, controller = evidence["worker"] or {}, evidence["controller"] or {}
     instance = controller.get("instance") or {}
-    lines = ["# AWS benchmark result", "", f"[Workflow attempt]({expected['run_url']})", "",
-             "History: " + ("approved for offline staging" if evidence["history_eligible"] else "diagnostic only; not published"), "",
-             "| Provenance | Value |", "| --- | --- |"]
+    lines = ['<h1>AWS benchmark result</h1>',
+             '<p><a href="' + html.escape(expected['run_url'], quote=True) + '">Workflow attempt</a></p>',
+             '<p>History: ' + ("approved for offline staging" if evidence["history_eligible"] else "diagnostic only; not published") + '</p>']
     fields = {"Run": expected["run"], "Producer conclusion": evidence["producer_conclusion"],
         "Suite": expected["suite"], "Candidate": expected["candidate"], "Baseline": expected["baseline"],
         "Controller": expected["controller"], "Controller observed AMI": instance.get("image_id", "unknown"),
@@ -313,19 +354,21 @@ def summary(evidence, result):
         "Raw harness checkout": (evidence["raw_revision"] or {}).get("commit") or "unknown",
         "Controller cleanup": controller.get("cleanup", "unknown"),
         "Archive SHA256": evidence["files"].get("results.zip", "unavailable")}
-    lines += [f"| {key} | {literal(value)} |" for key, value in fields.items()]
+    lines.append(table(("Provenance", "Value"), fields.items()))
     if result is not None:
-        lines += ["", "| Case | Variant | Median seconds | Repeats |", "| --- | --- | ---: | ---: |"]
-        lines += [f"| {literal(item['case_id'])} | {literal(item['variant_id'])} | {item['median']:.6g} | {len(item['samples'])} |"
-                  for item in result["summaries"]]
-    lines += ["", "Validation checks integrity and structure; it does not attest that candidate-controlled measurements are honest.",
-              "Raw worker evidence is retained separately from derived metadata. Missing provenance stays unknown."]
+        lines.append(table(("Case", "Variant", "Median seconds", "Repeats"),
+            [(item['case_id'], item['variant_id'], f"{item['median']:.6g}", len(item['samples'])) for item in result["summaries"]]))
+    lines += ['<p>Validation checks integrity and structure; it does not attest that candidate-controlled measurements are honest.</p>',
+              '<p>Raw worker evidence is retained separately from derived metadata. Missing provenance stays unknown.</p>']
     if evidence["errors"]:
-        lines += ["", "Diagnostics: " + "; ".join(map(literal, evidence["errors"]))]
-    return "\n".join(lines) + "\n"
+        lines.append('<p>Diagnostics: ' + "; ".join(map(literal, evidence["errors"])) + '</p>')
+    return "\n\n".join(lines) + "\n"
 
 
 def ingest(source, output, expected, conclusion, policy=None, history=None):
+    # reject invalid trusted arguments before claiming a must-be-new output directory
+    identity.validate(expected)
+    require(conclusion in {"success", "failure", "cancelled", "skipped"}, "invalid producer conclusion")
     require(source.resolve() != output.resolve(), "raw input and derived output must differ")
     # a fresh directory prevents a failed rerun from leaving an older success report
     output.mkdir(parents=True, exist_ok=False)
@@ -338,14 +381,14 @@ def ingest(source, output, expected, conclusion, policy=None, history=None):
         try:
             approve(evidence, raw, policy)
         except (ValueError, TypeError, KeyError, AttributeError) as error:
-            evidence["errors"].append("history approval: " + type(error).__name__)
+            evidence["errors"].append("history approval: " + diagnostic(error))
     record = derived_record(evidence, raw) if raw is not None else None
     if history is not None:
         try:
             require(evidence["history_eligible"] and record is not None, "history staging refused")
             stage_history(record, history)
         except (OSError, ValueError) as error:
-            evidence["errors"].append("history staging: " + type(error).__name__)
+            evidence["errors"].append("history staging: " + diagnostic(error))
             evidence["history_eligible"] = False
             record = derived_record(evidence, raw) if raw is not None else None
     (output / "provenance.json").write_bytes(encoded(evidence))
@@ -364,7 +407,7 @@ def ingest(source, output, expected, conclusion, policy=None, history=None):
     # a standalone, script-free provenance landing page; the dashboard is standalone too
     link = '<p><a href="dashboard/index.html">Measurement dashboard</a></p>' if record is not None else ""
     (output / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>AWS benchmark result</title>'
-        + link + '<pre style="white-space:pre-wrap">' + html.escape(html.unescape(text)) + '</pre>', encoding="utf-8")
+        + link + text, encoding="utf-8")
     return evidence
 
 

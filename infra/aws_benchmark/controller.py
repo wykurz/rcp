@@ -149,26 +149,37 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
     budget.left(LAUNCH_RESERVE)
     receipt.value["request"] = request
     receipt.value["cleanup"] = "unconfirmed"
-    receipt.save(required=True)
+    try:
+        receipt.save(required=True)
+    except BaseException:
+        # the API call was never attempted; a later save must not imply otherwise
+        receipt.value["cleanup"] = "not-requested"
+        raise
+    observation_errors = 0
+    def observe_instance():
+        nonlocal observation_errors
+        if receipt.value["instance"] is not None or observation_errors >= 3:
+            return
+        budget.left(30)
+        try:
+            observed = live_instances(api["ec2"], name)
+            if len(observed) == 1:
+                instance = observed[0]
+                receipt.value["instance"] = dict(instance_id=instance["InstanceId"],
+                    image_id=instance["ImageId"], instance_type=instance["InstanceType"])
+                receipt.save()
+        except Exception:
+            # empty answers can precede a slow launch; only errors consume retries
+            observation_errors += 1
+            print("Worker image observation unavailable; leave provenance unknown.")
+        # optional provenance reads never extend the deadline or bypass cleanup
+        budget.left(30)
     # enter the cleanup boundary before the API call, including uncertain outcomes
     try:
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)
-        observations = 0
         while True:
             budget.left(30)
-            if receipt.value["instance"] is None and observations < 3:
-                observations += 1
-                try:
-                    observed = live_instances(api["ec2"], name)
-                    if len(observed) == 1:
-                        instance = observed[0]
-                        receipt.value["instance"] = dict(instance_id=instance["InstanceId"],
-                            image_id=instance["ImageId"], instance_type=instance["InstanceType"])
-                        receipt.save()
-                except Exception:
-                    # no new IAM or deadline extension for optional provenance reads
-                    print("Worker image observation unavailable; leave provenance unknown.")
-                budget.left(30)
+            observe_instance()
             status = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, 30)
             require(isinstance(status, dict) and status.get("run") == identity["run"],
                     "worker status does not match this run")
@@ -178,6 +189,8 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
                 (output / "status.json").write_bytes(status_bytes)
                 receipt.value["status_sha256"] = digest(status_bytes)
                 receipt.save()
+                # terminal status can become visible before EC2's instance read
+                observe_instance()
                 require(status.get("state") == COMPLETED and isinstance(status.get("success"), bool),
                         "worker status protocol mismatch; rebuild WorkerAmiId from this revision")
                 if status.get("sha256"):
@@ -198,14 +211,15 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for field in ("region", "asg", "bucket", "run", "baseline", "candidate", "suite"):
+    for field in ("region", "asg", "bucket"):
         parser.add_argument("--" + field, required=True)
+    parser.add_argument("--identity", type=Path, required=True)
     parser.add_argument("--binaries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--role-arn", required=True)
     args = parser.parse_args()
-    identity = {field: getattr(args, field) for field in ("run", "baseline", "candidate", "suite")}
-    provenance = workflow_identity.environment()
+    provenance = workflow_identity.load(args.identity)
+    identity = {field: provenance[field] for field in ("run", "baseline", "candidate", "suite")}
     run(oidc_clients(args.region, args.role_arn), args.asg, args.bucket, identity, args.binaries, args.output,
         provenance=provenance)
 
