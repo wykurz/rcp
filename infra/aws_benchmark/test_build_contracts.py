@@ -34,7 +34,10 @@ class BuildContractTests(unittest.TestCase):
             output = Path(directory) / "outputs"
             source = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
             env = dict(os.environ, GITHUB_OUTPUT=str(output), GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
-                       BASELINE="a" * 40, CANDIDATE="a" * 40, SUITE="aa-smoke")
+                       BASELINE="a" * 40, CANDIDATE="a" * 40, SUITE="aa-smoke",
+                       GITHUB_REF="refs/heads/main", GITHUB_SHA="c" * 40, GITHUB_REPOSITORY="wykurz/rcp",
+                       GITHUB_WORKFLOW_REF="wykurz/rcp/.github/workflows/aws-benchmark.yml@refs/heads/main",
+                       GITHUB_WORKFLOW_SHA="c" * 40, GITHUB_EVENT_NAME="workflow_dispatch")
             subprocess.run([sys.executable, "-c", source], cwd=ROOT, env=env, check=True, timeout=10)
             self.assertEqual(output.read_text(), f"max-binary={common.MAX_BINARY}\n")
 
