@@ -1,0 +1,41 @@
+"""Exact workflow identity shared by admission, controller receipts and reporting."""
+
+import os
+import re
+
+from .common import require, validate_identity
+
+
+REPOSITORY = "wykurz/rcp"
+REF = "refs/heads/main"
+# temporary exact debug exception; never merge this allowance into main
+ALLOWED_REFS = {REF, "refs/heads/aws-benchmark-debug-20261019"}
+WORKFLOW = REPOSITORY + "/.github/workflows/aws-benchmark.yml@" + REF
+
+
+def validate(value):
+    require(isinstance(value, dict) and set(value) == {
+        "run", "baseline", "candidate", "suite", "controller", "ref", "repository",
+        "workflow", "workflow_sha", "event", "run_url"}, "unexpected workflow identity")
+    validate_identity(value)
+    require(value["ref"] in ALLOWED_REFS, "workflow ref is not an exact approved branch")
+    require(value["repository"] == REPOSITORY and value["workflow"] == REPOSITORY + "/.github/workflows/aws-benchmark.yml@" + value["ref"],
+            "unexpected workflow repository or path")
+    require(value["event"] == "workflow_dispatch", "workflow must be manually dispatched")
+    require(isinstance(value["controller"], str) and re.fullmatch(r"[0-9a-f]{40}", value["controller"])
+            and value["workflow_sha"] == value["controller"], "controller/workflow revision mismatch")
+    run_id, attempt = value["run"].split("-")
+    require(value["run_url"] == f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}",
+            "run URL does not match this attempt")
+    return value
+
+
+def environment(env=None):
+    env = os.environ if env is None else env
+    run_id, attempt = env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"]
+    return validate(dict(run=run_id + "-" + attempt, baseline=env["BASELINE"],
+        candidate=env["CANDIDATE"], suite=env["SUITE"], controller=env["GITHUB_SHA"],
+        ref=env["GITHUB_REF"], repository=env["GITHUB_REPOSITORY"],
+        workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha=env["GITHUB_WORKFLOW_SHA"],
+        event=env["GITHUB_EVENT_NAME"],
+        run_url=f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}"))

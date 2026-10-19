@@ -7,12 +7,13 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
 import yaml
 
-from infra.aws_benchmark import common
+from infra.aws_benchmark import identity
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -34,7 +35,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                             if isinstance(node, ast.Name)))
         code = compile(tree, "workflow branch guard", "eval")
         trusted = {"refs/heads/main", "refs/heads/aws-benchmark-debug-20261019"}
-        refs = trusted | {"refs/heads/other", "refs/heads/aws-benchmark-debug-202610190",
+        refs = trusted | {"refs/heads/other", "refs/heads/aws-benchmark-debug-20261019", "refs/heads/aws-benchmark-debug-202610190",
                           "refs/heads/aws-benchmark-debug-20261019/other", "refs/tags/main",
                           "refs/tags/aws-benchmark-debug-20261019", "refs/pull/357/merge", "refs/heads/MAIN",
                           "refs/heads/AWS-BENCHMARK-DEBUG-20261019", ""}
@@ -45,6 +46,20 @@ class WorkflowPolicyTests(unittest.TestCase):
                     actual = eval(code, {"__builtins__": {}}, {"ref": ref.lower(), "enabled": enabled.lower()})
                     self.assertEqual(actual, ref.lower() in trusted and enabled.lower() == "true")
 
+    def test_literal_ref_guard_runs_before_checkout_or_repository_imports(self):
+        steps = self.workflow["jobs"]["validate"]["steps"]
+        self.assertEqual(set(steps[0]), {"name", "run"})
+        self.assertTrue(steps[1]["uses"].startswith("actions/checkout@"))
+        for ref in ("refs/heads/main", "refs/heads/MAIN", "refs/tags/main", "refs/heads/other",
+                    "refs/heads/aws-benchmark-debug-20261019"):
+            for repository, event in (("wykurz/rcp", "workflow_dispatch"), ("attacker/rcp", "workflow_dispatch"),
+                                      ("wykurz/rcp", "pull_request")):
+                env = dict(os.environ, GITHUB_REF=ref, GITHUB_REPOSITORY=repository, GITHUB_EVENT_NAME=event)
+                result = subprocess.run(["bash", "-e", "-c", steps[0]["run"]], env=env,
+                                        capture_output=True, timeout=5)
+                expected = ref in {"refs/heads/main", "refs/heads/aws-benchmark-debug-20261019"} and repository == "wykurz/rcp" and event == "workflow_dispatch"
+                self.assertEqual(result.returncode == 0, expected, (ref, repository, event))
+
     def test_actual_validation_script_rejects_other_refs_and_records_run_binding(self):
         steps = self.workflow["jobs"]["validate"]["steps"]
         script = next(s["run"] for s in steps if s.get("id") == "protocol").splitlines()
@@ -53,7 +68,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         program = compile("\n".join(script[1:-1]), "actual workflow validation", "exec")
         trusted = {"refs/heads/main", "refs/heads/aws-benchmark-debug-20261019"}
         refs = trusted | {"refs/heads/MAIN", "refs/heads/AWS-BENCHMARK-DEBUG-20261019",
-                          "refs/heads/other", "refs/tags/main", "refs/tags/aws-benchmark-debug-20261019",
+                          "refs/heads/other", "refs/heads/aws-benchmark-debug-20261019", "refs/tags/main", "refs/tags/aws-benchmark-debug-20261019",
                           "refs/pull/357/merge", "refs/heads/aws-benchmark-debug-202610190", ""}
         for ref in refs:
             with self.subTest(ref=ref), tempfile.TemporaryDirectory() as root:
@@ -61,14 +76,13 @@ class WorkflowPolicyTests(unittest.TestCase):
                            GITHUB_SHA="c" * 40, GITHUB_REPOSITORY="wykurz/rcp",
                            GITHUB_WORKFLOW_REF="wykurz/rcp/.github/workflows/aws-benchmark.yml@" + ref,
                            GITHUB_WORKFLOW_SHA="c" * 40, BASELINE="a" * 40, CANDIDATE="a" * 40,
-                           SUITE="aa-smoke", GITHUB_OUTPUT=str(Path(root) / "output"))
+                           SUITE="aa-smoke", GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_OUTPUT=str(Path(root) / "output"))
                 output = io.StringIO()
                 with patch.dict(os.environ, env), redirect_stdout(output), \
-                     patch.object(common, "validate_identity", wraps=common.validate_identity) as validate:
+                     patch.object(identity, "validate_identity", wraps=identity.validate_identity) as validate:
                     if ref not in trusted:
-                        with self.assertRaisesRegex(ValueError, "not an approved branch"):
+                        with self.assertRaisesRegex(ValueError, "not an exact approved branch"):
                             exec(program, {})
-                        validate.assert_not_called()
                         self.assertFalse(Path(env["GITHUB_OUTPUT"]).exists())
                         continue
                     exec(program, {})
@@ -76,14 +90,15 @@ class WorkflowPolicyTests(unittest.TestCase):
                 binding = json.loads(output.getvalue().removeprefix("RCP_AWS_RUN_IDENTITY="))
                 self.assertEqual(binding, dict(run="123-1", baseline="a" * 40, candidate="a" * 40,
                     suite="aa-smoke", controller="c" * 40, ref=ref, repository="wykurz/rcp",
-                    workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha="c" * 40))
+                    workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha="c" * 40, event="workflow_dispatch",
+                    run_url="https://github.com/wykurz/rcp/actions/runs/123/attempts/1"))
 
     def test_manual_trigger_and_single_mailbox_gate_every_privileged_run(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
         self.assertEqual(self.workflow["concurrency"],
                          {"group": "aws-benchmark-single-mailbox", "cancel-in-progress": "false"})
         jobs = self.workflow["jobs"]
-        self.assertEqual(set(jobs), {"validate", "build", "benchmark"})
+        self.assertEqual(set(jobs), {"validate", "build", "benchmark", "report"})
         self.assertEqual(jobs["build"]["needs"], "validate")
         self.assertEqual(jobs["benchmark"]["needs"], "build")
         self.assertEqual(jobs["benchmark"]["environment"], "aws-benchmark")
@@ -92,10 +107,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         jobs = self.workflow["jobs"]
         self.assertEqual(jobs["build"]["permissions"], {"contents": "read"})
-        for name in ("validate", "build"):
+        for name in ("validate", "build", "report"):
             self.assertNotIn("environment", jobs[name])
             self.assertNotIn("id-token", jobs[name].get("permissions", {}))
             self.assertEqual(jobs[name]["runs-on"], "ubuntu-24.04")
+        self.assertEqual(jobs["report"]["permissions"], {"contents": "read"})
         self.assertEqual(jobs["benchmark"]["permissions"], {"contents": "read", "id-token": "write"})
 
     def test_privileged_checkout_and_artifacts_are_bound_to_this_run(self):
@@ -109,6 +125,26 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual({s["with"]["name"] for s in downloads}, {"aws-baseline", "aws-candidate"})
         for step in downloads:
             self.assertEqual(set(step["with"]), {"name", "path"})
+
+
+    def test_reporting_download_is_bound_to_trusted_producer_id_without_publication(self):
+        jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["benchmark"]["outputs"],
+                         {"result-artifact-id": "${{ steps.raw-results.outputs.artifact-id }}"})
+        job = jobs["report"]
+        self.assertEqual(job["needs"], ["validate", "benchmark"])
+        self.assertEqual(job["if"], "always() && needs.validate.result == 'success' && needs.benchmark.outputs.result-artifact-id != ''")
+        downloads = [step for step in job["steps"] if step.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual([step["with"] for step in downloads], [{
+            "artifact-ids": "${{ needs.benchmark.outputs.result-artifact-id }}", "path": "${{ runner.temp }}/aws-raw"}])
+        checkout = job["steps"][0]
+        self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "persist-credentials": "false"})
+        source = json.dumps(job)
+        for forbidden in ("workflow_run", "repository_dispatch", "benchmarks.publish", "--policy", "--history",
+                          "secrets.", "aws-sdk", "configure-aws-credentials"):
+            self.assertNotIn(forbidden, source)
+        self.assertEqual([step["with"]["retention-days"] for step in job["steps"]
+                          if step.get("uses", "").startswith("actions/upload-artifact@")], ["90"])
 
 
 if __name__ == "__main__":
