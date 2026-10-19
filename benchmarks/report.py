@@ -74,6 +74,21 @@ def validate_result(value):
     if "dirty" not in revision or (revision["dirty"] is not None and not isinstance(revision["dirty"], bool)):
         raise ValueError("revision.dirty must be a boolean or null")
     context = _object(run.get("context"), "context")
+    if revision.get("role") == "approved candidate":
+        provenance = context.get("aws_provenance")
+        identity = provenance.get("identity") if isinstance(provenance, dict) else None
+        candidate = identity.get("candidate") if isinstance(identity, dict) else None
+        repository = identity.get("repository") if isinstance(identity, dict) else None
+        # this binds the reserved label to consistent metadata, not authentication;
+        # the history writer must separately authenticate the approval policy
+        if (not isinstance(provenance, dict) or provenance.get("history_eligible") is not True
+                or not isinstance(candidate, str) or not re.fullmatch(r"[0-9a-f]{40}", candidate)
+                or revision.get("commit") != candidate or revision.get("branch") is not None
+                or revision["dirty"] is not False or run["status"] != "complete"
+                or context.get("purpose") != "performance" or not isinstance(repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or context.get("repository") != repository):
+            raise ValueError("revision.role 'approved candidate' requires consistent approved AWS provenance")
     for field in ("runner_label", "topology", "cache_policy", "timing_policy"):
         _text(context.get(field), f"context.{field}")
     if "timing_request" in context and context["timing_request"] not in ("automatic", "disabled"):

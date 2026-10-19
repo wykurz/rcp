@@ -157,10 +157,17 @@ observed `c5d.24xlarge`, matching image/baked source/binary digests, an allowlis
 suite, four balanced adjacent pairs, full source/destination proofs and complete local resource
 records. Smoke, failed, cancelled, incomplete and unapproved PR results cannot pass. The approved
 derived history copy labels its revision as the **approved candidate**, retaining the raw checkout
-separately. AWS series IDs include a versioned contract, original series ID, AMI and baked source so
-they cannot silently join legacy/Depot or different-image history. Same-attempt identical staging is
-a no-op; conflicting content cannot overwrite `runs/<deterministic-id>.json`. Staging does not push
-Git, update Pages or grant any permissions.
+separately. The general result schema requires that reserved label to agree with structured AWS
+eligibility, candidate and repository metadata. This is a consistency check, not authentication: the
+writer still needs the independently authenticated policy above. AWS ingestion replaces even
+internally consistent candidate-supplied approval claims with its own verified outcome. AWS series
+IDs include a versioned contract, original series ID, AMI and baked source so they cannot silently
+join legacy/Depot or different-image history. Same-attempt identical staging is a no-op; conflicting
+content cannot overwrite `runs/<deterministic-id>.json`. Creating that immutable link commits the
+record. Temporary-name cleanup is best effort: an unlink failure cannot revoke a successful commit
+or mask a prior staging error. Leftover `.aws-stage-*` names are not history JSON records and can be
+removed when no staging operation is active. Staging does not push Git, update Pages or grant any
+permissions.
 
 Offline tests exercise complete/partial/cancelled results, malformed and oversized archives, forged
 metadata, run/ref substitution, policy mismatch, idempotence and conflicting replay. They cannot

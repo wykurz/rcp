@@ -325,7 +325,11 @@ def stage_history(record, destination):
             require(read_file(path, MAX_JSON * 2, single_link=False) == payload, "conflicting history replay")
     finally:
         if temporary is not None:
-            temporary.unlink()
+            try:
+                temporary.unlink()
+            except OSError:
+                # cleanup cannot reverse a committed link or mask a prior failure
+                pass
     return path
 
 
