@@ -136,6 +136,10 @@ def run_link(item, prefix):
     return f'<a href="{target}">{label}</a>'
 
 
+def revision_role(item):
+    return "candidate revision" if item["revision"].get("role") == "approved candidate" else "checkout revision"
+
+
 def revision(item):
     commit = item["revision"].get("commit")
     label = commit[:10] if isinstance(commit, str) and COMMIT.fullmatch(commit) else commit or "unknown"
@@ -152,7 +156,7 @@ def notes(row):
     if reference:
         result.append("reference timings: " + ", ".join(reference["timing_statuses"]))
         if current["revision"]["commit"] == reference["revision"]["commit"]:
-            result.append("same recorded checkout revision")
+            result.append("same recorded " + revision_role(current))
         if reference["run_status"] != "complete":
             result.append("reference case from failed run")
         if current["case_order"] != reference["case_order"]:
@@ -183,7 +187,7 @@ def markdown(evidence, limit=10, link_base=""):
         lines.append(f"<p>Showing the latest {limit} runs; changes.json retains all {len(evidence['runs'])} runs.</p>")
     for item in reversed(selected):
         lines += [f"<h2>{literal(item['timestamp'])} — {literal(item['topology'])}</h2>",
-                  f"<p>Run {run_link(item, prefix)} · {literal(item['status'])} · checkout revision {revision(item)} · "
+                  f"<p>Run {run_link(item, prefix)} · {literal(item['status'])} · {revision_role(item)} {revision(item)} · "
                   f"{literal(item['repository'])} · {literal(item['runner_label'])} · {literal(item['cache_policy'])}</p>",
                   "<p>Recorded case order: " + ", ".join(literal(case) for case in item["case_order"]) + "</p>"]
         if item["exclusion"]:
@@ -195,7 +199,7 @@ def markdown(evidence, limit=10, link_base=""):
             lines.append("<p>No completed case measurements. Inspect producer logs and the raw record.</p>")
             continue
         lines.append("<table><thead><tr><th>Case / variant</th><th>Current median [range] s</th>"
-                     "<th>Reference median [range] s</th><th>Change</th><th>Reference run / checkout / date</th><th>Evidence</th></tr></thead><tbody>")
+                     "<th>Reference median [range] s</th><th>Change</th><th>Reference run / revision / date</th><th>Evidence</th></tr></thead><tbody>")
         for row in rows:
             current, reference = row["current"], row["reference"]
             change = "—"
@@ -203,7 +207,7 @@ def markdown(evidence, limit=10, link_base=""):
                 percent = row["change_percent"] if round(row["change_percent"], 1) else 0.0
                 ratio = format(row["ratio"], ".3f" if row["ratio"] >= 0.0005 else ".3g")
                 change = f"{ratio}x ({percent:+.1f}%)"
-            reference_label = (f"{run_link(reference, prefix)}<br>checkout {revision(reference)}<br>"
+            reference_label = (f"{run_link(reference, prefix)}<br>{revision_role(reference)} {revision(reference)}<br>"
                                f"{literal(reference['timestamp'])}") if reference else "—"
             cells = [literal(row["case_id"]) + " / " + literal(row["variant_id"]), measurement(current),
                      measurement(reference) if reference else "—", change, reference_label, literal(notes(row))]

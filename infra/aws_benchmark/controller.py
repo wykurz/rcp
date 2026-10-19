@@ -9,6 +9,8 @@ import stat
 import time
 import urllib.request
 
+from . import identity as workflow_identity
+
 from .common import (BINARIES, COMPLETED, LAUNCH_RESERVE, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
                      STATUS_KEY, WINDOW_KEY, Budget, checked_clients, digest, get_bytes, get_json,
                      group, live_instances, pending_status, put_json, require, retry_io, scheduled, utc,
@@ -67,12 +69,52 @@ def cleanup(api, name, timeout=600):
     raise TimeoutError("teardown unconfirmed; leave shutdown armed and inspect EC2")
 
 
-def run(api, name, bucket, identity, binary_root, output):
+class Receipt:
+    """Controller observations kept separately from untrusted worker evidence."""
+
+    def __init__(self, output, provenance):
+        self.output = output
+        self.value = dict(schema_version=1, identity=provenance, outcome="incomplete",
+                          cleanup="not-requested", instance=None, window=None, request=None,
+                          archive_sha256=None, status_sha256=None)
+        self.output.mkdir(parents=True, exist_ok=True)
+        self.save(required=True)
+
+    def save(self, required=False):
+        try:
+            temporary = self.output / "controller.tmp"
+            temporary.write_text(json.dumps(self.value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            temporary.replace(self.output / "controller.json")
+        except OSError:
+            if required:
+                raise
+            # evidence failures must never bypass cleanup or hide its exception
+            print("Controller receipt could not be updated; provenance remains incomplete.")
+
+
+def run(api, name, bucket, identity, binary_root, output, provenance=None):
+    if provenance is not None:
+        workflow_identity.validate(provenance)
+        require(all(provenance[key] == identity[key] for key in identity), "controller input identity mismatch")
+    receipt = Receipt(output, provenance)
+    try:
+        _run(api, name, bucket, identity, binary_root, output, receipt)
+        receipt.value["outcome"] = "success"
+    except BaseException:
+        receipt.value["outcome"] = "failure"
+        raise
+    finally:
+        receipt.save()
+
+
+def _run(api, name, bucket, identity, binary_root, output, receipt):
     validate_identity(identity)
     bootstrap = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     window = retry_io(lambda: get_json(api["s3"], bucket, WINDOW_KEY), bootstrap, reserve=5)
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
     budget = Budget(validate_window(window, minimum=LAUNCH_RESERVE))
+    receipt.value["window"] = window
+    receipt.save()
     initial = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, LAUNCH_RESERVE)
     require(initial == pending_status(identity["run"]),
             "operator must initialize the pending status before launch")
@@ -105,17 +147,37 @@ def run(api, name, bucket, identity, binary_root, output):
     verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)
     verify_group(read(lambda: group(api["autoscaling"], name)), 1)
     budget.left(LAUNCH_RESERVE)
+    receipt.value["request"] = request
+    receipt.value["cleanup"] = "unconfirmed"
+    receipt.save(required=True)
     # enter the cleanup boundary before the API call, including uncertain outcomes
     try:
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)
+        observations = 0
         while True:
             budget.left(30)
+            if receipt.value["instance"] is None and observations < 3:
+                observations += 1
+                try:
+                    observed = live_instances(api["ec2"], name)
+                    if len(observed) == 1:
+                        instance = observed[0]
+                        receipt.value["instance"] = dict(instance_id=instance["InstanceId"],
+                            image_id=instance["ImageId"], instance_type=instance["InstanceType"])
+                        receipt.save()
+                except Exception:
+                    # no new IAM or deadline extension for optional provenance reads
+                    print("Worker image observation unavailable; leave provenance unknown.")
+                budget.left(30)
             status = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, 30)
             require(isinstance(status, dict) and status.get("run") == identity["run"],
                     "worker status does not match this run")
             if status.get("state") != PENDING:
                 output.mkdir(parents=True, exist_ok=True)
-                (output / "status.json").write_text(json.dumps(status, separators=(",", ":")))
+                status_bytes = json.dumps(status, separators=(",", ":")).encode()
+                (output / "status.json").write_bytes(status_bytes)
+                receipt.value["status_sha256"] = digest(status_bytes)
+                receipt.save()
                 require(status.get("state") == COMPLETED and isinstance(status.get("success"), bool),
                         "worker status protocol mismatch; rebuild WorkerAmiId from this revision")
                 if status.get("sha256"):
@@ -123,11 +185,15 @@ def run(api, name, bucket, identity, binary_root, output):
                     require(digest(data) == status["sha256"], "result archive digest mismatch")
                     # never extract or execute worker output on the credentialed job
                     (output / "results.zip").write_bytes(data)
+                    receipt.value["archive_sha256"] = digest(data)
+                    receipt.save()
                 require(status.get("success") is True, "worker failed; see bounded partial results")
                 return
             time.sleep(10)
     finally:
         cleanup(api, name)
+        receipt.value["cleanup"] = "verified"
+        receipt.save()
 
 
 def main():
@@ -139,7 +205,9 @@ def main():
     parser.add_argument("--role-arn", required=True)
     args = parser.parse_args()
     identity = {field: getattr(args, field) for field in ("run", "baseline", "candidate", "suite")}
-    run(oidc_clients(args.region, args.role_arn), args.asg, args.bucket, identity, args.binaries, args.output)
+    provenance = workflow_identity.environment()
+    run(oidc_clients(args.region, args.role_arn), args.asg, args.bucket, identity, args.binaries, args.output,
+        provenance=provenance)
 
 
 if __name__ == "__main__":

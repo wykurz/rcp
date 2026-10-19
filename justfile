@@ -166,6 +166,10 @@ benchmark-test:
 aws-benchmark-test:
     python3 -m unittest discover -s infra/aws_benchmark -p 'test_*.py'
 
+# Ingest bounded AWS evidence without credentials, extraction or network publication.
+aws-benchmark-report *ARGS:
+    python3 -m infra.aws_benchmark.results "$@"
+
 # Render a standalone dashboard from a result file or history directory.
 benchmark-report *ARGS:
     python3 -m benchmarks.report "$@"

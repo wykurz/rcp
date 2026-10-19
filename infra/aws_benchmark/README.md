@@ -63,15 +63,15 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
-Changes to `benchmarks/`, worker-executed code in the baked modules in `infra/aws_benchmark/`,
+Changes to worker-executed code in `benchmarks/` or the baked modules in `infra/aws_benchmark/`,
 `requirements.txt`, or the installer require a new AMI from the reviewed commit and a closed-stack
 update of `WorkerAmiId` before dispatch. Updating the GitHub checkout does not update the baked
 harness or supervisor. A change confined to operator/controller checks, such as `verify_group` in
-`common.py`, does not require an image rebuild when worker behavior and the mailbox protocol are
-unchanged. Record the actual image source SHA and AMI together, even when the controller revision
-differs; retain predecessors only deliberately and do not use an old image with a newer controller
-protocol. A run-matching incompatible terminal status is saved with a protocol-mismatch diagnostic
-to help identify this case.
+`common.py`, or offline reporting does not require an image rebuild when worker behavior and the
+mailbox protocol are unchanged. Record the actual image source SHA and AMI together, even when the
+controller revision differs; retain predecessors only deliberately and do not use an old image with
+a newer controller protocol. A run-matching incompatible terminal status is saved with a
+protocol-mismatch diagnostic to help identify this case.
 
 The group check accepts an absent lifecycle policy or the exact explicit default
 `RetentionTriggers.TerminateHookAbandon=terminate`, which AWS documents as
@@ -284,16 +284,25 @@ a metadata-only failure archive. Failed/incomplete harness records can be downlo
 treated as successful comparisons.
 
 The unversioned S3 mailbox has a fixed number of exact keys and seven-day expiration, plus one-day
-incomplete-multipart cleanup. GitHub build artifacts live one day; result artifacts live seven. Size
-limits are enforced by trusted code, **not by IAM PutObject conditions**. A stolen runtime
-credential can overwrite permitted objects or issue excess requests; neither fixed keys nor
-lifecycle rules are a hard storage/billing cap. S3 storage/requests, AMI snapshots, EBS while
-allocated and public IPv4 addresses can cost money even though there is no always-running VM. Empty
-the bucket before deleting the stack, and delete obsolete AMI snapshots separately.
+incomplete-multipart cleanup. GitHub build artifacts live one day; result/report artifacts live 90
+days (subject to the repository limit). Size limits are enforced by trusted code, **not by IAM
+PutObject conditions**. A stolen runtime credential can overwrite permitted objects or issue excess
+requests; neither fixed keys nor lifecycle rules are a hard storage/billing cap. S3
+storage/requests, AMI snapshots, EBS while allocated and public IPv4 addresses can cost money even
+though there is no always-running VM. Empty the bucket before deleting the stack, and delete
+obsolete AMI snapshots separately.
 
 The current largest suites generate 30–31.25 GiB, below host RAM. This PR adds no larger case. After
 a validated A/A pilot, compare one targeted suite at a time. A future approximately 400 GiB bulk
 experiment needs its own reviewed fixture, storage and deadline plan.
+
+## Result reports
+
+The read-only report job validates bounded evidence and produces a standalone report with separate
+candidate, baseline, controller and baked-worker provenance. Raw results remain unchanged. See
+[result ingestion and reporting](RESULTS.md) for artifact contents, cancellation behavior, parser
+limits, the security boundary and offline-only future history staging. No history publisher is
+enabled, and Depot workflows remain operational.
 
 ## Offline validation and first live acceptance
 

@@ -209,6 +209,7 @@
         const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge, node("span", ` · ${purpose(run)}`));
         if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("span", " · Short sample: repeat under 10 s", "short-warning"));
         const rev = node("td"), hash = run.revision.commit || "unknown";
+        if (run.revision.role === "approved candidate") rev.append(node("span", "Candidate "));
         const repository = run.context.repository || run.revision.repository || run.repository;
         const slug = typeof repository === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ? repository : null;
         if (slug && /^[0-9a-f]{7,64}$/.test(hash)) {
