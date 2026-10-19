@@ -193,6 +193,38 @@ class ResultTests(unittest.TestCase):
         self.assertTrue(evidence["history_eligible"])
         self.assertEqual(evidence["errors"], [])
 
+    def test_committed_history_stays_approved_when_temporary_cleanup_fails(self):
+        history = self.root / "history"
+        original_unlink = Path.unlink
+        def cleanup(path, *args, **kwargs):
+            if path.name.startswith(".aws-stage-"):
+                raise PermissionError("injected temporary cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", autospec=True, side_effect=cleanup):
+            evidence = self.ingest(policy=self.policy, history=history)
+        self.assertEqual(evidence["errors"], [])
+        self.assertTrue(evidence["history_eligible"])
+        committed = next((history / "runs").glob("*.json"))
+        temporary = next((history / "runs").glob(".aws-stage-*"))
+        self.assertTrue(committed.samefile(temporary))
+        self.assertEqual(committed.read_bytes(), (self.output / "derived.json").read_bytes())
+        self.assertTrue(json.loads(committed.read_bytes())["context"]["aws_provenance"]["history_eligible"])
+        replay = self.ingest(policy=self.policy, history=history, output=self.root / "retry")
+        self.assertEqual(replay["errors"], [])
+        self.assertTrue(replay["history_eligible"])
+        self.assertEqual(list((history / "runs").glob("*.json")), [committed])
+
+    def test_temporary_cleanup_failure_does_not_replace_failed_commit_reason(self):
+        evidence, raw, _ = results.inspect(self.source, self.expected, "success")
+        results.approve(evidence, raw, self.policy)
+        record = results.derived_record(evidence, raw)
+        history = self.root / "history"
+        with patch.object(results.os, "link", side_effect=OSError("injected commit failure")):
+            with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
+                with self.assertRaisesRegex(OSError, "^injected commit failure$"):
+                    results.stage_history(record, history)
+        self.assertEqual(list((history / "runs").glob("*.json")), [])
+
     def test_conflicting_replay_cannot_overwrite_existing_history(self):
         history = self.root / "history"
         self.ingest(policy=self.policy, history=history)
@@ -364,9 +396,24 @@ class ResultTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertEqual(self.ingest()["errors"], [])
 
+    def test_unbacked_candidate_role_is_refused_without_erasing_supervisor_evidence(self):
+        raw = measurement(self.expected)
+        raw["revision"] = dict(commit="9" * 40, branch=None, dirty=False, role="approved candidate")
+        bundle(self.source, self.expected, raw)
+        evidence = self.ingest()
+        self.assertEqual(evidence["errors"], ["measurement record: ValueError"])
+        self.assertIsNotNone(evidence["controller"])
+        self.assertIsNotNone(evidence["worker"])
+        self.assertFalse(evidence["history_eligible"])
+        self.assertFalse((self.output / "derived.json").exists())
+        self.assertEqual((self.source / "results.zip").read_bytes(), (self.output / "raw/results.zip").read_bytes())
+
     def test_candidate_revision_role_is_not_preserved_in_diagnostics(self):
         raw = measurement(self.expected)
         raw["revision"] = dict(commit="9" * 40, branch=None, dirty=False, role="approved candidate")
+        # even structurally consistent candidate claims are replaced by trusted ingestion
+        raw["context"]["aws_provenance"] = dict(history_eligible=True,
+            identity=dict(candidate="9" * 40, repository=self.expected["repository"]))
         bundle(self.source, self.expected, raw)
         evidence = self.ingest()
         self.assertEqual(evidence["errors"], [])

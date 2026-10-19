@@ -89,6 +89,16 @@ class PublishTests(unittest.TestCase):
     def history(self):
         return self.git(self.remote, "rev-parse", "refs/heads/benchmark-history").stdout.strip()
 
+    def test_forged_candidate_role_cannot_create_history(self):
+        record = result("1" * 32)
+        record["revision"]["role"] = "approved candidate"
+        path = self.write_result(record["run_id"], revision=record["revision"])
+        completed = self.publish(path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("revision.role 'approved candidate' requires consistent approved AWS provenance", completed.stderr)
+        self.assertNotEqual(self.git(self.remote, "rev-parse", "refs/heads/benchmark-history", check=False).returncode, 0)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain=v1").stdout, "")
+
     def test_creates_history_without_changing_callers_checkout(self):
         (self.checkout / "user-file").write_text("keep this\n", encoding="utf-8")
         self.git(self.checkout, "add", "user-file")
