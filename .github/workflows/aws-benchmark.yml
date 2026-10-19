@@ -27,7 +27,10 @@ concurrency:
 
 jobs:
   validate:
-    if: github.ref == 'refs/heads/main' && vars.RCP_AWS_BENCHMARK_ENABLED == 'true'
+    if: >-
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/aws-benchmark-debug-20261019') &&
+      vars.RCP_AWS_BENCHMARK_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -44,10 +47,18 @@ jobs:
           SUITE: ${{ inputs.suite }}
         run: |
           python3 - <<'PY'
+          import json
           import os
+          if os.environ['GITHUB_REF'] not in {'refs/heads/main', 'refs/heads/aws-benchmark-debug-20261019'}:
+              raise ValueError('workflow ref is not an approved branch')
           from infra.aws_benchmark.common import MAX_BINARY, validate_identity
-          validate_identity(dict(run=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'],
-                                 baseline=os.environ['BASELINE'], candidate=os.environ['CANDIDATE'], suite=os.environ['SUITE']))
+          identity = dict(run=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'],
+                          baseline=os.environ['BASELINE'], candidate=os.environ['CANDIDATE'], suite=os.environ['SUITE'])
+          validate_identity(identity)
+          print('RCP_AWS_RUN_IDENTITY=' + json.dumps(dict(identity,
+              controller=os.environ['GITHUB_SHA'], ref=os.environ['GITHUB_REF'],
+              repository=os.environ['GITHUB_REPOSITORY'], workflow=os.environ['GITHUB_WORKFLOW_REF'],
+              workflow_sha=os.environ['GITHUB_WORKFLOW_SHA']), sort_keys=True))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print(f'max-binary={MAX_BINARY}', file=output)
           PY
