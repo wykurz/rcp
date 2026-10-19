@@ -63,41 +63,58 @@ template, runtime role, and ASG with minimum/desired/maximum all **zero**. The l
 not track `$Latest` or `$Default`. The AMI is an explicit ID, not an SSM lookup. Change the image or
 template only with no active window and after physical teardown. No rolling-update policy is used.
 
-Changes to `benchmarks/`, worker-executed code in the baked modules in `infra/aws_benchmark/`,
+Changes to worker-executed code in `benchmarks/` or the baked modules in `infra/aws_benchmark/`,
 `requirements.txt`, or the installer require a new AMI from the reviewed commit and a closed-stack
 update of `WorkerAmiId` before dispatch. Updating the GitHub checkout does not update the baked
 harness or supervisor. A change confined to operator/controller checks, such as `verify_group` in
-`common.py`, does not require an image rebuild when worker behavior and the mailbox protocol are
-unchanged. Record the actual image source SHA and AMI together, even when the controller revision
-differs; retain predecessors only deliberately and do not use an old image with a newer controller
-protocol. A run-matching incompatible terminal status is saved with a protocol-mismatch diagnostic
-to help identify this case.
+`common.py`, or offline reporting does not require an image rebuild when worker behavior and the
+mailbox protocol are unchanged. Record the actual image source SHA and AMI together, even when the
+controller revision differs; retain predecessors only deliberately and do not use an old image with
+a newer controller protocol. A run-matching incompatible terminal status is saved with a
+protocol-mismatch diagnostic to help identify this case.
 
 The group check accepts an absent lifecycle policy or the exact explicit default
 `RetentionTriggers.TerminateHookAbandon=terminate`, which AWS documents as
 [normal termination behavior](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RetentionTriggers.html).
 It rejects `retain` and unknown populated policy shapes; lifecycle hooks remain prohibited.
 
-Create a GitHub environment named `aws-benchmark` with a required trusted reviewer and deployment
-branch rules allowing **only main**. This is required: the OIDC environment subject does not encode
-a branch. Keep environment protection and changes to trusted main under review. Configure these
-environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`, `RCP_AWS_BUCKET`,
-`RCP_AWS_ROLE_ARN`. Finally set the **repository** variable `RCP_AWS_BENCHMARK_ENABLED=true`.
+Create a GitHub environment named `aws-benchmark` with a required trusted reviewer, administrator
+bypass disabled, and deployment branch rules allowing **only main** by default. The temporary debug
+branch `aws-benchmark-debug-20261019` may also be allowed as one exact **branch-type** rule after
+explicit approval; do not allow wildcard branches, tags or PR refs. This is an access expansion: the
+OIDC environment subject does not encode a branch, so each privileged debug commit must be reviewed
+before its run is approved. The debug branch does not inherit main's branch protections. Keep a
+draft PR for CI and review, use fast-forward pushes, and do not treat branch access as authorization
+for more paid attempts. No IAM change is needed.
+
+Configure these environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`,
+`RCP_AWS_BUCKET`, `RCP_AWS_ROLE_ARN`. Keep the **repository** variable
+`RCP_AWS_BENCHMARK_ENABLED=false` until an authorized acceptance run is ready. After testing,
+disable it again and verify capacity 0/0/0, physical teardown and no future opening. Retain
+temporary branch access only while the operator intends to continue debugging; coordinate revocation
+once stable. Then remove that exact environment rule and restore the main-only workflow guard.
+Removing the rule does not revoke already issued STS credentials; the closed ASG remains necessary.
 
 ## Run one window
 
-1. Dispatch **AWS benchmark (operator window required)** from main with full lowercase 40-character
-   baseline/candidate SHAs and an allowlisted suite. For the first run choose `aa-smoke` and the
-   same SHA twice. The pilot uses one binary build for both roles, two balanced adjacent pairs,
-   `tiny-10k`, and `source-warm`; it is labeled smoke. Builds finish on separate GitHub-hosted jobs
-   before the environment approval gate. They have no OIDC or cloud credentials.
-2. Once both builds succeed, note the GitHub `run ID-attempt`, for example `123456789-1`. The
-   trusted operator chooses an absolute UTC opening 2–5 minutes ahead and a cutoff 15–60 minutes
-   after opening. Use about 20 minutes for the first pilot. The 15-minute minimum leaves room for
-   the ten-minute launch admission floor, up to two minutes of scheduled-action delay, and three
-   minutes of headroom. It is an admission minimum, not a guarantee that preparation or a suite will
-   complete. All boot, download, formatting, file generation, hashing, validation, cleanup and
-   upload time must fit inside this window.
+1. Dispatch **AWS benchmark (operator window required)** from main or the explicitly authorized
+   `aws-benchmark-debug-20261019` branch with full lowercase 40-character baseline/candidate SHAs
+   and an allowlisted suite. For the first run choose `aa-smoke` and the same SHA twice. The pilot
+   uses one binary build for both roles, two balanced adjacent pairs, `tiny-10k`, and `source-warm`;
+   it is labeled smoke. Builds finish on separate GitHub-hosted jobs before the environment approval
+   gate. They have no OIDC or cloud credentials.
+2. Once both builds succeed, verify the actual GitHub run's repository, workflow path/ID,
+   `workflow_dispatch` event, exact allowed branch, immutable head SHA, `run ID-attempt`, input
+   revisions and suite against the reviewed run record. Require the privileged job to be waiting for
+   the protected environment. Use operator code from that reviewed checkout. Record the controller
+   SHA separately from the baked image SHA; the mailbox binds the run and benchmark inputs, not the
+   controller source. Reject mismatches before arming or approving. The trusted operator chooses an
+   absolute UTC opening 2–5 minutes ahead and a cutoff 15–60 minutes after opening. Use about 20
+   minutes for the first pilot. The 15-minute minimum leaves room for the ten-minute launch
+   admission floor, up to two minutes of scheduled-action delay, and three minutes of headroom. It
+   is an admission minimum, not a guarantee that preparation or a suite will complete. All boot,
+   download, formatting, file generation, hashing, validation, cleanup and upload time must fit
+   inside this window.
 3. In a local Python 3.12 virtual environment with
    `pip install --require-hashes -r infra/aws_benchmark/requirements.txt`, use an operator
    SSO/session identity:
@@ -210,7 +227,8 @@ authentication/control reads have a short bootstrap budget. The desired-one requ
 mutations remain single-attempt: an uncertain response requires the existing cleanup or
 read-back/reconciliation path, not an automatic second launch or re-armed window.
 
-The fresh controller executes only code checked out at the dispatched main commit. It never runs
+The fresh controller executes only code checked out at the dispatched, reviewed commit on an allowed
+branch, pinned by `github.sha`. Later branch movement does not change that checkout. It never runs
 downloaded binaries, builds candidate source, extracts result ZIPs, or exports AWS credentials to
 other jobs. Build jobs can execute arbitrary Rust build scripts, so pin and review the chosen
 revisions; a revision string and digest provide traceability, not proof that a hostile build told
@@ -284,16 +302,25 @@ a metadata-only failure archive. Failed/incomplete harness records can be downlo
 treated as successful comparisons.
 
 The unversioned S3 mailbox has a fixed number of exact keys and seven-day expiration, plus one-day
-incomplete-multipart cleanup. GitHub build artifacts live one day; result artifacts live seven. Size
-limits are enforced by trusted code, **not by IAM PutObject conditions**. A stolen runtime
-credential can overwrite permitted objects or issue excess requests; neither fixed keys nor
-lifecycle rules are a hard storage/billing cap. S3 storage/requests, AMI snapshots, EBS while
-allocated and public IPv4 addresses can cost money even though there is no always-running VM. Empty
-the bucket before deleting the stack, and delete obsolete AMI snapshots separately.
+incomplete-multipart cleanup. GitHub build artifacts live one day; result/report artifacts live 90
+days (subject to the repository limit). Size limits are enforced by trusted code, **not by IAM
+PutObject conditions**. A stolen runtime credential can overwrite permitted objects or issue excess
+requests; neither fixed keys nor lifecycle rules are a hard storage/billing cap. S3
+storage/requests, AMI snapshots, EBS while allocated and public IPv4 addresses can cost money even
+though there is no always-running VM. Empty the bucket before deleting the stack, and delete
+obsolete AMI snapshots separately.
 
 The current largest suites generate 30–31.25 GiB, below host RAM. This PR adds no larger case. After
 a validated A/A pilot, compare one targeted suite at a time. A future approximately 400 GiB bulk
 experiment needs its own reviewed fixture, storage and deadline plan.
+
+## Result reports
+
+The read-only report job validates bounded evidence and produces a standalone report with separate
+candidate, baseline, controller and baked-worker provenance. Raw results remain unchanged. See
+[result ingestion and reporting](RESULTS.md) for artifact contents, cancellation behavior, parser
+limits, the security boundary and offline-only future history staging. No history publisher is
+enabled, and Depot workflows remain operational.
 
 ## Offline validation and first live acceptance
 
