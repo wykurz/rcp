@@ -23,7 +23,7 @@ def validate(value):
     require(value["repository"] == REPOSITORY and value["workflow"] == WORKFLOW,
             "unexpected workflow repository or path")
     require(value["event"] == "workflow_dispatch", "workflow must be manually dispatched")
-    require(isinstance(value["controller"], str) and re.fullmatch(r"[0-9a-f]{40}", value["controller"])
+    require(re.fullmatch(r"[0-9a-f]{40}", value["controller"])
             and value["workflow_sha"] == value["controller"], "controller/workflow revision mismatch")
     run_id, attempt = value["run"].split("-")
     require(value["run_url"] == f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}",

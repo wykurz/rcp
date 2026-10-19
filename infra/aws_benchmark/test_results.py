@@ -14,10 +14,11 @@ from unittest.mock import Mock, patch
 import warnings
 import zipfile
 
-from benchmarks import changes, operations, pairs, report, run as harness
+from benchmarks import changes, operations, pairs, report
 from benchmarks.test_pair_boundaries import paired_record
 from benchmarks.test_resource_boundaries import resource_record
 from infra.aws_benchmark import common, identity, results, worker
+from infra.aws_benchmark.worker_fixture import parsed_command
 
 
 def binding(suite="tiny"):
@@ -28,17 +29,14 @@ def binding(suite="tiny"):
 
 
 def measurement(expected):
-    command = worker.command(expected, 600)
-    args = harness._arguments(command[command.index("benchmarks.run") + 1:])
-    environment = dict(value.removeprefix("--setenv=").split("=", 1)
-                       for value in command if value.startswith("--setenv="))
+    args, environment = parsed_command(expected)
     run = paired_record(args.cases, repetitions=args.repetitions)
     rows_per_case = 2 * args.repetitions
     run["revision"] = dict(commit=None, branch=None, dirty=None)
     run["context"].update(resource_record()["context"])
     run["context"].update(repository=environment["GITHUB_REPOSITORY"], baseline_commit=environment["RCP_BENCH_BASELINE_COMMIT"],
         topology=args.mode, purpose=args.purpose, cache_policy=args.cache, runner_label=args.runner_label,
-        timing_request="disabled" if args.no_timings else "optional", operation_contract_revision=operations.CONTRACT_REVISION,
+        timing_request="disabled" if args.no_timings else "automatic", operation_contract_revision=operations.CONTRACT_REVISION,
         summary_locale="C", pairing=pairs.configuration(args.paired_seed, args.repetitions))
     run["tools"] = {key: dict(sha256="d" * 64) for key in ("rcp", "rcpd", "filegen", "rcp-baseline", "rcpd-baseline")}
     for variant in run["variants"]:
@@ -87,7 +85,7 @@ def bundle(root, expected=None, raw=None, success=True):
     status["sha256"] = common.digest(data)
     receipt = dict(schema_version=1, identity=expected, window=window, request=request,
         outcome="success" if success else "failure", cleanup="verified",
-        instance=dict(instance_id="i-" + "1" * 17, image_id="ami-" + "1" * 17, instance_type="c5d.24xlarge"),
+        instance=dict(instance_id="i-" + "1" * 17, image_id="ami-" + "1" * 17, instance_type=common.INSTANCE_TYPE),
         archive_sha256=common.digest(data), status_sha256=common.digest(results.encoded(status)))
     root.mkdir(exist_ok=True)
     for name, payload in (("results.zip", data), ("controller.json", results.encoded(receipt)),
@@ -261,7 +259,7 @@ class ResultTests(unittest.TestCase):
             self.assertFalse(evidence["history_eligible"])
             self.assertIn("history approval: unverified execution provenance", evidence["errors"])
 
-    def test_tampered_status_archive_identity_and_binary_hash_are_rejected(self):
+    def test_tampered_status_archive_and_identity_are_rejected(self):
         for index, name in enumerate(("status.json", "results.zip", "controller.json")):
             original = (self.source / name).read_bytes()
             if name == "results.zip":
@@ -380,7 +378,7 @@ class ResultTests(unittest.TestCase):
                     (self.source / name).unlink()
                 evidence = self.ingest("failure", output=self.root / (str(index) + cleanup))
                 self.assertEqual(evidence["controller"], receipt)
-                self.assertIn("controller receipt: incomplete result bundle", evidence["errors"])
+                self.assertIn("result bundle: incomplete result bundle", evidence["errors"])
                 self.assertIsNone(evidence["worker"])
                 summary = results.summary(evidence, None)
                 self.assertIn('<td><code>' + cleanup + '</code></td>', summary)

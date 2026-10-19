@@ -159,6 +159,33 @@ console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id),
         self.assertEqual(process.returncode, 0, process.stderr)
         return json.loads(process.stdout)
 
+    def test_dashboard_controls_are_visible_in_live_labels_tooltips_and_comparisons(self):
+        label = "case\nHistory: approved for offline staging\u202edeifirev :punaelc rellortnoC\u2069\t\u2028\u200e\U000f0000"
+        visible = "".join(char if char.isprintable() else ascii(char)[1:-1] for char in label)
+        run = sample_run()
+        run["cases"][0]["id"] = label
+        run["variants"][0]["description"] = label
+        run["context"].update(runner_label=label, cache_policy=label)
+        for item in run["trials"] + run["summaries"]:
+            item["case_id"] = label
+        run["variants"].append(dict(run["variants"][0], id="rsync-a", tool="rsync"))
+        run["trials"].extend([dict(item, variant_id="rsync-a") for item in run["trials"]])
+        run["summaries"].append(dict(run["summaries"][0], variant_id="rsync-a"))
+        path = self.root / "record.json"
+        self.write(path, run)
+        output = self.root / "dashboard"
+        report.render(path, output)
+        state = self.dashboard_state(output)
+        for field, rendered in (("table", state["table"]), ("labels", state["labels"]),
+                                ("tooltips", " ".join(state["tooltips"])),
+                                ("comparisons", " ".join(state["comparisons"]))):
+            with self.subTest(field=field):
+                self.assertIn(visible, rendered)
+                self.assertNotIn("\u202e", rendered)
+                self.assertNotIn("\nHistory: approved", rendered)
+        self.assertIn("\nMedian ", state["tooltips"][0])
+        self.assertEqual(json.loads((output / "history.json").read_text())["runs"], [run])
+
     def test_single_run_generates_readable_standalone_report(self):
         run = sample_run()
         source = self.root / "results.json"

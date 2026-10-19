@@ -96,9 +96,12 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_manual_trigger_and_single_mailbox_gate_every_privileged_run(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
-        self.assertEqual(self.workflow["concurrency"],
-                         {"group": "aws-benchmark-single-mailbox", "cancel-in-progress": "false"})
+        self.assertNotIn("concurrency", self.workflow)
         jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["benchmark"]["concurrency"],
+                         {"group": "aws-benchmark-single-mailbox", "cancel-in-progress": "false"})
+        for name in ("validate", "build", "report"):
+            self.assertNotIn("concurrency", jobs[name])
         self.assertEqual(set(jobs), {"validate", "build", "benchmark", "report"})
         self.assertEqual(jobs["build"]["needs"], "validate")
         self.assertEqual(jobs["benchmark"]["needs"], "build")
@@ -149,26 +152,40 @@ class WorkflowPolicyTests(unittest.TestCase):
                           if step.get("uses", "").startswith("actions/upload-artifact@")], ["90"])
 
 
-    def producer(self, root):
+    def producer(self, root, attempt="1"):
         steps = self.workflow["jobs"]["benchmark"]["steps"]
         step = next(step for step in steps if step.get("id") == "identity")
         self.assertLess(steps.index(step), next(index for index, item in enumerate(steps)
                         if item.get("uses", "").startswith("actions/download-artifact@")))
         lines = step["run"].splitlines()
         self.assertEqual((lines[0], lines[-1]), ("python3 - <<'PY'", "PY"))
-        env = dict(GITHUB_REF=identity.REF, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+        env = dict(GITHUB_REF=identity.REF, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT=attempt,
                    GITHUB_SHA="c" * 40, GITHUB_REPOSITORY=identity.REPOSITORY,
                    GITHUB_WORKFLOW_REF=identity.WORKFLOW, GITHUB_WORKFLOW_SHA="c" * 40,
                    BASELINE="a" * 40, CANDIDATE="a" * 40, SUITE="aa-smoke",
                    GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_OUTPUT=str(root / "output"),
-                   RUNNER_TEMP=str(root))
-        with patch.dict(os.environ, env), patch.object(identity, "environment", wraps=identity.environment) as read:
+                   RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(root / "summary.md"))
+        printed = io.StringIO()
+        with patch.dict(os.environ, env), redirect_stdout(printed), \
+             patch.object(identity, "environment", wraps=identity.environment) as read:
             exec(compile("\n".join(lines[1:-1]), "producer identity step", "exec"), {})
             read.assert_called_once_with()
         name, encoded = (root / "output").read_text().strip().split("=", 1)
         self.assertEqual(name, "run-identity")
         self.assertEqual((root / "aws-identity.json").read_text(), encoded)
+        self.assertEqual(printed.getvalue(), "RCP_AWS_PRODUCER_IDENTITY=" + encoded + "\n")
+        self.assertEqual((root / "summary.md").read_text(),
+                         "Benchmark producer identity\n\n```json\n" + encoded + "\n```\n\n")
         return env, encoded
+
+    def test_benchmark_rerun_prints_actual_producer_attempt_for_offline_ingestion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, encoded = self.producer(root, attempt="2")
+            binding = identity.load(root / "aws-identity.json")
+            self.assertEqual(binding, json.loads(encoded))
+            self.assertEqual(binding["run"], "123-2")
+            self.assertEqual(binding["run_url"], "https://github.com/wykurz/rcp/actions/runs/123/attempts/2")
 
     def test_controller_receives_the_producer_identity_file_without_duplicate_flags(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,11 +274,12 @@ class WorkflowPolicyTests(unittest.TestCase):
                                                capture_output=True, text=True, timeout=5)
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     text = output.read_text()
+                    self.assertTrue(text.startswith("\n"))
                     if valid:
                         self.assertIn("[ID 456](https://github.com/wykurz/rcp/actions/runs/123/artifacts/456)", text)
                         self.assertIn("SHA-256: `" + digest + "`", text)
                     else:
-                        self.assertEqual(text, "No trusted " + label + " artifact was uploaded. "
+                        self.assertEqual(text, "\nNo trusted " + label + " artifact was uploaded. "
                                               "Do not select an artifact by name.\n")
 
 

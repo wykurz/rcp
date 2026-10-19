@@ -1,5 +1,7 @@
 """Controller receipts cannot infer an image, hide cleanup failure, or change evidence."""
 
+from datetime import datetime, timezone
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -42,9 +44,9 @@ class ReceiptTests(unittest.TestCase):
         with patch.object(controller, "cleanup", side_effect=TimeoutError("unconfirmed") if cleanup_error else None) as cleanup:
             if fail or cleanup_error:
                 with self.assertRaises(TimeoutError if cleanup_error else ValueError):
-                    controller.run(cloud.api, "group", "bucket", selected, root, root / "output", provenance=expected)
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "output")
             else:
-                controller.run(cloud.api, "group", "bucket", selected, root, root / "output", provenance=expected)
+                controller.run(cloud.api, "group", "bucket", expected, root, root / "output")
             cleanup.assert_called_once_with(cloud.api, "group")
         return json.loads((root / "output/controller.json").read_text()), archive
 
@@ -95,10 +97,10 @@ class ReceiptTests(unittest.TestCase):
             cloud.api["s3"].get_object.side_effect = get
             with patch.object(controller, "cleanup") as cleanup, patch.object(controller.time, "sleep") as sleep:
                 if budget is None:
-                    controller.run(cloud.api, "group", "bucket", selected, root, root / "out", expected)
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
                 else:
                     with patch.object(controller, "Budget", return_value=budget), self.assertRaisesRegex(TimeoutError, "observation deadline"):
-                        controller.run(cloud.api, "group", "bucket", selected, root, root / "out", expected)
+                        controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
             cleanup.assert_called_once_with(cloud.api, "group")
             self.assertEqual([call.kwargs["DesiredCapacity"] for call in
                               cloud.api["autoscaling"].set_desired_capacity.call_args_list], [1])
@@ -117,9 +119,9 @@ class ReceiptTests(unittest.TestCase):
     def test_terminal_status_gets_a_final_instance_observation(self):
         observed = dict(InstanceId="i-" + "1" * 17, ImageId="ami-" + "2" * 17, InstanceType="c5d.24xlarge")
         receipt, reads, sleeps = self.observation_run(
-            [{"Reservations": []}, {"Reservations": [{"Instances": [observed]}]}])
+            [{"Reservations": []}, {"Reservations": [{"Instances": [observed]}]}], pending_polls=1)
         self.assertEqual(receipt["instance"]["image_id"], observed["ImageId"])
-        self.assertEqual((reads, sleeps), (2, 0))
+        self.assertEqual((reads, sleeps), (2, 1))
 
     def test_observation_errors_are_isolated_and_capped_without_failing_run(self):
         receipt, reads, sleeps = self.observation_run(
@@ -144,10 +146,106 @@ class ReceiptTests(unittest.TestCase):
         def slow_read(**kwargs):
             budget.left.side_effect = TimeoutError("observation deadline")
             return {"Reservations": []}
-        receipt, reads, sleeps = self.observation_run(slow_read, budget=budget)
+        receipt, reads, sleeps = self.observation_run(slow_read, pending_polls=1, budget=budget)
         self.assertEqual((receipt["outcome"], receipt["cleanup"]), ("failure", "verified"))
         self.assertIsNone(receipt["instance"])
-        self.assertEqual((reads, sleeps), (1, 0))
+        self.assertEqual((reads, sleeps), (1, 1))
+
+    def deadline_run(self, *, success=True, remaining=45, download_seconds=0, pending_first=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cloud, selected, expected = self.prepare(root)
+            window = json.loads(cloud.objects[common.WINDOW_KEY])
+            deadline = common.utc(window["deadline"]).timestamp()
+            clock = {"wall": common.utc(window["opens"]).timestamp() + 1, "monotonic": 100.0}
+            events, launched, polls = [], False, 0
+            archive = b"mandatory terminal archive"
+            terminal = {**common.completed_status(selected["run"], success), "sha256": common.digest(archive)}
+            observed = dict(InstanceId="i-" + "1" * 17, ImageId="ami-" + "2" * 17,
+                            InstanceType="c5d.24xlarge")
+            class ClockDatetime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime.fromtimestamp(clock["wall"], tz)
+            def advance(seconds):
+                clock["wall"] += seconds
+                clock["monotonic"] += seconds
+            def launch(**kwargs):
+                nonlocal launched
+                launched = True
+                cloud.objects[common.RESULTS_KEY] = archive
+                cloud.objects[common.STATUS_KEY] = json.dumps(terminal).encode()
+            def get(**kwargs):
+                nonlocal polls
+                if launched and kwargs["Key"] == common.STATUS_KEY:
+                    polls += 1
+                    if polls == 1:
+                        advance(deadline - remaining - clock["wall"])
+                    events.append("status")
+                    if pending_first and polls == 1:
+                        value = json.dumps(common.pending_status(selected["run"])).encode()
+                        return {"ContentLength": len(value), "Body": io.BytesIO(value)}
+                if kwargs["Key"] == common.RESULTS_KEY:
+                    events.append("archive")
+                    advance(download_seconds)
+                return cloud.get(**kwargs)
+            def describe(**kwargs):
+                if not launched:
+                    return {"Reservations": []}
+                events.append("observation")
+                advance(20)
+                return {"Reservations": [{"Instances": [observed]}]}
+            cloud.api["autoscaling"].set_desired_capacity.side_effect = launch
+            cloud.api["s3"].get_object.side_effect = get
+            cloud.api["ec2"].describe_instances.side_effect = describe
+            with patch.object(controller, "datetime", ClockDatetime), patch.object(common, "datetime", ClockDatetime), \
+                 patch.object(common.time, "time", side_effect=lambda: clock["wall"]), \
+                 patch.object(common.time, "monotonic", side_effect=lambda: clock["monotonic"]), \
+                 patch.object(common.time, "sleep", side_effect=advance), patch.object(controller, "cleanup") as cleanup:
+                if remaining <= 30:
+                    with self.assertRaisesRegex(TimeoutError, "benchmark deadline exhausted"):
+                        controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
+                elif success:
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
+                else:
+                    with self.assertRaisesRegex(ValueError, "worker failed; see bounded partial results"):
+                        controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
+            cleanup.assert_called_once_with(cloud.api, "group")
+            receipt = json.loads((root / "out/controller.json").read_text())
+            self.assertEqual(receipt["window"]["deadline"], window["deadline"])
+            self.assertEqual(receipt["cleanup"], "verified")
+            if remaining <= 30:
+                self.assertFalse((root / "out/results.zip").exists())
+                self.assertEqual(events, ["status"])
+                self.assertIsNone(receipt["archive_sha256"])
+                self.assertEqual(receipt["outcome"], "failure")
+                return
+            self.assertEqual((root / "out/results.zip").read_bytes(), archive)
+            self.assertEqual(receipt["archive_sha256"], common.digest(archive))
+            self.assertEqual(receipt["outcome"], "success" if success else "failure")
+            self.assertEqual(events[:2 if not pending_first else 3],
+                             ["status", "status", "archive"] if pending_first else ["status", "archive"])
+            if download_seconds:
+                self.assertNotIn("observation", events)
+                self.assertIsNone(receipt["instance"])
+            else:
+                self.assertEqual(events[-1], "observation")
+                self.assertEqual(receipt["instance"]["image_id"], observed["ImageId"])
+            self.assertLessEqual(deadline - clock["wall"], 30)
+
+    def test_terminal_archive_precedes_slow_optional_observation_and_keeps_worker_outcome(self):
+        for success in (True, False):
+            for download_seconds in (0, 20):
+                with self.subTest(success=success, download_seconds=download_seconds):
+                    self.deadline_run(success=success, download_seconds=download_seconds)
+
+    def test_expired_download_admission_skips_archive_and_optional_observation(self):
+        self.deadline_run(remaining=30)
+
+    def test_pending_optional_observation_preserves_next_poll_archive_reserve(self):
+        for remaining in (45, 55):
+            with self.subTest(remaining=remaining):
+                self.deadline_run(pending_first=True, remaining=remaining)
 
     def test_failed_required_write_ahead_never_launches_and_final_receipt_is_truthful(self):
         for error in (OSError("injected write-ahead disk failure"), KeyboardInterrupt("cancelled write-ahead")):
@@ -166,7 +264,7 @@ class ReceiptTests(unittest.TestCase):
                     cloud.objects[common.STATUS_KEY] = json.dumps(common.completed_status(selected["run"], True)).encode()
                 cloud.api["autoscaling"].set_desired_capacity.side_effect = launch
                 with patch.object(Path, "replace", replace), patch.object(controller, "cleanup") as cleanup, self.assertRaises(type(error)):
-                    controller.run(cloud.api, "group", "bucket", selected, root, root / "out", expected)
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
                 cloud.api["autoscaling"].set_desired_capacity.assert_not_called()
                 cleanup.assert_not_called()
                 self.assertEqual(failures, 1)
@@ -183,7 +281,7 @@ class ReceiptTests(unittest.TestCase):
                 budget = Mock()
                 budget.left.return_value = 1000
                 observed = dict(InstanceId="i-" + "1" * 17, ImageId="ami-" + "2" * 17, InstanceType="c5d.24xlarge")
-                launched = False
+                launched, polls = False, 0
                 def describe(**kwargs):
                     if phase == "deadline":
                         budget.left.side_effect = TimeoutError("benchmark deadline exhausted")
@@ -195,17 +293,25 @@ class ReceiptTests(unittest.TestCase):
                     status = common.completed_status(selected["run"], False)
                     if phase == "protocol":
                         status["state"] = "legacy-completed"
+                    elif phase == "deadline":
+                        status = common.pending_status(selected["run"])
                     cloud.objects[common.STATUS_KEY] = json.dumps(status).encode()
                 def get(**kwargs):
-                    if launched and phase == "status-timeout" and kwargs["Key"] == common.STATUS_KEY:
-                        raise TimeoutError("status unavailable")
+                    nonlocal polls
+                    if launched and kwargs["Key"] == common.STATUS_KEY:
+                        polls += 1
+                        if phase in ("protocol", "status-timeout") and polls == 1:
+                            value = json.dumps(common.pending_status(selected["run"])).encode()
+                            return {"ContentLength": len(value), "Body": io.BytesIO(value)}
+                        if phase == "status-timeout":
+                            raise TimeoutError("status unavailable")
                     return cloud.get(**kwargs)
                 cloud.api["autoscaling"].set_desired_capacity.side_effect = launch
                 cloud.api["s3"].get_object.side_effect = get
                 error_type = TimeoutError if phase in ("status-timeout", "deadline") else ValueError
                 with patch.object(controller, "Budget", return_value=budget), patch.object(controller, "cleanup") as cleanup, \
                      patch.object(controller.time, "sleep"), self.assertRaises(error_type):
-                    controller.run(cloud.api, "group", "bucket", selected, root, root / "out", expected)
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
                 cleanup.assert_called_once_with(cloud.api, "group")
                 receipt = json.loads((root / "out/controller.json").read_text())
                 self.assertEqual((receipt["outcome"], receipt["cleanup"]), ("failure", "verified"))
@@ -236,8 +342,7 @@ class ReceiptTests(unittest.TestCase):
                 controller.main()
             clients.assert_called_once_with("us-east-1", "runtime-role")
             run.assert_called_once_with({}, "group", "bucket",
-                {key: expected[key] for key in ("run", "baseline", "candidate", "suite")},
-                root / "binaries", root / "out", provenance=expected)
+                expected, root / "binaries", root / "out")
 
     def test_controller_cli_rejects_invalid_identity_before_requesting_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -254,6 +359,16 @@ class ReceiptTests(unittest.TestCase):
             run.assert_not_called()
             self.assertFalse((root / "out").exists())
 
+    def test_missing_or_narrow_identity_never_creates_an_unusable_receipt(self):
+        for provenance in (None, {key: binding()[key] for key in ("run", "baseline", "candidate", "suite")}):
+            cloud, _ = controller_cloud()
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaisesRegex(ValueError, "unexpected workflow identity"):
+                    controller.run(cloud.api, "group", "bucket", provenance, root, root / "out")
+                self.assertFalse((root / "out").exists())
+            self.assertTrue(all(not client.mock_calls for client in cloud.api.values()))
+
     def test_invalid_workflow_identity_never_calls_cloud(self):
         for mutation in (dict(ref="refs/heads/MAIN"), dict(ref="refs/tags/main"),
                          dict(workflow_sha="d" * 40), dict(event="pull_request"),
@@ -261,7 +376,7 @@ class ReceiptTests(unittest.TestCase):
             cloud, selected = controller_cloud()
             expected = {**binding(selected["suite"]), **selected, **mutation}
             with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
-                controller.run(cloud.api, "group", "bucket", selected, Path(directory), Path(directory) / "out", expected)
+                controller.run(cloud.api, "group", "bucket", expected, Path(directory), Path(directory) / "out")
             self.assertTrue(all(not client.mock_calls for client in cloud.api.values()))
 
 
