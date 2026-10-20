@@ -112,9 +112,14 @@ def build(runs, sources):
                       "sources": fingerprints(sources[run["run_id"]])} for run in ordered], "changes": rows}
 
 
-def literal(value):
-    # HTML block tables avoid GFM pipe/backslash interactions; code also suppresses linkification
-    return "<code>" + html.escape(str(value), quote=True).replace("\n", "&#10;").replace("\r", "&#13;") + "</code>"
+def literal(value, limit=None):
+    # controls must stay visible even in pre-wrapped HTML; code suppresses GFM linkification
+    value = "".join(char if char.isprintable() else ascii(char)[1:-1] for char in str(value))
+    # cap the visible representation before HTML escaping: each character expands to at most
+    # six bytes, so callers can bound a complete summary without splitting HTML entities
+    if limit is not None:
+        value = value[:limit]
+    return "<code>" + html.escape(value, quote=True) + "</code>"
 
 
 def link_prefix(base):

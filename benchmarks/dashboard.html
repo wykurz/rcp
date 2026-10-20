@@ -92,9 +92,18 @@
     const colors = ["#087c83", "#ce6b39", "#8053ac", "#238151", "#ad3f6b", "#5269ba", "#9b7624", "#477b96"];
     const svgNS = "http://www.w3.org/2000/svg";
     const $ = id => document.getElementById(id);
+    // match changes.literal: controls, format characters and non-space separators stay visible
+    const visible = (value, formatted = false) => Array.from(String(value), character => {
+      if (character === " " || (formatted && character === "\n") || !/[\p{C}\p{Z}]/u.test(character)) return character;
+      if (character === "\n") return "\\n";
+      if (character === "\r") return "\\r";
+      if (character === "\t") return "\\t";
+      const point = character.codePointAt(0);
+      return "\\" + (point <= 0xff ? "x" : point <= 0xffff ? "u" : "U") + point.toString(16).padStart(point <= 0xff ? 2 : point <= 0xffff ? 4 : 8, "0");
+    }).join("");
     const node = (tag, text, className) => {
       const element = document.createElement(tag);
-      if (text !== undefined) element.textContent = String(text);
+      if (text !== undefined) element.textContent = visible(text);
       if (className) element.className = className;
       return element;
     };
@@ -193,7 +202,13 @@
           const whisker = svgNode("line", {x1: xx, y1: y(summary.minimum), x2: xx, y2: y(summary.maximum), stroke: color, class: "range"}); svg.append(whisker);
           for (const amount of [summary.minimum, summary.maximum]) svg.append(svgNode("line", {x1: xx-5, x2: xx+5, y1: y(amount), y2: y(amount), stroke: color, class: "range"}));
           const dot = svgNode("circle", {cx: xx, cy: y(summary.median), r: 6, fill: color, class: "point"});
-          const title = svgNode("title"); title.textContent = `${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}\nMedian ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s\n${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}${ratios(run,summary).length ? "\nSame-run speedup vs " + ratios(run,summary).join(" · ") : ""}${hasShortSample(run,summary) ? "\nShort sample: at least one repeat under 10 s" : ""}`;
+          const title = svgNode("title");
+          const lines = [`${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}`,
+            `Median ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s`,
+            `${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}`];
+          if (ratios(run,summary).length) lines.push("Same-run speedup vs " + ratios(run,summary).join(" · "));
+          if (hasShortSample(run,summary)) lines.push("Short sample: at least one repeat under 10 s");
+          title.textContent = lines.map(line => visible(line)).join("\n");
           dot.append(title); svg.append(dot);
         }
         const item = node("span", undefined, "legend-item"), swatch = node("span", undefined, "swatch"); swatch.style.background = color;
@@ -220,11 +235,14 @@
         const machine = node("td", group(run));
         const comparisons = node("td");
         const comparisonLines = run.summaries.flatMap(item => ratios(run,item).map(ratio => `${caseName(run,item.case_id)} · ${variantName(run,item.variant_id)} / ${ratio}`));
-        comparisons.textContent = comparisonLines.length ? comparisonLines.join("\n") : "—";
+        comparisons.textContent = comparisonLines.length ? comparisonLines.map(line => visible(line)).join("\n") : "—";
         comparisons.style.whiteSpace = "pre-line";
         const detail = node("td"), details = node("details"), summary = node("summary", "View context");
         const data = {run_id: run.run_id, branch: run.revision.branch, context: run.context, tools: run.tools, trials: run.trials.length, error: run.error || null};
-        details.append(summary, node("pre", JSON.stringify(data, null, 2)));
+        const context = node("pre");
+        // JSON already escapes embedded newlines; preserve only its trusted indentation
+        context.textContent = visible(JSON.stringify(data, null, 2), true);
+        details.append(summary, context);
         details.append(node("h3", "Scoped timings"));
         details.append(node("p", "Cumulative elapsed seconds sum scope invocations. Different scopes and processes can overlap, so totals are not additive wall time.", "footnote"));
         if (!run.trials.some(trial => trial.timings)) {

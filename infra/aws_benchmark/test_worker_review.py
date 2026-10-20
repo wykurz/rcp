@@ -15,7 +15,8 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from infra.aws_benchmark import common, controller, operator, worker
+from infra.aws_benchmark import common, controller, operator, results, worker
+from infra.aws_benchmark.test_results import binding, measurement
 from infra.aws_benchmark.test_safety import FakeCloud, closed, window
 
 
@@ -205,8 +206,13 @@ class WorkerReviewTests(unittest.TestCase):
 
     def test_collection_rejection_still_uploads_trusted_failure_metadata(self):
         with worker_fixture() as (root, cloud, _, _):
-            (root / "data/output/forbidden").symlink_to("/etc/passwd")
-            worker.run(cloud.api["s3"], "bucket")
+            collect = worker.collect
+            def reject_candidate_output(output, metadata, budget):
+                if output is not None:
+                    raise ValueError("result entry limit exceeded")
+                return collect(output, metadata, budget)
+            with patch.object(worker, "collect", side_effect=reject_candidate_output):
+                worker.run(cloud.api["s3"], "bucket")
             metadata, names = report(cloud)
             self.assertEqual(names, ["worker.json"])
             self.assertFalse(metadata["status"]["success"])
@@ -370,37 +376,102 @@ class WorkerReviewTests(unittest.TestCase):
             self.assertEqual(metadata["omitted_or_truncated"], [
                 {"name": "benchmark/results/oversized.bin", "size": 2 * 1024 * 1024, "archived_bytes": 0}])
 
-    def test_operator_controller_worker_status_contract_end_to_end(self):
-        with worker_fixture() as (root, cloud, measure, _), frozen_worker_time(cloud) as clock:
-            lease = json.loads(cloud.objects[common.WINDOW_KEY])
-            cloud.objects.clear()
-            operator.arm(cloud.api, "group", "bucket", lease,
-                         now=lambda: datetime.fromtimestamp(clock["wall"], timezone.utc))
-            opening = common.utc(lease["opens"]).timestamp() + 1
-            clock["monotonic"] += opening - clock["wall"]
-            clock["wall"] = opening
-            asg = cloud.api["autoscaling"]
-            asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
-            def capacity(**kwargs):
-                if kwargs["DesiredCapacity"] == 1:
-                    worker.run(cloud.api["s3"], "bucket")
+    def run_pipeline(self, suite, failure=None):
+        # only cloud/guest effects are faked; all producer and consumer contracts run
+        with worker_fixture() as (root, cloud, measure, stop):
+            expected = binding(suite)
+            lease = {**json.loads(cloud.objects[common.WINDOW_KEY]),
+                     **{key: expected[key] for key in ("run", "baseline", "candidate", "suite")}}
+            cloud.objects[common.WINDOW_KEY] = json.dumps(lease).encode()
+            baked = "f" * 40
+            (root / "revision.txt").write_text(baked)
+            raw = measurement(expected)
+            for value in raw["tools"].values():
+                value["sha256"] = common.digest(b"binary")
+            def execute_measurement(*args, **kwargs):
+                destination = root / "data/output/results/results.json"
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(results.encoded(raw))
+                return Mock(returncode=1 if failure == "measurement" else 0)
+            measure.side_effect = execute_measurement
+            if failure == "stop":
+                stop.side_effect = ValueError("candidate cgroup still contains processes")
+            observed = dict(InstanceId="i-" + "1" * 17, ImageId="ami-" + "2" * 17,
+                            InstanceType="c5d.24xlarge")
+            with frozen_worker_time(cloud) as clock:
+                cloud.objects.clear()
+                operator.arm(cloud.api, "group", "bucket", lease,
+                             now=lambda: datetime.fromtimestamp(clock["wall"], timezone.utc))
+                opening = common.utc(lease["opens"]).timestamp() + 1
+                clock["monotonic"] += opening - clock["wall"]
+                clock["wall"] = opening
+                asg = cloud.api["autoscaling"]
+                asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
+                def capacity(**kwargs):
+                    if kwargs["DesiredCapacity"] == 1:
+                        worker.run(cloud.api["s3"], "bucket")
+                        cloud.api["ec2"].describe_instances.return_value = {
+                            "Reservations": [{"Instances": [observed]}]}
+                    else:
+                        cloud.api["ec2"].describe_instances.return_value = {"Reservations": []}
+                asg.set_desired_capacity.side_effect = capacity
+                binaries = root / "controller-binaries"
+                for key in common.BINARIES:
+                    binary = binaries / key
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_bytes(b"binary")
+                output = root / "controller-output"
+                if failure:
+                    with self.assertRaisesRegex(ValueError, "worker failed; see bounded partial results"):
+                        controller.run(cloud.api, "group", "bucket", expected, binaries, output)
                 else:
-                    asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed(1)]}
-            asg.set_desired_capacity.side_effect = capacity
-            binaries = root / "controller-binaries"
-            for key in common.BINARIES:
-                binary = binaries / key
-                binary.parent.mkdir(parents=True, exist_ok=True)
-                binary.write_bytes(b"binary")
-            output = root / "controller-output"
-            identity = {key: lease[key] for key in ("run", "baseline", "candidate", "suite")}
-            controller.run(cloud.api, "group", "bucket", identity, binaries, output)
+                    controller.run(cloud.api, "group", "bucket", expected, binaries, output)
             status = json.loads((output / "status.json").read_text())
+            archive = (output / "results.zip").read_bytes()
             self.assertEqual(status["run"], lease["run"])
-            self.assertTrue(status["success"])
-            self.assertEqual(status["sha256"], common.digest((output / "results.zip").read_bytes()))
+            self.assertEqual(status["success"], failure is None)
+            self.assertEqual(status["sha256"], common.digest(archive))
             self.assertEqual([call.kwargs["DesiredCapacity"] for call in asg.set_desired_capacity.call_args_list], [1, 0])
             measure.assert_called_once()
+            policy = dict(schema_version=1, identity=expected, archive_sha256=common.digest(archive),
+                          ami_id=observed["ImageId"], harness_revision=baked)
+            derived = root / "ingested"
+            evidence = results.ingest(output, derived, expected, "failure" if failure else "success",
+                                      policy if suite == "tiny" else None)
+            for name in ("controller.json", "status.json", "results.zip"):
+                self.assertEqual((derived / "raw" / name).read_bytes(), (output / name).read_bytes())
+            self.assertEqual(evidence["controller"]["window"], lease)
+            self.assertEqual(evidence["controller"]["cleanup"], "verified")
+            self.assertEqual(evidence["controller"]["instance"]["image_id"], observed["ImageId"])
+            self.assertEqual(evidence["worker"]["request"], evidence["controller"]["request"])
+            self.assertEqual(evidence["worker"]["status"], {k: v for k, v in status.items() if k != "sha256"})
+            self.assertEqual(evidence["controller"]["archive_sha256"], common.digest(archive))
+            self.assertEqual(evidence["history_eligible"], suite == "tiny" and failure is None, evidence["errors"])
+            if failure:
+                self.assertIn("history approval: diagnostic run cannot enter performance history", evidence["errors"])
+                self.assertEqual(evidence["controller"]["outcome"], "failure")
+                if failure == "stop":
+                    self.assertIn("harness result unavailable", evidence["errors"])
+                    self.assertEqual(evidence["worker"]["status"]["stop_error"]["message"],
+                                     "candidate cgroup still contains processes")
+                else:
+                    self.assertEqual(evidence["worker"]["service_returncode"], 1)
+            else:
+                self.assertEqual(evidence["errors"], [])
+                self.assertEqual(evidence["controller"]["outcome"], "success")
+            self.assertEqual((derived / "dashboard/index.html").exists(), failure != "stop")
+
+    def test_real_smoke_pipeline_ingests_complete_diagnostic_evidence(self):
+        self.run_pipeline("aa-smoke")
+
+    def test_real_tiny_pipeline_is_eligible_under_exact_offline_policy(self):
+        self.run_pipeline("tiny")
+
+    def test_real_failed_measurement_pipeline_keeps_results_and_refuses_approval(self):
+        self.run_pipeline("tiny", failure="measurement")
+
+    def test_real_failed_stop_pipeline_keeps_supervisor_evidence_without_candidate_output(self):
+        self.run_pipeline("tiny", failure="stop")
 
 
     def test_invalid_window_never_rearms_alarm_or_enters_reporting(self):

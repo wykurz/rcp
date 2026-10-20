@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import errno
 import io
 import itertools
 import json
@@ -19,8 +20,8 @@ import threading
 import zipfile
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
-                     completed_status, digest, error_code, get_bytes, get_json, put_json, require, retry_io,
-                     timestamp, validate_request, validate_window,
+                     archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
+                     measurement_contract, put_json, require, retry_io, timestamp, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
@@ -107,6 +108,7 @@ def cache_server(budget, uid):
 
 
 def command(window, seconds):
+    contract = measurement_contract(window["suite"])
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -128,12 +130,11 @@ def command(window, seconds):
              "--setenv=RCP_BENCH_BASELINE_COMMIT=" + window["baseline"],
              "--setenv=GITHUB_REPOSITORY=wykurz/rcp", "/usr/bin/python3", "-m", "benchmarks.run",
              "--bin-dir", str(STATE / "candidate"), "--baseline-bin-dir", str(STATE / "baseline"),
-             "--mode", "local", "--variant", "rcp-default", "--paired-seed", "0",
-             "--repetitions", "2" if window["suite"] == "aa-smoke" else "4",
+             "--mode", "local", "--variant", "rcp-default",
+             "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
-             "--purpose", "smoke" if window["suite"] == "aa-smoke" else "performance",
-             "--cache", "source-warm" if window["suite"] == "aa-smoke" else "linux-drop-caches",
-             "--timeout", "600", "--runner-label", "aws-c5d24-ext4-isolated-v1",
+             "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
+             "--timeout", "600", "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
              "--source-storage-id", "c5d-local-ext4-source", "--destination-storage-id", "c5d-local-ext4-destination",
              "--output", str(DATA / "output" / "results")]
@@ -155,14 +156,14 @@ def collect(output, metadata, budget):
         nonlocal omitted
         omitted += 1
         if len(omissions) < 128:
-            omissions.append(dict(name=name[:512], size=size, archived_bytes=kept))
+            # a filesystem surrogate must not poison the trusted metadata JSON
+            display_name = name.encode("utf-8", errors="backslashreplace").decode("utf-8")
+            omissions.append(dict(name=display_name[:512], size=size, archived_bytes=kept))
     def priority(entry):
         return (entry.name not in ("results", "results.json", "summary.md"), entry.name)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as result:
-        def walk(fd, prefix, depth):
+        def walk(fd, prefix):
             nonlocal total, count
-            # results/logs/<case>/<variant>/<iteration>/ is the harness's layout.
-            require(depth <= 5, "result directory nesting limit exceeded")
             with os.scandir(fd) as entries:
                 batch = list(itertools.islice(entries, 1001 - count))
             count += len(batch)
@@ -170,16 +171,33 @@ def collect(output, metadata, budget):
             for entry in sorted(batch, key=priority):
                 name = entry.name
                 budget.left(60)
-                require(len(name) <= 200, "result name limit exceeded")
-                require(name not in (".", "..") and "/" not in name and "\\" not in name, "unsafe result name")
-                child = os.open(name, flags, dir_fd=fd)
+                member = prefix + name
+                # this snapshot only filters entries that need no content read.
+                # opened files still pass the held-descriptor checks below.
+                observed = entry.stat(follow_symlinks=False)
+                if (not archive_name_supported(member)
+                        or not (stat.S_ISREG(observed.st_mode) or stat.S_ISDIR(observed.st_mode))):
+                    omit(member, observed.st_size, 0)
+                    continue
+                try:
+                    child = os.open(name, flags, dir_fd=fd)
+                except OSError as error:
+                    if error.errno not in (errno.ELOOP, errno.ENXIO):
+                        raise
+                    omit(member, entry.stat(follow_symlinks=False).st_size, 0)
+                    continue
                 try:
                     info = os.fstat(child)
-                    member = prefix + name
                     if stat.S_ISDIR(info.st_mode):
-                        walk(child, member + "/", depth + 1)
+                        # do not enter a directory whose children cannot be archived
+                        if archive_name_supported(member + "/_"):
+                            walk(child, member + "/")
+                        else:
+                            omit(member, info.st_size, 0)
                         continue
-                    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "non-regular or linked result")
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        omit(member, info.st_size, 0)
+                        continue
                     overhead = 76 + 2 * len(member.encode("utf-8"))
                     remaining = max(0, available - total - overhead)
                     limit = min(1024 * 1024, remaining) if name.endswith(".log") else remaining
@@ -210,7 +228,7 @@ def collect(output, metadata, budget):
             if fd is not None:
                 try:
                     # Candidate names cannot duplicate trusted worker.json.
-                    walk(fd, "benchmark/", 0)
+                    walk(fd, "benchmark/")
                 finally:
                     os.close(fd)
         record = dict(metadata)

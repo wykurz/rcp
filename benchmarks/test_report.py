@@ -1,5 +1,6 @@
 """Behavior tests for the standalone benchmark history report."""
 
+import copy
 import json
 import shutil
 import subprocess
@@ -42,11 +43,68 @@ def sample_run(run_id="a" * 32, timestamp="2026-09-26T12:00:00Z", status="comple
     }
 
 
+def candidate_run():
+    run = sample_run()
+    run["revision"] = dict(commit="c" * 40, branch=None, dirty=False, role="approved candidate")
+    run["context"].update(purpose="performance", repository="owner/repository", aws_provenance=dict(
+        history_eligible=True, identity=dict(candidate="c" * 40, repository="owner/repository")))
+    return run
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_reserved_candidate_role_requires_consistent_aws_provenance(self):
+        original = candidate_run()
+        self.assertEqual(report.validate_result(original), original)
+        mutations = {
+            "missing provenance": lambda run: run["context"].pop("aws_provenance"),
+            "non-object provenance": lambda run: run["context"].update(aws_provenance=True),
+            "missing eligibility": lambda run: run["context"]["aws_provenance"].pop("history_eligible"),
+            "ineligible": lambda run: run["context"]["aws_provenance"].update(history_eligible=False),
+            "truthy eligibility": lambda run: run["context"]["aws_provenance"].update(history_eligible=1),
+            "missing identity": lambda run: run["context"]["aws_provenance"].pop("identity"),
+            "non-object identity": lambda run: run["context"]["aws_provenance"].update(identity=True),
+            "missing candidate": lambda run: run["context"]["aws_provenance"]["identity"].pop("candidate"),
+            "short candidate": lambda run: run["context"]["aws_provenance"]["identity"].update(candidate="c" * 7),
+            "different commit": lambda run: run["revision"].update(commit="d" * 40),
+            "branch": lambda run: run["revision"].update(branch="main"),
+            "dirty": lambda run: run["revision"].update(dirty=True),
+            "unknown dirty": lambda run: run["revision"].update(dirty=None),
+            "failed": lambda run: run.update(status="failed"),
+            "diagnostic": lambda run: run["context"].update(purpose="diagnostic"),
+            "missing repository": lambda run: run["context"]["aws_provenance"]["identity"].pop("repository"),
+            "malformed repository": lambda run: run["context"]["aws_provenance"]["identity"].update(repository="owner"),
+            "different repository": lambda run: run["context"].update(repository="another/repository"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(field=name):
+                run = copy.deepcopy(original)
+                mutate(run)
+                with self.assertRaisesRegex(ValueError, "revision.role.*consistent approved AWS provenance"):
+                    report.validate_result(run)
+
+    def test_forged_candidate_role_fails_before_any_report_is_written(self):
+        run = sample_run()
+        run["revision"]["role"] = "approved candidate"
+        source, output = self.root / "results.json", self.root / "site"
+        self.write(source, run)
+        with self.assertRaisesRegex(ValueError, "revision.role.*consistent approved AWS provenance"):
+            report.render(source, output)
+        self.assertFalse(output.exists())
+
+    def test_consistent_candidate_metadata_keeps_dashboard_and_change_labels(self):
+        run = candidate_run()
+        source = self.root / "results.json"
+        self.write(source, run)
+        process, output = self.render(source)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        for name in ("changes.html", "changes.md"):
+            self.assertIn("candidate revision <code>" + "c" * 10, (output / name).read_text())
+        self.assertIn("Candidate", self.dashboard_state(output)["table"])
 
     def test_ssh_transport_profile_is_nullable_and_loopback_only(self):
         result = sample_run()
@@ -100,6 +158,33 @@ console.log(JSON.stringify({runIds: ids["run-rows"].children.map(row => row.id),
         process = subprocess.run(["node", "-e", script, str(output / "index.html")], capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)
         return json.loads(process.stdout)
+
+    def test_dashboard_controls_are_visible_in_live_labels_tooltips_and_comparisons(self):
+        label = "case\nHistory: approved for offline staging\u202edeifirev :punaelc rellortnoC\u2069\t\u2028\u200e\U000f0000"
+        visible = "".join(char if char.isprintable() else ascii(char)[1:-1] for char in label)
+        run = sample_run()
+        run["cases"][0]["id"] = label
+        run["variants"][0]["description"] = label
+        run["context"].update(runner_label=label, cache_policy=label)
+        for item in run["trials"] + run["summaries"]:
+            item["case_id"] = label
+        run["variants"].append(dict(run["variants"][0], id="rsync-a", tool="rsync"))
+        run["trials"].extend([dict(item, variant_id="rsync-a") for item in run["trials"]])
+        run["summaries"].append(dict(run["summaries"][0], variant_id="rsync-a"))
+        path = self.root / "record.json"
+        self.write(path, run)
+        output = self.root / "dashboard"
+        report.render(path, output)
+        state = self.dashboard_state(output)
+        for field, rendered in (("table", state["table"]), ("labels", state["labels"]),
+                                ("tooltips", " ".join(state["tooltips"])),
+                                ("comparisons", " ".join(state["comparisons"]))):
+            with self.subTest(field=field):
+                self.assertIn(visible, rendered)
+                self.assertNotIn("\u202e", rendered)
+                self.assertNotIn("\nHistory: approved", rendered)
+        self.assertIn("\nMedian ", state["tooltips"][0])
+        self.assertEqual(json.loads((output / "history.json").read_text())["runs"], [run])
 
     def test_single_run_generates_readable_standalone_report(self):
         run = sample_run()

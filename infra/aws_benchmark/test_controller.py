@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from infra.aws_benchmark import common, controller, operator
+from infra.aws_benchmark.test_results import binding
 from infra.aws_benchmark.test_safety import FakeCloud, Missing, NOW, closed, window
 
 
@@ -190,7 +191,7 @@ def run_controller(cloud, identity, root):
     for key in common.BINARIES:
         (root / key).parent.mkdir(exist_ok=True)
         (root / key).write_bytes(b"binary")
-    controller.run(cloud.api, "group", "bucket", identity, root, root / "out")
+    controller.run(cloud.api, "group", "bucket", {**binding(identity["suite"]), **identity}, root, root / "out")
 
 
 class ControllerMailboxTests(unittest.TestCase):

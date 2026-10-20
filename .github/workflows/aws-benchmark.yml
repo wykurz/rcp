@@ -21,10 +21,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: aws-benchmark-single-mailbox
-  cancel-in-progress: false
-
 jobs:
   validate:
     if: >-
@@ -117,12 +113,17 @@ jobs:
 
   benchmark:
     needs: build
+    # only this job uses the mailbox; report-only retries must not queue or displace paid jobs
+    concurrency:
+      group: aws-benchmark-single-mailbox
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     # includes the maximum opening lead/window, teardown, and bounded final upload
     timeout-minutes: 90
     # required reviewer arms the window only after both build jobs have completed
     environment: aws-benchmark
     outputs:
+      run-identity: ${{ steps.identity.outputs.run-identity }}
       result-artifact-id: ${{ steps.raw-results.outputs.artifact-id }}
     permissions:
       contents: read
@@ -132,6 +133,26 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Bind the producer attempt before reading candidate artifacts
+        id: identity
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          CANDIDATE: ${{ inputs.candidate }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from infra.aws_benchmark.identity import environment
+          binding = json.dumps(environment(), sort_keys=True, separators=(',', ':'))
+          print('RCP_AWS_PRODUCER_IDENTITY=' + binding)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print('Benchmark producer identity\n\n```json\n' + binding + '\n```\n', file=summary)
+          (Path(os.environ['RUNNER_TEMP']) / 'aws-identity.json').write_text(binding, encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('run-identity=' + binding, file=output)
+          PY
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: aws-baseline
@@ -146,9 +167,6 @@ jobs:
           "$RUNNER_TEMP/aws-sdk/bin/pip" install --require-hashes -r infra/aws_benchmark/requirements.txt
       - name: Run within the operator window and verify teardown
         env:
-          BASELINE: ${{ inputs.baseline }}
-          CANDIDATE: ${{ inputs.candidate }}
-          SUITE: ${{ inputs.suite }}
           AWS_REGION: ${{ vars.RCP_AWS_REGION }}
           ASG: ${{ vars.RCP_AWS_ASG }}
           BUCKET: ${{ vars.RCP_AWS_BUCKET }}
@@ -157,8 +175,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/aws-sdk/bin/python" -m infra.aws_benchmark.controller \
             --region "$AWS_REGION" --asg "$ASG" --bucket "$BUCKET" --role-arn "$ROLE" \
-            --run "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --baseline "$BASELINE" --candidate "$CANDIDATE" --suite "$SUITE" \
+            --identity "$RUNNER_TEMP/aws-identity.json" \
             --binaries "$RUNNER_TEMP/binaries" --output "$RUNNER_TEMP/aws-results"
       - name: Preserve bounded results even when a comparison fails
         id: raw-results
@@ -171,9 +188,22 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+      - name: Identify the trusted raw artifact
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.raw-results.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.raw-results.outputs.artifact-digest }}
+        run: |
+          if [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            printf '\nTrusted raw artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
+              "$ARTIFACT_ID" "$GITHUB_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '\nNo trusted raw artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   report:
     needs: [validate, benchmark]
-    if: always() && needs.validate.result == 'success' && needs.benchmark.outputs.result-artifact-id != ''
+    if: always() && needs.validate.result == 'success' && needs.benchmark.outputs.result-artifact-id != '' && needs.benchmark.outputs.run-identity != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # untrusted result parsing has no environment, OIDC, AWS credentials or history write access
@@ -191,12 +221,12 @@ jobs:
           path: ${{ runner.temp }}/aws-raw
       - name: Validate bounded evidence and render diagnostic report
         env:
-          BASELINE: ${{ inputs.baseline }}
-          CANDIDATE: ${{ inputs.candidate }}
-          SUITE: ${{ inputs.suite }}
+          PRODUCER_IDENTITY: ${{ needs.benchmark.outputs.run-identity }}
           PRODUCER_CONCLUSION: ${{ needs.benchmark.result }}
         run: |
+          printf '%s\n' "$PRODUCER_IDENTITY" > "$RUNNER_TEMP/aws-identity.json"
           python3 -m infra.aws_benchmark.results "$RUNNER_TEMP/aws-raw" \
+            --identity "$RUNNER_TEMP/aws-identity.json" \
             --output "$RUNNER_TEMP/aws-report" --conclusion "$PRODUCER_CONCLUSION"
       - name: Add readable result summary
         if: always()
@@ -205,11 +235,24 @@ jobs:
             cat "$RUNNER_TEMP/aws-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Preserve raw evidence and derived report
+        id: report-results
         if: always()
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aws-benchmark-report
+          name: aws-benchmark-report-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aws-report/
           retention-days: 90
           if-no-files-found: warn
+      - name: Identify the trusted report artifact
+        if: always()
+        env:
+          ARTIFACT_ID: ${{ steps.report-results.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.report-results.outputs.artifact-digest }}
+        run: |
+          if [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            printf '\nTrusted report artifact: [ID %s](https://github.com/wykurz/rcp/actions/runs/%s/artifacts/%s)\n\nSHA-256: `%s`\n' \
+              "$ARTIFACT_ID" "$GITHUB_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '\nNo trusted report artifact was uploaded. Do not select an artifact by name.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -16,6 +16,7 @@ MAX_WINDOW = 3600
 MAX_OPEN_LEAD = 300
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
+INSTANCE_TYPE = "c5d.24xlarge"
 WINDOW_KEY = "control/window.json"
 REQUEST_KEY = "input/request.json"
 RESULTS_KEY = "output/results.zip"
@@ -29,9 +30,38 @@ SUITES = {"aa-smoke": ("tiny-10k",), "tiny": ("tiny-1m",),
           "medium": ("medium-128k",), "large": ("large-120",), "deep": ("deep-20x80",)}
 
 
+# the baked worker and offline approval must describe the same measurement
+PERFORMANCE_CONTRACT = dict(paired_seed=0, repetitions=4, purpose="performance",
+    cache_policy="linux-drop-caches", runner_label="aws-c5d24-ext4-isolated-v1")
+
+
+def measurement_contract(suite):
+    require(suite in SUITES, "suite is not allowlisted")
+    contract = PERFORMANCE_CONTRACT.copy()
+    if suite == "aa-smoke":
+        contract.update(repetitions=2, purpose="smoke", cache_policy="source-warm")
+    return contract
+
+
+class ValidationError(ValueError):
+    """A validation failure whose message is supplied by trusted code."""
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise ValidationError(message)
+
+
+def archive_name_supported(name):
+    # collection and reporting share structural limits. Portability and case-fold
+    # collisions are separate reporting policy; existing diagnostic names survive.
+    parts = name.split("/")
+    try:
+        size = len(name.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    return (size <= 1200 and len(parts) <= 7 and "\\" not in name
+            and all(part not in ("", ".", "..") and len(part) <= 200 for part in parts))
 
 
 def utc(value):
