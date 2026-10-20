@@ -38,6 +38,9 @@ def measurement(expected):
         topology=args.mode, purpose=args.purpose, cache_policy=args.cache, runner_label=args.runner_label,
         timing_request="disabled" if args.no_timings else "automatic", operation_contract_revision=operations.CONTRACT_REVISION,
         summary_locale="C", pairing=pairs.configuration(args.paired_seed, args.repetitions))
+    if args.streaming_verification:
+        run["context"]["verification"] = dict(policy=("metadata-size-tree-v1"
+            if args.verification_mode == "metadata-size" else "sha256-tree-stream-v1"), workers=args.verification_workers)
     run["tools"] = {key: dict(sha256="d" * 64) for key in ("rcp", "rcpd", "filegen", "rcp-baseline", "rcpd-baseline")}
     for variant in run["variants"]:
         variant["args"] = ["--summary"]
@@ -50,7 +53,11 @@ def measurement(expected):
         pairing = pairs.trial_metadata(run["context"]["pairing"], case["id"], iteration + 1, position)
         role = pairing["order"][position]
         proof = dict(ok=True, counts=counts, digest=case["fixture_digest"])
+        if args.streaming_verification and args.verification_mode == "metadata-size":
+            proof["policy"] = "metadata-size-tree-v1"
         metadata = dict(ok=True, entries=counts["directories"] + counts["files"] + 1)
+        if args.streaming_verification and args.verification_mode == "metadata-size":
+            proof["metadata"] = dict(metadata, checked_fields=["mode"])
         trial.update(resource_record(status="ok")["trials"][0])
         trial.update(variant_id=role, pairing=pairing, elapsed_seconds=1.0 if role == pairs.CANDIDATE else 2.0,
             child_locale="C", operation="fresh", expected_transfer=operations.transfer_counts("fresh", counts),

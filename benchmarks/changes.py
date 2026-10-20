@@ -40,8 +40,10 @@ def exclusion(run):
 
 
 def identity(run, summary):
-    # series IDs already bind workload, tools, environment and measurement contracts
-    return (run["context"]["repository"], summary["series_id"], summary["case_id"], summary["variant_id"])
+    # producers bind verification into series IDs; also check the explicit contract on import.
+    verification = run["context"].get("verification") or {}
+    return (run["context"]["repository"], summary["series_id"], summary["case_id"], summary["variant_id"],
+            verification.get("policy"), verification.get("workers"))
 
 
 def fingerprints(sources):
@@ -50,11 +52,13 @@ def fingerprints(sources):
 
 
 def point(run, summary, sources):
+    from benchmarks.report import verification_label
     indices = [index for index, trial in enumerate(run["trials"])
                if trial["case_id"] == summary["case_id"] and trial["variant_id"] == summary["variant_id"]]
     return {
         "run_id": run["run_id"], "timestamp": run["timestamp"], "run_status": run["status"],
         "revision": run["revision"], "sources": fingerprints(sources[run["run_id"]]),
+        "verification_label": verification_label(run["context"]),
         "median_seconds": summary["median"], "minimum_seconds": summary["minimum"],
         "maximum_seconds": summary["maximum"], "samples_seconds": summary["samples"],
         "trial_indices": indices, "case_order": [case["id"] for case in run["cases"]],
@@ -64,6 +68,7 @@ def point(run, summary, sources):
 
 def build(runs, sources):
     """Compare only strictly earlier compatible observations; never evaluate acceptance."""
+    from benchmarks.report import verification_label
     ordered = sorted(runs, key=lambda run: (timestamp(run), run["run_id"]))
     previous = {}
     rows = []
@@ -107,6 +112,7 @@ def build(runs, sources):
                       "revision": run["revision"], "repository": run["context"].get("repository"),
                       "topology": run["context"]["topology"], "runner_label": run["context"]["runner_label"],
                       "cache_policy": run["context"]["cache_policy"],
+                      "verification_label": verification_label(run["context"]),
                       "case_order": [case["id"] for case in run["cases"]],
                       "exclusion": exclusion(run), "completed_summaries": len(run["summaries"]),
                       "sources": fingerprints(sources[run["run_id"]])} for run in ordered], "changes": rows}
@@ -194,6 +200,7 @@ def markdown(evidence, limit=10, link_base=""):
         lines += [f"<h2>{literal(item['timestamp'])} — {literal(item['topology'])}</h2>",
                   f"<p>Run {run_link(item, prefix)} · {literal(item['status'])} · {revision_role(item)} {revision(item)} · "
                   f"{literal(item['repository'])} · {literal(item['runner_label'])} · {literal(item['cache_policy'])}</p>",
+                  f"<p>Validation: {literal(item['verification_label'])}.</p>",
                   "<p>Recorded case order: " + ", ".join(literal(case) for case in item["case_order"]) + "</p>"]
         if item["exclusion"]:
             lines.append(f"<p>Excluded from historical comparisons: {literal(item['exclusion'])}.</p>")

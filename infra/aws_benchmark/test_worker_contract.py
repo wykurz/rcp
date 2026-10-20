@@ -35,7 +35,7 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertEqual(args.resource_time, Path("/usr/bin/time"))
 
     def test_large_qualification_profiles_are_bounded_and_never_history_eligible(self):
-        for suite in common.LARGE_SUITES:
+        for suite in common.LARGE_SUITES.keys() - common.METADATA_SUITES.keys():
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 args, _ = parsed_command(expected)
@@ -43,6 +43,8 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertTrue(args.streaming_verification)
                 self.assertTrue(args.check_capacity)
                 self.assertEqual(args.verification_workers, 8)
+                self.assertNotIn("--verification-mode", argv)
+                self.assertEqual(common.verification_contract(suite), dict(policy="sha256-tree-stream-v1", workers=8))
                 self.assertEqual(args.timeout, 1200)
                 self.assertEqual(args.repetitions, 2)
                 self.assertEqual(args.purpose, "smoke")
@@ -55,6 +57,63 @@ class WorkerContractTests(unittest.TestCase):
                 evidence, record, policy = self.inspected_measurement(expected)
                 with self.assertRaisesRegex(ValueError, "diagnostic"):
                     results.approve(evidence, record, policy)
+
+    def test_metadata_performance_suite_keeps_storage_deadline_and_proof_identity(self):
+        expected = binding("bulk-1g-metadata")
+        args, _ = parsed_command(expected)
+        argv = worker.command(expected, 417)
+        self.assertEqual(args.cases, ["bulk-1g-1tb"])
+        self.assertTrue(args.streaming_verification)
+        self.assertTrue(args.check_capacity)
+        self.assertEqual(args.verification_mode, "metadata-size")
+        self.assertEqual(args.verification_workers, 8)
+        self.assertEqual(args.timeout, 1200)
+        self.assertEqual(args.repetitions, 2)
+        self.assertEqual(args.purpose, "performance")
+        self.assertEqual(args.runner_label, "aws-c5d24-ext4-raid0-metadata-v1")
+        self.assertEqual(args.cache, "linux-drop-caches")
+        self.assertEqual(args.source_storage_id, "c5d-raid0-ext4-source-v1")
+        self.assertEqual(args.destination_storage_id, "c5d-raid0-ext4-destination-v1")
+        self.assertIn("--property=RuntimeMaxSec=417", argv)
+        self.assertEqual(common.RESERVE, 180)
+        evidence, record, policy = self.inspected_measurement(expected)
+        self.assertFalse(evidence["history_eligible"])
+        verification = dict(policy="metadata-size-tree-v1", workers=8)
+        self.assertEqual(record["context"]["verification"], verification)
+        self.assertEqual(evidence["expected_verification"], verification)
+        self.assertEqual(len(record["trials"]), 4)
+        self.assertIn("file content integrity not checked", results.summary(evidence, record))
+        results.approve(evidence, record, policy)
+        self.assertTrue(evidence["history_eligible"])
+        self.assertEqual(results.derived_record(evidence, record)["context"]["aws_provenance"]["expected_verification"],
+                         verification)
+
+    def test_suite_verification_drift_cannot_be_inspected_or_approved(self):
+        for suite, drift in (("bulk-1g-metadata", None),
+                ("bulk-1g-metadata", dict(policy="sha256-tree-stream-v1", workers=8)),
+                ("bulk-1g-metadata", dict(policy="metadata-size-tree-v1", workers=4)),
+                ("bulk-1g", dict(policy="metadata-size-tree-v1", workers=8)),
+                ("tiny", dict(policy="metadata-size-tree-v1", workers=8))):
+            with self.subTest(suite=suite, drift=drift):
+                expected = binding(suite)
+                evidence, record, policy = self.inspected_measurement(expected)
+                changed = copy.deepcopy(record)
+                if drift is None:
+                    changed["context"].pop("verification", None)
+                else:
+                    changed["context"]["verification"] = drift
+                if common.measurement_contract(suite)["purpose"] == "performance":
+                    with self.assertRaisesRegex(ValueError, "unexpected suite verification contract"):
+                        results.approve(copy.deepcopy(evidence), changed, policy)
+                with tempfile.TemporaryDirectory() as directory:
+                    source = Path(directory)
+                    bundle(source, expected, changed)
+                    # Focus the ingress contract test independently of generic proof-schema rejection.
+                    with patch.object(results.report, "validate_result", return_value=changed):
+                        inspected, parsed, _ = results.inspect(source, expected, "success")
+                    self.assertIsNone(parsed)
+                    self.assertEqual(inspected["errors"], ["measurement record: unexpected suite verification contract"])
+                    self.assertFalse(inspected["history_eligible"])
 
     def inspected_measurement(self, expected):
         temporary = tempfile.TemporaryDirectory()
