@@ -24,10 +24,10 @@ filesystems. Do not compare their absolute times as an XFS reproduction.
 
 ## Storage admission
 
-Only these four suites create two disjoint RAID0 arrays on the four expected approximately 900 GB
-instance-store NVMe disks. Each array has two members, a 512 KiB chunk and metadata version 1.2;
-source and destination each have roughly 1.8 TB raw capacity. RAID0 has no redundancy. Either member
-failing invalidates that disposable filesystem and the measurement.
+These four suites and `bulk-1g-metadata` create two disjoint RAID0 arrays on the four expected
+approximately 900 GB instance-store NVMe disks. Each array has two members, a 512 KiB chunk and
+metadata version 1.2; source and destination each have roughly 1.8 TB raw capacity. RAID0 has no
+redundancy. Either member failing invalidates that disposable filesystem and the measurement.
 
 Before creating either array, the trusted supervisor rejects unexpected NVMe models, anything other
 than exactly four instance-store whole disks, duplicate paths/device numbers/serials, partitions,
@@ -90,6 +90,38 @@ Runner ID `aws-c5d24-ext4-raid0-stream-v1` and storage IDs `c5d-raid0-ext4-sourc
 `c5d-raid0-ext4-destination-v1` prevent pooling with the old single-disk layout. Eight verification
 workers are an initial bounded choice, not a demonstrated throughput optimum.
 
+## Performance mode without payload hashing
+
+The separate allowlisted suite **`bulk-1g-metadata`** uses the same `bulk-1g-1tb` random-byte
+fixture, two balanced adjacent pairs (four copies), cold-cache policy, per-command timeout, storage
+layout and absolute lease. Its purpose is `performance`, with runner
+`aws-c5d24-ext4-raid0-metadata-v1` and verification identity `metadata-size-tree-v1` (eight
+workers). It passes `--streaming-verification --verification-mode metadata-size`; the four original
+suites retain their full-content verification and smoke purpose.
+
+Only this performance mode omits **both the initial and per-trial full-content scans**. The trusted
+baked Python verifier checks expected relative paths, counts, entry types and file sizes; it rejects
+missing, extra, truncated, linked or special files. Destination modes and source modes, owners and
+modification times must still match. Copy exit status, timeouts, reported transfer counts and local
+resource collection remain required. The verifier does not use candidate-produced `rcmp` or other
+tools to certify output. A digest fingerprints structure and metadata, **not file contents**;
+same-size content corruption can go undetected. Reports explicitly disclose that file content
+integrity was not checked. Use the retained full-content mode for separate correctness checks.
+
+Validation stays outside timed copy intervals, and no validation runs between cache drop and copy.
+Source reuse and cache semantics are unchanged. The new policy and runner identity prevent pooling
+with historical full-content measurements. AWS inspection and approval require the exact suite's
+verification policy and worker count. Performance purpose alone does not publish history: the
+existing independent per-attempt approval remains mandatory.
+
+Existing measured generation/copy costs model approximately **56.4 minutes before metadata
+verification overhead** for the complete attempt, including the reserved reporting time. This is an
+estimate, not demonstrated completion or a guarantee. All formatting, generation, validation,
+deletion and upload still consume the fixed window of at most 60 minutes; three minutes remain
+reserved for stop/collection/upload. Repeating isolated one-copy runs would repeat fixture setup and
+generation; an isolated qualification is not a balanced performance comparison. Preserve partial
+results and stop at the original cutoff if any phase exhausts its allowance.
+
 ## Qualification prerequisites and first run
 
 This change does not deploy, bake an image, arm a window or launch anything. No IAM, OIDC,
@@ -107,17 +139,18 @@ After separate authorization:
 2. Keep the group closed while updating the pinned AMI/numeric launch-template version. Verify the
    usual exact-main admission, no active prior instance, suspended replacement paths and cutoff
    behavior. Do not run the old draft debug workflow.
-3. Propose one **60-minute `bulk-1g` A/A** window with the same reviewed binary SHA in both roles.
-   This first exercises beyond-RAM data with only 1,000 files. Build before opening the host. The
-   first real run must qualify actual mdadm/mkfs/mount behavior and free capacity; offline tests
-   cannot establish those properties on EC2.
+3. For performance qualification, select one **60-minute `bulk-1g-metadata` A/A** window with the
+   same reviewed binary SHA in both roles. This exercises beyond-RAM data with only 1,000 files.
+   Build before opening the host. Qualify actual mdadm/mkfs/mount behavior and free capacity;
+   offline tests cannot establish those properties on EC2. The earlier four-copy full-content
+   attempt did not finish within 60 minutes; repeating it unchanged is not the next experiment.
 4. Preserve partial output if any phase times out. The per-generation/per-copy timeout is 1,200
    seconds; the unchanged absolute lease and three-minute reporting reserve still dominate.
-   Generation, formatting, all hashing, deletion and upload count. Do not extend or automatically
-   retry a window. A 1 TB source plus four full destination/source validations reads many TB;
-   completion within one hour is unproven.
+   Generation, formatting, validation, deletion and upload count. Do not extend or automatically
+   retry a window. Metadata mode reduces verification I/O but completion within one hour remains
+   unproven. Any new attempt needs fresh admission and budget accounting.
 5. Verify physical termination and all ASG capacities zero before considering another case. Review
-   phase costs, capacity proof, full validation, isolation, resource collection and A/A balance.
+   phase costs, capacity proof, the recorded validation mode, isolation, resources and A/A balance.
    Propose `bulk-100m`, then `bulk-1m`, then `tiny-1k` separately only when evidence supports their
    bounded runs. Do not dispatch all four as a batch.
 

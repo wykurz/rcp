@@ -601,14 +601,18 @@ def _arguments(argv):
     parser.add_argument("--resource-time", type=Path, help="GNU time executable for --local-resources")
     parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
     parser.add_argument("--command-clocks", action="store_true", help="record bracketed local command clock observations without changing elapsed timing")
-    parser.add_argument("--streaming-verification", action="store_true", help="bounded SHA256 verification for fresh local fixtures")
-    parser.add_argument("--verification-workers", type=int, default=8, help="streaming SHA256 workers, 1..32 (default 8)")
+    parser.add_argument("--streaming-verification", action="store_true", help="bounded verification for fresh local fixtures")
+    parser.add_argument("--verification-mode", choices=("full-content", "metadata-size"), default="full-content",
+                        help="full-content (default) or performance-only metadata-size; metadata-size does not verify content integrity")
+    parser.add_argument("--verification-workers", type=int, default=8, help="streaming verification workers, 1..32 (default 8)")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks/inodes on distinct scratch filesystems")
     args = parser.parse_args(argv)
     if not 1 <= args.verification_workers <= 32:
         parser.error("--verification-workers must be 1..32")
     if args.streaming_verification and (args.mode != "local" or args.cache not in ("source-warm", "linux-drop-caches")):
         parser.error("streaming verification requires local fresh copies and source-warm or linux-drop-caches")
+    if args.verification_mode == "metadata-size" and not args.streaming_verification:
+        parser.error("--verification-mode metadata-size requires --streaming-verification")
     if args.check_capacity and not args.streaming_verification:
         parser.error("--check-capacity requires --streaming-verification")
     if args.command_clocks and args.mode != "local":
@@ -709,8 +713,16 @@ def main(argv=None):
         if args.streaming_verification:
             if any(case.get("mode", "fresh") != "fresh" for case in cases):
                 raise ValueError("streaming verification supports fresh fixtures only")
-            record["context"]["verification"] = dict(policy=streaming.POLICY, workers=args.verification_workers)
-            record["context"]["verification_policy"] = VERIFICATION_POLICY + "; " + streaming.POLICY
+            verification_policy = streaming.METADATA_POLICY if args.verification_mode == "metadata-size" else streaming.POLICY
+            record["context"]["verification"] = dict(policy=verification_policy, workers=args.verification_workers)
+            if args.verification_mode == "metadata-size":
+                record["context"]["verification_policy"] = ("performance-only: exact paths, types, counts, sizes and modes; "
+                    "source mode/uid/gid/mtime_ns unchanged; no payload reads; same-size content corruption is not detected; "
+                    + verification_policy)
+                record["context"]["fixture_policy"] = record["context"]["fixture_policy"].replace(
+                    "verified counts and digest", "verified counts and structure fingerprint; payload contents are not checked")
+            else:
+                record["context"]["verification_policy"] = VERIFICATION_POLICY + "; " + verification_policy
             for case in cases:
                 capacity.requirements(case, 4096)
         record["cases"] = cases
@@ -791,7 +803,7 @@ def main(argv=None):
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
             initial_started = time.monotonic()
-            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case))
+            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy)
                            if args.streaming_verification else scan_tree(source))
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
@@ -901,7 +913,8 @@ def main(argv=None):
                                 trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True)
                                     if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
                                 if not trial["source_validation"]["ok"]:
-                                    raise ValueError("source changed: " + trial["source_validation"]["error"])
+                                    reason = "interrupted" if trial["source_validation"].get("interrupted") is True else "failed"
+                                    raise ValueError("source verification " + reason + ": " + trial["source_validation"]["error"])
                         except (OSError, ValueError) as error:
                             trial["validation"].update(ok=False, error=str(error))
                     if timing_error:
