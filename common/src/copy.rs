@@ -8148,6 +8148,33 @@ mod copy_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn non_dereference_copy_preserves_outside_sentinel_symlink() -> anyhow::Result<()> {
+        let tmp = testutils::create_temp_dir().await?;
+        let sentinel = tmp.join("sentinel_secret");
+        tokio::fs::write(&sentinel, "SENTINEL_SECRET_CONTENT").await?;
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::symlink(&sentinel, src.join("entry")).await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &toctou_settings(),
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        let entry = dst.join("entry");
+        assert!(tokio::fs::symlink_metadata(&entry).await?.is_symlink());
+        assert_eq!(tokio::fs::read_link(&entry).await?, sentinel);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.bytes_copied, 0);
+        assert_eq!(summary.symlinks_created, 1);
+        Ok(())
+    }
+
     // Task 1.5 helper: repeatedly swap `path` between a real regular file (content `REAL_CONTENT`)
     // and a symlink pointing at `sentinel`, using rename so each individual state is atomic. Two
     // staging names (a prepared symlink and the real file) live alongside `path` and are renamed
@@ -8180,8 +8207,8 @@ mod copy_tests {
 
     // Task 1.5 (a): final-component file<->symlink swap. While the copy runs, `src/sub/entry` is
     // rapidly flipped between a real regular file and a symlink to a sentinel outside the tree. The
-    // copy may grab the real file, or O_NOFOLLOW/fstat may catch the symlink (error or skip), but
-    // the sentinel's secret content must NEVER end up in the destination as data.
+    // copy may grab the real file, preserve the symlink itself, or catch a swap (error or skip),
+    // but the sentinel's secret content must NEVER end up in the destination as data.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_symlink_swap_never_leaks_sentinel() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::create_temp_dir().await?;
@@ -8202,6 +8229,7 @@ mod copy_tests {
         let settings = toctou_settings();
         let mut caught_swaps = 0usize;
         let mut copied_real = 0usize;
+        let mut copied_symlinks = 0usize;
         for i in 0..200 {
             let dst = test_path.join(format!("dst_{i}"));
             let result = tokio::time::timeout(
@@ -8224,31 +8252,40 @@ mod copy_tests {
             // CORE ASSERTION: if a regular file landed at the destination, it is the real content —
             // never the sentinel's secret. The entry may instead be absent or a symlink.
             let entry_dst = dst.join("sub").join("entry");
-            if let Ok(md) = tokio::fs::symlink_metadata(&entry_dst).await
-                && md.file_type().is_file()
-            {
-                let content = tokio::fs::read_to_string(&entry_dst).await?;
-                assert_ne!(
-                    content, "SENTINEL_SECRET_CONTENT",
-                    "iteration {i}: sentinel content leaked into the destination as a regular file"
-                );
-                assert_eq!(
-                    content, "REAL_CONTENT",
-                    "iteration {i}: a regular destination file must hold the real content"
-                );
-                copied_real += 1;
+            if let Ok(md) = tokio::fs::symlink_metadata(&entry_dst).await {
+                if md.file_type().is_file() {
+                    let content = tokio::fs::read_to_string(&entry_dst).await?;
+                    assert_ne!(
+                        content, "SENTINEL_SECRET_CONTENT",
+                        "iteration {i}: sentinel content leaked into the destination as a regular file"
+                    );
+                    assert_eq!(
+                        content, "REAL_CONTENT",
+                        "iteration {i}: a regular destination file must hold the real content"
+                    );
+                    copied_real += 1;
+                } else if md.file_type().is_symlink() {
+                    assert_eq!(
+                        tokio::fs::read_link(&entry_dst).await?,
+                        sentinel,
+                        "iteration {i}: a destination symlink must preserve the literal target"
+                    );
+                    copied_symlinks += 1;
+                }
             }
             let _ = tokio::fs::remove_dir_all(&dst).await;
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         swapper.join().expect("swapper thread panicked");
-        // sanity: the run did meaningful work (caught some swaps or copied the real file at least
-        // once). This is not the safety assertion — the safety assertion is "sentinel never leaks"
-        // above and holds on every iteration regardless of timing.
-        tracing::info!("file/symlink swap: caught_swaps={caught_swaps}, copied_real={copied_real}");
+        // sanity: require a caught swap, verified real file, or verified literal symlink target.
+        // the per-iteration content assertions above remain independent of which outcome occurs.
+        tracing::info!(
+            "file/symlink swap: caught_swaps={caught_swaps}, copied_real={copied_real}, \
+             copied_symlinks={copied_symlinks}"
+        );
         assert!(
-            caught_swaps + copied_real > 0,
+            caught_swaps + copied_real + copied_symlinks > 0,
             "expected at least one observable outcome across 200 iterations"
         );
         Ok(())
