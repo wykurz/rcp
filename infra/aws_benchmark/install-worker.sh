@@ -23,7 +23,15 @@ progress remove-ssm
 python3 -m infra.aws_benchmark.guest_security --remove-ssm
 progress packages
 apt-get update
-apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm
+# avoid background monitoring/check wakeups; leave md assembly and udev intact
+for unit in mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer \
+    mdcheck_start.service mdcheck_continue.service mdmonitor.service mdmonitor-oneshot.service; do
+  if systemctl cat "$unit" >/dev/null 2>&1; then
+    systemctl stop "$unit"
+    systemctl mask "$unit"
+  fi
+done
 useradd --system --no-create-home --shell /usr/sbin/nologin rcp-benchmark
 install -d -m 0755 /opt/rcp-benchmark/infra/aws_benchmark /opt/rcp-benchmark/bin
 progress python-environment
@@ -31,7 +39,7 @@ python3 -m venv /opt/rcp-benchmark/venv
 /opt/rcp-benchmark/venv/bin/pip install --require-hashes -r infra/aws_benchmark/requirements.txt
 progress harness
 cp -r benchmarks /opt/rcp-benchmark/
-cp infra/aws_benchmark/{__init__,common,worker,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
+cp infra/aws_benchmark/{__init__,common,worker,large_storage,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
 install -m 0755 infra/aws_benchmark/cache_client.py /opt/rcp-benchmark/bin/sudo
 python3 -m infra.aws_benchmark.maintenance
 python3 -m infra.aws_benchmark.guest_security

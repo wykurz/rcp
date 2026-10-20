@@ -16,7 +16,7 @@ on:
         required: true
         type: choice
         default: aa-smoke
-        options: [aa-smoke, tiny, medium, large, deep]
+        options: [aa-smoke, tiny, medium, large, deep, bulk-1g, bulk-100m, bulk-1m, tiny-1k]
 
 permissions:
   contents: read

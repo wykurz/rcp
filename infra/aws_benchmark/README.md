@@ -5,11 +5,12 @@ or default configuration. Infrastructure deployment, operator window arming, and
 are separate operations. Start with the A/A smoke pilot before using these results for comparisons.
 
 The fixed On-Demand VM is `c5d.24xlarge`: 96 vCPU, 192 GiB RAM and four 900 GB local NVMe SSDs. It
-is not metal. Two disks provide separate ext4 source and destination filesystems; two remain unused.
-There is no RAID, Spot, fallback instance type, warm pool, NAT gateway, load balancer, or monthly
-allowance service. No remote shell is provisioned; the SSM prerequisite below also excludes
-inherited account-level management. Availability and the account's 96-vCPU On-Demand quota must be
-checked in the selected Availability Zone before the first window.
+is not metal. Existing suites use two disks as separate ext4 source and destination filesystems; two
+remain unused. The opt-in [large qualification suites](LARGE_WORKLOADS.md) use all four as two
+disjoint two-disk RAID0 arrays, each with ext4. There is no Spot, fallback instance type, warm pool,
+NAT gateway, load balancer, or monthly allowance service. No remote shell is provisioned; the SSM
+prerequisite below also excludes inherited account-level management. Availability and the account's
+96-vCPU On-Demand quota must be checked in the selected Availability Zone before the first window.
 
 ## Essential setup inputs
 
@@ -313,9 +314,11 @@ storage/requests, AMI snapshots, EBS while allocated and public IPv4 addresses c
 though there is no always-running VM. Empty the bucket before deleting the stack, and delete
 obsolete AMI snapshots separately.
 
-The current largest suites generate 30–31.25 GiB, below host RAM. This PR adds no larger case. After
-a validated A/A pilot, compare one targeted suite at a time. A future approximately 400 GiB bulk
-experiment needs its own reviewed fixture, storage and deadline plan.
+The existing suites generate at most 30–31.25 GiB, below host RAM. The separate
+[large-workload manifest and qualification plan](LARGE_WORKLOADS.md) add decimal 1 TB/1.024 TB bulk
+layouts and a 10,240,000-file tiny layout. Those opt-in suites are smoke diagnostics with distinct
+storage/verification identities; they cannot enter performance history. They require a new reviewed
+AMI and an independently authorized, bounded qualification window.
 
 ## Result reports
 
@@ -329,8 +332,9 @@ enabled, and Depot workflows remain operational.
 
 Run `just aws-benchmark-test` and `just benchmark-test`. Both are included in lint/CI. The focused
 tests use fake AWS clients and local temporary files, never credentials or network. Validate the
-template with `cfn-lint infra/aws_benchmark/stack.yaml` as well. No Rust or harness semantics
-change.
+template with `cfn-lint infra/aws_benchmark/stack.yaml` as well. The large-profile tests use
+arithmetic, simulated block inventories and small real file trees; they do not format devices or
+generate the large payloads.
 
 If no worker status arrives, the trusted operator should inspect the exact ASG's activity history
 for launch failures (capacity, quota, AMI or KMS errors), alongside EC2 inventory and the scheduled
