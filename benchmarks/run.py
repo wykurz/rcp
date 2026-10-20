@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport, pairs, measurements, clocks
+from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming
 from benchmarks.operations import expected_counts
 
 
@@ -412,7 +412,7 @@ def environment(source_root, destination_root):
     return {"kernel": platform.release(), "architecture": platform.machine(), "cpu_model": cpu, "effective_parallelism": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(), "cpu_quota": quota, "memory_limit": memory, "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0], "filesystem": {"source": _mount(source_root), "destination": _mount(destination_root)}}
 
 
-def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy", operation_revision=None, owned_transport=None, experiment=None):
+def series_id(case, variant, cache_policy, topology, runner_label, endpoint_environment, tools, storage_ids=None, ssh_transport_profile=None, timing_collection="legacy", timing_capability=None, timing_request="legacy", operation_revision=None, owned_transport=None, experiment=None, verification=None):
     filesystem = endpoint_environment.get("filesystem", {})
     storage_ids = storage_ids or {}
     comparable_environment = {key: value for key, value in endpoint_environment.items() if key != "filesystem"}
@@ -428,6 +428,8 @@ def series_id(case, variant, cache_policy, topology, runner_label, endpoint_envi
         if tool in tools:
             stable_references[tool] = {"version": tools[tool]["version"], "sha256": tools[tool]["sha256"]}
     value = {"case": {key: item for key, item in case.items() if key != "description"}, "variant": {key: item for key, item in variant.items() if key != "description"}, "cache_policy": cache_policy, "topology": topology, "runner_label": runner_label, "environment": comparable_environment, "reference_versions": stable_references, "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "timing_policy": TIMING_POLICY, "timing_request": timing_request, "timing_collection": timing_collection, "timing_capability": timing_capability, "verification_policy": VERIFICATION_POLICY}
+    if verification is not None:
+        value["verification"] = verification
     if experiment is not None:
         value["experiment"] = experiment
     if operation_revision is not None:
@@ -599,7 +601,16 @@ def _arguments(argv):
     parser.add_argument("--resource-time", type=Path, help="GNU time executable for --local-resources")
     parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
     parser.add_argument("--command-clocks", action="store_true", help="record bracketed local command clock observations without changing elapsed timing")
+    parser.add_argument("--streaming-verification", action="store_true", help="bounded SHA256 verification for fresh local fixtures")
+    parser.add_argument("--verification-workers", type=int, default=8, help="streaming SHA256 workers, 1..32 (default 8)")
+    parser.add_argument("--check-capacity", action="store_true", help="require free blocks/inodes on distinct scratch filesystems")
     args = parser.parse_args(argv)
+    if not 1 <= args.verification_workers <= 32:
+        parser.error("--verification-workers must be 1..32")
+    if args.streaming_verification and (args.mode != "local" or args.cache not in ("source-warm", "linux-drop-caches")):
+        parser.error("streaming verification requires local fresh copies and source-warm or linux-drop-caches")
+    if args.check_capacity and not args.streaming_verification:
+        parser.error("--check-capacity requires --streaming-verification")
     if args.command_clocks and args.mode != "local":
         parser.error("--command-clocks requires local mode")
     if args.build_provenance is not None:
@@ -695,6 +706,13 @@ def main(argv=None):
             pairs.validate_selection(args.mode, variants)
         if args.local_resources:
             measurements.validate_selection(args.mode, variants)
+        if args.streaming_verification:
+            if any(case.get("mode", "fresh") != "fresh" for case in cases):
+                raise ValueError("streaming verification supports fresh fixtures only")
+            record["context"]["verification"] = dict(policy=streaming.POLICY, workers=args.verification_workers)
+            record["context"]["verification_policy"] = VERIFICATION_POLICY + "; " + streaming.POLICY
+            for case in cases:
+                capacity.requirements(case, 4096)
         record["cases"] = cases
         record["variants"] = variants
         _persist(output, record)
@@ -752,6 +770,9 @@ def main(argv=None):
         record["context"]["timing_collection"] = timing_collection
         _persist(output, record)
         for case in cases:
+            if args.check_capacity:
+                record["context"].setdefault("capacity_admission", {})[case["id"]] = capacity.check_pair(
+                    args.source_root, args.destination_root, case)
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
             leaf_files = "files_per_leaf" in case
@@ -770,11 +791,14 @@ def main(argv=None):
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
             initial_started = time.monotonic()
-            source_scan = scan_tree(source)
+            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case))
+                           if args.streaming_verification else scan_tree(source))
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
             operation = case.get("mode", "fresh")
-            source_metadata = operations.metadata_tree(source) if args.cache == "source-verified" or operation != "fresh" or any(operations.summary_supported(variant) for variant in variants) else None
+            source_metadata = (source_scan if args.streaming_verification else
+                operations.metadata_tree(source) if args.cache == "source-verified" or operation != "fresh"
+                or any(operations.summary_supported(variant) for variant in variants) else None)
             if collect_costs:
                 measurements.add_cost(record, "initial_verification", initial_started)
             stale_names = operations.select_stale(source_scan["entries"]) if operation == "partial" else []
@@ -805,6 +829,8 @@ def main(argv=None):
                     record["trials"].append(trial)
                     _persist(output, record)
                     preparation_started = time.monotonic()
+                    if args.check_capacity:
+                        capacity.check(args.destination_root, case)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if operation != "fresh":
                         stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
@@ -861,15 +887,21 @@ def main(argv=None):
                         except timings.CollectionError as error:
                             trial["timings"]["reports"] = error.reports
                             timing_error = str(error)
-                    trial["validation"] = validate_tree(source, destination, source_scan) if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"}
+                    trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers)
+                        if args.streaming_verification else validate_tree(source, destination, source_scan))
+                        if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"})
                     if outcome["ok"] and trial["validation"]["ok"]:
                         try:
                             if operations.summary_supported(variant):
                                 text = "\n".join(Path(path).read_text() for item in outcome["logs"] for path in item.values())
                                 trial["copy_summary"] = operations.validate_summary(variant, text, expected_transfer)
-                                trial["metadata_validation"] = operations.validate_metadata(destination, source_metadata)
+                                trial["metadata_validation"] = (trial["validation"]["metadata"] if args.streaming_verification
+                                    else operations.validate_metadata(destination, source_metadata))
                             if source_metadata is not None:
-                                trial["source_validation"] = operations.validate_source(source, source_scan, source_metadata)
+                                trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True)
+                                    if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
+                                if not trial["source_validation"]["ok"]:
+                                    raise ValueError("source changed: " + trial["source_validation"]["error"])
                         except (OSError, ValueError) as error:
                             trial["validation"].update(ok=False, error=str(error))
                     if timing_error:
@@ -900,7 +932,7 @@ def main(argv=None):
                     if any(observation != observations[0] for observation in observations):
                         raise ValueError("owned role capacity/resource observations changed between repetitions; refusing to pool samples")
                     owned_semantics = {**transport.semantics(args.rtt_ms), "observations": observations[0]}
-                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics, experiment=experiment), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
+                case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics, experiment=experiment, verification=record["context"].get("verification")), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
             _persist(output, record)
             shutil.rmtree(fixture_root)

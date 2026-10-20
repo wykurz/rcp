@@ -272,7 +272,7 @@ def approve(evidence, result, policy):
             and isinstance(policy["harness_revision"], str)
             and re.fullmatch(r"[0-9a-f]{40}", policy["harness_revision"]), "invalid approved AMI provenance")
     require(not evidence["errors"] and result is not None and evidence["producer_conclusion"] == "success"
-            and expected["suite"] != "aa-smoke", "diagnostic run cannot enter performance history")
+            and measurement_contract(expected["suite"])["purpose"] == "performance", "diagnostic run cannot enter performance history")
     receipt, worker = evidence["controller"], evidence["worker"]
     instance = receipt.get("instance") or {}
     require(receipt["outcome"] == "success" and receipt["cleanup"] == "verified"

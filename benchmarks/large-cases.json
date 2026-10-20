@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "bulk-1g-1tb", "description": "XFS report layout 10x100x1G; decimal bytes, 1 TB", "directory_widths": [10], "files_per_leaf": 100, "file_size_bytes": 1000000000},
+    {"id": "bulk-100m-1024gb", "description": "XFS report layout 10x1024x100M; decimal bytes, 1.024 TB", "directory_widths": [10], "files_per_leaf": 1024, "file_size_bytes": 100000000},
+    {"id": "bulk-1m-1024gb", "description": "XFS report layout 10x10x10x1024x1M; decimal bytes, 1.024 TB", "directory_widths": [10, 10, 10], "files_per_leaf": 1024, "file_size_bytes": 1000000},
+    {"id": "tiny-1k-10240k", "description": "XFS report layout 10x10x10x10x1024x1K; decimal bytes, 10.24 GB", "directory_widths": [10, 10, 10, 10], "files_per_leaf": 1024, "file_size_bytes": 1000}
+  ],
+  "variants": [
+    {"id": "rcp-default", "description": "rcp default copy", "tool": "rcp", "args": ["--summary"], "processes": 1}
+  ]
+}

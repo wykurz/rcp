@@ -126,11 +126,13 @@ class BuildContractTests(unittest.TestCase):
 
 
     def test_worker_argv_parses_and_resolves_every_allowlisted_suite(self):
-        manifest = json.loads((ROOT / "benchmarks/cases.json").read_text())
         for suite, selected in common.SUITES.items():
             with self.subTest(suite=suite):
                 command = worker.command(dict(suite=suite, baseline="a" * 40), 600)
                 args = harness._arguments(command[command.index("benchmarks.run") + 1:])
+                # resolve the baked worker's selected manifest inside the checkout
+                manifest_path = ROOT / "benchmarks" / args.manifest.name
+                manifest = harness.load_manifest(manifest_path)
                 cases = harness._select(manifest["cases"], args.cases, "case")
                 variants = harness._select(manifest["variants"], args.variants, "variant")
                 self.assertEqual([case["id"] for case in cases], list(selected))
