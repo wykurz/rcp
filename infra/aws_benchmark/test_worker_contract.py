@@ -34,6 +34,28 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertTrue(args.local_resources)
                 self.assertEqual(args.resource_time, Path("/usr/bin/time"))
 
+    def test_large_qualification_profiles_are_bounded_and_never_history_eligible(self):
+        for suite in common.LARGE_SUITES:
+            with self.subTest(suite=suite):
+                expected = binding(suite)
+                args, _ = parsed_command(expected)
+                argv = worker.command(expected, 417)
+                self.assertTrue(args.streaming_verification)
+                self.assertTrue(args.check_capacity)
+                self.assertEqual(args.verification_workers, 8)
+                self.assertEqual(args.timeout, 1200)
+                self.assertEqual(args.repetitions, 2)
+                self.assertEqual(args.purpose, "smoke")
+                self.assertEqual(args.cache, "linux-drop-caches")
+                self.assertEqual(args.manifest.name, "large-cases.json")
+                self.assertIn("--property=LimitFSIZE=1073741824", argv)
+                self.assertIn("--property=RuntimeMaxSec=417", argv)
+                self.assertIn("--property=PrivateNetwork=yes", argv)
+                self.assertIn("--property=PrivateDevices=yes", argv)
+                evidence, record, policy = self.inspected_measurement(expected)
+                with self.assertRaisesRegex(ValueError, "diagnostic"):
+                    results.approve(evidence, record, policy)
+
     def inspected_measurement(self, expected):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -44,7 +66,7 @@ class WorkerContractTests(unittest.TestCase):
         return evidence, record, policy
 
     def test_approval_accepts_measurements_built_from_real_worker_arguments(self):
-        for suite in common.SUITES.keys() - {"aa-smoke"}:
+        for suite in common.SUITES.keys() - {"aa-smoke"} - common.LARGE_SUITES.keys():
             with self.subTest(suite=suite):
                 evidence, record, policy = self.inspected_measurement(binding(suite))
                 results.approve(evidence, record, policy)

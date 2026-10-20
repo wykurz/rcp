@@ -26,6 +26,8 @@ from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_S
 from .cache_client import SOCKET
 from .maintenance import check_quiet
 from .guest_security import check_ssm_absent
+from .common import LARGE_SUITES
+from . import large_storage
 
 ROOT = Path("/opt/rcp-benchmark")
 STATE = Path("/run/rcp-benchmark")
@@ -109,6 +111,7 @@ def cache_server(budget, uid):
 
 def command(window, seconds):
     contract = measurement_contract(window["suite"])
+    large = window["suite"] in LARGE_SUITES
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -118,7 +121,7 @@ def command(window, seconds):
         "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "RestrictSUIDSGID": "yes",
         "RestrictNamespaces": "yes", "LockPersonality": "yes", "RestrictAddressFamilies": "AF_UNIX",
         "MemoryMax": "180G", "TasksMax": "8192", "LimitNOFILE": "1048576",
-        "LimitCORE": "0", "LimitFSIZE": "536870912", "UMask": "0077",
+        "LimitCORE": "0", "LimitFSIZE": "1073741824" if large else "536870912", "UMask": "0077",
         "TemporaryFileSystem": "/tmp:size=64m,mode=1777 /var/tmp:size=64m,mode=1777",
         "ReadWritePaths": str(DATA), "InaccessiblePaths": "/root /home /var/lib/cloud",
         "WorkingDirectory": str(ROOT), "StandardOutput": "null", "StandardError": "null",
@@ -134,10 +137,14 @@ def command(window, seconds):
              "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
              "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
-             "--timeout", "600", "--runner-label", contract["runner_label"],
+             "--timeout", "1200" if large else "600", "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
-             "--source-storage-id", "c5d-local-ext4-source", "--destination-storage-id", "c5d-local-ext4-destination",
+             "--source-storage-id", "c5d-raid0-ext4-source-v1" if large else "c5d-local-ext4-source",
+             "--destination-storage-id", "c5d-raid0-ext4-destination-v1" if large else "c5d-local-ext4-destination",
              "--output", str(DATA / "output" / "results")]
+    if large:
+        argv += ["--manifest", str(ROOT / "benchmarks/large-cases.json"),
+                 "--streaming-verification", "--verification-workers", "8", "--check-capacity"]
     for case in SUITES[window["suite"]]:
         argv += ["--case", case]
     return argv
@@ -344,7 +351,12 @@ def run(s3, bucket):
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(data)
             path.chmod(0o555)
-        metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
+        if window["suite"] in LARGE_SUITES:
+            manifest = json.loads((ROOT / "benchmarks/large-cases.json").read_text())
+            case = next(case for case in manifest["cases"] if case["id"] == SUITES[window["suite"]][0])
+            metadata["storage"] = large_storage.prepare(DATA, case, budget, account.pw_uid, account.pw_gid, execute)
+        else:
+            metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
         cache_server(budget, account.pw_uid)
         try:
             stopped = False

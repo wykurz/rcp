@@ -136,6 +136,15 @@ def validate_result(value):
         if operation_revision is not None:
             if variant.get("tool") not in ("rcp", "rsync", "cp") or type(variant.get("processes")) is not int or variant["processes"] < 1 or not isinstance(variant.get("args"), list) or any(not isinstance(arg, str) or not arg for arg in variant["args"]):
                 raise ValueError(f"variants[{i}] has invalid tool/processes/args")
+    verification = context.get("verification")
+    if verification is not None:
+        if (not isinstance(verification, dict) or set(verification) != {"policy", "workers"}
+                or verification["policy"] != "sha256-tree-stream-v1"
+                or type(verification["workers"]) is not int or not 1 <= verification["workers"] <= 32
+                or context["topology"] != "local"
+                or operation_revision != operations.CONTRACT_REVISION
+                or any(case.get("mode", "fresh") != "fresh" for case in cases)):
+            raise ValueError("invalid streaming verification contract")
     owned = context.get("owned_transport")
     if owned is None and ("owned_transport" in context or context.get("ssh_transport_profile") == transport.PROFILE or any(isinstance(trial, dict) and ("transport" in trial or "transport_artifacts" in trial) for trial in trials)):
         raise ValueError("context.owned_transport is required for owned profile/trial records")
@@ -345,7 +354,8 @@ def _validate_operation_trial(trial, case, variant, context):
         cache = proof("cache_validation")
         content(cache, "cache_validation")
         metadata(_object(cache.get("metadata"), "trial.cache_validation.metadata"), "cache_validation.metadata", timestamps=True)
-    if operation != "fresh" or operations.summary_supported(variant) or context["cache_policy"] == "source-verified":
+    if (operation != "fresh" or operations.summary_supported(variant)
+            or context["cache_policy"] == "source-verified" or context.get("verification") is not None):
         source = proof("source_validation")
         content(source, "source_validation")
         metadata(_object(source.get("metadata"), "trial.source_validation.metadata"), "source_validation.metadata", timestamps=True)

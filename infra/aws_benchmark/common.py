@@ -29,6 +29,10 @@ SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", 
 SUITES = {"aa-smoke": ("tiny-10k",), "tiny": ("tiny-1m",),
           "medium": ("medium-128k",), "large": ("large-120",), "deep": ("deep-20x80",)}
 
+LARGE_SUITES = {"bulk-1g": ("bulk-1g-1tb",), "bulk-100m": ("bulk-100m-1024gb",),
+                "bulk-1m": ("bulk-1m-1024gb",), "tiny-1k": ("tiny-1k-10240k",)}
+SUITES.update(LARGE_SUITES)
+
 
 # the baked worker and offline approval must describe the same measurement
 PERFORMANCE_CONTRACT = dict(paired_seed=0, repetitions=4, purpose="performance",
@@ -40,6 +44,8 @@ def measurement_contract(suite):
     contract = PERFORMANCE_CONTRACT.copy()
     if suite == "aa-smoke":
         contract.update(repetitions=2, purpose="smoke", cache_policy="source-warm")
+    if suite in LARGE_SUITES:
+        contract.update(repetitions=2, purpose="smoke", runner_label="aws-c5d24-ext4-raid0-stream-v1")
     return contract
 
 
