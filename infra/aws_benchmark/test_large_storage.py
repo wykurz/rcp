@@ -1,6 +1,7 @@
 """No block devices or commands: synthetic inventory/sysfs and a recording executor."""
 
 from contextlib import ExitStack
+import copy
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,9 @@ def inventory():
              model=storage.MODEL, mountpoints=[None], fstype=None, ro=False,
              serial=f"disk{index}", **{"maj:min": f"259:{index}"})
         for index in range(1, 5)
-    ] + [dict(path="/dev/nvme0n1", model=storage.EBS_MODEL, mountpoints=["/"])])
+    ] + [dict(path="/dev/nvme0n1", type="disk", model=storage.EBS_MODEL, mountpoints=[None],
+              children=[dict(path="/dev/nvme0n1p1", type="part", model=None, mountpoints=["/"],
+                             fstype="ext4", ro=False, serial=None, **{"maj:min": "259:5"})])])
 
 
 class SelectionTests(unittest.TestCase):
@@ -122,7 +125,12 @@ class PreparationTests(unittest.TestCase):
         if self.fail_command and self.fail_command(argv):
             raise TimeoutError("injected command/deadline failure")
         if argv[0] == "lsblk":
-            return SimpleNamespace(stdout=json.dumps(self.tree))
+            tree = copy.deepcopy(self.tree)
+            # these selected columns omit NAME; lsblk only nests partitions with --tree
+            if "--tree" not in argv:
+                for disk in list(tree["blockdevices"]):
+                    tree["blockdevices"].extend(disk.pop("children", []))
+            return SimpleNamespace(stdout=json.dumps(tree))
         if argv[0] == "wipefs":
             fd = int(argv[-1].rsplit("/", 1)[1])
             self.assertEqual(kwargs["pass_fds"], (fd,))
@@ -147,6 +155,7 @@ class PreparationTests(unittest.TestCase):
     def test_all_member_checks_precede_creation_and_both_arrays_precede_formatting(self):
         result = self.prepare()
         commands = self.commands()
+        self.assertIn("--tree", self.calls[0][0])
         self.assertEqual(commands[:5], ["lsblk"] + ["wipefs"] * 4)
         self.assertEqual(commands[5:9], ["mdadm", "wipefs", "mdadm", "wipefs"])
         self.assertEqual(commands.count("mkfs.ext4"), 2)
@@ -163,6 +172,14 @@ class PreparationTests(unittest.TestCase):
                 self.assertIn("--internal-only", argv)
                 self.assertEqual(argv[-2], f"/proc/self/fd/{kwargs['pass_fds'][0]}")
         self.assertEqual(result["layout"], "two-disjoint-raid0-ext4-v1")
+
+    def test_flat_root_partition_refuses_before_opening_any_disk(self):
+        self.tree["blockdevices"].extend(self.tree["blockdevices"][-1].pop("children"))
+        with mock.patch.object(storage, "open_block") as opened:
+            with self.assertRaisesRegex(ValueError, "unexpected NVMe model"):
+                self.prepare()
+            opened.assert_not_called()
+        self.assertEqual(self.commands(), ["lsblk"])
 
     def test_last_disk_signature_refuses_all_mutating_commands(self):
         self.signature_fd = 14
