@@ -266,9 +266,11 @@ isolation for a dedicated disposable host, not a separate kernel or a hostile-co
 Targeted suites use the existing `linux-drop-caches` policy. A root-owned executable named `sudo`
 accepts exactly the harness's fixed cache-drop argv and sends a fixed request to a root supervisor
 UNIX socket. The helper verifies the peer UID, calls `sync`, and writes `3` to `drop_caches`; it
-accepts no paths or commands. No sudoers grant is installed. All fixture generation, full SHA-256
-validation, source reuse, pairing and cleanup stay in the existing harness. Its random-byte
-`filegen` fixture policy is unchanged; no sparse or all-zero replacements are introduced.
+accepts no paths or commands. No sudoers grant is installed. Fixture generation, validation, source
+reuse, pairing and cleanup stay in the existing harness. Existing suites retain full SHA-256
+validation; the explicitly named `bulk-1g-metadata` performance suite checks structure, metadata and
+sizes without reading payload contents. Its reports disclose that content integrity is not checked.
+The random-byte `filegen` fixture policy is unchanged; no sparse or all-zero replacements are used.
 
 The initial worker control read has a separate 60-second bootstrap deadline and bounded retries.
 Once a complete, valid control document arrives, its absolute cutoff replaces that bootstrap
@@ -316,9 +318,11 @@ obsolete AMI snapshots separately.
 
 The existing suites generate at most 30–31.25 GiB, below host RAM. The separate
 [large-workload manifest and qualification plan](LARGE_WORKLOADS.md) add decimal 1 TB/1.024 TB bulk
-layouts and a 10,240,000-file tiny layout. Those opt-in suites are smoke diagnostics with distinct
-storage/verification identities; they cannot enter performance history. They require a new reviewed
-AMI and an independently authorized, bounded qualification window.
+layouts and a 10,240,000-file tiny layout. The full-content opt-in suites are smoke diagnostics with
+distinct storage/verification identities; they cannot enter performance history. The separate
+`bulk-1g-metadata` performance suite reuses the 1 TB case with metadata/size validation and requires
+independent per-attempt approval before history staging. These suites require a new reviewed AMI and
+an independently authorized, bounded qualification window.
 
 ## Result reports
 

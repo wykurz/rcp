@@ -21,7 +21,7 @@ import zipfile
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
-                     measurement_contract, put_json, require, retry_io, timestamp, validate_request, validate_window,
+                     measurement_contract, verification_contract, put_json, require, retry_io, timestamp, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
@@ -143,8 +143,11 @@ def command(window, seconds):
              "--destination-storage-id", "c5d-raid0-ext4-destination-v1" if large else "c5d-local-ext4-destination",
              "--output", str(DATA / "output" / "results")]
     if large:
+        verification = verification_contract(window["suite"])
         argv += ["--manifest", str(ROOT / "benchmarks/large-cases.json"),
-                 "--streaming-verification", "--verification-workers", "8", "--check-capacity"]
+                 "--streaming-verification", "--verification-workers", str(verification["workers"]), "--check-capacity"]
+        if verification["policy"] == "metadata-size-tree-v1":
+            argv += ["--verification-mode", "metadata-size"]
     for case in SUITES[window["suite"]]:
         argv += ["--case", case]
     return argv

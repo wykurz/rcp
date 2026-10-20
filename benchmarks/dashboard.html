@@ -75,7 +75,7 @@
       </div>
       <div class="chart-wrap" id="chart"></div>
       <div class="legend" id="legend"></div>
-      <p class="footnote">Series IDs include workload, flags, cache and timing policy, topology, runner and relevant machine context. Different IDs are drawn as separate lines. A single run appears as one point. Repeats under 10 seconds are flagged as short samples.</p>
+      <p class="footnote">Series IDs include workload, flags, cache, timing and verification policy, topology, runner and relevant machine context. Different IDs are drawn as separate lines. Metadata/size validation does not check file content integrity or detect same-size content corruption. A single run appears as one point. Repeats under 10 seconds are flagged as short samples.</p>
     </section>
     <section aria-labelledby="runs-heading">
       <h2 id="runs-heading">Runs</h2>
@@ -115,6 +115,7 @@
     const date = stamp => new Date(stamp).toLocaleDateString(undefined, {year: "numeric", month: "short", day: "numeric", timeZone: "UTC"});
     const number = value => Number(value).toLocaleString(undefined, {maximumFractionDigits: 3});
     const group = run => `${run.context.runner_label} · ${run.context.topology} · ${run.context.cache_policy}`;
+    const verification = run => run.verification_label;
     const purpose = run => run.context.purpose === undefined ? "performance" : String(run.context.purpose);
     const isPerformance = run => purpose(run) === "performance";
     const hasShortSample = (run, summary) => isPerformance(run) && summary.samples.some(sample => sample < 10);
@@ -135,7 +136,9 @@
       const item = run.variants.find(item => item.id === id);
       return item?.description ? `${id} · ${item.description}` : id;
     };
-    const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)}`;
+    // check the explicit policy as well as the producer's series ID on imported history.
+    const seriesKey = point => JSON.stringify([point.summary.series_id, point.run.context.verification?.policy ?? null, point.run.context.verification?.workers ?? null]);
+    const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)} · ${verification(point.run)}`;
     const sameRcpSettings = (candidate, baseline) => candidate?.tool === "rcp" && baseline?.tool === "rcp" &&
       Array.isArray(candidate.args) && Array.isArray(baseline.args) &&
       candidate.args.every(arg => typeof arg === "string") && baseline.args.every(arg => typeof arg === "string") &&
@@ -156,17 +159,17 @@
     function draw() {
       const caseId = $("case-filter").value, variantId = $("variant-filter").value, groupId = $("group-filter").value;
       const matched = allPoints.filter(({run, summary}) => (!caseId || summary.case_id === caseId) && (!variantId || summary.variant_id === variantId) && (!groupId || group(run) === groupId));
-      const ids = [...new Set(matched.map(point => point.summary.series_id))].sort();
+      const ids = [...new Set(matched.map(seriesKey))].sort();
       const seriesFilter = $("series-filter");
       const selected = seriesFilter.value;
       seriesFilter.replaceChildren();
       const all = node("option", "All compatible series"); all.value = ""; seriesFilter.append(all);
       for (const id of ids) {
-        const point = matched.find(item => item.summary.series_id === id);
+        const point = matched.find(item => seriesKey(item) === id);
         const item = node("option", seriesLabel(point)); item.value = id; seriesFilter.append(item);
       }
       seriesFilter.value = ids.includes(selected) ? selected : "";
-      const points = matched.filter(point => !seriesFilter.value || point.summary.series_id === seriesFilter.value);
+      const points = matched.filter(point => !seriesFilter.value || seriesKey(point) === seriesFilter.value);
       const chart = $("chart"), legend = $("legend"); chart.replaceChildren(); legend.replaceChildren();
       if (!points.length) { chart.append(node("p", "No performance measurements match these filters. Smoke runs and failures remain in the run table.", "empty")); return; }
       const width = 1000, height = 390, left = 80, right = 25, top = 22, bottom = 52;
@@ -188,7 +191,7 @@
       }
       const bySeries = new Map();
       for (const point of points) {
-        const id = point.summary.series_id;
+        const id = seriesKey(point);
         if (!bySeries.has(id)) bySeries.set(id, []);
         bySeries.get(id).push(point);
       }
@@ -205,7 +208,8 @@
           const title = svgNode("title");
           const lines = [`${date(run.timestamp)} · ${caseName(run,summary.case_id)} / ${variantName(run,summary.variant_id)}`,
             `Median ${number(summary.median)} s · range ${number(summary.minimum)}–${number(summary.maximum)} s`,
-            `${summary.samples.length} repeats · ${id.slice(0,12)} · ${run.revision.commit || "unknown revision"}`];
+            `${summary.samples.length} repeats · ${summary.series_id.slice(0,12)} · ${run.revision.commit || "unknown revision"}`,
+            verification(run)];
           if (ratios(run,summary).length) lines.push("Same-run speedup vs " + ratios(run,summary).join(" · "));
           if (hasShortSample(run,summary)) lines.push("Short sample: at least one repeat under 10 s");
           title.textContent = lines.map(line => visible(line)).join("\n");
@@ -222,6 +226,7 @@
         const row = node("tr"), timestamp = node("td", date(run.timestamp));
         row.id = `run-${run.run_id}`;
         const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge, node("span", ` · ${purpose(run)}`));
+        result.append(node("p", verification(run)));
         if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("span", " · Short sample: repeat under 10 s", "short-warning"));
         const rev = node("td"), hash = run.revision.commit || "unknown";
         if (run.revision.role === "approved candidate") rev.append(node("span", "Candidate "));
@@ -238,11 +243,11 @@
         comparisons.textContent = comparisonLines.length ? comparisonLines.map(line => visible(line)).join("\n") : "—";
         comparisons.style.whiteSpace = "pre-line";
         const detail = node("td"), details = node("details"), summary = node("summary", "View context");
-        const data = {run_id: run.run_id, branch: run.revision.branch, context: run.context, tools: run.tools, trials: run.trials.length, error: run.error || null};
+        const data = {verification: verification(run), run_id: run.run_id, branch: run.revision.branch, context: run.context, tools: run.tools, trials: run.trials.length, error: run.error || null};
         const context = node("pre");
         // JSON already escapes embedded newlines; preserve only its trusted indentation
         context.textContent = visible(JSON.stringify(data, null, 2), true);
-        details.append(summary, context);
+        details.append(summary, node("p", verification(run)), context);
         details.append(node("h3", "Scoped timings"));
         details.append(node("p", "Cumulative elapsed seconds sum scope invocations. Different scopes and processes can overlap, so totals are not additive wall time.", "footnote"));
         if (!run.trials.some(trial => trial.timings)) {
@@ -290,7 +295,7 @@
     function start() {
       const complete = runs.filter(run => run.status === "complete").length;
       const failed = runs.filter(run => run.status === "failed").length;
-      for (const [value,label] of [[runs.length,"runs"],[complete,"complete"],[failed,"failed"],[new Set(allPoints.map(point => point.summary.series_id)).size,"series"]]) {
+      for (const [value,label] of [[runs.length,"runs"],[complete,"complete"],[failed,"failed"],[new Set(allPoints.map(seriesKey)).size,"series"]]) {
         const card = node("div", undefined, "stat"); card.append(node("b",value),node("span",label)); $("stats").append(card);
       }
       options("case-filter", [...new Set(allPoints.map(point => point.summary.case_id))].sort(), "All cases");

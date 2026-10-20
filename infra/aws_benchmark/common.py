@@ -31,6 +31,8 @@ SUITES = {"aa-smoke": ("tiny-10k",), "tiny": ("tiny-1m",),
 
 LARGE_SUITES = {"bulk-1g": ("bulk-1g-1tb",), "bulk-100m": ("bulk-100m-1024gb",),
                 "bulk-1m": ("bulk-1m-1024gb",), "tiny-1k": ("tiny-1k-10240k",)}
+METADATA_SUITES = {"bulk-1g-metadata": ("bulk-1g-1tb",)}
+LARGE_SUITES.update(METADATA_SUITES)
 SUITES.update(LARGE_SUITES)
 
 
@@ -46,7 +48,18 @@ def measurement_contract(suite):
         contract.update(repetitions=2, purpose="smoke", cache_policy="source-warm")
     if suite in LARGE_SUITES:
         contract.update(repetitions=2, purpose="smoke", runner_label="aws-c5d24-ext4-raid0-stream-v1")
+    if suite in METADATA_SUITES:
+        contract.update(purpose="performance", runner_label="aws-c5d24-ext4-raid0-metadata-v1")
     return contract
+
+
+def verification_contract(suite):
+    """Expected recorded proof identity, shared by the baked worker and offline ingestion."""
+    require(suite in SUITES, "suite is not allowlisted")
+    if suite in LARGE_SUITES:
+        policy = "metadata-size-tree-v1" if suite in METADATA_SUITES else "sha256-tree-stream-v1"
+        return dict(policy=policy, workers=8)
+    return None  # legacy full-content proof schema has no explicit verification context
 
 
 class ValidationError(ValueError):

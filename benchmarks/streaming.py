@@ -1,4 +1,4 @@
-"""Bounded fresh-tree SHA256 and metadata proofs; no per-tree file dictionaries."""
+"""Bounded fresh-tree content or metadata proofs; no per-tree file dictionaries."""
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -10,6 +10,7 @@ import stat
 from benchmarks import capacity
 
 POLICY = "sha256-tree-stream-v1"
+METADATA_POLICY = "metadata-size-tree-v1"
 MAX_DIRECTORY_ENTRIES = 4096
 MAX_DEPTH = 128
 DEFAULT_WORKERS = 8
@@ -35,22 +36,26 @@ def _stable(before, after):
                ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink"))
 
 
-def _file(parent, name):
+def _file(parent, name, policy=POLICY):
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     try:
         before = _metadata(fd)
         if not stat.S_ISREG(before.st_mode) or not 0 <= before.st_size <= capacity.MAX_FILE_BYTES:
             raise ValueError("invalid bounded regular file")
-        digest, size = hashlib.sha256(), 0
-        with os.fdopen(os.dup(fd), "rb") as stream:
-            for block in iter(lambda: stream.read(READ_SIZE), b""):
-                size += len(block)
-                if size > before.st_size:
-                    raise ValueError("file grew during verification")
-                digest.update(block)
-        if size != before.st_size or not _stable(before, os.fstat(fd)):
+        digest = None
+        if policy == POLICY:
+            digest, size = hashlib.sha256(), 0
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                for block in iter(lambda: stream.read(READ_SIZE), b""):
+                    size += len(block)
+                    if size > before.st_size:
+                        raise ValueError("file grew during verification")
+                    digest.update(block)
+            if size != before.st_size:
+                raise ValueError("file changed during verification")
+        if not _stable(before, os.fstat(fd)):
             raise ValueError("file changed during verification")
-        return before, digest.hexdigest()
+        return before, digest.hexdigest() if digest is not None else None
     finally:
         os.close(fd)
 
@@ -61,12 +66,14 @@ def _feed(digest, row):
     digest.update(data)
 
 
-def scan_tree(root, workers=DEFAULT_WORKERS, expected_counts=None):
+def scan_tree(root, workers=DEFAULT_WORKERS, expected_counts=None, *, policy=POLICY):
+    if policy not in (POLICY, METADATA_POLICY):
+        raise ValueError("unsupported streaming verification policy")
     if type(workers) is not int or not 1 <= workers <= MAX_WORKERS:
         raise ValueError("verification workers must be 1..32")
     maximum = expected_counts or dict(files=capacity.MAX_FILES, directories=capacity.MAX_DIRECTORIES,
                                      bytes=capacity.MAX_FILES * capacity.MAX_FILE_BYTES)
-    content, modes, metadata = (hashlib.sha256(POLICY.encode()) for _ in range(3))
+    content, modes, metadata = (hashlib.sha256(policy.encode()) for _ in range(3))
     counts = dict(files=0, directories=0, bytes=0)
     entries = 0
     def record(path, info, digest=None):
@@ -79,7 +86,7 @@ def scan_tree(root, workers=DEFAULT_WORKERS, expected_counts=None):
         if any(counts[key] > maximum[key] for key in counts):
             raise ValueError("fixture exceeded bounded entry/byte counts")
         entries += 1
-        # versioned depth-first, sorted-name records; root is included
+        # versioned depth-first records; metadata mode fingerprints structure, never payload bytes
         _feed(content, [path, "directory" if directory else "file",
                         None if directory else info.st_size, digest])
         _feed(modes, [path, stat.S_IMODE(info.st_mode)])
@@ -104,10 +111,10 @@ def scan_tree(root, workers=DEFAULT_WORKERS, expected_counts=None):
                     if stat.S_ISDIR(kind):
                         batch.append((name, None))
                     elif stat.S_ISREG(kind):
-                        batch.append((name, pool.submit(_file, fd, name)))
+                        batch.append((name, pool.submit(_file, fd, name, policy)))
                     else:
                         raise ValueError("unexpected symlink or special fixture entry")
-                # finish all reads while this directory fd remains held
+                # finish all file checks while this directory fd remains held
                 ready = [(name, future.result() if future is not None else None) for name, future in batch]
             finally:
                 for _, future in batch:
@@ -138,18 +145,27 @@ def scan_tree(root, workers=DEFAULT_WORKERS, expected_counts=None):
     if expected_counts is not None and counts != expected_counts:
         raise ValueError("fixture counts differ from manifest")
     return dict(counts=counts, digest=content.hexdigest(), modes=modes.hexdigest(),
-                metadata=metadata.hexdigest(), entries=entries, policy=POLICY)
+                metadata=metadata.hexdigest(), entries=entries, policy=policy)
 
 
 def validate_tree(destination, expected, workers=DEFAULT_WORKERS, *, source=False):
     try:
-        actual = scan_tree(destination, workers, expected["counts"])
+        policy = expected.get("policy")
+        if policy not in (POLICY, METADATA_POLICY):
+            raise ValueError("unsupported streaming verification policy")
+        actual = scan_tree(destination, workers, expected["counts"], policy=policy)
         if actual["digest"] != expected["digest"] or actual["modes"] != expected["modes"]:
-            raise ValueError("fixture paths, contents or modes differ")
+            compared = "contents" if policy == POLICY else "sizes"
+            raise ValueError(f"fixture paths, {compared} or modes differ")
         if source and actual["metadata"] != expected["metadata"]:
             raise ValueError("source metadata changed")
         fields = ["mode", "uid", "gid", "mtime_ns"] if source else ["mode"]
-        return dict(ok=True, counts=actual["counts"], digest=actual["digest"],
-                    metadata=dict(ok=True, entries=actual["entries"], checked_fields=fields))
+        proof = dict(ok=True, counts=actual["counts"], digest=actual["digest"],
+                     metadata=dict(ok=True, entries=actual["entries"], checked_fields=fields))
+        if policy == METADATA_POLICY:
+            proof["policy"] = policy
+        return proof
+    except InterruptedError as error:
+        return dict(ok=False, error=str(error), interrupted=True)
     except (OSError, ValueError) as error:
         return dict(ok=False, error=str(error))

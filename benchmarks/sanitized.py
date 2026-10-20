@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 
-from benchmarks import measurements, pairs, clocks
+from benchmarks import measurements, pairs, clocks, streaming
 
 EXPORT_SCHEMA_VERSION = 1
 TOOLS = ('rcp', 'rcpd', 'rsync', 'cp', 'filegen', 'ssh', 'rcp-baseline', 'rcpd-baseline')
@@ -68,6 +68,9 @@ def proof(value, admitted):
     ok = boolean(value.get('ok'))
     qualification = 'unknown' if ok is None else 'failed' if not ok else 'passed' if admitted else 'recorded-unqualified'
     result = dict(qualification=qualification, recorded_ok=ok, counts=counts(value.get('counts')), digest=fingerprint(value.get('digest')))
+    if value.get('policy') == streaming.METADATA_POLICY:
+        result.update(policy=streaming.METADATA_POLICY,
+                      digest_qualification='path/type/size metadata fingerprint; file content integrity not checked')
     for key in ('entries','stale_files'):
         if key in value:result[key]=number(value[key],integer=True)
     fields=value.get('checked_fields')
@@ -95,6 +98,12 @@ def conditions(context):
                 child_summary_locale=enum(context.get('summary_locale'),{'C'}),
                 measurement='command-completion; durability not measured',
                 shared_host=True if context.get('topology') in ('local','loopback') else None,filesystem={})
+    verification=context.get('verification')
+    if isinstance(verification,dict):
+        from benchmarks.report import verification_label
+        result['verification']=dict(policy=enum(verification.get('policy'),{streaming.POLICY,streaming.METADATA_POLICY}),
+                                    workers=number(verification.get('workers'),integer=True),
+                                    label=verification_label(context))
     for key in ('effective_parallelism','fd_limit'):
         result[key]=number(environment.get(key),integer=True)
     baseline=context.get('baseline_commit')
@@ -280,6 +289,7 @@ def project_run(run, source_results):
     from benchmarks import report
     report.validate_result(run)
     from benchmarks import operations
+    metadata_only=(run['context'].get('verification') or {}).get('policy')==streaming.METADATA_POLICY
     selected_cases={case['id']:case for case in run['cases']}
     selected_variants={variant['id']:variant for variant in run['variants']}
     case_aliases={case['id']:f'case-{index+1}' for index,case in enumerate(run['cases'])}
@@ -305,6 +315,8 @@ def project_run(run, source_results):
             files_per_directory=number(case.get('files_per_directory'),integer=True),file_size_bytes=number(case.get('file_size_bytes'),integer=True),
             operation=enum(case.get('mode','fresh'),{'fresh','unchanged','partial'}),fixture_digest=fingerprint(case.get('fixture_digest')),
             realized_counts=counts(case.get('realized_counts'))))
+        if metadata_only:
+            result['cases'][-1]['fixture_digest_qualification']='path/type/size metadata fingerprint; file content integrity not checked'
     for variant in run['variants']:
         result['variants'].append(dict(alias=variant_aliases[variant['id']],tool=enum(variant.get('tool'),{'rcp','rsync','cp'}),processes=number(variant.get('processes'),integer=True),flags=[safe_flag(arg) for arg in variant.get('args',[])],args_withheld=any(safe_flag(arg) is None for arg in variant.get('args',[])),timing_collection=enum(collection.get(variant['id']),TIMING_STATUS)))
     for index,trial in enumerate(run['trials']):
@@ -312,8 +324,8 @@ def project_run(run, source_results):
         operation=selected_cases[trial['case_id']].get('mode','fresh')
         exact_summary=operations.summary_supported(selected_variants[trial['variant_id']]) if admitted else False
         source_verified=run['context'].get('cache_policy')=='source-verified'
-        checked=dict(content=admitted,seed=admitted and operation!='fresh',cache=admitted and source_verified,
-                     metadata=admitted and exact_summary,source=admitted and (operation!='fresh' or exact_summary or source_verified))
+        checked=dict(content=admitted and not metadata_only,seed=admitted and operation!='fresh',cache=admitted and source_verified,
+                     metadata=admitted and exact_summary,source=admitted and (operation!='fresh' or exact_summary or source_verified or run['context'].get('verification') is not None))
         row=dict(ordinal=index,case=case_aliases[trial['case_id']],variant=variant_aliases[trial['variant_id']],iteration=trial['iteration'],
                  status=trial['status'],elapsed_seconds=trial.get('elapsed_seconds'),exit_codes=[number(code,integer=True,minimum=-255) for code in (trial['exit_codes'] if isinstance(trial['exit_codes'],list) else trial['exit_codes'].values())],
                  exit_code_collection='array' if isinstance(trial['exit_codes'],list) else 'legacy-object-values; keys withheld',
@@ -321,6 +333,10 @@ def project_run(run, source_results):
                  child_locale=enum(trial.get('child_locale'),{'C','inherited'}),short_sample=trial['elapsed_seconds']<10 if trial.get('elapsed_seconds') is not None else None,
                  proofs={name:proof(trial.get(field),checked[name]) for name,field in PROOFS.items()},commands=[],
                  failure=diagnostic(trial.get('failure'),f"{run['run_id']}-trial-{index}-diagnostic") if trial['status']!='ok' else None)
+        if metadata_only:
+            row['proofs']['structure']=proof(trial.get('validation'),admitted)
+            row['proofs']['content']=dict(proof(None,False),qualification='not-checked')
+            row['proofs']['metadata']=proof((trial.get('validation') or {}).get('metadata'),admitted)
         row['timings']=timing(trial.get('timings'))
         row['commands']=[command(argv,None,ordinal,None,None) for ordinal,argv in enumerate(trial['commands'])]
         row['transport'],row['evidence'],role_commands=owned_trial(trial,run['context'].get('owned_transport'),f"{run['run_id']}-trial-{index}",trial['status']=='ok' and run['context'].get('owned_transport') is not None,selected_variants[trial['variant_id']],run['tools'])

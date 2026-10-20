@@ -14,11 +14,21 @@ from pathlib import Path
 from benchmarks.strict_json import parse_json
 from benchmarks.site import read_theme
 from benchmarks.timings import require_roles, validate_report
-from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks
+from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks, streaming
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 SERIES_ID = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def verification_label(context):
+    """Describe the recorded verification contract without upgrading legacy evidence."""
+    policy = (context.get("verification") or {}).get("policy")
+    if policy == streaming.METADATA_POLICY:
+        return "Metadata/size only; file content integrity not checked"
+    if policy == streaming.POLICY:
+        return "Full-content SHA-256"
+    return "Legacy validation; see recorded proof contract"
 
 
 def _object(value, name):
@@ -139,7 +149,7 @@ def validate_result(value):
     verification = context.get("verification")
     if verification is not None:
         if (not isinstance(verification, dict) or set(verification) != {"policy", "workers"}
-                or verification["policy"] != "sha256-tree-stream-v1"
+                or verification["policy"] not in (streaming.POLICY, streaming.METADATA_POLICY)
                 or type(verification["workers"]) is not int or not 1 <= verification["workers"] <= 32
                 or context["topology"] != "local"
                 or operation_revision != operations.CONTRACT_REVISION
@@ -203,6 +213,11 @@ def validate_result(value):
             raise ValueError(f"trials[{i}].validation.ok must be a boolean")
         if trial["status"] == "ok" and not trial["validation"]["ok"]:
             raise ValueError(f"trials[{i}] is ok without passing validation")
+        expected_policy = verification["policy"] if verification else streaming.POLICY
+        for field in ("validation", "source_validation", "cache_validation"):
+            value = trial.get(field)
+            if isinstance(value, dict) and "policy" in value and value["policy"] != expected_policy:
+                raise ValueError(f"trial.{field} policy differs from verification contract")
         if operation_revision is not None:
             _validate_operation_trial(trial, cases_by_id[trial["case_id"]], variants_by_id[trial["variant_id"]], context)
         if owned is not None and trial["status"] == "ok":
@@ -335,11 +350,19 @@ def _validate_operation_trial(trial, case, variant, context):
     def exact_counts(value):
         return isinstance(value, dict) and value == counts and all(type(item) is int for item in value.values())
 
-    def content(value, field):
-        if not exact_counts(value.get("counts")) or value.get("digest") != case.get("fixture_digest") or not isinstance(value.get("digest"), str) or not SERIES_ID.fullmatch(value["digest"]):
-            raise ValueError(f"trial.{field} lacks exact source content proof")
+    metadata_only = (context.get("verification") or {}).get("policy") == streaming.METADATA_POLICY
 
-    content(proof("validation"), "validation")
+    def content(value, field):
+        if metadata_only and value.get("policy") != streaming.METADATA_POLICY:
+            raise ValueError(f"trial.{field} lacks metadata verification policy")
+        if not exact_counts(value.get("counts")) or value.get("digest") != case.get("fixture_digest") or not isinstance(value.get("digest"), str) or not SERIES_ID.fullmatch(value["digest"]):
+            kind = "structure" if metadata_only else "content"
+            raise ValueError(f"trial.{field} lacks exact source {kind} proof")
+
+    destination = proof("validation")
+    content(destination, "validation")
+    if metadata_only:
+        metadata(_object(destination.get("metadata"), "trial.validation.metadata"), "validation.metadata")
     if operation != "fresh":
         seed = proof("seed_validation")
         if not exact_counts(seed.get("counts")) or type(seed.get("stale_files")) is not int or seed["stale_files"] != expected["files_copied"] or seed.get("independent_files") is not True or seed.get("exact_seed_mtimes") is not True or not isinstance(seed.get("digest"), str) or not SERIES_ID.fullmatch(seed["digest"]):
@@ -394,7 +417,7 @@ def _dashboard_run(record):
         observation = trial.get("command_clocks")
         trials.append(trial if observation is None else dict(trial, command_clocks=dict(
             observation, comparison=clocks.comparison(observation))))
-    return dict(record, trials=trials)
+    return dict(record, trials=trials, verification_label=verification_label(record["context"]))
 
 
 def render(input_path, output, reports_url=None):
