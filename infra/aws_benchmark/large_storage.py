@@ -109,7 +109,8 @@ def prepare(data, case, budget, uid, gid, execute):
             "benchmark mount/output path already exists")
     swaps = Path("/proc/swaps").read_text().splitlines()
     require(len(swaps) == 1 and swaps[0].startswith("Filename"), "active or unknown swap inventory")
-    tree = json.loads(execute(["lsblk", "--json", "--bytes", "--paths", "--output",
+    # without NAME or an explicit tree, lsblk flattens partitions into top-level entries
+    tree = json.loads(execute(["lsblk", "--json", "--tree", "--bytes", "--paths", "--output",
         "PATH,TYPE,SIZE,MODEL,MOUNTPOINTS,FSTYPE,RO,MAJ:MIN,SERIAL"],
         budget, capture_output=True, text=True).stdout)
     disks = select(tree)
