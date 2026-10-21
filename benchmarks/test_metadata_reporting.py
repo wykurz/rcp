@@ -43,6 +43,31 @@ def verified_record(policy, run_id="a" * 32, timestamp="2026-09-26T12:00:00Z", i
     return record
 
 
+def imported_tuning_history(policy):
+    contracts = [
+        {},
+        dict(inline_bytes=0),
+        dict(inline_bytes=0, read_bytes=verification.DEFAULT_READ_SIZE),
+        dict(inline_bytes=0, batch_depth=verification.DEFAULT_BATCH_MULTIPLIER),
+        dict(inline_bytes=0, read_bytes=verification.DEFAULT_READ_SIZE,
+             batch_depth=verification.DEFAULT_BATCH_MULTIPLIER),
+        dict(inline_bytes=0, read_bytes=verification.DEFAULT_READ_SIZE * 2,
+             batch_depth=verification.DEFAULT_BATCH_MULTIPLIER),
+        dict(inline_bytes=0, read_bytes=verification.DEFAULT_READ_SIZE,
+             batch_depth=verification.DEFAULT_BATCH_MULTIPLIER + 1),
+    ]
+    records = []
+    for index, contract in enumerate(contracts + contracts):
+        record = verified_record(policy, f"{index + 1:032x}",
+                                 f"2026-09-{index + 1:02d}T12:00:00Z", contract.get("inline_bytes"))
+        record["context"]["verification"].update(contract)
+        # imported producer IDs may be stale; the explicit contract must also agree
+        record["summaries"][0]["series_id"] = "a" * 64
+        report.validate_result(record)
+        records.append(record)
+    return records
+
+
 class MetadataReportingTests(unittest.TestCase):
     def test_metadata_and_full_streaming_proofs_keep_distinct_policies(self):
         for policy in (streaming.POLICY, streaming.METADATA_POLICY):
@@ -300,6 +325,34 @@ class MetadataReportingTests(unittest.TestCase):
             state = test_report.ReportTests().dashboard_state(output)
             self.assertEqual(state["points"], 3)
             self.assertEqual(state["lines"], 0)
+
+    def test_changes_partition_imported_read_and_batch_contracts_without_defaulting_history(self):
+        for policy in (streaming.POLICY, streaming.METADATA_POLICY):
+            with self.subTest(policy=policy):
+                records = imported_tuning_history(policy)
+                evidence = changes.build(records, {record["run_id"]: [] for record in records})
+                groups = len(records) // 2
+                for index, row in enumerate(evidence["changes"]):
+                    if index < groups:
+                        self.assertIsNone(row["reference"], records[index]["context"]["verification"])
+                    else:
+                        self.assertEqual(row["reference"]["run_id"], records[index - groups]["run_id"])
+                        self.assertEqual(row["status"], "compared")
+
+    def test_dashboard_partitions_imported_read_and_batch_contracts_without_defaulting_history(self):
+        for policy in (streaming.POLICY, streaming.METADATA_POLICY):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as temporary:
+                records = imported_tuning_history(policy)
+                root = Path(temporary)
+                history = root / "input" / "runs"
+                history.mkdir(parents=True)
+                for record in records:
+                    (history / (record["run_id"] + ".json")).write_text(json.dumps(record))
+                output = root / "output"
+                report.render(history.parent, output)
+                state = test_report.ReportTests().dashboard_state(output)
+                self.assertEqual(state["points"], len(records))
+                self.assertEqual(state["lines"], len(records) // 2)
 
     def test_metadata_cannot_be_relabelled_as_full_or_legacy(self):
         for policy in (streaming.POLICY, None):
