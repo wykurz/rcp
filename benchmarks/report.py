@@ -16,7 +16,8 @@ from benchmarks.site import read_theme
 from benchmarks.timings import require_roles, validate_report
 from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks
 from benchmarks.verification import (FULL_CONTENT_POLICY, METADATA_POLICY, MAX_WORKERS, MAX_INLINE_BYTES,
-                                     LEGACY_SOURCE_METADATA_FIELDS, SOURCE_METADATA_FIELDS, verification_label)
+                                     LEGACY_SOURCE_METADATA_FIELDS, SOURCE_METADATA_FIELDS, verification_label,
+                                     MIN_READ_BYTES, MAX_READ_BYTES, MAX_BATCH_DEPTH)
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -141,11 +142,16 @@ def validate_result(value):
     verification = context.get("verification")
     if verification is not None:
         if (not isinstance(verification, dict) or not {"policy", "workers"} <= verification.keys()
-                or verification.keys() - {"policy", "workers", "inline_bytes"}
+                or verification.keys() - {"policy", "workers", "inline_bytes", "read_bytes", "batch_depth"}
                 or verification["policy"] not in (FULL_CONTENT_POLICY, METADATA_POLICY)
                 or type(verification["workers"]) is not int or not 1 <= verification["workers"] <= MAX_WORKERS
                 or ("inline_bytes" in verification and (type(verification["inline_bytes"]) is not int
                     or not 0 <= verification["inline_bytes"] <= MAX_INLINE_BYTES))
+                or ({"read_bytes", "batch_depth"} & verification.keys() and "inline_bytes" not in verification)
+                or ("read_bytes" in verification and (type(verification["read_bytes"]) is not int
+                    or not MIN_READ_BYTES <= verification["read_bytes"] <= MAX_READ_BYTES))
+                or ("batch_depth" in verification and (type(verification["batch_depth"]) is not int
+                    or not 1 <= verification["batch_depth"] <= MAX_BATCH_DEPTH))
                 or context["topology"] != "local"
                 or context["cache_policy"] not in ("source-warm", "linux-drop-caches")
                 or operation_revision != operations.CONTRACT_REVISION
@@ -210,6 +216,10 @@ def validate_result(value):
         if trial["status"] == "ok" and not trial["validation"]["ok"]:
             raise ValueError(f"trials[{i}] is ok without passing validation")
         expected_policy = verification["policy"] if verification else FULL_CONTENT_POLICY
+        for field in ("validation", "source_validation", "cache_validation", "seed_validation",
+                      "metadata_validation", "summary_validation"):
+            if field in trial:
+                _validate_proof_diagnostics(trial[field], f"trial.{field}")
         for field in ("validation", "source_validation", "cache_validation"):
             value = trial.get(field)
             if isinstance(value, dict) and "policy" in value and value["policy"] != expected_policy:
@@ -315,6 +325,40 @@ def validate_result(value):
     return run
 
 
+def _validate_proof_diagnostics(value, field):
+    value = _object(value, field)
+    for flag in ("ok", "interrupted", "verification_error", "complete", "digest_match",
+                 "modes_match", "source_metadata_match"):
+        if flag in value and type(value[flag]) is not bool:
+            raise ValueError(f"{field}.{flag} must be a boolean")
+    for nested in ("metadata", "modes"):
+        if nested in value:
+            _validate_proof_diagnostics(value[nested], f"{field}.{nested}")
+
+
+def operation_proof_contract(case, variant, context):
+    """Select the same evidence paths and requirements for validation and export."""
+    streaming = context.get("verification") is not None
+    summary = operations.summary_supported(variant)
+    seeded = case.get("mode", "fresh") != "fresh"
+    cached = context.get("cache_policy") == "source-verified"
+    return {
+        "content": ("validation", True),
+        "seed": ("seed_validation", seeded),
+        "cache": ("cache_validation", cached),
+        "metadata": ("validation.metadata" if streaming else "metadata_validation", streaming or summary),
+        "source": ("source_validation", seeded or summary or cached or streaming),
+        "summary": ("summary_validation", summary),
+    }
+
+
+def trial_proof(trial, field):
+    value = trial
+    for component in field.split("."):
+        value = value.get(component) if isinstance(value, dict) else None
+    return value
+
+
 def _validate_operation_trial(trial, case, variant, context):
     operation = case.get("mode", "fresh")
     operations.validate_variant(variant, operation)
@@ -332,8 +376,10 @@ def _validate_operation_trial(trial, case, variant, context):
     if trial["status"] != "ok":
         return
 
+    contract = operation_proof_contract(case, variant, context)
+
     def proof(field):
-        value = _object(trial.get(field), f"trial.{field}")
+        value = _object(trial_proof(trial, field), f"trial.{field}")
         if (value.get("ok") is not True or value.get("interrupted") is True
                 or value.get("verification_error") is True or value.get("complete") is False):
             raise ValueError(f"trial.{field} is not a successful proof")
@@ -342,8 +388,13 @@ def _validate_operation_trial(trial, case, variant, context):
     def metadata(value, field, timestamps=False):
         expected_fields = [list(LEGACY_SOURCE_METADATA_FIELDS)] if timestamps else [["mode"]]
         if timestamps and context.get("verification") is not None:
-            expected_fields.append(list(SOURCE_METADATA_FIELDS))
-        if value.get("ok") is not True or type(value.get("entries")) is not int or value["entries"] != directories + files + 1 or value.get("checked_fields") not in expected_fields:
+            expected_fields = [list(SOURCE_METADATA_FIELDS)]
+            if "inline_bytes" not in context["verification"]:
+                expected_fields.append(list(LEGACY_SOURCE_METADATA_FIELDS))
+        if (value.get("ok") is not True or value.get("interrupted") is True
+                or value.get("verification_error") is True or value.get("complete") is False
+                or type(value.get("entries")) is not int or value["entries"] != directories + files + 1
+                or value.get("checked_fields") not in expected_fields):
             raise ValueError(f"trial.{field} lacks required metadata proof")
 
     def exact_counts(value):
@@ -360,24 +411,26 @@ def _validate_operation_trial(trial, case, variant, context):
 
     destination = proof("validation")
     content(destination, "validation")
-    if context.get("verification") is not None:
-        metadata(_object(destination.get("metadata"), "trial.validation.metadata"), "validation.metadata")
-    if operation != "fresh":
+    metadata_field, metadata_required = contract["metadata"]
+    if metadata_required:
+        metadata(proof(metadata_field), metadata_field)
+    if contract["seed"][1]:
         seed = proof("seed_validation")
         if not exact_counts(seed.get("counts")) or type(seed.get("stale_files")) is not int or seed["stale_files"] != expected["files_copied"] or seed.get("independent_files") is not True or seed.get("exact_seed_mtimes") is not True or not isinstance(seed.get("digest"), str) or not SERIES_ID.fullmatch(seed["digest"]):
             raise ValueError("trial.seed_validation lacks exact seed proof")
         metadata(_object(seed.get("modes"), "trial.seed_validation.modes"), "seed_validation.modes")
-    if operations.summary_supported(variant):
+    if contract["summary"][1]:
+        if "summary_validation" in trial:
+            proof("summary_validation")
         summary = trial.get("copy_summary")
         if summary != expected or not isinstance(summary, dict) or any(type(item) is not int for item in summary.values()):
             raise ValueError("trial.copy_summary differs from operation counts")
         metadata(proof("metadata_validation"), "metadata_validation")
-    if context["cache_policy"] == "source-verified":
+    if contract["cache"][1]:
         cache = proof("cache_validation")
         content(cache, "cache_validation")
         metadata(_object(cache.get("metadata"), "trial.cache_validation.metadata"), "cache_validation.metadata", timestamps=True)
-    if (operation != "fresh" or operations.summary_supported(variant)
-            or context["cache_policy"] == "source-verified" or context.get("verification") is not None):
+    if contract["source"][1]:
         source = proof("source_validation")
         content(source, "source_validation")
         metadata(_object(source.get("metadata"), "trial.source_validation.metadata"), "source_validation.metadata", timestamps=True)

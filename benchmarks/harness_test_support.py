@@ -13,7 +13,7 @@ from benchmarks.test_timings import TimingTests
 
 def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=None,
                 outcome=None, summary=True, streaming_verification=True, cache="linux-drop-caches",
-                summary_text=None, extra_args=()):
+                summary_text=None, extra_args=(), cache_fault=None):
     binary, manifest = TimingTests()._fixture(root)
     if summary:
         contents = json.loads(manifest.read_text())
@@ -28,9 +28,14 @@ def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=No
         events.append("verify")
         if scan_fault:
             scan_fault(stage, path)
+        if streaming_verification and policy == streaming.METADATA_POLICY:
+            with mock.patch.object(streaming.os, "read", side_effect=AssertionError("payload read")):
+                return original_scan(path, *args, **kwargs)
         return original_scan(path, *args, **kwargs)
     def prepare_cache(*args):
         events.append("drop")
+        if cache_fault:
+            cache_fault()
         return original_cache(*args) if cache == "source-verified" else None
     def execute(commands, logdir, timeout, **kwargs):
         nonlocal copied_source
@@ -60,11 +65,9 @@ def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=No
         stack.enter_context(mock.patch.object(run, "execute_commands", side_effect=execute))
         stack.enter_context(mock.patch.object(streaming if streaming_verification else run, "scan_tree", side_effect=scan))
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-        if policy == streaming.METADATA_POLICY:
-            stack.enter_context(mock.patch.object(streaming.os, "fdopen", side_effect=AssertionError("payload read")))
         try:
             run.main(args)
-        except (RuntimeError, run.operations.VerificationError):
+        except (RuntimeError, ValueError, OSError, KeyboardInterrupt):
             pass
     record = report.parse_result((root / "out/results.json").read_text())
     return record, events, (root / "out/summary.md").read_text()

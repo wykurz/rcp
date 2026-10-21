@@ -17,12 +17,15 @@ from benchmarks.harness_test_support import run_fixture
 class HarnessVerificationTests(unittest.TestCase):
     def test_streaming_only_options_require_explicit_streaming(self):
         for option in (["--verification-mode", "full-content"], ["--verification-mode", "metadata-size"],
-                       ["--verification-workers", "8"], ["--verification-workers", "16"], ["--verification-inline-bytes", "0"], ["--check-capacity"]):
+                       ["--verification-workers", "8"], ["--verification-workers", "16"], ["--verification-inline-bytes", "0"], ["--verification-read-bytes", "4096"],
+                       ["--verification-batch-depth", "1"], ["--check-capacity"]):
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run._arguments(["--output", "unused", *option])
         args = run._arguments(["--output", "unused", "--streaming-verification"])
         self.assertEqual(args.verification_mode, "full-content")
         self.assertEqual(args.verification_workers, streaming.DEFAULT_WORKERS)
+        self.assertEqual(args.verification_read_bytes, streaming.DEFAULT_READ_SIZE)
+        self.assertEqual(args.verification_batch_depth, streaming.DEFAULT_BATCH_MULTIPLIER)
 
     def test_inline_threshold_and_capacity_options_have_effective_defaults_and_guards(self):
         base = ["--output", "unused", "--streaming-verification"]
@@ -36,6 +39,8 @@ class HarnessVerificationTests(unittest.TestCase):
         self.assertEqual(args.capacity_policy, dict(byte_percent=35, inode_percent=40,
                                                     byte_reserve=17, inode_reserve=19))
         for option in (["--verification-inline-bytes", "-1"], ["--verification-inline-bytes", "1000000001"],
+                       ["--verification-read-bytes", "4095"], ["--verification-read-bytes", "16777217"],
+                       ["--verification-batch-depth", "0"], ["--verification-batch-depth", "9"],
                        ["--capacity-byte-percent", "20"], ["--capacity-inode-percent", "20"],
                        ["--capacity-byte-reserve", "0"], ["--capacity-inode-reserve", "0"],
                        ["--check-capacity", "--capacity-byte-percent", "-1"]):
@@ -47,7 +52,7 @@ class HarnessVerificationTests(unittest.TestCase):
         original_scan = streaming.scan_tree
         thresholds = []
         def scan(*args, **kwargs):
-            thresholds.append(kwargs["inline_bytes"])
+            thresholds.append((kwargs["inline_bytes"], kwargs["read_bytes"], kwargs["batch_depth"]))
             return original_scan(*args, **kwargs)
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(run.capacity, "check_pair", return_value={}) as pair, \
@@ -55,12 +60,15 @@ class HarnessVerificationTests(unittest.TestCase):
                 mock.patch.object(streaming, "scan_tree", side_effect=scan):
             root = Path(directory)
             record, events, _ = run_fixture(root, extra_args=["--verification-inline-bytes", "0",
+                "--verification-read-bytes", "4096", "--verification-batch-depth", "3",
                 "--check-capacity", "--capacity-byte-percent", "35", "--capacity-inode-percent", "40",
                 "--capacity-byte-reserve", "17", "--capacity-inode-reserve", "19"])
             self.assertEqual(record["status"], "complete")
             self.assertEqual(record["context"]["verification"]["inline_bytes"], 0)
             self.assertEqual(record["context"]["capacity_policy"], policy)
-            self.assertEqual(thresholds, [0] * 9)
+            self.assertEqual(thresholds, [(0, 4096, 3)] * 9)
+            self.assertEqual(record["context"]["verification"]["read_bytes"], 4096)
+            self.assertEqual(record["context"]["verification"]["batch_depth"], 3)
             self.assertEqual(events, ["verify"] + ["drop", "copy", "verify", "verify"] * 4)
             self.assertEqual(pair.call_count, 1)
             self.assertEqual(pair.call_args.kwargs, policy)

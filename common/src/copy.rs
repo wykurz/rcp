@@ -8183,6 +8183,8 @@ mod copy_tests {
         let sentinel = root.join("sentinel");
         tokio::fs::write(&src, "REAL_CONTENT").await?;
         tokio::fs::write(&sentinel, "SENTINEL_SECRET_CONTENT").await?;
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -8202,24 +8204,33 @@ mod copy_tests {
         // force the classification/open race rather than relying on swapper scheduling
         tokio::fs::remove_file(&src).await?;
         tokio::fs::symlink(&sentinel, &src).await?;
-        let result = copy_child(
-            &PROGRESS,
-            &src_parent,
-            Some(&dst_parent),
-            std::ffi::OsStr::new("source"),
-            &src,
-            &dst,
-            std::path::Path::new(""),
-            &toctou_settings(),
-            &NO_PRESERVE_SETTINGS,
-            false,
-            DeleteScanAnchor::new(&dst, std::path::Path::new("")),
-            entry,
+        let error = run_with_open_file_cleanup(
+            &admission,
+            copy_child(
+                &PROGRESS,
+                &src_parent,
+                Some(&dst_parent),
+                std::ffi::OsStr::new("source"),
+                &src,
+                &dst,
+                std::path::Path::new(""),
+                &toctou_settings(),
+                &NO_PRESERVE_SETTINGS,
+                false,
+                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                entry,
+            ),
         )
-        .await;
-        assert!(
-            result.is_err(),
-            "the admitted regular-file open must reject a symlink"
+        .await?
+        .expect_err("the admitted regular-file open must reject a symlink");
+        assert_eq!(
+            error
+                .source
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "the failure must come from the nofollow source open"
         );
         assert!(!dst.exists(), "no destination payload may be created");
         assert_eq!(
@@ -8308,6 +8319,15 @@ mod copy_tests {
             )
             .await
             .expect("copy must not hang under concurrent swapping");
+            if i == 0 {
+                result
+                    .as_ref()
+                    .expect("the stable regular-file control must succeed");
+                assert_eq!(
+                    tokio::fs::read(dst.join("sub/entry")).await?,
+                    b"REAL_CONTENT"
+                );
+            }
             match result {
                 Ok(_) => {}
                 Err(_) => caught_swaps += 1, // a swap was caught mid-copy (failed closed)
@@ -8341,15 +8361,10 @@ mod copy_tests {
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         swapper.unwrap().join().expect("swapper thread panicked");
-        // literal symlink copies cannot satisfy the regular-file path's non-vacuity check
-        // the initial control guarantees coverage without a probabilistic scheduler assumption
+        // concurrent outcomes are diagnostic; the separate admitted-source test proves the boundary
         tracing::info!(
             "file/symlink swap: caught_swaps={caught_swaps}, copied_real={copied_real}, \
              copied_symlinks={copied_symlinks}"
-        );
-        assert!(
-            caught_swaps + copied_real > 0,
-            "expected the guarded regular-file path to be exercised"
         );
         Ok(())
     }

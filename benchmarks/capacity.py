@@ -3,6 +3,7 @@
 import os
 
 from benchmarks.operations import expected_counts, validate_case
+from benchmarks.verification import MAX_DIRECTORY_ENTRIES, MAX_DEPTH
 
 MAX_FILE_BYTES = 1_000_000_000
 MAX_FILES = 10_240_000
@@ -25,6 +26,11 @@ def policy(**overrides):
 
 def validate_contract(case):
     validate_case(case)
+    widths = case["directory_widths"]
+    maximum_entries = (max(widths) + case["files_per_directory"]
+                       if "files_per_directory" in case else max(*widths, case["files_per_leaf"]))
+    if len(widths) > MAX_DEPTH or maximum_entries > MAX_DIRECTORY_ENTRIES:
+        raise ValueError("fixture exceeds bounded verification depth or directory entry limit")
     counts = expected_counts(case)
     if (case.get("mode", "fresh") != "fresh"
             or not 0 < case["file_size_bytes"] <= MAX_FILE_BYTES

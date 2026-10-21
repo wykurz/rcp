@@ -41,7 +41,8 @@ def measurement(expected):
     if args.streaming_verification:
         run["context"]["verification"] = dict(policy=("metadata-size-tree-v1"
             if args.verification_mode == "metadata-size" else "sha256-tree-stream-v1"),
-            workers=args.verification_workers, inline_bytes=args.verification_inline_bytes)
+            workers=args.verification_workers, inline_bytes=args.verification_inline_bytes,
+            read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
     run["tools"] = {key: dict(sha256="d" * 64) for key in ("rcp", "rcpd", "filegen", "rcp-baseline", "rcpd-baseline")}
     for variant in run["variants"]:
         variant["args"] = ["--summary"]
@@ -59,12 +60,15 @@ def measurement(expected):
         metadata = dict(ok=True, entries=counts["directories"] + counts["files"] + 1)
         if args.streaming_verification:
             proof["metadata"] = dict(metadata, checked_fields=["mode"])
+        source_fields = ["mode", "uid", "gid", "mtime_ns"]
+        if args.streaming_verification:
+            source_fields += ["ctime_ns", "dev", "ino"]
         trial.update(resource_record(status="ok")["trials"][0])
         trial.update(variant_id=role, pairing=pairing, elapsed_seconds=1.0 if role == pairs.CANDIDATE else 2.0,
             child_locale="C", operation="fresh", expected_transfer=operations.transfer_counts("fresh", counts),
             copy_summary=operations.transfer_counts("fresh", counts), validation=proof,
             metadata_validation=dict(metadata, checked_fields=["mode"]),
-            source_validation=dict(proof, metadata=dict(metadata, checked_fields=["mode", "uid", "gid", "mtime_ns"])))
+            source_validation=dict(proof, metadata=dict(metadata, checked_fields=source_fields)))
     return report.validate_result(run)
 
 
@@ -150,14 +154,21 @@ class ResultTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 raw = measurement(expected)
-                raw["context"]["verification"].pop("inline_bytes")
+                raw["context"]["verification"] = common.verification_contracts(suite)[0]
+                for trial in raw["trials"]:
+                    trial["source_validation"]["metadata"]["checked_fields"] = ["mode", "uid", "gid", "mtime_ns"]
                 source, output = self.root / (suite + "-old-raw"), self.root / (suite + "-old-report")
                 _, policy = bundle(source, expected, raw)
                 evidence = results.ingest(source, output, expected, "success", policy)
-                self.assertFalse(any("verification contract" in error for error in evidence["errors"]))
+                self.assertFalse(any("measurement record" in error for error in evidence["errors"]))
                 derived = report.parse_result((output / "derived.json").read_text())
                 self.assertNotIn("inline_bytes", derived["context"]["verification"])
-                self.assertEqual(evidence["history_eligible"], suite in common.METADATA_SUITES)
+                self.assertFalse(evidence["history_eligible"])
+                self.assertEqual(evidence["expected_verification"], raw["context"]["verification"])
+                self.assertEqual(derived["context"]["aws_provenance"]["expected_verification"],
+                                 raw["context"]["verification"])
+                if suite in common.METADATA_SUITES:
+                    self.assertIn("history approval: unexpected suite verification contract", evidence["errors"])
 
     def test_comparison_labels_require_source_and_binary_equality(self):
         expected = binding("bulk-1g-metadata")
