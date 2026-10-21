@@ -19,12 +19,16 @@ CHUNK_BYTES = 512 * 1024
 
 def select(tree):
     selected = []
+    require(isinstance(tree, dict), "invalid block-device inventory")
     devices = tree.get("blockdevices")
     require(isinstance(devices, list), "missing block-device inventory")
     for disk in devices:
+        require(isinstance(disk, dict), "invalid block-device inventory entry")
         model = (disk.get("model") or "").strip()
         path = disk.get("path") or ""
         if path.startswith("/dev/nvme"):
+            require(disk.get("type") == "disk" and re.fullmatch(r"/dev/nvme[0-9]+n1", path),
+                    "invalid NVMe tree topology")
             require(model in (MODEL, EBS_MODEL), "unexpected NVMe model")
         if model != MODEL:
             continue
@@ -101,26 +105,35 @@ def check_array(number, members):
     unmounted(number)
 
 
-def prepare(data, case, budget, uid, gid, execute):
-    """Fail before formatting unless all disks and both newly created arrays pass."""
-    arrays = {side: Path("/dev/md") / ("rcp-" + side) for side in SIDES}
-    require(all(not os.path.lexists(path) for path in arrays.values()), "target RAID array already exists")
+def unused_targets(data):
     require(all(not os.path.lexists(data / side) for side in (*SIDES, "output")),
             "benchmark mount/output path already exists")
     swaps = Path("/proc/swaps").read_text().splitlines()
     require(len(swaps) == 1 and swaps[0].startswith("Filename"), "active or unknown swap inventory")
+
+
+def open_disks(execute, budget, stack):
     # without NAME or an explicit tree, lsblk flattens partitions into top-level entries
     tree = json.loads(execute(["lsblk", "--json", "--tree", "--bytes", "--paths", "--output",
         "PATH,TYPE,SIZE,MODEL,MOUNTPOINTS,FSTYPE,RO,MAJ:MIN,SERIAL"],
         budget, capture_output=True, text=True).stdout)
     disks = select(tree)
+    held = []
+    for disk in disks:
+        fd, number = open_block(disk["path"], stack)
+        check_disk(disk, fd, number, execute, budget)
+        held.append((fd, number))
+    require(len({number for _, number in held}) == 4, "overlapping opened disks")
+    return disks, held
+
+
+def prepare(data, case, budget, uid, gid, execute):
+    """Fail before formatting unless all disks and both newly created arrays pass."""
+    arrays = {side: Path("/dev/md") / ("rcp-" + side) for side in SIDES}
+    require(all(not os.path.lexists(path) for path in arrays.values()), "target RAID array already exists")
+    unused_targets(data)
     with ExitStack() as stack:
-        held = []
-        for disk in disks:
-            fd, number = open_block(disk["path"], stack)
-            check_disk(disk, fd, number, execute, budget)
-            held.append((fd, number))
-        require(len({number for _, number in held}) == 4, "overlapping opened disks")
+        disks, held = open_disks(execute, budget, stack)
         # no candidate exists and only this trusted supervisor may change devices
         # pass held descriptors to the tools rather than resolving disk names again
         opened = {}

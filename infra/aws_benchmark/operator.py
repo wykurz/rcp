@@ -8,7 +8,7 @@ import re
 from .common import (INSTANCE_TYPE, MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, Budget,
                      checked_clients, error_code, get_json, group, live_instances, pending_status, put_json,
                      require, retry_io, scheduled, timestamp, utc,
-                     validate_window, verify_close, verify_group)
+                     validate_admission, validate_window, verify_close, verify_group)
 
 
 def operator_clients(region):
@@ -69,6 +69,7 @@ def inspect_closed(api, name, budget):
 
 def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
     validate_window(window, now(), minimum=MIN_WINDOW)
+    validate_admission(window)
     require(120 <= (utc(window["opens"]) - now()).total_seconds() <= MAX_OPEN_LEAD,
             "opening must be 2–5 minutes in the future")
     budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))

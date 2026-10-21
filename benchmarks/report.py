@@ -14,21 +14,13 @@ from pathlib import Path
 from benchmarks.strict_json import parse_json
 from benchmarks.site import read_theme
 from benchmarks.timings import require_roles, validate_report
-from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks, streaming
+from benchmarks import operations, transport, sanitized, changes, pairs, measurements, clocks
+from benchmarks.verification import (FULL_CONTENT_POLICY, METADATA_POLICY, MAX_WORKERS, MAX_INLINE_BYTES,
+                                     LEGACY_SOURCE_METADATA_FIELDS, SOURCE_METADATA_FIELDS, verification_label)
 
 
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 SERIES_ID = re.compile(r"[0-9a-f]{64}\Z")
-
-
-def verification_label(context):
-    """Describe the recorded verification contract without upgrading legacy evidence."""
-    policy = (context.get("verification") or {}).get("policy")
-    if policy == streaming.METADATA_POLICY:
-        return "Metadata/size only; file content integrity not checked"
-    if policy == streaming.POLICY:
-        return "Full-content SHA-256"
-    return "Legacy validation; see recorded proof contract"
 
 
 def _object(value, name):
@@ -148,10 +140,14 @@ def validate_result(value):
                 raise ValueError(f"variants[{i}] has invalid tool/processes/args")
     verification = context.get("verification")
     if verification is not None:
-        if (not isinstance(verification, dict) or set(verification) != {"policy", "workers"}
-                or verification["policy"] not in (streaming.POLICY, streaming.METADATA_POLICY)
-                or type(verification["workers"]) is not int or not 1 <= verification["workers"] <= 32
+        if (not isinstance(verification, dict) or not {"policy", "workers"} <= verification.keys()
+                or verification.keys() - {"policy", "workers", "inline_bytes"}
+                or verification["policy"] not in (FULL_CONTENT_POLICY, METADATA_POLICY)
+                or type(verification["workers"]) is not int or not 1 <= verification["workers"] <= MAX_WORKERS
+                or ("inline_bytes" in verification and (type(verification["inline_bytes"]) is not int
+                    or not 0 <= verification["inline_bytes"] <= MAX_INLINE_BYTES))
                 or context["topology"] != "local"
+                or context["cache_policy"] not in ("source-warm", "linux-drop-caches")
                 or operation_revision != operations.CONTRACT_REVISION
                 or any(case.get("mode", "fresh") != "fresh" for case in cases)):
             raise ValueError("invalid streaming verification contract")
@@ -213,7 +209,7 @@ def validate_result(value):
             raise ValueError(f"trials[{i}].validation.ok must be a boolean")
         if trial["status"] == "ok" and not trial["validation"]["ok"]:
             raise ValueError(f"trials[{i}] is ok without passing validation")
-        expected_policy = verification["policy"] if verification else streaming.POLICY
+        expected_policy = verification["policy"] if verification else FULL_CONTENT_POLICY
         for field in ("validation", "source_validation", "cache_validation"):
             value = trial.get(field)
             if isinstance(value, dict) and "policy" in value and value["policy"] != expected_policy:
@@ -338,22 +334,25 @@ def _validate_operation_trial(trial, case, variant, context):
 
     def proof(field):
         value = _object(trial.get(field), f"trial.{field}")
-        if value.get("ok") is not True:
+        if (value.get("ok") is not True or value.get("interrupted") is True
+                or value.get("verification_error") is True or value.get("complete") is False):
             raise ValueError(f"trial.{field} is not a successful proof")
         return value
 
     def metadata(value, field, timestamps=False):
-        expected_fields = ["mode", "uid", "gid", "mtime_ns"] if timestamps else ["mode"]
-        if value.get("ok") is not True or type(value.get("entries")) is not int or value["entries"] != directories + files + 1 or value.get("checked_fields") != expected_fields:
+        expected_fields = [list(LEGACY_SOURCE_METADATA_FIELDS)] if timestamps else [["mode"]]
+        if timestamps and context.get("verification") is not None:
+            expected_fields.append(list(SOURCE_METADATA_FIELDS))
+        if value.get("ok") is not True or type(value.get("entries")) is not int or value["entries"] != directories + files + 1 or value.get("checked_fields") not in expected_fields:
             raise ValueError(f"trial.{field} lacks required metadata proof")
 
     def exact_counts(value):
         return isinstance(value, dict) and value == counts and all(type(item) is int for item in value.values())
 
-    metadata_only = (context.get("verification") or {}).get("policy") == streaming.METADATA_POLICY
+    metadata_only = (context.get("verification") or {}).get("policy") == METADATA_POLICY
 
     def content(value, field):
-        if metadata_only and value.get("policy") != streaming.METADATA_POLICY:
+        if metadata_only and value.get("policy") != METADATA_POLICY:
             raise ValueError(f"trial.{field} lacks metadata verification policy")
         if not exact_counts(value.get("counts")) or value.get("digest") != case.get("fixture_digest") or not isinstance(value.get("digest"), str) or not SERIES_ID.fullmatch(value["digest"]):
             kind = "structure" if metadata_only else "content"
@@ -361,7 +360,7 @@ def _validate_operation_trial(trial, case, variant, context):
 
     destination = proof("validation")
     content(destination, "validation")
-    if metadata_only:
+    if context.get("verification") is not None:
         metadata(_object(destination.get("metadata"), "trial.validation.metadata"), "validation.metadata")
     if operation != "fresh":
         seed = proof("seed_validation")

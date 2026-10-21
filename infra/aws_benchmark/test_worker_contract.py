@@ -1,19 +1,129 @@
 """The baked worker command and offline approval share one measurement contract."""
 
 import copy
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from benchmarks import pairs, report
+from benchmarks import operations, pairs, report, run as harness
 from infra.aws_benchmark import common, results, worker
 from infra.aws_benchmark.test_results import binding, bundle, measurement
+from infra.aws_benchmark.test_worker_review import worker_fixture
 from infra.aws_benchmark.worker_fixture import parsed_command
 
 
-
 class WorkerContractTests(unittest.TestCase):
+    def test_large_worker_dispatch_uses_manifest_summary_variant_and_archives_storage_evidence(self):
+        manifest_path = Path(__file__).resolve().parents[2] / "benchmarks/large-cases.json"
+        manifest = harness.load_manifest(manifest_path)
+        case = next(case for case in manifest["cases"] if case["id"] == "bulk-1g-1tb")
+        storage = dict(layout="two-disjoint-raid0-ext4-v1", capacity={"checked": True},
+                       arrays={"source": {"device": "9:0"}, "destination": {"device": "9:1"}})
+        with worker_fixture() as (root, cloud, measure, stop):
+            for key in (common.WINDOW_KEY, common.REQUEST_KEY):
+                value = json.loads(cloud.objects[key])
+                value["suite"] = "bulk-1g-metadata"
+                cloud.objects[key] = json.dumps(value).encode()
+            (root / "benchmarks").mkdir()
+            (root / "benchmarks/large-cases.json").write_text(manifest_path.read_text())
+            events = []
+            def prepare(data, selected, budget, uid, gid, execute):
+                events.append("prepare")
+                self.assertEqual(data, root / "data")
+                self.assertEqual(selected, case)
+                self.assertEqual((uid, gid), (123, 123))
+                self.assertIs(execute, worker.execute)
+                self.assertEqual(operations.expected_counts(selected),
+                                 dict(directories=10, files=1000, bytes=1_000_000_000_000))
+                return storage
+            def dispatch(argv, **kwargs):
+                events.append("measure")
+                args = harness._arguments(argv[argv.index("benchmarks.run") + 1:])
+                selected_manifest = harness.load_manifest(args.manifest)
+                self.assertEqual(selected_manifest, manifest)
+                self.assertEqual(args.manifest, root / "benchmarks/large-cases.json")
+                self.assertEqual(args.cases, [case["id"]])
+                self.assertEqual(args.variants, ["rcp-default"])
+                variant, = [entry for entry in selected_manifest["variants"] if entry["id"] in args.variants]
+                self.assertEqual(variant["args"], ["--summary"])
+                self.assertTrue(operations.summary_supported(variant))
+                self.assertTrue(args.streaming_verification)
+                self.assertTrue(args.check_capacity)
+                self.assertEqual(args.verification_mode, "metadata-size")
+                self.assertEqual(args.verification_workers, 8)
+                self.assertEqual(args.verification_inline_bytes, 1_048_576)
+                self.assertEqual(args.timeout, 1200)
+                self.assertEqual(args.repetitions, 2)
+                self.assertEqual(args.source_root, root / "data/source")
+                self.assertEqual(args.destination_root, root / "data/destination")
+                self.assertEqual(args.bin_dir, root / "state/candidate")
+                self.assertEqual(args.baseline_bin_dir, root / "state/baseline")
+                self.assertEqual(args.source_storage_id, "c5d-raid0-ext4-source-v1")
+                self.assertEqual(args.destination_storage_id, "c5d-raid0-ext4-destination-v1")
+                args.output.mkdir()
+                (args.output / "summary.md").write_text("fake harness summary\n")
+                return SimpleNamespace(returncode=0)
+            measure.side_effect = dispatch
+            stop.side_effect = lambda: events.append("stop")
+            with patch.object(worker.large_storage, "prepare", side_effect=prepare) as prepared:
+                worker.run(cloud.api["s3"], "bucket")
+                prepared.assert_called_once()
+            worker.prepare_storage.assert_not_called()
+            status = json.loads(cloud.objects[common.STATUS_KEY])
+            self.assertTrue(status["success"], status)
+            self.assertEqual(events, ["prepare", "measure", "stop"])
+            with zipfile.ZipFile(io.BytesIO(cloud.objects[common.RESULTS_KEY])) as archive:
+                metadata = json.loads(archive.read("worker.json"))
+                self.assertEqual(metadata["storage"], storage)
+                self.assertEqual(metadata["service_returncode"], 0)
+                self.assertEqual(archive.read("benchmark/results/summary.md"), b"fake harness summary\n")
+
+    def test_large_worker_rejects_duplicate_or_missing_case_before_storage_preparation(self):
+        manifest_path = Path(__file__).resolve().parents[2] / "benchmarks/large-cases.json"
+        for defect in ("duplicate", "missing"):
+            with self.subTest(defect=defect), worker_fixture() as (root, cloud, measure, stop):
+                for key in (common.WINDOW_KEY, common.REQUEST_KEY):
+                    value = json.loads(cloud.objects[key])
+                    value["suite"] = "bulk-1g-metadata"
+                    cloud.objects[key] = json.dumps(value).encode()
+                manifest = harness.load_manifest(manifest_path)
+                if defect == "duplicate":
+                    manifest["cases"].append(manifest["cases"][0])
+                else:
+                    manifest["cases"] = manifest["cases"][1:]
+                (root / "benchmarks").mkdir()
+                (root / "benchmarks/large-cases.json").write_text(json.dumps(manifest))
+                with patch.object(worker.large_storage, "prepare") as prepared:
+                    worker.run(cloud.api["s3"], "bucket")
+                    prepared.assert_not_called()
+                measure.assert_not_called()
+                status = json.loads(cloud.objects[common.STATUS_KEY])
+                self.assertFalse(status["success"])
+                self.assertIn("case", status["error"]["message"])
+
+    def test_inactive_large_suite_refuses_before_binary_download_or_storage_preparation(self):
+        with worker_fixture() as (root, cloud, measure, stop):
+            for key in (common.WINDOW_KEY, common.REQUEST_KEY):
+                value = json.loads(cloud.objects[key])
+                value["suite"] = "bulk-1g"
+                cloud.objects[key] = json.dumps(value).encode()
+            with patch.object(worker.large_storage, "prepare") as prepared:
+                worker.run(cloud.api["s3"], "bucket")
+                prepared.assert_not_called()
+            worker.prepare_storage.assert_not_called()
+            measure.assert_not_called()
+            self.assertFalse((root / "state").exists())
+            self.assertEqual([call.kwargs["Key"] for call in cloud.api["s3"].get_object.call_args_list],
+                             [common.WINDOW_KEY, common.REQUEST_KEY])
+            status = json.loads(cloud.objects[common.STATUS_KEY])
+            self.assertFalse(status["success"])
+            self.assertIn("disabled", status["error"]["message"])
+
     def test_real_worker_argv_matches_every_suite_contract(self):
         for suite, cases in common.SUITES.items():
             with self.subTest(suite=suite):
@@ -43,8 +153,9 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertTrue(args.streaming_verification)
                 self.assertTrue(args.check_capacity)
                 self.assertEqual(args.verification_workers, 8)
+                self.assertEqual(args.verification_inline_bytes, 1_048_576)
                 self.assertNotIn("--verification-mode", argv)
-                self.assertEqual(common.verification_contract(suite), dict(policy="sha256-tree-stream-v1", workers=8))
+                self.assertEqual(common.verification_contract(suite), dict(policy="sha256-tree-stream-v1", workers=8, inline_bytes=1_048_576))
                 self.assertEqual(args.timeout, 1200)
                 self.assertEqual(args.repetitions, 2)
                 self.assertEqual(args.purpose, "smoke")
@@ -67,6 +178,7 @@ class WorkerContractTests(unittest.TestCase):
         self.assertTrue(args.check_capacity)
         self.assertEqual(args.verification_mode, "metadata-size")
         self.assertEqual(args.verification_workers, 8)
+        self.assertEqual(args.verification_inline_bytes, 1_048_576)
         self.assertEqual(args.timeout, 1200)
         self.assertEqual(args.repetitions, 2)
         self.assertEqual(args.purpose, "performance")
@@ -78,7 +190,7 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(common.RESERVE, 180)
         evidence, record, policy = self.inspected_measurement(expected)
         self.assertFalse(evidence["history_eligible"])
-        verification = dict(policy="metadata-size-tree-v1", workers=8)
+        verification = dict(policy="metadata-size-tree-v1", workers=8, inline_bytes=1_048_576)
         self.assertEqual(record["context"]["verification"], verification)
         self.assertEqual(evidence["expected_verification"], verification)
         self.assertEqual(len(record["trials"]), 4)
@@ -108,7 +220,7 @@ class WorkerContractTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     source = Path(directory)
                     bundle(source, expected, changed)
-                    # Focus the ingress contract test independently of generic proof-schema rejection.
+                    # focus the ingress contract test independently of generic proof-schema rejection
                     with patch.object(results.report, "validate_result", return_value=changed):
                         inspected, parsed, _ = results.inspect(source, expected, "success")
                     self.assertIsNone(parsed)

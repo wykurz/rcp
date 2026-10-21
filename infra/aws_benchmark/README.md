@@ -318,11 +318,13 @@ obsolete AMI snapshots separately.
 
 The existing suites generate at most 30–31.25 GiB, below host RAM. The separate
 [large-workload manifest and qualification plan](LARGE_WORKLOADS.md) add decimal 1 TB/1.024 TB bulk
-layouts and a 10,240,000-file tiny layout. The full-content opt-in suites are smoke diagnostics with
-distinct storage/verification identities; they cannot enter performance history. The separate
-`bulk-1g-metadata` performance suite reuses the 1 TB case with metadata/size validation and requires
-independent per-attempt approval before history staging. These suites require a new reviewed AMI and
-an independently authorized, bounded qualification window.
+layouts and a 10,240,000-file tiny layout. The four large full-content suites are retained for local
+correctness diagnostics and historical parsing, with distinct storage/verification identities; they
+cannot enter performance history and are disabled for new AWS windows because runtime within 60
+minutes has not been established. The separate `bulk-1g-metadata` performance suite reuses the 1 TB
+case with metadata/size validation and requires independent per-attempt approval before history
+staging. These suites require a new reviewed AMI and an independently authorized, bounded
+qualification window.
 
 ## Result reports
 

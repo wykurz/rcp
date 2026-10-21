@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from infra.aws_benchmark import large_storage as storage
+from infra.aws_benchmark import large_storage as storage, worker
 
 
 def inventory():
@@ -59,7 +59,7 @@ class SelectionTests(unittest.TestCase):
             closed.assert_called_once_with(23)
 
 
-class PreparationTests(unittest.TestCase):
+class PreparationFixture:
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -70,7 +70,6 @@ class PreparationTests(unittest.TestCase):
         self.calls = []
         self.signature_fd = None
         self.fail_command = None
-        self.capacity_error = False
         self.case = dict(directory_widths=[10], files_per_leaf=100, file_size_bytes=1_000_000_000)
         self.write("proc/swaps", "Filename\tType\tSize\tUsed\tPriority\n")
         self.write("proc/self/mountinfo", "1 0 259:0 / / rw - ext4 /dev/nvme0n1 rw\n")
@@ -100,10 +99,11 @@ class PreparationTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(storage, "open_block", side_effect=self.open_block))
         self.stack.enter_context(mock.patch.object(storage.os, "chown"))
         self.capacity = self.stack.enter_context(mock.patch.object(storage.capacity, "check_pair", return_value={"checked": True}))
+        self.mount_numbers = {side: os.makedev(9, index) for index, side in enumerate(storage.SIDES)}
         original_stat = Path.stat
         def mounted_stat(path, *args, **kwargs):
             if path in [self.data / side for side in storage.SIDES]:
-                return SimpleNamespace(st_dev=os.makedev(9, storage.SIDES.index(path.name)))
+                return SimpleNamespace(st_dev=self.mount_numbers[path.name])
             return original_stat(path, *args, **kwargs)
         self.stack.enter_context(mock.patch.object(Path, "stat", mounted_stat))
 
@@ -152,6 +152,8 @@ class PreparationTests(unittest.TestCase):
     def commands(self):
         return [argv[0] for argv, _ in self.calls]
 
+
+class PreparationTests(PreparationFixture, unittest.TestCase):
     def test_all_member_checks_precede_creation_and_both_arrays_precede_formatting(self):
         result = self.prepare()
         commands = self.commands()
@@ -162,6 +164,8 @@ class PreparationTests(unittest.TestCase):
         self.capacity.assert_called_once_with(self.data / "source", self.data / "destination", self.case)
         self.assertEqual(result["arrays"]["source"]["members"], ["/dev/nvme1n1", "/dev/nvme2n1"])
         self.assertEqual(result["arrays"]["destination"]["members"], ["/dev/nvme3n1", "/dev/nvme4n1"])
+        self.assertEqual(result["arrays"]["source"]["device"], "9:0")
+        self.assertEqual(result["arrays"]["destination"]["device"], "9:1")
         for argv, kwargs in self.calls:
             if argv[0] == "mkfs.ext4":
                 self.assertNotIn("-F", argv)
@@ -176,7 +180,7 @@ class PreparationTests(unittest.TestCase):
     def test_flat_root_partition_refuses_before_opening_any_disk(self):
         self.tree["blockdevices"].extend(self.tree["blockdevices"][-1].pop("children"))
         with mock.patch.object(storage, "open_block") as opened:
-            with self.assertRaisesRegex(ValueError, "unexpected NVMe model"):
+            with self.assertRaisesRegex(ValueError, "NVMe tree topology"):
                 self.prepare()
             opened.assert_not_called()
         self.assertEqual(self.commands(), ["lsblk"])
@@ -224,7 +228,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.commands().count("mdadm"), 2)
         self.assertNotIn("mkfs.ext4", self.commands())
 
-    def test_format_deadline_and_capacity_failures_never_prepare_output(self):
+    def test_format_timeout_aborts_before_capacity_check_or_output(self):
         self.fail_command = lambda argv: argv[0] == "mkfs.ext4"
         with self.assertRaises(TimeoutError):
             self.prepare()
@@ -245,6 +249,84 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             self.prepare()
         self.assertEqual(self.calls, [])
+
+
+class LegacyPreparationTests(PreparationFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.mount_numbers = {side: os.makedev(259, index + 1) for index, side in enumerate(storage.SIDES)}
+        self.stack.enter_context(mock.patch.object(worker, "DATA", self.data))
+        self.stack.enter_context(mock.patch.object(worker, "execute", side_effect=self.execute))
+
+    def prepare(self):
+        return worker.prepare_storage(self.budget, 1000, 1000)
+
+    def test_all_four_disks_are_checked_before_formatting_the_first_two_lexical_paths(self):
+        self.tree["blockdevices"][0]["serial"] = "disk9"
+        self.write("sys/dev/block/259:1/device/serial", "disk9")
+        self.assertEqual(self.prepare(), ["/dev/nvme1n1", "/dev/nvme2n1"])
+        self.assertIn("--tree", self.calls[0][0])
+        self.assertEqual(self.commands()[:5], ["lsblk"] + ["wipefs"] * 4)
+        self.assertEqual(self.commands()[5:], ["mkfs.ext4", "mount", "mkfs.ext4", "mount", "mount"])
+        for argv, kwargs in self.calls:
+            if argv[0] == "mkfs.ext4":
+                self.assertNotIn("-F", argv)
+                self.assertEqual(argv[-1], f"/proc/self/fd/{kwargs['pass_fds'][0]}")
+            if argv[0] == "mount" and "ext4" in argv:
+                self.assertIn("--no-canonicalize", argv)
+                self.assertIn("--internal-only", argv)
+                self.assertEqual(argv[-2], f"/proc/self/fd/{kwargs['pass_fds'][0]}")
+
+    def test_nested_or_flat_partitions_refuse_before_opening_or_formatting(self):
+        for flat in (False, True):
+            for model in (None, storage.MODEL, storage.EBS_MODEL):
+                with self.subTest(flat=flat, model=model):
+                    self.tree = inventory()
+                    partition = dict(path="/dev/nvme1n1p1", type="part", model=model,
+                                     mountpoints=[None], fstype=None, ro=False)
+                    if flat:
+                        self.tree["blockdevices"].append(partition)
+                    else:
+                        self.tree["blockdevices"][0]["children"] = [partition]
+                    with mock.patch.object(storage, "open_block") as opened:
+                        with self.assertRaises(ValueError):
+                            self.prepare()
+                        opened.assert_not_called()
+                    self.assertIn("--tree", self.calls[0][0])
+                    self.assertEqual(self.commands(), ["lsblk"])
+                    self.calls.clear()
+
+    def test_flat_root_partition_refuses_before_opening_or_formatting(self):
+        self.tree["blockdevices"].extend(self.tree["blockdevices"][-1].pop("children"))
+        with mock.patch.object(storage, "open_block") as opened:
+            with self.assertRaisesRegex(ValueError, "NVMe tree topology"):
+                self.prepare()
+            opened.assert_not_called()
+        self.assertEqual(self.commands(), ["lsblk"])
+
+    def test_root_mount_holder_or_signature_on_last_disk_prevents_every_format(self):
+        for defect in ("mount", "holder", "signature"):
+            with self.subTest(defect=defect):
+                mountinfo = self.root / "proc/self/mountinfo"
+                original_mountinfo = mountinfo.read_text()
+                holder = self.root / "sys/dev/block/259:4/holders/md0"
+                if defect == "mount":
+                    mountinfo.write_text("1 0 259:4 / / rw - ext4 /dev/nvme4n1 rw\n")
+                elif defect == "holder":
+                    holder.touch()
+                else:
+                    self.signature_fd = 14
+                try:
+                    with self.assertRaises(ValueError):
+                        self.prepare()
+                    self.assertNotIn("mkfs.ext4", self.commands())
+                    self.assertNotIn("mount", self.commands())
+                    self.assertFalse(self.data.exists())
+                finally:
+                    mountinfo.write_text(original_mountinfo)
+                    holder.unlink(missing_ok=True)
+                    self.signature_fd = None
+                    self.calls.clear()
 
 
 if __name__ == "__main__":

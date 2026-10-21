@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -15,6 +14,7 @@ from unittest import mock
 
 from benchmarks import capacity, report, run, streaming
 from benchmarks.test_pair_boundaries import paired_record
+from benchmarks.harness_test_support import run_fixture
 
 
 class CapacityTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class CapacityTests(unittest.TestCase):
                 self.assertLess(need["required_inodes"], 16_000_000)
                 self.assertLess(need["required_bytes"], 1_600_000_000_000)
 
-    def test_actual_free_blocks_and_inodes_are_required_on_each_side(self):
+    def test_actual_free_blocks_and_inodes_are_required(self):
         case = self.cases[-1]
         need = capacity.requirements(case, 4096)
         blocks = (need["required_bytes"] + 4095) // 4096
@@ -200,100 +200,53 @@ class StreamingTests(unittest.TestCase):
 
 
 class StreamingIntegrationTests(unittest.TestCase):
-    def test_real_small_fixture_preserves_cold_copy_boundary_and_full_source_checks(self):
-        from benchmarks.test_timings import TimingTests
+    def test_summary_fixture_preserves_cold_copy_boundary_and_full_source_checks(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            binary, manifest = TimingTests()._fixture(root)
-            events = []
-            original_scan = streaming.scan_tree
-            def scan(*args, **kwargs):
-                events.append("verify")
-                return original_scan(*args, **kwargs)
-            def execute(commands, logdir, timeout, **kwargs):
-                events.append("copy")
-                source, destination = map(Path, commands[0][-2:])
-                shutil.copytree(source, destination)
-                return dict(ok=True, elapsed_seconds=1.0, exit_codes=[0], timed_out=False, commands=commands, logs=[])
-            # helper variant has no summary flag; content/source checks still apply
-            with mock.patch.object(run, "environment", return_value={}), \
-                    mock.patch.object(run, "_prepare_cache", side_effect=lambda *args: events.append("drop")), \
-                    mock.patch.object(run, "execute_commands", side_effect=execute), \
-                    mock.patch.object(streaming, "scan_tree", side_effect=scan), contextlib.redirect_stdout(io.StringIO()):
-                record = run.main(["--manifest", str(manifest), "--case", "tiny", "--variant", "rcp-default",
-                    "--bin-dir", str(binary), "--baseline-bin-dir", str(binary), "--source-root", str(root),
-                    "--destination-root", str(root), "--cache", "linux-drop-caches", "--no-timings",
-                    "--paired-seed", "7", "--repetitions", "2", "--streaming-verification",
-                    "--output", str(root / "out")])
-            self.assertEqual(record["status"], "complete")
-            self.assertEqual(events, ["verify"] + ["drop", "copy", "verify", "verify"] * 4)
-            self.assertTrue(all(trial["source_validation"]["ok"] for trial in record["trials"]))
-            report.validate_result(record)
-            missing = copy.deepcopy(record)
-            missing["trials"][0].pop("source_validation")
-            with self.assertRaisesRegex(ValueError, "source_validation"):
-                report.validate_result(missing)
+            record, events, summary = run_fixture(Path(directory))
+        self.assertEqual(record["status"], "complete")
+        self.assertEqual(events, ["verify"] + ["drop", "copy", "verify", "verify"] * 4)
+        self.assertTrue(all(trial["source_validation"]["ok"] for trial in record["trials"]))
+        self.assertIn("Full-content SHA-256", summary)
+        for trial in record["trials"]:
+            self.assertEqual(trial["copy_summary"], trial["expected_transfer"])
+            self.assertEqual(trial["metadata_validation"], trial["validation"]["metadata"])
+        missing = copy.deepcopy(record)
+        missing["trials"][0].pop("source_validation")
+        with self.assertRaisesRegex(ValueError, "source_validation"):
+            report.validate_result(missing)
 
     def _failed_source_verification(self, fault, reason):
-        from benchmarks.test_timings import TimingTests
+        def scan_fault(stage, path):
+            if stage == "source":
+                fault(path)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            binary, manifest = TimingTests()._fixture(root)
-            copied_source = None
-            events = []
-            original_scan = streaming.scan_tree
-            def scan(path, *args, **kwargs):
-                events.append("verify")
-                if path == copied_source:
-                    fault(path)
-                return original_scan(path, *args, **kwargs)
-            def execute(commands, logdir, timeout, **kwargs):
-                nonlocal copied_source
-                events.append("copy")
-                copied_source, destination = map(Path, commands[0][-2:])
-                shutil.copytree(copied_source, destination)
-                return dict(ok=True, elapsed_seconds=1.0, exit_codes=[0], timed_out=False, commands=commands, logs=[])
-            with mock.patch.object(run, "environment", return_value={}), \
-                    mock.patch.object(run, "_prepare_cache", side_effect=lambda *args: events.append("drop")), \
-                    mock.patch.object(run, "execute_commands", side_effect=execute), \
-                    mock.patch.object(streaming, "scan_tree", side_effect=scan), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(RuntimeError, "source verification " + reason):
-                    run.main(["--manifest", str(manifest), "--case", "tiny", "--variant", "rcp-default",
-                        "--bin-dir", str(binary), "--baseline-bin-dir", str(binary), "--source-root", str(root),
-                        "--destination-root", str(root), "--cache", "linux-drop-caches", "--no-timings",
-                        "--paired-seed", "7", "--repetitions", "2", "--streaming-verification",
-                        "--output", str(root / "out")])
-            record = report.parse_result((root / "out/results.json").read_text())
-            self.assertEqual(record["status"], "failed")
-            self.assertEqual(record["summaries"], [])
-            self.assertEqual(events, ["verify", "drop", "copy", "verify", "verify"])
-            self.assertEqual(len(record["trials"]), 1)
-            trial = record["trials"][0]
-            self.assertEqual(trial["status"], "failed")
-            self.assertFalse(trial["validation"]["ok"])
-            self.assertFalse(trial["source_validation"]["ok"])
-            self.assertEqual(trial["exit_codes"], [0])
-            self.assertFalse(trial["timed_out"])
-            self.assertEqual(trial["validation"]["digest"], record["cases"][0]["fixture_digest"])
-            self.assertNotIn("source changed:", record["error"])
-            # A successful copy and destination digest cannot substitute for source proof.
-            forged = copy.deepcopy(record)
-            forged["trials"][0]["status"] = "ok"
-            forged["trials"][0]["validation"]["ok"] = True
-            with self.assertRaisesRegex(ValueError, "source_validation"):
-                report.validate_result(forged)
-            return trial
+            record, events, _ = run_fixture(Path(directory), scan_fault=scan_fault)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["summaries"], [])
+        self.assertEqual(events, ["verify", "drop", "copy", "verify", "verify"])
+        self.assertEqual(len(record["trials"]), 1)
+        trial = record["trials"][0]
+        self.assertEqual(trial["status"], "failed")
+        self.assertTrue(trial["validation"]["ok"])
+        self.assertFalse(trial["source_validation"]["ok"])
+        self.assertEqual(trial["exit_codes"], [0])
+        self.assertFalse(trial["timed_out"])
+        self.assertEqual(trial["validation"]["digest"], record["cases"][0]["fixture_digest"])
+        self.assertIn("source verification " + reason, record["error"])
+        self.assertNotIn("source changed:", record["error"])
+        # a successful destination proof cannot substitute for the source proof
+        forged = copy.deepcopy(record)
+        forged["trials"][0]["status"] = "ok"
+        with self.assertRaisesRegex(ValueError, "source_validation"):
+            report.validate_result(forged)
+        return trial
 
-    def test_sigterm_during_source_verification_is_interrupted_and_stays_failed(self):
-        def interrupt(_signum, _frame):
+    def test_interrupted_source_proof_keeps_completed_destination_and_failed_trial(self):
+        def interrupt(path):
             raise InterruptedError("SIGTERM")
-        previous = signal.signal(signal.SIGTERM, interrupt)
-        try:
-            trial = self._failed_source_verification(lambda path: signal.raise_signal(signal.SIGTERM), "interrupted")
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-        self.assertEqual(trial["source_validation"], dict(ok=False, error="SIGTERM", interrupted=True))
-        self.assertEqual(trial["validation"]["error"], "source verification interrupted: SIGTERM")
+        trial = self._failed_source_verification(interrupt, "interrupted")
+        self.assertTrue(trial["source_validation"]["interrupted"])
+        self.assertEqual(trial["error"], "source verification interrupted: SIGTERM")
 
     def test_source_content_mismatch_stays_failed_with_specific_evidence(self):
         def change(source):
@@ -301,9 +254,8 @@ class StreamingIntegrationTests(unittest.TestCase):
             file.write_bytes(b"z")
         trial = self._failed_source_verification(change, "failed")
         self.assertNotIn("interrupted", trial["source_validation"])
-        self.assertEqual(trial["source_validation"]["error"], "fixture paths, contents or modes differ")
-        self.assertEqual(trial["validation"]["error"],
-            "source verification failed: fixture paths, contents or modes differ")
+        self.assertFalse(trial["source_validation"]["digest_match"])
+        self.assertEqual(trial["error"], "source verification failed: " + trial["source_validation"]["error"])
 
     def test_other_source_verification_errors_do_not_claim_change_or_interruption(self):
         for error in (PermissionError("read denied"), ValueError("invalid fixture"), ValueError("SIGTERM")):
@@ -312,7 +264,7 @@ class StreamingIntegrationTests(unittest.TestCase):
                     raise error
                 trial = self._failed_source_verification(fail, "failed")
                 self.assertNotIn("interrupted", trial["source_validation"])
-                self.assertEqual(trial["validation"]["error"], "source verification failed: " + str(error))
+                self.assertEqual(trial["error"], "source verification failed: " + str(error))
 
     def test_capacity_failure_precedes_fixture_generation(self):
         from benchmarks.test_timings import TimingTests

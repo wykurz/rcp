@@ -7,6 +7,7 @@ import re
 from urllib.parse import urlsplit
 
 from benchmarks.site import read_theme
+from benchmarks.verification import verification_label
 
 
 POLICY = "previous-compatible-terminal-clean-run-v1"
@@ -40,10 +41,10 @@ def exclusion(run):
 
 
 def identity(run, summary):
-    # producers bind verification into series IDs; also check the explicit contract on import.
+    # producers bind verification into series IDs; also check the explicit contract on import
     verification = run["context"].get("verification") or {}
     return (run["context"]["repository"], summary["series_id"], summary["case_id"], summary["variant_id"],
-            verification.get("policy"), verification.get("workers"))
+            verification.get("policy"), verification.get("workers"), verification.get("inline_bytes"))
 
 
 def fingerprints(sources):
@@ -52,7 +53,6 @@ def fingerprints(sources):
 
 
 def point(run, summary, sources):
-    from benchmarks.report import verification_label
     indices = [index for index, trial in enumerate(run["trials"])
                if trial["case_id"] == summary["case_id"] and trial["variant_id"] == summary["variant_id"]]
     return {
@@ -68,7 +68,6 @@ def point(run, summary, sources):
 
 def build(runs, sources):
     """Compare only strictly earlier compatible observations; never evaluate acceptance."""
-    from benchmarks.report import verification_label
     ordered = sorted(runs, key=lambda run: (timestamp(run), run["run_id"]))
     previous = {}
     rows = []
