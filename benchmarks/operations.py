@@ -6,6 +6,9 @@ import re
 import shutil
 import stat
 
+from benchmarks.signals import SignalCancellation
+from benchmarks.verification import MismatchError, failure_proof, observed_error
+
 
 CONTRACT_REVISION = 1
 CACHE_REVISION = 1
@@ -84,42 +87,53 @@ def select_stale(entries):
 
 def metadata_tree(path):
     """Snapshot ordinary modes and mtimes; reject ACLs, foreign ownership and links."""
-    path = Path(path)
-    result = {}
-    pending = [path]
-    while pending:
-        current = pending.pop()
-        st = current.stat(follow_symlinks=False)
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
-            raise ValueError(f"non-regular fixture entry: {current}")
-        if stat.S_IMODE(st.st_mode) & 0o7000:
-            raise ValueError(f"special fixture mode bits: {current}")
-        if st.st_uid != os.geteuid() or st.st_gid != os.getegid():
-            raise ValueError(f"foreign fixture owner/group: {current}")
-        if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
-            raise ValueError(f"fixture has hardlinks: {current}")
-        if any(name.startswith("system.posix_acl_") for name in os.listxattr(current, follow_symlinks=False)):
-            raise ValueError(f"fixture/destination has ACL inheritance: {current}")
-        result[str(current.relative_to(path))] = dict(mode=stat.S_IMODE(st.st_mode),
-            uid=st.st_uid, gid=st.st_gid, mtime_ns=st.st_mtime_ns)
-        if stat.S_ISDIR(st.st_mode):
-            pending.extend(current.iterdir())
-    return result
+    try:
+        with SignalCancellation() as cancellation:
+            path = Path(path)
+            result = {}
+            pending = [path]
+            while pending:
+                cancellation.checkpoint()
+                current = pending.pop()
+                st = current.stat(follow_symlinks=False)
+                if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                    raise MismatchError(f"non-regular fixture entry: {current}")
+                if stat.S_IMODE(st.st_mode) & 0o7000:
+                    raise MismatchError(f"special fixture mode bits: {current}")
+                if st.st_uid != os.geteuid() or st.st_gid != os.getegid():
+                    raise MismatchError(f"foreign fixture owner/group: {current}")
+                if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+                    raise MismatchError(f"fixture has hardlinks: {current}")
+                if any(name.startswith("system.posix_acl_") for name in os.listxattr(current, follow_symlinks=False)):
+                    raise MismatchError(f"fixture/destination has ACL inheritance: {current}")
+                result[str(current.relative_to(path))] = dict(mode=stat.S_IMODE(st.st_mode),
+                    uid=st.st_uid, gid=st.st_gid, mtime_ns=st.st_mtime_ns)
+                if stat.S_ISDIR(st.st_mode):
+                    pending.extend(current.iterdir())
+            cancellation.checkpoint()
+            return result
+    except OSError as error:
+        classified = observed_error(error, error.filename or path)
+        if classified is error:
+            raise
+        raise classified from error
 
 
-class _MetadataMismatch(ValueError):
+class _MetadataMismatch(MismatchError):
     pass
 
 
 def validate_metadata(path, expected, timestamps=False):
-    actual = metadata_tree(path)
-    fields = ("mode", "uid", "gid", "mtime_ns") if timestamps else ("mode",)
-    if set(actual) != set(expected):
-        raise _MetadataMismatch("metadata paths differ")
-    changed = [name for name in actual if any(actual[name][key] != expected[name][key] for key in fields)]
-    if changed:
-        raise _MetadataMismatch(f"metadata differs: {changed[:5]}")
-    return dict(ok=True, entries=len(actual), checked_fields=list(fields))
+    with SignalCancellation() as cancellation:
+        actual = metadata_tree(path)
+        fields = ("mode", "uid", "gid", "mtime_ns") if timestamps else ("mode",)
+        if set(actual) != set(expected):
+            raise _MetadataMismatch("metadata paths differ")
+        changed = [name for name in actual if any(actual[name][key] != expected[name][key] for key in fields)]
+        if changed:
+            raise _MetadataMismatch(f"metadata differs: {changed[:5]}")
+        cancellation.checkpoint()
+        return dict(ok=True, entries=len(actual), checked_fields=list(fields))
 
 
 def seed_destination(source, destination, expected, metadata, stale_names):
@@ -204,22 +218,31 @@ def validate_source(source, expected, metadata):
         return proof
     try:
         proof["metadata"] = validate_metadata(source, metadata, timestamps=True)
-    except _MetadataMismatch as error:
-        proof.update(ok=False, error=str(error))
-    except InterruptedError as error:
-        proof.update(ok=False, error=str(error), interrupted=True)
-    except (OSError, ValueError) as error:
-        proof.update(ok=False, error=str(error), verification_error=True)
+    except Exception as error:
+        proof.update(failure_proof(error))
     return proof
 
 
-def validate_summary(variant, text, expected):
+def summary_proof(variant, text, expected):
     if variant["tool"] == "rcp":
         labels = (("files_copied", "files copied"), ("files_unchanged", "files unchanged"))
     else:
         labels = (("files_copied", "Number of regular files transferred"), ("bytes_copied", "Total transferred file size"))
+    observed = {}
+    errors = []
     for name, label in labels:
         found = re.findall(rf"^{label}:\s*([0-9,]+)(?: bytes)?\s*$", text, re.MULTILINE)
-        if len(found) != 1 or int(found[0].replace(",", "")) != expected[name]:
-            raise ValueError(f"incorrect summary {label}: {found}; expected {expected[name]}")
-    return dict(expected)
+        if len(found) == 1:
+            observed[name] = int(found[0].replace(",", ""))
+        if len(found) != 1 or observed[name] != expected[name]:
+            errors.append(f"incorrect summary {label}: {found}; expected {expected[name]}")
+    if errors:
+        return observed, dict(ok=False, error="; ".join(errors))
+    return dict(expected), dict(ok=True)
+
+
+def validate_summary(variant, text, expected):
+    observed, proof = summary_proof(variant, text, expected)
+    if not proof["ok"]:
+        raise MismatchError(proof["error"])
+    return observed

@@ -180,17 +180,18 @@ the first order; the second reverses it. The seed is a JavaScript-safe integer f
 through 9007199254740991. Results record policy `adjacent-balanced-sha256-v1`, seed, pair, block,
 position (zero-based), and both role IDs. Scheduling is reproducible independently of Python's PRNG.
 
-The roles remain adjacent in execution order, with the normal preparation, full verification and
-cleanup between commands. They share one generated source but receive fresh destinations. A failure
-stops the run, retains diagnostics and owned failure trees, and never invents a missing measurement.
-Only pairs from fully validated cases with both committed summaries get candidate/reference wall
-ratios in `summary.md` and the sanitized run envelope; raw trial indices preserve the pairing. A
-partial prefix remains readable, but its unfinished case supplies no ratios. Earlier completed cases
-survive a later case failure. Ratios retain their run status and smoke/performance purpose and are
-not acceptance gates or statistical tests. Ordinary historical median ratios are still separate,
-unpaired summaries. Use a custom manifest to fix concurrency and runtime flags on `rcp-default`;
-paired mode intentionally rejects sweeps and additional variants. Smoke-purpose ratios, if
-explicitly paired, are diagnostic only.
+The roles remain adjacent in execution order, with preparation, the selected verification mode and
+cleanup between commands. Full-content verification is the default; explicitly selected
+metadata-size performance runs do not prove content integrity. They share one generated source but
+receive fresh destinations. A failure stops the run, retains diagnostics and owned failure trees,
+and never invents a missing measurement. Only pairs from fully validated cases with both committed
+summaries get candidate/reference wall ratios in `summary.md` and the sanitized run envelope; raw
+trial indices preserve the pairing. A partial prefix remains readable, but its unfinished case
+supplies no ratios. Earlier completed cases survive a later case failure. Ratios retain their run
+status and smoke/performance purpose and are not acceptance gates or statistical tests. Ordinary
+historical median ratios are still separate, unpaired summaries. Use a custom manifest to fix
+concurrency and runtime flags on `rcp-default`; paired mode intentionally rejects sweeps and
+additional variants. Smoke-purpose ratios, if explicitly paired, are diagnostic only.
 
 `--local-resources` independently opts into Linux GNU time measurements for one local command per
 trial. The Nix development environment provides GNU time; `--resource-time PATH` can select another
@@ -549,10 +550,13 @@ between cache preparation and the timed copy.
   weaker validation policy.
 - `--verification-workers` sets 1–32 hashing workers (default 8). Metadata mode runs inline, with no
   per-file futures. Full-content mode runs inline with one worker, and otherwise runs files up to
-  `--verification-inline-bytes` inline (default 1,048,576 bytes; 0 disables small-file inline
-  scheduling with multiple workers). Larger files use bounded queued tasks and 1 MiB reads. The
-  inline threshold accepts 0 through 1,000,000,000 bytes. These settings are explicit in new
-  result/series identity; historical records without the threshold remain readable.
+  `--verification-inline-bytes` inline (default 131,072 bytes; 0 disables small-file inline
+  scheduling with multiple workers). The threshold accepts 0 through 1,000,000,000 bytes; the 128
+  KiB default keeps decimal 1 MB files eligible for parallel hashing. It is a tuning heuristic, not
+  a demonstrated optimum. `--verification-read-bytes` controls each read buffer (default 1,048,576
+  bytes, range 4,096–16,777,216), and `--verification-batch-depth` bounds pending tasks as a
+  worker-count multiplier (default 2, range 1–8). These settings are explicit in new result/series
+  identity; historical records retain only the fields actually recorded.
 - `--check-capacity` checks available blocks and inodes on distinct source/destination filesystems
   before generation and on the destination before each copy. Defaults add 20% plus 1 GiB byte
   headroom and 20% plus 1,024 inode headroom. Local tuning uses `--capacity-byte-percent`,
@@ -564,7 +568,9 @@ between cache preparation and the timed copy.
 Explicit verification controls require `--streaming-verification`; capacity checking also requires
 it. Cancellation stops queued verification and requests active reads to finish at the next read
 boundary, then drains workers before closing held descriptors. Interrupted verification and other
-verification errors remain failed qualification, distinct from a proven mismatch. An unresponsive
+verification errors remain failed qualification, distinct from a proven mismatch. Completed tree
+proofs and command exit codes survive later source, summary or metadata failures; those outcomes are
+recorded separately. SIGINT retains its interrupt exit behavior after safe cleanup. An unresponsive
 kernel I/O operation can still require the outer process/cgroup timeout.
 
 ## Results and history

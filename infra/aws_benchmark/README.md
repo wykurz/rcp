@@ -109,7 +109,8 @@ environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`, `
    the ten-minute launch admission floor, up to two minutes of scheduled-action delay, and three
    minutes of headroom. It is an admission minimum, not a guarantee that preparation or a suite will
    complete. All boot, download, formatting, file generation, hashing, validation, cleanup and
-   upload time must fit inside this window.
+   upload time must fit inside this window. The large `bulk-1g-metadata` suite instead requires
+   exactly 60 minutes and the stricter admission floors documented below.
 3. In a local Python 3.12 virtual environment with
    `pip install --require-hashes -r infra/aws_benchmark/requirements.txt`, use an operator
    SSO/session identity:
@@ -122,17 +123,20 @@ python -m infra.aws_benchmark.operator \
 ```
 
 4. After successful read-back, approve the waiting environment job **before the opening**. CI
-   refuses to request capacity with ten minutes or less remaining; the worker refuses preparation
-   with eight minutes or less remaining. These floors reserve time for boot/preparation and final
-   reporting, but cannot guarantee a suite completes. A late approval or delayed capacity must fail
-   within the existing lease, never extend it. CI waits for the opening, checks the cutoff, uploads
-   bounded binaries, and requests desired capacity 1. It never opens the ASG maximum. Afterward, use
-   the raw artifact ID, SHA-256 digest and direct link from the trusted `benchmark` job's summary;
-   if its upload failed or no ID appears, there is no trusted raw artifact. Never select by artifact
-   name or rely on a candidate build job's summary. Inspect `status.json`, `worker.json` inside
-   `results.zip`, the unchanged harness `benchmark/results/results.json`, and partial logs. The ZIP
-   is data; review its contents before opening anything executable or HTML. The trusted `report` job
-   similarly identifies its report artifact; see [result reporting](RESULTS.md).
+   refuses to request capacity with less than ten minutes remaining; the worker refuses preparation
+   with less than eight minutes remaining. These floors reserve time for boot/preparation and final
+   reporting, but cannot guarantee a suite completes. For `bulk-1g-metadata`, require at least 58
+   minutes 40 seconds immediately before requesting capacity and 56 minutes 40 seconds before
+   storage preparation; equality is accepted at these suite-specific floors. A late approval or
+   delayed capacity must fail within the existing lease, never extend it. CI waits for the opening,
+   checks the cutoff, uploads bounded binaries, and requests desired capacity 1. It never opens the
+   ASG maximum. Afterward, use the raw artifact ID, SHA-256 digest and direct link from the trusted
+   `benchmark` job's summary; if its upload failed or no ID appears, there is no trusted raw
+   artifact. Never select by artifact name or rely on a candidate build job's summary. Inspect
+   `status.json`, `worker.json` inside `results.zip`, the unchanged harness
+   `benchmark/results/results.json`, and partial logs. The ZIP is data; review its contents before
+   opening anything executable or HTML. The trusted `report` job similarly identifies its report
+   artifact; see [result reporting](RESULTS.md).
 5. Confirm the controller reports physical teardown. At the cutoff, verify all three ASG capacities
    are zero and all instances tagged for this group are terminated. Normal CI cleanup sets desired
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
@@ -253,9 +257,13 @@ Six exact raw binary objects are accepted, each at most 128 MiB, with SHA-256 ch
 input archives, paths, shell commands or root scripts are accepted. A request must match the
 operator's run, revisions, suite and deadline, use exactly the defined fields, and provide one
 lowercase SHA-256 digest for each binary. Disk preparation runs before candidate execution. It
-selects only four expected-size devices with the exact EC2 instance-store model, rejects
-filesystems, children, mountpoints and read-only devices, then formats two. EBS/root devices never
-qualify. Only this trusted supervisor has device access.
+selects exactly four expected-size devices with the exact EC2 instance-store model from an explicit
+`lsblk --tree` inventory. Both layouts reject partitions, filesystems, mountpoints, active swap,
+holders, changed identity and read-only devices, and pin all four devices before any format. The
+legacy layout formats the first two lexical paths; large profiles build two disjoint RAID0 arrays.
+Both use held descriptors for formatting and mounting, verify the resulting ext4 type and mounted
+device identity, and reject existing output/mount paths. EBS/root devices never qualify. Only this
+trusted supervisor has device access.
 
 The harness and binaries run as `rcp-benchmark` in a systemd cgroup with no capabilities, no new
 privileges, private networking/devices, read-only system files, protected control groups, a 180 GiB

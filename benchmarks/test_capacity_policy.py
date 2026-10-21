@@ -32,3 +32,25 @@ class CapacityPolicyTests(unittest.TestCase):
             capacity.requirements(dict(self.case, file_size_bytes=capacity.MAX_FILE_BYTES + 1),
                                   4096, byte_percent=0, inode_percent=0,
                                   byte_reserve=0, inode_reserve=0)
+
+
+class StructuralAdmissionTests(unittest.TestCase):
+    def test_impossible_tree_shapes_fail_before_count_or_storage_work(self):
+        from unittest import mock
+        for shape in (dict(directory_widths=[5000], files_per_leaf=1),
+                      dict(directory_widths=[1], files_per_leaf=4097),
+                      dict(directory_widths=[1] * 129, files_per_leaf=1),
+                      dict(directory_widths=[4096], files_per_directory=1)):
+            with self.subTest(shape=shape), mock.patch.object(capacity, "expected_counts") as counts:
+                with self.assertRaisesRegex(ValueError, "verification depth or directory entry"):
+                    capacity.validate_contract(dict(id="impossible", file_size_bytes=100_000_000, **shape))
+                counts.assert_not_called()
+
+    def test_verifier_boundaries_are_admitted_without_generating_fixtures(self):
+        for shape in (dict(directory_widths=[4096], files_per_leaf=1),
+                      dict(directory_widths=[1], files_per_leaf=4096),
+                      dict(directory_widths=[1] * 128, files_per_leaf=1),
+                      dict(directory_widths=[4095], files_per_directory=1)):
+            with self.subTest(shape=shape):
+                counts = capacity.validate_contract(dict(id="boundary", file_size_bytes=1, **shape))
+                self.assertGreater(counts["files"], 0)

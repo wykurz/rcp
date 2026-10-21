@@ -11,8 +11,8 @@ import urllib.request
 
 from . import identity as workflow_identity
 
-from .common import (BINARY_NAMES, COMPLETED, LAUNCH_RESERVE, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
-                     STATUS_KEY, WINDOW_KEY, Budget, checked_clients, digest, get_bytes, get_json,
+from .common import (BINARY_NAMES, COMPLETED, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
+                     STATUS_KEY, WINDOW_KEY, Budget, admission_contract, checked_clients, digest, get_bytes, get_json,
                      group, live_instances, pending_status, put_json, require, retry_io, scheduled, utc,
                      validate_admission, validate_request, validate_window, verify_close, verify_group)
 
@@ -111,22 +111,30 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
     bootstrap = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     window = retry_io(lambda: get_json(api["s3"], bucket, WINDOW_KEY), bootstrap, reserve=5)
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
-    budget = Budget(validate_window(window, minimum=LAUNCH_RESERVE))
+    validate_admission(window, window=True)
+    launch_reserve = admission_contract(window["suite"])["launch"]
+    budget = Budget(validate_window(window, minimum=launch_reserve))
     receipt.value["window"] = window
     receipt.save()
-    initial = retry_io(lambda: get_json(api["s3"], bucket, STATUS_KEY), budget, LAUNCH_RESERVE)
+    def admit_launch():
+        if budget.left() < launch_reserve:
+            raise TimeoutError("suite launch admission deadline exhausted")
+    def prelaunch(operation):
+        def admitted():
+            admit_launch()
+            return operation()
+        return retry_io(admitted, budget)
+    initial = prelaunch(lambda: get_json(api["s3"], bucket, STATUS_KEY))
     require(initial == pending_status(identity["run"]),
             "operator must initialize the pending status before launch")
     # do not touch a different/active run when the preflight fails
-    def read(operation):
-        return retry_io(operation, budget, LAUNCH_RESERVE)
     while True:
-        budget.left(LAUNCH_RESERVE)
-        verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)
-        g = read(lambda: group(api["autoscaling"], name))
+        admit_launch()
+        verify_close(prelaunch(lambda: scheduled(api["autoscaling"], name)), window)
+        g = prelaunch(lambda: group(api["autoscaling"], name))
         verify_group(g, g["MaxSize"])
         require(g["MaxSize"] in (0, 1), "unexpected maximum")
-        require(not read(lambda: live_instances(api["ec2"], name)), "previous worker has not terminated")
+        require(not prelaunch(lambda: live_instances(api["ec2"], name)), "previous worker has not terminated")
         if g["MaxSize"] == 1 and datetime.now(timezone.utc) >= utc(window["opens"]):
             break
         time.sleep(10)
@@ -134,19 +142,20 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
     same_source = identity["baseline"] == identity["candidate"]
     for binary_name in BINARY_NAMES:
         for role in ("baseline", "candidate"):
-            budget.left(LAUNCH_RESERVE)
+            admit_launch()
             key = role + "/" + binary_name
             if role == "baseline" or not same_source:
                 data = read_binary(binary_root / key)
-            request["sha256"][key] = digest(data)
-            retry_io(lambda: api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data),
-                     budget, LAUNCH_RESERVE)
+                binary_digest = digest(data)
+            # same-source A/A intentionally reuses the baseline bytes and their digest
+            request["sha256"][key] = binary_digest
+            prelaunch(lambda: api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data))
     validate_request(request, window)
-    retry_io(lambda: put_json(api["s3"], bucket, REQUEST_KEY, request), budget, LAUNCH_RESERVE)
-    budget.left(LAUNCH_RESERVE)
-    verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)
-    verify_group(read(lambda: group(api["autoscaling"], name)), 1)
-    budget.left(LAUNCH_RESERVE)
+    prelaunch(lambda: put_json(api["s3"], bucket, REQUEST_KEY, request))
+    admit_launch()
+    verify_close(prelaunch(lambda: scheduled(api["autoscaling"], name)), window)
+    verify_group(prelaunch(lambda: group(api["autoscaling"], name)), 1)
+    admit_launch()
     receipt.value["request"] = request
     receipt.value["cleanup"] = "unconfirmed"
     try:
@@ -176,6 +185,12 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
             # empty answers can precede a slow launch; only errors consume retries
             observation_errors += 1
             print("Worker image observation unavailable; leave provenance unknown.")
+    # a slow receipt write must not consume the launch floor unnoticed
+    try:
+        admit_launch()
+    except BaseException:
+        receipt.value["cleanup"] = "not-requested"
+        raise
     # enter the cleanup boundary before the API call, including uncertain outcomes
     try:
         api["autoscaling"].set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1, HonorCooldown=False)

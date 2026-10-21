@@ -24,7 +24,7 @@ class WorkerContractTests(unittest.TestCase):
         case = next(case for case in manifest["cases"] if case["id"] == "bulk-1g-1tb")
         storage = dict(layout="two-disjoint-raid0-ext4-v1", capacity={"checked": True},
                        arrays={"source": {"device": "9:0"}, "destination": {"device": "9:1"}})
-        with worker_fixture() as (root, cloud, measure, stop):
+        with worker_fixture("bulk-1g-metadata") as (root, cloud, measure, stop):
             for key in (common.WINDOW_KEY, common.REQUEST_KEY):
                 value = json.loads(cloud.objects[key])
                 value["suite"] = "bulk-1g-metadata"
@@ -57,6 +57,8 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertEqual(args.verification_mode, "metadata-size")
                 self.assertEqual(args.verification_workers, 8)
                 self.assertEqual(args.verification_inline_bytes, 1_048_576)
+                self.assertEqual(args.verification_read_bytes, 1_048_576)
+                self.assertEqual(args.verification_batch_depth, 2)
                 self.assertEqual(args.timeout, 1200)
                 self.assertEqual(args.repetitions, 2)
                 self.assertEqual(args.source_root, root / "data/source")
@@ -86,7 +88,7 @@ class WorkerContractTests(unittest.TestCase):
     def test_large_worker_rejects_duplicate_or_missing_case_before_storage_preparation(self):
         manifest_path = Path(__file__).resolve().parents[2] / "benchmarks/large-cases.json"
         for defect in ("duplicate", "missing"):
-            with self.subTest(defect=defect), worker_fixture() as (root, cloud, measure, stop):
+            with self.subTest(defect=defect), worker_fixture("bulk-1g-metadata") as (root, cloud, measure, stop):
                 for key in (common.WINDOW_KEY, common.REQUEST_KEY):
                     value = json.loads(cloud.objects[key])
                     value["suite"] = "bulk-1g-metadata"
@@ -107,7 +109,7 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertIn("case", status["error"]["message"])
 
     def test_inactive_large_suite_refuses_before_binary_download_or_storage_preparation(self):
-        with worker_fixture() as (root, cloud, measure, stop):
+        with worker_fixture("bulk-1g-metadata") as (root, cloud, measure, stop):
             for key in (common.WINDOW_KEY, common.REQUEST_KEY):
                 value = json.loads(cloud.objects[key])
                 value["suite"] = "bulk-1g"
@@ -154,8 +156,10 @@ class WorkerContractTests(unittest.TestCase):
                 self.assertTrue(args.check_capacity)
                 self.assertEqual(args.verification_workers, 8)
                 self.assertEqual(args.verification_inline_bytes, 1_048_576)
+                self.assertEqual(args.verification_read_bytes, 1_048_576)
+                self.assertEqual(args.verification_batch_depth, 2)
                 self.assertNotIn("--verification-mode", argv)
-                self.assertEqual(common.verification_contract(suite), dict(policy="sha256-tree-stream-v1", workers=8, inline_bytes=1_048_576))
+                self.assertEqual(common.verification_contract(suite), dict(policy="sha256-tree-stream-v1", workers=8, inline_bytes=1_048_576, read_bytes=1_048_576, batch_depth=2))
                 self.assertEqual(args.timeout, 1200)
                 self.assertEqual(args.repetitions, 2)
                 self.assertEqual(args.purpose, "smoke")
@@ -179,6 +183,8 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(args.verification_mode, "metadata-size")
         self.assertEqual(args.verification_workers, 8)
         self.assertEqual(args.verification_inline_bytes, 1_048_576)
+        self.assertEqual(args.verification_read_bytes, 1_048_576)
+        self.assertEqual(args.verification_batch_depth, 2)
         self.assertEqual(args.timeout, 1200)
         self.assertEqual(args.repetitions, 2)
         self.assertEqual(args.purpose, "performance")
@@ -190,7 +196,7 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(common.RESERVE, 180)
         evidence, record, policy = self.inspected_measurement(expected)
         self.assertFalse(evidence["history_eligible"])
-        verification = dict(policy="metadata-size-tree-v1", workers=8, inline_bytes=1_048_576)
+        verification = dict(policy="metadata-size-tree-v1", workers=8, inline_bytes=1_048_576, read_bytes=1_048_576, batch_depth=2)
         self.assertEqual(record["context"]["verification"], verification)
         self.assertEqual(evidence["expected_verification"], verification)
         self.assertEqual(len(record["trials"]), 4)

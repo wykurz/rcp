@@ -12,7 +12,7 @@ import threading
 import unittest
 from unittest import mock
 
-from benchmarks import streaming
+from benchmarks import streaming, signals
 
 
 def signal_probe(scenario):
@@ -22,10 +22,14 @@ def signal_probe(scenario):
         for index in range(8):
             (root / "nested" / str(index)).write_bytes(b"abc")
         expected = streaming.scan_tree(root)
-        number = signal.SIGINT if scenario == "sigint" else signal.SIGTERM
+        number = signal.SIGINT if scenario in ("sigint", "default-sigint") else signal.SIGTERM
+        chained = []
         def prior_handler(_number, _frame):
+            assert not any(thread.name.startswith("ThreadPoolExecutor-") for thread in threading.enumerate())
+            chained.append(_number)
             raise InterruptedError(signal.Signals(_number).name)
-        previous = signal.signal(number, prior_handler)
+        installed_handler = signal.default_int_handler if scenario == "default-sigint" else prior_handler
+        previous = signal.signal(number, installed_handler)
         fired = False
         opened = []
         started, release = threading.Event(), threading.Event()
@@ -49,7 +53,7 @@ def signal_probe(scenario):
             return future
         def wait(pending, *args, **kwargs):
             nonlocal fired
-            if scenario in ("drain", "sigint") and not fired:
+            if scenario in ("drain", "sigint", "default-sigint") and not fired:
                 if not started.wait(3):
                     raise AssertionError("worker did not start")
                 fired = True
@@ -67,7 +71,7 @@ def signal_probe(scenario):
                 original_shutdown(pool, wait=False, cancel_futures=True)
                 release.set()
             return original_shutdown(pool, *args, **kwargs)
-        def file(parent, name, policy, cancellation):
+        def file(parent, name, policy, cancellation, read_bytes):
             cancellation.checkpoint()
             opened.append(name)
             started.set()
@@ -76,7 +80,7 @@ def signal_probe(scenario):
                     raise AssertionError("worker was not released")
                 assert os.fstat(parent).st_ino == (root / "nested").stat().st_ino
             cancellation.checkpoint()
-            return original_file(parent, name, policy, cancellation)
+            return original_file(parent, name, policy, cancellation, read_bytes)
         def send_from_worker():
             if not started.wait(3):
                 raise AssertionError("worker did not start")
@@ -91,11 +95,25 @@ def signal_probe(scenario):
                     mock.patch.object(ThreadPoolExecutor, "shutdown", shutdown), \
                     mock.patch.object(streaming, "wait", wait), \
                     mock.patch.object(streaming, "_file", file):
-                proof = streaming.validate_tree(root, expected, workers=2, source=True, inline_bytes=0)
+                try:
+                    proof = streaming.validate_tree(root, expected, workers=2, source=True, inline_bytes=0)
+                except KeyboardInterrupt as error:
+                    assert scenario == "default-sigint", scenario
+                    assert error.actual["counts"]["files"] < expected["counts"]["files"]
+                    assert error.proof["interrupted"] is True, error.proof
+                    assert error.proof["complete"] is False, error.proof
+                    assert error.proof["counts"] == error.actual["counts"]
+                    assert signal.getsignal(number) is signal.default_int_handler
+                    assert all(future.done() for future in futures)
+                    assert not any(t.name.startswith("ThreadPoolExecutor-") for t in threading.enumerate())
+                    print(json.dumps(dict(exception="KeyboardInterrupt", chained_after_cleanup=True)))
+                    return
+            assert scenario != "default-sigint", "default SIGINT was swallowed"
             assert proof.get("interrupted") is True, proof
             assert proof["error"] == signal.Signals(number).name, proof
             assert proof["ok"] is False and proof["complete"] is False, proof
             assert signal.getsignal(number) is prior_handler
+            assert chained == [number], chained
             assert all(future.done() for future in futures)
             assert len(opened) <= 2, opened
             assert not any(thread.name.startswith("ThreadPoolExecutor-") for thread in threading.enumerate())
@@ -174,8 +192,10 @@ def submission_failure_probe():
                 mock.patch.object(ThreadPoolExecutor, "shutdown", shutdown):
             try:
                 streaming.scan_tree(root, workers=3, inline_bytes=0)
-            except RuntimeError as error:
+            except streaming._ScanError as error:
                 assert str(error) == "cannot start new thread after enqueue", error
+                assert error.verification_error is True, error
+                assert error.actual["complete"] is False, error.actual
             else:
                 raise AssertionError("submission failure was lost")
         assert third_done.is_set()
@@ -196,6 +216,15 @@ class StreamingCancellationTests(unittest.TestCase):
                 if scenario in ("drain", "error-drain", "sigint"):
                     self.assertGreaterEqual(evidence["cancelled"], 1)
 
+    def test_default_sigint_during_streaming_remains_keyboard_interrupt(self):
+        result = subprocess.run([sys.executable, "-m", "benchmarks.test_streaming_cancellation",
+                                 "--probe", "default-sigint"],
+                                cwd=Path(__file__).resolve().parents[1], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         dict(exception="KeyboardInterrupt", chained_after_cleanup=True))
+
     def test_submit_failure_after_enqueue_drains_unreturned_worker_before_parent_close(self):
         result = subprocess.run([sys.executable, "-m", "benchmarks.test_streaming_cancellation",
                                  "--probe", "submission-failure"],
@@ -207,6 +236,83 @@ class StreamingCancellationTests(unittest.TestCase):
         self.assertTrue(evidence["worker_done_before_parent_close"], evidence)
         self.assertIsNone(evidence["open_error"], evidence)
 
+    def test_shared_guard_restores_install_failure_and_chains_after_nested_cleanup(self):
+        original_signal = signal.signal
+        previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+        self.addCleanup(lambda: [original_signal(number, handler) for number, handler in previous.items()])
+        calls = []
+        def handler(number, frame):
+            calls.append(number)
+            raise InterruptedError(signal.Signals(number).name)
+        signal.signal(signal.SIGTERM, handler)
+        fired = False
+        def install(number, callback):
+            nonlocal fired
+            value = original_signal(number, callback)
+            if number == signal.SIGINT and callable(callback) and not fired:
+                fired = True
+                os.kill(os.getpid(), signal.SIGTERM)
+            return value
+        with mock.patch.object(signals.signal, "signal", side_effect=install), \
+                self.assertRaisesRegex(InterruptedError, "SIGTERM"):
+            with signals.SignalCancellation():
+                self.fail("partial handler installation did not propagate")
+        self.assertIs(signal.getsignal(signal.SIGINT), previous[signal.SIGINT])
+        self.assertIs(signal.getsignal(signal.SIGTERM), handler)
+        self.assertEqual(calls, [signal.SIGTERM])
+
+        events = []
+        def interrupt(number, frame):
+            events.append("chained")
+            self.assertEqual(number, signal.SIGINT)
+            self.assertEqual(events, ["inner-cleanup", "outer-cleanup", "chained"])
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGINT, interrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            with signals.SignalCancellation():
+                try:
+                    with signals.SignalCancellation() as guard:
+                        try:
+                            os.kill(os.getpid(), signal.SIGINT)
+                            guard.checkpoint()
+                        finally:
+                            events.append("inner-cleanup")
+                finally:
+                    events.append("outer-cleanup")
+        self.assertEqual(events.count("chained"), 1)
+        self.assertIs(signal.getsignal(signal.SIGINT), interrupt)
+
+    def test_default_sigint_and_ignored_handlers_keep_their_semantics(self):
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        with self.assertRaises(KeyboardInterrupt):
+            with signals.SignalCancellation() as guard:
+                os.kill(os.getpid(), signal.SIGINT)
+                guard.checkpoint()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        with signals.SignalCancellation() as guard:
+            self.assertEqual(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+            os.kill(os.getpid(), signal.SIGINT)
+            guard.checkpoint()
+        self.assertFalse(guard.stopped)
+
+    def test_successful_scan_pool_finalization_stays_inside_signal_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "file").write_bytes(b"small fixture")
+            expected = streaming.scan_tree(root)
+            finalized = []
+            class FinalizingPool(ThreadPoolExecutor):
+                def __del__(self):
+                    finalized.append(True)
+                    os.kill(os.getpid(), signal.SIGTERM)
+            with mock.patch.object(streaming, "ThreadPoolExecutor", FinalizingPool):
+                proof = streaming.validate_tree(root, expected, inline_bytes=0)
+            self.assertTrue(finalized)
+            self.assertTrue(proof["interrupted"], proof)
+            self.assertFalse(proof["complete"], proof)
+            self.assertFalse(any(t.name.startswith("ThreadPoolExecutor-") for t in threading.enumerate()))
+
     def test_worker_stops_between_payload_reads_without_reading_remaining_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -215,21 +321,13 @@ class StreamingCancellationTests(unittest.TestCase):
             self.addCleanup(os.close, parent)
             cancellation = streaming._Cancellation()
             reads = []
-            actual_fdopen = os.fdopen
-            def fdopen(fd, mode):
-                stream = actual_fdopen(fd, mode)
-                class Stream:
-                    def __enter__(self):
-                        return self
-                    def __exit__(self, *args):
-                        stream.close()
-                    def read(self, size):
-                        reads.append(size)
-                        cancellation.stopped = True
-                        return stream.read(size)
-                return Stream()
+            original_read = os.read
+            def read(fd, size):
+                reads.append(size)
+                cancellation.stopped = True
+                return original_read(fd, size)
             with mock.patch.object(streaming, "READ_SIZE", 1), \
-                    mock.patch.object(streaming.os, "fdopen", side_effect=fdopen), \
+                    mock.patch.object(streaming.os, "read", side_effect=read), \
                     self.assertRaises(streaming._ScanCancelled):
                 streaming._file(parent, "file", cancellation=cancellation)
             self.assertEqual(reads, [1])

@@ -127,6 +127,28 @@ def open_disks(execute, budget, stack):
     return disks, held
 
 
+
+def format_mount(fd, number, mount, budget, execute, *, geometry=()):
+    """Format and mount the already admitted device without resolving its name again."""
+    execute(["mkfs.ext4", "-q", *geometry, "-E", "lazy_itable_init=0,lazy_journal_init=0",
+             f"/proc/self/fd/{fd}"], budget, pass_fds=(fd,))
+    filesystem = execute(["blkid", "-p", "-o", "value", "-s", "TYPE", f"/proc/self/fd/{fd}"],
+        budget, pass_fds=(fd,), capture_output=True, text=True).stdout.strip()
+    require(filesystem == "ext4", "unexpected formatted filesystem")
+    mount.mkdir(parents=True, exist_ok=False)
+    execute(["mount", "--no-canonicalize", "--internal-only", "-t", "ext4",
+             "-o", "nodev,nosuid", f"/proc/self/fd/{fd}", str(mount)], budget, pass_fds=(fd,))
+    require(mount.stat().st_dev == os.makedev(*map(int, number.split(":"))),
+            "mounted filesystem differs from held device")
+
+
+def prepare_output(data, budget, uid, gid, execute):
+    output = data / "output"
+    output.mkdir()
+    execute(["mount", "-t", "tmpfs", "-o", "size=128m,nosuid,nodev,noexec", "tmpfs", str(output)], budget)
+    os.chown(output, uid, gid)
+
+
 def prepare(data, case, budget, uid, gid, execute):
     """Fail before formatting unless all disks and both newly created arrays pass."""
     arrays = {side: Path("/dev/md") / ("rcp-" + side) for side in SIDES}
@@ -152,26 +174,12 @@ def prepare(data, case, budget, uid, gid, execute):
                 and not ({number for _, number, _ in opened.values()} & {number for _, number in held}),
                 "overlapping RAID/source/destination identity")
         for side, (fd, number, _) in opened.items():
-            execute(["mkfs.ext4", "-q", "-b", "4096", "-N", str(INODES),
-                "-E", "lazy_itable_init=0,lazy_journal_init=0", f"/proc/self/fd/{fd}"],
-                budget, pass_fds=(fd,))
-            filesystem = execute(["blkid", "-p", "-o", "value", "-s", "TYPE", f"/proc/self/fd/{fd}"],
-                budget, pass_fds=(fd,), capture_output=True, text=True).stdout.strip()
-            require(filesystem == "ext4", "unexpected formatted filesystem")
-            mount = data / side
-            mount.mkdir(parents=True, exist_ok=False)
-            execute(["mount", "--no-canonicalize", "--internal-only", "-t", "ext4",
-                    "-o", "nodev,nosuid", f"/proc/self/fd/{fd}", str(mount)],
-                    budget, pass_fds=(fd,))
-            require(mount.stat().st_dev == os.makedev(*map(int, number.split(":"))),
-                    "mounted filesystem differs from held array")
+            format_mount(fd, number, data / side, budget, execute,
+                         geometry=("-b", "4096", "-N", str(INODES)))
         proof = capacity.check_pair(data / "source", data / "destination", case)
         for side in SIDES:
             os.chown(data / side, uid, gid)
-        output = data / "output"
-        output.mkdir()
-        execute(["mount", "-t", "tmpfs", "-o", "size=128m,nosuid,nodev,noexec", "tmpfs", str(output)], budget)
-        os.chown(output, uid, gid)
+        prepare_output(data, budget, uid, gid, execute)
         return dict(layout="two-disjoint-raid0-ext4-v1", capacity=proof,
             arrays={side: dict(device=number, members=members, chunk_bytes=CHUNK_BYTES)
                     for side, (_, number, members) in opened.items()})

@@ -69,7 +69,7 @@ def inspect_closed(api, name, budget):
 
 def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
     validate_window(window, now(), minimum=MIN_WINDOW)
-    validate_admission(window)
+    validate_admission(window, window=True)
     require(120 <= (utc(window["opens"]) - now()).total_seconds() <= MAX_OPEN_LEAD,
             "opening must be 2–5 minutes in the future")
     budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))

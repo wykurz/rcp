@@ -59,9 +59,8 @@ class MetadataVerificationTests(unittest.TestCase):
         file.write_bytes(b"damaged-content")
         self.assertTrue(streaming.validate_tree(destination, expected)["ok"])
         self.assertFalse(streaming.validate_tree(destination, full)["ok"])
-        self.assertFalse(streaming.validate_tree(destination, expected, source=True)["ok"])
         os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
-        self.assertFalse(streaming.validate_tree(destination, expected, source=True)["ok"])
+        self.assertTrue(streaming.validate_tree(destination, expected)["ok"])
         file = self.source / "directory/file"
         before = file.stat()
         file.write_bytes(b"damaged-content")
@@ -81,6 +80,8 @@ class MetadataVerificationTests(unittest.TestCase):
             with self.subTest(damage=damage):
                 destination = self.root / damage
                 shutil.copytree(self.source, destination)
+                source_expected = self.scan(destination)
+                self.assertTrue(streaming.validate_tree(destination, source_expected, source=True)["ok"])
                 file = destination / "directory/file"
                 if damage == "missing":
                     file.unlink()
@@ -97,8 +98,20 @@ class MetadataVerificationTests(unittest.TestCase):
                     file.chmod(0o600)
                 else:
                     file.parent.chmod(0o700)
-                self.assertFalse(streaming.validate_tree(destination, expected)["ok"])
-                self.assertFalse(streaming.validate_tree(destination, expected, source=True)["ok"])
+                proof = streaming.validate_tree(destination, expected)
+                source_proof = streaming.validate_tree(destination, source_expected, source=True)
+                self.assertFalse(proof["ok"])
+                self.assertFalse(source_proof["ok"])
+                self.assertNotIn("verification_error", proof)
+                self.assertNotIn("verification_error", source_proof)
+                self.assertEqual(proof["error"], source_proof["error"])
+                if damage in ("mode", "directory-mode"):
+                    self.assertTrue(source_proof["digest_match"])
+                    self.assertFalse(source_proof["modes_match"])
+                    self.assertFalse(source_proof["source_metadata_match"])
+                elif damage == "rename":
+                    self.assertFalse(source_proof["digest_match"])
+                    self.assertFalse(source_proof["source_metadata_match"])
 
     def test_source_timestamp_is_revalidated_without_requiring_destination_timestamp(self):
         expected = self.scan()
@@ -111,6 +124,9 @@ class MetadataVerificationTests(unittest.TestCase):
         self.assertEqual(proof["counts"], expected["counts"])
         self.assertEqual(proof["digest"], expected["digest"])
         self.assertTrue(proof["complete"])
+        self.assertTrue(proof["digest_match"])
+        self.assertTrue(proof["modes_match"])
+        self.assertFalse(proof["source_metadata_match"])
 
     def test_metadata_retains_link_special_file_owner_acl_and_capacity_guards(self):
         for kind in ("symlink", "hardlink", "fifo"):
@@ -138,6 +154,34 @@ class MetadataVerificationTests(unittest.TestCase):
         with mock.patch.object(capacity, "MAX_FILE_BYTES", 14):
             with self.assertRaisesRegex(ValueError, "bounded"):
                 self.scan()
+
+    def test_observed_source_guards_are_mismatches_not_verifier_errors(self):
+        expected = self.scan()
+        for kind in ("symlink", "hardlink", "fifo", "special-mode", "foreign-owner", "acl"):
+            with self.subTest(kind=kind):
+                target = self.source / "directory/file"
+                path = self.source / "invalid"
+                with contextlib.ExitStack() as stack:
+                    if kind == "symlink":
+                        path.symlink_to(target)
+                        stack.callback(path.unlink)
+                    elif kind == "hardlink":
+                        os.link(target, path)
+                        stack.callback(path.unlink)
+                    elif kind == "fifo":
+                        os.mkfifo(path)
+                        stack.callback(path.unlink)
+                    elif kind == "special-mode":
+                        target.chmod(0o2644)
+                        stack.callback(target.chmod, 0o644)
+                    elif kind == "foreign-owner":
+                        stack.enter_context(mock.patch.object(streaming.os, "geteuid", return_value=os.geteuid() + 1))
+                    else:
+                        stack.enter_context(mock.patch.object(streaming.os, "listxattr", return_value=["system.posix_acl_access"]))
+                    proof = streaming.validate_tree(self.source, expected, source=True)
+                    self.assertFalse(proof["ok"], proof)
+                    self.assertFalse(proof["complete"], proof)
+                    self.assertNotIn("verification_error", proof)
 
     def test_metadata_checks_stability_on_the_same_no_follow_descriptor(self):
         original = os.fstat
@@ -168,7 +212,7 @@ class MetadataVerificationTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "policy"):
                         streaming.scan_tree(self.source, policy=policy)
                     self.assertEqual(streaming.validate_tree(self.source, dict(expected, policy=policy)),
-                        dict(ok=False, error="unsupported streaming verification policy"))
+                        dict(ok=False, error="unsupported streaming verification policy", verification_error=True))
             for workers in (0, 33, True):
                 with self.assertRaisesRegex(ValueError, "workers"):
                     self.scan(workers=workers)
@@ -201,7 +245,9 @@ class MetadataIntegrationTests(unittest.TestCase):
         record, events = self._run()
         self.assertEqual(record["status"], "complete")
         self.assertEqual(events, ["verify"] + ["drop", "copy", "verify", "verify"] * 4)
-        self.assertEqual(record["context"]["verification"], dict(policy=streaming.METADATA_POLICY, workers=8, inline_bytes=streaming.DEFAULT_INLINE_BYTES))
+        self.assertEqual(record["context"]["verification"], dict(policy=streaming.METADATA_POLICY, workers=8,
+                         inline_bytes=streaming.DEFAULT_INLINE_BYTES, read_bytes=streaming.DEFAULT_READ_SIZE,
+                         batch_depth=streaming.DEFAULT_BATCH_MULTIPLIER))
         self.assertIn("same-size content corruption is not detected", record["context"]["verification_policy"])
         self.assertIn("payload contents are not checked", record["context"]["fixture_policy"])
         for trial in record["trials"]:

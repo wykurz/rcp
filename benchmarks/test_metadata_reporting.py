@@ -26,7 +26,9 @@ def verified_record(policy, run_id="a" * 32, timestamp="2026-09-26T12:00:00Z", i
         destination = dict(ok=True, counts=dict(counts), digest=case["fixture_digest"],
                            metadata=dict(ok=True, entries=entries, checked_fields=["mode"]))
         source = dict(ok=True, counts=dict(counts), digest=case["fixture_digest"],
-                      metadata=dict(ok=True, entries=entries, checked_fields=["mode", "uid", "gid", "mtime_ns"]))
+                      metadata=dict(ok=True, entries=entries, checked_fields=list(
+                          verification.SOURCE_METADATA_FIELDS if inline_bytes is not None
+                          else verification.LEGACY_SOURCE_METADATA_FIELDS)))
         if policy == streaming.METADATA_POLICY:
             destination["policy"] = source["policy"] = policy
         trial.update(validation=destination, source_validation=source,
@@ -82,9 +84,31 @@ class MetadataReportingTests(unittest.TestCase):
                     trial.pop("copy_summary")
                     trial.pop("metadata_validation")
                 report.validate_result(record)
+                for trial in sanitized.project_run(record, [])["trials"]:
+                    self.assertEqual(trial["proofs"]["metadata"]["qualification"], "passed")
+                    self.assertEqual(trial["proofs"]["metadata"]["checked_fields"], ["mode"])
                 record["trials"][0]["validation"].pop("metadata")
                 with self.assertRaisesRegex(ValueError, "validation.metadata"):
                     report.validate_result(record)
+
+    def test_nonsummary_streaming_metadata_export_retains_partial_evidence(self):
+        for policy in (streaming.POLICY, streaming.METADATA_POLICY):
+            for marker in (dict(ok=False), dict(ok=False, interrupted=True),
+                           dict(ok=False, verification_error=True)):
+                with self.subTest(policy=policy, marker=marker):
+                    record = verified_record(policy)
+                    record["variants"][0]["args"] = []
+                    record.update(status="failed", summaries=[])
+                    record["trials"] = record["trials"][:1]
+                    trial = record["trials"][0]
+                    trial.update(status="failed", child_locale="inherited", source_validation=marker)
+                    trial.pop("copy_summary")
+                    trial.pop("metadata_validation")
+                    projected = sanitized.project_run(record, [])["trials"][0]
+                    self.assertEqual(projected["proofs"]["metadata"]["qualification"], "recorded-unqualified")
+                    self.assertTrue(projected["proofs"]["metadata"]["recorded_ok"])
+                    self.assertEqual(projected["proofs"]["source"]["qualification"],
+                        "interrupted" if marker.get("interrupted") else "verification-error" if marker.get("verification_error") else "failed")
 
     def test_streaming_contract_rejects_unsupported_cache_policies(self):
         for policy in (streaming.POLICY, streaming.METADATA_POLICY):
@@ -124,6 +148,91 @@ class MetadataReportingTests(unittest.TestCase):
                     exported = sanitized.project_run(record, [])
                     self.assertEqual(exported["trials"][0]["proofs"]["source"]["metadata"]["checked_fields"], list(fields))
 
+    def test_modern_streaming_source_proofs_require_all_recorded_identity_fields(self):
+        for policy in (streaming.POLICY, streaming.METADATA_POLICY):
+            for threshold in (0, verification.DEFAULT_INLINE_BYTES):
+                with self.subTest(policy=policy, threshold=threshold):
+                    record = verified_record(policy, inline_bytes=threshold)
+                    report.validate_result(record)
+                    for fields in (verification.LEGACY_SOURCE_METADATA_FIELDS,
+                                   verification.SOURCE_METADATA_FIELDS[:-1]):
+                        record["trials"][0]["source_validation"]["metadata"]["checked_fields"] = list(fields)
+                        with self.assertRaisesRegex(ValueError, "source_validation.metadata"):
+                            report.validate_result(record)
+
+    def test_known_legacy_labels_are_exact_and_do_not_override_metadata_mode(self):
+        policies = (
+            "exact relative directory and regular-file paths, sizes, and SHA256 contents",
+            "exact relative directory and regular-file paths, sizes, and SHA256 contents; "
+            "source tree must match initial scan after all case trials",
+        )
+        for policy in policies:
+            with self.subTest(policy=policy):
+                record = verified_record(streaming.POLICY)
+                record["context"].pop("verification")
+                record["context"]["verification_policy"] = policy
+                self.assertEqual(report.verification_label(record["context"]), "Full-content SHA-256")
+                self.assertEqual(report._dashboard_run(record)["verification_label"], "Full-content SHA-256")
+                evidence = changes.build([record], {record["run_id"]: []})
+                self.assertIn("Full-content SHA-256", changes.markdown(evidence))
+                record["context"]["verification"] = dict(policy=streaming.METADATA_POLICY)
+                self.assertIn("file content integrity not checked", report.verification_label(record["context"]))
+            for unknown in (policy + "; unrecognized", policy.upper(), " " + policy):
+                self.assertIn("Legacy", report.verification_label(dict(verification_policy=unknown)))
+        self.assertIn("Legacy", report.verification_label({}))
+
+    def test_completed_proof_remains_visible_when_later_summary_or_metadata_fails(self):
+        for policy in (None, streaming.POLICY, streaming.METADATA_POLICY):
+            for field in (("summary_validation", "metadata_validation") if policy is None else ("summary_validation",)):
+                for qualification, marker in (
+                        ("failed", {}), ("interrupted", dict(interrupted=True)),
+                        ("verification-error", dict(verification_error=True))):
+                    with self.subTest(policy=policy, field=field, qualification=qualification):
+                        record = verified_record(policy or streaming.POLICY)
+                        if policy is None:
+                            record["context"].pop("verification")
+                        record.update(status="failed", summaries=[])
+                        record["trials"] = record["trials"][:1]
+                        trial = record["trials"][0]
+                        trial.update(status="failed", failure=dict(kind="interrupted" if marker.get("interrupted") else "exception",
+                            stage="summary" if field == "summary_validation" else "metadata",
+                            category="cancellation" if marker.get("interrupted") else "validation", message="private output"))
+                        trial[field] = dict(ok=False, error="private output", **marker)
+                        before = copy.deepcopy(record)
+                        exported = sanitized.project_run(record, [])
+                        self.assertEqual(record, before)
+                        proof = exported["trials"][0]["proofs"]
+                        destination = "structure" if policy == streaming.METADATA_POLICY else "content"
+                        self.assertEqual(proof[destination]["qualification"], "recorded-unqualified")
+                        self.assertEqual(proof["summary" if field == "summary_validation" else "metadata"]["qualification"], qualification)
+                        self.assertEqual(exported["trials"][0]["failure"]["stage"], trial["failure"]["stage"])
+                        self.assertEqual(exported["trials"][0]["failure"]["category"], trial["failure"]["category"])
+                        self.assertNotIn("private output", json.dumps(exported))
+
+    def test_summary_proof_is_typed_and_cannot_contradict_success(self):
+        for policy in (streaming.POLICY, streaming.METADATA_POLICY):
+            for marker in (dict(ok=False), dict(ok=True, interrupted=True),
+                           dict(ok=True, verification_error=True), dict(ok=True, complete=False)):
+                record = verified_record(policy)
+                record["trials"][0]["summary_validation"] = marker
+                with self.subTest(policy=policy, marker=marker), self.assertRaisesRegex(ValueError, "summary_validation"):
+                    report.validate_result(record)
+            record = verified_record(policy)
+            for trial in record["trials"]:
+                trial["summary_validation"] = dict(ok=True)
+            self.assertTrue(all(trial["proofs"]["summary"]["qualification"] == "passed"
+                                for trial in sanitized.project_run(record, [])["trials"]))
+        for field in ("validation", "metadata_validation", "source_validation", "summary_validation"):
+            for flag in ("ok", "interrupted", "verification_error", "complete"):
+                record = verified_record(streaming.METADATA_POLICY)
+                record.update(status="failed", summaries=[])
+                record["trials"] = record["trials"][:1]
+                record["trials"][0].update(status="failed")
+                record["trials"][0][field] = dict(ok=False)
+                record["trials"][0][field][flag] = "false"
+                with self.subTest(field=field, flag=flag), self.assertRaisesRegex(ValueError, "must be a boolean"):
+                    report.validate_result(record)
+
     def test_successful_streaming_trial_cannot_claim_an_incomplete_proof(self):
         for policy in (streaming.POLICY, streaming.METADATA_POLICY):
             for field in ("validation", "source_validation"):
@@ -149,6 +258,28 @@ class MetadataReportingTests(unittest.TestCase):
                         report.validate_result(record)
             historical = verified_record(policy)
             self.assertNotIn("inline_bytes", sanitized.project_run(historical, [])["conditions"]["verification"])
+
+    def test_streaming_read_and_batch_tuning_are_bounded_and_exported_without_defaults(self):
+        bounds = dict(read_bytes=(verification.MIN_READ_BYTES, verification.MAX_READ_BYTES),
+                      batch_depth=(1, verification.MAX_BATCH_DEPTH))
+        for field, (minimum, maximum) in bounds.items():
+            for value in (minimum, maximum):
+                with self.subTest(field=field, value=value):
+                    record = verified_record(streaming.POLICY, inline_bytes=0)
+                    record["context"]["verification"][field] = value
+                    self.assertEqual(sanitized.project_run(record, [])["conditions"]["verification"][field], value)
+            for value in (None, True, minimum - 1, maximum + 1, float(minimum), str(minimum)):
+                with self.subTest(field=field, invalid=value):
+                    record = verified_record(streaming.POLICY, inline_bytes=0)
+                    record["context"]["verification"][field] = value
+                    with self.assertRaisesRegex(ValueError, "streaming verification contract"):
+                        report.validate_result(record)
+            modern = verified_record(streaming.POLICY)
+            modern["context"]["verification"][field] = minimum
+            with self.assertRaisesRegex(ValueError, "streaming verification contract"):
+                report.validate_result(modern)
+        historical = sanitized.project_run(verified_record(streaming.POLICY), [])
+        self.assertTrue(bounds.keys().isdisjoint(historical["conditions"]["verification"]))
 
     def test_scheduling_threshold_separates_imported_history_even_with_reused_series_id(self):
         records = [verified_record(streaming.POLICY, character * 32, f"2026-09-{day}T12:00:00Z", threshold)

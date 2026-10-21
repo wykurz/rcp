@@ -15,12 +15,11 @@ ROLES = ('master', 'source', 'destination')
 HASH = re.compile(r'[0-9a-f]{64}\Z')
 COMMIT = re.compile(r'[0-9a-f]{7,64}\Z')
 COUNT_FIELDS = ('files', 'directories', 'bytes', 'files_copied', 'files_unchanged', 'bytes_copied', 'entries', 'stale_files')
-PROOFS = {'content':'validation', 'seed':'seed_validation', 'cache':'cache_validation',
-          'metadata':'metadata_validation', 'source':'source_validation'}
 FILESYSTEMS = {'ext4','ext3','xfs','zfs','btrfs','tmpfs','overlay','nfs','nfs4','fuse','fuseblk','f2fs','bcachefs'}
 MOUNT_FLAGS = {'rw','ro','nosuid','nodev','noexec','relatime','noatime','strictatime','sync','async','lazytime','acl','noacl','seclabel','dirsync'}
 STAGES = {'setup','command','postflight','teardown','qualification','copy_worker','outer_wait','outer_launch',
-          'outer_teardown','host_audit','inner_record','outer_teardown_cancellation'}
+          'outer_teardown','host_audit','inner_record','outer_teardown_cancellation',
+          'preparation','cache','capacity','destination','summary','metadata','source','cleanup','timings'}
 CATEGORIES = {'validation','execution','timeout','cancellation'}
 
 
@@ -112,8 +111,9 @@ def conditions(context):
         result['verification']=dict(policy=enum(contract.get('policy'),{verification.FULL_CONTENT_POLICY,verification.METADATA_POLICY}),
                                     workers=number(contract.get('workers'),integer=True),
                                     label=verification.verification_label(context))
-        if 'inline_bytes' in contract:
-            result['verification']['inline_bytes']=number(contract['inline_bytes'],integer=True)
+        for field in ('inline_bytes','read_bytes','batch_depth'):
+            if field in contract:
+                result['verification'][field]=number(contract[field],integer=True)
     for key in ('effective_parallelism','fd_limit'):
         result[key]=number(environment.get(key),integer=True)
     baseline=context.get('baseline_commit')
@@ -132,6 +132,7 @@ def conditions(context):
 def diagnostic(value, artifact_id):
     value=value if isinstance(value,dict) else {}
     return dict(stage=enum(value.get('stage'),STAGES) or 'unknown',category=enum(value.get('category'),CATEGORIES) or 'unknown',
+                kind=enum(value.get('kind'),{'interrupted','exception'}),
                 artifact_id=artifact_id,raw_text_withheld=True)
 
 
@@ -298,7 +299,6 @@ def ratios(run, cases, variants):
 def project_run(run, source_results):
     from benchmarks import report
     report.validate_result(run)
-    from benchmarks import operations
     metadata_only=(run['context'].get('verification') or {}).get('policy')==verification.METADATA_POLICY
     selected_cases={case['id']:case for case in run['cases']}
     selected_variants={variant['id']:variant for variant in run['variants']}
@@ -331,22 +331,19 @@ def project_run(run, source_results):
         result['variants'].append(dict(alias=variant_aliases[variant['id']],tool=enum(variant.get('tool'),{'rcp','rsync','cp'}),processes=number(variant.get('processes'),integer=True),flags=[safe_flag(arg) for arg in variant.get('args',[])],args_withheld=any(safe_flag(arg) is None for arg in variant.get('args',[])),timing_collection=enum(collection.get(variant['id']),TIMING_STATUS)))
     for index,trial in enumerate(run['trials']):
         admitted=trial['status']=='ok' and run['context'].get('operation_contract_revision')==1
-        operation=selected_cases[trial['case_id']].get('mode','fresh')
-        exact_summary=operations.summary_supported(selected_variants[trial['variant_id']]) if admitted else False
-        source_verified=run['context'].get('cache_policy')=='source-verified'
-        checked=dict(content=admitted,seed=admitted and operation!='fresh',cache=admitted and source_verified,
-                     metadata=admitted and exact_summary,source=admitted and (operation!='fresh' or exact_summary or source_verified or run['context'].get('verification') is not None))
+        contract=report.operation_proof_contract(selected_cases[trial['case_id']],
+                                                  selected_variants[trial['variant_id']],run['context'])
         row=dict(ordinal=index,case=case_aliases[trial['case_id']],variant=variant_aliases[trial['variant_id']],iteration=trial['iteration'],
                  status=trial['status'],elapsed_seconds=trial.get('elapsed_seconds'),exit_codes=[number(code,integer=True,minimum=-255) for code in (trial['exit_codes'] if isinstance(trial['exit_codes'],list) else trial['exit_codes'].values())],
                  exit_code_collection='array' if isinstance(trial['exit_codes'],list) else 'legacy-object-values; keys withheld',
                  timed_out=boolean(trial.get('timed_out')),expected_transfer=counts(trial.get('expected_transfer')),observed_transfer=counts(trial.get('copy_summary')),
                  child_locale=enum(trial.get('child_locale'),{'C','inherited'}),short_sample=trial['elapsed_seconds']<10 if trial.get('elapsed_seconds') is not None else None,
-                 proofs={name:proof(trial.get(field),checked[name]) for name,field in PROOFS.items()},commands=[],
+                 proofs={name:proof(report.trial_proof(trial,field),admitted and required)
+                         for name,(field,required) in contract.items()},commands=[],
                  failure=diagnostic(trial.get('failure'),f"{run['run_id']}-trial-{index}-diagnostic") if trial['status']!='ok' else None)
         if metadata_only:
             row['proofs']['structure']=proof(trial.get('validation'),admitted)
             row['proofs']['content']=dict(proof(None,False),qualification='not-checked')
-            row['proofs']['metadata']=proof((trial.get('validation') or {}).get('metadata'),admitted)
         row['timings']=timing(trial.get('timings'))
         row['commands']=[command(argv,None,ordinal,None,None) for ordinal,argv in enumerate(trial['commands'])]
         row['transport'],row['evidence'],role_commands=owned_trial(trial,run['context'].get('owned_transport'),f"{run['run_id']}-trial-{index}",trial['status']=='ok' and run['context'].get('owned_transport') is not None,selected_variants[trial['variant_id']],run['tools'])
