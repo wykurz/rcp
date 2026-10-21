@@ -7,7 +7,7 @@ import re
 import time
 from urllib.error import HTTPError, URLError
 
-from benchmarks.verification import DEFAULT_INLINE_BYTES, DEFAULT_WORKERS, FULL_CONTENT_POLICY, METADATA_POLICY
+from benchmarks.verification import FULL_CONTENT_POLICY, METADATA_POLICY
 
 RESERVE = 180
 WORKER_START_RESERVE = RESERVE + 300
@@ -29,11 +29,21 @@ BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
 
+# append versions when cloud tuning changes; never infer old settings from local defaults
+_CLOUD_VERIFICATION_VERSIONS = (
+    dict(workers=8),
+    dict(workers=8, inline_bytes=1_048_576),
+    dict(workers=8, inline_bytes=1_048_576, read_bytes=1_048_576, batch_depth=2),
+)
+# 3104s projected generation/four copies + 180s upload + 116s remaining-work headroom
+_METADATA_ADMISSION = dict(window=3600, launch=3520, worker=3400)
+# the launch floor adds 120s for startup (92s observed); neither floor guarantees completion
+
 # historical contracts remain readable independently of current cloud admission
 PERFORMANCE_CONTRACT = dict(paired_seed=0, repetitions=4, purpose="performance",
     cache_policy="linux-drop-caches", runner_label="aws-c5d24-ext4-isolated-v1")
 _STREAM_PROFILE = dict(repetitions=2, purpose="smoke", runner_label="aws-c5d24-ext4-raid0-stream-v1",
-                       policy=FULL_CONTENT_POLICY, active=False)
+                       policy=FULL_CONTENT_POLICY, verification_versions=_CLOUD_VERIFICATION_VERSIONS, active=False)
 SUITE_PROFILES = {
     "aa-smoke": dict(cases=("tiny-10k",), repetitions=2, purpose="smoke", cache_policy="source-warm"),
     "tiny": dict(cases=("tiny-1m",)),
@@ -45,7 +55,8 @@ SUITE_PROFILES = {
     "bulk-1m": dict(_STREAM_PROFILE, cases=("bulk-1m-1024gb",)),
     "tiny-1k": dict(_STREAM_PROFILE, cases=("tiny-1k-10240k",)),
     "bulk-1g-metadata": dict(cases=("bulk-1g-1tb",), repetitions=2,
-        runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY),
+        runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY,
+        verification_versions=_CLOUD_VERIFICATION_VERSIONS, admission=_METADATA_ADMISSION),
 }
 SUITES = {name: profile["cases"] for name, profile in SUITE_PROFILES.items()}
 ACTIVE_SUITES = {name: cases for name, cases in SUITES.items() if SUITE_PROFILES[name].get("active", True)}
@@ -60,11 +71,23 @@ def measurement_contract(suite):
     return {key: profile.get(key, value) for key, value in PERFORMANCE_CONTRACT.items()}
 
 
-def verification_contract(suite):
-    """Expected recorded proof identity, shared by the baked worker and offline ingestion."""
+def verification_contracts(suite):
+    """Frozen recorded identities, oldest first; missing historical fields stay unknown."""
     require(suite in SUITES, "suite is not allowlisted")
-    policy = SUITE_PROFILES[suite].get("policy")
-    return dict(policy=policy, workers=DEFAULT_WORKERS, inline_bytes=DEFAULT_INLINE_BYTES) if policy else None
+    profile = SUITE_PROFILES[suite]
+    return tuple(dict(policy=profile["policy"], **version) for version in profile["verification_versions"]) \
+        if "policy" in profile else (None,)
+
+
+def verification_contract(suite):
+    """Exact current cloud proof identity, independent of local harness defaults."""
+    return verification_contracts(suite)[-1]
+
+
+def admission_contract(suite):
+    require(suite in SUITES, "suite is not allowlisted")
+    return {**dict(window=MIN_WINDOW, launch=LAUNCH_RESERVE, worker=WORKER_START_RESERVE),
+            **SUITE_PROFILES[suite].get("admission", {})}
 
 
 class ValidationError(ValueError):
@@ -108,11 +131,15 @@ def validate_identity(value):
         require(value["baseline"] == value["candidate"], "A/A pilot requires identical revisions")
 
 
-def validate_admission(value):
+def validate_admission(value, *, window=False):
     """Apply current cloud policy without changing historical identity validation."""
     validate_identity(value)
     require(value["suite"] in ACTIVE_SUITES,
             "suite is disabled for new AWS runs until full-content verification fits the bounded window")
+    if window:
+        minimum = admission_contract(value["suite"])["window"]
+        require(minimum <= (utc(value["deadline"]) - utc(value["opens"])).total_seconds() <= MAX_WINDOW,
+                f"suite requires a {minimum // 60}–{MAX_WINDOW // 60} minute window")
 
 
 def validate_window(value, now=None, minimum=RESERVE):

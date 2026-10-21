@@ -26,11 +26,14 @@ import uuid
 from benchmarks.strict_json import parse_json
 from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming
 from benchmarks.operations import expected_counts
-from benchmarks.verification import DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label
+from benchmarks.verification import (DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label,
+    DEFAULT_READ_SIZE, DEFAULT_BATCH_MULTIPLIER, MismatchError, failure_proof, observed_error,
+    MIN_READ_BYTES, MAX_READ_BYTES, MAX_BATCH_DEPTH,
+    LEGACY_SOURCE_VERIFICATION_POLICY as VERIFICATION_POLICY)
+from benchmarks.signals import SignalCancellation
 
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
-VERIFICATION_POLICY = "exact relative directory and regular-file paths, sizes, and SHA256 contents; source tree must match initial scan after all case trials"
 FIXTURE_CONTRACT_REVISION = 2
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 MOUNTINFO_ESCAPE = re.compile(r"\\(040|011|012|134)")
@@ -86,56 +89,72 @@ def load_manifest(path):
 
 def scan_tree(root):
     root = Path(root)
-    try:
-        root_metadata = root.stat(follow_symlinks=False)
-    except InterruptedError:
-        raise
-    except OSError as exc:
-        raise ValueError(f"missing regular directory: {root}: {exc}") from exc
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise ValueError(f"missing regular directory: {root}")
     entries = {}
     counts = {"directories": 0, "files": 0, "bytes": 0}
-    for current, dirs, files in os.walk(root, followlinks=False):
-        for name in sorted(dirs + files):
-            path = Path(current) / name
-            relative = path.relative_to(root).as_posix()
-            metadata = path.stat(follow_symlinks=False)
-            if stat.S_ISLNK(metadata.st_mode):
-                raise ValueError(f"unexpected symlink: {relative}")
-            if stat.S_ISDIR(metadata.st_mode):
-                entries[relative] = {"type": "directory"}
-                counts["directories"] += 1
-            elif stat.S_ISREG(metadata.st_mode):
-                digest = hashlib.sha256()
-                with path.open("rb") as handle:
-                    for block in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(block)
-                size = metadata.st_size
-                entries[relative] = {"type": "file", "size": size, "sha256": digest.hexdigest()}
-                counts["files"] += 1
-                counts["bytes"] += size
-            else:
-                raise ValueError(f"unexpected special path: {relative}")
-    digest = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return {"entries": entries, "counts": counts, "digest": digest}
+    try:
+        with SignalCancellation() as cancellation:
+            try:
+                root_metadata = root.stat(follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise MismatchError(f"missing regular directory: {root}") from error
+            cancellation.checkpoint()
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise MismatchError(f"missing regular directory: {root}")
+            pending = [root]
+            while pending:
+                cancellation.checkpoint()
+                current = pending.pop()
+                # explicit enumeration never suppresses scandir/stat failures as os.walk does
+                with os.scandir(current) as children:
+                    paths = sorted(Path(entry.path) for entry in children)
+                for path in paths:
+                    cancellation.checkpoint()
+                    relative = path.relative_to(root).as_posix()
+                    metadata = path.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise MismatchError(f"unexpected symlink: {relative}")
+                    if stat.S_ISDIR(metadata.st_mode):
+                        entries[relative] = {"type": "directory"}
+                        counts["directories"] += 1
+                        pending.append(path)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        digest = hashlib.sha256()
+                        with path.open("rb") as handle:
+                            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                                cancellation.checkpoint()
+                                digest.update(block)
+                        size = metadata.st_size
+                        entries[relative] = {"type": "file", "size": size, "sha256": digest.hexdigest()}
+                        counts["files"] += 1
+                        counts["bytes"] += size
+                    else:
+                        raise MismatchError(f"unexpected special path: {relative}")
+            cancellation.checkpoint()
+            digest = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            return {"entries": entries, "counts": counts, "digest": digest}
+    except OSError as error:
+        classified = observed_error(error, error.filename or root)
+        if classified is error:
+            raise
+        raise classified from error
 
 
 def validate_tree(source, destination, expected=None):
-    expected = expected or scan_tree(source)
     try:
-        actual = scan_tree(destination)
-    except InterruptedError as exc:
-        return {"ok": False, "error": str(exc), "interrupted": True}
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "error": str(exc), "verification_error": True}
-    missing = sorted(expected["entries"].keys() - actual["entries"].keys())
-    extra = sorted(actual["entries"].keys() - expected["entries"].keys())
-    changed = sorted(key for key in expected["entries"].keys() & actual["entries"].keys() if expected["entries"][key] != actual["entries"][key])
-    result = {"ok": not (missing or extra or changed), "counts": actual["counts"], "digest": actual["digest"]}
-    if not result["ok"]:
-        result["error"] = f"missing={missing[:5]}, extra={extra[:5]}, changed={changed[:5]}"
-    return result
+        with SignalCancellation() as cancellation:
+            expected = expected or scan_tree(source)
+            actual = scan_tree(destination)
+            cancellation.checkpoint()
+            missing = sorted(expected["entries"].keys() - actual["entries"].keys())
+            extra = sorted(actual["entries"].keys() - expected["entries"].keys())
+            changed = sorted(key for key in expected["entries"].keys() & actual["entries"].keys() if expected["entries"][key] != actual["entries"][key])
+            result = {"ok": not (missing or extra or changed), "counts": actual["counts"], "digest": actual["digest"]}
+            if not result["ok"]:
+                result["error"] = f"missing={missing[:5]}, extra={extra[:5]}, changed={changed[:5]}"
+            cancellation.checkpoint()
+        return result
+    except Exception as exc:
+        return failure_proof(exc)
 
 
 def _validate_variant_mode(variant, mode):
@@ -187,54 +206,43 @@ def plan_commands(variant, source, destination, tools, mode, operation="fresh", 
     return commands
 
 
-class _CancelledSignal(Exception):
-    pass
-
-
-class _SignalCancellation:
-    def __init__(self, condition):
-        self.condition = condition
-        self.previous = {}
-        self.pending = None
+class _TrialOutcome:
+    """Persist one typed failure without rewriting completed stage evidence."""
+    def __init__(self, trial):
+        self.trial = trial
+        self.verification_started = None
+        self.stage = "preparation"
 
     def __enter__(self):
-        if threading.current_thread() is not threading.main_thread():
-            return self
-        self.previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
-        installed = []
-        try:
-            for number in self.previous:
-                signal.signal(number, self._record)
-                installed.append(number)
-        except BaseException:
-            for number in reversed(installed):
-                signal.signal(number, self.previous[number])
-            raise
         return self
 
-    def _record(self, number, _frame):
-        if self.previous[number] == signal.SIG_IGN:
-            return
-        if self.pending is None:
-            self.pending = number
-        with self.condition:
-            self.condition.notify_all()
-
-    def checkpoint(self):
-        if self.pending is not None:
-            raise _CancelledSignal
-
-    def __exit__(self, _type, _value, _traceback):
-        for number, handler in self.previous.items():
-            signal.signal(number, handler)
-        if self.pending is not None:
-            number = self.pending
-            handler = self.previous[number]
-            if callable(handler):
-                handler(number, None)
-            if number == signal.SIGINT:
-                raise KeyboardInterrupt
-            raise InterruptedError("SIGTERM")
+    def __exit__(self, kind, error, traceback):
+        if self.verification_started is not None:
+            measurements.add_cost(self.trial, "verification", self.verification_started)
+        if error is None:
+            return False
+        trial = self.trial
+        if hasattr(error, "outcome"):
+            trial.update(error.outcome)
+        proof = getattr(error, "proof", None) or failure_proof(error)
+        interrupted = proof.get("interrupted") is True
+        trial.update(status="failed", error=str(error) or type(error).__name__)
+        if interrupted:
+            trial["interrupted"] = True
+        failure = dict(kind="interrupted" if interrupted else "exception",
+            stage=self.stage, category="cancellation" if interrupted else
+            "validation" if self.stage in ("capacity", "cache", "destination", "summary", "metadata", "source", "timings") else "execution",
+            message=trial["error"])
+        if interrupted or "failure" not in trial:
+            trial["failure"] = failure
+        field = {"cache": "cache_validation", "destination": "validation", "summary": "summary_validation",
+                 "metadata": "metadata_validation", "source": "source_validation"}.get(self.stage)
+        if field is not None and (not trial.get(field) or trial.get(field) == {"ok": False}):
+            trial[field] = proof
+        if trial.get("validation") == {"ok": False}:
+            trial["validation"] = dict(proof, complete=False)
+        if not interrupted and self.stage in ("destination", "summary", "metadata", "source"):
+            raise RuntimeError(trial["error"]) from error
         return False
 
 
@@ -297,92 +305,104 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
                     break
                 condition.wait(min(remaining, .05))
         signal_groups(signal.SIGKILL)
-    with _SignalCancellation(condition) as cancellation:
-        try:
-            for index, command in enumerate(launched_commands):
-                cancellation.checkpoint()
-                stdout_path = log_dir / f"{index}.stdout.log"
-                stderr_path = log_dir / f"{index}.stderr.log"
-                stdout = stdout_path.open("wb")
-                files.append(stdout)
-                stderr = stderr_path.open("wb")
-                files.append(stderr)
-                try:
-                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True, env=child_environment)
-                except OSError as exc:
-                    launch_error = str(exc)
-                else:
-                    children.append(process)
-                    def wait_child(i=index, p=process):
-                        code = p.wait()
-                        stamp = time.monotonic()
-                        with condition:
-                            finished[i] = (code, stamp)
-                            condition.notify_all()
-                        if command_clocks:
-                            try:
-                                clock_finish = clocks.sample()
-                            except Exception:
-                                # optional diagnostics cannot erase a completed child
-                                clock_finish = clocks.unavailable_sample()
-                            with condition:
-                                clock_finishes[i] = clock_finish
-                    waiter = threading.Thread(target=wait_child, daemon=True)
-                    waiter.start()
-                    waiters.append(waiter)
-                cancellation.checkpoint()
-                if launch_error is not None:
-                    break
-            deadline = started + timeout
-            with condition:
-                while len(finished) < len(children) and launch_error is None:
+    caught = None
+    try:
+        with SignalCancellation() as cancellation:
+            try:
+                for index, command in enumerate(launched_commands):
                     cancellation.checkpoint()
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    stdout_path = log_dir / f"{index}.stdout.log"
+                    stderr_path = log_dir / f"{index}.stderr.log"
+                    stdout = stdout_path.open("wb")
+                    files.append(stdout)
+                    stderr = stderr_path.open("wb")
+                    files.append(stderr)
+                    try:
+                        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True, env=child_environment)
+                    except OSError as exc:
+                        launch_error = str(exc)
+                    else:
+                        children.append(process)
+                        def wait_child(i=index, p=process):
+                            code = p.wait()
+                            stamp = time.monotonic()
+                            with condition:
+                                finished[i] = (code, stamp)
+                                condition.notify_all()
+                            if command_clocks:
+                                try:
+                                    clock_finish = clocks.sample()
+                                except Exception:
+                                    # optional diagnostics cannot erase a completed child
+                                    clock_finish = clocks.unavailable_sample()
+                                with condition:
+                                    clock_finishes[i] = clock_finish
+                        waiter = threading.Thread(target=wait_child, daemon=True)
+                        waiter.start()
+                        waiters.append(waiter)
+                    cancellation.checkpoint()
+                    if launch_error is not None:
                         break
-                    condition.wait(min(remaining, .1))
+                deadline = started + timeout
+                with condition:
+                    while len(finished) < len(children) and launch_error is None:
+                        cancellation.checkpoint()
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        condition.wait(min(remaining, .1))
+                    cancellation.checkpoint()
+                    timed_out = launch_error is None and len(finished) < len(children)
+                cleanup_groups = bool(launch_error is not None or timed_out or any(code != 0 for code, _ in finished.values()))
+                if resource_time is not None and not cleanup_groups:
+                    resources = measurements.collect(resource_path, successful=True)
+                    cleanup_groups = resources["status"] != "complete"
                 cancellation.checkpoint()
-                timed_out = launch_error is None and len(finished) < len(children)
-            cleanup_groups = bool(launch_error is not None or timed_out or any(code != 0 for code, _ in finished.values()))
-            if resource_time is not None and not cleanup_groups:
-                resources = measurements.collect(resource_path, successful=True)
-                cleanup_groups = resources["status"] != "complete"
-            cancellation.checkpoint()
-        except BaseException:
-            cleanup_groups = True
-            raise
-        finally:
-            if cleanup_groups:
-                terminate_groups()
-            for waiter in waiters:
-                waiter.join()
-            for process in children:
-                if process.returncode is None:
-                    process.wait()
-            for handle in files:
-                handle.close()
-    codes = [process.returncode for process in children]
-    completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
-    status = measurements.payload_status(codes, timed_out, launch_error, expected_commands=len(commands))
-    outcome = {"ok": status == "succeeded", "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
-    if command_clocks:
-        index = max(finished, key=lambda i: finished[i][1]) if finished else None
-        outcome["command_clocks"] = clocks.observation(clock_start, clock_finishes.get(index), index)
-    if resource_time is not None:
-        outcome["measurement_commands"] = launched_commands
-        outcome["exit_status_scope"] = measurements.EXIT_STATUS_SCOPE
-        outcome["payload_status"] = status
-        outcome["resources"] = resources or measurements.collect(resource_path, status == "succeeded")
-    failure = _execution_failure(outcome, wrapped=resource_time is not None)
-    if failure is not None:
-        outcome["failure"] = failure
-        outcome["ok"] = False
+            except BaseException as exc:
+                cleanup_groups = True
+                caught = exc
+            finally:
+                if cleanup_groups:
+                    terminate_groups()
+                for waiter in waiters:
+                    waiter.join()
+                waiters.clear()
+                waiter = None
+                for process in children:
+                    if process.returncode is None:
+                        process.wait()
+                for handle in files:
+                    handle.close()
+            codes = [process.returncode for process in children]
+            completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
+            status = measurements.payload_status(codes, timed_out, launch_error, expected_commands=len(commands))
+            outcome = {"ok": status == "succeeded", "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
+            if command_clocks:
+                index = max(finished, key=lambda i: finished[i][1]) if finished else None
+                outcome["command_clocks"] = clocks.observation(clock_start, clock_finishes.get(index), index)
+            if resource_time is not None:
+                outcome["measurement_commands"] = launched_commands
+                outcome["exit_status_scope"] = measurements.EXIT_STATUS_SCOPE
+                outcome["payload_status"] = status
+                outcome["resources"] = resources or measurements.collect(resource_path, status == "succeeded")
+            failure = _execution_failure(outcome, wrapped=resource_time is not None)
+            if failure is not None:
+                outcome["failure"] = failure
+                outcome["ok"] = False
+            if caught is not None:
+                raise caught
+    except BaseException as exc:
+        if "outcome" in locals():
+            exc.outcome = outcome
+        raise
     return outcome
 
 
 def _read(path):
     try:
-        return Path(path).read_text()
+        return Path(path).read_text(errors="replace")
+    except InterruptedError:
+        raise
     except OSError:
         return ""
 
@@ -562,11 +582,24 @@ def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
         return
     subprocess.run(["sync"], check=True, timeout=timeout)
     if policy == "source-warm":
-        for current, _, files in os.walk(source):
-            for name in files:
-                with (Path(current) / name).open("rb") as handle:
-                    for _ in iter(lambda: handle.read(1024 * 1024), b""):
-                        pass
+        with SignalCancellation() as cancellation:
+            pending = [Path(source)]
+            while pending:
+                cancellation.checkpoint()
+                current = pending.pop()
+                with os.scandir(current) as children:
+                    paths = [Path(entry.path) for entry in children]
+                for path in paths:
+                    cancellation.checkpoint()
+                    mode = path.stat(follow_symlinks=False).st_mode
+                    if stat.S_ISDIR(mode):
+                        pending.append(path)
+                    elif stat.S_ISREG(mode):
+                        with path.open("rb") as handle:
+                            for _ in iter(lambda: handle.read(1024 * 1024), b""):
+                                cancellation.checkpoint()
+                    else:
+                        raise MismatchError(f"non-regular cache entry: {path}")
         return
     if sys.platform != "linux":
         raise ValueError("linux-drop-caches requires Linux")
@@ -622,12 +655,16 @@ def _arguments(argv):
     parser.add_argument("--verification-workers", type=int, help=f"streaming verification workers, 1..{streaming.MAX_WORKERS} (default {streaming.DEFAULT_WORKERS})")
     parser.add_argument("--verification-inline-bytes", type=int,
                         help=f"hash files at or below this size inline; 0 disables small-file inline scheduling with multiple workers (default {DEFAULT_INLINE_BYTES})")
+    parser.add_argument("--verification-read-bytes", type=int,
+                        help=f"full-content read chunk bytes, {MIN_READ_BYTES}..{MAX_READ_BYTES} (default {DEFAULT_READ_SIZE})")
+    parser.add_argument("--verification-batch-depth", type=int,
+                        help=f"maximum submitted files per worker per batch, 1..{MAX_BATCH_DEPTH} (default {DEFAULT_BATCH_MULTIPLIER})")
     for name, value in capacity.DEFAULT_POLICY.items():
         parser.add_argument("--capacity-" + name.replace("_", "-"), type=int,
                             help=f"capacity {name.replace('_', ' ')} override (default {value}); requires --check-capacity")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks/inodes on distinct scratch filesystems")
     args = parser.parse_args(argv)
-    for option in ("verification_mode", "verification_workers", "verification_inline_bytes"):
+    for option in ("verification_mode", "verification_workers", "verification_inline_bytes", "verification_read_bytes", "verification_batch_depth"):
         if getattr(args, option) is not None and not args.streaming_verification:
             parser.error("--" + option.replace("_", "-") + " requires --streaming-verification")
     overrides = {name: getattr(args, "capacity_" + name) for name in capacity.DEFAULT_POLICY}
@@ -640,6 +677,12 @@ def _arguments(argv):
     args.verification_inline_bytes = DEFAULT_INLINE_BYTES if args.verification_inline_bytes is None else args.verification_inline_bytes
     if not 0 <= args.verification_inline_bytes <= MAX_INLINE_BYTES:
         parser.error(f"--verification-inline-bytes must be 0..{MAX_INLINE_BYTES}")
+    args.verification_read_bytes = DEFAULT_READ_SIZE if args.verification_read_bytes is None else args.verification_read_bytes
+    args.verification_batch_depth = DEFAULT_BATCH_MULTIPLIER if args.verification_batch_depth is None else args.verification_batch_depth
+    if not MIN_READ_BYTES <= args.verification_read_bytes <= MAX_READ_BYTES:
+        parser.error(f"--verification-read-bytes must be {MIN_READ_BYTES}..{MAX_READ_BYTES}")
+    if not 1 <= args.verification_batch_depth <= MAX_BATCH_DEPTH:
+        parser.error(f"--verification-batch-depth must be 1..{MAX_BATCH_DEPTH}")
     args.verification_mode = args.verification_mode or "full-content"
     args.verification_workers = streaming.DEFAULT_WORKERS if args.verification_workers is None else args.verification_workers
     if not 1 <= args.verification_workers <= streaming.MAX_WORKERS:
@@ -676,7 +719,8 @@ def _fixture_policy(all_directory_files=False, metadata_only=False):
               if all_directory_files else "--leaf-files")
     proof = ("verified counts and structure fingerprint; payload contents are not checked"
              if metadata_only else "verified counts and digest")
-    return f"filegen {layout}; --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; {proof}"
+    separator = "; " if all_directory_files else " "
+    return f"filegen {layout}{separator}--bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; {proof}"
 
 
 def main(argv=None):
@@ -755,7 +799,7 @@ def main(argv=None):
             if any(case.get("mode", "fresh") != "fresh" for case in cases):
                 raise ValueError("streaming verification supports fresh fixtures only")
             verification_policy = streaming.METADATA_POLICY if args.verification_mode == "metadata-size" else streaming.POLICY
-            record["context"]["verification"] = dict(policy=verification_policy, workers=args.verification_workers, inline_bytes=args.verification_inline_bytes)
+            record["context"]["verification"] = dict(policy=verification_policy, workers=args.verification_workers, inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
             if args.verification_mode == "metadata-size":
                 record["context"]["verification_policy"] = ("performance-only: exact paths, types, counts, sizes and modes; "
                     "source mode/uid/gid/mtime_ns/ctime_ns/device/inode unchanged; no payload reads; same-size content corruption is not detected; "
@@ -844,7 +888,7 @@ def main(argv=None):
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
             initial_started = time.monotonic()
-            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy, inline_bytes=args.verification_inline_bytes)
+            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy, inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
                            if args.streaming_verification else scan_tree(source))
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
@@ -881,103 +925,106 @@ def main(argv=None):
                         trial["resources"] = {"status": "unavailable", "metrics": None}
                     record["trials"].append(trial)
                     _persist(output, record)
-                    preparation_started = time.monotonic()
-                    if args.check_capacity:
-                        capacity.check(args.destination_root, case, **args.capacity_policy)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    if operation != "fresh":
-                        stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
-                        trial["seed_validation"] = operations.validate_seed(source, destination, source_scan, source_metadata, stale)
-                    elif variant["processes"] > 1 or variant["tool"] == "rsync":
-                        destination.mkdir()
-                    selected_tools = dict(tools)
-                    if variant["id"] == "rcp-baseline":
-                        selected_tools["rcp"] = tools["rcp-baseline"]
-                        if args.mode == "loopback":
-                            selected_tools["rcpd"] = tools["rcpd-baseline"]
-                    commands = [] if args.rtt_ms is not None else plan_commands(variant, source, destination, selected_tools, args.mode, operation)
-                    timing_prefix = output / "timings" / trial_path / "trace"
-                    if timing_policy == "coarse":
-                        timing_prefix.parent.mkdir(parents=True, exist_ok=False)
-                        commands = [[command[0], f"--timings={timing_prefix}", *command[1:]] for command in commands]
-                    trial["commands"] = commands
-                    if args.rtt_ms is not None:
-                        trial["transport_artifacts"] = str(output / "transport" / trial_path)
-                    try:
+                    with _TrialOutcome(trial) as active:
+                        preparation_started = time.monotonic()
+                        active.stage = "capacity"
+                        if args.check_capacity:
+                            capacity.check(args.destination_root, case, **args.capacity_policy)
+                        active.stage = "preparation"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if operation != "fresh":
+                            stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
+                            trial["seed_validation"] = operations.validate_seed(source, destination, source_scan, source_metadata, stale)
+                        elif variant["processes"] > 1 or variant["tool"] == "rsync":
+                            destination.mkdir()
+                        selected_tools = dict(tools)
+                        if variant["id"] == "rcp-baseline":
+                            selected_tools["rcp"] = tools["rcp-baseline"]
+                            if args.mode == "loopback":
+                                selected_tools["rcpd"] = tools["rcpd-baseline"]
+                        commands = [] if args.rtt_ms is not None else plan_commands(variant, source, destination, selected_tools, args.mode, operation)
+                        timing_prefix = output / "timings" / trial_path / "trace"
+                        if timing_policy == "coarse":
+                            timing_prefix.parent.mkdir(parents=True, exist_ok=False)
+                            commands = [[command[0], f"--timings={timing_prefix}", *command[1:]] for command in commands]
+                        trial["commands"] = commands
+                        if args.rtt_ms is not None:
+                            trial["transport_artifacts"] = str(output / "transport" / trial_path)
+                        active.stage = "cache"
                         proof = _prepare_cache(args.cache, source, args.timeout, source_scan, source_metadata)
                         if args.cache == "source-verified":
                             trial["cache_validation"] = proof
-                    except Exception as exc:
-                        if isinstance(exc, operations.VerificationError):
-                            trial["cache_validation"] = exc.proof
-                        trial["status"] = "failed"
-                        trial["validation"] = {"ok": False, "error": f"cache preparation failed: {exc}"}
+                        if collect_costs:
+                            measurements.add_cost(trial, "preparation", preparation_started)
                         _persist(output, record)
-                        raise
-                    if collect_costs:
-                        measurements.add_cost(trial, "preparation", preparation_started)
-                    _persist(output, record)
-                    if args.rtt_ms is not None:
-                        identities = {key: record["tools"][key + "-baseline" if variant["id"] == "rcp-baseline" else key]["sha256"] for key in (("rcp", "rcpd") if variant["tool"] == "rcp" else ("rsync",))}
-                        outcome = transport.execute_trial(variant, source, destination, selected_tools,
-                            output / "logs" / trial_path, Path(trial["transport_artifacts"]), args.timeout,
-                            args.rtt_ms, operation, source_scan["counts"], timing_policy, timing_prefix,
-                            len(record["trials"]) - 1, expected_pins=identities, ssh_identity=record["tools"]["ssh"])
-                        commands = outcome["commands"]
-                    else:
-                        options = {"resource_time": resource_time} if resource_time is not None else {}
-                        if args.command_clocks:
-                            options["command_clocks"] = True
-                        outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale, **options)
-                    verification_started = time.monotonic()
-                    trial.update(outcome)
-                    timing_error = None
-                    if timing_policy == "coarse":
-                        expected_roles = ["rcp-master"] * len(commands)
-                        if args.mode == "loopback":
-                            expected_roles += ["rcpd-source"] * len(commands)
-                            expected_roles += ["rcpd-destination"] * len(commands)
-                        try:
-                            trial["timings"]["reports"] = timings.collect(timing_prefix, expected_roles, successful=outcome["ok"])
-                        except timings.CollectionError as error:
-                            trial["timings"]["reports"] = error.reports
-                            timing_error = str(error)
-                    trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers, inline_bytes=args.verification_inline_bytes)
-                        if args.streaming_verification else validate_tree(source, destination, source_scan))
-                        if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"})
-                    if outcome["ok"] and not trial["validation"]["ok"]:
-                        trial["error"] = operations.verification_failure(trial["validation"], "destination")
-                    if outcome["ok"] and trial["validation"]["ok"]:
-                        try:
+                        active.stage = "command"
+                        if args.rtt_ms is not None:
+                            identities = {key: record["tools"][key + "-baseline" if variant["id"] == "rcp-baseline" else key]["sha256"] for key in (("rcp", "rcpd") if variant["tool"] == "rcp" else ("rsync",))}
+                            outcome = transport.execute_trial(variant, source, destination, selected_tools,
+                                output / "logs" / trial_path, Path(trial["transport_artifacts"]), args.timeout,
+                                args.rtt_ms, operation, source_scan["counts"], timing_policy, timing_prefix,
+                                len(record["trials"]) - 1, expected_pins=identities, ssh_identity=record["tools"]["ssh"])
+                            commands = outcome["commands"]
+                        else:
+                            options = {"resource_time": resource_time} if resource_time is not None else {}
+                            if args.command_clocks:
+                                options["command_clocks"] = True
+                            outcome = execute_commands(commands, output / "logs" / trial_path, args.timeout, stable_summary_locale=stable_summary_locale, **options)
+                        if collect_costs:
+                            active.verification_started = time.monotonic()
+                        trial.update(outcome)
+                        timing_error = None
+                        active.stage = "timings"
+                        if timing_policy == "coarse":
+                            expected_roles = ["rcp-master"] * len(commands)
+                            if args.mode == "loopback":
+                                expected_roles += ["rcpd-source"] * len(commands)
+                                expected_roles += ["rcpd-destination"] * len(commands)
+                            try:
+                                trial["timings"]["reports"] = timings.collect(timing_prefix, expected_roles, successful=outcome["ok"])
+                            except timings.CollectionError as error:
+                                trial["timings"]["reports"] = error.reports
+                                timing_error = str(error)
+                        active.stage = "destination"
+                        trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers, inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
+                            if args.streaming_verification else validate_tree(source, destination, source_scan))
+                            if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"})
+                        if outcome["ok"] and not trial["validation"]["ok"]:
+                            raise operations.VerificationError(trial["validation"], "destination")
+                        if outcome["ok"]:
                             if operations.summary_supported(variant):
+                                active.stage = "summary"
                                 text = "\n".join(Path(path).read_text() for item in outcome["logs"] for path in item.values())
-                                trial["copy_summary"] = operations.validate_summary(variant, text, expected_transfer)
+                                trial["copy_summary"], trial["summary_validation"] = operations.summary_proof(variant, text, expected_transfer)
+                                if not trial["summary_validation"]["ok"]:
+                                    raise operations.VerificationError(trial["summary_validation"], "summary")
+                                active.stage = "metadata"
                                 trial["metadata_validation"] = (trial["validation"]["metadata"] if args.streaming_verification
                                     else operations.validate_metadata(destination, source_metadata))
-                        except (OSError, ValueError) as error:
-                            trial["validation"].update(ok=False, error=str(error))
-                            if isinstance(error, InterruptedError):
-                                trial["validation"]["interrupted"] = True
-                                trial["error"] = operations.verification_failure(trial["validation"], "destination")
-                        if trial["validation"]["ok"] and source_metadata is not None:
-                            trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True, inline_bytes=args.verification_inline_bytes)
-                                if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
-                            if not trial["source_validation"]["ok"]:
-                                trial["error"] = operations.verification_failure(trial["source_validation"], "source")
-                    if timing_error:
-                        trial["validation"]["timing_error"] = timing_error
-                        if trial["validation"]["ok"]:
-                            trial["validation"].update(ok=False, error=f"timing collection failed: {timing_error}")
-                    if collect_costs:
-                        measurements.add_cost(trial, "verification", verification_started)
-                    trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] and trial.get("source_validation", {}).get("ok", True) else "failed"
-                    _persist(output, record)
-                    if trial["status"] != "ok":
-                        raise RuntimeError(f"trial {trial_path} failed: {trial.get('error') or trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
-                    cleanup_started = time.monotonic()
-                    shutil.rmtree(destination)
-                    if collect_costs:
-                        measurements.add_cost(trial, "cleanup", cleanup_started)
+                            if source_metadata is not None:
+                                active.stage = "source"
+                                trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True,
+                                    inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
+                                    if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
+                                if not trial["source_validation"]["ok"]:
+                                    raise operations.VerificationError(trial["source_validation"], "source")
+                        if timing_error:
+                            trial["validation"]["timing_error"] = timing_error
+                            if outcome["ok"]:
+                                active.stage = "timings"
+                                raise RuntimeError(f"timing collection failed: {timing_error}")
+                        if collect_costs:
+                            measurements.add_cost(trial, "verification", active.verification_started)
+                            active.verification_started = None
+                        trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] and trial.get("source_validation", {}).get("ok", True) else "failed"
+                        _persist(output, record)
+                        if trial["status"] != "ok":
+                            raise RuntimeError(f"trial {trial_path} failed: {trial.get('error') or trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
+                        active.stage = "cleanup"
+                        cleanup_started = time.monotonic()
+                        shutil.rmtree(destination)
+                        if collect_costs:
+                            measurements.add_cost(trial, "cleanup", cleanup_started)
             source_validation = record["trials"][-1]["source_validation"] if source_metadata is not None else validate_tree(source, source, source_scan)
             if not source_validation["ok"]:
                 raise RuntimeError(f"case {case['id']}: {operations.verification_failure(source_validation, 'source')}")
@@ -1007,7 +1054,7 @@ def main(argv=None):
         for trial in record["trials"]:
             if trial["status"] == "running":
                 trial["status"] = "failed"
-                trial["validation"] = {"ok": False, "error": record["error"]}
+                _TrialOutcome(trial).__exit__(type(exc), exc, exc.__traceback__)
         if source_scratch or destination_scratch:
             record["context"]["failure_artifacts"] = {"source_scratch": str(source_scratch) if source_scratch else "", "destination_scratch": str(destination_scratch) if destination_scratch else ""}
         _persist(output, record)

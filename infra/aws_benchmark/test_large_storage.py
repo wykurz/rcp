@@ -69,6 +69,7 @@ class PreparationFixture:
         self.tree = inventory()
         self.calls = []
         self.signature_fd = None
+        self.filesystem = "ext4"
         self.fail_command = None
         self.case = dict(directory_widths=[10], files_per_leaf=100, file_size_bytes=1_000_000_000)
         self.write("proc/swaps", "Filename\tType\tSize\tUsed\tPriority\n")
@@ -143,7 +144,7 @@ class PreparationFixture:
             path.touch()
             self.assertEqual(argv[-2:], [f"/proc/self/fd/{fd}" for fd in kwargs["pass_fds"]])
         if argv[0] == "blkid":
-            return SimpleNamespace(stdout="ext4\n")
+            return SimpleNamespace(stdout=self.filesystem + "\n")
         return SimpleNamespace(stdout="")
 
     def prepare(self):
@@ -151,6 +152,34 @@ class PreparationFixture:
 
     def commands(self):
         return [argv[0] for argv, _ in self.calls]
+
+
+    def test_existing_mount_or_output_target_refuses_before_commands(self):
+        for side in (*storage.SIDES, "output"):
+            target = self.data / side
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to("/nonexistent")
+            try:
+                with self.subTest(side=side), self.assertRaisesRegex(ValueError, "already exists"):
+                    self.prepare()
+                self.assertEqual(self.calls, [])
+            finally:
+                target.unlink()
+
+    def test_active_swap_refuses_before_commands(self):
+        self.write("proc/swaps", "Filename\tType\tSize\tUsed\tPriority\n/swap file 1 0 -2\n")
+        with self.assertRaisesRegex(ValueError, "swap"):
+            self.prepare()
+        self.assertEqual(self.calls, [])
+
+    def test_unexpected_formatted_filesystem_refuses_before_mount(self):
+        self.filesystem = "xfs"
+        with self.assertRaisesRegex(ValueError, "formatted filesystem"):
+            self.prepare()
+        self.assertEqual(self.commands().count("mkfs.ext4"), 1)
+        self.assertNotIn("mount", self.commands())
+        self.capacity.assert_not_called()
+        self.assertFalse((self.data / "output").exists())
 
 
 class PreparationTests(PreparationFixture, unittest.TestCase):
@@ -267,7 +296,7 @@ class LegacyPreparationTests(PreparationFixture, unittest.TestCase):
         self.assertEqual(self.prepare(), ["/dev/nvme1n1", "/dev/nvme2n1"])
         self.assertIn("--tree", self.calls[0][0])
         self.assertEqual(self.commands()[:5], ["lsblk"] + ["wipefs"] * 4)
-        self.assertEqual(self.commands()[5:], ["mkfs.ext4", "mount", "mkfs.ext4", "mount", "mount"])
+        self.assertEqual(self.commands()[5:], ["mkfs.ext4", "blkid", "mount", "mkfs.ext4", "blkid", "mount", "mount"])
         for argv, kwargs in self.calls:
             if argv[0] == "mkfs.ext4":
                 self.assertNotIn("-F", argv)

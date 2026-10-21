@@ -89,15 +89,19 @@ extra timestamp-preservation semantics.
 
 Memory scales with a bounded directory/depth and worker batch, not total file count. Traversal
 allows at most 4,096 entries per directory and depth 128. It uses eight hashing workers by default
-(`--verification-workers`, range 1–32), at most twice that many pending large-file tasks, and 1 MiB
-read buffers. Full-content files up to 1 MiB run inline by default; `--verification-inline-bytes`
-independently tunes that threshold from 0 through 1,000,000,000 bytes. One-worker full-content and
-all metadata walks run inline, avoiding per-file future scheduling. Cancellation records a pending
-signal, cancels queued work and stops active reads cooperatively, draining them before closing
-descriptors. Manifest counts and the 1,000,000,000-byte per-file ceiling bound accepted content. The
-digest order is deterministic across worker counts and inline thresholds. The verifier policy,
-worker count and effective inline threshold are included in new series identity; old result schemas
-and old identities remain readable and unchanged.
+(`--verification-workers`, range 1–32). Pending large-file tasks default to twice the worker count;
+`--verification-batch-depth` tunes that multiplier from 1–8. Read buffers default to 1 MiB;
+`--verification-read-bytes` tunes them from 4 KiB–16 MiB. Full-content files up to 128 KiB run
+inline by default; `--verification-inline-bytes` independently tunes that threshold from 0 through
+1,000,000,000 bytes. This local default leaves decimal 1 MB files eligible for parallel hashing; it
+is a heuristic, not measured throughput on the AWS host. One-worker full-content and all metadata
+walks run inline, avoiding per-file future scheduling. Cancellation records a pending signal,
+cancels queued work and stops active reads cooperatively, draining them before closing descriptors.
+Manifest counts and the 1,000,000,000-byte per-file ceiling bound accepted content. The digest order
+is deterministic across worker counts and inline thresholds. The verifier policy, worker count,
+effective inline threshold, read size and batch depth are included in new series identity; old
+result schemas and old identities remain readable and unchanged. Manifest shapes that exceed the
+directory-entry or depth bound are rejected before fixture generation.
 
 The memory bound applies to the verifier only. The unchanged `filegen` can queue per-file tasks, and
 copy tools retain their own resource behavior; whole-workload memory use still needs qualification.
@@ -116,7 +120,8 @@ The separate allowlisted suite **`bulk-1g-metadata`** uses the same `bulk-1g-1tb
 fixture, two balanced adjacent pairs (four copies), cold-cache policy, per-command timeout, storage
 layout and absolute lease. Its purpose is `performance`, with runner
 `aws-c5d24-ext4-raid0-metadata-v1` and verification identity `metadata-size-tree-v1` (eight
-configured hashing workers and a 1 MiB inline threshold; metadata walks themselves run inline). It
+configured hashing workers, a 1 MiB inline threshold/read size and batch depth 2; metadata walks
+themselves run inline). These cloud values are frozen independently of local harness defaults. It
 passes `--streaming-verification --verification-mode metadata-size`; the four original suites retain
 full-content verification and smoke purpose for historical/local use only.
 
@@ -133,17 +138,27 @@ checks.
 
 Validation stays outside timed copy intervals, and no validation runs between cache drop and copy.
 Source reuse and cache semantics are unchanged. The new policy and runner identity prevent pooling
-with historical full-content measurements. AWS inspection and approval require the exact suite's
-verification policy, worker count and inline threshold. Performance purpose alone does not publish
-history: the existing independent per-attempt approval remains mandatory.
+with historical full-content measurements. AWS inspection accepts only explicitly versioned
+historical contracts and reports only recorded fields. Approval of a new run requires the exact
+current five-field verification contract and all seven source identity fields; missing settings are
+not inferred from current defaults. Performance purpose alone does not publish history: the existing
+independent per-attempt approval remains mandatory.
 
-Existing measured generation/copy costs model approximately **56.4 minutes before metadata
-verification overhead** for the complete attempt, including the reserved reporting time. This is an
-estimate, not demonstrated completion or a guarantee. All formatting, generation, validation,
-deletion and upload still consume the fixed window of at most 60 minutes; three minutes remain
-reserved for stop/collection/upload. Repeating isolated one-copy runs would repeat fixture setup and
-generation; an isolated qualification is not a balanced performance comparison. Preserve partial
-results and stop at the original cutoff if any phase exhausts its allowance.
+Previously measured generation and per-copy durations project approximately **3,104 seconds** for
+generation plus four copies. The previous attempt recorded two copy timings; completion of all four
+copies remains unproven. Adding the previously observed 92-second setup and 180-second reporting
+reserve models about **56.3 minutes before remaining metadata and cleanup overhead**. This is an
+estimate, not demonstrated completion or a guarantee. New `bulk-1g-metadata` admission requires an
+exactly **3,600-second window**, at least **3,520 seconds** remaining immediately before requesting
+capacity, and at least **3,400 seconds** immediately before worker storage preparation. The worker
+floor comprises 3,104 seconds plus the 180-second upload reserve and 116 seconds of remaining-work
+headroom; the launch floor adds a 120-second startup allowance. A slow approval, upload, boot or
+download fails admission rather than extending the lease. Older recorded windows remain readable but
+cannot satisfy new-run admission. All formatting, generation, validation, deletion and upload still
+consume the fixed 60-minute window; three minutes remain reserved for stop/collection/upload.
+Repeating isolated one-copy runs would repeat fixture setup and generation; an isolated
+qualification is not a balanced performance comparison. Preserve partial results and stop at the
+original cutoff if any phase exhausts its allowance.
 
 ## Qualification prerequisites and first run
 

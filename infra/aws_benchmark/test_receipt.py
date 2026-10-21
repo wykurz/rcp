@@ -69,6 +69,9 @@ class ReceiptTests(unittest.TestCase):
 
     def binary_run(self, root, suite, same_source):
         lease = dict(window(datetime.now(timezone.utc) - timedelta(minutes=4)), suite=suite)
+        if suite in common.METADATA_SUITES:
+            lease["opens"] = common.timestamp(datetime.now(timezone.utc) - timedelta(seconds=1))
+            lease["deadline"] = common.timestamp(common.utc(lease["opens"]) + timedelta(seconds=3600))
         if not same_source:
             lease["candidate"] = "b" * 40
         cloud, selected = controller_cloud(lease)

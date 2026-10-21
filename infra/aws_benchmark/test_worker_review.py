@@ -25,11 +25,15 @@ class Transient(Exception):
 
 
 @contextmanager
-def worker_fixture():
+def worker_fixture(suite="aa-smoke"):
     with tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
         root = Path(directory)
         cloud = FakeCloud()
         lease = window(datetime.now(timezone.utc))
+        lease["suite"] = suite
+        if suite in common.METADATA_SUITES:
+            lease["opens"] = common.timestamp(datetime.now(timezone.utc) - timedelta(seconds=1))
+            lease["deadline"] = common.timestamp(common.utc(lease["opens"]) + timedelta(seconds=3600))
         request = {k: lease[k] for k in ("run", "baseline", "candidate", "suite", "deadline")}
         request["sha256"] = {key: common.digest(b"binary") for key in common.BINARIES}
         cloud.objects.update({"input/" + key: b"binary" for key in common.BINARIES})
@@ -283,7 +287,7 @@ class WorkerReviewTests(unittest.TestCase):
                 worker.run(cloud.api["s3"], "bucket")
                 metadata, _ = report(cloud)
                 admission = metadata["admission"]
-                accepted = remaining > common.WORKER_START_RESERVE
+                accepted = remaining >= common.WORKER_START_RESERVE
                 self.assertEqual(admission["accepted"], accepted)
                 self.assertEqual(admission["remaining_seconds"], remaining)
                 self.assertEqual(admission["required_seconds"], common.WORKER_START_RESERVE)

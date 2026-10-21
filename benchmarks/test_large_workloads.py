@@ -93,16 +93,24 @@ class StreamingTests(unittest.TestCase):
         for leaf in ("a", "b", "c"):
             target = self.source / leaf
             target.mkdir()
-            for index in range(37):
+            for index in range(67):
                 (target / str(index)).write_bytes(bytes([index, 17, 255]) * 7)
 
     def test_digest_order_is_independent_of_worker_count_and_proof_is_compact(self):
         proof = streaming.scan_tree(self.source, 1)
-        self.assertEqual(proof["counts"], dict(files=111, directories=3, bytes=2331))
-        self.assertEqual(proof["entries"], 115)
+        self.assertEqual(proof["counts"], dict(files=201, directories=3, bytes=4221))
+        self.assertEqual(proof["entries"], 205)
         self.assertLess(len(json.dumps(proof)), 500)
+        original_submit = streaming.ThreadPoolExecutor.submit
         for workers in (2, 8, 32):
-            self.assertEqual(streaming.scan_tree(self.source, workers), proof)
+            submitted = []
+            def submit(pool, function, *args, **kwargs):
+                submitted.append(args[1])
+                return original_submit(pool, function, *args, **kwargs)
+            with mock.patch.object(streaming.ThreadPoolExecutor, "submit", submit):
+                self.assertEqual(streaming.scan_tree(self.source, workers, inline_bytes=0), proof)
+            self.assertEqual(len(submitted), 201)
+            self.assertGreater(67, workers * 2)
         copy_path = self.root / "copy"
         shutil.copytree(self.source, copy_path)
         self.assertTrue(streaming.validate_tree(copy_path, proof)["ok"])
@@ -127,9 +135,24 @@ class StreamingTests(unittest.TestCase):
                     file.chmod(0o600)
                 else:
                     os.utime(file, ns=(1, 1))
-                self.assertFalse(streaming.validate_tree(destination, proof, source=True)["ok"])
-                # destination timestamps are deliberately outside copy semantics
-                self.assertEqual(streaming.validate_tree(destination, proof)["ok"], damage == "mtime")
+                unchanged_source = streaming.validate_tree(self.source, proof, source=True)
+                self.assertTrue(unchanged_source["ok"])
+                observed = streaming.validate_tree(destination, proof)
+                if damage == "mode":
+                    self.assertFalse(observed["modes_match"])
+                elif damage == "mtime":
+                    self.assertTrue(observed["ok"])
+                else:
+                    self.assertFalse(observed["ok"])
+                    if damage in ("content", "rename"):
+                        self.assertFalse(observed["digest_match"])
+        initial = streaming.scan_tree(self.source)
+        os.utime(self.source / "a" / "0", ns=(1, 1))
+        changed_source = streaming.validate_tree(self.source, initial, source=True)
+        self.assertFalse(changed_source["ok"])
+        self.assertTrue(changed_source["digest_match"])
+        self.assertTrue(changed_source["modes_match"])
+        self.assertFalse(changed_source["source_metadata_match"])
 
     def test_links_special_files_acl_and_unbounded_entries_are_rejected(self):
         for kind in ("symlink", "hardlink", "fifo"):
@@ -264,6 +287,7 @@ class StreamingIntegrationTests(unittest.TestCase):
                     raise error
                 trial = self._failed_source_verification(fail, "failed")
                 self.assertNotIn("interrupted", trial["source_validation"])
+                self.assertTrue(trial["source_validation"]["verification_error"])
                 self.assertEqual(trial["error"], "source verification failed: " + str(error))
 
     def test_capacity_failure_precedes_fixture_generation(self):

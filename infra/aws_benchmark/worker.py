@@ -22,7 +22,7 @@ import zipfile
 from benchmarks.run import load_manifest
 from benchmarks.verification import METADATA_POLICY
 
-from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
+from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, timestamp,
                      validate_admission, validate_request, validate_window,
@@ -51,18 +51,9 @@ def prepare_storage(budget, uid, gid):
         # all four disks pass admission before any format; actions use the held devices
         for side, (_, (fd, number)) in zip(large_storage.SIDES, selected):
             mount = DATA / side
-            mount.mkdir(parents=True, exist_ok=False)
-            execute(["mkfs.ext4", "-q", "-E", "lazy_itable_init=0,lazy_journal_init=0",
-                     f"/proc/self/fd/{fd}"], budget, pass_fds=(fd,))
-            execute(["mount", "--no-canonicalize", "--internal-only", "-t", "ext4",
-                     "-o", "nodev,nosuid", f"/proc/self/fd/{fd}", str(mount)], budget, pass_fds=(fd,))
-            require(mount.stat().st_dev == os.makedev(*map(int, number.split(":"))),
-                    "mounted filesystem differs from held disk")
+            large_storage.format_mount(fd, number, mount, budget, execute)
             os.chown(mount, uid, gid)
-        output = DATA / "output"
-        output.mkdir()
-        execute(["mount", "-t", "tmpfs", "-o", "size=128m,nosuid,nodev,noexec", "tmpfs", str(output)], budget)
-        os.chown(output, uid, gid)
+        large_storage.prepare_output(DATA, budget, uid, gid, execute)
         return [disk["path"] for disk, _ in selected]
 
 
@@ -145,7 +136,9 @@ def command(window, seconds):
         verification = verification_contract(window["suite"])
         argv += ["--manifest", str(ROOT / "benchmarks/large-cases.json"),
                  "--streaming-verification", "--verification-workers", str(verification["workers"]),
-                 "--verification-inline-bytes", str(verification["inline_bytes"]), "--check-capacity"]
+                 "--verification-inline-bytes", str(verification["inline_bytes"]),
+                 "--verification-read-bytes", str(verification["read_bytes"]),
+                 "--verification-batch-depth", str(verification["batch_depth"]), "--check-capacity"]
         if verification["policy"] == METADATA_POLICY:
             argv += ["--verification-mode", "metadata-size"]
     for case in SUITES[window["suite"]]:
@@ -333,13 +326,17 @@ def run(s3, bucket):
     try:
         request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
         validate_request(request, window)
-        validate_admission(window)
+        validate_admission(window, window=True)
         metadata["request"] = request
-        remaining = budget.left()
-        metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
-            "remaining_seconds": round(remaining, 3), "required_seconds": WORKER_START_RESERVE,
-            "accepted": remaining > WORKER_START_RESERVE}
-        budget.left(WORKER_START_RESERVE)
+        worker_reserve = admission_contract(window["suite"])["worker"]
+        def admit_storage():
+            remaining = budget.left()
+            metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
+                "remaining_seconds": round(remaining, 3), "required_seconds": worker_reserve,
+                "accepted": remaining >= worker_reserve}
+            if remaining < worker_reserve:
+                raise TimeoutError("suite worker admission deadline exhausted")
+        admit_storage()
         metadata["guest_security"] = check_ssm_absent(
             timeout=lambda maximum: min(maximum, budget.left(RESERVE)))
         metadata["harness_revision"] = (ROOT / "revision.txt").read_text().strip()
@@ -361,8 +358,10 @@ def run(s3, bucket):
             case_id, = SUITES[window["suite"]]
             require(case_id in cases, "suite case is missing from the large manifest")
             case = cases[case_id]
+            admit_storage()
             metadata["storage"] = large_storage.prepare(DATA, case, budget, account.pw_uid, account.pw_gid, execute)
         else:
+            admit_storage()
             metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
         cache_server(budget, account.pw_uid)
         try:

@@ -18,7 +18,7 @@ from benchmarks.strict_json import parse_json
 from benchmarks.verification import verification_label
 from . import identity
 from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
-                     digest, measurement_contract, verification_contract, require, utc)
+                     digest, measurement_contract, verification_contract, verification_contracts, require, utc)
 
 
 MAX_METADATA = 1024 * 1024
@@ -187,18 +187,18 @@ def historical_inputs(receipt, expected):
     return window, request
 
 
-def validate_recorded_verification(context, suite):
-    recorded, expected = context.get("verification"), verification_contract(suite)
-    if isinstance(recorded, dict) and "inline_bytes" not in recorded and expected is not None:
-        expected.pop("inline_bytes")
-    require(recorded == expected, "unexpected suite verification contract")
+def validate_recorded_verification(context, suite, *, exact=False):
+    recorded = context.get("verification")
+    allowed = (verification_contract(suite),) if exact else verification_contracts(suite)
+    require(recorded in allowed, "unexpected suite verification contract")
+    return copy.deepcopy(recorded)
 
 
 def inspect(source, expected, conclusion):
     evidence = {"schema_version": 1, "identity": expected, "producer_conclusion": conclusion,
                 "history_eligible": False, "files": {}, "members": {}, "errors": [],
                 "controller": None, "status": None, "worker": None, "raw_revision": None,
-                "expected_verification": verification_contract(expected["suite"])}
+                "expected_verification": None}
     snapshots = {}
     # preserve each bounded file even if another file is absent or invalid
     for name, limit in (("controller.json", MAX_METADATA), ("status.json", MAX_METADATA), ("results.zip", MAX_RESULT)):
@@ -259,7 +259,7 @@ def inspect(source, expected, conclusion):
                     for key, limit in (("cases", 16), ("variants", 16), ("trials", 512), ("summaries", 256))),
                     "measurement collection exceeds reporting limit")
             result = report.validate_result(value)
-            validate_recorded_verification(result["context"], expected["suite"])
+            evidence["expected_verification"] = validate_recorded_verification(result["context"], expected["suite"])
             evidence["raw_revision"] = copy.deepcopy(result["revision"])
         else:
             evidence["errors"].append("harness result unavailable")
@@ -292,7 +292,7 @@ def approve(evidence, result, policy):
             and worker.get("admission", {}).get("accepted") is True
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
     contract = measurement_contract(expected["suite"])
-    validate_recorded_verification(result["context"], expected["suite"])
+    validate_recorded_verification(result["context"], expected["suite"], exact=True)
     require(result["status"] == "complete" and result["context"].get("purpose") == contract["purpose"]
             and result["context"].get("repository") == expected["repository"]
             and result["context"].get("baseline_commit") == expected["baseline"]
@@ -310,6 +310,8 @@ def approve(evidence, result, policy):
     require(all(trial.get("source_validation", {}).get("ok") is True
                     and trial.get("resources", {}).get("status") == "complete"
                     for trial in result["trials"]), "incomplete paired comparison")
+    # approval also validates the current source proof; callers cannot bypass inspection
+    report.validate_result(result)
     evidence["history_eligible"] = True
     evidence["policy_sha256"] = digest(encoded(policy))
 
@@ -332,7 +334,7 @@ def derived_record(evidence, raw):
         raw_revision=raw["revision"], files=evidence["files"], members=evidence["members"],
         instance=controller.get("instance"), supervisor_harness_revision=worker.get("harness_revision"),
         source_series_ids=[item["series_id"] for item in raw["summaries"]],
-        expected_verification=verification_contract(expected["suite"]))
+        expected_verification=evidence["expected_verification"])
     result["context"]["aws_provenance"] = provenance
     for item in result["summaries"]:
         item["series_id"] = digest(encoded([SERIES_CONTRACT, item["series_id"],
@@ -409,8 +411,8 @@ def summary(evidence, result):
         "Raw harness checkout": (evidence["raw_revision"] or {}).get("commit") or "unknown",
         "Controller cleanup": controller.get("cleanup", "unknown"),
         "Archive SHA256": evidence["files"].get("results.zip", "unavailable"),
-        "Requested file validation": verification_label(
-            {"verification": verification_contract(expected["suite"])}),
+        "Recorded contract file validation": verification_label(
+            {"verification": evidence["expected_verification"]}) if result is not None else "unavailable",
         "Observed file validation": verification_label(result["context"]) if result is not None else "unavailable"}
     status = evidence.get("status") or {}
     if status:
