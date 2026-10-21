@@ -138,7 +138,7 @@
       return item?.description ? `${id} · ${item.description}` : id;
     };
     // check the explicit policy as well as the producer's series ID on imported history
-    const seriesKey = point => JSON.stringify([point.summary.series_id, point.run.context.verification?.policy ?? null, point.run.context.verification?.workers ?? null, point.run.context.verification?.inline_bytes ?? null]);
+    const seriesKey = point => JSON.stringify([point.summary.series_id, point.run.context.verification?.policy ?? null, point.run.context.verification?.workers ?? null, point.run.context.verification?.inline_bytes ?? null, point.run.context.verification?.read_bytes ?? null, point.run.context.verification?.batch_depth ?? null]);
     const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)} · ${verification(point.run)}`;
     const sameRcpSettings = (candidate, baseline) => candidate?.tool === "rcp" && baseline?.tool === "rcp" &&
       Array.isArray(candidate.args) && Array.isArray(baseline.args) &&

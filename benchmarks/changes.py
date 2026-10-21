@@ -44,7 +44,8 @@ def identity(run, summary):
     # producers bind verification into series IDs; also check the explicit contract on import
     verification = run["context"].get("verification") or {}
     return (run["context"]["repository"], summary["series_id"], summary["case_id"], summary["variant_id"],
-            verification.get("policy"), verification.get("workers"), verification.get("inline_bytes"))
+            verification.get("policy"), verification.get("workers"), verification.get("inline_bytes"),
+            verification.get("read_bytes"), verification.get("batch_depth"))
 
 
 def fingerprints(sources):
