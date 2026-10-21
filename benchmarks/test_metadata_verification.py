@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from benchmarks import capacity, report, run, streaming
+from benchmarks.harness_test_support import run_fixture
 
 
 class MetadataVerificationTests(unittest.TestCase):
@@ -60,7 +61,19 @@ class MetadataVerificationTests(unittest.TestCase):
         self.assertFalse(streaming.validate_tree(destination, full)["ok"])
         self.assertFalse(streaming.validate_tree(destination, expected, source=True)["ok"])
         os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
-        self.assertTrue(streaming.validate_tree(destination, expected, source=True)["ok"])
+        self.assertFalse(streaming.validate_tree(destination, expected, source=True)["ok"])
+        file = self.source / "directory/file"
+        before = file.stat()
+        file.write_bytes(b"damaged-content")
+        os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(file.stat().st_ino, before.st_ino)
+        self.assertNotEqual(file.stat().st_ctime_ns, before.st_ctime_ns)
+        self.assertTrue(streaming.validate_tree(self.source, expected)["ok"])
+        proof = streaming.validate_tree(self.source, expected, source=True)
+        self.assertFalse(proof["ok"])
+        self.assertEqual(proof["error"], "source metadata changed")
+        self.assertTrue(proof["digest_match"])
+        self.assertFalse(proof["source_metadata_match"])
 
     def test_incomplete_or_wrong_structure_and_modes_fail_metadata_validation(self):
         expected = self.scan()
@@ -92,8 +105,12 @@ class MetadataVerificationTests(unittest.TestCase):
         file = self.source / "directory/file"
         os.utime(file, ns=(1, 1))
         self.assertTrue(streaming.validate_tree(self.source, expected)["ok"])
-        self.assertEqual(streaming.validate_tree(self.source, expected, source=True),
-            dict(ok=False, error="source metadata changed"))
+        proof = streaming.validate_tree(self.source, expected, source=True)
+        self.assertFalse(proof["ok"])
+        self.assertEqual(proof["error"], "source metadata changed")
+        self.assertEqual(proof["counts"], expected["counts"])
+        self.assertEqual(proof["digest"], expected["digest"])
+        self.assertTrue(proof["complete"])
 
     def test_metadata_retains_link_special_file_owner_acl_and_capacity_guards(self):
         for kind in ("symlink", "hardlink", "fifo"):
@@ -168,53 +185,23 @@ class MetadataVerificationTests(unittest.TestCase):
         helper = StorageIdentityTests()
         helper.setUp()
         identity = (helper.case, helper.variant, "source-warm", "local", "runner", helper.environment, {})
-        policies = (None, dict(policy=streaming.POLICY, workers=8), dict(policy=streaming.METADATA_POLICY, workers=8))
+        policies = (None, dict(policy=streaming.POLICY, workers=8), dict(policy=streaming.METADATA_POLICY, workers=8, inline_bytes=streaming.DEFAULT_INLINE_BYTES))
         self.assertEqual(len({run.series_id(*identity, verification=policy) for policy in policies}), 3)
 
 
 class MetadataIntegrationTests(unittest.TestCase):
     def _run(self, fault=None, outcome=None):
-        from benchmarks.test_timings import TimingTests
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            binary, manifest = TimingTests()._fixture(root)
-            events = []
-            original_scan = streaming.scan_tree
-            def scan(*args, **kwargs):
-                events.append("verify")
-                self.assertEqual(kwargs["policy"], streaming.METADATA_POLICY)
-                return original_scan(*args, **kwargs)
-            def execute(commands, logdir, timeout, **kwargs):
-                events.append("copy")
-                source, destination = map(Path, commands[0][-2:])
-                shutil.copytree(source, destination)
-                if fault:
-                    fault(source, destination)
-                return dict(ok=True, elapsed_seconds=1.0, exit_codes=[0], timed_out=False,
-                            commands=commands, logs=[]) | (outcome or {})
-            with mock.patch.object(run, "environment", return_value={}), \
-                    mock.patch.object(run, "_prepare_cache", side_effect=lambda *args: events.append("drop")), \
-                    mock.patch.object(run, "execute_commands", side_effect=execute), \
-                    mock.patch.object(streaming, "scan_tree", side_effect=scan), \
-                    mock.patch.object(streaming.os, "fdopen", side_effect=AssertionError("payload read")), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                try:
-                    run.main(["--manifest", str(manifest), "--case", "tiny", "--variant", "rcp-default",
-                        "--bin-dir", str(binary), "--baseline-bin-dir", str(binary), "--source-root", str(root),
-                        "--destination-root", str(root), "--cache", "linux-drop-caches", "--no-timings",
-                        "--paired-seed", "7", "--repetitions", "2", "--streaming-verification",
-                        "--verification-mode", "metadata-size", "--output", str(root / "out")])
-                except RuntimeError:
-                    pass
-            record = report.parse_result((root / "out/results.json").read_text())
-            report.validate_result(record)
-            return record, events
+            record, events, summary = run_fixture(Path(directory), policy=streaming.METADATA_POLICY,
+                                                  copy_fault=fault, outcome=outcome)
+        self.assertIn("content integrity not checked", summary)
+        return record, events
 
     def test_four_metadata_trials_keep_cache_boundary_and_disclose_validation_strength(self):
         record, events = self._run()
         self.assertEqual(record["status"], "complete")
         self.assertEqual(events, ["verify"] + ["drop", "copy", "verify", "verify"] * 4)
-        self.assertEqual(record["context"]["verification"], dict(policy=streaming.METADATA_POLICY, workers=8))
+        self.assertEqual(record["context"]["verification"], dict(policy=streaming.METADATA_POLICY, workers=8, inline_bytes=streaming.DEFAULT_INLINE_BYTES))
         self.assertIn("same-size content corruption is not detected", record["context"]["verification_policy"])
         self.assertIn("payload contents are not checked", record["context"]["fixture_policy"])
         for trial in record["trials"]:
@@ -233,7 +220,9 @@ class MetadataIntegrationTests(unittest.TestCase):
                 self.assertEqual(record["summaries"], [])
                 self.assertEqual(events.count("copy"), 1)
                 self.assertEqual(record["trials"][0]["exit_codes"], [0])
-                self.assertFalse(record["trials"][0]["validation"]["ok"])
+                self.assertEqual(record["trials"][0]["validation"]["ok"], side == "source")
+                if side == "source":
+                    self.assertFalse(record["trials"][0]["source_validation"]["ok"])
 
     def test_copy_failure_and_timeout_cannot_pass_even_with_complete_destination(self):
         for exit_code, timed_out in ((1, False), (0, True)):

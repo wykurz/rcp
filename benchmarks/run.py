@@ -26,6 +26,7 @@ import uuid
 from benchmarks.strict_json import parse_json
 from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming
 from benchmarks.operations import expected_counts
+from benchmarks.verification import DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label
 
 
 TIMING_POLICY = "monotonic launch-to-last-child-exit; excludes verification and cache preparation"
@@ -87,8 +88,10 @@ def scan_tree(root):
     root = Path(root)
     try:
         root_metadata = root.stat(follow_symlinks=False)
+    except InterruptedError:
+        raise
     except OSError as exc:
-        raise ValueError(f"missing regular directory: {root}") from exc
+        raise ValueError(f"missing regular directory: {root}: {exc}") from exc
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError(f"missing regular directory: {root}")
     entries = {}
@@ -122,8 +125,10 @@ def validate_tree(source, destination, expected=None):
     expected = expected or scan_tree(source)
     try:
         actual = scan_tree(destination)
+    except InterruptedError as exc:
+        return {"ok": False, "error": str(exc), "interrupted": True}
     except (OSError, ValueError) as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "verification_error": True}
     missing = sorted(expected["entries"].keys() - actual["entries"].keys())
     extra = sorted(actual["entries"].keys() - expected["entries"].keys())
     changed = sorted(key for key in expected["entries"].keys() & actual["entries"].keys() if expected["entries"][key] != actual["entries"][key])
@@ -397,7 +402,13 @@ def _mount(path):
             continue
         mountpoint = decoded(left[4])
         if (resolved == mountpoint or resolved.startswith(mountpoint.rstrip("/") + "/")) and len(mountpoint) > len(best.get("mountpoint", "")):
-            best = {"mountpoint": mountpoint, "filesystem_type": right[0], "mount_source": decoded(right[1]), "mount_options": sorted(set(left[5].split(",") + right[2].split(",")))}
+            best = {"mountpoint": mountpoint, "kernel_device": left[2], "filesystem_type": right[0], "mount_source": decoded(right[1]), "mount_options": sorted(set(left[5].split(",") + right[2].split(",")))}
+    if best:
+        device = best["kernel_device"]
+        for line in _read(f"/sys/dev/block/{device}/uevent").splitlines():
+            if line.startswith("DEVNAME="):
+                best["kernel_device_name"] = "/dev/" + line.partition("=")[2]
+                break
     return best
 
 
@@ -487,7 +498,8 @@ def _persist(output, record):
     temporary = output / "results.json.tmp"
     temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     temporary.replace(output / "results.json")
-    lines = [f"# Benchmark {record['run_id']}", "", f"Status: **{record['status']}**", ""]
+    lines = [f"# Benchmark {record['run_id']}", "", f"Status: **{record['status']}**", "",
+             f"Verification: {verification_label(record['context'])}", ""]
     if record.get("context", {}).get("purpose") == "smoke":
         lines += ["Smoke check; excluded from performance trends.", ""]
     if record.get("error"):
@@ -542,7 +554,10 @@ def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
     if policy == "source-verified":
         if expected is None or metadata is None:
             raise ValueError("source-verified requires the initial source snapshots")
-        return operations.validate_source(source, expected, metadata)
+        proof = operations.validate_source(source, expected, metadata)
+        if not proof["ok"]:
+            raise operations.VerificationError(proof, "source")
+        return proof
     if policy == "uncontrolled":
         return
     subprocess.run(["sync"], check=True, timeout=timeout)
@@ -602,17 +617,35 @@ def _arguments(argv):
     parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
     parser.add_argument("--command-clocks", action="store_true", help="record bracketed local command clock observations without changing elapsed timing")
     parser.add_argument("--streaming-verification", action="store_true", help="bounded verification for fresh local fixtures")
-    parser.add_argument("--verification-mode", choices=("full-content", "metadata-size"), default="full-content",
+    parser.add_argument("--verification-mode", choices=("full-content", "metadata-size"),
                         help="full-content (default) or performance-only metadata-size; metadata-size does not verify content integrity")
-    parser.add_argument("--verification-workers", type=int, default=8, help="streaming verification workers, 1..32 (default 8)")
+    parser.add_argument("--verification-workers", type=int, help=f"streaming verification workers, 1..{streaming.MAX_WORKERS} (default {streaming.DEFAULT_WORKERS})")
+    parser.add_argument("--verification-inline-bytes", type=int,
+                        help=f"hash files at or below this size inline; 0 disables small-file inline scheduling with multiple workers (default {DEFAULT_INLINE_BYTES})")
+    for name, value in capacity.DEFAULT_POLICY.items():
+        parser.add_argument("--capacity-" + name.replace("_", "-"), type=int,
+                            help=f"capacity {name.replace('_', ' ')} override (default {value}); requires --check-capacity")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks/inodes on distinct scratch filesystems")
     args = parser.parse_args(argv)
-    if not 1 <= args.verification_workers <= 32:
-        parser.error("--verification-workers must be 1..32")
+    for option in ("verification_mode", "verification_workers", "verification_inline_bytes"):
+        if getattr(args, option) is not None and not args.streaming_verification:
+            parser.error("--" + option.replace("_", "-") + " requires --streaming-verification")
+    overrides = {name: getattr(args, "capacity_" + name) for name in capacity.DEFAULT_POLICY}
+    if not args.check_capacity and any(value is not None for value in overrides.values()):
+        parser.error("capacity tuning options require --check-capacity")
+    try:
+        args.capacity_policy = capacity.policy(**overrides)
+    except ValueError as error:
+        parser.error(str(error))
+    args.verification_inline_bytes = DEFAULT_INLINE_BYTES if args.verification_inline_bytes is None else args.verification_inline_bytes
+    if not 0 <= args.verification_inline_bytes <= MAX_INLINE_BYTES:
+        parser.error(f"--verification-inline-bytes must be 0..{MAX_INLINE_BYTES}")
+    args.verification_mode = args.verification_mode or "full-content"
+    args.verification_workers = streaming.DEFAULT_WORKERS if args.verification_workers is None else args.verification_workers
+    if not 1 <= args.verification_workers <= streaming.MAX_WORKERS:
+        parser.error(f"--verification-workers must be 1..{streaming.MAX_WORKERS}")
     if args.streaming_verification and (args.mode != "local" or args.cache not in ("source-warm", "linux-drop-caches")):
         parser.error("streaming verification requires local fresh copies and source-warm or linux-drop-caches")
-    if args.verification_mode == "metadata-size" and not args.streaming_verification:
-        parser.error("--verification-mode metadata-size requires --streaming-verification")
     if args.check_capacity and not args.streaming_verification:
         parser.error("--check-capacity requires --streaming-verification")
     if args.command_clocks and args.mode != "local":
@@ -638,6 +671,14 @@ def _default_bin_dir():
     return target_root / target / "release"
 
 
+def _fixture_policy(all_directory_files=False, metadata_only=False):
+    layout = ("--leaf-files for files_per_leaf; files_per_directory includes fixture root and intermediate directories"
+              if all_directory_files else "--leaf-files")
+    proof = ("verified counts and structure fingerprint; payload contents are not checked"
+             if metadata_only else "verified counts and digest")
+    return f"filegen {layout}; --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; {proof}"
+
+
 def main(argv=None):
     args = _arguments(argv)
     run_started = time.monotonic()
@@ -645,7 +686,7 @@ def main(argv=None):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
-    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": "filegen --leaf-files --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest", "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": _fixture_policy(metadata_only=args.verification_mode == "metadata-size"), "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
     if args.command_clocks:
         record["context"]["command_clocks"] = clocks.POLICY
         record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
@@ -684,7 +725,7 @@ def main(argv=None):
         if all_directory_files:
             if any(variant["processes"] > 1 for variant in variants):
                 raise ValueError("partitioned variants cannot copy files_per_directory cases with root files")
-            record["context"]["fixture_policy"] = "filegen --leaf-files for files_per_leaf; files_per_directory includes fixture root and intermediate directories; --bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; verified counts and digest"
+            record["context"]["fixture_policy"] = _fixture_policy(True, args.verification_mode == "metadata-size")
         if args.files_in_flight is not None:
             if not any(variant["tool"] == "rcp" for variant in variants):
                 raise ValueError("files-in-flight requires a selected rcp variant")
@@ -714,17 +755,17 @@ def main(argv=None):
             if any(case.get("mode", "fresh") != "fresh" for case in cases):
                 raise ValueError("streaming verification supports fresh fixtures only")
             verification_policy = streaming.METADATA_POLICY if args.verification_mode == "metadata-size" else streaming.POLICY
-            record["context"]["verification"] = dict(policy=verification_policy, workers=args.verification_workers)
+            record["context"]["verification"] = dict(policy=verification_policy, workers=args.verification_workers, inline_bytes=args.verification_inline_bytes)
             if args.verification_mode == "metadata-size":
                 record["context"]["verification_policy"] = ("performance-only: exact paths, types, counts, sizes and modes; "
-                    "source mode/uid/gid/mtime_ns unchanged; no payload reads; same-size content corruption is not detected; "
+                    "source mode/uid/gid/mtime_ns/ctime_ns/device/inode unchanged; no payload reads; same-size content corruption is not detected; "
                     + verification_policy)
-                record["context"]["fixture_policy"] = record["context"]["fixture_policy"].replace(
-                    "verified counts and digest", "verified counts and structure fingerprint; payload contents are not checked")
             else:
                 record["context"]["verification_policy"] = VERIFICATION_POLICY + "; " + verification_policy
             for case in cases:
-                capacity.requirements(case, 4096)
+                capacity.validate_contract(case)
+        if args.check_capacity:
+            record["context"]["capacity_policy"] = args.capacity_policy
         record["cases"] = cases
         record["variants"] = variants
         _persist(output, record)
@@ -784,7 +825,7 @@ def main(argv=None):
         for case in cases:
             if args.check_capacity:
                 record["context"].setdefault("capacity_admission", {})[case["id"]] = capacity.check_pair(
-                    args.source_root, args.destination_root, case)
+                    args.source_root, args.destination_root, case, **args.capacity_policy)
             fixture_root = source_scratch / case["id"]
             fixture_root.mkdir()
             leaf_files = "files_per_leaf" in case
@@ -803,7 +844,7 @@ def main(argv=None):
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
             initial_started = time.monotonic()
-            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy)
+            source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy, inline_bytes=args.verification_inline_bytes)
                            if args.streaming_verification else scan_tree(source))
             if source_scan["counts"] != expected_counts(case):
                 raise ValueError(f"filegen count mismatch for {case['id']}: {source_scan['counts']} != {expected_counts(case)}")
@@ -842,7 +883,7 @@ def main(argv=None):
                     _persist(output, record)
                     preparation_started = time.monotonic()
                     if args.check_capacity:
-                        capacity.check(args.destination_root, case)
+                        capacity.check(args.destination_root, case, **args.capacity_policy)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if operation != "fresh":
                         stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
@@ -867,6 +908,8 @@ def main(argv=None):
                         if args.cache == "source-verified":
                             trial["cache_validation"] = proof
                     except Exception as exc:
+                        if isinstance(exc, operations.VerificationError):
+                            trial["cache_validation"] = exc.proof
                         trial["status"] = "failed"
                         trial["validation"] = {"ok": False, "error": f"cache preparation failed: {exc}"}
                         _persist(output, record)
@@ -899,9 +942,11 @@ def main(argv=None):
                         except timings.CollectionError as error:
                             trial["timings"]["reports"] = error.reports
                             timing_error = str(error)
-                    trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers)
+                    trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers, inline_bytes=args.verification_inline_bytes)
                         if args.streaming_verification else validate_tree(source, destination, source_scan))
                         if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"})
+                    if outcome["ok"] and not trial["validation"]["ok"]:
+                        trial["error"] = operations.verification_failure(trial["validation"], "destination")
                     if outcome["ok"] and trial["validation"]["ok"]:
                         try:
                             if operations.summary_supported(variant):
@@ -909,31 +954,33 @@ def main(argv=None):
                                 trial["copy_summary"] = operations.validate_summary(variant, text, expected_transfer)
                                 trial["metadata_validation"] = (trial["validation"]["metadata"] if args.streaming_verification
                                     else operations.validate_metadata(destination, source_metadata))
-                            if source_metadata is not None:
-                                trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True)
-                                    if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
-                                if not trial["source_validation"]["ok"]:
-                                    reason = "interrupted" if trial["source_validation"].get("interrupted") is True else "failed"
-                                    raise ValueError("source verification " + reason + ": " + trial["source_validation"]["error"])
                         except (OSError, ValueError) as error:
                             trial["validation"].update(ok=False, error=str(error))
+                            if isinstance(error, InterruptedError):
+                                trial["validation"]["interrupted"] = True
+                                trial["error"] = operations.verification_failure(trial["validation"], "destination")
+                        if trial["validation"]["ok"] and source_metadata is not None:
+                            trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True, inline_bytes=args.verification_inline_bytes)
+                                if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
+                            if not trial["source_validation"]["ok"]:
+                                trial["error"] = operations.verification_failure(trial["source_validation"], "source")
                     if timing_error:
                         trial["validation"]["timing_error"] = timing_error
                         if trial["validation"]["ok"]:
                             trial["validation"].update(ok=False, error=f"timing collection failed: {timing_error}")
                     if collect_costs:
                         measurements.add_cost(trial, "verification", verification_started)
-                    trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] else "failed"
+                    trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] and trial.get("source_validation", {}).get("ok", True) else "failed"
                     _persist(output, record)
                     if trial["status"] != "ok":
-                        raise RuntimeError(f"trial {trial_path} failed: {trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
+                        raise RuntimeError(f"trial {trial_path} failed: {trial.get('error') or trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                     cleanup_started = time.monotonic()
                     shutil.rmtree(destination)
                     if collect_costs:
                         measurements.add_cost(trial, "cleanup", cleanup_started)
             source_validation = record["trials"][-1]["source_validation"] if source_metadata is not None else validate_tree(source, source, source_scan)
             if not source_validation["ok"]:
-                raise RuntimeError(f"source changed during case {case['id']}: {source_validation['error']}")
+                raise RuntimeError(f"case {case['id']}: {operations.verification_failure(source_validation, 'source')}")
             case_summaries = []
             for variant in variants:
                 samples = [trial["elapsed_seconds"] for trial in record["trials"] if trial["case_id"] == case["id"] and trial["variant_id"] == variant["id"] and trial["status"] == "ok"]

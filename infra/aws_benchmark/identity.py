@@ -5,7 +5,7 @@ import re
 
 from benchmarks.strict_json import parse_json
 
-from .common import require, validate_identity
+from .common import require, validate_admission, validate_identity
 
 
 REPOSITORY = "wykurz/rcp"
@@ -36,12 +36,14 @@ def validate(value):
 def environment(env=None):
     env = os.environ if env is None else env
     run_id, attempt = env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"]
-    return validate(dict(run=run_id + "-" + attempt, baseline=env["BASELINE"],
+    value = validate(dict(run=run_id + "-" + attempt, baseline=env["BASELINE"],
         candidate=env["CANDIDATE"], suite=env["SUITE"], controller=env["GITHUB_SHA"],
         ref=env["GITHUB_REF"], repository=env["GITHUB_REPOSITORY"],
         workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha=env["GITHUB_WORKFLOW_SHA"],
         event=env["GITHUB_EVENT_NAME"],
         run_url=f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}"))
+    validate_admission(value)
+    return value
 
 
 def load(path):

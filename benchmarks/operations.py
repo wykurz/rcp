@@ -107,14 +107,18 @@ def metadata_tree(path):
     return result
 
 
+class _MetadataMismatch(ValueError):
+    pass
+
+
 def validate_metadata(path, expected, timestamps=False):
     actual = metadata_tree(path)
     fields = ("mode", "uid", "gid", "mtime_ns") if timestamps else ("mode",)
     if set(actual) != set(expected):
-        raise ValueError("metadata paths differ")
+        raise _MetadataMismatch("metadata paths differ")
     changed = [name for name in actual if any(actual[name][key] != expected[name][key] for key in fields)]
     if changed:
-        raise ValueError(f"metadata differs: {changed[:5]}")
+        raise _MetadataMismatch(f"metadata differs: {changed[:5]}")
     return dict(ok=True, entries=len(actual), checked_fields=list(fields))
 
 
@@ -182,15 +186,30 @@ def validate_seed(source, destination, expected, metadata, stale):
                 stale_files=len(stale), independent_files=True, exact_seed_mtimes=True)
 
 
+class VerificationError(ValueError):
+    def __init__(self, proof, side):
+        super().__init__(verification_failure(proof, side))
+        self.proof = proof
+
+
+def verification_failure(proof, side):
+    reason = "interrupted" if proof.get("interrupted") is True else "failed"
+    return f"{side} verification {reason}: {proof.get('error', 'incomplete proof')}"
+
+
 def validate_source(source, expected, metadata):
     from benchmarks.run import validate_tree
     proof = validate_tree(source, source, expected)
     if not proof["ok"]:
-        raise ValueError(f"source changed: {proof.get('error')}")
+        return proof
     try:
         proof["metadata"] = validate_metadata(source, metadata, timestamps=True)
-    except ValueError as error:
-        raise ValueError(f"source changed: {error}") from error
+    except _MetadataMismatch as error:
+        proof.update(ok=False, error=str(error))
+    except InterruptedError as error:
+        proof.update(ok=False, error=str(error), interrupted=True)
+    except (OSError, ValueError) as error:
+        proof.update(ok=False, error=str(error), verification_error=True)
     return proof
 
 

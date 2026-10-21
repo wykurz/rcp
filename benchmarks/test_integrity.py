@@ -40,10 +40,12 @@ class IntegrityTests(unittest.TestCase):
                 manifest = root / "manifest.json"
                 manifest.write_text(json.dumps({"schema_version": 1, "cases": [{"id": case, "directory_widths": [1], "files_per_leaf": 1, "file_size_bytes": 1} for case in ("first", "later")], "variants": [{"id": "copy", "tool": "rsync", "args": ["-a"], "processes": 1}]}))
                 output = root / "out"
-                with mock.patch.object(run.shutil, "which", return_value=str(copier)), self.assertRaisesRegex(RuntimeError, "source.*changed.*later"):
+                with mock.patch.object(run.shutil, "which", return_value=str(copier)), self.assertRaisesRegex(RuntimeError, "case later: source verification failed:"):
                     run.main(["--manifest", str(manifest), "--case", "first", "--case", "later", "--variant", "copy", "--bin-dir", str(binary), "--cache", "uncontrolled", "--repetitions", "2", "--source-root", str(root), "--destination-root", str(root), "--output", str(output)])
                 result = report.parse_result((output / "results.json").read_text())
                 self.assertEqual(result["status"], "failed")
+                self.assertIn("changed=['dir/file']" if damage == "change" else "missing regular directory", result["error"])
+                self.assertNotIn("source changed", result["error"])
                 self.assertEqual([summary["case_id"] for summary in result["summaries"]], ["first"])
                 self.assertEqual([trial["validation"]["ok"] for trial in result["trials"]], [True] * 4)
                 scratch = Path(result["context"]["failure_artifacts"]["source_scratch"])

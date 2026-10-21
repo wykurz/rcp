@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 
-from benchmarks import measurements, pairs, clocks, streaming
+from benchmarks import measurements, pairs, clocks, verification
 
 EXPORT_SCHEMA_VERSION = 1
 TOOLS = ('rcp', 'rcpd', 'rsync', 'cp', 'filegen', 'ssh', 'rcp-baseline', 'rcpd-baseline')
@@ -66,20 +66,29 @@ def version(value):
 def proof(value, admitted):
     value = value if isinstance(value,dict) else {}
     ok = boolean(value.get('ok'))
-    qualification = 'unknown' if ok is None else 'failed' if not ok else 'passed' if admitted else 'recorded-unqualified'
+    if value.get('interrupted') is True:
+        qualification = 'interrupted'
+    elif value.get('verification_error') is True:
+        qualification = 'verification-error'
+    else:
+        qualification = 'unknown' if ok is None else 'failed' if not ok else 'passed' if admitted else 'recorded-unqualified'
     result = dict(qualification=qualification, recorded_ok=ok, counts=counts(value.get('counts')), digest=fingerprint(value.get('digest')))
-    if value.get('policy') == streaming.METADATA_POLICY:
-        result.update(policy=streaming.METADATA_POLICY,
+    for key in ('interrupted','verification_error','complete','digest_match','modes_match','source_metadata_match'):
+        if key in value:result[key]=boolean(value[key])
+    for key in ('modes_digest','metadata_digest'):
+        if key in value:result[key]=fingerprint(value[key])
+    if value.get('policy') == verification.METADATA_POLICY:
+        result.update(policy=verification.METADATA_POLICY,
                       digest_qualification='path/type/size metadata fingerprint; file content integrity not checked')
     for key in ('entries','stale_files'):
         if key in value:result[key]=number(value[key],integer=True)
     fields=value.get('checked_fields')
-    result['checked_fields']=[enum(field,{'mode','uid','gid','mtime_ns'}) for field in fields] if isinstance(fields,list) else None
+    result['checked_fields']=[enum(field,verification.SOURCE_METADATA_FIELDS) for field in fields] if isinstance(fields,list) else None
     for nested in ('metadata','modes'):
         raw=value.get(nested)
         if isinstance(raw,dict):
             result[nested]=dict(recorded_ok=boolean(raw.get('ok')),entries=number(raw.get('entries'),integer=True),
-                               checked_fields=[enum(field,{'mode','uid','gid','mtime_ns'}) for field in raw.get('checked_fields',[])] if isinstance(raw.get('checked_fields'),list) else None)
+                               checked_fields=[enum(field,verification.SOURCE_METADATA_FIELDS) for field in raw.get('checked_fields',[])] if isinstance(raw.get('checked_fields'),list) else None)
     for key in ('independent_files','exact_seed_mtimes'):
         if key in value:result[key]=boolean(value[key])
     return result
@@ -98,12 +107,13 @@ def conditions(context):
                 child_summary_locale=enum(context.get('summary_locale'),{'C'}),
                 measurement='command-completion; durability not measured',
                 shared_host=True if context.get('topology') in ('local','loopback') else None,filesystem={})
-    verification=context.get('verification')
-    if isinstance(verification,dict):
-        from benchmarks.report import verification_label
-        result['verification']=dict(policy=enum(verification.get('policy'),{streaming.POLICY,streaming.METADATA_POLICY}),
-                                    workers=number(verification.get('workers'),integer=True),
-                                    label=verification_label(context))
+    contract=context.get('verification')
+    if isinstance(contract,dict):
+        result['verification']=dict(policy=enum(contract.get('policy'),{verification.FULL_CONTENT_POLICY,verification.METADATA_POLICY}),
+                                    workers=number(contract.get('workers'),integer=True),
+                                    label=verification.verification_label(context))
+        if 'inline_bytes' in contract:
+            result['verification']['inline_bytes']=number(contract['inline_bytes'],integer=True)
     for key in ('effective_parallelism','fd_limit'):
         result[key]=number(environment.get(key),integer=True)
     baseline=context.get('baseline_commit')
@@ -289,7 +299,7 @@ def project_run(run, source_results):
     from benchmarks import report
     report.validate_result(run)
     from benchmarks import operations
-    metadata_only=(run['context'].get('verification') or {}).get('policy')==streaming.METADATA_POLICY
+    metadata_only=(run['context'].get('verification') or {}).get('policy')==verification.METADATA_POLICY
     selected_cases={case['id']:case for case in run['cases']}
     selected_variants={variant['id']:variant for variant in run['variants']}
     case_aliases={case['id']:f'case-{index+1}' for index,case in enumerate(run['cases'])}
@@ -324,7 +334,7 @@ def project_run(run, source_results):
         operation=selected_cases[trial['case_id']].get('mode','fresh')
         exact_summary=operations.summary_supported(selected_variants[trial['variant_id']]) if admitted else False
         source_verified=run['context'].get('cache_policy')=='source-verified'
-        checked=dict(content=admitted and not metadata_only,seed=admitted and operation!='fresh',cache=admitted and source_verified,
+        checked=dict(content=admitted,seed=admitted and operation!='fresh',cache=admitted and source_verified,
                      metadata=admitted and exact_summary,source=admitted and (operation!='fresh' or exact_summary or source_verified or run['context'].get('verification') is not None))
         row=dict(ordinal=index,case=case_aliases[trial['case_id']],variant=variant_aliases[trial['variant_id']],iteration=trial['iteration'],
                  status=trial['status'],elapsed_seconds=trial.get('elapsed_seconds'),exit_codes=[number(code,integer=True,minimum=-255) for code in (trial['exit_codes'] if isinstance(trial['exit_codes'],list) else trial['exit_codes'].values())],

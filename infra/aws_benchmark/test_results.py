@@ -40,7 +40,8 @@ def measurement(expected):
         summary_locale="C", pairing=pairs.configuration(args.paired_seed, args.repetitions))
     if args.streaming_verification:
         run["context"]["verification"] = dict(policy=("metadata-size-tree-v1"
-            if args.verification_mode == "metadata-size" else "sha256-tree-stream-v1"), workers=args.verification_workers)
+            if args.verification_mode == "metadata-size" else "sha256-tree-stream-v1"),
+            workers=args.verification_workers, inline_bytes=args.verification_inline_bytes)
     run["tools"] = {key: dict(sha256="d" * 64) for key in ("rcp", "rcpd", "filegen", "rcp-baseline", "rcpd-baseline")}
     for variant in run["variants"]:
         variant["args"] = ["--summary"]
@@ -56,7 +57,7 @@ def measurement(expected):
         if args.streaming_verification and args.verification_mode == "metadata-size":
             proof["policy"] = "metadata-size-tree-v1"
         metadata = dict(ok=True, entries=counts["directories"] + counts["files"] + 1)
-        if args.streaming_verification and args.verification_mode == "metadata-size":
+        if args.streaming_verification:
             proof["metadata"] = dict(metadata, checked_fields=["mode"])
         trial.update(resource_record(status="ok")["trials"][0])
         trial.update(variant_id=role, pairing=pairing, elapsed_seconds=1.0 if role == pairs.CANDIDATE else 2.0,
@@ -128,6 +129,63 @@ class ResultTests(unittest.TestCase):
         self.assertEqual(provenance["supervisor_harness_revision"], "f" * 40)
         self.assertNotIn("<script>untrusted()", (self.output / "index.html").read_text())
         self.assertTrue((self.output / "dashboard/index.html").exists())
+
+    def test_disabled_suites_keep_archived_identity_and_full_content_results(self):
+        for suite in common.SUITES.keys() - common.ACTIVE_SUITES.keys():
+            with self.subTest(suite=suite):
+                expected = binding(suite)
+                self.assertEqual(identity.validate(expected), expected)
+                source, output = self.root / (suite + "-raw"), self.root / (suite + "-report")
+                bundle(source, expected)
+                evidence = results.ingest(source, output, expected, "success")
+                self.assertEqual(evidence["errors"], [])
+                self.assertFalse(evidence["history_eligible"])
+                raw = report.parse_result((output / "derived.json").read_text())
+                self.assertEqual(raw["context"]["verification"], common.verification_contract(suite))
+                self.assertIn("Full-content SHA-256", (output / "summary.md").read_text())
+                self.assertEqual((output / "raw/results.zip").read_bytes(), (source / "results.zip").read_bytes())
+
+    def test_historical_streaming_policy_without_inline_threshold_is_readable(self):
+        for suite in common.LARGE_SUITES:
+            with self.subTest(suite=suite):
+                expected = binding(suite)
+                raw = measurement(expected)
+                raw["context"]["verification"].pop("inline_bytes")
+                source, output = self.root / (suite + "-old-raw"), self.root / (suite + "-old-report")
+                _, policy = bundle(source, expected, raw)
+                evidence = results.ingest(source, output, expected, "success", policy)
+                self.assertFalse(any("verification contract" in error for error in evidence["errors"]))
+                derived = report.parse_result((output / "derived.json").read_text())
+                self.assertNotIn("inline_bytes", derived["context"]["verification"])
+                self.assertEqual(evidence["history_eligible"], suite in common.METADATA_SUITES)
+
+    def test_comparison_labels_require_source_and_binary_equality(self):
+        expected = binding("bulk-1g-metadata")
+        request = dict(sha256=dict.fromkeys(common.BINARIES, "d" * 64))
+        receipt = dict(request=request)
+        self.assertEqual(results.comparison_label(expected, receipt), "A/B (different source revisions)")
+        expected["candidate"] = expected["baseline"]
+        self.assertEqual(results.comparison_label(expected, receipt),
+                         "A/A (identical source revision and binary digests)")
+        request["sha256"]["candidate/rcp"] = "e" * 64
+        self.assertEqual(results.comparison_label(expected, receipt),
+                         "Same source revision; different binary digests (not A/A)")
+        for invalid in ({}, dict(request="invalid"), dict(request={"sha256": "invalid"}),
+                        dict(request={"sha256": []}), dict(request={"sha256": {"candidate/rcp": 1}})):
+            self.assertEqual(results.comparison_label(expected, invalid),
+                             "Same source revision; binary identity unavailable")
+
+    def test_historical_same_source_requests_with_different_binaries_remain_readable(self):
+        expected = binding("bulk-1g-metadata")
+        expected["candidate"] = expected["baseline"]
+        bundle(self.source, expected)
+        receipt = json.loads((self.source / "controller.json").read_text())
+        receipt["request"]["sha256"]["candidate/rcp"] = "e" * 64
+        window, request = results.historical_inputs(receipt, expected)
+        self.assertEqual(request, receipt["request"])
+        with self.assertRaisesRegex(ValueError, "A/A binary digests differ"):
+            common.validate_request(request, window)
+        self.assertIn("not A/A", results.comparison_label(expected, receipt))
 
     def test_failed_and_cancelled_runs_keep_diagnostics_without_history(self):
         for conclusion in ("failure", "cancelled", "skipped"):

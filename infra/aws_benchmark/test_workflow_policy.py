@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import yaml
 
-from infra.aws_benchmark import identity
+from infra.aws_benchmark import common, identity
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -93,6 +93,24 @@ class WorkflowPolicyTests(unittest.TestCase):
                     suite="aa-smoke", controller="c" * 40, ref=ref, repository="wykurz/rcp",
                     workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha="c" * 40, event="workflow_dispatch",
                     run_url="https://github.com/wykurz/rcp/actions/runs/123/attempts/1"))
+
+    def test_dispatch_choices_and_real_validation_exclude_disabled_suites(self):
+        choices = self.workflow["on"]["workflow_dispatch"]["inputs"]["suite"]["options"]
+        self.assertEqual(set(choices), set(common.ACTIVE_SUITES))
+        script = next(step["run"] for step in self.workflow["jobs"]["validate"]["steps"]
+                      if step.get("id") == "protocol").splitlines()
+        program = compile("\n".join(script[1:-1]), "actual workflow validation", "exec")
+        for suite in common.SUITES.keys() - common.ACTIVE_SUITES.keys():
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                env = dict(GITHUB_REF=identity.REF, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                    GITHUB_SHA="c" * 40, GITHUB_REPOSITORY=identity.REPOSITORY,
+                    GITHUB_WORKFLOW_REF=identity.WORKFLOW, GITHUB_WORKFLOW_SHA="c" * 40,
+                    BASELINE="a" * 40, CANDIDATE="a" * 40, SUITE=suite,
+                    GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_OUTPUT=str(output))
+                with patch.dict(os.environ, env), self.assertRaisesRegex(ValueError, "disabled for new AWS runs"):
+                    exec(program, {})
+                self.assertFalse(output.exists())
 
     def test_manual_trigger_and_single_mailbox_gate_every_privileged_run(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})

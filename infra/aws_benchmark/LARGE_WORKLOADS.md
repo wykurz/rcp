@@ -1,16 +1,23 @@
 # Large workload qualification
 
-These manually selected AWS suites reuse the directory shapes from the
+These large-workload profiles reuse the directory shapes from the
 [historical performance report](../../docs/reports/performance.md). Sizes are **decimal bytes**.
 They live in `benchmarks/large-cases.json`; the original manifest, default selections and Depot
 workflows are unchanged.
 
-| Dispatch suite | Case ID            | Directory widths | Files per leaf | Bytes per file |      Files |     Logical bytes |
-| -------------- | ------------------ | ---------------- | -------------: | -------------: | ---------: | ----------------: |
-| `bulk-1g`      | `bulk-1g-1tb`      | `[10]`           |            100 |  1,000,000,000 |      1,000 | 1,000,000,000,000 |
-| `bulk-100m`    | `bulk-100m-1024gb` | `[10]`           |          1,024 |    100,000,000 |     10,240 | 1,024,000,000,000 |
-| `bulk-1m`      | `bulk-1m-1024gb`   | `[10,10,10]`     |          1,024 |      1,000,000 |  1,024,000 | 1,024,000,000,000 |
-| `tiny-1k`      | `tiny-1k-10240k`   | `[10,10,10,10]`  |          1,024 |          1,000 | 10,240,000 |    10,240,000,000 |
+| Historical full-content suite | Case ID            | Directory widths | Files per leaf | Bytes per file |      Files |     Logical bytes |
+| ----------------------------- | ------------------ | ---------------- | -------------: | -------------: | ---------: | ----------------: |
+| `bulk-1g`                     | `bulk-1g-1tb`      | `[10]`           |            100 |  1,000,000,000 |      1,000 | 1,000,000,000,000 |
+| `bulk-100m`                   | `bulk-100m-1024gb` | `[10]`           |          1,024 |    100,000,000 |     10,240 | 1,024,000,000,000 |
+| `bulk-1m`                     | `bulk-1m-1024gb`   | `[10,10,10]`     |          1,024 |      1,000,000 |  1,024,000 | 1,024,000,000,000 |
+| `tiny-1k`                     | `tiny-1k-10240k`   | `[10,10,10,10]`  |          1,024 |          1,000 | 10,240,000 |    10,240,000,000 |
+
+These four full-content suites are retained for local correctness diagnostics and reading historical
+results. They are **not admitted for new AWS dispatches or operator windows**: the measured 1 TB
+hashing cost did not fit the 60-minute lease, and million-file/tiny-file full scans have no
+demonstrated bounded runtime. Workflow, controller, operator and worker admission reject them before
+launch or execution. Re-enabling a profile needs a separately reviewed workload and runtime
+qualification; the deadline must not be extended to accommodate it.
 
 All four use fresh local copies, existing random-byte `filegen`, baseline/candidate binary pins, two
 balanced adjacent pairs (seed 0), disabled coarse timings, full verification and GNU time resources.
@@ -24,10 +31,11 @@ filesystems. Do not compare their absolute times as an XFS reproduction.
 
 ## Storage admission
 
-These four suites and `bulk-1g-metadata` create two disjoint RAID0 arrays on the four expected
-approximately 900 GB instance-store NVMe disks. Each array has two members, a 512 KiB chunk and
-metadata version 1.2; source and destination each have roughly 1.8 TB raw capacity. RAID0 has no
-redundancy. Either member failing invalidates that disposable filesystem and the measurement.
+The active `bulk-1g-metadata` suite uses the storage contract retained for the four historical
+full-content profiles: two disjoint RAID0 arrays on the four expected approximately 900 GB
+instance-store NVMe disks. Each array has two members, a 512 KiB chunk and metadata version 1.2;
+source and destination each have roughly 1.8 TB raw capacity. RAID0 has no redundancy. Either member
+failing invalidates that disposable filesystem and the measurement.
 
 Before creating either array, the trusted supervisor rejects unexpected NVMe models, anything other
 than exactly four instance-store whole disks, duplicate paths/device numbers/serials, partitions,
@@ -39,9 +47,12 @@ force-format, array repair or alternate disk fallback is performed.
 Both newly created arrays must have the expected level, member identities, chunk, metadata, capacity
 and distinct device numbers before the first format. Tools receive inherited held `/proc/self/fd`
 paths; ext4 mounting disables pathname canonicalization and external helpers. The mounted filesystem
-must report the held array's device number. This operates before candidate execution, on a
-disposable guest where no other privileged actor may rearrange storage. It is not protection from a
-concurrent root administrator or kernel compromise.
+must report the held array's device number. Storage evidence retains array roles, held device
+numbers and membership; harness environment evidence records mountinfo major/minor device numbers
+and the kernel's device name. A raw mount source such as `/proc/self/fd/5` is an informational
+descriptor alias, not a reusable device path. Actions remain bound to held descriptors. This
+operates before candidate execution, on a disposable guest where no other privileged actor may
+rearrange storage. It is not protection from a concurrent root administrator or kernel compromise.
 
 Each ext4 filesystem requests 4 KiB blocks and 16,000,000 inodes, with lazy inode-table and journal
 initialization disabled. Formatting and all metadata initialization consume the existing lease.
@@ -57,27 +68,36 @@ Same-filesystem source/destination admission fails.
 | `tiny-1k-10240k`   |                         10,251,111 |                41,943,040,000 |
 
 Admission adds two blocks per directory, 20% byte headroom and 1 GiB; inode admission adds 20% and
-1,024. These are conservative estimates, not a guarantee against ENOSPC. Filesystem overhead and
-concurrent candidate writes can still exhaust storage; failure must end within the lease. The
-per-file process limit is 1 GiB only for these suites, sufficient for a decimal 1 GB file. Legacy
-suites retain their 512 MiB limit. Output remains a 128 MiB tmpfs with a 64 MiB archive cap and the
-existing bounded collector, object keys and retention.
+1,024. The local harness exposes independent byte/inode percentage and absolute-reserve overrides
+documented in
+[benchmarking.md](../../docs/benchmarking.md#bounded-verification-for-large-local-fixtures); the
+cloud worker pins the default policy. These are conservative estimates, not a guarantee against
+ENOSPC. Filesystem overhead and concurrent candidate writes can still exhaust storage; failure must
+end within the lease. The per-file process limit is 1 GiB only for these suites, sufficient for a
+decimal 1 GB file. Legacy suites retain their 512 MiB limit. Output remains a 128 MiB tmpfs with a
+64 MiB archive cap and the existing bounded collector, object keys and retention.
 
 ## Verification and timing
 
 `--streaming-verification` replaces the legacy per-file dictionaries with versioned compact SHA-256
 tree, mode and source-metadata digests. The fresh-only walker opens directories and files without
-following final-component symlinks, reads every file byte, rejects links/special files, ACLs and
-foreign ownership, and checks held-file stability during reads. Source content, paths, modes, owners
-and modification times are checked after every successful copy; destination modes are checked
-without imposing extra timestamp-preservation semantics.
+following final-component symlinks. Full-content mode reads every file byte; metadata mode does not.
+Both reject links/special files, ACLs and foreign ownership and check held-file stability. Source
+content (full-content mode), paths, modes, owners, modification/change times and device/inode
+identity are checked after every successful copy; destination modes are checked without imposing
+extra timestamp-preservation semantics.
 
 Memory scales with a bounded directory/depth and worker batch, not total file count. Traversal
 allows at most 4,096 entries per directory and depth 128. It uses eight hashing workers by default
-(`--verification-workers`, range 1–32), at most twice that many pending file tasks, and 1 MiB read
-buffers. Manifest counts and the 1,000,000,000-byte per-file ceiling bound accepted content. The
-digest order is deterministic across worker counts. The verifier version and worker count are
-included in series identity; old result schemas and old identities remain readable and unchanged.
+(`--verification-workers`, range 1–32), at most twice that many pending large-file tasks, and 1 MiB
+read buffers. Full-content files up to 1 MiB run inline by default; `--verification-inline-bytes`
+independently tunes that threshold from 0 through 1,000,000,000 bytes. One-worker full-content and
+all metadata walks run inline, avoiding per-file future scheduling. Cancellation records a pending
+signal, cancels queued work and stops active reads cooperatively, draining them before closing
+descriptors. Manifest counts and the 1,000,000,000-byte per-file ceiling bound accepted content. The
+digest order is deterministic across worker counts and inline thresholds. The verifier policy,
+worker count and effective inline threshold are included in new series identity; old result schemas
+and old identities remain readable and unchanged.
 
 The memory bound applies to the verifier only. The unchanged `filegen` can queue per-file tasks, and
 copy tools retain their own resource behavior; whole-workload memory use still needs qualification.
@@ -96,23 +116,26 @@ The separate allowlisted suite **`bulk-1g-metadata`** uses the same `bulk-1g-1tb
 fixture, two balanced adjacent pairs (four copies), cold-cache policy, per-command timeout, storage
 layout and absolute lease. Its purpose is `performance`, with runner
 `aws-c5d24-ext4-raid0-metadata-v1` and verification identity `metadata-size-tree-v1` (eight
-workers). It passes `--streaming-verification --verification-mode metadata-size`; the four original
-suites retain their full-content verification and smoke purpose.
+configured hashing workers and a 1 MiB inline threshold; metadata walks themselves run inline). It
+passes `--streaming-verification --verification-mode metadata-size`; the four original suites retain
+full-content verification and smoke purpose for historical/local use only.
 
 Only this performance mode omits **both the initial and per-trial full-content scans**. The trusted
 baked Python verifier checks expected relative paths, counts, entry types and file sizes; it rejects
 missing, extra, truncated, linked or special files. Destination modes and source modes, owners and
-modification times must still match. Copy exit status, timeouts, reported transfer counts and local
-resource collection remain required. The verifier does not use candidate-produced `rcmp` or other
-tools to certify output. A digest fingerprints structure and metadata, **not file contents**;
-same-size content corruption can go undetected. Reports explicitly disclose that file content
-integrity was not checked. Use the retained full-content mode for separate correctness checks.
+modification/change times and device/inode identity must still match. These source checks detect
+more mutations but do not prove content integrity. Copy exit status, timeouts, reported transfer
+counts and local resource collection remain required. The verifier does not use candidate-produced
+`rcmp` or other tools to certify output. A digest fingerprints structure and metadata, **not file
+contents**; same-size content corruption can go undetected. Reports explicitly disclose that file
+content integrity was not checked. Use the retained full-content mode for separate correctness
+checks.
 
 Validation stays outside timed copy intervals, and no validation runs between cache drop and copy.
 Source reuse and cache semantics are unchanged. The new policy and runner identity prevent pooling
 with historical full-content measurements. AWS inspection and approval require the exact suite's
-verification policy and worker count. Performance purpose alone does not publish history: the
-existing independent per-attempt approval remains mandatory.
+verification policy, worker count and inline threshold. Performance purpose alone does not publish
+history: the existing independent per-attempt approval remains mandatory.
 
 Existing measured generation/copy costs model approximately **56.4 minutes before metadata
 verification overhead** for the complete attempt, including the reserved reporting time. This is an
@@ -140,10 +163,15 @@ After separate authorization:
    usual exact-main admission, no active prior instance, suspended replacement paths and cutoff
    behavior. Do not run the old draft debug workflow.
 3. For performance qualification, select one **60-minute `bulk-1g-metadata` A/A** window with the
-   same reviewed binary SHA in both roles. This exercises beyond-RAM data with only 1,000 files.
-   Build before opening the host. Qualify actual mdadm/mkfs/mount behavior and free capacity;
-   offline tests cannot establish those properties on EC2. The earlier four-copy full-content
-   attempt did not finish within 60 minutes; repeating it unchanged is not the next experiment.
+   same reviewed source SHA in both roles. Across every active suite, equal source SHAs cause the
+   controller to read each baseline binary once and upload those identical bytes to both roles;
+   request admission verifies matching binary digests. Both workflow builds still complete and
+   retain provenance, but the candidate build is unused in this A/A case. Different source SHAs
+   remain a valid A/B performance comparison, not an A/A qualification. This exercises beyond-RAM
+   data with only 1,000 files. Build before opening the host. Qualify actual mdadm/mkfs/mount
+   behavior and free capacity; offline tests cannot establish those properties on EC2. The earlier
+   four-copy full-content attempt did not finish within 60 minutes; repeating it unchanged is not
+   the next experiment.
 4. Preserve partial output if any phase times out. The per-generation/per-copy timeout is 1,200
    seconds; the unchanged absolute lease and three-minute reporting reserve still dominate.
    Generation, formatting, validation, deletion and upload count. Do not extend or automatically
@@ -151,8 +179,9 @@ After separate authorization:
    unproven. Any new attempt needs fresh admission and budget accounting.
 5. Verify physical termination and all ASG capacities zero before considering another case. Review
    phase costs, capacity proof, the recorded validation mode, isolation, resources and A/A balance.
-   Propose `bulk-100m`, then `bulk-1m`, then `tiny-1k` separately only when evidence supports their
-   bounded runs. Do not dispatch all four as a batch.
+   Future smaller-file profiles need their own reviewed runtime and correctness contract before
+   enabling cloud dispatch. Neither the three disabled bulk full-content profiles nor `tiny-1k`
+   should be retried unchanged or dispatched as a batch.
 
 For the current us-east-1 planning example, an AWS price readback on 2026-10-20 showed Linux
 On-Demand `c5d.24xlarge` at **$4.608/hour**: one nominal 60-minute worker window is $4.608 compute,
