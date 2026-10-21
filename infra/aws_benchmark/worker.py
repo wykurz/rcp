@@ -1,6 +1,7 @@
 """Root-owned one-shot supervisor, baked into the AMI; never execute mailbox scripts."""
 
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import errno
 import io
@@ -10,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import pwd
-import re
 import signal
 import socket
 import stat
@@ -19,9 +19,13 @@ import subprocess
 import threading
 import zipfile
 
+from benchmarks.run import load_manifest
+from benchmarks.verification import METADATA_POLICY
+
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, WORKER_START_RESERVE, Budget, clients,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
-                     measurement_contract, verification_contract, put_json, require, retry_io, timestamp, validate_request, validate_window,
+                     measurement_contract, verification_contract, put_json, require, retry_io, timestamp,
+                     validate_admission, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
@@ -39,37 +43,27 @@ def execute(argv, budget, **kwargs):
     return subprocess.run(argv, check=True, timeout=min(60, budget.left(RESERVE)), **kwargs)
 
 
-def choose_disks(tree):
-    selected = []
-    for disk in tree["blockdevices"]:
-        if (disk.get("model") or "").strip() != "Amazon EC2 NVMe Instance Storage":
-            continue
-        require(disk["type"] == "disk" and re.fullmatch(r"/dev/nvme[0-9]+n1", disk["path"]), "unexpected NVMe path")
-        require(not disk.get("children") and not any(disk.get("mountpoints") or [])
-                and not disk.get("fstype") and not disk.get("ro"), "instance disk is already in use")
-        require(850_000_000_000 <= disk["size"] <= 950_000_000_000, "unexpected instance disk size")
-        selected.append(disk["path"])
-    require(len(selected) == 4, "expected all four unused c5d.24xlarge instance-store disks")
-    return sorted(selected)[:2]
-
-
 def prepare_storage(budget, uid, gid):
-    tree = json.loads(execute(["lsblk", "--json", "--bytes", "--paths", "--output",
-        "PATH,TYPE,SIZE,MODEL,MOUNTPOINTS,FSTYPE,RO"], budget, capture_output=True, text=True).stdout)
-    disks = choose_disks(tree)
-    # no untrusted process exists yet; candidate services get PrivateDevices and no
-    # mount capability. Refuse filesystems/partitions/mounts rather than wiping them.
-    for side, disk in zip(("source", "destination"), disks):
-        mount = DATA / side
-        mount.mkdir(parents=True, exist_ok=False)
-        execute(["mkfs.ext4", "-q", "-E", "lazy_itable_init=0,lazy_journal_init=0", disk], budget)
-        execute(["mount", "-o", "nodev,nosuid", disk, str(mount)], budget)
-        os.chown(mount, uid, gid)
-    output = DATA / "output"
-    output.mkdir()
-    execute(["mount", "-t", "tmpfs", "-o", "size=128m,nosuid,nodev,noexec", "tmpfs", str(output)], budget)
-    os.chown(output, uid, gid)
-    return disks
+    large_storage.unused_targets(DATA)
+    with ExitStack() as stack:
+        disks, held = large_storage.open_disks(execute, budget, stack)
+        selected = sorted(zip(disks, held), key=lambda value: value[0]["path"])[:2]
+        # all four disks pass admission before any format; actions use the held devices
+        for side, (_, (fd, number)) in zip(large_storage.SIDES, selected):
+            mount = DATA / side
+            mount.mkdir(parents=True, exist_ok=False)
+            execute(["mkfs.ext4", "-q", "-E", "lazy_itable_init=0,lazy_journal_init=0",
+                     f"/proc/self/fd/{fd}"], budget, pass_fds=(fd,))
+            execute(["mount", "--no-canonicalize", "--internal-only", "-t", "ext4",
+                     "-o", "nodev,nosuid", f"/proc/self/fd/{fd}", str(mount)], budget, pass_fds=(fd,))
+            require(mount.stat().st_dev == os.makedev(*map(int, number.split(":"))),
+                    "mounted filesystem differs from held disk")
+            os.chown(mount, uid, gid)
+        output = DATA / "output"
+        output.mkdir()
+        execute(["mount", "-t", "tmpfs", "-o", "size=128m,nosuid,nodev,noexec", "tmpfs", str(output)], budget)
+        os.chown(output, uid, gid)
+        return [disk["path"] for disk, _ in selected]
 
 
 def handle_cache(connection, budget, uid):
@@ -112,6 +106,11 @@ def cache_server(budget, uid):
 def command(window, seconds):
     contract = measurement_contract(window["suite"])
     large = window["suite"] in LARGE_SUITES
+    file_limit, timeout = "536870912", "600"
+    source_storage, destination_storage = "c5d-local-ext4-source", "c5d-local-ext4-destination"
+    if large:
+        file_limit, timeout = "1073741824", "1200"
+        source_storage, destination_storage = "c5d-raid0-ext4-source-v1", "c5d-raid0-ext4-destination-v1"
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -121,7 +120,7 @@ def command(window, seconds):
         "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "RestrictSUIDSGID": "yes",
         "RestrictNamespaces": "yes", "LockPersonality": "yes", "RestrictAddressFamilies": "AF_UNIX",
         "MemoryMax": "180G", "TasksMax": "8192", "LimitNOFILE": "1048576",
-        "LimitCORE": "0", "LimitFSIZE": "1073741824" if large else "536870912", "UMask": "0077",
+        "LimitCORE": "0", "LimitFSIZE": file_limit, "UMask": "0077",
         "TemporaryFileSystem": "/tmp:size=64m,mode=1777 /var/tmp:size=64m,mode=1777",
         "ReadWritePaths": str(DATA), "InaccessiblePaths": "/root /home /var/lib/cloud",
         "WorkingDirectory": str(ROOT), "StandardOutput": "null", "StandardError": "null",
@@ -137,16 +136,17 @@ def command(window, seconds):
              "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
              "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
-             "--timeout", "1200" if large else "600", "--runner-label", contract["runner_label"],
+             "--timeout", timeout, "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
-             "--source-storage-id", "c5d-raid0-ext4-source-v1" if large else "c5d-local-ext4-source",
-             "--destination-storage-id", "c5d-raid0-ext4-destination-v1" if large else "c5d-local-ext4-destination",
+             "--source-storage-id", source_storage,
+             "--destination-storage-id", destination_storage,
              "--output", str(DATA / "output" / "results")]
     if large:
         verification = verification_contract(window["suite"])
         argv += ["--manifest", str(ROOT / "benchmarks/large-cases.json"),
-                 "--streaming-verification", "--verification-workers", str(verification["workers"]), "--check-capacity"]
-        if verification["policy"] == "metadata-size-tree-v1":
+                 "--streaming-verification", "--verification-workers", str(verification["workers"]),
+                 "--verification-inline-bytes", str(verification["inline_bytes"]), "--check-capacity"]
+        if verification["policy"] == METADATA_POLICY:
             argv += ["--verification-mode", "metadata-size"]
     for case in SUITES[window["suite"]]:
         argv += ["--case", case]
@@ -333,6 +333,7 @@ def run(s3, bucket):
     try:
         request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
         validate_request(request, window)
+        validate_admission(window)
         metadata["request"] = request
         remaining = budget.left()
         metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
@@ -355,8 +356,11 @@ def run(s3, bucket):
             path.write_bytes(data)
             path.chmod(0o555)
         if window["suite"] in LARGE_SUITES:
-            manifest = json.loads((ROOT / "benchmarks/large-cases.json").read_text())
-            case = next(case for case in manifest["cases"] if case["id"] == SUITES[window["suite"]][0])
+            manifest = load_manifest(ROOT / "benchmarks/large-cases.json")
+            cases = {case["id"]: case for case in manifest["cases"]}
+            case_id, = SUITES[window["suite"]]
+            require(case_id in cases, "suite case is missing from the large manifest")
+            case = cases[case_id]
             metadata["storage"] = large_storage.prepare(DATA, case, budget, account.pw_uid, account.pw_gid, execute)
         else:
             metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)

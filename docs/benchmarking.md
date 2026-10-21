@@ -311,8 +311,9 @@ The default loopback comparison includes rcp with `--summary`, rsync with `-a`, 
 rsync processes on disjoint top-level directories. Local mode adds GNU `cp -a`. The optional
 `rcp-preserve` variant adds `--preserve-settings=all`. These preservation policies are deliberately
 named: default rcp does less metadata preservation than the archive variants; rcp's `all` also
-preserves access times. They are not claimed to have identical metadata semantics. Universal
-validation checks tree structure, regular file paths, sizes and contents. It does not certify
+preserves access times. They are not claimed to have identical metadata semantics. Default
+validation checks tree structure, regular file paths, sizes and contents; explicit `metadata-size`
+mode omits payload checks and does not prove file content integrity. Neither mode certifies
 metadata-policy equivalence.
 
 Select a variant with repeatable `--variant` arguments. Adding another regular-file workload or flag
@@ -489,9 +490,11 @@ release version alone does not start a new performance series.
 
 Every trial prepares an independent destination for its operation and its cache state, then measures
 from launching the first process until the last process exits. All child exit codes are checked.
-Full content and directory verification follows timing. Before recording a completed case, the
-harness verifies that the source tree still matches its original snapshot. Variant order rotates
-between repetitions. Logs retain rcp's own summary alongside the external wall time.
+Full content and directory verification follows timing by default. The explicitly selected
+metadata/size performance mode below omits payload hashing and does not prove content integrity.
+Before recording a completed case, the harness verifies the source against the initial snapshot
+under the selected validation policy. Variant order rotates between repetitions. Logs retain rcp's
+own summary alongside the external wall time.
 
 Full positional balance requires a repetition count divisible by the number of selected variants
 after adding baseline or concurrency variants. Fewer repetitions are allowed for exploratory runs,
@@ -526,6 +529,43 @@ Timeouts terminate owned local process groups, preserve diagnostics, and abort t
 timed-out remote operation is not followed by another measurement that might overlap surviving work.
 Profiling with strace or tracing belongs in a separate diagnostic run, because it changes the
 measured workload.
+
+### Bounded verification for large local fixtures
+
+`--streaming-verification` uses a bounded descriptor-based tree walk instead of retaining a record
+for every file. It accepts fresh local copies with `source-warm` or `linux-drop-caches`. Directory
+entries, depth, file count and file size are bounded; symlinks, hard links, special files, ACLs and
+foreign ownership are rejected. Verification remains outside copy timing. No verification runs
+between cache preparation and the timed copy.
+
+- `--verification-mode full-content` is the default. It reads every file byte for the initial
+  snapshot and checks destination content and source stability after each successful copy.
+- `--verification-mode metadata-size` performs no initial or per-trial payload hashing. It checks
+  relative paths, entry types, counts, sizes and ordinary modes. Source checks also compare owner,
+  modification/change times, device and inode identity against the snapshot. **Performance-only
+  validation does not prove file content integrity: same-size corruption can pass.** Source identity
+  checks improve mutation detection without being a cryptographic content proof. Tool exit status
+  and timeout gates remain mandatory. Raw summaries, reports and sanitized exports disclose this
+  weaker validation policy.
+- `--verification-workers` sets 1–32 hashing workers (default 8). Metadata mode runs inline, with no
+  per-file futures. Full-content mode runs inline with one worker, and otherwise runs files up to
+  `--verification-inline-bytes` inline (default 1,048,576 bytes; 0 disables small-file inline
+  scheduling with multiple workers). Larger files use bounded queued tasks and 1 MiB reads. The
+  inline threshold accepts 0 through 1,000,000,000 bytes. These settings are explicit in new
+  result/series identity; historical records without the threshold remain readable.
+- `--check-capacity` checks available blocks and inodes on distinct source/destination filesystems
+  before generation and on the destination before each copy. Defaults add 20% plus 1 GiB byte
+  headroom and 20% plus 1,024 inode headroom. Local tuning uses `--capacity-byte-percent`,
+  `--capacity-inode-percent`, `--capacity-byte-reserve` (bytes) and `--capacity-inode-reserve`; each
+  accepts a nonnegative integer below 2^63 and requires `--check-capacity`. These estimates cannot
+  guarantee fit. They never relax fixture, topology or device-safety bounds. The AWS worker keeps
+  the default margins.
+
+Explicit verification controls require `--streaming-verification`; capacity checking also requires
+it. Cancellation stops queued verification and requests active reads to finish at the next read
+boundary, then drains workers before closing held descriptors. Interrupted verification and other
+verification errors remain failed qualification, distinct from a proven mismatch. An unresponsive
+kernel I/O operation can still require the outer process/cgroup timeout.
 
 ## Results and history
 

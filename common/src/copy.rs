@@ -8175,6 +8175,60 @@ mod copy_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn admitted_regular_source_replaced_by_symlink_fails_before_copy() -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        let sentinel = root.join("sentinel");
+        tokio::fs::write(&src, "REAL_CONTENT").await?;
+        tokio::fs::write(&sentinel, "SENTINEL_SECRET_CONTENT").await?;
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let dst_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await?
+                .into_tree(),
+        );
+        let entry = crate::walk::classify_admitted_entry(
+            &src_parent,
+            std::ffi::OsStr::new("source"),
+            crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await,
+        )
+        .await?;
+        // force the classification/open race rather than relying on swapper scheduling
+        tokio::fs::remove_file(&src).await?;
+        tokio::fs::symlink(&sentinel, &src).await?;
+        let result = copy_child(
+            &PROGRESS,
+            &src_parent,
+            Some(&dst_parent),
+            std::ffi::OsStr::new("source"),
+            &src,
+            &dst,
+            std::path::Path::new(""),
+            &toctou_settings(),
+            &NO_PRESERVE_SETTINGS,
+            false,
+            DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+            entry,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the admitted regular-file open must reject a symlink"
+        );
+        assert!(!dst.exists(), "no destination payload may be created");
+        assert_eq!(
+            tokio::fs::read_to_string(&sentinel).await?,
+            "SENTINEL_SECRET_CONTENT"
+        );
+        Ok(())
+    }
+
     // Task 1.5 helper: repeatedly swap `path` between a real regular file (content `REAL_CONTENT`)
     // and a symlink pointing at `sentinel`, using rename so each individual state is atomic. Two
     // staging names (a prepared symlink and the real file) live alongside `path` and are renamed
@@ -8223,14 +8277,23 @@ mod copy_tests {
         tokio::fs::write(sub.join("entry"), "REAL_CONTENT").await?;
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let swapper =
-            spawn_file_symlink_swapper(sub.clone(), "entry", sentinel.clone(), stop.clone());
+        let mut swapper = None;
 
         let settings = toctou_settings();
         let mut caught_swaps = 0usize;
         let mut copied_real = 0usize;
         let mut copied_symlinks = 0usize;
         for i in 0..200 {
+            // establish a real-file control before the 199 concurrent swap attempts
+            // the deterministic admitted-source test exercises the exact unsafe boundary
+            if i == 1 {
+                swapper = Some(spawn_file_symlink_swapper(
+                    sub.clone(),
+                    "entry",
+                    sentinel.clone(),
+                    stop.clone(),
+                ));
+            }
             let dst = test_path.join(format!("dst_{i}"));
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -8277,16 +8340,16 @@ mod copy_tests {
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.join().expect("swapper thread panicked");
-        // sanity: require a caught swap, verified real file, or verified literal symlink target.
-        // the per-iteration content assertions above remain independent of which outcome occurs.
+        swapper.unwrap().join().expect("swapper thread panicked");
+        // literal symlink copies cannot satisfy the regular-file path's non-vacuity check
+        // the initial control guarantees coverage without a probabilistic scheduler assumption
         tracing::info!(
             "file/symlink swap: caught_swaps={caught_swaps}, copied_real={copied_real}, \
              copied_symlinks={copied_symlinks}"
         );
         assert!(
-            caught_swaps + copied_real + copied_symlinks > 0,
-            "expected at least one observable outcome across 200 iterations"
+            caught_swaps + copied_real > 0,
+            "expected the guarded regular-file path to be exercised"
         );
         Ok(())
     }

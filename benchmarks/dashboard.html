@@ -46,6 +46,7 @@
     .pill.complete { background: var(--success-background); color: var(--success-text); }
     .pill.failed { background: var(--error-background); color: var(--error-text); }
     .pill.running { background: var(--warning-background); color: var(--warning-text); }
+    .result-note { margin: .35rem 0 0; }
     .short-warning { color: var(--warning-text); font-size: .75rem; font-weight: 600; }
     code { font-size: .78rem; overflow-wrap: anywhere; }
     details { max-width: 70rem; }
@@ -136,8 +137,8 @@
       const item = run.variants.find(item => item.id === id);
       return item?.description ? `${id} · ${item.description}` : id;
     };
-    // check the explicit policy as well as the producer's series ID on imported history.
-    const seriesKey = point => JSON.stringify([point.summary.series_id, point.run.context.verification?.policy ?? null, point.run.context.verification?.workers ?? null]);
+    // check the explicit policy as well as the producer's series ID on imported history
+    const seriesKey = point => JSON.stringify([point.summary.series_id, point.run.context.verification?.policy ?? null, point.run.context.verification?.workers ?? null, point.run.context.verification?.inline_bytes ?? null]);
     const seriesLabel = point => `${caseName(point.run,point.summary.case_id)} / ${variantName(point.run,point.summary.variant_id)} · ${point.summary.series_id.slice(0, 10)} · ${group(point.run)} · ${verification(point.run)}`;
     const sameRcpSettings = (candidate, baseline) => candidate?.tool === "rcp" && baseline?.tool === "rcp" &&
       Array.isArray(candidate.args) && Array.isArray(baseline.args) &&
@@ -226,8 +227,8 @@
         const row = node("tr"), timestamp = node("td", date(run.timestamp));
         row.id = `run-${run.run_id}`;
         const result = node("td"), badge = node("span", run.status, `pill ${run.status}`); result.append(badge, node("span", ` · ${purpose(run)}`));
-        result.append(node("p", verification(run)));
-        if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("span", " · Short sample: repeat under 10 s", "short-warning"));
+        result.append(node("p", verification(run), "result-note"));
+        if (run.summaries.some(item => hasShortSample(run,item))) result.append(node("p", "Short sample: repeat under 10 s", "result-note short-warning"));
         const rev = node("td"), hash = run.revision.commit || "unknown";
         if (run.revision.role === "approved candidate") rev.append(node("span", "Candidate "));
         const repository = run.context.repository || run.revision.repository || run.repository;

@@ -1,6 +1,6 @@
 """Controller receipts cannot infer an image, hide cleanup failure, or change evidence."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from infra.aws_benchmark import common, controller, results
+from infra.aws_benchmark import common, controller, operator, results
 from infra.aws_benchmark.test_controller import controller_cloud
 from infra.aws_benchmark.test_results import binding
+from infra.aws_benchmark.test_safety import FakeCloud, NOW, window
 
 
 class ReceiptTests(unittest.TestCase):
@@ -49,6 +50,72 @@ class ReceiptTests(unittest.TestCase):
                 controller.run(cloud.api, "group", "bucket", expected, root, root / "output")
             cleanup.assert_called_once_with(cloud.api, "group")
         return json.loads((root / "output/controller.json").read_text()), archive
+
+    def test_disabled_suites_reject_operator_and_controller_before_any_cloud_operation(self):
+        for suite in common.SUITES.keys() - common.ACTIVE_SUITES.keys():
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                cloud = FakeCloud()
+                lease = dict(window(), suite=suite)
+                with self.assertRaisesRegex(ValueError, "disabled for new AWS runs"):
+                    operator.arm(cloud.api, "group", "bucket", lease, now=lambda: NOW)
+                expected = binding(suite)
+                root = Path(directory)
+                with self.assertRaisesRegex(ValueError, "disabled for new AWS runs"):
+                    controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
+                self.assertTrue(all(not client.mock_calls for client in cloud.api.values()))
+                receipt = json.loads((root / "out/controller.json").read_text())
+                self.assertEqual(receipt["identity"], expected)
+                self.assertEqual((receipt["outcome"], receipt["cleanup"]), ("failure", "not-requested"))
+
+    def binary_run(self, root, suite, same_source):
+        lease = dict(window(datetime.now(timezone.utc) - timedelta(minutes=4)), suite=suite)
+        if not same_source:
+            lease["candidate"] = "b" * 40
+        cloud, selected = controller_cloud(lease)
+        expected = dict(binding(suite), **selected)
+        reads = []
+        def read_binary(path):
+            reads.append(path.relative_to(root).as_posix())
+            return ("nondeterministic-build-" + str(len(reads))).encode()
+        def launch(**kwargs):
+            request = json.loads(cloud.objects[common.REQUEST_KEY])
+            self.assertEqual(common.validate_request(request, lease), request)
+            cloud.objects[common.STATUS_KEY] = json.dumps(common.completed_status(selected["run"], True)).encode()
+        cloud.api["autoscaling"].set_desired_capacity.side_effect = launch
+        with patch.object(controller, "read_binary", side_effect=read_binary), patch.object(controller, "cleanup"):
+            controller.run(cloud.api, "group", "bucket", expected, root, root / "out")
+        receipt = json.loads((root / "out/controller.json").read_text())
+        self.assertEqual(receipt["identity"], expected)
+        for name in common.BINARY_NAMES:
+            baseline, candidate = (cloud.objects["input/" + role + "/" + name] for role in ("baseline", "candidate"))
+            self.assertEqual(baseline == candidate, same_source)
+            for role in ("baseline", "candidate"):
+                key = role + "/" + name
+                self.assertEqual(receipt["request"]["sha256"][key], common.digest(cloud.objects["input/" + key]))
+        return reads
+
+    def test_same_source_reuses_one_baseline_read_for_every_tool_in_every_active_suite(self):
+        for suite in common.ACTIVE_SUITES:
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                reads = self.binary_run(Path(directory), suite, same_source=True)
+                self.assertEqual(reads, ["baseline/" + name for name in common.BINARY_NAMES])
+
+    def test_different_source_metadata_run_uses_each_producer_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reads = self.binary_run(Path(directory), "bulk-1g-metadata", same_source=False)
+            self.assertEqual(set(reads), set(common.BINARIES))
+            self.assertEqual(len(reads), len(common.BINARIES))
+
+    def test_same_source_request_rejects_different_digests_for_every_suite(self):
+        for suite in common.SUITES:
+            lease = dict(window(), suite=suite)
+            request = {key: lease[key] for key in ("run", "baseline", "candidate", "suite", "deadline")}
+            request["sha256"] = dict.fromkeys(common.BINARIES, "d" * 64)
+            for name in common.BINARY_NAMES:
+                with self.subTest(suite=suite, name=name):
+                    changed = dict(request, sha256=dict(request["sha256"], **{"candidate/" + name: "e" * 64}))
+                    with self.assertRaisesRegex(ValueError, "A/A binary digests differ"):
+                        common.validate_request(changed, lease)
 
     def test_success_receipt_separates_observed_image_and_bound_workflow_identity(self):
         with tempfile.TemporaryDirectory() as directory:

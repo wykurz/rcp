@@ -7,6 +7,8 @@ import re
 import time
 from urllib.error import HTTPError, URLError
 
+from benchmarks.verification import DEFAULT_INLINE_BYTES, DEFAULT_WORKERS, FULL_CONTENT_POLICY, METADATA_POLICY
+
 RESERVE = 180
 WORKER_START_RESERVE = RESERVE + 300
 LAUNCH_RESERVE = WORKER_START_RESERVE + 120
@@ -23,43 +25,46 @@ RESULTS_KEY = "output/results.zip"
 STATUS_KEY = "output/status.json"
 PENDING = "pending"
 COMPLETED = "completed"
-BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
-                 for name in ("rcp", "rcpd", "filegen"))
+BINARY_NAMES = ("rcp", "rcpd", "filegen")
+BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
-SUITES = {"aa-smoke": ("tiny-10k",), "tiny": ("tiny-1m",),
-          "medium": ("medium-128k",), "large": ("large-120",), "deep": ("deep-20x80",)}
 
-LARGE_SUITES = {"bulk-1g": ("bulk-1g-1tb",), "bulk-100m": ("bulk-100m-1024gb",),
-                "bulk-1m": ("bulk-1m-1024gb",), "tiny-1k": ("tiny-1k-10240k",)}
-METADATA_SUITES = {"bulk-1g-metadata": ("bulk-1g-1tb",)}
-LARGE_SUITES.update(METADATA_SUITES)
-SUITES.update(LARGE_SUITES)
-
-
-# the baked worker and offline approval must describe the same measurement
+# historical contracts remain readable independently of current cloud admission
 PERFORMANCE_CONTRACT = dict(paired_seed=0, repetitions=4, purpose="performance",
     cache_policy="linux-drop-caches", runner_label="aws-c5d24-ext4-isolated-v1")
+_STREAM_PROFILE = dict(repetitions=2, purpose="smoke", runner_label="aws-c5d24-ext4-raid0-stream-v1",
+                       policy=FULL_CONTENT_POLICY, active=False)
+SUITE_PROFILES = {
+    "aa-smoke": dict(cases=("tiny-10k",), repetitions=2, purpose="smoke", cache_policy="source-warm"),
+    "tiny": dict(cases=("tiny-1m",)),
+    "medium": dict(cases=("medium-128k",)),
+    "large": dict(cases=("large-120",)),
+    "deep": dict(cases=("deep-20x80",)),
+    "bulk-1g": dict(_STREAM_PROFILE, cases=("bulk-1g-1tb",)),
+    "bulk-100m": dict(_STREAM_PROFILE, cases=("bulk-100m-1024gb",)),
+    "bulk-1m": dict(_STREAM_PROFILE, cases=("bulk-1m-1024gb",)),
+    "tiny-1k": dict(_STREAM_PROFILE, cases=("tiny-1k-10240k",)),
+    "bulk-1g-metadata": dict(cases=("bulk-1g-1tb",), repetitions=2,
+        runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY),
+}
+SUITES = {name: profile["cases"] for name, profile in SUITE_PROFILES.items()}
+ACTIVE_SUITES = {name: cases for name, cases in SUITES.items() if SUITE_PROFILES[name].get("active", True)}
+LARGE_SUITES = {name: cases for name, cases in SUITES.items() if "policy" in SUITE_PROFILES[name]}
+METADATA_SUITES = {name: cases for name, cases in SUITES.items()
+                   if SUITE_PROFILES[name].get("policy") == METADATA_POLICY}
 
 
 def measurement_contract(suite):
     require(suite in SUITES, "suite is not allowlisted")
-    contract = PERFORMANCE_CONTRACT.copy()
-    if suite == "aa-smoke":
-        contract.update(repetitions=2, purpose="smoke", cache_policy="source-warm")
-    if suite in LARGE_SUITES:
-        contract.update(repetitions=2, purpose="smoke", runner_label="aws-c5d24-ext4-raid0-stream-v1")
-    if suite in METADATA_SUITES:
-        contract.update(purpose="performance", runner_label="aws-c5d24-ext4-raid0-metadata-v1")
-    return contract
+    profile = SUITE_PROFILES[suite]
+    return {key: profile.get(key, value) for key, value in PERFORMANCE_CONTRACT.items()}
 
 
 def verification_contract(suite):
     """Expected recorded proof identity, shared by the baked worker and offline ingestion."""
     require(suite in SUITES, "suite is not allowlisted")
-    if suite in LARGE_SUITES:
-        policy = "metadata-size-tree-v1" if suite in METADATA_SUITES else "sha256-tree-stream-v1"
-        return dict(policy=policy, workers=8)
-    return None  # legacy full-content proof schema has no explicit verification context
+    policy = SUITE_PROFILES[suite].get("policy")
+    return dict(policy=policy, workers=DEFAULT_WORKERS, inline_bytes=DEFAULT_INLINE_BYTES) if policy else None
 
 
 class ValidationError(ValueError):
@@ -103,6 +108,13 @@ def validate_identity(value):
         require(value["baseline"] == value["candidate"], "A/A pilot requires identical revisions")
 
 
+def validate_admission(value):
+    """Apply current cloud policy without changing historical identity validation."""
+    validate_identity(value)
+    require(value["suite"] in ACTIVE_SUITES,
+            "suite is disabled for new AWS runs until full-content verification fits the bounded window")
+
+
 def validate_window(value, now=None, minimum=RESERVE):
     require(isinstance(value, dict) and set(value) ==
             {"run", "baseline", "candidate", "suite", "opens", "deadline"}, "unexpected window fields")
@@ -125,6 +137,9 @@ def validate_request(value, window):
     require(isinstance(hashes, dict) and set(hashes) == set(BINARIES), "unexpected binary list")
     require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                 for value in hashes.values()), "binary digests must be lowercase SHA-256")
+    if value["baseline"] == value["candidate"]:
+        require(all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in BINARY_NAMES),
+                "A/A binary digests differ")
     return value
 
 

@@ -326,19 +326,6 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "still contains"):
                 worker.stop_unit()
 
-    def test_only_unused_instance_store_disks_are_selected(self):
-        disks = [dict(path=f"/dev/nvme{i}n1", type="disk", size=900_000_000_000,
-                      model="Amazon EC2 NVMe Instance Storage", mountpoints=[None], fstype=None, ro=False)
-                 for i in range(1, 5)]
-        root = dict(path="/dev/nvme0n1", model="Amazon Elastic Block Store", children=[{"mountpoints": ["/"]}])
-        self.assertEqual(worker.choose_disks({"blockdevices": [root, *disks]}), ["/dev/nvme1n1", "/dev/nvme2n1"])
-        for changes in ({"mountpoints": ["/"]}, {"children": [{}]}, {"fstype": "ext4"},
-                        {"path": "/dev/sda"}, {"size": 1}, {"ro": True}):
-            broken = copy.deepcopy(disks)
-            broken[0].update(changes)
-            with self.assertRaises(ValueError):
-                worker.choose_disks({"blockdevices": broken})
-
     def test_result_collector_omits_links_and_fifos_with_manifest(self):
         for kind in ("symlink", "hardlink", "fifo"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:

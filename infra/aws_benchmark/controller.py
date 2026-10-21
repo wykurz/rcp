@@ -11,10 +11,10 @@ import urllib.request
 
 from . import identity as workflow_identity
 
-from .common import (BINARIES, COMPLETED, LAUNCH_RESERVE, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
+from .common import (BINARY_NAMES, COMPLETED, LAUNCH_RESERVE, MAX_BINARY, MAX_RESULT, PENDING, REQUEST_KEY, RESULTS_KEY,
                      STATUS_KEY, WINDOW_KEY, Budget, checked_clients, digest, get_bytes, get_json,
                      group, live_instances, pending_status, put_json, require, retry_io, scheduled, utc,
-                     validate_identity, validate_window, verify_close, verify_group)
+                     validate_admission, validate_request, validate_window, verify_close, verify_group)
 
 
 def oidc_clients(region, role):
@@ -107,7 +107,7 @@ def run(api, name, bucket, provenance, binary_root, output):
 
 
 def _run(api, name, bucket, identity, binary_root, output, receipt):
-    validate_identity(identity)
+    validate_admission(identity)
     bootstrap = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     window = retry_io(lambda: get_json(api["s3"], bucket, WINDOW_KEY), bootstrap, reserve=5)
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
@@ -131,16 +131,17 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
             break
         time.sleep(10)
     request = {**identity, "deadline": window["deadline"], "sha256": {}}
-    for key in BINARIES:
-        budget.left(LAUNCH_RESERVE)
-        source = "baseline/" + key.split("/")[1] if identity["suite"] == "aa-smoke" else key
-        data = read_binary(binary_root / source)
-        request["sha256"][key] = digest(data)
-        retry_io(lambda: api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data),
-                 budget, LAUNCH_RESERVE)
-    if identity["suite"] == "aa-smoke":
-        require(all(request["sha256"]["baseline/" + name] == request["sha256"]["candidate/" + name]
-                    for name in ("rcp", "rcpd", "filegen")), "A/A binary digests differ")
+    same_source = identity["baseline"] == identity["candidate"]
+    for binary_name in BINARY_NAMES:
+        for role in ("baseline", "candidate"):
+            budget.left(LAUNCH_RESERVE)
+            key = role + "/" + binary_name
+            if role == "baseline" or not same_source:
+                data = read_binary(binary_root / key)
+            request["sha256"][key] = digest(data)
+            retry_io(lambda: api["s3"].put_object(Bucket=bucket, Key="input/" + key, Body=data),
+                     budget, LAUNCH_RESERVE)
+    validate_request(request, window)
     retry_io(lambda: put_json(api["s3"], bucket, REQUEST_KEY, request), budget, LAUNCH_RESERVE)
     budget.left(LAUNCH_RESERVE)
     verify_close(read(lambda: scheduled(api["autoscaling"], name)), window)

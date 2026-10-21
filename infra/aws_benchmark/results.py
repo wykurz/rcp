@@ -15,8 +15,9 @@ import zipfile
 
 from benchmarks import changes, operations, pairs, report
 from benchmarks.strict_json import parse_json
+from benchmarks.verification import verification_label
 from . import identity
-from .common import (MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
+from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
                      digest, measurement_contract, verification_contract, require, utc)
 
 
@@ -186,6 +187,13 @@ def historical_inputs(receipt, expected):
     return window, request
 
 
+def validate_recorded_verification(context, suite):
+    recorded, expected = context.get("verification"), verification_contract(suite)
+    if isinstance(recorded, dict) and "inline_bytes" not in recorded and expected is not None:
+        expected.pop("inline_bytes")
+    require(recorded == expected, "unexpected suite verification contract")
+
+
 def inspect(source, expected, conclusion):
     evidence = {"schema_version": 1, "identity": expected, "producer_conclusion": conclusion,
                 "history_eligible": False, "files": {}, "members": {}, "errors": [],
@@ -251,8 +259,7 @@ def inspect(source, expected, conclusion):
                     for key, limit in (("cases", 16), ("variants", 16), ("trials", 512), ("summaries", 256))),
                     "measurement collection exceeds reporting limit")
             result = report.validate_result(value)
-            require(result["context"].get("verification") == verification_contract(expected["suite"]),
-                    "unexpected suite verification contract")
+            validate_recorded_verification(result["context"], expected["suite"])
             evidence["raw_revision"] = copy.deepcopy(result["revision"])
         else:
             evidence["errors"].append("harness result unavailable")
@@ -285,8 +292,7 @@ def approve(evidence, result, policy):
             and worker.get("admission", {}).get("accepted") is True
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
     contract = measurement_contract(expected["suite"])
-    require(result["context"].get("verification") == verification_contract(expected["suite"]),
-            "unexpected suite verification contract")
+    validate_recorded_verification(result["context"], expected["suite"])
     require(result["status"] == "complete" and result["context"].get("purpose") == contract["purpose"]
             and result["context"].get("repository") == expected["repository"]
             and result["context"].get("baseline_commit") == expected["baseline"]
@@ -372,6 +378,22 @@ def table(headers, rows):
         "<tr>" + "".join("<td>" + literal(value) + "</td>" for value in row) + "</tr>" for row in rows) + "\n</tbody></table>"
 
 
+def comparison_label(expected, controller):
+    if expected["baseline"] != expected["candidate"]:
+        return "A/B (different source revisions)"
+    request = controller.get("request")
+    hashes = request.get("sha256") if isinstance(request, dict) else None
+    if not isinstance(hashes, dict):
+        hashes = {}
+    if not all(isinstance(hashes.get(role + "/" + name), str)
+               and re.fullmatch(r"[0-9a-f]{64}", hashes[role + "/" + name])
+               for role in ("baseline", "candidate") for name in BINARY_NAMES):
+        return "Same source revision; binary identity unavailable"
+    if all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in BINARY_NAMES):
+        return "A/A (identical source revision and binary digests)"
+    return "Same source revision; different binary digests (not A/A)"
+
+
 def summary(evidence, result):
     expected = evidence["identity"]
     worker, controller = evidence["worker"] or {}, evidence["controller"] or {}
@@ -380,15 +402,16 @@ def summary(evidence, result):
              '<p><a href="' + html.escape(expected['run_url'], quote=True) + '">Workflow attempt</a></p>',
              '<p>History: ' + ("approved for offline staging" if evidence["history_eligible"] else "diagnostic only; not published") + '</p>']
     fields = {"Run": expected["run"], "Producer conclusion": evidence["producer_conclusion"],
-        "Suite": expected["suite"], "Candidate": expected["candidate"], "Baseline": expected["baseline"],
+        "Suite": expected["suite"], "Comparison": comparison_label(expected, controller),
+        "Candidate": expected["candidate"], "Baseline": expected["baseline"],
         "Controller": expected["controller"], "Controller observed AMI": instance.get("image_id", "unknown"),
         "Supervisor reported baked source": worker.get("harness_revision", "unknown"),
         "Raw harness checkout": (evidence["raw_revision"] or {}).get("commit") or "unknown",
         "Controller cleanup": controller.get("cleanup", "unknown"),
         "Archive SHA256": evidence["files"].get("results.zip", "unavailable"),
-        "Requested file validation": report.verification_label(
+        "Requested file validation": verification_label(
             {"verification": verification_contract(expected["suite"])}),
-        "Observed file validation": report.verification_label(result["context"]) if result is not None else "unavailable"}
+        "Observed file validation": verification_label(result["context"]) if result is not None else "unavailable"}
     status = evidence.get("status") or {}
     if status:
         fields.update({"Worker state": status.get("state", "unknown"), "Worker success": status.get("success", "unknown")})
