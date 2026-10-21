@@ -120,7 +120,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                          {"group": "aws-benchmark-single-mailbox", "cancel-in-progress": "false"})
         for name in ("validate", "build", "report"):
             self.assertNotIn("concurrency", jobs[name])
-        self.assertEqual(set(jobs), {"validate", "build", "benchmark", "report"})
+        self.assertEqual(set(jobs), {"validate", "build", "benchmark", "report", "durable-submit"})
         self.assertEqual(jobs["build"]["needs"], "validate")
         self.assertEqual(jobs["benchmark"]["needs"], "build")
         self.assertEqual(jobs["benchmark"]["environment"], "aws-benchmark")

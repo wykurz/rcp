@@ -371,3 +371,11 @@ cancellation and an unavailable-capacity/failure window before trusting unattend
 - [EC2 compute instance specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/co.html)
 - [EBS encryption and Auto Scaling key access](https://docs.aws.amazon.com/autoscaling/ec2/userguide/key-policy-requirements-EBS-encryption.html)
 - [Default Host Management Configuration](https://docs.aws.amazon.com/systems-manager/latest/userguide/fleet-manager-default-host-management-configuration.html)
+
+## Optional durable capacity acquisition
+
+The disabled [durable protocol](DURABLE.md) uses direct EC2 capacity retries for up to 12 hours and
+an immutable 180-minute envelope from each launch attempt's start. An independent expiry guard is
+verified before allocation; GitHub uses short submission and collection jobs. This original ASG
+operator-window protocol remains available. Review the new coordinator launch permission and funding
+before deployment; no recurring benchmark schedule is created.
