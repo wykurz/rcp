@@ -1,0 +1,98 @@
+name: Collect direct AWS benchmark evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: Original producer run ID-attempt (for example 123-1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main' && vars.RCP_AWS_DURABLE_ROLE_ARN != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: aws-benchmark-durable
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      artifact-id: ${{ steps.raw.outputs.artifact-id }}
+    steps:
+      - name: Require literal trusted collector before checking out code
+        run: |
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$GITHUB_REPOSITORY" = 'wykurz/rcp'
+          test "$GITHUB_EVENT_NAME" = 'workflow_dispatch'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install SDK for bounded opaque collection
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aws-sdk"
+          "$RUNNER_TEMP/aws-sdk/bin/pip" install --require-hashes -r infra/aws_benchmark/requirements.txt
+      - name: Read exact request and evidence without parsing worker archives
+        env:
+          AWS_REGION: ${{ vars.RCP_AWS_REGION }}
+          BUCKET: ${{ vars.RCP_AWS_BUCKET }}
+          ROLE: ${{ vars.RCP_AWS_DURABLE_ROLE_ARN }}
+          STATE_MACHINE: ${{ vars.RCP_AWS_DURABLE_STATE_MACHINE_ARN }}
+          PRODUCER_RUN: ${{ inputs.run }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          "$RUNNER_TEMP/aws-sdk/bin/python" -m infra.aws_benchmark.durable_client collect \
+            --region "$AWS_REGION" --bucket "$BUCKET" --state-machine "$STATE_MACHINE" --role-arn "$ROLE" \
+            --run "$PRODUCER_RUN" --output "$RUNNER_TEMP/durable-raw"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: raw
+        if: always()
+        with:
+          name: aws-durable-raw-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/durable-raw/
+          retention-days: 90
+          if-no-files-found: warn
+
+  report:
+    needs: collect
+    if: always() && needs.collect.outputs.artifact-id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.collect.outputs.artifact-id }}
+          path: ${{ runner.temp }}/durable-raw
+      - name: Validate and render without cloud credentials
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from infra.aws_benchmark.durable_client import validate_offline
+          root = Path(os.environ['RUNNER_TEMP'])
+          source = root / 'durable-raw'
+          evidence, qualification = validate_offline(source, root / 'durable-report')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print((root / 'durable-report/summary.md').read_text(), file=summary)
+              print('\nHistory was not published. Metadata/size validation does not prove content integrity.', file=summary)
+          if evidence['errors'] or not qualification['accepted']:
+              raise SystemExit('Qualification has not passed; pending/failed evidence was retained.')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: aws-durable-report-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/durable-report/
+          retention-days: 90
+          if-no-files-found: warn

@@ -10,10 +10,17 @@ Parameters:
     Type: AWS::EC2::Image::Id
     AllowedPattern: 'ami-[0-9a-f]+'
     Description: Pinned x86_64 Ubuntu 24.04 image prepared with install-worker.sh.
+  WorkerProtocol:
+    Type: String
+    Default: operator-window
+    AllowedValues: [operator-window, durable, direct]
+    Description: Select durable or direct only with its reviewed control stack, immutable guards and matching AMI.
   GitHubOidcProviderArn:
     Type: String
     AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'
     Description: Existing provider in this account; this stack does not create it.
+Conditions:
+  DirectWorker: {Fn::Equals: [{Ref: WorkerProtocol}, direct]}
 Resources:
   Artifacts:
     Type: AWS::S3::Bucket
@@ -102,6 +109,7 @@ Resources:
       LaunchTemplateData:
         ImageId: {Ref: WorkerAmiId}
         InstanceType: c5d.24xlarge
+        InstanceInitiatedShutdownBehavior: {Fn::If: [DirectWorker, terminate, {Ref: 'AWS::NoValue'}]}
         IamInstanceProfile:
           Arn: {Fn::GetAtt: [WorkerProfile, Arn]}
         MetadataOptions:
@@ -128,7 +136,13 @@ Resources:
               #!/bin/bash
               set -euo pipefail
               # trusted, root-owned code is baked into the pinned AMI
-              systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
+              if [ '${WorkerProtocol}' = 'direct' ]; then
+                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=10800 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --direct --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
+              elif [ '${WorkerProtocol}' = 'durable' ]; then
+                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=10800 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --durable --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
+              else
+                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
+              fi
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:

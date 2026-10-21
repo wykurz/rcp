@@ -1,0 +1,518 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disabled direct EC2 benchmark coordination; independent expiry guard requires deployment review.
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: rcp-durable-benchmark
+    AllowedPattern: '[a-z][a-z0-9-]{2,39}'
+  RuntimeEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Enable only after reviewed deployment, funding, image and cutoff validation.
+  AdmissionEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Permit new submissions; disabling admission leaves an activated watchdog running.
+  WorkerSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  WorkerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  WorkerInstanceProfileArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+'
+  WorkerRoleArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+'
+    Description: Exact role inside the reviewed instance profile; PassRole never targets the profile ARN.
+  ArtifactBucket:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+    Description: Existing private bounded mailbox; this stack does not change its policy or lifecycle.
+  LaunchTemplateId:
+    Type: String
+    AllowedPattern: 'lt-[0-9a-f]{17}'
+  LaunchTemplateVersion:
+    Type: String
+    AllowedPattern: '[1-9][0-9]*'
+  WorkerAmiId:
+    Type: AWS::EC2::Image::Id
+    AllowedPattern: 'ami-[0-9a-f]{17}'
+  WorkerSourceRevision:
+    Type: String
+    AllowedPattern: '[0-9a-f]{40}'
+  CodeBucket:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+    Description: Existing versioned bucket containing the reviewed Lambda package.
+  CodeKey:
+    Type: String
+    MinLength: 1
+  CodeObjectVersion:
+    Type: String
+    MinLength: 1
+    AllowedPattern: '(?!null$).+'
+    Description: Exact immutable S3 version; unversioned code is rejected.
+  GitHubOidcProviderArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'
+Conditions:
+  Enabled: {Fn::Equals: [{Ref: RuntimeEnabled}, 'true']}
+  Admitting:
+    Fn::And:
+      - {Condition: Enabled}
+      - {Fn::Equals: [{Ref: AdmissionEnabled}, 'true']}
+Resources:
+  LeaseTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      # an expired TTL must never release ownership or delete cleanup evidence
+  RuntimeScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: {Fn::Sub: '${ResourcePrefix}-runtime'}
+  SchedulerTerminationRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: {Ref: AWS::AccountId}
+              ArnEquals:
+                aws:SourceArn:
+                  - {Fn::GetAtt: [RuntimeScheduleGroup, Arn]}
+      Policies:
+        - PolicyName: TerminateManagedWorkers
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
+                Condition:
+                  StringEquals: {ec2:ResourceTag/rcp:namespace: {Ref: ResourcePrefix}}
+  CoordinatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: {Fn::Sub: '/aws/lambda/${ResourcePrefix}-coordinator'}
+      RetentionInDays: 7
+  WatchdogLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: {Fn::Sub: '/aws/lambda/${ResourcePrefix}-watchdog'}
+      RetentionInDays: 7
+  CoordinatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CoordinateExactLease
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/${WorkerAmiId}'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplateId}'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${WorkerSubnetId}'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${WorkerSecurityGroupId}'}
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplateId}'}
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplateId}'}
+                    ec2:InstanceProfile: {Ref: WorkerInstanceProfileArn}
+                  StringEquals:
+                    ec2:InstanceType: c5d.24xlarge
+                    ec2:InstanceMarketType: on-demand
+                    ec2:Tenancy: default
+                    ec2:MetadataHttpTokens: required
+                    ec2:MetadataHttpEndpoint: enabled
+                    ec2:InstanceMetadataTags: disabled
+                    aws:RequestTag/rcp:namespace: {Ref: ResourcePrefix}
+                  NumericEquals: {ec2:MetadataHttpPutResponseHopLimit: 1}
+                  StringLike:
+                    aws:RequestTag/rcp:run: '?*'
+                    aws:RequestTag/rcp:attempt: '?*'
+                    aws:RequestTag/rcp:deadline: '?*'
+                    aws:RequestTag/rcp:created-at: '?*'
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at']
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'}
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplateId}'}
+                    ec2:Subnet: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${WorkerSubnetId}'}
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'}
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplateId}'}
+                  StringEquals:
+                    ec2:VolumeType: gp3
+                    aws:RequestTag/rcp:namespace: {Ref: ResourcePrefix}
+                  NumericEquals: {ec2:VolumeSize: 16}
+                  Bool: {ec2:Encrypted: 'true'}
+                  StringLike:
+                    aws:RequestTag/rcp:run: '?*'
+                    aws:RequestTag/rcp:attempt: '?*'
+                    aws:RequestTag/rcp:deadline: '?*'
+                    aws:RequestTag/rcp:created-at: '?*'
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at']
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'}
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+                    aws:RequestTag/rcp:namespace: {Ref: ResourcePrefix}
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at']
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: {Ref: WorkerRoleArn}
+                Condition:
+                  StringEquals: {iam:PassedToService: ec2.amazonaws.com}
+              - Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeLaunchTemplateVersions]
+                Resource: '*'
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: {Fn::GetAtt: [LeaseTable, Arn]}
+                Condition:
+                  ForAllValues:StringEquals: {dynamodb:LeadingKeys: [lease, guard]}
+                  'Null': {dynamodb:LeadingKeys: 'false'}
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: {Fn::GetAtt: [LeaseTable, Arn]}
+                Condition:
+                  ForAllValues:StringEquals: {dynamodb:LeadingKeys: [lease]}
+                  'Null': {dynamodb:LeadingKeys: 'false'}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/rcp'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/rcpd'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/filegen'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/rcp'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/rcpd'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/filegen'}
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-coordinator:log-stream:*'}
+  WatchdogRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GuardExactLease
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
+                Condition:
+                  StringEquals: {ec2:ResourceTag/rcp:namespace: {Ref: ResourcePrefix}}
+              - Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeVolumes]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: {Fn::GetAtt: [LeaseTable, Arn]}
+                Condition:
+                  ForAllValues:StringEquals: {dynamodb:LeadingKeys: [lease]}
+                  'Null': {dynamodb:LeadingKeys: 'false'}
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: {Fn::GetAtt: [LeaseTable, Arn]}
+                Condition:
+                  ForAllValues:StringEquals: {dynamodb:LeadingKeys: [guard]}
+                  'Null': {dynamodb:LeadingKeys: 'false'}
+              - Effect: Allow
+                Action: [scheduler:CreateSchedule, scheduler:GetSchedule]
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${RuntimeScheduleGroup}/*'}
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: {Fn::GetAtt: [SchedulerTerminationRole, Arn]}
+                Condition:
+                  StringEquals: {iam:PassedToService: scheduler.amazonaws.com}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/status.json'}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/control/window.json'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/request.json'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/durable-receipt.json'}
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-watchdog:log-stream:*'}
+  CoordinatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CoordinatorLogGroup
+    Properties:
+      FunctionName: {Fn::Sub: '${ResourcePrefix}-coordinator'}
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: infra.aws_benchmark.durable_aws.coordinator
+      Role: {Fn::GetAtt: [CoordinatorRole, Arn]}
+      Code:
+        S3Bucket: {Ref: CodeBucket}
+        S3Key: {Ref: CodeKey}
+        S3ObjectVersion: {Ref: CodeObjectVersion}
+      Timeout: 45
+      MemorySize: 256
+      ReservedConcurrentExecutions: {Fn::If: [Admitting, 1, 0]}
+      Environment:
+        Variables:
+          RCP_DURABLE_ENABLED: {Fn::If: [Admitting, 'true', 'false']}
+          RCP_DURABLE_TABLE: {Ref: LeaseTable}
+          RCP_DURABLE_REGION: {Ref: AWS::Region}
+          RCP_DURABLE_ACCOUNT: {Ref: AWS::AccountId}
+          RCP_DURABLE_NAMESPACE: {Ref: ResourcePrefix}
+          RCP_DURABLE_SUBNET: {Ref: WorkerSubnetId}
+          RCP_DURABLE_SECURITY_GROUP: {Ref: WorkerSecurityGroupId}
+          RCP_DURABLE_PROFILE_ARN: {Ref: WorkerInstanceProfileArn}
+          RCP_DURABLE_BUCKET: {Ref: ArtifactBucket}
+          RCP_DURABLE_LT_ID: {Ref: LaunchTemplateId}
+          RCP_DURABLE_LT_VERSION: {Ref: LaunchTemplateVersion}
+          RCP_DURABLE_AMI: {Ref: WorkerAmiId}
+          RCP_DURABLE_SOURCE: {Ref: WorkerSourceRevision}
+          RCP_DURABLE_RUNTIME_GROUP: {Ref: RuntimeScheduleGroup}
+          RCP_DURABLE_TERMINATION_ROLE: {Fn::GetAtt: [SchedulerTerminationRole, Arn]}
+  WatchdogFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: WatchdogLogGroup
+    Properties:
+      FunctionName: {Fn::Sub: '${ResourcePrefix}-watchdog'}
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: infra.aws_benchmark.durable_aws.watchdog
+      Role: {Fn::GetAtt: [WatchdogRole, Arn]}
+      Code:
+        S3Bucket: {Ref: CodeBucket}
+        S3Key: {Ref: CodeKey}
+        S3ObjectVersion: {Ref: CodeObjectVersion}
+      Timeout: 45
+      MemorySize: 256
+      ReservedConcurrentExecutions: {Fn::If: [Enabled, 1, 0]}
+      Environment:
+        Variables:
+          RCP_DURABLE_ENABLED: {Fn::If: [Admitting, 'true', 'false']}
+          RCP_DURABLE_TABLE: {Ref: LeaseTable}
+          RCP_DURABLE_REGION: {Ref: AWS::Region}
+          RCP_DURABLE_ACCOUNT: {Ref: AWS::AccountId}
+          RCP_DURABLE_NAMESPACE: {Ref: ResourcePrefix}
+          RCP_DURABLE_SUBNET: {Ref: WorkerSubnetId}
+          RCP_DURABLE_SECURITY_GROUP: {Ref: WorkerSecurityGroupId}
+          RCP_DURABLE_PROFILE_ARN: {Ref: WorkerInstanceProfileArn}
+          RCP_DURABLE_BUCKET: {Ref: ArtifactBucket}
+          RCP_DURABLE_LT_ID: {Ref: LaunchTemplateId}
+          RCP_DURABLE_LT_VERSION: {Ref: LaunchTemplateVersion}
+          RCP_DURABLE_AMI: {Ref: WorkerAmiId}
+          RCP_DURABLE_SOURCE: {Ref: WorkerSourceRevision}
+          RCP_DURABLE_RUNTIME_GROUP: {Ref: RuntimeScheduleGroup}
+          RCP_DURABLE_TERMINATION_ROLE: {Fn::GetAtt: [SchedulerTerminationRole, Arn]}
+  WatchdogRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Independent namespace expiry scan before lease access; disabled on initial deployment.
+      ScheduleExpression: rate(1 minute)
+      State: {Fn::If: [Enabled, ENABLED, DISABLED]}
+      Targets:
+        - Id: watchdog
+          Arn: {Fn::GetAtt: [WatchdogFunction, Arn]}
+          Input: '{}'
+          RetryPolicy: {MaximumEventAgeInSeconds: 60, MaximumRetryAttempts: 0}
+  WatchdogPermission:
+    Type: AWS::Lambda::Permission
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: {Ref: WatchdogFunction}
+      Principal: events.amazonaws.com
+      SourceArn: {Fn::GetAtt: [WatchdogRule, Arn]}
+      SourceAccount: {Ref: AWS::AccountId}
+  WatchdogAsyncPolicy:
+    Type: AWS::Lambda::EventInvokeConfig
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: {Ref: WatchdogFunction}
+      Qualifier: '$LATEST'
+      MaximumEventAgeInSeconds: 60
+      MaximumRetryAttempts: 0
+  CoordinatorMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {aws:SourceAccount: {Ref: AWS::AccountId}}
+              ArnEquals:
+                aws:SourceArn: {Fn::Sub: 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-capacity'}
+      Policies:
+        - PolicyName: InvokeCoordinator
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: {Fn::GetAtt: [CoordinatorFunction, Arn]}
+  CoordinatorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: {Fn::Sub: '${ResourcePrefix}-capacity'}
+      StateMachineType: STANDARD
+      RoleArn: {Fn::GetAtt: [CoordinatorMachineRole, Arn]}
+      LoggingConfiguration: {Level: 'OFF', IncludeExecutionData: false}
+      TracingConfiguration: {Enabled: false}
+      Definition:
+        Comment: One allocation; independent tag-expiry guard survives coordinator failure.
+        TimeoutSeconds: 57600
+        StartAt: Observe
+        States:
+          Observe:
+            Type: Task
+            Resource: {Fn::GetAtt: [CoordinatorFunction, Arn]}
+            Parameters:
+              run.$: $.run
+              execution_arn.$: $$.Execution.Id
+              execution_name.$: $$.Execution.Name
+            ResultPath: $.observation
+            TimeoutSeconds: 50
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: Failed
+            Next: Decision
+          Decision:
+            Type: Choice
+            Choices:
+              - Variable: $.observation.state
+                StringEquals: wait
+                Next: Pause
+              - Variable: $.observation.state
+                StringEquals: complete
+                Next: Complete
+            Default: Failed
+          Pause:
+            Type: Wait
+            Seconds: 60
+            Next: Observe
+          Complete:
+            Type: Succeed
+          Failed:
+            Type: Fail
+            Error: DurableLeaseIncomplete
+            Cause: Inspect the lease receipt and independent cleanup; do not resubmit blindly.
+  GitHubSubmitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: {Ref: GitHubOidcProviderArn}}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:wykurz/rcp:environment:aws-benchmark-durable
+      Policies:
+        - PolicyName: SubmitAndCollect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: {Fn::If: [Admitting, Allow, Deny]}
+                Action: states:StartExecution
+                Resource: {Ref: CoordinatorStateMachine}
+              - Effect: Allow
+                Action: states:DescribeExecution
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${CoordinatorStateMachine.Name}:*'}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/control/durable-request.json'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/durable-receipt.json'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/status.json'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/results.zip'}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/rcp'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/rcpd'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/filegen'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/rcp'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/rcpd'}
+                  - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/candidate/filegen'}
+Outputs:
+  LeaseTableName:
+    Value: {Ref: LeaseTable}
+  CoordinatorStateMachineArn:
+    Value: {Ref: CoordinatorStateMachine}
+  GitHubSubmitRoleArn:
+    Value: {Fn::GetAtt: [GitHubSubmitRole, Arn]}
+  RuntimeScheduleGroupName:
+    Value: {Ref: RuntimeScheduleGroup}
+  SchedulerTerminationRoleArn:
+    Value: {Fn::GetAtt: [SchedulerTerminationRole, Arn]}
+  WatchdogRuleName:
+    Value: {Ref: WatchdogRule}
+  WatchdogFunctionName:
+    Value: {Ref: WatchdogFunction}

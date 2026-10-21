@@ -11,18 +11,22 @@ import math
 import os
 from pathlib import Path
 import pwd
+import re
 import signal
 import socket
 import stat
 import struct
 import subprocess
 import threading
+import time
 import zipfile
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from benchmarks.run import load_manifest
 from benchmarks.verification import METADATA_POLICY
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
+                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, timestamp,
                      validate_admission, validate_request, validate_window,
@@ -37,6 +41,7 @@ ROOT = Path("/opt/rcp-benchmark")
 STATE = Path("/run/rcp-benchmark")
 DATA = Path("/mnt/rcp-benchmark")
 UNIT = "rcp-measure"
+DURABLE_STATE = Path("/var/lib/rcp-benchmark")
 
 
 def execute(argv, budget, **kwargs):
@@ -307,28 +312,101 @@ def publish_report(s3, bucket, output, metadata, status, budget):
     retry_io(lambda: put_json(s3, bucket, STATUS_KEY, status), budget)
 
 
-def run(s3, bucket):
+class NoMetadataRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, target):
+        return None
+
+
+def instance_identity(budget):
+    """Read only the instance ID through IMDSv2, without proxy or credential access."""
+    opener = build_opener(ProxyHandler({}), NoMetadataRedirect())
+    endpoint = "http://169.254.169.254/latest/"
+    request = Request(endpoint + "api/token", method="PUT",
+                      headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+    with opener.open(request, timeout=min(2, budget.left(5))) as response:
+        token = response.read(4097)
+    require(0 < len(token) <= 4096 and all(32 < byte < 127 for byte in token), "invalid IMDSv2 token")
+    request = Request(endpoint + "meta-data/instance-id",
+                      headers={"X-aws-ec2-metadata-token": token.decode("ascii")})
+    with opener.open(request, timeout=min(2, budget.left(5))) as response:
+        identity = response.read(65).decode("ascii")
+    require(re.fullmatch(r"i-[0-9a-f]{17}", identity), "invalid IMDS instance identity")
+    return identity
+
+
+def durable_window(s3, bucket, identity, budget, *, protocol=DURABLE_PROTOCOL):
+    """Wait briefly for this instance's assignment; stale mail cannot admit any work."""
+    while True:
+        budget.left(5)
+        try:
+            value = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+        except Exception as error:
+            if error_code(error) not in ("NoSuchKey", "404"):
+                raise
+        else:
+            require(isinstance(value, dict), "invalid durable mailbox window")
+            if value.get("protocol") == protocol and value.get("instance_id") == identity:
+                return value
+        time.sleep(min(3, budget.left(5)))
+
+
+def consume_durable_assignment(window):
+    """Persist one-shot admission on the root disk, so reboot cannot replay the same worker."""
+    DURABLE_STATE.mkdir(mode=0o700, exist_ok=True)
+    directory = os.open(DURABLE_STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory)
+        require(info.st_uid == os.geteuid() and not stat.S_IMODE(info.st_mode) & 0o077,
+                "durable state directory is not private to the supervisor")
+        descriptor = os.open("durable-started.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        with os.fdopen(descriptor, "w") as output:
+            keys = ("protocol", "run", "instance_id", "launch_at", "deadline")
+            if window["protocol"] == DIRECT_PROTOCOL:
+                keys += ("attempt_id", "attempt_started_at")
+            json.dump({key: window[key] for key in keys}, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def run(s3, bucket, *, durable=False, direct=False):
+    require(not (durable and direct), "select exactly one explicit worker protocol")
+    protocol = DIRECT_PROTOCOL if direct else DURABLE_PROTOCOL if durable else None
+    bounded = durable or direct
     # A failed initial control read has no trustworthy run identity to report.
     # Bound it anyway; an uncaught failure powers off via the supervisor unit.
     started = datetime.now(timezone.utc)
-    budget = Budget(started + timedelta(seconds=60))
+    budget = Budget(started + timedelta(seconds=120 if bounded else 60))
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
-    window = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+    identity = instance_identity(budget) if bounded else None
+    window = durable_window(s3, bucket, identity, budget, protocol=protocol) if bounded else \
+        retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+    require(isinstance(window, dict), "invalid worker window")
+    require(window.get("protocol") == protocol, "worker launch protocol mismatch")
     # Trust no retained metadata or extended alarm until the complete window is
     # validated. Late valid windows still reach the admission failure report.
     deadline = validate_window(window, minimum=0)
-    budget = Budget(deadline)
+    budget = Budget(deadline, ceiling_seconds=DURABLE_MAX_RUNTIME) if bounded else Budget(deadline)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     status = completed_status(window["run"])
     metadata = {"window": window, "worker_started_at": timestamp(started)}
+    if bounded:
+        metadata.update(guest_instance_id=identity, timing_basis="projected workload with explicit headroom; not a measured complete run",
+                        runtime_origin="attempt_started_at" if direct else "launch_at")
     stopped = True
     try:
         request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
         validate_request(request, window)
         validate_admission(window, window=True)
         metadata["request"] = request
-        worker_reserve = admission_contract(window["suite"])["worker"]
+        worker_reserve = durable_worker_reserve(window["plan"]) if bounded else \
+            admission_contract(window["suite"])["worker"]
+        if bounded:
+            consume_durable_assignment(window)
         def admit_storage():
             remaining = budget.left()
             metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
@@ -391,10 +469,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--region", required=True)
     parser.add_argument("--bucket", required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--durable", action="store_true", help="require a historical launch-bound durable assignment")
+    mode.add_argument("--direct", action="store_true", help="require an immutable attempt-bound direct assignment")
     args = parser.parse_args()
     require(os.geteuid() == 0, "supervisor requires root")
     os.chdir(ROOT)
-    run(clients(args.region)["s3"], args.bucket)
+    run(clients(args.region)["s3"], args.bucket, durable=args.durable, direct=args.direct)
 
 
 if __name__ == "__main__":
