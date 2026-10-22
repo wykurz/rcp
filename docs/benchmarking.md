@@ -701,13 +701,13 @@ Triage a concerning observation in this order:
 
 ## Coverage and next automation decisions
 
-The recurring suite currently covers fresh tiny/medium/large copies locally and over shared-host SSH
-loopback. PR smoke checks exercise correctness and the measurement mechanism, including an rcp base
-build. Weekly performance jobs compare tools, but do not yet build a paired previous rcp revision.
-The receiver manifest adds massive unchanged/partial updates and wide directory sets; owned
-RTT0/2/10 support is available but not part of the weekly matrix. Neither loopback nor a Depot
-runner demonstrates physical fast-NIC, separate-server storage behavior. Deep chains are useful
-mechanism checks, not the priority for representative performance coverage.
+The retired Depot suite covered fresh tiny/medium/large copies locally and over shared-host SSH
+loopback. Its PR smoke runs exercised correctness and the measurement mechanism, including an rcp
+base build. Weekly performance jobs compared tools without a paired previous rcp revision. The
+receiver manifest adds massive unchanged/partial updates and wide directory sets; owned RTT0/2/10
+support is available but was not part of that weekly matrix. Neither loopback nor a Depot runner
+demonstrates physical fast-NIC, separate-server storage behavior. Deep chains are useful mechanism
+checks, not the priority for representative performance coverage.
 
 Keep three distinct budgets as coverage grows:
 
@@ -723,16 +723,17 @@ that existing `wait_rate`/admission/worker/execute scopes cannot answer. Its rel
 overhead test. A runtime recorder alone would not provide this workflow. Detailed scopes and poll
 traces should not contaminate the paired numeric samples.
 
-Use Depot as a coarse screen while calibrating repeated same-commit pairs. A dedicated pair of
+Use retained Depot measurements only as historical context. Calibrate future benchmark
+infrastructure with repeated same-commit pairs before comparing performance. A dedicated pair of
 fast-NIC servers would add physical-network and controlled storage coverage; evaluate that benefit
-against observed Depot variance, utilization, maintenance and quoted runner/storage/retention costs.
-No dedicated runners, new permissions, credentials, paid services, or additional recurring jobs are
-required for this reporting workflow. The weekly schedule and 90-day artifact retention remain in
-place. Producer run URLs come only from `BENCHMARK_RUN_URL`, which the current workflows do not set;
-new records as well as older ones can therefore have empty URLs. A caller can set that environment
-variable to a verified run URL when collecting evidence. Run IDs, checkout commits, binary
-fingerprints and input hashes remain the durable evidence keys, not a promise that expired raw logs
-are recoverable.
+against measured variance, utilization, maintenance and quoted runner/storage/retention costs. The
+Depot weekly schedule is retired; retained artifacts keep their original expiry. Rendering existing
+history requires no new benchmark worker or recurring measurement job.
+
+Producer run URLs come only from `BENCHMARK_RUN_URL`. Records collected without that environment
+variable can have empty URLs. A caller can set it to a verified run URL when collecting evidence.
+Run IDs, checkout commits, binary fingerprints and input hashes remain the durable evidence keys,
+not a promise that expired raw logs are recoverable.
 
 ## CI and stability
 
