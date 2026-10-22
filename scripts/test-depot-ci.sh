@@ -199,6 +199,13 @@ run_case() {
 
 [[ -x "$script" ]] || fail "scripts/depot-ci.sh is absent or not executable"
 
+# new remote workflow manifests require a deliberate policy review
+shopt -s nullglob
+workflows=("$repo_root"/.depot/workflows/*.yml "$repo_root"/.depot/workflows/*.yaml)
+shopt -u nullglob
+[[ "${#workflows[@]}" -eq 1 && "${workflows[0]}" == "$repo_root/.depot/workflows/ci.yml" ]] || \
+    fail "only the ordinary Depot ci.yml workflow is allowed"
+
 run_case success test "doc job"
 assert_status 0
 assert_contains "$output" "fake launch output"
@@ -229,18 +236,10 @@ assert_call_before \
     $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow' \
     $'CALL\tci\trun\tshow\ttest-run-id\t--output\tjson'
 
-run_case finished --workflow '.depot/workflows/test suite.yml' test
-assert_status 0
-assert_call $'CALL\tci\trun\t--workflow\t.depot/workflows/test suite.yml\t--job\ttest'
-assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow'
-
-run_case finished --workflow
+run_case finished --workflow .depot/workflows/retired.yml test
 assert_status 2
-assert_contains "$output" 'workflow path is required'
-
-run_case finished --workflow .depot/workflows/ci.yml
-assert_status 2
-assert_contains "$output" 'at least one workflow job is required'
+assert_contains "$output" 'unsupported option'
+[[ ! -s "$DEPOT_TEST_LOG" ]] || fail "unsupported option reached Depot"
 
 run_case failed lint
 [[ "$status" -ne 0 ]] || fail "failed terminal status returned success"
