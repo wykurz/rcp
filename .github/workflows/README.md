@@ -27,19 +27,20 @@ security-sensitive change:
 
 Publishes the project landing page, a trend dashboard under `ci-benchmarks/` from the dedicated
 `benchmark-history` branch, and the Markdown-based [reports](../../docs/reports/README.md) under
-`reports/`. A trusted Depot run can dispatch `benchmark-history-updated`; every push to `main` and
-manual requests also rebuild the combined site. The push trigger covers changes to linked
-documentation as well as report sources. Pull requests validate the report build and original
-measurement checksums without deploying. Published rendering code and report sources come from
-`main`; historical records are data. The deployment is enabled with the repository variable
-`RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
+`reports/`. Every push to `main` and manual requests rebuild the combined site. The retained
+`benchmark-history-updated` dispatch also supports explicit history publication. The push trigger
+covers changes to linked documentation as well as report sources. Pull requests validate the report
+build and original measurement checksums without deploying. Published rendering code and report
+sources come from `main`; historical records are data. The deployment is enabled with the repository
+variable `RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
 [Benchmark dashboard and run results](../../docs/benchmarking.md#view-results) for viewing
 instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
 publication.
 
-The benchmarks themselves run in `.depot/workflows/benchmarks.yml`: PRs and pushes run local and
-loopback smoke checks with artifacts. Scheduled and manual runs on main measure larger filesets and
-append performance history. No timing threshold blocks a change.
+Depot benchmark execution is retired: PR, push, schedule and manual benchmark triggers have been
+removed. The ordinary Depot build and test workflow remains available. Local benchmark commands,
+harness tests and existing history are retained; AWS qualification is separately opt-in and does not
+automatically replace those triggers. No timing threshold blocks a change.
 
 ### rust.yml
 

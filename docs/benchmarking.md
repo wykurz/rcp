@@ -2,12 +2,13 @@
 
 For the opt-in, manually armed AWS worker and its setup checklist, see
 [AWS benchmarks](../infra/aws_benchmark/README.md). Its independent scheduled shutdown must be
-configured by a trusted operator; the ordinary benchmark workflows do not deploy AWS resources.
+configured by a trusted operator. Depot benchmark execution is retired; ordinary builds and tests
+remain available and do not deploy AWS resources.
 
 For the measured comparison across shared and local filesystems, remote transfers, and a Linux
 source tree, see the [performance report](reports/performance.md). Its
 [original measurement packet and analysis](../analysis/2026-10-11/README.md) are preserved
-separately from the continuous benchmark suite described here.
+separately from the benchmark harness described here.
 
 The benchmark suite measures complete command invocations on generated filesets. Timing is
 informational: a slower copy does not fail CI. Failed commands, timeouts, incorrect copies, and
@@ -22,16 +23,17 @@ root files require whole-tree variants; partitioned variants are rejected before
 
 ## View results
 
-Open a **Copy benchmarks** run from its PR check or the Depot dashboard. Each local or loopback job
-has a summary of median wall time and repeat range. For the full report, download the corresponding
-`benchmark-results-local` or `benchmark-results-loopback` artifact, extract it, and open
-`report/index.html` in a browser. The report is self-contained and needs no server. The same
-artifact contains `results.json`, `summary.md`, and per-process logs; artifacts are retained for 90
-days.
+Existing **Copy benchmarks** runs remain in Depot history. Their local and loopback jobs have
+summaries of median wall time and repeat range; no new Depot measurements are scheduled. For the
+full report, download the corresponding `benchmark-results-local` or `benchmark-results-loopback`
+artifact, extract it, and open `report/index.html` in a browser. The report is self-contained and
+needs no server. The same artifact contains `results.json`, `summary.md`, and per-process logs;
+artifacts are retained for 90 days.
 
-PR and push reports list smoke runs; their timings are in `summary.md` and `results.json`, excluded
-from performance trends and ratios. Scheduled and manual performance runs on main also save durable
-JSON records to the `benchmark-history` branch. After
+Historical PR and push reports list smoke runs; their timings are in `summary.md` and
+`results.json`, excluded from performance trends and ratios. Earlier scheduled and manual
+performance runs saved durable JSON records to the `benchmark-history` branch. Those records are
+retained without starting new benchmark jobs. After
 [enabling the historical site](#enable-the-historical-site), the
 [Benchmark history and reports workflow](https://github.com/wykurz/rcp/actions/workflows/benchmark-pages.yml)
 publishes those records as a GitHub Pages dashboard under `ci-benchmarks/`. The
@@ -99,15 +101,16 @@ not a measurement of a physical 100G link or two independent servers.
 
 Loopback records the SSH client version and binary digest. Use `--ssh-transport-profile` to identify
 the server and configuration when running outside CI; without it, that part of the transport is
-unknown. Depot supplies a digest of the actual daemon binary and the source-owned SSH setup action,
-so changes to either start a new series without recording keys or temporary configuration paths.
+unknown. Historical Depot runs supplied a digest of the actual daemon binary and the source-owned
+SSH setup action, so changes to either start a new series without recording keys or temporary
+configuration paths.
 
 `local` compares rcp, GNU `cp -a`, and both rsync variants without SSH. Both rcp and cp retain their
-default reflink policy; a reflink-capable filesystem can make these copies much faster. The Depot
-storage profile uses ext4, and sizing must be recalibrated for other storage profiles. `cp-a` is
-rejected in loopback mode because cp cannot perform a remote pull. Local and loopback measurements
-have separate historical series. The first version does not provision fixtures or binaries on two
-independent hosts; that requires an additional endpoint adapter.
+default reflink policy; a reflink-capable filesystem can make these copies much faster. The
+historical Depot storage profile used ext4, and sizing must be recalibrated for other storage
+profiles. `cp-a` is rejected in loopback mode because cp cannot perform a remote pull. Local and
+loopback measurements have separate historical series. The first version does not provision fixtures
+or binaries on two independent hosts; that requires an additional endpoint adapter.
 
 Use `--source-root` and `--destination-root` to choose existing parent directories on different
 filesystems. The harness creates unique owned subdirectories and never clears the supplied parents.
@@ -115,10 +118,10 @@ By default, the observed mount source and mountpoint identify each endpoint's st
 Use `--source-storage-id` and `--destination-storage-id` to declare stable storage profiles when
 device names or mountpoints change between allocations. These IDs are your declaration that the
 underlying storage configuration is comparable; use different IDs when it changes. Filesystem type
-and semantic mount options still distinguish series. Depot sets both IDs to `depot-root` for its
-ephemeral runner root filesystem, while retaining the actual mount details in each result. Use
-`--bin-dir` for a prepared release build. `--baseline-bin-dir` adds an rcp baseline using its
-matching daemon; both versions use the same fixture and measurement procedure.
+and semantic mount options still distinguish series. Historical Depot runs set both IDs to
+`depot-root` for their ephemeral runner root filesystems, while retaining the actual mount details
+in each result. Use `--bin-dir` for a prepared release build. `--baseline-bin-dir` adds an rcp
+baseline using its matching daemon; both versions use the same fixture and measurement procedure.
 
 ```bash
 just benchmark-run --case tiny-1m --mode loopback --repetitions 3 \
@@ -501,8 +504,8 @@ Full positional balance requires a repetition count divisible by the number of s
 after adding baseline or concurrency variants. Fewer repetitions are allowed for exploratory runs,
 but some variants then occupy different parts of the order; temporal or cache drift can bias their
 ratios. Full loopback runs balance three variants with three repetitions; local runs balance four
-with four. PR smoke checks add a baseline and use four or five repetitions respectively. Choose an
-appropriate count explicitly when constructing a custom comparison.
+with four. Historical Depot PR smoke checks added a baseline and used four or five repetitions
+respectively. Choose an appropriate count explicitly when constructing a custom comparison.
 
 Cache modes are procedures, not assumptions:
 
@@ -733,44 +736,18 @@ are recoverable.
 
 ## CI and stability
 
-[Depot benchmarks](../.depot/workflows/benchmarks.yml) use separate local and loopback jobs on the
-fixed 32-CPU x86 runner. PRs and main pushes run the three small smoke cases with source-warm cache
-preparation. They validate the harness and retain artifacts without publishing performance history.
-PR smoke jobs also build the PR base and balance four loopback or five local variants across trial
-positions. Superseded PR runs are cancelled.
+Depot benchmark execution is retired to stop spending on automated measurements. The benchmark
+workflow and `just depot-benchmark` entrypoint have been removed, including PR, push, weekly and
+manual triggers. Ordinary Depot builds and non-benchmark tests remain available through
+`just depot-ci` and the other `depot-*` test recipes. Harness behavior tests remain in normal
+lint/validation; they do not launch a paid benchmark worker.
 
-Weekly runs and manual dispatches measure the three performance cases with Linux cache dropping
-before every copy. Manual runs can select one case or all cases and can choose source-warm instead.
-Loopback uses three variants and three repetitions; local uses four of each. Each mode has a
-120-minute job budget; smoke jobs retain 45 minutes. Each command has a 20-minute timeout in full
-runs. Fileset generation, cache preparation, verification, and cleanup add untimed overhead. No
-copies overlap within a job, and each topology gets its own runner and artifact. Scheduled and
-manual main-branch results are appended to history after both producer jobs end, including valid
-partial results if one job fails.
+Existing result artifacts retain their original expiry, and the `benchmark-history` branch and
+report renderer remain available. This change does not activate an AWS replacement or create a
+recurring benchmark schedule. AWS runs require their separately configured admission and shutdown
+controls.
 
-To start a performance run on a pushed revision, use **Run a workflow** in the Depot CI dashboard,
-select this repository, the branch, and **Copy benchmarks**, then choose the case and cache inputs.
-The equivalent CLI command for all cases on main is:
-
-```bash
-depot ci dispatch --repo wykurz/rcp --workflow benchmarks.yml --ref main \
-  --input case=all --input cache=linux-drop-caches
-```
-
-Use `tiny-1m`, `medium-128k`, or `large-120` instead of `all` to select one case. A dispatch on a
-branch other than main retains artifacts without publishing history. See Depot's
-[manual workflow instructions](https://depot.dev/docs/ci/how-to-guides/manage-workflow-runs#manually-trigger-workflows).
-
-To run the benchmark job against local changes without publishing history:
-
-```bash
-just depot-benchmark
-```
-
-This runs the workflow against the current worktree and retains measurements and artifacts. Stage
-ordinary untracked files first so Depot includes them. It does not run the history-publishing job.
-Benchmarking is separate from `just depot-ci`; harness behavior tests are included in normal
-lint/validation. For a small local harness check, explicitly select a smoke case and purpose:
+For a small local harness check, explicitly select a smoke case and purpose:
 
 ```bash
 just benchmark-run --case tiny-10k --mode local --purpose smoke --output /tmp/rcp-bench-smoke
@@ -861,25 +838,21 @@ rows and checks README section links in the landing page and shared header. The 
 remains wider than the shared header to accommodate tables and figures; mobile gutters match
 throughout.
 
-Scheduled and manual Depot runs on main publish performance history. Push and PR smoke jobs do not
-publish history. PR jobs have read-only repository permissions and never publish. The history job
-needs the Depot GitHub App to permit repository `contents: write`. It then sends a
-`benchmark-history-updated` repository dispatch.
+Historical Depot performance records remain in `benchmark-history`; the retired benchmark workflow
+no longer writes new records or sends `benchmark-history-updated` dispatches. No Depot write
+permission is needed to render the retained history.
 
 The native [Pages workflow](../.github/workflows/benchmark-pages.yml) publishes with code from
 `main` and treats the history branch only as data. Pull requests run read-only validation;
 publication does not run code from a PR or the history branch. Native GitHub Actions provides the
-Pages deployment environment and GitHub OIDC; benchmark computation stays on Depot.
+Pages deployment environment and GitHub OIDC. Rendering historical reports does not start benchmark
+computation.
 
 One-time repository setup:
 
-1. Allow the Depot GitHub App repository Contents write access for the history job.
-2. In Settings → Pages, choose **GitHub Actions** as the source.
-3. Set repository Actions variable `RCP_BENCHMARK_PAGES` to `true`.
-4. Dispatch **Copy benchmarks** on main to verify history publication, then run **Benchmark history
-   and reports** manually if needed.
+1. In Settings → Pages, choose **GitHub Actions** as the source.
+2. Set repository Actions variable `RCP_BENCHMARK_PAGES` to `true`.
+3. Run **Benchmark history and reports** manually to publish the existing records.
 
-Until Pages is enabled, run artifacts and durable history remain usable. This PR prepares the
-workflow; a successful remote measurement is not proof that Pages publication has occurred. Inspect
-the first post-merge history job to confirm both the history push and repository dispatch succeed
-with the Depot App token.
+Until Pages is enabled, retained run artifacts and durable history remain usable. A successful
+measurement is not proof that Pages publication has occurred; inspect the Pages deployment result.

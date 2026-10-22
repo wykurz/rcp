@@ -229,16 +229,16 @@ assert_call_before \
     $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow' \
     $'CALL\tci\trun\tshow\ttest-run-id\t--output\tjson'
 
-run_case finished --workflow '.depot/workflows/benchmark suite.yml' benchmark
+run_case finished --workflow '.depot/workflows/test suite.yml' test
 assert_status 0
-assert_call $'CALL\tci\trun\t--workflow\t.depot/workflows/benchmark suite.yml\t--job\tbenchmark'
-assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\tbenchmark\t--follow'
+assert_call $'CALL\tci\trun\t--workflow\t.depot/workflows/test suite.yml\t--job\ttest'
+assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow'
 
 run_case finished --workflow
 assert_status 2
 assert_contains "$output" 'workflow path is required'
 
-run_case finished --workflow .depot/workflows/benchmarks.yml
+run_case finished --workflow .depot/workflows/ci.yml
 assert_status 2
 assert_contains "$output" 'at least one workflow job is required'
 

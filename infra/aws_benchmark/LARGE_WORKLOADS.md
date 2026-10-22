@@ -2,8 +2,8 @@
 
 These large-workload profiles reuse the directory shapes from the
 [historical performance report](../../docs/reports/performance.md). Sizes are **decimal bytes**.
-They live in `benchmarks/large-cases.json`; the original manifest, default selections and Depot
-workflows are unchanged.
+They live in `benchmarks/large-cases.json`; the original manifest and default selections are
+unchanged. Depot benchmark execution is retired independently of these opt-in profiles.
 
 | Historical full-content suite | Case ID            | Directory widths | Files per leaf | Bytes per file |      Files |     Logical bytes |
 | ----------------------------- | ------------------ | ---------------- | -------------: | -------------: | ---------: | ----------------: |

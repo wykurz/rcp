@@ -198,10 +198,6 @@ report-tables-check:
 analysis-test:
     python3 -m unittest discover -s analysis/2026-10-11 -p 'test_*.py'
 
-# Run the benchmark job remotely without publishing history.
-depot-benchmark:
-    ./scripts/depot-ci.sh --workflow .depot/workflows/benchmarks.yml benchmark
-
 # Build and check documentation
 doc:
     RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" ./scripts/cargo-host.sh doc --no-deps --workspace
