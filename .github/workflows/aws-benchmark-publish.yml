@@ -1,0 +1,263 @@
+name: Publish retired AWS benchmark history
+
+# Publishing is separate from paid execution and remains inert until explicitly enabled.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_TERMINAL_PROMPT: '0'
+    outputs:
+      artifact_id: ${{ steps.raw.outputs.artifact-id }}
+      inventory_sha256: ${{ steps.download.outputs.inventory_sha256 }}
+      reader_revision: ${{ steps.download.outputs.reader_revision }}
+    steps:
+      - name: Require the exact main publication workflow
+        run: |
+          python3 - <<'PY'
+          import os, re
+          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
+          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA']
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read published identities before downloading raw evidence
+        run: |
+          history="$RUNNER_TEMP/download-history.git"
+          git init --bare "$history"
+          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/download-history-ref"; then
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+          else
+            code=$?
+            test "$code" -eq 2
+          fi
+      - name: Install the pinned read-only SDK
+        run: |
+          python3 -m venv "$RUNNER_TEMP/publication-sdk"
+          "$RUNNER_TEMP/publication-sdk/bin/pip" install --require-hashes -r infra/aws_benchmark/requirements.txt
+      - name: Download retired evidence with read-only AWS access
+        id: download
+        env:
+          REGION: ${{ vars.RCP_AWS_PRODUCTION_REGION }}
+          ROLE: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ROLE }}
+          BUCKET: ${{ vars.RCP_AWS_PRODUCTION_BUCKET }}
+          TABLE: ${{ vars.RCP_AWS_PRODUCTION_TABLE }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          "$RUNNER_TEMP/publication-sdk/bin/python" -m infra.aws_benchmark.production_publish download \
+            --region "$REGION" --role "$ROLE" --bucket "$BUCKET" --table "$TABLE" \
+            --history "$RUNNER_TEMP/download-history.git" \
+            --output "$RUNNER_TEMP/retired-evidence" --reader-revision "$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: raw
+        with:
+          name: aws-retired-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/retired-evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+  export:
+    needs: download
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.public.outputs.artifact-id }}
+      inventory_sha256: ${{ steps.export.outputs.inventory_sha256 }}
+      reader_revision: ${{ steps.export.outputs.reader_revision }}
+    env:
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_TERMINAL_PROMPT: '0'
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - name: Bind download provenance to this workflow revision
+        env:
+          EXPECTED_READER: ${{ needs.download.outputs.reader_revision }}
+          EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
+          EXPECTED_ARTIFACT: ${{ needs.download.outputs.artifact_id }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
+          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
+          assert re.fullmatch(r'[0-9a-f]{64}', os.environ['EXPECTED_INVENTORY'])
+          assert re.fullmatch(r'[1-9][0-9]*', os.environ['EXPECTED_ARTIFACT'])
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.download.outputs.artifact_id }}
+          path: ${{ runner.temp }}/retired-evidence
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Read existing public history without checking out its files
+        run: |
+          history="$RUNNER_TEMP/export-history.git"
+          git init --bare "$history"
+          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/history-ref"; then
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+          else
+            code=$?
+            test "$code" -eq 2
+          fi
+      - name: Validate and export without cloud or write credentials
+        id: export
+        env:
+          EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
+        run: |
+          python3 -m infra.aws_benchmark.production_publish export \
+            --input "$RUNNER_TEMP/retired-evidence" --history "$RUNNER_TEMP/export-history.git" \
+            --output "$RUNNER_TEMP/public-records" --reader-revision "$GITHUB_SHA" \
+            --expected-sha256 "$EXPECTED_INVENTORY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: public
+        with:
+          name: aws-public-records-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-records/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: export
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      history_commit: ${{ steps.append.outputs.history_commit }}
+    concurrency:
+      group: aws-production-history-publish
+      cancel-in-progress: false
+    env:
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_TERMINAL_PROMPT: '0'
+      AWS_EC2_METADATA_DISABLED: 'true'
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - name: Bind public artifact provenance to this workflow revision
+        env:
+          EXPECTED_READER: ${{ needs.export.outputs.reader_revision }}
+          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
+          EXPECTED_ARTIFACT: ${{ needs.export.outputs.artifact_id }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
+          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
+          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
+          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
+          assert re.fullmatch(r'[0-9a-f]{64}', os.environ['EXPECTED_INVENTORY'])
+          assert re.fullmatch(r'[1-9][0-9]*', os.environ['EXPECTED_ARTIFACT'])
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.export.outputs.artifact_id }}
+          path: ${{ runner.temp }}/public-records
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Append to freshly read history with bounded conflict reconciliation
+        id: append
+        env:
+          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            history="$RUNNER_TEMP/publish-history-$attempt.git"
+            receipt="$RUNNER_TEMP/publish-commit-$attempt.txt"
+            git init --bare "$history"
+            has_history=false
+            if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-$attempt"; then
+              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+              has_history=true
+            else
+              code=$?
+              test "$code" -eq 2
+            fi
+            GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
+              --input "$RUNNER_TEMP/public-records" --history "$history" \
+              --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
+            commit=$(python3 - "$receipt" <<'PY'
+          import re, sys
+          from pathlib import Path
+          value = Path(sys.argv[1]).read_text()
+          assert re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'Invalid append receipt'
+          print(value.removeprefix('commit=').strip())
+          PY
+            )
+            if test -z "$commit"; then
+              if test "$has_history" = true; then
+                commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
+                [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+              fi
+              printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+              echo 'History already contains all verified records.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            authorization=$(python3 - <<'PY'
+          import base64, os
+          print('AUTHORIZATION: basic ' + base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode())
+          PY
+            )
+            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="$authorization" \
+              git -c credential.helper= --git-dir="$history" push https://github.com/wykurz/rcp.git "$commit:refs/heads/aws-benchmark-history"; then
+              printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+              echo 'Appended verified public records to aws-benchmark-history.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            unset authorization
+          done
+          echo 'History publication requires reconciliation after three bounded attempts.' >&2
+          exit 1
+
+  pages:
+    needs: publish
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/benchmark-pages.yml
+    with:
+      aws_history_commit: ${{ needs.publish.outputs.history_commit }}

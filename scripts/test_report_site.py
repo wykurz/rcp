@@ -3,6 +3,7 @@
 from html.parser import HTMLParser
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -64,6 +65,133 @@ class ReportSiteTests(unittest.TestCase):
              '--root', str(self.repo), '--output', str(self.output), *flags],
             text=True, capture_output=True,
         )
+
+    def aws_record(self, run='123', *, passed=True):
+        from infra.aws_benchmark import production_export as public
+        value = dict(schema=public.SCHEMA, run_key='repo-655073755-run-' + run,
+            retirement_sha256='1' * 64, benchmark_valid=passed, cleanup_verified=True,
+            validation=public.VALIDATION, series_contract=public.results.SERIES_CONTRACT,
+            identity=dict(run=run + '-1', run_url=f'https://github.com/wykurz/rcp/actions/runs/{run}/attempts/1',
+                suite='bulk-1g-metadata', baseline='a' * 40, candidate='a' * 40, controller='b' * 40),
+            comparison='A/A qualification', measurements=[], note='Two local pairs do not establish broad variance.')
+        if passed:
+            value.update(timestamp='2026-10-22T19:00:00Z', verification={'policy': 'metadata-size'},
+                measurements=[dict(case_id='bulk', variant_id='candidate', series_id='aws-local-ext4-v1',
+                    median=620.5, samples=[620, 621])])
+        return value
+
+    def aws_history(self, records):
+        repository = self.root / 'aws-history.git'
+        environment = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
+            GIT_AUTHOR_NAME='Offline test', GIT_AUTHOR_EMAIL='test@example.invalid',
+            GIT_COMMITTER_NAME='Offline test', GIT_COMMITTER_EMAIL='test@example.invalid')
+        def git(*args, source=None):
+            result = subprocess.run(['git', '--git-dir=' + str(repository), *args], input=source,
+                text=True, capture_output=True, env=environment, check=True)
+            return result.stdout.strip()
+        git('init', '--bare')
+        if records is None:
+            return repository
+        entries = []
+        for name, (mode, value) in records.items():
+            raw = value if isinstance(value, str) else json.dumps(value)
+            blob = git('hash-object', '-w', '--stdin', source=raw)
+            entries.append(f'{mode} blob {blob}\t{name}\n')
+        tree = git('mktree', source=''.join(entries))
+        outer = git('mktree', source=f'040000 tree {tree}\trecords\n')
+        commit = git('commit-tree', outer, '-m', 'Offline public history')
+        git('update-ref', 'refs/heads/aws-benchmark-history', commit)
+        return repository
+
+    def test_aws_history_navigation_requires_actual_records(self):
+        for records in (None, {}):
+            with self.subTest(records=records):
+                repository = self.aws_history(records)
+                result = self.build('--aws-history', str(repository))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('AWS benchmarks', (self.output / 'index.html').read_text())
+                self.assertFalse((self.output / 'aws-benchmarks/index.html').exists())
+
+    def test_aws_records_render_separately_with_resolving_links_and_public_json(self):
+        passed, failed = self.aws_record(), self.aws_record('124', passed=False)
+        records = {value['run_key'] + '.json': ('100644', value) for value in (passed, failed)}
+        repository = self.aws_history(records)
+        result = self.build('--aws-history', str(repository))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        landing = (self.output / 'index.html').read_text()
+        self.assertIn('href="aws-benchmarks/index.html">AWS benchmarks', landing)
+        self.assertNotIn('ci-benchmarks', landing)
+        index = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('does not prove content integrity', index)
+        self.assertIn('failed; excluded from performance history', index)
+        self.assertLess(index.index('124-1'), index.index('123-1'))
+        for value in (passed, failed):
+            record = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
+            self.assertEqual(json.loads(record.read_text()), value)
+            page = self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')
+            self.assertIn('Cleanup', page.read_text())
+            self.assertIn('verified', page.read_text())
+            self.assertNotIn('<script', page.read_text())
+        for page in self.output.rglob('*.html'):
+            for tag, attrs in Elements(page.read_text()).tags:
+                value = attrs.get('href') if tag in {'a', 'link'} else attrs.get('src')
+                if not value:
+                    continue
+                url = urlsplit(value)
+                if url.scheme or url.netloc:
+                    continue
+                self.assertFalse(url.path.startswith('/'), value)
+                target = (page.parent / unquote(url.path)).resolve() if url.path else page
+                if target.is_dir():
+                    target /= 'index.html'
+                self.assertTrue(target.is_file(), (page, value))
+                if url.fragment and target.suffix == '.html':
+                    self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
+
+    def test_aws_public_record_strings_are_escaped(self):
+        value = self.aws_record()
+        value['identity']['suite'] = '<script>alert(1)</script>'
+        value['comparison'] = '<img src=x onerror=alert(1)>'
+        repository = self.aws_history({value['run_key'] + '.json': ('100644', value)})
+        result = self.build('--aws-history', str(repository))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for page in (self.output / 'aws-benchmarks/index.html',
+                     self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')):
+            text = page.read_text()
+            self.assertIn('&lt;script&gt;', text)
+            self.assertNotIn('<img src=x', text)
+            self.assertNotIn('<script>alert', text)
+
+    def test_invalid_aws_history_fails_before_writing_site(self):
+        value = self.aws_record()
+        for records in (
+            {'repo-655073755-run-123.json': ('120000', 'outside.json')},
+            {'repo-1-run-123.json': ('100644', value)},
+            {'repo-655073755-run-124.json': ('100644', value)},
+            {'repo-655073755-run-123.json': ('100644', dict(value, private='unexpected'))},
+            {'repo-655073755-run-123.json': ('100644', '{malformed')},
+            {'unexpected.html': ('100644', '<script>raw retained HTML</script>')},
+        ):
+            with self.subTest(records=records):
+                repository = self.aws_history(records)
+                result = self.build('--aws-history', str(repository))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
+
+    def test_aws_history_keeps_depot_dashboard_bytes_and_navigation_separate(self):
+        self.test_preserves_existing_benchmark_dashboard()
+        history = self.output / 'ci-benchmarks'
+        prior = {path.name: path.read_bytes() for path in history.iterdir()}
+        value = self.aws_record()
+        repository = self.aws_history({value['run_key'] + '.json': ('100644', value)})
+        result = self.build('--with-benchmark-history', '--aws-history', str(repository))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({path.name: path.read_bytes() for path in history.iterdir()}, prior)
+        header = next(attrs for tag, attrs in Elements((self.output / 'index.html').read_text()).tags if tag == 'header')
+        self.assertEqual(header['class'], 'site-header')
+        links = [attrs.get('href', '') for tag, attrs in Elements((self.output / 'reports/index.html').read_text()).tags if tag == 'a']
+        self.assertIn('../aws-benchmarks/index.html', links)
+        self.assertFalse(any('ci-benchmarks' in link for link in links))
 
     def test_report_links_and_assets_work_under_a_project_prefix(self):
         result = self.build()
