@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 import yaml
 
 from infra.aws_benchmark import common, results, worker
+from infra.aws_benchmark.ami_image import reviewed_startup
 from infra.aws_benchmark.test_results import archive, binding, bundle, measurement
 from infra.aws_benchmark.test_safety import NOW, window
 from infra.aws_benchmark.test_worker_review import frozen_worker_time, report, worker_fixture
@@ -61,7 +62,7 @@ def advance(clock, seconds):
 
 
 class WorkerProtocolTemplateTests(unittest.TestCase):
-    def test_only_explicit_durable_selection_changes_timeout_and_worker_mode(self):
+    def test_direct_selection_changes_timeout_and_mode_while_durable_is_rejected(self):
         template = yaml.safe_load((Path(__file__).with_name("stack.yaml")).read_text())
         parameter = template["Parameters"]["WorkerProtocol"]
         self.assertEqual(parameter["Default"], "operator-window")
@@ -73,8 +74,7 @@ class WorkerProtocolTemplateTests(unittest.TestCase):
         user_data = data["UserData"]["Fn::Base64"]["Fn::Sub"]
         for protocol, limit in ((parameter["Default"], 3900), ("direct", 10800)):
             with self.subTest(protocol=protocol):
-                script = user_data.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", "bucket").replace(
-                    "${AWS::Region}", "us-east-1")
+                script = reviewed_startup(protocol, "bucket", "us-east-1")
                 stubs = "systemd-run() { printf '%s\\n' \"$@\"; }; systemctl() { exit 99; };\n"
                 result = subprocess.run(["bash", "-c", stubs + script], capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -88,8 +88,8 @@ class WorkerProtocolTemplateTests(unittest.TestCase):
                 self.assertEqual(argv.count("--unit=rcp-supervisor"), 1)
         self.assertEqual(user_data.count("systemd-run "), 1)
         for protocol in ("durable", "unknown"):
-            script = user_data.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", "bucket").replace(
-                "${AWS::Region}", "us-east-1")
+            script = reviewed_startup("operator-window", "bucket", "us-east-1").replace(
+                "case 'operator-window' in", "case '" + protocol + "' in")
             stubs = "systemd-run() { printf 'unexpected launch'; }; systemctl() { exit 99; };\n"
             result = subprocess.run(["bash", "-c", stubs + script], capture_output=True, text=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
@@ -334,6 +334,66 @@ class DurableGuestTests(unittest.TestCase):
                 measure.assert_not_called()
                 self.assertTrue(all(call.kwargs["Key"] == common.WINDOW_KEY
                                     for call in cloud.api["s3"].get_object.call_args_list))
+
+    def test_transient_assignment_failure_after_retry_batch_can_recover(self):
+        class Unavailable(Exception):
+            response = {"Error": {"Code": "SlowDown"}, "ResponseMetadata": {"HTTPStatusCode": 503}}
+        for failure in (Unavailable, ConnectionError):
+            with self.subTest(failure=failure), durable_fixture() as (_, cloud, measure, clock, _, prepare):
+                original, reads, started = cloud.get, [], clock["wall"]
+                def get(**kwargs):
+                    if kwargs["Key"] == common.WINDOW_KEY:
+                        reads.append(clock["wall"])
+                        if len(reads) <= 4:
+                            raise failure("temporary assignment read failure")
+                    return original(**kwargs)
+                cloud.api["s3"].get_object.side_effect = get
+                with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)):
+                    worker.run(cloud.api["s3"], "bucket", direct=True)
+                metadata, _ = report(cloud)
+                self.assertEqual(len(reads), 5)
+                self.assertEqual(clock["wall"] - started, 7)
+                self.assertTrue(metadata["status"]["success"])
+                self.assertEqual(worker.signal.setitimer.call_args_list[0].args,
+                                 (signal.ITIMER_REAL, worker.ASSIGNMENT_WAIT_SECONDS))
+                self.assertEqual(metadata["admission"]["remaining_seconds"], 10403)
+                prepare.assert_called_once()
+                measure.assert_called_once()
+
+    def test_persistent_transient_assignment_errors_stop_within_original_budget(self):
+        class Unavailable(Exception):
+            response = {"Error": {"Code": "SlowDown"}, "ResponseMetadata": {"HTTPStatusCode": 503}}
+        for failure in (Unavailable, ConnectionError):
+            with self.subTest(failure=failure), durable_fixture() as (root, cloud, measure, clock, _, prepare):
+                started = clock["wall"]
+                cloud.api["s3"].get_object.side_effect = failure("temporary assignment read failure")
+                with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)), \
+                     self.assertRaises(TimeoutError):
+                    worker.run(cloud.api["s3"], "bucket", direct=True)
+                self.assertGreater(cloud.api["s3"].get_object.call_count, 3)
+                self.assertGreaterEqual(clock["wall"] - started, 100)
+                self.assertLessEqual(clock["wall"] - started, worker.ASSIGNMENT_WAIT_SECONDS)
+                self.assertEqual(worker.signal.setitimer.call_count, 1)
+                self.assertFalse((root / "persistent").exists())
+                self.assertNotIn(common.STATUS_KEY, cloud.objects)
+                self.assertNotIn(common.RESULTS_KEY, cloud.objects)
+                prepare.assert_not_called()
+                measure.assert_not_called()
+                self.assertTrue(all(call.kwargs["Key"] == common.WINDOW_KEY
+                                    for call in cloud.api["s3"].get_object.call_args_list))
+
+    def test_malformed_assignment_fails_without_polling_or_extending_alarm(self):
+        for body in (b"not json", b"[]"):
+            with self.subTest(body=body), durable_fixture() as (root, cloud, measure, clock, _, prepare):
+                cloud.objects[common.WINDOW_KEY] = body
+                with patch.object(worker.time, "sleep") as sleep, self.assertRaises(ValueError):
+                    worker.run(cloud.api["s3"], "bucket", direct=True)
+                sleep.assert_not_called()
+                self.assertEqual(cloud.api["s3"].get_object.call_count, 1)
+                self.assertEqual(worker.signal.setitimer.call_count, 1)
+                self.assertFalse((root / "persistent").exists())
+                prepare.assert_not_called()
+                measure.assert_not_called()
 
     def test_other_window_errors_are_not_treated_as_missing(self):
         with durable_fixture() as (_, cloud, measure, clock, _, prepare):

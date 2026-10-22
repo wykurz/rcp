@@ -435,7 +435,7 @@ Resources:
             ResultPath: $.observation
             TimeoutSeconds: 50
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.ClientExecutionTimeoutException, Lambda.TooManyRequestsException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.ClientExecutionTimeoutException, Lambda.TooManyRequestsException, Sandbox.Timedout, Lambda.Unknown, States.Timeout]
                 IntervalSeconds: 2
                 BackoffRate: 2
                 MaxAttempts: 6

@@ -430,7 +430,8 @@ class RevisedContractsTests(unittest.TestCase):
         boto3 = types.SimpleNamespace(client=Mock(return_value=sts), Session=Mock(return_value=session))
         config = types.SimpleNamespace(Config=Mock(return_value="single-attempt-config"))
         credentials = {"AccessKeyId": "dummy", "SecretAccessKey": "dummy", "SessionToken": "dummy"}
-        sts.assume_role_with_web_identity.side_effect = [ServiceError("Throttling", 429), {"Credentials": credentials}]
+        sts.assume_role_with_web_identity.side_effect = [ServiceError("Throttling", 429),
+            ServiceError("IDPCommunicationError", 400), {"Credentials": credentials}]
         response = io.BytesIO(b'{"value":"dummy-token"}')
         environment = {"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.invalid?request=1",
                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "dummy", "GITHUB_RUN_ID": "123"}
@@ -441,9 +442,66 @@ class RevisedContractsTests(unittest.TestCase):
              patch.object(common.time, "sleep") as sleep:
             self.assertEqual(controller.oidc_clients("us-east-1", "role"), {"safe": True})
         self.assertEqual(token.call_count, 2)
-        self.assertEqual(sts.assume_role_with_web_identity.call_count, 2)
-        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (1,)])
+        self.assertEqual(sts.assume_role_with_web_identity.call_count, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (1,), (2,)])
+        self.assertTrue(all(call.kwargs["DurationSeconds"] == 7200 and
+                            call.kwargs["RoleSessionName"] == "rcp-benchmark-123"
+                            for call in sts.assume_role_with_web_identity.call_args_list))
         clients.assert_called_once_with(session, "single-attempt-config")
+
+    def test_oidc_session_preserves_sts_errors_and_bounds_identity_provider_retries(self):
+        for code, attempts in (("IDPCommunicationError", 3), ("AccessDenied", 1), ("IDPRejectedClaim", 1),
+                               ("InvalidIdentityToken", 1), ("ExpiredToken", 1)):
+            with self.subTest(code=code):
+                sts = Mock()
+                error = ServiceError(code, 403 if code in ("AccessDenied", "IDPRejectedClaim") else 400)
+                sts.assume_role_with_web_identity.side_effect = error
+                boto3 = types.SimpleNamespace(client=Mock(return_value=sts), Session=Mock())
+                config = types.SimpleNamespace(Config=Mock(return_value="single-attempt-config"))
+                environment = dict(ACTIONS_ID_TOKEN_REQUEST_URL="https://example.invalid?request=1",
+                                   ACTIONS_ID_TOKEN_REQUEST_TOKEN="dummy", GITHUB_RUN_ID="123")
+                budget = Mock()
+                budget.left.return_value = 100
+                with patch.dict("sys.modules", {"boto3": boto3, "botocore.config": config}), \
+                     patch.dict(controller.os.environ, environment), \
+                     patch.object(controller.urllib.request, "urlopen", return_value=io.BytesIO(b'{"value":"dummy"}')) as token, \
+                     patch.object(common.time, "sleep") as sleep:
+                    with self.assertRaises(ServiceError) as caught:
+                        controller.oidc_session("us-east-1", "role", session_prefix="rcp-durable-",
+                                                duration_seconds=900, budget=budget, reserve=30)
+                self.assertIs(caught.exception, error)
+                token.assert_called_once()
+                self.assertEqual(sts.assume_role_with_web_identity.call_count, attempts)
+                self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)] if attempts == 3 else [])
+                self.assertTrue(all(call.args == (30,) for call in budget.left.call_args_list))
+                self.assertTrue(all(call.kwargs["DurationSeconds"] == 900 and
+                                    call.kwargs["RoleSessionName"] == "rcp-durable-123"
+                                    for call in sts.assume_role_with_web_identity.call_args_list))
+                boto3.Session.assert_not_called()
+                config.Config.assert_called_once_with(connect_timeout=5, read_timeout=15,
+                                                      retries={"total_max_attempts": 1})
+
+    def test_oidc_session_budget_exhaustion_stops_identity_provider_retries(self):
+        sts = Mock()
+        error = ServiceError("IDPCommunicationError", 400)
+        sts.assume_role_with_web_identity.side_effect = error
+        boto3 = types.SimpleNamespace(client=Mock(return_value=sts), Session=Mock())
+        config = types.SimpleNamespace(Config=Mock(return_value="single-attempt-config"))
+        environment = dict(ACTIONS_ID_TOKEN_REQUEST_URL="https://example.invalid?request=1",
+                           ACTIONS_ID_TOKEN_REQUEST_TOKEN="dummy", GITHUB_RUN_ID="123")
+        budget = Mock()
+        budget.left.side_effect = [60, 60, 1]
+        with patch.dict("sys.modules", {"boto3": boto3, "botocore.config": config}), \
+             patch.dict(controller.os.environ, environment), \
+             patch.object(controller.urllib.request, "urlopen", return_value=io.BytesIO(b'{"value":"dummy"}')), \
+             patch.object(common.time, "sleep") as sleep:
+            with self.assertRaisesRegex(TimeoutError, "no time for an operation retry") as caught:
+                controller.oidc_session("us-east-1", "role", session_prefix="rcp-durable-",
+                                        duration_seconds=900, budget=budget, reserve=30)
+        self.assertIs(caught.exception.__cause__, error)
+        sts.assume_role_with_web_identity.assert_called_once()
+        sleep.assert_not_called()
+        boto3.Session.assert_not_called()
 
     def test_operator_retries_fixed_key_writes_without_repeating_schedule_mutations(self):
         for key in (common.WINDOW_KEY, common.STATUS_KEY):

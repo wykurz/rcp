@@ -11,7 +11,8 @@ import json
 import re
 
 from .common import (DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
-                     durable_worker_reserve, durable_plan_contract, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
+                     durable_worker_reserve, durable_plan_contract, durable_minimum_runtime,
+                     validate_durable_hashes, validate_durable_pins, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
                      INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity)
 
 PROTOCOL = DIRECT_PROTOCOL
@@ -19,7 +20,7 @@ CAPACITY_SECONDS = DURABLE_MAX_PROVISIONING
 RUNTIME_SECONDS = DURABLE_MAX_RUNTIME
 GUARD_GAP_SECONDS = 120
 LAUNCH_ACK_SECONDS = 90
-DELIVERY_DRAIN_SECONDS = 15 * 60
+DELIVERY_DRAIN_SECONDS = durable_plan_contract(DURABLE_PLAN)["delivery_drain_seconds"]
 SHUTDOWN_ALLOWANCE_SECONDS = 16 * 60
 RETRY_SECONDS = 60
 MAX_ATTEMPTS = DIRECT_MAX_ATTEMPTS
@@ -31,12 +32,8 @@ TAG_ATTEMPT = "rcp:attempt"
 TAG_DEADLINE = "rcp:deadline"
 TAG_CREATED = "rcp:created-at"
 TAG_KEYS = {TAG_NAMESPACE, TAG_RUN, TAG_ATTEMPT, TAG_DEADLINE, TAG_CREATED}
-PIN_KEYS = {"region", "account", "namespace", "bucket", "lt_id", "lt_version", "ami", "source",
-            "subnet", "security_group", "profile_arn"}
-
-
-def minimum_runtime(plan=PLAN, *, exact=True):
-    return worker_minimum(plan, exact=exact) + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
+PIN_KEYS = frozenset(durable_plan_contract(PLAN)["pin_patterns"])
+minimum_runtime = durable_minimum_runtime
 
 
 def validate(value, *, exact=True):
@@ -56,24 +53,8 @@ def validate(value, *, exact=True):
     created, expiry, outer = (utc(value[k]) for k in ("created_at", "capacity_deadline", "outer_deadline"))
     require(0 < (expiry - created).total_seconds() <= contract["max_provisioning"], "capacity wait exceeds the recorded policy")
     require(outer == expiry + timedelta(seconds=seconds), "control reconciliation horizon differs")
-    hashes = value["sha256"]
-    require(isinstance(hashes, dict) and set(hashes) == set(contract["binaries"]), "unexpected binary manifest")
-    require(all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in hashes.values()),
-            "invalid binary digest")
-    require(all(hashes["baseline/" + name] == hashes["candidate/" + name]
-                for name in ("rcp", "rcpd", "filegen")), "A/A binaries differ")
-    pins = value["pins"]
-    require(isinstance(pins, dict) and set(pins) == PIN_KEYS, "unexpected deployment pins")
-    for key, pattern in {"lt_id": r"lt-[0-9a-f]{17}", "lt_version": r"[1-9][0-9]*",
-                         "ami": r"ami-[0-9a-f]{17}", "source": r"[0-9a-f]{40}",
-                         "subnet": r"subnet-[0-9a-f]{8,17}", "security_group": r"sg-[0-9a-f]{8,17}",
-                         "region": r"[a-z]{2}-[a-z]+-[0-9]", "account": r"[0-9]{12}",
-                         "namespace": r"[a-zA-Z][a-zA-Z0-9-]{0,47}",
-                         "bucket": r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"}.items():
-        require(isinstance(pins[key], str) and re.fullmatch(pattern, pins[key]), "invalid pin: " + key)
-    require(isinstance(pins["profile_arn"], str) and re.fullmatch(
-        r"arn:aws:iam::" + pins["account"] + r":instance-profile/[A-Za-z0-9+=,.@_/-]+", pins["profile_arn"]),
-        "invalid pinned instance profile")
+    validate_durable_hashes(value["sha256"], value["plan"], exact=exact)
+    validate_durable_pins(value["pins"], value["plan"], exact=exact)
     return value
 
 

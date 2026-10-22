@@ -5,8 +5,7 @@ It never requests a worker or opens an ASG; the direct launcher owns one allocat
 """
 
 import argparse
-import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import re
@@ -16,13 +15,13 @@ from benchmarks.strict_json import parse_json
 
 from . import durable
 from .account_security import dhmc_arn, verify_dhmc_disabled
-from .ami_image import image_shape
-from .common import (BINARIES, STATUS_KEY, WINDOW_KEY, digest, error_code, get_json,
-                     pending_status, put_json, require, utc)
+from .ami_image import image_shape, launch_template_data, verify_startup
+from .common import (BINARIES, STATUS_KEY, Budget, digest, pending_status, put_json,
+                     require, retry_io, utc)
 from .controller import read_binary
 from .durable_aws import Configuration, REQUEST, Service, clients, verify_launch_data
 from .identity import load as load_identity
-from .mailbox import claim
+from .mailbox import claim, verify_previous_window
 
 
 def reservation(request, quote, now):
@@ -45,44 +44,37 @@ def reservation(request, quote, now):
     return dict(quote=quote, projection=cost, reserved_total_usd=str(prior + amount))
 
 
-def verify_image(service):
+def verify_image(service, *, budget=None):
+    budget = budget or Budget(datetime.now(timezone.utc) + timedelta(seconds=60), ceiling_seconds=60)
+    def read(operation):
+        return retry_io(operation, budget)
     config = service.config
-    response = service.api["ec2"].describe_launch_template_versions(LaunchTemplateId=config.lt_id,
-                                                                  Versions=[config.lt_version])
-    versions = response["LaunchTemplateVersions"]
-    require(len(versions) == 1 and str(versions[0]["VersionNumber"]) == config.lt_version,
-            "numeric launch version not found")
-    data = verify_launch_data(config, versions[0]["LaunchTemplateData"])
-    userdata = base64.b64decode(data["UserData"], validate=True).decode()
-    import yaml
-    template = yaml.safe_load(Path(__file__).with_name("stack.yaml").read_text())
-    expected = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-    expected = expected.replace("${WorkerProtocol}", "direct").replace("${Artifacts}", config.bucket).replace(
-        "${AWS::Region}", config.region)
-    require(userdata == expected, "launch template differs from exact reviewed direct guest startup")
-    images = service.api["ec2"].describe_images(ImageIds=[config.ami], Owners=[config.account])["Images"]
-    require(len(images) == 1 and images[0]["State"] == "available" and not images[0].get("Public") and
-            images[0].get("RootDeviceName") == "/dev/sda1" and images[0].get("RootDeviceType") == "ebs" and
-            images[0].get("Architecture") == "x86_64", "worker image must be compatible, private and account-owned")
+    data = verify_launch_data(config, launch_template_data(service.api["ec2"], config.lt_id,
+                                                           config.lt_version, read=read))
+    verify_startup(data, "direct", config.bucket, config.region)
+    images = read(lambda: service.api["ec2"].describe_images(ImageIds=[config.ami], Owners=[config.account]))["Images"]
+    require(len(images) == 1 and images[0]["State"] == "available" and not images[0].get("Public"),
+            "worker image must be compatible, private and account-owned")
     root = image_shape(images[0])
-    require(root.get("Encrypted") is True and 0 < root.get("VolumeSize", 0) <= 16, "invalid encrypted image root")
-    snapshots = service.api["ec2"].describe_snapshots(SnapshotIds=[root["SnapshotId"]], OwnerIds=[config.account])["Snapshots"]
+    require(root.get("Encrypted") is True, "invalid encrypted image root")
+    snapshots = read(lambda: service.api["ec2"].describe_snapshots(
+        SnapshotIds=[root["SnapshotId"]], OwnerIds=[config.account]))["Snapshots"]
     require(len(snapshots) == 1 and snapshots[0].get("State") == "completed" and snapshots[0].get("Encrypted") is True
             and snapshots[0].get("SnapshotId") == root["SnapshotId"] and snapshots[0].get("VolumeSize") == root["VolumeSize"],
             "root snapshot differs from reviewed image")
     key_arn = snapshots[0].get("KmsKeyId", "")
     require(re.fullmatch(r"arn:aws:kms:" + re.escape(config.region) + ":" + config.account + r":key/[0-9a-f-]{36}", key_arn),
             "snapshot KMS identity differs")
-    key = service.api["kms"].describe_key(KeyId=key_arn)["KeyMetadata"]
+    key = read(lambda: service.api["kms"].describe_key(KeyId=key_arn))["KeyMetadata"]
     require(key.get("Arn") == key_arn and key.get("AWSAccountId") == config.account and key.get("KeyManager") == "AWS"
             and key.get("KeyState") == "Enabled" and key.get("KeyUsage") == "ENCRYPT_DECRYPT"
             and key.get("KeySpec") == "SYMMETRIC_DEFAULT", "custom or unavailable root encryption key is unsupported")
-    alias = service.api["kms"].describe_key(KeyId="alias/aws/ebs")["KeyMetadata"]
+    alias = read(lambda: service.api["kms"].describe_key(KeyId="alias/aws/ebs"))["KeyMetadata"]
     require(alias.get("Arn") == key_arn, "root snapshot does not use the exact AWS-managed EBS key")
-    permissions = service.api["ec2"].describe_image_attribute(ImageId=config.ami, Attribute="launchPermission")
+    permissions = read(lambda: service.api["ec2"].describe_image_attribute(ImageId=config.ami, Attribute="launchPermission"))
     require(permissions.get("LaunchPermissions") == [], "worker image is shared")
-    subnet = service.api["ec2"].describe_subnets(SubnetIds=[config.subnet])["Subnets"]
-    groups = service.api["ec2"].describe_security_groups(GroupIds=[config.security_group])["SecurityGroups"]
+    subnet = read(lambda: service.api["ec2"].describe_subnets(SubnetIds=[config.subnet]))["Subnets"]
+    groups = read(lambda: service.api["ec2"].describe_security_groups(GroupIds=[config.security_group]))["SecurityGroups"]
     require(len(subnet) == len(groups) == 1 and subnet[0]["OwnerId"] == config.account and
             subnet[0]["State"] == "available" and subnet[0]["VpcId"] == groups[0]["VpcId"] and
             groups[0]["OwnerId"] == config.account and groups[0].get("IpPermissions") == [],
@@ -104,30 +96,30 @@ def arm(service, request, quote):
     allocation = reservation(request, quote, service.now())
     require(0 <= (service.now() - utc(request["created_at"])).total_seconds() <= 120,
             "prepare a fresh immutable request after the builds finish")
-    response = service.api["dynamodb"].get_item(TableName=service.config.table,
-        Key={"pk": {"S": "lease"}}, ConsistentRead=True)
+    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60), ceiling_seconds=60)
+    response = retry_io(lambda: service.api["dynamodb"].get_item(TableName=service.config.table,
+        Key={"pk": {"S": "lease"}}, ConsistentRead=True), budget)
     require(not response.get("Item"), "existing lease must be physically reconciled and retired manually")
     service.fresh_guard()
     require(not any(i["State"]["Name"] != "terminated" for i in service.inventory()), "physical managed worker exists")
     verify_management(service)
-    verify_image(service)
+    verify_image(service, budget=budget)
     service.fresh_guard()
+    verify_previous_window(service.api["s3"], service.config.bucket, request["run"], service.now, budget)
+    budget.left()
+    require(0 <= (service.now() - utc(request["created_at"])).total_seconds() <= 120,
+            "operator preflight exhausted the fresh-request allowance")
     owner = claim(service.api["s3"], service.config.bucket, durable.PROTOCOL, request)
-    try:
-        previous = get_json(service.api["s3"], service.config.bucket, WINDOW_KEY)
-    except Exception as error:
-        if error_code(error) not in {"NoSuchKey", "404"}:
-            raise
-    else:
-        require(isinstance(previous, dict) and utc(previous["deadline"]) < service.now(),
-                "previous mailbox window has not expired")
     state = durable.initial_lease(request)
     state["reservation"] = allocation
+    budget.left()
     service.api["dynamodb"].put_item(TableName=service.config.table,
         Item={"pk": {"S": "lease"}, "revision": {"N": "0"}, "payload": {"S": json.dumps(state, sort_keys=True)}},
         ConditionExpression="attribute_not_exists(pk)")
     # failures retain ownership; no automatic retry can replace the armed lease
+    budget.left()
     put_json(service.api["s3"], service.config.bucket, REQUEST, request)
+    budget.left()
     put_json(service.api["s3"], service.config.bucket, STATUS_KEY, pending_status(request["run"]))
     return dict(protocol=durable.PROTOCOL, state="armed-not-launched", request=request,
                 reservation=allocation, mailbox_owner=owner)

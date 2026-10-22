@@ -8,27 +8,22 @@ import html
 import os
 from pathlib import Path
 import re
-import urllib.request
 
 from benchmarks.strict_json import parse_json
 from . import durable, identity
-from .common import (BINARIES, MAX_RESULT, RESULTS_KEY, STATUS_KEY, Budget, digest, error_code, get_bytes,
+from .common import (BINARIES, MAX_RESULT, RESULTS_KEY, STATUS_KEY, Budget, digest, durable_plan_contract, error_code, get_bytes,
                      require, retry_io, utc)
-from .controller import read_binary
-from .durable_aws import RECEIPT, REQUEST
+from .controller import oidc_session, read_binary
+from .durable_aws import MAX_RECEIPT, RECEIPT, REQUEST
+from .json_bytes import encoded
 
 
-MAX_RECEIPT = 100_000
 SHORT_JOB_SECONDS = 600
 
 
 def short_budget():
     return Budget(datetime.now(timezone.utc) + timedelta(seconds=SHORT_JOB_SECONDS),
                   ceiling_seconds=SHORT_JOB_SECONDS)
-
-
-def encoded(value):
-    return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
 
 def read_json(api, bucket, key, limit=MAX_RECEIPT, *, budget=None):
@@ -147,7 +142,8 @@ def verify_cleanup(observation, request, binding):
             and cleanup["lease_released"] is False and type(cleanup["allocation_consumed"]) is bool
             and cleanup["allocation_consumed"] is observation.get("allocation_consumed"),
             "invalid physical cleanup receipt")
-    earliest = utc(request["outer_deadline"]) + timedelta(seconds=durable.DELIVERY_DRAIN_SECONDS)
+    drain_seconds = durable_plan_contract(request["plan"], exact=False)["delivery_drain_seconds"]
+    earliest = utc(request["outer_deadline"]) + timedelta(seconds=drain_seconds)
     require(earliest <= utc(cleanup["verified_at"]) <= utc(observation["observed_at"]),
             "cleanup receipt has not drained the independent cutoff")
     seen = observation.get("seen")
@@ -171,6 +167,31 @@ def verify_cleanup(observation, request, binding):
     return True
 
 
+class _RetainedReceipt(Exception):
+    """A distinct earlier run's receipt has not yet been overwritten by this run."""
+
+
+def bind_receipt_request(observation, request, machine, *, running, now):
+    require(isinstance(observation, dict) and observation.get("protocol") == durable.PROTOCOL,
+            "invalid watchdog receipt")
+    if observation.get("request") == request:
+        return
+    # validate the old request's structure and scope, not its cleanup or results.
+    # those fields are retained only as raw diagnostics and never used for this run.
+    prior = durable.validate(observation.get("request"), exact=False)
+    require(running and prior["run"] != request["run"]
+            and utc(prior["created_at"]) < utc(request["created_at"]),
+            "watchdog receipt does not match the operator request")
+    require(all(prior["pins"][key] == request["pins"][key]
+                for key in ("bucket", "account", "region", "namespace")), "retained receipt scope differs")
+    require(observation.get("phase") == "complete"
+            and utc(prior["created_at"]) <= utc(observation["observed_at"]) <= utc(request["created_at"]) <= now,
+            "receipt does not precede the current request")
+    require("execution_arn" in observation and observation["execution_arn"] in (
+        None, execution_arn(machine, prior["run"])), "retained receipt execution binding differs")
+    raise _RetainedReceipt
+
+
 def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timezone.utc), budget=None):
     budget = budget or short_budget()
     request = operator_request(api, bucket, run=run, exact=False, budget=budget)
@@ -178,6 +199,7 @@ def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timez
     expected = producer(request)
     execution = describe(api, machine, run, budget=budget)
     require(execution is not None, "no submission exists for this run")
+    running = execution["status"] == "RUNNING"
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     write(output, "identity.json", encoded(expected))
@@ -188,16 +210,17 @@ def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timez
     stage = "watchdog receipt read"
     try:
         raw = retry_io(lambda: get_bytes(api["s3"], bucket, RECEIPT, MAX_RECEIPT), budget)
+        stage = "watchdog receipt export"
         write(output, "durable.json", raw)
         stage = "watchdog receipt structure and request binding"
         observation = parse_json(raw.decode("utf-8"))
-        require(isinstance(observation, dict) and observation.get("protocol") == durable.PROTOCOL
-                and observation.get("request") == request, "watchdog receipt does not match the operator request")
+        bind_receipt_request(observation, request, machine, running=running, now=now())
         execution_bound = observation.get("execution_arn") == execution["executionArn"]
         no_launch = dict(execution_arn=None, attempt=None, attempts=0, allocation_consumed=False,
                          launch_outcome="none", known_instance_ids=[], binding=None, seen={},
                          runtime_verified=False, worker_published=False)
-        unlaunched = (execution["status"] in ("RUNNING", "FAILED", "TIMED_OUT", "ABORTED")
+        unlaunched = ((execution["status"] in ("RUNNING", "FAILED", "TIMED_OUT", "ABORTED")
+                      or execution["status"] == "SUCCEEDED" and observation.get("phase") == "complete")
             and observation.get("phase") in ("armed", "closing", "complete")
             and all(key in observation and observation[key] == value for key, value in no_launch.items()))
         require(execution_bound or unlaunched, "watchdog execution binding differs")
@@ -229,22 +252,32 @@ def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timez
                 write(output, "results.zip", archive)
                 receipt["archive_sha256"] = digest(archive)
                 require(receipt["archive_sha256"] == status["sha256"], "archive differs from worker status")
-        if receipt["cleanup"] == "verified" and execution["status"] != "RUNNING":
-            admitted = (binding is not None and observation.get("runtime_verified") is True
+        if not running:
+            admitted = (receipt["cleanup"] == "verified" and binding is not None
+                        and observation.get("runtime_verified") is True
                         and observation.get("worker_published") is True
                         and set(observation["seen"]) == {binding["instance_id"]})
             receipt["outcome"] = "success" if (execution["status"] == "SUCCEEDED" and admitted
                 and status.get("state") == "completed" and status.get("success") is True
                 and receipt["archive_sha256"]) else "failure"
+    except _RetainedReceipt:
+        receipt["collection_message"] = (
+            "Only an earlier run's watchdog receipt is published; collect this running execution again later.")
     except Exception as error:
-        message = "Durable collection could not verify " + stage + "; raw evidence is retained."
-        receipt.update(outcome="failure", collection_error=type(error).__name__, collection_message=message)
-        raise ValueError(message) from error
+        if stage == "watchdog receipt read" and code(error) == "NoSuchKey" and running:
+            # the first watchdog publication may lag submission; absence proves neither no launch nor cleanup
+            receipt["collection_message"] = (
+                "Watchdog receipt is not yet published; collect this running execution again later.")
+        else:
+            message = "Durable collection could not verify " + stage + "; raw evidence is retained."
+            receipt.update(outcome="failure", collection_error=type(error).__name__, collection_message=message)
+            raise ValueError(message) from error
     finally:
         write(output, "controller.json", encoded(receipt))
         terminal = execution["status"] in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED")
         conclusion = "pending" if receipt["outcome"] == "incomplete" else receipt["outcome"]
-        result = dict(run=run, state="complete" if receipt["cleanup"] == "verified" and terminal else "pending",
+        result = dict(run=run, state="complete" if receipt["cleanup"] == "verified" and terminal else (
+            "pending" if running else "held"),
             execution_status=execution["status"], cleanup=receipt["cleanup"],
             execution_binding="exact" if execution_bound else ("not-launched" if unlaunched else "unconfirmed"),
             worker_reported_success=isinstance(status, dict) and status.get("state") == "completed" and status.get("success") is True,
@@ -317,22 +350,9 @@ def validate_offline(source, output):
 
 
 def oidc_clients(region, role, *, budget=None):
-    import boto3
-    from botocore.config import Config
     budget = budget or short_budget()
-    config = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 1})
-    request = urllib.request.Request(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com",
-        headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-    def token_request():
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return json.load(response)["value"]
-    token = retry_io(token_request, budget, reserve=30)
-    sts = boto3.client("sts", region_name=region, config=config)
-    credentials = retry_io(lambda: sts.assume_role_with_web_identity(
-        RoleArn=role, RoleSessionName="rcp-durable-" + os.environ["GITHUB_RUN_ID"],
-        WebIdentityToken=token, DurationSeconds=900), budget, reserve=30)["Credentials"]
-    session = boto3.Session(region_name=region, aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"], aws_session_token=credentials["SessionToken"])
+    session, config = oidc_session(region, role, session_prefix="rcp-durable-", duration_seconds=900,
+                                   budget=budget, reserve=30)
     return {service: session.client(service, config=config) for service in ("s3", "stepfunctions")}
 
 

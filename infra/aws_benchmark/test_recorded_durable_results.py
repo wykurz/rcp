@@ -32,32 +32,31 @@ def replace_worker(root, policy, mutate):
 
 
 class RecordedDurableResultTests(unittest.TestCase):
-    def test_current_policy_changes_do_not_reinterpret_historical_bundles(self):
-        mutations = {
-            "DURABLE_PLAN": (dict(common.DURABLE_PLAN, version="bulk-metadata-plan-v2"), "not current"),
-            "DURABLE_MAX_RUNTIME": (10000, "runtime does not fit"),
-            "DURABLE_MAX_PROVISIONING": (60, "provisioning deadline"),
-            "BINARIES": (common.BINARIES + ("candidate/future-tool",), "unexpected binary list"),
-        }
-        for name, (value, reason) in mutations.items():
-            with self.subTest(policy=name), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                source, output = root / "source", root / "report"
-                expected, policy = durable_bundle(source, direct=True)
-                original = (source / "results.zip").read_bytes()
-                before, raw, _ = results.inspect(source, expected, "success")
-                self.assertEqual(before["errors"], [])
-                with patch.object(common, name, value):
-                    evidence = results.ingest(source, output, expected, "success")
-                    self.assertEqual(evidence["errors"], [])
-                    self.assertFalse(evidence["history_eligible"])
-                    derived = json.loads((output / "derived.json").read_bytes())
-                    self.assertEqual(derived["context"]["verification"], raw["context"]["verification"])
-                    self.assertEqual(derived["trials"], raw["trials"])
-                    self.assertTrue((output / "dashboard/index.html").is_file())
-                    self.assertEqual((output / "raw/results.zip").read_bytes(), original)
-                    with self.assertRaisesRegex(ValueError, reason):
-                        results.validate_qualification(before, raw, policy)
+    def test_current_version_changes_do_not_reinterpret_historical_bundles(self):
+        v2 = common.durable_plan_contract(common.DURABLE_PLAN)
+        v2.update(plan=dict(v2["plan"], version="bulk-metadata-plan-v2"), max_runtime=12000,
+                  max_provisioning=60000, max_attempts=999, delivery_drain_seconds=1200,
+                  binary_names=v2["binary_names"] + ("future-tool",),
+                  pin_patterns=dict(v2["pin_patterns"], future="reviewed"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "source", root / "report"
+            expected, policy = durable_bundle(source, direct=True)
+            original = (source / "results.zip").read_bytes()
+            before, raw, _ = results.inspect(source, expected, "success")
+            self.assertEqual(before["errors"], [])
+            with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {v2["plan"]["version"]: v2}), \
+                 patch.object(common, "DURABLE_PLAN", v2["plan"]):
+                evidence = results.ingest(source, output, expected, "success")
+                self.assertEqual(evidence["errors"], [])
+                self.assertFalse(evidence["history_eligible"])
+                derived = json.loads((output / "derived.json").read_bytes())
+                self.assertEqual(derived["context"]["verification"], raw["context"]["verification"])
+                self.assertEqual(derived["trials"], raw["trials"])
+                self.assertTrue((output / "dashboard/index.html").is_file())
+                self.assertEqual((output / "raw/results.zip").read_bytes(), original)
+                with self.assertRaisesRegex(ValueError, "not current"):
+                    results.validate_qualification(before, raw, policy)
 
     def test_recorded_contract_is_an_independent_versioned_snapshot(self):
         original = common.durable_plan_contract(common.DURABLE_PLAN, exact=False)
@@ -92,14 +91,18 @@ class RecordedDurableResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, reason):
                     results.historical_inputs(changed, expected)
 
-    def test_historical_attempt_bound_is_independent_of_current_attempt_admission(self):
+    def test_historical_attempt_bound_is_independent_of_current_version(self):
         window = direct_window()
         window["attempt_id"] = window["run"] + "-720"
-        with patch.object(common, "DIRECT_MAX_ATTEMPTS", 1):
+        v2 = common.durable_plan_contract(common.DURABLE_PLAN)
+        v2.update(plan=dict(v2["plan"], version="bulk-metadata-plan-v2"), max_attempts=1)
+        with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {v2["plan"]["version"]: v2}), \
+             patch.object(common, "DURABLE_PLAN", v2["plan"]):
             self.assertEqual(common.validate_durable_window(window, now=common.utc(window["launch_at"]),
                                                            minimum=0, exact=False), common.utc(window["deadline"]))
+            current = dict(window, plan=v2["plan"])
             with self.assertRaisesRegex(ValueError, "invalid direct attempt identity"):
-                common.validate_durable_window(window, now=common.utc(window["launch_at"]), minimum=0)
+                common.validate_durable_window(current, now=common.utc(current["launch_at"]), minimum=0)
         for suffix in ("0", "01", "721", "1.0", "1x", "9" * 400):
             with self.subTest(suffix=suffix), self.assertRaisesRegex(ValueError, "invalid direct attempt identity"):
                 common.validate_attempt_id(window["run"], window["run"] + "-" + suffix)
@@ -118,6 +121,40 @@ class RecordedDurableResultTests(unittest.TestCase):
                 self.assertFalse(evidence["history_eligible"])
                 self.assertTrue((output / "dashboard/index.html").is_file())
                 self.assertEqual((output / "raw/results.zip").read_bytes(), (source / "results.zip").read_bytes())
+
+    def test_timing_labels_reject_arbitrary_json_and_unbounded_or_control_text(self):
+        for direct in (False, True):
+            for key in ("timing_basis", "runtime_origin"):
+                for value in ({"claim": "measured"}, ["launch_at"], 1, True, "", "x" * 257, "launch_at\n"):
+                    with self.subTest(direct=direct, key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        source, output = root / "source", root / "report"
+                        expected, policy = durable_bundle(source, direct=direct)
+                        replace_worker(source, policy, lambda worker: worker.update({key: value}))
+                        evidence = results.ingest(source, output, expected, "success", qualification=policy)
+                        self.assertFalse(evidence["qualification_accepted"])
+                        self.assertIn("worker metadata: invalid worker timing labels", evidence["errors"])
+                        self.assertIsNotNone(evidence["worker"])
+                        self.assertFalse((output / "derived.json").exists())
+                        self.assertEqual((output / "raw/results.zip").read_bytes(), (source / "results.zip").read_bytes())
+
+    def test_historical_timing_text_and_missing_labels_remain_diagnostic_not_qualified(self):
+        for direct in (False, True):
+            for labels in ({"timing_basis": "measured complete run"}, {"runtime_origin": "worker start"},
+                           {"timing_basis": None}, {"runtime_origin": None}):
+                with self.subTest(direct=direct, labels=labels), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source, output = root / "source", root / "report"
+                    expected, policy = durable_bundle(source, direct=direct)
+                    replace_worker(source, policy, lambda worker: worker.update(labels))
+                    evidence = results.ingest(source, output, expected, "success", qualification=policy)
+                    self.assertFalse(evidence["qualification_accepted"])
+                    self.assertEqual(evidence["errors"], ["qualification: unverified worker timing labels"])
+                    derived = json.loads((output / "derived.json").read_bytes())
+                    timing = derived["context"]["aws_provenance"]["timing"]
+                    for name, value in labels.items():
+                        self.assertEqual(timing["basis" if name == "timing_basis" else name], value)
+                    self.assertFalse(derived["context"]["aws_provenance"]["history_eligible"])
 
     def test_recorded_timing_text_is_copied_verbatim_and_missing_values_stay_unknown(self):
         for direct in (False, True):
