@@ -1,0 +1,122 @@
+name: AWS production benchmark
+
+# Initially inert. Schedule activation and the production IAM trust are separate approvals.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full source SHA for the initial four-copy A/A qualification (blank uses main)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && vars.RCP_AWS_PRODUCTION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      - id: source
+        env:
+          REVISION: ${{ inputs.revision || github.sha }}
+          REQUESTER_ID: ${{ github.actor_id }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          # early UI guard only; signed server identity and central policy authorize the cost
+          assert os.environ['REQUESTER_ID'] == '483465', 'Only the repository owner may request acceptance'
+          revision = os.environ['REVISION']
+          assert re.fullmatch(r'[0-9a-f]{40}', revision), 'A full commit SHA is required'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('revision=' + revision + '\n')
+          PY
+
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: --cfg tokio_unstable
+      PKG_CONFIG_ALLOW_CROSS: '1'
+    # no OIDC, production environment, cloud credentials or shared candidate build cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: x86_64-unknown-linux-musl
+          cache: false
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: just
+      - name: Build one immutable A/A artifact before admission
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils musl-tools pkg-config
+          sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+          just build-release
+          mkdir -p "$RUNNER_TEMP/binaries"
+          for name in rcp rcpd filegen; do
+            install -m 0755 "target/x86_64-unknown-linux-musl/release/$name" "$RUNNER_TEMP/binaries/$name"
+            strip --strip-debug "$RUNNER_TEMP/binaries/$name"
+            size=$(stat -c %s "$RUNNER_TEMP/binaries/$name")
+            test "$size" -gt 0 && test "$size" -le 134217728
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-aa-binaries
+          path: ${{ runner.temp }}/binaries/
+          retention-days: 1
+          if-no-files-found: error
+
+  submit:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    # convenience only: central transactions, immutable run keys and independent expiry enforce safety
+    concurrency:
+      group: aws-production-submit
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: production-aa-binaries
+          path: ${{ runner.temp }}/candidate-data
+      - name: Install the pinned submission SDK
+        run: python3 -m pip install --require-hashes -r infra/aws_benchmark/requirements.txt
+      - name: Reserve, upload data and submit the existing run
+        env:
+          REVISION: ${{ needs.validate.outputs.revision }}
+          REGION: ${{ vars.RCP_AWS_PRODUCTION_REGION }}
+          ROLE: ${{ vars.RCP_AWS_PRODUCTION_SUBMIT_ROLE }}
+          FUNCTION: ${{ vars.RCP_AWS_PRODUCTION_ADMISSION_FUNCTION }}
+          BUCKET: ${{ vars.RCP_AWS_PRODUCTION_BUCKET }}
+          AUDIENCE: ${{ vars.RCP_AWS_PRODUCTION_AUDIENCE }}
+        run: |
+          python3 -m infra.aws_benchmark.production_client \
+            --binaries "$RUNNER_TEMP/candidate-data" --revision "$REVISION" \
+            --receipt "$RUNNER_TEMP/production-admission.json" \
+            --region "$REGION" --role "$ROLE" --function "$FUNCTION" \
+            --bucket "$BUCKET" --audience "$AUDIENCE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: production-admission-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-admission.json
+          retention-days: 90
+          if-no-files-found: warn

@@ -1,0 +1,19 @@
+# Isolated admission-only closure; existing workers retain requirements.txt.
+# Targets CPython 3.12 x86_64 AL2023 (glibc 2.34) and CPython 3.14 Linux tests.
+# cryptography uses cp39-abi3 manylinux_2_34; cffi has cp312/cp314 manylinux2014 wheels.
+# Other additions are universal wheels; dependencies for Python <3.11 are out of scope.
+# Primary wheel metadata:
+# https://pypi.org/pypi/PyJWT/2.15.1/json
+# https://pypi.org/pypi/cryptography/50.0.2/json
+# https://pypi.org/pypi/cffi/2.1.1/json
+# https://pypi.org/pypi/pycparser/3.12/json
+-r requirements.txt
+PyJWT==2.15.1 \
+    --hash=sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193
+cryptography==50.0.2 \
+    --hash=sha256:1981f1db4630889b9ef7803fadef12b056f428cb6b85c27ba57b774793b6093c
+cffi==2.1.1 \
+    --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf \
+    --hash=sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96
+pycparser==3.12 \
+    --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e

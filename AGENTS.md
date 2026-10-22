@@ -31,7 +31,10 @@ nix develop  # automatically includes just and all dev tools
 
 Install `jq` and the Python PyYAML package (often named `python3-yaml`) with your system package
 manager, and install the report dependencies from `scripts/report-site-requirements.txt` in your
-Python environment. These are required by `just lint`. Then install the remaining tools:
+Python environment. Offline AWS safety tests additionally require the pinned SDK and
+JWT/cryptography closure in `infra/aws_benchmark/production-requirements.txt` (CPython 3.12 or 3.14,
+Linux x86_64), or the dependencies provided by `nix develop`. These tests do not call AWS. The
+report and AWS dependencies are required by `just lint`. Then install the remaining tools:
 
 ```bash
 ./scripts/cargo-install-host.sh just
