@@ -13,15 +13,17 @@ permission, which requires separate deployment approval. Read
 ## Request and execution
 
 Build pinned revisions without AWS credentials first. Identical A/A revisions build once and use the
-same baseline artifact for both roles, avoiding drift between independent build runners. A trusted
-operator prepares and arms one exclusive request with the six binary hashes, controller revision,
-region, subnet, security group, instance profile, AMI, numeric launch-template version, suite and
-immutable timing plan. The first qualification supports only `bulk-1g-metadata` with identical
-revisions and identical binary bytes. It retains four adjacent, balanced local A/A copies and the
-existing cold-cache behavior. Initial and per-trial file-content hashing are disabled. Path, type,
-count, size and required metadata checks, copy exit status and timeouts still apply; these checks do
-not prove content integrity or detect same-size corruption. The existing 1,200-second per-copy
-timeout is unchanged.
+same baseline artifact for both roles, avoiding drift between independent build runners. For
+`prepare --binaries binaries`, copy that one artifact's `rcp`, `rcpd` and `filegen` into both
+`binaries/baseline/` and `binaries/candidate/`; the six input paths must contain the same bytes for
+each matching binary. A trusted operator prepares and arms one exclusive request with the six binary
+hashes, controller revision, region, subnet, security group, instance profile, AMI, numeric
+launch-template version, suite and immutable timing plan. The first qualification supports only
+`bulk-1g-metadata` with identical revisions and identical binary bytes. It retains four adjacent,
+balanced local A/A copies and the existing cold-cache behavior. Initial and per-trial file-content
+hashing are disabled. Path, type, count, size and required metadata checks, copy exit status and
+timeouts still apply; these checks do not prove content integrity or detect same-size corruption.
+The existing 1,200-second per-copy timeout is unchanged.
 
 A short GitHub job uploads the prebuilt binaries and starts one Standard Step Functions execution.
 Its name binds the original workflow run ID and attempt. GitHub does not hold credentials or a
@@ -180,12 +182,15 @@ in chat, the repository or GitHub settings.
    implicitly create code storage or grant access to customer-managed KMS keys.
 3. Build a reviewed image containing `rcp-direct-v1`. Prepare a separate unused numeric launch
    version with `WorkerProtocol=direct`, a pinned AMI and the 10,800-second supervisor; record the
-   exact version in the direct configuration. Do not select it on the ASG or change the template's
-   default. Updating the worker stack itself would select its latest version on the ASG and is not
-   an interchangeable preparation step. Legacy arming requires the exact reviewed operator-window
-   startup and refuses direct user data before opening capacity. Preserve the AWS-managed EBS key,
-   disposable root volume, disabled DHMC and image provenance checks. Worker-role permissions do not
-   expand.
+   exact version in the direct configuration. For its exact `UserData`, import `reviewed_startup`
+   from `infra.aws_benchmark.ami_image` and encode
+   `base64.b64encode(reviewed_startup("direct", bucket, region).encode()).decode()` with the
+   reviewed bucket and region. Rendering is offline; creating the unused version remains a separate
+   reviewed operator action. Do not select it on the ASG or change the template's default. Updating
+   the worker stack itself would select its latest version on the ASG and is not an interchangeable
+   preparation step. Legacy arming requires the exact reviewed operator-window startup and refuses
+   direct user data before opening capacity. Preserve the AWS-managed EBS key, disposable root
+   volume, disabled DHMC and image provenance checks. Worker-role permissions do not expand.
 4. Record the dedicated namespace, lease table, runtime schedule group, termination role,
    state-machine ARN and GitHub role ARN. Configure protected environment `aws-benchmark-durable`
    with required review and exact main branch. Do not enable admission during deployment testing.
@@ -207,9 +212,28 @@ schedule groups or retire the lease while an attempt is unresolved. Service-role
 continue independently of the operator's SSO expiry, but deployment and subsequent manual recovery
 still require a usable operator identity.
 
+To stop an existing capacity wait, first close admission and record the exact execution ARN and
+retained request/attempt identities. An operator who already has separately authorized
+`states:StopExecution` access may stop that exact execution; this setup does not grant that
+permission. Stopping orchestration does not roll back Lambda invocations or EC2 requests already
+issued. Keep `RuntimeEnabled=true`, the expiry guard and all immutable cutoff schedules active.
+Reconcile the saved launch token and any in-flight attempt; an empty inventory is not proof of no
+allocation. If a bound worker exists, use the existing authorized termination path for its verified
+instance ID and confirm its termination and root deletion. Retain the lease and mailbox owner
+through the full reconciliation horizon, delivery drain and physical cleanup before retirement.
+Stopping the execution or closing admission alone is not cleanup and never justifies removing a
+cutoff.
+
 ### Packaging and operation
 
-Use a build Python environment with pip and PyYAML; the minimal runtime environment may omit pip.
+Use a local CPython 3.12 virtual environment with the operator dependencies:
+
+```sh
+python -m pip install --require-hashes -r infra/aws_benchmark/operator-requirements.txt
+```
+
+This adds pinned PyYAML for operator image verification to the pinned SDK. The worker and Lambda use
+only `requirements.txt`, so operator-only dependency changes do not change their installed packages.
 Download the hash-pinned wheels from `requirements.txt` into a scratch wheel directory separately.
 Then:
 
@@ -246,7 +270,13 @@ using `aws-benchmark-durable-collect.yml` and the original run ID-attempt. The c
 fetches bounded opaque archives; a separate job parses and qualifies them without cloud credentials.
 An in-progress collection is labeled pending, not failed qualification. Cleanup evidence is retained
 even if qualification failed. Historical recorded plans remain readable; new qualification requires
-the current exact plan. Metadata-only labels remain explicit.
+the current exact plan. Both paths use the same immutable per-version workload bounds, paired binary
+manifest, deployment pin rules and cleanup delivery drain. Changed rules require a new reviewed
+version; unknown plans, pins and unequal A/A binary digests remain invalid. Metadata-only labels
+remain explicit. The collector cross-checks requested settings, supervisor metadata and harness
+records as consistency checks, not independent execution attestation. Candidate binaries share the
+harness UID and can forge candidate-owned measurement files; matching command settings and hashes
+cannot prove that those measurements are honest.
 
 Completed cleanup is terminal and preserves its original verification timestamp. If an early
 terminated instance never exposed its root ID, exact attempt-tag discovery may recover that ID;
@@ -260,4 +290,7 @@ cutoffs, execution and cleanup receipts before a separately reviewed manual reti
 bypass a held lease with another table, namespace or request ID. After physical and producer/drain
 reconciliation and saving results, inspect the exact mailbox-owner document and its current ETag. A
 separately approved operator retirement may delete only that key conditionally with `IfMatch` for
-the inspected ETag. Never unconditionally delete or replace an owner to make arming succeed.
+the inspected ETag. Never unconditionally delete or replace an owner to make arming succeed. Follow
+the shared [mailbox retirement procedure](MAILBOX_RETIREMENT.md), including direct lease
+reconciliation and conditional lease retirement before the owner. A terminal execution or an expired
+request alone is insufficient, especially after an ambiguous allocation or partial arm.

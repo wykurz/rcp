@@ -1,20 +1,17 @@
 """Trusted operator only: arm a fresh, bounded window without launching an instance."""
 
 import argparse
-import base64
 from datetime import datetime, timedelta, timezone
 import json
 import re
-from pathlib import Path
-
-import yaml
 
 from .account_security import dhmc_arn, verify_dhmc_disabled
+from .ami_image import launch_template_data, verify_startup
 from .common import (INSTANCE_TYPE, MAX_OPEN_LEAD, MIN_WINDOW, STATUS_KEY, SUSPEND, WINDOW_KEY, Budget,
-                     checked_clients, error_code, get_json, group, live_instances, pending_status, put_json,
+                     checked_clients, get_json, group, live_instances, pending_status, put_json,
                      require, retry_io, scheduled, timestamp, utc,
                      validate_admission, validate_window, verify_close, verify_group)
-from .mailbox import claim
+from .mailbox import claim, verify_previous_window
 
 
 def operator_clients(region):
@@ -59,21 +56,11 @@ def inspect_closed(api, name, bucket, budget):
     require(all(r["Status"] in {"Successful", "Failed", "Cancelled", "RollbackSuccessful", "RollbackFailed"}
                 for r in refreshes), "instance refresh is active")
     lt = g["LaunchTemplate"]
-    require(lt["Version"].isdigit(), "launch template version must be numeric")
-    versions = read(lambda: ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"],
-            Versions=[lt["Version"]]))["LaunchTemplateVersions"]
-    require(len(versions) == 1 and str(versions[0]["VersionNumber"]) == lt["Version"],
-            "numeric launch version not found")
-    data = versions[0]["LaunchTemplateData"]
+    data = launch_template_data(ec2, lt["LaunchTemplateId"], lt["Version"], read=read)
     require(data["InstanceType"] == INSTANCE_TYPE and data["ImageId"].startswith("ami-")
             and not data.get("InstanceMarketOptions") and not data.get("InstanceRequirements")
             and not data.get("DisableApiTermination"), "launch template is not a disposable fixed On-Demand VM")
-    template = yaml.safe_load(Path(__file__).with_name("stack.yaml").read_text())
-    expected = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-    expected = expected.replace("${WorkerProtocol}", "operator-window").replace("${Artifacts}", bucket).replace(
-        "${AWS::Region}", g["AutoScalingGroupARN"].split(":")[3])
-    require(base64.b64decode(data.get("UserData", ""), validate=True).decode() == expected,
-            "ASG launch template is not the exact reviewed operator-window startup")
+    verify_startup(data, "operator-window", bucket, g["AutoScalingGroupARN"].split(":")[3])
     budget.left()
     asg.suspend_processes(AutoScalingGroupName=name, ScalingProcesses=sorted(SUSPEND))
     verify_group(read(lambda: group(asg, name)), 0)
@@ -90,15 +77,7 @@ def arm(api, name, bucket, window, now=lambda: datetime.now(timezone.utc)):
     def read(operation):
         return retry_io(operation, budget)
     inspect_closed(api, name, bucket, budget)
-    # reject a pre-migration window before acquiring the retained shared claim
-    try:
-        previous = read(lambda: get_json(api["s3"], bucket, WINDOW_KEY))
-    except Exception as error:
-        if error_code(error) != "NoSuchKey":
-            raise
-    else:
-        require(utc(previous["deadline"]) < now(), "previous window has not expired")
-        require(previous["run"] != window["run"], "a run attempt cannot be rearmed")
+    verify_previous_window(api["s3"], bucket, window["run"], now, budget)
     budget.left()
     owner = claim(api["s3"], bucket, "operator-window", window)
     asg = api["autoscaling"]

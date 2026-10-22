@@ -198,6 +198,19 @@ class ResultTests(unittest.TestCase):
             common.validate_request(request, window)
         self.assertIn("not A/A", results.comparison_label(expected, receipt))
 
+    def test_recorded_durable_a_a_contract_rejects_unequal_binary_digests(self):
+        from infra.aws_benchmark.test_durable_worker import direct_window, request
+        expected = binding("bulk-1g-metadata")
+        expected["candidate"] = expected["baseline"]
+        window = direct_window()
+        window.update({key: expected[key] for key in ("run", "baseline", "candidate", "suite")})
+        window["attempt_id"] = window["run"] + "-1"
+        receipt = dict(window=window, request=request(window))
+        results.historical_inputs(receipt, expected)
+        receipt["request"]["sha256"]["candidate/rcp"] = "e" * 64
+        with self.assertRaisesRegex(ValueError, "A/A binary digests differ"):
+            results.historical_inputs(receipt, expected)
+
     def test_failed_and_cancelled_runs_keep_diagnostics_without_history(self):
         for conclusion in ("failure", "cancelled", "skipped"):
             with self.subTest(conclusion=conclusion):
@@ -334,6 +347,36 @@ class ResultTests(unittest.TestCase):
             evidence = self.ingest(policy=self.policy, output=self.root / str(index))
             self.assertFalse(evidence["history_eligible"])
             self.assertIn("history approval: unverified execution provenance", evidence["errors"])
+
+    def test_missing_image_observations_preserve_measurements_without_qualification(self):
+        for index, fields in enumerate((("image_id",), ("instance_type",), ("image_id", "instance_type"))):
+            with self.subTest(fields=fields):
+                self.expected, self.policy = bundle(self.source)
+                path = self.source / "controller.json"
+                receipt = json.loads(path.read_bytes())
+                receipt["instance"].update(dict.fromkeys(fields))
+                path.write_bytes(results.encoded(receipt))
+                output = self.root / str(index)
+                evidence = results.ingest(self.source, output, self.expected, "success", qualification=self.policy)
+                self.assertEqual(evidence["errors"], ["qualification: unverified execution provenance"])
+                self.assertFalse(evidence["qualification_accepted"])
+                self.assertIsNotNone(evidence["worker"])
+                derived = json.loads((output / "derived.json").read_bytes())
+                self.assertEqual(derived["context"]["aws_provenance"]["instance"], receipt["instance"])
+                self.assertEqual((output / "raw/controller.json").read_bytes(), path.read_bytes())
+                self.assertTrue((output / "dashboard/index.html").is_file())
+
+    def test_unknown_observations_do_not_allow_malformed_instance_fields(self):
+        for index, (field, value) in enumerate((("instance_id", None), ("image_id", []), ("instance_type", {}))):
+            with self.subTest(field=field):
+                self.expected, self.policy = bundle(self.source)
+                path = self.source / "controller.json"
+                receipt = json.loads(path.read_bytes())
+                receipt["instance"][field] = value
+                path.write_bytes(results.encoded(receipt))
+                evidence = self.ingest(output=self.root / str(index))
+                self.assertIn("controller receipt: invalid controller instance observation", evidence["errors"])
+                self.assertIsNone(evidence["controller"])
 
     def test_tampered_status_archive_and_identity_are_rejected(self):
         for index, name in enumerate(("status.json", "results.zip", "controller.json")):

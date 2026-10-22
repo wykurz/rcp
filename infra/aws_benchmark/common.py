@@ -6,6 +6,7 @@ import json
 import re
 import time
 from urllib.error import HTTPError, URLError
+from types import MappingProxyType
 
 from benchmarks.verification import FULL_CONTENT_POLICY, METADATA_POLICY
 
@@ -18,9 +19,6 @@ MAX_WINDOW = 3600
 MAX_OPEN_LEAD = 300
 DURABLE_PROTOCOL = "rcp-durable-v1"
 DIRECT_PROTOCOL = "rcp-direct-v1"
-DURABLE_MAX_RUNTIME = 10800
-DURABLE_MAX_PROVISIONING = 43200
-DIRECT_MAX_ATTEMPTS = 720
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
 INSTANCE_TYPE = "c5d.24xlarge"
@@ -32,18 +30,29 @@ PENDING = "pending"
 COMPLETED = "completed"
 BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
-# append versions; recorded caps and manifests must not alias current admission globals
+# append versions; admission and historical reads use the same frozen policy entry
 _RECORDED_DURABLE_CONTRACTS = {
-    "bulk-metadata-plan-v1": dict(
-        plan=dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
+    "bulk-metadata-plan-v1": MappingProxyType(dict(
+        plan=MappingProxyType(dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
                   report_seconds=180, safety_factor=3, boot_reserve_seconds=300,
-                  shutdown_reserve_seconds=300),
-        max_runtime=10800, max_provisioning=43200, max_attempts=720,
-        binaries=tuple(f"{role}/{name}" for role in ("baseline", "candidate")
-                       for name in ("rcp", "rcpd", "filegen"))),
+                  shutdown_reserve_seconds=300)),
+        max_runtime=10800, max_provisioning=43200, max_attempts=720, delivery_drain_seconds=900,
+        binary_names=("rcp", "rcpd", "filegen"),
+        pin_patterns=MappingProxyType({
+            "lt_id": r"lt-[0-9a-f]{17}", "lt_version": r"[1-9][0-9]*",
+            "ami": r"ami-[0-9a-f]{17}", "source": r"[0-9a-f]{40}",
+            "subnet": r"subnet-[0-9a-f]{8,17}", "security_group": r"sg-[0-9a-f]{8,17}",
+            "region": r"[a-z]{2}-[a-z]+-[0-9]", "account": r"[0-9]{12}",
+            "namespace": r"[a-zA-Z][a-zA-Z0-9-]{0,47}",
+            "bucket": r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]",
+            "profile_arn": r"arn:aws:iam::{account}:instance-profile/[A-Za-z0-9+=,.@_/-]+"}))),
 }
-# projected work, not a measured complete run; preserve its version in every receipt
-DURABLE_PLAN = dict(_RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]["plan"])
+# projected work, not a measured complete run; advance the version when any bound changes
+_CURRENT_DURABLE_CONTRACT = _RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]
+DURABLE_PLAN = dict(_CURRENT_DURABLE_CONTRACT["plan"])
+DURABLE_MAX_RUNTIME = _CURRENT_DURABLE_CONTRACT["max_runtime"]
+DURABLE_MAX_PROVISIONING = _CURRENT_DURABLE_CONTRACT["max_provisioning"]
+DIRECT_MAX_ATTEMPTS = _CURRENT_DURABLE_CONTRACT["max_attempts"]
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
 
 # append versions when cloud tuning changes; never infer old settings from local defaults
@@ -155,18 +164,43 @@ def durable_plan_contract(plan, *, exact=True):
     require(recorded is not None and plan == recorded["plan"], "unknown durable workload plan")
     require(all(type(value) is int for key, value in plan.items() if key != "version"),
             "durable plan durations must be integers")
-    contract = {**recorded, "plan": dict(recorded["plan"]), "binaries": tuple(recorded["binaries"])}
     if exact:
         require(plan == DURABLE_PLAN, "durable workload plan is not current")
-        contract.update(max_runtime=DURABLE_MAX_RUNTIME, max_provisioning=DURABLE_MAX_PROVISIONING,
-                        max_attempts=DIRECT_MAX_ATTEMPTS, binaries=tuple(BINARIES))
-    return contract
+    return {**recorded, "plan": dict(recorded["plan"]), "pin_patterns": dict(recorded["pin_patterns"]),
+            "binaries": tuple(f"{role}/{name}" for role in ("baseline", "candidate")
+                              for name in recorded["binary_names"])}
 
 
 def durable_worker_reserve(plan, *, exact=True):
     """Return the recognized plan's projected work plus its recorded planning headroom."""
     plan = durable_plan_contract(plan, exact=exact)["plan"]
     return (plan["work_seconds"] + plan["report_seconds"]) * plan["safety_factor"]
+
+
+def durable_minimum_runtime(plan=None, *, exact=True):
+    """One admission floor for the coordinator and its bound worker window."""
+    plan = durable_plan_contract(DURABLE_PLAN if plan is None else plan, exact=exact)["plan"]
+    return durable_worker_reserve(plan, exact=exact) + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
+
+
+def validate_durable_hashes(hashes, plan, *, exact=True):
+    """Require the recorded paired manifest and identical A/A executable bytes."""
+    contract = durable_plan_contract(plan, exact=exact)
+    require(isinstance(hashes, dict) and set(hashes) == set(contract["binaries"]),
+            "unexpected recorded durable binary manifest")
+    require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in hashes.values()), "invalid binary digest")
+    require(all(hashes["baseline/" + name] == hashes["candidate/" + name]
+                for name in contract["binary_names"]), "A/A binary digests differ")
+
+
+def validate_durable_pins(pins, plan, *, exact=True):
+    """Validate only the named version's pin schema, including the profile account binding."""
+    patterns = durable_plan_contract(plan, exact=exact)["pin_patterns"]
+    require(isinstance(pins, dict) and set(pins) == set(patterns), "unexpected deployment pins")
+    require(all(isinstance(value, str) for value in pins.values()), "deployment pins must be strings")
+    for key, pattern in patterns.items():
+        require(re.fullmatch(pattern.replace("{account}", pins["account"]), pins[key]), "invalid pin: " + key)
 
 
 def validate_attempt_id(run, attempt_id, *, maximum=None):
@@ -195,11 +229,9 @@ def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
             "durable qualification requires metadata-only A/A")
     require(re.fullmatch(r"i-[0-9a-f]{17}", value["instance_id"]), "invalid durable instance identity")
     contract = durable_plan_contract(value["plan"], exact=exact)
-    required = durable_worker_reserve(value["plan"], exact=exact)
     runtime = value["runtime_seconds"]
     plan = contract["plan"]
-    require(type(runtime) is int and
-            required + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
+    require(type(runtime) is int and durable_minimum_runtime(value["plan"], exact=exact)
             <= runtime <= contract["max_runtime"], "durable runtime does not fit the disclosed workload plan")
     try:
         start, launch = utc(value["opens"]), utc(value["launch_at"])
@@ -265,6 +297,9 @@ def validate_request(value, window):
     require(all(value[key] == window[key] for key in ("run", "baseline", "candidate", "suite", "deadline")),
             "mailbox request does not match the operator window")
     hashes = value["sha256"]
+    if window.get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
+        validate_durable_hashes(hashes, window["plan"])
+        return value
     require(isinstance(hashes, dict) and set(hashes) == set(BINARIES), "unexpected binary list")
     require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                 for value in hashes.values()), "binary digests must be lowercase SHA-256")
@@ -320,7 +355,7 @@ def retryable_io(error):
             or isinstance(error, HTTPError) and error.code in {429, 500, 502, 503, 504}
             or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
             or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
-                                    "RequestTimeout", "RequestTimeoutException", "Throttling",
+                                    "RequestTimeout", "RequestTimeoutException", "Throttling", "IDPCommunicationError",
                                     "ThrottlingException", "RequestLimitExceeded", "ProvisionedThroughputExceededException"})
 
 

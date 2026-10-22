@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 # package only the handler import closure, never arbitrary local Python configuration
 SOURCES = ("infra/aws_benchmark/__init__.py",
            "infra/aws_benchmark/common.py", "infra/aws_benchmark/durable.py",
-           "infra/aws_benchmark/durable_aws.py", "benchmarks/__init__.py",
+           "infra/aws_benchmark/durable_aws.py", "infra/aws_benchmark/ami_image.py",
+           "benchmarks/__init__.py",
            "benchmarks/verification.py", "benchmarks/signals.py")
 
 
@@ -88,10 +89,11 @@ def package(output, wheels):
         # make the repository namespace importable directly from the Lambda ZIP
         (stage / "infra/__init__.py").write_text("", encoding="utf-8")
         members = package_files(stage)
-        with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        # stored members avoid compressor-version-dependent bytes within the 32 MiB code cap
+        with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_STORED) as archive:
             for name, data in members.items():
                 info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_DEFLATED
+                info.compress_type = zipfile.ZIP_STORED
                 info.external_attr = 0o100644 << 16
                 archive.writestr(info, data)
     print("sha256=" + hashlib.sha256(output.read_bytes()).hexdigest())

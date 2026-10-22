@@ -1,5 +1,6 @@
 """Offline legacy admission rejects direct or historical control and startup."""
 
+import base64
 from contextlib import redirect_stdout
 import io
 import json
@@ -63,8 +64,12 @@ class OperatorProtocolTests(unittest.TestCase):
             cloud = FakeCloud()
             versions = cloud.api["ec2"].describe_launch_template_versions.return_value["LaunchTemplateVersions"]
             data = versions[0]["LaunchTemplateData"]
-            if change in {"direct", "durable", "unknown"}:
+            if change == "direct":
                 data["UserData"] = startup(change)
+            elif change in {"durable", "unknown"}:
+                text = base64.b64decode(startup()).decode().replace(
+                    "case 'operator-window' in", "case '" + change + "' in")
+                data["UserData"] = base64.b64encode(text.encode()).decode()
             elif change == "bucket":
                 data["UserData"] = startup(bucket="other")
             elif change == "region":

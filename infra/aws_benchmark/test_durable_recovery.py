@@ -6,7 +6,7 @@ import json
 import unittest
 
 from infra.aws_benchmark import common, durable, durable_aws
-from infra.aws_benchmark.test_durable_coordinator import Cloud, ApiError, NOW, INSTANCE, ROOT
+from infra.aws_benchmark.test_durable_coordinator import Cloud, ApiError, INSTANCE, ROOT
 
 
 class RecoveryTests(unittest.TestCase):
@@ -40,7 +40,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(c.state["launch_outcome"], "accepted")
         self.assertEqual(c.state["binding"]["close_at"], deadline)
         self.assertTrue(c.state["worker_published"])
-        self.assertEqual(len(c.launches), 1)
+        self.assertEqual(len(c.launches), 3)
+        self.assertTrue(all(parameters == c.launches[0] for parameters in c.launches))
 
     def test_known_acceptance_survives_transient_write_before_or_after_commit(self):
         for committed in (False, True):
@@ -147,7 +148,8 @@ class RecoveryTests(unittest.TestCase):
                 self.assertFalse(c.state["worker_published"])
                 self.assertIsNone(c.state["binding"])
                 self.assertTrue(any(event[0] == "terminate" for event in c.events))
-                self.assertEqual(len(c.launches), 1)
+                self.assertEqual(len(c.launches), 3)
+                self.assertTrue(all(parameters == c.launches[0] for parameters in c.launches))
 
     def test_ambiguous_absent_instance_keeps_hold_after_drain(self):
         c = Cloud()

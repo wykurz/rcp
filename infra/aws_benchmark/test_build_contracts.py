@@ -13,7 +13,7 @@ from unittest.mock import patch
 import yaml
 
 from benchmarks import run as harness
-from infra.aws_benchmark import cache_client, common, worker
+from infra.aws_benchmark import ami_image, cache_client, common, worker
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -145,10 +145,7 @@ class BuildContractTests(unittest.TestCase):
                 self.assertEqual(args.mode, "local")
 
     def test_userdata_submission_failure_powers_off_without_requiring_worker_directory(self):
-        stack = yaml.safe_load((ROOT / "infra/aws_benchmark/stack.yaml").read_text())
-        user_data = stack["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-        script = user_data.replace("$" + "{Artifacts}", "test-bucket").replace("$" + "{AWS::Region}", "us-east-1").replace(
-            "$" + "{WorkerProtocol}", "operator-window")
+        script = ami_image.reviewed_startup("operator-window", "test-bucket", "us-east-1")
         for launch_status in (None, 0, 7):
             with self.subTest(launch_status=launch_status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

@@ -13,13 +13,17 @@ import hashlib
 import json
 import os
 import re
+import time
 
 from . import durable
+from .ami_image import launch_template_data
 from .common import (BINARIES, MAX_BINARY, REQUEST_KEY, STATUS_KEY, WINDOW_KEY,
-                     get_json, put_json, error_code, retryable_io, INSTANCE_TYPE, require, timestamp, utc)
+                     get_json, put_json, error_code, retryable_io, INSTANCE_TYPE, require, timestamp, utc,
+                     durable_plan_contract)
 
 REQUEST = "control/durable-request.json"
 RECEIPT = "output/durable-receipt.json"
+MAX_RECEIPT = 100_000
 LIVE = {"pending", "running", "stopping", "stopped", "shutting-down"}
 
 
@@ -62,6 +66,10 @@ class AllocationDeferred(Exception):
     """A missing or stale heartbeat blocks allocation without failing the execution."""
 
 
+def transient(error):
+    return retryable_io(error) or error_code(error) == "ConditionalCheckFailedException"
+
+
 def capacity_rejection(error):
     response = getattr(error, "response", None) or {}
     metadata = response.get("ResponseMetadata", {})
@@ -94,8 +102,19 @@ def verify_launch_data(config, data):
 
 
 class Service:
-    def __init__(self, api, config, now=lambda: datetime.now(timezone.utc)):
+    def __init__(self, api, config, now=lambda: datetime.now(timezone.utc), *, sleep=time.sleep,
+                 monotonic=time.monotonic):
         self.api, self.config, self.now = api, config, now
+        self.sleep, self.monotonic = sleep, monotonic
+        self.retry_until = monotonic() + 40
+
+    def backoff(self, error, retry, *, reserve=16):
+        # leave room for one bounded SDK call; reconciliation can use the remaining invocation budget
+        delay = 2 ** retry
+        if retry >= 2 or not transient(error) or self.retry_until - self.monotonic() < delay + reserve:
+            return False
+        self.sleep(delay)
+        return self.retry_until - self.monotonic() >= reserve
 
     def load(self):
         response = self.api["dynamodb"].get_item(TableName=self.config.table,
@@ -103,13 +122,20 @@ class Service:
         item = response.get("Item")
         require(item is not None, "no operator-armed lease")
         state = json.loads(item["payload"]["S"])
-        durable.validate(state["request"])
-        require(state["request"]["pins"] == self.config.pins(), "deployment pins changed")
+        complete = state["phase"] == "complete"
+        durable.validate(state["request"], exact=not complete)
+        pins = state["request"]["pins"]
+        if complete:
+            require(all(pins[key] == getattr(self.config, key) for key in ("account", "region", "namespace", "bucket")),
+                    "completed lease namespace changed")
+        else:
+            require(pins == self.config.pins(), "deployment pins changed")
         return state, int(item["revision"]["N"])
 
     def save(self, state, revision):
         data = json.dumps(state, sort_keys=True, separators=(",", ":"))
-        require(len(data.encode()) <= 100_000, "lease evidence exceeds bound; manual reconciliation required")
+        # account for the same wrapper and encoding used by the bounded collector
+        self.receipt_bytes(state)
         self.api["dynamodb"].update_item(TableName=self.config.table, Key={"pk": {"S": "lease"}},
             ConditionExpression="#revision = :previous", UpdateExpression="SET payload = :payload, #revision = :next",
             ExpressionAttributeNames={"#revision": "revision"}, ExpressionAttributeValues={
@@ -185,12 +211,8 @@ class Service:
         return instances
 
     def launch_parameters(self, request, allocation):
-        response = self.api["ec2"].describe_launch_template_versions(LaunchTemplateId=self.config.lt_id,
-                                                                  Versions=[self.config.lt_version])
-        versions = response["LaunchTemplateVersions"]
-        require(len(versions) == 1 and str(versions[0]["VersionNumber"]) == self.config.lt_version,
-                "numeric launch version not found")
-        data = verify_launch_data(self.config, versions[0]["LaunchTemplateData"])
+        data = verify_launch_data(self.config, launch_template_data(
+            self.api["ec2"], self.config.lt_id, self.config.lt_version))
         interface = dict(data["NetworkInterfaces"][0], SubnetId=self.config.subnet)
         tags = [{"Key": k, "Value": v} for k, v in sorted(durable.tags(request, allocation).items())]
         return dict(LaunchTemplate={"LaunchTemplateId": self.config.lt_id, "Version": self.config.lt_version},
@@ -224,12 +246,17 @@ class Service:
         token = hashlib.sha256((binding["attempt_id"] + binding["close_at"]).encode()).hexdigest()
         try:
             self.api["scheduler"].create_schedule(**expected, ClientToken=token)
-        except Exception:
-            return self.verify_schedule(expected)
+        except Exception as primary:
+            try:
+                return self.verify_schedule(expected)
+            except Exception as observed:
+                if error_code(observed) == "ResourceNotFoundException" or retryable_io(observed):
+                    raise primary from observed
+                raise
         return self.verify_schedule(expected)
 
-    def finish_launch(self, run, allocation, *, response=None, failure=None, not_sent=False):
-        # retries reconcile the same evidence after a conditional conflict or an unknown write result
+    def reconcile_launch(self, run, allocation, mutate, *, not_sent=False):
+        # all outcomes reconcile the same evidence and revision; only this loop retries state writes
         for retry in range(3):
             try:
                 state, revision = self.load()
@@ -240,48 +267,90 @@ class Service:
                     return
                 require(state["attempt"] == allocation, "allocation changed during launch reconciliation")
                 original = copy.deepcopy(state)
-                if response is not None:
-                    instances = response.get("Instances", [])
-                    require(len(instances) == 1 and re.fullmatch(r"i-[0-9a-f]{17}", instances[0].get("InstanceId", "")),
-                            "launch response did not bind exactly one instance")
-                    identity = instances[0]["InstanceId"]
-                    require(not state["known_instance_ids"] or state["known_instance_ids"] == [identity],
-                            "accepted response conflicts with observed allocation")
-                    state["known_instance_ids"] = [identity]
-                    durable.launch_outcome(state, "accepted")
-                    if "LaunchTime" in instances[0] and "State" in instances[0]:
-                        try:
-                            self.remember_instance(state, instances[0])
-                        except (ValueError, KeyError, TypeError):
-                            state["close_reason"] = state["close_reason"] or "invalid accepted launch observation"
-                    state["phase"] = "requested" if not state["close_reason"] else "closing"
-                elif state["launch_outcome"] == "accepted":
-                    # a concurrent positive observation or already committed response must never regress
-                    return
-                elif not_sent or failure is not None and capacity_rejection(failure):
-                    require(not state["known_instance_ids"] and not state["seen"] and not state["binding"],
-                            "no-allocation evidence conflicts with observed allocation")
-                    if not not_sent:
-                        proof = dict(attempt=allocation["ordinal"], at=allocation["started_at"],
-                                     request_id=failure.response["ResponseMetadata"]["RequestId"])
-                        previous = [p for p in state["capacity_failures"] if p["attempt"] == allocation["ordinal"]]
-                        require(not previous or previous == [proof], "capacity rejection evidence changed")
-                        if not previous:
-                            state["capacity_failures"].append(proof)
-                    durable.launch_outcome(state, "not-sent" if not_sent else "capacity-rejected")
-                    if self.now() >= utc(state["request"]["capacity_deadline"]):
-                        state["close_reason"] = state["close_reason"] or "capacity wait expired"
-                    state.update(phase="closing" if state["close_reason"] else "armed",
-                                 next_attempt_at=timestamp(self.now() + timedelta(seconds=durable.RETRY_SECONDS)))
-                elif state["launch_outcome"] not in ("capacity-rejected", "not-sent"):
-                    durable.launch_outcome(state, "uncertain")
-                    state["phase"] = "closing" if state["close_reason"] else "uncertain"
+                mutate(state)
                 if state != original:
                     self.save(state, revision)
                 return
             except Exception as error:
-                if retry == 2 or not (retryable_io(error) or error_code(error) == "ConditionalCheckFailedException"):
+                if not self.backoff(error, retry):
                     raise
+
+    def expire_capacity(self, state):
+        if not state["binding"] and self.now() >= utc(state["request"]["capacity_deadline"]):
+            state.update(phase="closing", close_reason=state["close_reason"] or "capacity wait expired")
+            return True
+        return False
+
+    def capacity_open(self, state, revision):
+        if not self.expire_capacity(state):
+            return True
+        self.save(state, revision)
+        return False
+
+    def finish_launch(self, run, allocation, *, response=None, failure=None, not_sent=False):
+        require(sum((response is not None, failure is not None, not_sent is True)) == 1,
+                "exactly one launch outcome is required")
+        def mutate(state):
+            if response is not None:
+                instances = response.get("Instances", [])
+                require(len(instances) == 1 and re.fullmatch(r"i-[0-9a-f]{17}", instances[0].get("InstanceId", "")),
+                        "launch response did not bind exactly one instance")
+                identity = instances[0]["InstanceId"]
+                require(not state["known_instance_ids"] or state["known_instance_ids"] == [identity],
+                        "accepted response conflicts with observed allocation")
+                state["known_instance_ids"] = [identity]
+                durable.launch_outcome(state, "accepted")
+                if "LaunchTime" in instances[0] and "State" in instances[0]:
+                    try:
+                        self.remember_instance(state, instances[0])
+                    except (ValueError, KeyError, TypeError):
+                        state["close_reason"] = state["close_reason"] or "invalid accepted launch observation"
+                state["phase"] = "requested" if not state["close_reason"] else "closing"
+            elif state["launch_outcome"] == "accepted":
+                # positive evidence is monotonic, even after an uncertain response or write
+                return
+            elif not_sent or capacity_rejection(failure):
+                require(not state["known_instance_ids"] and not state["seen"] and not state["binding"],
+                        "no-allocation evidence conflicts with observed allocation")
+                if not not_sent:
+                    proof = dict(attempt=allocation["ordinal"], at=allocation["started_at"],
+                                 request_id=failure.response["ResponseMetadata"]["RequestId"])
+                    previous = [p for p in state["capacity_failures"] if p["attempt"] == allocation["ordinal"]]
+                    require(not previous or previous == [proof], "capacity rejection evidence changed")
+                    if not previous:
+                        state["capacity_failures"].append(proof)
+                durable.launch_outcome(state, "not-sent" if not_sent else "capacity-rejected")
+                self.expire_capacity(state)
+                state.update(phase="closing" if state["close_reason"] else "armed",
+                             next_attempt_at=timestamp(self.now() + timedelta(seconds=durable.RETRY_SECONDS)))
+            elif state["launch_outcome"] not in ("capacity-rejected", "not-sent"):
+                durable.launch_outcome(state, "uncertain")
+                state["phase"] = "closing" if state["close_reason"] else "uncertain"
+        self.reconcile_launch(run, allocation, mutate, not_sent=not_sent)
+
+    def launch_allowed(self, request, observed):
+        return (self.now() < utc(request["capacity_deadline"]) and
+                0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS)
+
+    def launch(self, request, allocation, observed):
+        uncertain = None
+        for retry in range(3):
+            try:
+                # retries use the identical saved parameters/token/region/subnet, within this invocation only
+                response = self.api["ec2"].run_instances(**allocation["parameters"])
+            except Exception as error:
+                if capacity_rejection(error) and uncertain is None:
+                    self.finish_launch(request["run"], allocation, failure=error)
+                    return
+                uncertain = uncertain or error
+                if (not retryable_io(error) or not self.launch_allowed(request, observed) or
+                        not self.backoff(error, retry, reserve=24) or not self.launch_allowed(request, observed)):
+                    # no later negative response can erase an earlier unknown allocation
+                    self.finish_launch(request["run"], allocation, failure=uncertain)
+                    return
+            else:
+                self.finish_launch(request["run"], allocation, response=response)
+                return
 
     def coordinator(self, event):
         require(set(event) == {"run", "execution_arn", "execution_name"}, "unexpected submission fields")
@@ -298,9 +367,7 @@ class Service:
         require(not state["allocation_consumed"], "possible allocation cannot be retried")
         if self.now() < utc(state["next_attempt_at"]):
             return dict(state="wait", run=request["run"])
-        if self.now() >= utc(request["capacity_deadline"]):
-            state.update(phase="closing", close_reason=state["close_reason"] or "capacity wait expired")
-            self.save(state, revision)
+        if not self.capacity_open(state, revision):
             return dict(state="wait", run=request["run"])
         self.fresh_guard()
         require(not self.inventory(request), "previous or unexpected managed instance exists")
@@ -310,9 +377,7 @@ class Service:
             require(type(head.get("ContentLength")) is int and 0 < head["ContentLength"] <= MAX_BINARY and
                     head.get("ChecksumSHA256") == expected and head.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT",
                     "uploaded binary digest or size differs from operator manifest")
-        if self.now() >= utc(request["capacity_deadline"]):
-            state.update(phase="closing", close_reason="capacity wait expired during artifact validation")
-            self.save(state, revision)
+        if not self.capacity_open(state, revision):
             return dict(state="wait", run=request["run"])
         allocation = durable.attempt(request, state["attempts"] + 1, self.now())
         allocation["parameters"] = self.launch_parameters(request, allocation)
@@ -324,9 +389,7 @@ class Service:
                 not fresh["close_reason"], "lease changed during artifact validation")
         state = fresh
         observed = self.fresh_guard()
-        if self.now() >= utc(request["capacity_deadline"]):
-            state.update(phase="closing", close_reason="capacity wait expired during validation")
-            self.save(state, revision)
+        if not self.capacity_open(state, revision):
             return dict(state="wait", run=request["run"])
         state.update(phase="launching", execution_arn=event["execution_arn"], attempt=allocation,
                      attempts=allocation["ordinal"])
@@ -339,16 +402,10 @@ class Service:
                 self.finish_launch(request["run"], allocation, not_sent=True)
             raise
         # a delayed intent write cannot refresh the saved deadline or bypass admission
-        if not (self.now() < utc(request["capacity_deadline"]) and
-                0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS):
+        if not self.launch_allowed(request, observed):
             self.finish_launch(request["run"], allocation, not_sent=True)
             return dict(state="wait", run=request["run"])
-        try:
-            response = self.api["ec2"].run_instances(**allocation["parameters"])
-        except Exception as error:
-            self.finish_launch(request["run"], allocation, failure=error)
-            return dict(state="wait", run=request["run"])
-        self.finish_launch(request["run"], allocation, response=response)
+        self.launch(request, allocation, observed)
         return dict(state="wait", run=request["run"])
 
     def remember_instance(self, state, instance):
@@ -391,17 +448,18 @@ class Service:
             bound = [i for i in instances if i["InstanceId"] == state["binding"]["instance_id"]]
             if bound and bound[0]["State"]["Name"] not in ("pending", "running"):
                 reason = reason or "bound instance stopped or terminated"
-        elif now >= utc(request["capacity_deadline"]):
-            reason = reason or "capacity wait expired"
         if reason:
             state.update(phase="closing", close_reason=reason)
+        self.expire_capacity(state)
 
     def discover_roots(self, state):
         # tags can recover an identity missed in the instance mapping; empty results prove nothing
-        binding = state["binding"]
-        if not binding or len(state["known_instance_ids"]) != 1:
+        if not state["attempt"] or len(state["known_instance_ids"]) != 1:
             return
-        seen = state["seen"][binding["instance_id"]]
+        identity = state["known_instance_ids"][0]
+        seen = state["seen"].get(identity)
+        if seen is None:
+            return
         if seen["root_volumes"]:
             return
         expected = durable.tags(state["request"], state["attempt"])
@@ -416,7 +474,7 @@ class Service:
                 observed = durable.instance_tags(volume)
                 require(all(observed.get(k) == v for k, v in expected.items()), "root volume tags differ")
                 require(re.fullmatch(r"vol-[0-9a-f]{17}", volume["VolumeId"]), "invalid root volume identity")
-                require(all(a.get("InstanceId") == binding["instance_id"] and
+                require(all(a.get("InstanceId") == identity and
                             a.get("Device") == "/dev/sda1" for a in volume.get("Attachments", [])),
                         "root volume attachment differs")
                 roots.append(volume["VolumeId"])
@@ -428,10 +486,18 @@ class Service:
                 return
         raise ValueError("root inventory pagination exceeds bound")
 
+    def admit_publication(self, state):
+        request, binding = state["request"], state["binding"]
+        intent = {key: binding[key] for key in ("attempt_id", "instance_id", "deadline")}
+        if state.get("publication"):
+            require(state["publication"] == intent, "worker publication binding changed")
+        else:
+            require((utc(binding["deadline"]) - self.now()).total_seconds() >= durable.worker_minimum(request["plan"]),
+                    "remaining allocation time does not fit workload and explicit headroom")
+            state["publication"] = intent
+
     def publish_worker(self, state):
         request, binding = state["request"], state["binding"]
-        require((utc(binding["deadline"]) - self.now()).total_seconds() >= durable.worker_minimum(request["plan"]),
-                "remaining allocation time does not fit workload and explicit headroom")
         put_json(self.api["s3"], self.config.bucket, REQUEST_KEY, durable.worker_command(request, binding))
         put_json(self.api["s3"], self.config.bucket, WINDOW_KEY, durable.window(request, binding))
 
@@ -454,10 +520,16 @@ class Service:
             raise ValueError("worker root volume remains")
         return sorted(deleted)
 
+    def receipt_bytes(self, state):
+        observed = state["cleanup"]["verified_at"] if state["phase"] == "complete" else timestamp(self.now())
+        data = json.dumps(dict(protocol=durable.PROTOCOL, observed_at=observed, **state),
+                          sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        require(len(data) <= MAX_RECEIPT, "durable receipt exceeds collector bound; manual reconciliation required")
+        return data
+
     def receipt(self, state):
-        put_json(self.api["s3"], self.config.bucket, RECEIPT,
-                 dict(protocol=durable.PROTOCOL, observed_at=(state["cleanup"]["verified_at"] if state["phase"] == "complete"
-                      else timestamp(self.now())), **state))
+        self.api["s3"].put_object(Bucket=self.config.bucket, Key=RECEIPT,
+                                  Body=self.receipt_bytes(state), ContentType="application/json")
 
     def watchdog(self):
         # expiration is enforced before DynamoDB access, even if the lease is missing or unreadable
@@ -470,60 +542,83 @@ class Service:
             raise
         relevant = [i for i in instances if i["State"]["Name"] in LIVE or
                     durable.instance_tags(i).get(durable.TAG_RUN) == state["request"]["run"]]
-        if state["phase"] == "complete":
-            self.terminate([i["InstanceId"] for i in relevant if i["State"]["Name"] in LIVE])
-            # a lost final receipt write is repairable without changing completed evidence or its time
-            self.receipt(state)
-            return dict(state="complete", run=state["request"]["run"])
-        original = copy.deepcopy(state)
-        self.observe(state, relevant)
-        if state != original:
-            revision = self.save(state, revision)
-        saved = copy.deepcopy(state)
-        try:
-            self.discover_roots(state)
-            if state["binding"] and state["phase"] == "requested" and not state["close_reason"]:
-                if not state["runtime_verified"]:
-                    self.runtime_schedule(state["binding"])
-                    state["runtime_verified"] = True
-                if not state["worker_published"]:
-                    self.publish_worker(state)
-                    state["worker_published"] = True
-                status = get_json(self.api["s3"], self.config.bucket, STATUS_KEY)
-                if status.get("run") == state["request"]["run"] and status.get("state") == "completed":
-                    state.update(phase="closing", close_reason="worker completed; result validity is separate from physical cleanup")
-            if state["close_reason"]:
-                self.terminate([i["InstanceId"] for i in relevant if i["State"]["Name"] in LIVE])
-                after = utc(state["request"]["outer_deadline"]) + timedelta(seconds=durable.DELIVERY_DRAIN_SECONDS)
-                if self.now() >= after and not any(i["State"]["Name"] in LIVE for i in relevant):
-                    deleted = self.root_cleanup(state)
-                    state["cleanup"] = dict(verified_at=timestamp(self.now()), deleted_roots=deleted,
-                        live_instances=[], allocation_consumed=state["allocation_consumed"],
-                        unresolved_allocation=False, lease_released=False)
-                    state["phase"] = "complete"
-        except Exception as error:
-            if error_code(error) == "ConditionalCheckFailedException":
-                raise
-            if retryable_io(error):
-                if state != saved:
-                    self.save(state, revision)
-                self.receipt(state)
-                return dict(state="deferred", run=state["request"]["run"])
-            state.update(phase="closing", close_reason=state["close_reason"] or "guard failure: " + type(error).__name__)
+        live = [i["InstanceId"] for i in relevant if i["State"]["Name"] in LIVE]
+        saved, errors, roots_attempted = copy.deepcopy(state), [], False
+        def failed(error, *, close=True):
+            errors.append(error)
+            if close and state["phase"] != "complete" and not transient(error):
+                state.update(phase="closing", close_reason=state["close_reason"] or "guard failure: " + type(error).__name__)
+        def checkpoint():
+            nonlocal saved, revision
             if state != saved:
-                self.save(state, revision)
-            self.terminate([i["InstanceId"] for i in relevant if i["State"]["Name"] in LIVE])
-            self.receipt(state)
-            raise
-        if state != saved:
-            self.save(state, revision)
-        self.receipt(state)
+                revision = self.save(state, revision)
+                saved = copy.deepcopy(state)
+        try:
+            if state["phase"] != "complete":
+                self.observe(state, relevant)
+                if not state["close_reason"]:
+                    checkpoint()
+                    roots_attempted = True
+                    self.discover_roots(state)
+                    if state["binding"] and state["phase"] == "requested":
+                        if not state["runtime_verified"]:
+                            self.runtime_schedule(state["binding"])
+                            state["runtime_verified"] = True
+                        if not state["worker_published"]:
+                            self.admit_publication(state)
+                            # durable intent precedes both PUTs; a lost final save replays only this binding
+                            checkpoint()
+                            self.publish_worker(state)
+                            state["worker_published"] = True
+                        status = get_json(self.api["s3"], self.config.bucket, STATUS_KEY)
+                        if status.get("run") == state["request"]["run"] and status.get("state") == "completed":
+                            state.update(phase="closing",
+                                close_reason="worker completed; result validity is separate from physical cleanup")
+        except Exception as error:
+            failed(error)
+        # one tail attempts every independent obligation; a save failure cannot skip termination,
+        # and a failed termination cannot hide the original contract failure or its state write
+        if state["close_reason"] or state["phase"] == "complete":
+            try:
+                self.terminate(live)
+            except Exception as error:
+                failed(error)
+            if state["phase"] != "complete":
+                try:
+                    if not roots_attempted:
+                        self.discover_roots(state)
+                    drain = durable_plan_contract(state["request"]["plan"])["delivery_drain_seconds"]
+                    after = utc(state["request"]["outer_deadline"]) + timedelta(seconds=drain)
+                    if self.now() >= after and not live:
+                        deleted = self.root_cleanup(state)
+                        state["cleanup"] = dict(verified_at=timestamp(self.now()), deleted_roots=deleted,
+                            live_instances=[], allocation_consumed=state["allocation_consumed"],
+                            unresolved_allocation=False, lease_released=False)
+                        state["phase"] = "complete"
+                except Exception as error:
+                    failed(error)
+        try:
+            checkpoint()
+        except Exception as error:
+            failed(error, close=False)
+        try:
+            # only committed cleanup evidence is eligible for a terminal receipt
+            self.receipt(saved)
+        except Exception as error:
+            failed(error, close=False)
+        if errors:
+            primary = next((error for error in errors if not transient(error)), errors[0])
+            if not transient(primary):
+                raise primary
+            return dict(state="deferred", run=state["request"]["run"])
         return dict(state=state["phase"], run=state["request"]["run"])
 
 
 def coordinator(event, context):
     config = Configuration.environment(runtime=True)
     service = Service(clients(config.region), config)
+    if context is not None:
+        service.retry_until = service.monotonic() + max(0, context.get_remaining_time_in_millis() / 1000 - 5)
     try:
         return service.coordinator(event)
     except Exception as error:

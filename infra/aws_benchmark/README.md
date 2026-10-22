@@ -111,9 +111,11 @@ environment variables from the stack outputs: `RCP_AWS_REGION`, `RCP_AWS_ASG`, `
    complete. All boot, download, formatting, file generation, hashing, validation, cleanup and
    upload time must fit inside this window. The large `bulk-1g-metadata` suite instead requires
    exactly 60 minutes and the stricter admission floors documented below.
-3. In a local Python 3.12 virtual environment with
-   `pip install --require-hashes -r infra/aws_benchmark/requirements.txt`, use an operator
-   SSO/session identity:
+3. In a local CPython 3.12 virtual environment, install the operator dependencies with
+   `python -m pip install --require-hashes -r infra/aws_benchmark/operator-requirements.txt`. This
+   includes the pinned SDK and PyYAML for validating the reviewed launch-template YAML. The worker
+   and Lambda retain the separate SDK-only `requirements.txt`; changing operator-only dependencies
+   does not require an AMI or Lambda rebuild. Use an operator SSO/session identity:
 
 ```bash
 python -m infra.aws_benchmark.operator \
@@ -141,6 +143,11 @@ python -m infra.aws_benchmark.operator \
    are zero and all instances tagged for this group are terminated. Normal CI cleanup sets desired
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
    cutoff also closes maximum, even after cancellation or lost GitHub credentials.
+6. Before another run, archive the evidence and complete the separate
+   [mailbox retirement procedure](MAILBOX_RETIREMENT.md). Expiry and physical teardown alone do not
+   retire the persistent owner or prove that old producers are quiescent. Retire only the inspected
+   owner with a conditional delete after all reconciliation requirements hold; neither arm command
+   performs this step automatically.
 
 Both legacy and direct operators first reserve `control/mailbox-owner.json` with one conditional
 `IfNoneMatch=*` write and a unique invocation token. A conflict refuses arming, even for the same
@@ -153,14 +160,16 @@ Successful CLI output is now a receipt with `window` and `mailbox_owner`, rather
 Save it for exact-owner reconciliation. The runtime window object keeps its existing six-field
 schema. A partial failure may have stored a claim without returning a receipt; inspect that owner
 instead of assuming nothing happened. Owner retirement is a separate deliberate conditional delete
-using its current ETag after all producers and cleanup are reconciled, never automatic takeover.
+using its current ETag after all producers and cleanup are reconciled, never automatic takeover. The
+exact checks and conditional command are in [mailbox retirement](MAILBOX_RETIREMENT.md).
 
 Only one trusted operator may arm this group at a time. The script refuses active capacities,
 live/terminating/stopped instances, pending schedules, and a control document whose deadline has not
 passed. For every new benchmark attempt, start a **fresh workflow dispatch** with a new run ID so
 both revisions are rebuilt. Do not rerun the benchmark job or reuse build artifacts from a previous
 attempt: reruns can lose artifacts from successful build jobs that are not rerun. Arm the new run
-only after the previous deadline and confirmed physical teardown. Do not manually rewrite the
+only after the previous deadline, confirmed physical teardown, producer/drain reconciliation, saved
+results and explicit [mailbox-owner retirement](MAILBOX_RETIREMENT.md). Do not manually rewrite the
 control document to extend a lease.
 
 To retry only reporting, choose **Re-run job** on the `report` job itself, including when the
@@ -188,6 +197,11 @@ belong to CI:
   expire, and `ListBucket` constrained to `control/window.json` so its initial absence is
   distinguishable from access denial. The status object is initialized and read back before opening;
   CI needs no bucket listing permission.
+- For separately reviewed owner retirement only, `s3:DeleteObject` on exactly
+  `control/mailbox-owner.json`, plus `ListBucket` constrained to that key to distinguish absence
+  from access denial. Use its inspected ETag with `IfMatch`; do not grant deletion of other keys.
+  Neither runtime role may delete the owner, and neither arm command does so. This documents
+  prerequisites for the operator; it does not apply a permission change.
 
 Infrastructure deployment uses a separate trusted identity with permission to create the resources
 declared in the template and pass the worker role. There is no need to grant CI `PassRole`, SSM,
@@ -329,14 +343,16 @@ limits are explicit. Standard service output is discarded. Unsafe files or faile
 a metadata-only failure archive. Failed/incomplete harness records can be downloaded but must not be
 treated as successful comparisons.
 
-The unversioned S3 mailbox has a fixed number of exact keys and seven-day expiration, plus one-day
-incomplete-multipart cleanup. GitHub build artifacts live one day; result/report artifacts live 90
-days (subject to the repository limit). Size limits are enforced by trusted code, **not by IAM
-PutObject conditions**. A stolen runtime credential can overwrite permitted objects or issue excess
-requests; neither fixed keys nor lifecycle rules are a hard storage/billing cap. S3
-storage/requests, AMI snapshots, EBS while allocated and public IPv4 addresses can cost money even
-though there is no always-running VM. Empty the bucket before deleting the stack, and delete
-obsolete AMI snapshots separately.
+The unversioned S3 mailbox has a fixed number of exact keys. Input/output prefixes and the published
+window/request control keys expire after seven days; incomplete multipart uploads are aborted after
+one day. The separate `control/mailbox-owner.json` marker never expires and requires deliberate
+retirement after reconciliation. Waiting seven days does not free the mailbox. GitHub build
+artifacts live one day; result/report artifacts live 90 days (subject to the repository limit). Size
+limits are enforced by trusted code, **not by IAM PutObject conditions**. A stolen runtime
+credential can overwrite permitted objects or issue excess requests; neither fixed keys nor
+lifecycle rules are a hard storage/billing cap. S3 storage/requests, AMI snapshots, EBS while
+allocated and public IPv4 addresses can cost money even though there is no always-running VM. Empty
+the bucket before deleting the stack, and delete obsolete AMI snapshots separately.
 
 The existing suites generate at most 30–31.25 GiB, below host RAM. The separate
 [large-workload manifest and qualification plan](LARGE_WORKLOADS.md) add decimal 1 TB/1.024 TB bulk

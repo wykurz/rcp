@@ -128,7 +128,7 @@ jobs:
     runs-on: ubuntu-24.04
     # includes the maximum opening lead/window, teardown, and bounded final upload
     timeout-minutes: 90
-    # required reviewer arms the window only after both build jobs have completed
+    # required reviewer arms the window only after the binary build has completed
     environment: aws-benchmark
     outputs:
       run-identity: ${{ steps.identity.outputs.run-identity }}

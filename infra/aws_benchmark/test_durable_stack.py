@@ -380,7 +380,8 @@ class DurableStackTests(unittest.TestCase):
         self.assertEqual(len(retry), 1)
         self.assertEqual(set(retry[0]["ErrorEquals"]), {
             "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException",
-            "Lambda.ClientExecutionTimeoutException", "Lambda.TooManyRequestsException"})
+            "Lambda.ClientExecutionTimeoutException", "Lambda.TooManyRequestsException",
+            "Sandbox.Timedout", "Lambda.Unknown", "States.Timeout"})
         self.assertEqual(retry[0]["MaxAttempts"], 6)
         self.assertEqual(retry[0]["MaxDelaySeconds"], 30)
         self.assertEqual(retry[0]["JitterStrategy"], "FULL")
