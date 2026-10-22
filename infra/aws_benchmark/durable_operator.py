@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 from . import durable
+from .ami_image import image_shape
 from .common import BINARIES, STATUS_KEY, digest, pending_status, put_json, require, utc
 from .controller import read_binary
 from .durable_aws import Configuration, REQUEST, Service, clients, verify_launch_data
@@ -58,9 +59,7 @@ def verify_image(service):
     require(len(images) == 1 and images[0]["State"] == "available" and not images[0].get("Public") and
             images[0].get("RootDeviceName") == "/dev/sda1" and images[0].get("RootDeviceType") == "ebs" and
             images[0].get("Architecture") == "x86_64", "worker image must be compatible, private and account-owned")
-    mappings = images[0]["BlockDeviceMappings"]
-    require(len(mappings) == 1 and mappings[0].get("DeviceName") == "/dev/sda1", "unexpected AMI volumes")
-    root = mappings[0].get("Ebs", {})
+    root = image_shape(images[0])
     require(root.get("Encrypted") is True and 0 < root.get("VolumeSize", 0) <= 16, "invalid encrypted image root")
     snapshots = service.api["ec2"].describe_snapshots(SnapshotIds=[root["SnapshotId"]], OwnerIds=[config.account])["Snapshots"]
     require(len(snapshots) == 1 and snapshots[0].get("State") == "completed" and snapshots[0].get("Encrypted") is True
