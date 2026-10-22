@@ -9,9 +9,8 @@ from .common import require, validate_admission, validate_identity
 
 
 REPOSITORY = "wykurz/rcp"
-REF = "refs/heads/main"
-# temporary exact debug exception; never merge this allowance into main
-ALLOWED_REFS = {REF, "refs/heads/aws-benchmark-debug-20261019"}
+# temporary debug-only identity; never merge this integration into main
+REF = "refs/heads/aws-benchmark-debug-20261019"
 WORKFLOW = REPOSITORY + "/.github/workflows/aws-benchmark.yml@" + REF
 
 
@@ -21,8 +20,8 @@ def validate(value):
         "workflow", "workflow_sha", "event", "run_url"}, "unexpected workflow identity")
     require(all(isinstance(item, str) for item in value.values()), "workflow identity fields must be strings")
     validate_identity(value)
-    require(value["ref"] in ALLOWED_REFS, "workflow ref is not an exact approved branch")
-    require(value["repository"] == REPOSITORY and value["workflow"] == REPOSITORY + "/.github/workflows/aws-benchmark.yml@" + value["ref"],
+    require(value["ref"] == REF, "workflow ref is not the exact approved debug branch")
+    require(value["repository"] == REPOSITORY and value["workflow"] == WORKFLOW,
             "unexpected workflow repository or path")
     require(value["event"] == "workflow_dispatch", "workflow must be manually dispatched")
     require(re.fullmatch(r"[0-9a-f]{40}", value["controller"])

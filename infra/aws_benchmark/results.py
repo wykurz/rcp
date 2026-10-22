@@ -13,12 +13,13 @@ import struct
 import tempfile
 import zipfile
 
-from benchmarks import changes, operations, pairs, report
+from benchmarks import changes, measurements, operations, pairs, report
 from benchmarks.strict_json import parse_json
 from benchmarks.verification import verification_label
 from . import identity
 from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
-                     digest, measurement_contract, verification_contract, verification_contracts, require, utc)
+                     digest, measurement_contract, verification_contract, verification_contracts, require, utc,
+                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_plan_contract, durable_worker_reserve, validate_durable_window, validate_request)
 
 
 MAX_METADATA = 1024 * 1024
@@ -163,9 +164,14 @@ def historical_inputs(receipt, expected):
     # receipts record admitted inputs; offline readers validate protocol shape and bindings,
     # not the current launch duration or binary admission policy
     window, request = receipt.get("window"), receipt.get("request")
-    require(isinstance(window, dict) and set(window) ==
-            {"run", "baseline", "candidate", "suite", "opens", "deadline"}, "unexpected window fields")
-    require(all(isinstance(value, str) for value in window.values()), "window fields must be strings")
+    require(isinstance(window, dict), "unexpected window fields")
+    if "protocol" in window:
+        # the versioned plan is part of the historical receipt, never local clock time
+        validate_durable_window(window, now=utc(window.get("launch_at", "")), minimum=0, exact=False)
+    else:
+        require(set(window) == {"run", "baseline", "candidate", "suite", "opens", "deadline"},
+                "unexpected window fields")
+        require(all(isinstance(value, str) for value in window.values()), "window fields must be strings")
     require(all(window[key] == expected[key] for key in ("run", "baseline", "candidate", "suite")),
             "window identity mismatch")
     try:
@@ -184,6 +190,9 @@ def historical_inputs(receipt, expected):
             "unexpected binary digest map")
     require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                 for value in hashes.values()), "binary digests must be lowercase SHA-256")
+    if "protocol" in window:
+        recorded = durable_plan_contract(window["plan"], exact=False)
+        require(set(hashes) == set(recorded["binaries"]), "unexpected recorded durable binary manifest")
     return window, request
 
 
@@ -270,8 +279,8 @@ def inspect(source, expected, conclusion):
     return evidence, result, snapshots
 
 
-def approve(evidence, result, policy):
-    """Offline gate; the caller must authenticate this independent per-attempt policy."""
+def validate_qualification(evidence, result, policy):
+    """Validate an authenticated attempt contract without authorizing history publication."""
     expected = evidence["identity"]
     require(isinstance(policy, dict) and set(policy) == {"schema_version", "identity", "archive_sha256",
             "ami_id", "harness_revision"} and type(policy["schema_version"]) is int
@@ -291,6 +300,18 @@ def approve(evidence, result, policy):
     require(worker["status"]["success"] is True and worker.get("service_returncode") == 0
             and worker.get("admission", {}).get("accepted") is True
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
+    if receipt["window"].get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
+        window = receipt["window"]
+        validate_durable_window(window, now=utc(window["launch_at"]), minimum=0, exact=True)
+        validate_request(receipt["request"], window)
+        required = durable_worker_reserve(window["plan"], exact=True)
+        admission = worker.get("admission", {})
+        remaining = admission.get("remaining_seconds")
+        require(worker.get("guest_instance_id") == window["instance_id"] == instance.get("instance_id"),
+                "durable worker instance binding differs from controller")
+        require(admission.get("required_seconds") == required and measurements.nonnegative(remaining)
+                and required <= remaining <= window["runtime_seconds"],
+                "durable admission does not prove the disclosed workload headroom")
     contract = measurement_contract(expected["suite"])
     validate_recorded_verification(result["context"], expected["suite"], exact=True)
     require(result["status"] == "complete" and result["context"].get("purpose") == contract["purpose"]
@@ -312,6 +333,11 @@ def approve(evidence, result, policy):
                     for trial in result["trials"]), "incomplete paired comparison")
     # approval also validates the current source proof; callers cannot bypass inspection
     report.validate_result(result)
+
+
+def approve(evidence, result, policy):
+    """Offline history gate; the caller must authenticate this per-attempt policy."""
+    validate_qualification(evidence, result, policy)
     evidence["history_eligible"] = True
     evidence["policy_sha256"] = digest(encoded(policy))
 
@@ -335,6 +361,16 @@ def derived_record(evidence, raw):
         instance=controller.get("instance"), supervisor_harness_revision=worker.get("harness_revision"),
         source_series_ids=[item["series_id"] for item in raw["summaries"]],
         expected_verification=evidence["expected_verification"])
+    if worker.get("window", {}).get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
+        provenance["timing"] = {key: copy.deepcopy(worker["window"][key]) for key in
+            ("protocol", "plan", "launch_at", "deadline", "runtime_seconds", "outer_deadline", "request_expires")}
+        if worker["window"]["protocol"] == DIRECT_PROTOCOL:
+            provenance["timing"].update({key: worker["window"][key]
+                                        for key in ("attempt_id", "attempt_started_at")})
+            provenance["timing"]["outer_deadline_role"] = "control reconciliation horizon; not instance expiry"
+        # supervisor observations remain verbatim; older missing observations stay unknown
+        provenance["timing"].update(runtime_origin=copy.deepcopy(worker.get("runtime_origin")),
+                                    basis=copy.deepcopy(worker.get("timing_basis")))
     result["context"]["aws_provenance"] = provenance
     for item in result["summaries"]:
         item["series_id"] = digest(encoded([SERIES_CONTRACT, item["series_id"],
@@ -414,6 +450,8 @@ def summary(evidence, result):
         "Recorded contract file validation": verification_label(
             {"verification": evidence["expected_verification"]}) if result is not None else "unavailable",
         "Observed file validation": verification_label(result["context"]) if result is not None else "unavailable"}
+    if "qualification_accepted" in evidence:
+        fields["Qualification"] = "passed; history not published" if evidence["qualification_accepted"] else "failed"
     status = evidence.get("status") or {}
     if status:
         fields.update({"Worker state": status.get("state", "unknown"), "Worker success": status.get("success", "unknown")})
@@ -431,7 +469,7 @@ def summary(evidence, result):
     return "\n\n".join(lines) + "\n"
 
 
-def ingest(source, output, expected, conclusion, policy=None, history=None):
+def ingest(source, output, expected, conclusion, policy=None, history=None, *, qualification=None):
     # reject invalid trusted arguments before claiming a must-be-new output directory
     identity.validate(expected)
     require(conclusion in CONCLUSIONS, "invalid producer conclusion")
@@ -443,6 +481,14 @@ def ingest(source, output, expected, conclusion, policy=None, history=None):
     raw_dir.mkdir()
     for name, payload in snapshots.items():
         (raw_dir / name).write_bytes(payload)
+    if qualification is not None:
+        evidence["qualification_accepted"] = False
+        try:
+            validate_qualification(evidence, raw, qualification)
+            evidence["qualification_accepted"] = True
+            evidence["qualification_contract_sha256"] = digest(encoded(qualification))
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            evidence["errors"].append("qualification: " + diagnostic(error))
     if policy is not None:
         try:
             approve(evidence, raw, policy)

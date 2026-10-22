@@ -13,13 +13,15 @@ import sys
 import time
 import uuid
 
+from .account_security import DHMC_SETTING, dhmc_arn, verify_dhmc_disabled
+from .ami_image import image_shape
+
 HERE = Path(__file__).resolve().parent
 TAG = "rcp-ami-build"
 TIMEOUT = 3600
 POLL = 15
 # emit a diagnostic after a long console lag; only the original capture cutoff ends the wait
 CONSOLE_GRACE = 600
-DHMC_SETTING = "/ssm/managed-instance/default-ec2-instance-management-role"
 READ_OPERATIONS = {
     ("sts", "get-caller-identity"),
     ("cloudformation", "describe-stacks"), ("cloudformation", "describe-stack-resources"),
@@ -150,41 +152,11 @@ def identity(aws, m):
     require(caller["Arn"].startswith("arn:aws:"), "only the commercial AWS partition is supported")
 
 
-def image_shape(image):
-    require(image.get("Architecture") == "x86_64" and image.get("VirtualizationType") == "hvm"
-            and image.get("EnaSupport") is True, "AMI must support x86_64 HVM and ENA")
-    require(image.get("RootDeviceType") == "ebs" and image.get("RootDeviceName") == "/dev/sda1",
-            "AMI must have an EBS /dev/sda1 root")
-    root = None
-    devices, virtuals = set(), set()
-    for mapping in image["BlockDeviceMappings"]:
-        device = mapping.get("DeviceName")
-        require(isinstance(device, str) and device not in devices, "missing or duplicate AMI device")
-        devices.add(device)
-        if "Ebs" in mapping:
-            require(root is None and device == "/dev/sda1" and set(mapping) == {"DeviceName", "Ebs"},
-                    "AMI must contain exactly one EBS volume, its /dev/sda1 root")
-            root = mapping["Ebs"]
-        else:
-            # Canonical AMIs can retain legacy instance-store references; these are not EBS volumes
-            virtual = mapping.get("VirtualName")
-            require(set(mapping) == {"DeviceName", "VirtualName"}
-                    and re.fullmatch(r"/dev/sd[b-z]", device)
-                    and isinstance(virtual, str) and re.fullmatch(r"ephemeral(?:[0-9]|1[0-9]|2[0-3])", virtual)
-                    and virtual not in virtuals, "unexpected AMI instance-store mapping")
-            virtuals.add(virtual)
-    require(root is not None, "AMI root EBS mapping is missing")
-    require(0 < root["VolumeSize"] <= 16, "AMI root exceeds 16 GiB")
-    return root
-
-
 def dhmc_disabled(aws, m):
     # no instance profile is not sufficient: DHMC can provide separate SSM credentials
-    arn = f"arn:aws:ssm:{m['region']}:{m['account']}:servicesetting{DHMC_SETTING}"
+    arn = dhmc_arn(m["region"], m["account"])
     setting = aws("ssm", "get-service-setting", SettingId=arn)["ServiceSetting"]
-    require(setting.get("ARN") == arn and setting.get("SettingId") in {DHMC_SETTING, arn}
-            and setting.get("Status") == "Default" and setting.get("SettingValue") == "$None",
-            "Default Host Management Configuration must already be disabled; no settings were changed")
+    verify_dhmc_disabled(setting, arn)
 
 
 def preflight(aws, m):

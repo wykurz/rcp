@@ -1,6 +1,6 @@
 """Small, shared protocol with fixed object names and bounded inputs."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -16,6 +16,11 @@ LAUNCH_RESERVE = WORKER_START_RESERVE + 120
 MIN_WINDOW = LAUNCH_RESERVE + 120 + 180
 MAX_WINDOW = 3600
 MAX_OPEN_LEAD = 300
+DURABLE_PROTOCOL = "rcp-durable-v1"
+DIRECT_PROTOCOL = "rcp-direct-v1"
+DURABLE_MAX_RUNTIME = 10800
+DURABLE_MAX_PROVISIONING = 43200
+DIRECT_MAX_ATTEMPTS = 720
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
 INSTANCE_TYPE = "c5d.24xlarge"
@@ -27,6 +32,18 @@ PENDING = "pending"
 COMPLETED = "completed"
 BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
+# append versions; recorded caps and manifests must not alias current admission globals
+_RECORDED_DURABLE_CONTRACTS = {
+    "bulk-metadata-plan-v1": dict(
+        plan=dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
+                  report_seconds=180, safety_factor=3, boot_reserve_seconds=300,
+                  shutdown_reserve_seconds=300),
+        max_runtime=10800, max_provisioning=43200, max_attempts=720,
+        binaries=tuple(f"{role}/{name}" for role in ("baseline", "candidate")
+                       for name in ("rcp", "rcpd", "filegen"))),
+}
+# projected work, not a measured complete run; preserve its version in every receipt
+DURABLE_PLAN = dict(_RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]["plan"])
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
 
 # append versions when cloud tuning changes; never infer old settings from local defaults
@@ -131,11 +148,96 @@ def validate_identity(value):
         require(value["baseline"] == value["candidate"], "A/A pilot requires identical revisions")
 
 
+def durable_plan_contract(plan, *, exact=True):
+    """Resolve a recorded version; current admission remains an explicit stricter check."""
+    require(isinstance(plan, dict) and isinstance(plan.get("version"), str), "unknown durable workload plan")
+    recorded = _RECORDED_DURABLE_CONTRACTS.get(plan["version"])
+    require(recorded is not None and plan == recorded["plan"], "unknown durable workload plan")
+    require(all(type(value) is int for key, value in plan.items() if key != "version"),
+            "durable plan durations must be integers")
+    contract = {**recorded, "plan": dict(recorded["plan"]), "binaries": tuple(recorded["binaries"])}
+    if exact:
+        require(plan == DURABLE_PLAN, "durable workload plan is not current")
+        contract.update(max_runtime=DURABLE_MAX_RUNTIME, max_provisioning=DURABLE_MAX_PROVISIONING,
+                        max_attempts=DIRECT_MAX_ATTEMPTS, binaries=tuple(BINARIES))
+    return contract
+
+
+def durable_worker_reserve(plan, *, exact=True):
+    """Return the recognized plan's projected work plus its recorded planning headroom."""
+    plan = durable_plan_contract(plan, exact=exact)["plan"]
+    return (plan["work_seconds"] + plan["report_seconds"]) * plan["safety_factor"]
+
+
+def validate_attempt_id(run, attempt_id, *, maximum=None):
+    """Return the canonical bounded attempt ordinal shared by tags and windows."""
+    maximum = DIRECT_MAX_ATTEMPTS if maximum is None else maximum
+    require(type(maximum) is int and maximum > 0, "invalid direct attempt bound")
+    require(isinstance(run, str) and isinstance(attempt_id, str), "invalid direct attempt identity")
+    identity = re.fullmatch(re.escape(run) + r"-([1-9][0-9]{0," + str(len(str(maximum)) - 1) + r"})", attempt_id)
+    require(identity is not None and int(identity[1]) <= maximum, "invalid direct attempt identity")
+    return int(identity[1])
+
+
+def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
+    """Validate explicit clock origins without reinterpreting historical windows."""
+    fields = {"run", "baseline", "candidate", "suite", "opens", "deadline", "protocol",
+              "instance_id", "launch_at", "runtime_seconds", "outer_deadline", "request_expires", "plan"}
+    direct = isinstance(value, dict) and value.get("protocol") == DIRECT_PROTOCOL
+    if direct:
+        fields |= {"attempt_id", "attempt_started_at"}
+    require(isinstance(value, dict) and set(value) == fields, "unexpected durable window fields")
+    require(all(isinstance(value[key], str) for key in fields - {"runtime_seconds", "plan"}),
+            "durable identity and timestamps must be strings")
+    require(value["protocol"] in (DURABLE_PROTOCOL, DIRECT_PROTOCOL), "unsupported durable protocol")
+    validate_identity(value)
+    require(value["suite"] == "bulk-1g-metadata" and value["baseline"] == value["candidate"],
+            "durable qualification requires metadata-only A/A")
+    require(re.fullmatch(r"i-[0-9a-f]{17}", value["instance_id"]), "invalid durable instance identity")
+    contract = durable_plan_contract(value["plan"], exact=exact)
+    required = durable_worker_reserve(value["plan"], exact=exact)
+    runtime = value["runtime_seconds"]
+    plan = contract["plan"]
+    require(type(runtime) is int and
+            required + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
+            <= runtime <= contract["max_runtime"], "durable runtime does not fit the disclosed workload plan")
+    try:
+        start, launch = utc(value["opens"]), utc(value["launch_at"])
+        deadline, outer, expires = (utc(value[key]) for key in ("deadline", "outer_deadline", "request_expires"))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ValidationError("invalid durable window timestamp") from error
+    if direct:
+        attempt = utc(value["attempt_started_at"])
+        validate_attempt_id(value["run"], value["attempt_id"], maximum=contract["max_attempts"])
+        require(start == attempt, "direct window must begin at the immutable attempt start")
+        require(attempt <= launch <= deadline and launch < expires,
+                "direct launch lies outside the attempt admission interval")
+        require(0 < (expires - attempt).total_seconds() <= contract["max_provisioning"],
+                "direct attempt lies outside the provisioning deadline")
+        require(deadline == attempt + timedelta(seconds=runtime - plan["shutdown_reserve_seconds"]),
+                "direct worker deadline differs from fixed attempt runtime")
+    else:
+        require(start == launch, "durable window must begin at the bound launch time")
+        require(0 < (expires - launch).total_seconds() <= contract["max_provisioning"],
+                "instance arrived outside the provisioning deadline")
+        require(deadline == launch + timedelta(seconds=runtime - plan["shutdown_reserve_seconds"]),
+                "durable worker deadline differs from launch-bound runtime")
+    require(outer == expires + timedelta(seconds=runtime), "durable reconciliation horizon mismatch")
+    now = now or datetime.now(timezone.utc)
+    require(launch <= now, "durable launch is in the future")
+    require(minimum <= (deadline - now).total_seconds() <= contract["max_runtime"],
+            "expired or too short durable worker deadline")
+    return deadline
+
+
 def validate_admission(value, *, window=False):
     """Apply current cloud policy without changing historical identity validation."""
     validate_identity(value)
     require(value["suite"] in ACTIVE_SUITES,
             "suite is disabled for new AWS runs until full-content verification fits the bounded window")
+    if window and "protocol" in value:
+        validate_durable_window(value, now=utc(value["launch_at"]), minimum=0)
+        return
     if window:
         minimum = admission_contract(value["suite"])["window"]
         require(minimum <= (utc(value["deadline"]) - utc(value["opens"])).total_seconds() <= MAX_WINDOW,
@@ -143,6 +245,8 @@ def validate_admission(value, *, window=False):
 
 
 def validate_window(value, now=None, minimum=RESERVE):
+    if isinstance(value, dict) and "protocol" in value:
+        return validate_durable_window(value, now, minimum)
     require(isinstance(value, dict) and set(value) ==
             {"run", "baseline", "candidate", "suite", "opens", "deadline"}, "unexpected window fields")
     validate_identity(value)
@@ -182,9 +286,11 @@ def completed_status(run, success=False):
 class Budget:
     """A wall-clock deadline plus a monotonic ceiling; clock changes cannot extend it."""
 
-    def __init__(self, deadline):
+    def __init__(self, deadline, *, ceiling_seconds=MAX_WINDOW + MAX_OPEN_LEAD):
+        require(type(ceiling_seconds) is int and 0 < ceiling_seconds <= DURABLE_MAX_RUNTIME,
+                "invalid monotonic budget ceiling")
         self.deadline = utc(deadline).timestamp()
-        self.end = time.monotonic() + min(MAX_WINDOW + MAX_OPEN_LEAD, self.deadline - time.time())
+        self.end = time.monotonic() + min(ceiling_seconds, self.deadline - time.time())
 
     def left(self, reserve=0):
         remaining = min(self.deadline - time.time(), self.end - time.monotonic()) - reserve
@@ -215,7 +321,7 @@ def retryable_io(error):
             or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
             or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
                                     "RequestTimeout", "RequestTimeoutException", "Throttling",
-                                    "ThrottlingException", "RequestLimitExceeded"})
+                                    "ThrottlingException", "RequestLimitExceeded", "ProvisionedThroughputExceededException"})
 
 
 def retry_io(operation, budget, reserve=0, attempts=3):

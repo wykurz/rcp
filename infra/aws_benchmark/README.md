@@ -142,6 +142,19 @@ python -m infra.aws_benchmark.operator \
    zero and waits up to ten minutes for the group and live EC2 inventory to empty. The independent
    cutoff also closes maximum, even after cancellation or lost GitHub credentials.
 
+Both legacy and direct operators first reserve `control/mailbox-owner.json` with one conditional
+`IfNoneMatch=*` write and a unique invocation token. A conflict refuses arming, even for the same
+run. A failed or interrupted arm retains ownership; do not delete it or retry with another producer
+until schedules, instances, volumes, delivery horizons and result collection are reconciled. The
+owner does not expire. Migrate older whole-bucket expiration rules only while the mailbox is
+quiescent; the new claim cannot fence an already-running producer using older code.
+
+Successful CLI output is now a receipt with `window` and `mailbox_owner`, rather than a bare window.
+Save it for exact-owner reconciliation. The runtime window object keeps its existing six-field
+schema. A partial failure may have stored a claim without returning a receipt; inspect that owner
+instead of assuming nothing happened. Owner retirement is a separate deliberate conditional delete
+using its current ETag after all producers and cleanup are reconciled, never automatic takeover.
+
 Only one trusted operator may arm this group at a time. The script refuses active capacities,
 live/terminating/stopped instances, pending schedules, and a control document whose deadline has not
 passed. For every new benchmark attempt, start a **fresh workflow dispatch** with a new run ID so
@@ -170,10 +183,11 @@ belong to CI:
   `arn:PARTITION:ssm:REGION:ACCOUNT:servicesetting/ssm/managed-instance/default-ec2-instance-management-role`.
   This read verifies that DHMC is disabled; it does not grant session, shell or setting-change
   access.
-- S3 `GetObject` and `PutObject` on exactly `control/window.json` and `output/status.json`, plus
-  `ListBucket` constrained to `control/window.json` so its initial absence is distinguishable from
-  access denial. The status object is initialized and read back before opening; CI needs no bucket
-  listing permission.
+- S3 `GetObject` and `PutObject` on exactly `control/window.json`, `control/mailbox-owner.json` and
+  `output/status.json`, plus bucket-scoped `GetLifecycleConfiguration` to prove the owner cannot
+  expire, and `ListBucket` constrained to `control/window.json` so its initial absence is
+  distinguishable from access denial. The status object is initialized and read back before opening;
+  CI needs no bucket listing permission.
 
 Infrastructure deployment uses a separate trusted identity with permission to create the resources
 declared in the template and pass the worker role. There is no need to grant CI `PassRole`, SSM,
@@ -371,3 +385,11 @@ cancellation and an unavailable-capacity/failure window before trusting unattend
 - [EC2 compute instance specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/co.html)
 - [EBS encryption and Auto Scaling key access](https://docs.aws.amazon.com/autoscaling/ec2/userguide/key-policy-requirements-EBS-encryption.html)
 - [Default Host Management Configuration](https://docs.aws.amazon.com/systems-manager/latest/userguide/fleet-manager-default-host-management-configuration.html)
+
+## Optional durable capacity acquisition
+
+The disabled [durable protocol](DURABLE.md) uses direct EC2 capacity retries for up to 12 hours and
+an immutable 180-minute envelope from each launch attempt's start. An independent expiry guard is
+verified before allocation; GitHub uses short submission and collection jobs. This original ASG
+operator-window protocol remains available. Review the new coordinator launch permission and funding
+before deployment; no recurring benchmark schedule is created.

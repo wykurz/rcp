@@ -423,7 +423,7 @@ class ReceiptTests(unittest.TestCase):
                     "--role-arn", "runtime-role", "--identity", str(identity_path),
                     "--binaries", str(root / "binaries"), "--output", str(root / "out")]
             with patch("sys.argv", args), patch.object(controller, "oidc_clients") as clients, \
-                 patch.object(controller, "run") as run, self.assertRaisesRegex(ValueError, "exact approved branch"):
+                 patch.object(controller, "run") as run, self.assertRaisesRegex(ValueError, "exact approved debug"):
                 controller.main()
             clients.assert_not_called()
             run.assert_not_called()

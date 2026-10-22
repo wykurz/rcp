@@ -110,6 +110,8 @@ def _run(api, name, bucket, identity, binary_root, output, receipt):
     validate_admission(identity)
     bootstrap = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     window = retry_io(lambda: get_json(api["s3"], bucket, WINDOW_KEY), bootstrap, reserve=5)
+    require(isinstance(window, dict) and "protocol" not in window,
+            "ASG controller requires an operator window, not a direct or historical protocol")
     require(all(window[k] == identity[k] for k in identity), "operator window does not match this run")
     validate_admission(window, window=True)
     launch_reserve = admission_contract(window["suite"])["launch"]
