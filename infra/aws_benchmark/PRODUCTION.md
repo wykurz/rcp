@@ -84,7 +84,19 @@ Collection retains version-bound raw evidence, a report, HTML and a hashed manif
 revision-fenced retirement transaction releases the active pointer. Missing or inaccessible proof
 holds ownership. Closed historical replay uses retained artifacts rather than regenerating history
 with a newer renderer. A bounded diagnostic report can describe a failed archive while preserving
-its exact raw bytes. Public dashboard publication is a later cutover step.
+its exact raw bytes. The local publication helpers discover only retired manifests, bind each to a
+consistent closed tombstone, and download exact retained versions through read-only clients.
+Discovery traverses the full retained prefix within page/count/time bounds; it is not an atomic
+snapshot, and later scans must revisit the prefix. It cannot describe active or held runs without
+manifests.
+
+A separate bounded bundle format binds the downloader revision and repository for credential-free
+processing. The public exporter renders escaped allowlisted fields and never publishes retained
+HTML. Failed qualifications retain diagnostics without performance measurements. Exact source replay
+preserves historical output without today's measurement parser. The history repository is trusted
+prior exporter storage: the retirement digest binds source evidence, not arbitrary edited
+measurement bytes. An embedded checksum would not replace that trust. These are local helpers;
+GitHub publication, Pages integration and a deployed read-only role remain later cutover steps.
 
 ## Storage and privileges
 

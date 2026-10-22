@@ -94,6 +94,51 @@ def verify_producer(documents, producer, now):
     return documents["attempt"]["conclusion"]
 
 
+def validate_retained(record, manifest, payloads):
+    """Pure validation of retained bytes; no live reads, rendering or workload parsing."""
+    binding = dict(schema=SCHEMA, run_key=record.run_key, epoch=record.epoch,
+        state_sha256=digest(encoded(record.state)), admission_sha256=digest(encoded(record.admission)),
+        identity=identity(record))
+    require(isinstance(manifest, dict) and set(manifest) == set(binding) | {
+        "execution", "producer_conclusion", "sources", "retained", "benchmark_valid"} and
+        all(manifest.get(k) == v for k, v in binding.items()) and
+        type(manifest["benchmark_valid"]) is bool and manifest["producer_conclusion"] in CONCLUSIONS and
+        isinstance(manifest["execution"], dict) and
+        manifest["execution"].get("status") in TERMINAL | {"NEVER_SUBMITTED"},
+        "retained manifest belongs to different evidence")
+    prefix = "production/runs/" + record.run_key + "/collection/"
+    limits = {"durable.json": MAX_RECEIPT, "status.json": MAX_DOCUMENT, "results.zip": MAX_RESULT,
+              "controller.json": MAX_DOCUMENT, "report.json": MAX_REPORT, "summary.html": MAX_REPORT}
+    refs = manifest["retained"]
+    require(isinstance(refs, dict) and {"durable.json", "controller.json", "report.json", "summary.html"}
+            <= set(refs) <= set(limits) and isinstance(payloads, dict) and set(payloads) == set(refs),
+            "retained file set differs")
+    for name, ref in refs.items():
+        raw = payloads[name]
+        require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
+                ref["key"] == prefix + name and isinstance(ref["version"], str) and
+                0 < len(ref["version"]) <= 1024 and ref["version"] != "null" and
+                all(32 < ord(char) < 127 for char in ref["version"]) and
+                isinstance(raw, bytes) and 0 < len(raw) <= limits[name] and type(ref["bytes"]) is int and
+                ref["bytes"] == len(raw) and ref["sha256"] == digest(raw), "retained reference differs")
+    Collector.retained_provenance(record, manifest, payloads)
+    sources = manifest["sources"]
+    require(isinstance(sources, dict) and set(sources) == set(refs) - {
+        "controller.json", "report.json", "summary.html"}, "source references differ")
+    paths = None if record.state.get("binding") is None else MailboxPaths.for_instance(
+        record.state["request"]["pins"]["account"], record.state["request"]["pins"]["region"],
+        record.state["binding"]["instance_id"])
+    keys = {"durable.json": "production/runs/" + record.run_key + "/durable-receipt.json"}
+    if paths:
+        keys.update({"status.json": paths.status, "results.zip": paths.results})
+    for name, ref in sources.items():
+        require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
+                ref["key"] == keys[name] and isinstance(ref["version"], str) and
+                ref["version"] not in ("", "null") and ref["sha256"] == digest(payloads[name]) and
+                type(ref["bytes"]) is int and ref["bytes"] == len(payloads[name]), "source binding differs")
+    return binding["identity"]
+
+
 class Objects:
     """Bounded versioned reads and create-only writes, with reconciliation after lost responses."""
     def __init__(self, api, bucket):
@@ -341,6 +386,7 @@ class Collector:
             # a valid physical cleanup into a permanent oversized-report hold.
             details = dict(schema_version=evidence["schema_version"], identity=expected,
                 producer_conclusion=conclusion, files=evidence["files"], controller=controller,
+                expected_verification=evidence["expected_verification"],
                 errors=[str(item)[:256] for item in evidence["errors"][:16]],
                 errors_total=len(evidence["errors"]), members_total=len(evidence["members"]),
                 diagnostic_projection=True, unabridged_report_sha256=digest(raw_report),
@@ -411,25 +457,12 @@ class Collector:
             require(isinstance(refs, dict) and {"durable.json", "controller.json", "report.json", "summary.html"} <= set(refs)
                     <= set(limits), "retained file set differs")
             payloads = {name: self.objects.referenced(ref, self.prefix + name, limits[name]) for name, ref in refs.items()}
-            self.retained_provenance(record, manifest, payloads)
+            validate_retained(record, manifest, payloads)
             if not record.closed:
                 # an open run still needs today's qualification verdict before retirement.
                 # Presentation bytes are historical and are never regenerated for equality.
                 valid, _ = self.analyze(record, expected, execution, conclusion, payloads)
                 require(valid == manifest["benchmark_valid"], "retained qualification verdict differs")
-            # validate exact original source identities without depending on their shorter retention
-            sources = manifest["sources"]
-            require(isinstance(sources, dict) and set(sources) == set(refs) - {
-                "controller.json", "report.json", "summary.html"}, "source references differ")
-            paths = None if record.state.get("binding") is None else MailboxPaths.for_instance(
-                record.state["request"]["pins"]["account"], record.state["request"]["pins"]["region"], record.state["binding"]["instance_id"])
-            keys = {"durable.json": "production/runs/" + record.run_key + "/durable-receipt.json"}
-            if paths:
-                keys.update({"status.json": paths.status, "results.zip": paths.results})
-            for name, ref in sources.items():
-                require(set(ref) == {"key", "version", "sha256", "bytes"} and ref["key"] == keys[name] and
-                        isinstance(ref["version"], str) and ref["version"] not in ("", "null") and
-                        ref["sha256"] == digest(payloads[name]) and ref["bytes"] == len(payloads[name]), "source binding differs")
             return manifest, existing[1]
         payloads, sources = self.raw(record)
         valid, derived = self.analyze(record, expected, execution, conclusion, payloads)
