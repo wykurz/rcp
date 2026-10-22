@@ -24,11 +24,13 @@ root files require whole-tree variants; partitioned variants are rejected before
 ## View results
 
 Existing **Copy benchmarks** runs remain in Depot history. Their local and loopback jobs have
-summaries of median wall time and repeat range; no new Depot measurements are scheduled. For the
-full report, download the corresponding `benchmark-results-local` or `benchmark-results-loopback`
-artifact, extract it, and open `report/index.html` in a browser. The report is self-contained and
-needs no server. The same artifact contains `results.json`, `summary.md`, and per-process logs;
-artifacts are retained for 90 days.
+summaries of median wall time and repeat range. Refs containing the retirement commit no longer
+define Depot measurements; older refs and reruns can retain the workflow (see
+[CI and stability](#ci-and-stability)). For the full report, download the corresponding
+`benchmark-results-local` or `benchmark-results-loopback` artifact, extract it, and open
+`report/index.html` in a browser. The report is self-contained and needs no server. The same
+artifact contains `results.json`, `summary.md`, and per-process logs; artifacts are retained for 90
+days.
 
 Historical PR and push reports list smoke runs; their timings are in `summary.md` and
 `results.json`, excluded from performance trends and ratios. Earlier scheduled and manual
@@ -100,10 +102,10 @@ share a machine, kernel, CPU budget and storage unless separate filesystem roots
 not a measurement of a physical 100G link or two independent servers.
 
 Loopback records the SSH client version and binary digest. Use `--ssh-transport-profile` to identify
-the server and configuration when running outside CI; without it, that part of the transport is
-unknown. Historical Depot runs supplied a digest of the actual daemon binary and the source-owned
-SSH setup action, so changes to either start a new series without recording keys or temporary
-configuration paths.
+the server and configuration for new runs; without it, that part of the transport is unknown.
+Historical Depot runs supplied a digest of the actual daemon binary and the source-owned SSH setup
+action, so changes to either start a new series without recording keys or temporary configuration
+paths.
 
 `local` compares rcp, GNU `cp -a`, and both rsync variants without SSH. Both rcp and cp retain their
 default reflink policy; a reflink-capable filesystem can make these copies much faster. The
@@ -599,19 +601,21 @@ bytes and the tested rcp revision do not split the series: rcp changes are preci
 history should expose. Keep runner labels stable and descriptive, and distinguish materially
 different storage configurations with endpoint storage IDs.
 
-History is one immutable JSON file per run on the `benchmark-history` branch. CI artifacts preserve
-full logs and per-run standalone reports; the history branch provides persistence independent of
-artifact expiration. Identical duplicate run IDs are harmless; conflicting duplicates fail.
-Publication appends with normal Git pushes and retries concurrent updates without force-pushing.
-Validated terminal failures are also recorded, so a failed measurement remains visible in history.
-Failures before the harness creates a result, such as a build failure, remain in CI logs.
+History is one immutable JSON file per run on the `benchmark-history` branch. Historical CI
+artifacts contain full logs and per-run standalone reports until their original expiry; the history
+branch provides persistence independent of artifact expiration. Identical duplicate run IDs are
+harmless; conflicting duplicates fail. Publication appends with normal Git pushes and retries
+concurrent updates without force-pushing. Validated terminal failures are also recorded, so a failed
+measurement remains visible in history. Historical failures before the harness created a result,
+such as a build failure, remain only in retained CI logs. There is currently no automatic history
+publisher.
 
-The history job runs after the benchmark job has ended. It passes `--finalize-interrupted` to the
-publisher so a saved `running` artifact becomes a failed history record with an explicit recovery
-diagnostic. Completed trials and case summaries are retained; running trials are marked failed. The
-original artifact is unchanged. For manual recovery, use this flag only after confirming the
-producer has stopped. Without it, publication rejects a `running` record. A hard runner shutdown can
-prevent artifact upload entirely, in which case there is no result for the history job to recover.
+For manual recovery, pass `--finalize-interrupted` to the publisher only after confirming the
+producer has stopped. A saved `running` artifact becomes a failed history record with an explicit
+recovery diagnostic. Completed trials and case summaries are retained; running trials are marked
+failed. The original artifact is unchanged. Without the flag, publication rejects a `running`
+record. A hard runner shutdown can prevent artifact upload entirely, leaving no saved result to
+recover.
 
 To render downloaded history locally:
 
@@ -713,7 +717,7 @@ Keep three distinct budgets as coverage grows:
 
 | Lane                     | Purpose                                                                       | Next decision                                                                                                                                            |
 | ------------------------ | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PR correctness/mechanism | Cheap fixtures and existing smoke checks; fail broken copies/evidence         | Keep behavioral checks in `benchmark-test`; review the current multi-variant smoke cost separately                                                       |
+| PR correctness/mechanism | Harness unit tests with cheap fixtures; fail broken copies/evidence           | Keep behavioral checks in `benchmark-test`; choose a new smoke budget before enabling any remote measurement lane                                        |
 | Paired numeric samples   | Candidate/base on the same workload with balanced order and verified outcomes | Choose a bounded subset of massive fresh, update and wide-directory/RTT workloads, a baseline pin policy and repeat budget before expanding the schedule |
 | Targeted diagnostics     | Explain a confirmed change with bounded evidence                              | Define one workload/role selection, timeout, byte/event cap, 90-day raw retention and durable numeric/provenance summary before automatic dispatch       |
 
@@ -737,16 +741,19 @@ not a promise that expired raw logs are recoverable.
 
 ## CI and stability
 
-Depot benchmark execution is retired to stop spending on automated measurements. The benchmark
-workflow and `just depot-benchmark` entrypoint have been removed, including PR, push, weekly and
-manual triggers. Ordinary Depot builds and non-benchmark tests remain available through
-`just depot-ci` and the other `depot-*` test recipes. Harness behavior tests remain in normal
-lint/validation; they do not launch a paid benchmark worker.
+Refs containing the Depot retirement commit no longer define the benchmark workflow or
+`just depot-benchmark` entrypoint, including PR, push, weekly and manual triggers. Removing source
+files does not disable retained workflows on older refs or historical reruns. Before treating Depot
+benchmark spending as stopped, verify the live workflow registration and queued/running jobs, and
+update stale branches that still contain the definition or, if supported, pause that specific
+workflow in Depot. Do not pause ordinary builds or tests. Ordinary Depot builds and non-benchmark
+tests remain available through `just depot-ci` and the other `depot-*` test recipes. Harness
+behavior tests remain in normal lint/validation; they do not launch a paid benchmark worker.
 
 Existing result artifacts retain their original expiry, and the `benchmark-history` branch and
-report renderer remain available. This change does not activate an AWS replacement or create a
-recurring benchmark schedule. AWS runs require their separately configured admission and shutdown
-controls.
+report renderer remain available. Retiring Depot benchmarks did not activate an AWS replacement or
+any recurring benchmark schedule. AWS runs require their separately configured admission and
+shutdown controls.
 
 For a small local harness check, explicitly select a smoke case and purpose:
 
@@ -754,16 +761,17 @@ For a small local harness check, explicitly select a smoke case and purpose:
 just benchmark-run --case tiny-10k --mode local --purpose smoke --output /tmp/rcp-bench-smoke
 ```
 
-We do not yet have evidence that this CI environment supports reliable timing gates. Fixed runner
-labels do not eliminate host contention, storage variation, cache effects or infrastructure updates.
-Inspect both absolute wall time and within-run ratios: a machine change may affect all tools, while
-a code regression may disproportionately affect rcp. Neither ratio alone nor a small within-run
-spread proves stability across runs.
+Validate any future benchmark environment before enabling timing gates. Fixed runner labels do not
+eliminate host contention, storage variation, cache effects or infrastructure updates. Inspect both
+absolute wall time and within-run ratios: a machine change may affect all tools, while a code
+regression may disproportionately affect rcp. Neither ratio alone nor a small within-run spread
+proves stability across runs.
 
-First collect repeated main-branch runs, including repeats of the same commit, and inspect their
-spread. A future gate should be based on demonstrated noise bounds and paired candidate/base
-measurements, with a repeat policy for suspicious results. Until then, timing remains informational
-and correctness/operational failures remain visible failures.
+Once a replacement measurement lane is explicitly enabled, collect repeated main-branch runs,
+including repeats of the same commit, and inspect their spread. A future gate should be based on
+demonstrated noise bounds and paired candidate/base measurements, with a repeat policy for
+suspicious results. Until then, timing remains informational and correctness/operational failures
+remain visible failures.
 
 ## Share an all-row JSON export
 
@@ -840,8 +848,12 @@ remains wider than the shared header to accommodate tables and figures; mobile g
 throughout.
 
 Historical Depot performance records remain in `benchmark-history`; the retired benchmark workflow
-no longer writes new records or sends `benchmark-history-updated` dispatches. No Depot write
-permission is needed to render the retained history.
+no longer writes new records. The unused `benchmark-history-updated` Pages trigger is removed. No
+Depot write permission is needed to render retained history. Repository administrators should audit
+and revoke any Depot Contents-write grant previously added only for the history job, retaining the
+Contents-read access needed by ordinary CI. This source change does not alter App installation
+permissions; if supported App controls cannot remove that obsolete grant independently, record it as
+outstanding administrator cleanup rather than claiming it has been revoked.
 
 The native [Pages workflow](../.github/workflows/benchmark-pages.yml) publishes with code from
 `main` and treats the history branch only as data. Pull requests run read-only validation;
@@ -851,9 +863,11 @@ computation.
 
 One-time repository setup:
 
-1. In Settings → Pages, choose **GitHub Actions** as the source.
-2. Set repository Actions variable `RCP_BENCHMARK_PAGES` to `true`.
-3. Run **Benchmark history and reports** manually to publish the existing records.
+1. Audit and revoke the obsolete Depot history-writer Contents-write grant as described above;
+   preserve ordinary CI read access.
+2. In Settings → Pages, choose **GitHub Actions** as the source.
+3. Set repository Actions variable `RCP_BENCHMARK_PAGES` to `true`.
+4. Run **Benchmark history and reports** manually to publish the existing records.
 
 Until Pages is enabled, retained run artifacts and durable history remain usable. A successful
 measurement is not proof that Pages publication has occurred; inspect the Pages deployment result.

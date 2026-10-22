@@ -2,16 +2,6 @@
 
 set -euo pipefail
 
-workflow=.depot/workflows/ci.yml
-if [[ "${1:-}" == --workflow ]]; then
-    if [[ "$#" -lt 2 || -z "$2" ]]; then
-        echo "depot-ci: workflow path is required after --workflow" >&2
-        exit 2
-    fi
-    workflow="$2"
-    shift 2
-fi
-
 if [[ "$#" -eq 0 ]]; then
     echo "depot-ci: at least one workflow job is required" >&2
     exit 2
@@ -25,8 +15,12 @@ for required_command in depot git jq; do
 done
 
 jobs=("$@")
-run_args=(ci run --workflow "$workflow")
+run_args=(ci run --workflow .depot/workflows/ci.yml)
 for job in "${jobs[@]}"; do
+    if [[ "$job" == -* ]]; then
+        echo "depot-ci: unsupported option: $job; provide CI job names only" >&2
+        exit 2
+    fi
     run_args+=(--job "$job")
 done
 

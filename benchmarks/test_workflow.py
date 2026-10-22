@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import subprocess
 import tarfile
 import tempfile
@@ -13,35 +12,12 @@ from benchmarks.test_changes import Fragment, observation
 
 
 class BenchmarkWorkflowTests(unittest.TestCase):
-    def test_depot_measurement_entrypoints_are_removed(self):
+    def test_pages_accepts_only_main_push_and_manual_requests(self):
         project = Path(__file__).resolve().parent.parent
-        self.assertFalse((project / ".depot/workflows/benchmarks.yml").exists())
-        self.assertNotRegex((project / "justfile").read_text(), r"(?m)^depot-benchmark\s*:")
-        for path in (project / ".depot/workflows").glob("*.y*ml"):
-            workflow = yaml.safe_load(path.read_text())
-            for job in workflow["jobs"].values():
-                self.assertNotIn("benchmarks.yml", job.get("uses", ""))
-                for step in job.get("steps", []):
-                    command = step.get("run", "")
-                    with self.subTest(workflow=path.name, step=step.get("name")):
-                        self.assertNotRegex(command, r"\bjust\s+benchmark(?:-run)?(?=\s|$)")
-                        self.assertNotRegex(command, r"\bpython[0-9.]*\s+-m\s+benchmarks\.run\b")
-
-    def test_depot_build_and_test_jobs_remain_available(self):
-        project = Path(__file__).resolve().parent.parent
-        workflow = yaml.load((project / ".depot/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
-        self.assertIn("workflow_dispatch", workflow["on"])
-        jobs = workflow["jobs"]
-        expected = {"lint": "just lint", "doc": "just doc", "test": "just test --no-run",
-                    "doctest": "just doctest", "test-release": "just test-release --no-run",
-                    "doctest-release": "just doctest-release", "docker-test": "just docker-up",
-                    "docker-chaos-test": "just docker-up"}
-        for job, command in expected.items():
-            with self.subTest(job=job):
-                self.assertIn(command, [step.get("run") for step in jobs[job]["steps"]])
-        recipes = set(re.findall(r"(?m)^([a-z][a-z-]*)(?:[ :])", (project / "justfile").read_text()))
-        self.assertTrue({"benchmark", "benchmark-run", "benchmark-test", "benchmark-report",
-                         "depot-ci", "depot-test", "depot-test-release", "depot-docker-test"} <= recipes)
+        workflow = yaml.load((project / ".github/workflows/benchmark-pages.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"push", "workflow_dispatch"})
+        self.assertEqual(workflow["on"]["push"]["branches"], ["main"])
 
     def test_pages_packages_rendered_history_for_direct_pinned_upload(self):
         project = Path(__file__).resolve().parent.parent

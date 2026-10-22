@@ -27,8 +27,7 @@ security-sensitive change:
 
 Publishes the project landing page, a trend dashboard under `ci-benchmarks/` from the dedicated
 `benchmark-history` branch, and the Markdown-based [reports](../../docs/reports/README.md) under
-`reports/`. Every push to `main` and manual requests rebuild the combined site. The retained
-`benchmark-history-updated` dispatch also supports explicit history publication. The push trigger
+`reports/`. Every push to `main` and manual requests rebuild the combined site. The push trigger
 covers changes to linked documentation as well as report sources. Pull requests validate the report
 build and original measurement checksums without deploying. Published rendering code and report
 sources come from `main`; historical records are data. The deployment is enabled with the repository
@@ -37,10 +36,12 @@ variable `RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Action
 instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
 publication.
 
-Depot benchmark execution is retired: PR, push, schedule and manual benchmark triggers have been
-removed. The ordinary Depot build and test workflow remains available. Local benchmark commands,
-harness tests and existing history are retained; AWS qualification is separately opt-in and does not
-automatically replace those triggers. No timing threshold blocks a change.
+Depot benchmark definitions are removed from refs containing the retirement commit, including PR,
+push, schedule and manual benchmark triggers. Old refs and reruns can retain those definitions;
+verify live Depot registration and update stale branches before treating spending as stopped. The
+ordinary Depot build and test workflow remains available. Local benchmark commands, harness tests
+and existing history are retained; AWS qualification is separately opt-in and does not automatically
+replace those triggers. No timing threshold blocks a change.
 
 ### rust.yml
 
