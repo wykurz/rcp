@@ -49,7 +49,7 @@ class OperatorTests(unittest.TestCase):
             {"VersionNumber": 9, "LaunchTemplateData": self.data}]}
         self.snapshot_id = "snap-" + "f" * 17
         self.image = dict(ImageId=self.config.ami, State="available", Public=False, Architecture="x86_64",
-            RootDeviceName="/dev/sda1", RootDeviceType="ebs", BlockDeviceMappings=[dict(DeviceName="/dev/sda1",
+            VirtualizationType="hvm", EnaSupport=True, RootDeviceName="/dev/sda1", RootDeviceType="ebs", BlockDeviceMappings=[dict(DeviceName="/dev/sda1",
                 Ebs=dict(SnapshotId=self.snapshot_id, Encrypted=True, VolumeSize=16))])
         api["ec2"].describe_images.return_value = {"Images": [self.image]}
         self.key_arn = "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
@@ -180,7 +180,41 @@ class OperatorTests(unittest.TestCase):
 
     def test_unexpected_extra_image_volume_is_rejected(self):
         self.image["BlockDeviceMappings"].append(dict(DeviceName="/dev/sdb", Ebs={}))
-        with self.assertRaisesRegex(ValueError, "AMI volumes"):
+        with self.assertRaisesRegex(ValueError, "exactly one EBS volume"):
+            verify_image(self.service)
+
+    def test_canonical_legacy_instance_store_mappings_preserve_single_root_validation(self):
+        root = self.image["BlockDeviceMappings"][0]
+        self.image["BlockDeviceMappings"] = [dict(DeviceName="/dev/sdb", VirtualName="ephemeral0"),
+            root, dict(DeviceName="/dev/sdc", VirtualName="ephemeral1")]
+        verify_image(self.service)
+        self.service.api["ec2"].describe_snapshots.assert_called_once_with(
+            SnapshotIds=[self.snapshot_id], OwnerIds=[self.config.account])
+
+    def test_legacy_mappings_do_not_allow_duplicates_extra_ebs_or_unknown_devices(self):
+        root = copy.deepcopy(self.image["BlockDeviceMappings"][0])
+        cases = [[dict(DeviceName="/dev/sdb", Ebs={})],
+            [dict(DeviceName="/dev/sda1", VirtualName="ephemeral0")],
+            [dict(DeviceName="/dev/sdb", VirtualName="ephemeral0"),
+             dict(DeviceName="/dev/sdc", VirtualName="ephemeral0")],
+            [dict(DeviceName="/dev/sdb", VirtualName="ephemeral0", NoDevice="")],
+            [dict(DeviceName="/dev/nvme0n1", VirtualName="ephemeral0")],
+            [dict(DeviceName="/dev/sdb", VirtualName="ephemeral24")],
+            [dict(DeviceName="/dev/sdb")]]
+        for extras in cases:
+            with self.subTest(extras=extras):
+                self.image["BlockDeviceMappings"] = [copy.deepcopy(root), *extras]
+                with self.assertRaises(ValueError):
+                    verify_image(self.service)
+        self.service.api["ec2"].describe_snapshots.assert_not_called()
+
+    def test_legacy_mappings_do_not_allow_unencrypted_or_missing_root(self):
+        self.image["BlockDeviceMappings"].append(dict(DeviceName="/dev/sdb", VirtualName="ephemeral0"))
+        self.image["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] = False
+        with self.assertRaisesRegex(ValueError, "encrypted image root"):
+            verify_image(self.service)
+        self.image["BlockDeviceMappings"].pop(0)
+        with self.assertRaisesRegex(ValueError, "root EBS mapping is missing"):
             verify_image(self.service)
 
     def test_inbound_security_group_access_is_rejected(self):
