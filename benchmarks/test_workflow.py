@@ -12,11 +12,17 @@ from benchmarks.test_changes import Fragment, observation
 
 
 class BenchmarkWorkflowTests(unittest.TestCase):
-    def test_pages_accepts_only_main_push_and_manual_requests(self):
+    def test_pages_accepts_main_push_manual_and_pinned_reusable_publication(self):
         project = Path(__file__).resolve().parent.parent
         workflow = yaml.load((project / ".github/workflows/benchmark-pages.yml").read_text(),
                              Loader=yaml.BaseLoader)
-        self.assertEqual(set(workflow["on"]), {"push", "workflow_dispatch"})
+        self.assertEqual(set(workflow["on"]), {"push", "workflow_dispatch", "workflow_call"})
+        self.assertEqual(workflow["on"]["workflow_call"]["inputs"], {"aws_history_commit": {
+            "description": "Exact public history commit returned by the successful history writer",
+            "type": "string", "required": "true"}})
+        guard = workflow["jobs"]["publish"]["if"]
+        self.assertIn("github.repository == 'wykurz/rcp'", guard)
+        self.assertIn("github.ref == 'refs/heads/main'", guard)
         self.assertEqual(workflow["on"]["push"]["branches"], ["main"])
 
     def test_pages_packages_rendered_history_for_direct_pinned_upload(self):

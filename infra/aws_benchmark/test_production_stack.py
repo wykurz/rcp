@@ -54,9 +54,9 @@ def sequence(value):
     return value if isinstance(value, list) else [value]
 
 
-def resolve(value, enabled=True, admission=True):
+def resolve(value, enabled=True, admission=True, publication=True):
     if isinstance(value, list):
-        return [resolve(item, enabled, admission) for item in value]
+        return [resolve(item, enabled, admission, publication) for item in value]
     if not isinstance(value, dict):
         return value
     if set(value) == {"Ref"}:
@@ -65,19 +65,19 @@ def resolve(value, enabled=True, admission=True):
         return VALUES[".".join(value["Fn::GetAtt"])]
     if set(value) == {"Fn::If"}:
         condition, yes, no = value["Fn::If"]
-        assert condition in {"Enabled", "Admitting"}
-        active = enabled if condition == "Enabled" else enabled and admission
-        return resolve(yes if active else no, enabled, admission)
+        assert condition in {"Enabled", "Admitting", "Publishing"}
+        active = {"Enabled": enabled, "Admitting": enabled and admission, "Publishing": publication}[condition]
+        return resolve(yes if active else no, enabled, admission, publication)
     if set(value) == {"Fn::Sub"}:
         def replace(match):
             name = match[1]
             return "${" + name[1:] + "}" if name.startswith("!") else str(VALUES[name])
         return re.sub(r"\$\{([^}]+)\}", replace, value["Fn::Sub"])
-    return {key: resolve(item, enabled, admission) for key, item in value.items()}
+    return {key: resolve(item, enabled, admission, publication) for key, item in value.items()}
 
 
-def statements(role, enabled=True, admission=True):
-    return [resolve(statement, enabled, admission)
+def statements(role, enabled=True, admission=True, publication=True):
+    return [resolve(statement, enabled, admission, publication)
             for policy in TEMPLATE["Resources"][role]["Properties"]["Policies"]
             for statement in policy["PolicyDocument"]["Statement"]]
 
@@ -116,10 +116,10 @@ def conditions_match(conditions, context):
     return True
 
 
-def permits(role, action, resource, context=None, *, enabled=True, admission=True):
+def permits(role, action, resource, context=None, *, enabled=True, admission=True, publication=True):
     context = context or {}
     allowed = False
-    for statement in statements(role, enabled, admission):
+    for statement in statements(role, enabled, admission, publication):
         if not any(fnmatch.fnmatchcase(action, item) for item in sequence(statement["Action"])):
             continue
         patterns = [re.sub(r"\$\{([^}]+)\}", lambda match: str(context.get(match[1], "<missing>")), item)
@@ -170,7 +170,7 @@ def launch_context():
 class ProductionStackTests(unittest.TestCase):
     def test_default_flags_disable_every_invocation_and_background_tick(self):
         self.assertEqual(TEMPLATE["Parameters"]["ResourcePrefix"]["Default"], PREFIX)
-        for name in ("RuntimeEnabled", "AdmissionEnabled"):
+        for name in ("RuntimeEnabled", "AdmissionEnabled", "PublicationEnabled"):
             self.assertEqual(TEMPLATE["Parameters"][name]["Default"], "false")
         for enabled, admitting in ((False, False), (False, True), (True, False), (True, True)):
             for name in ("Admission", "Coordinator", "Watchdog", "Collector"):
@@ -621,6 +621,119 @@ class ProductionStackTests(unittest.TestCase):
             self.assertNotIn("VpcConfig", props)
             self.assertEqual(TEMPLATE["Resources"][name + "LogGroup"]["Properties"]["RetentionInDays"], 7)
         self.assertIsNone(re.fullmatch(TEMPLATE["Parameters"]["CodeObjectVersion"]["AllowedPattern"], "null"))
+
+
+class PublicationRoleTests(unittest.TestCase):
+    role = "GitHubPublicationRole"
+    collection = BUCKET_ARN + "/production/runs/" + RUN + "/collection/"
+
+    def test_publication_gate_defaults_off_and_is_independent_of_paid_runtime(self):
+        parameter = TEMPLATE["Parameters"]["PublicationEnabled"]
+        self.assertEqual(parameter["Default"], "false")
+        self.assertEqual(parameter["AllowedValues"], ["false", "true"])
+        self.assertEqual(TEMPLATE["Conditions"]["Publishing"],
+                         {"Fn::Equals": [{"Ref": "PublicationEnabled"}, "true"]})
+        props = TEMPLATE["Resources"][self.role]["Properties"]
+        for enabled in (False, True):
+            for admission in (False, True):
+                for publication in (False, True):
+                    flags = dict(enabled=enabled, admission=admission, publication=publication)
+                    trust = resolve(props["AssumeRolePolicyDocument"], **flags)["Statement"]
+                    self.assertEqual(trust[0]["Effect"], "Allow" if publication else "Deny")
+                    self.assertTrue(all(entry["Effect"] == ("Allow" if publication else "Deny")
+                                        for entry in statements(self.role, **flags)))
+                    self.assertEqual(permits(self.role, "dynamodb:GetItem", TABLE,
+                        db_context("active", transaction=False), **flags), publication)
+                    self.assertEqual(permits(self.role, "s3:GetObject", self.collection + "manifest.json", **flags),
+                                     publication)
+        self.assertEqual(TEMPLATE["Outputs"]["GitHubPublicationRoleArn"]["Value"],
+                         {"Fn::GetAtt": [self.role, "Arn"]})
+
+    def test_publication_trust_uses_only_supported_exact_audience_and_main_subject(self):
+        props = TEMPLATE["Resources"][self.role]["Properties"]
+        trust = resolve(props["AssumeRolePolicyDocument"])["Statement"]
+        context = {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                   "token.actions.githubusercontent.com:sub": "repo:wykurz/rcp:ref:refs/heads/main"}
+        self.assertEqual(trust, [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+            "Principal": {"Federated": VALUES["GitHubOidcProviderArn"]}, "Condition": {"StringEquals": context}}])
+        self.assertEqual(props["MaxSessionDuration"], 3600)
+        self.assertNotIn("ManagedPolicyArns", props)
+        self.assertTrue(conditions_match(trust[0]["Condition"], context))
+        subjects = ["repo:wykurz/rcp:pull_request", "repo:wykurz/rcp:environment:production",
+                    "repo:wykurz/rcp:ref:refs/heads/debug", "repo:wykurz/rcp:ref:refs/tags/main",
+                    "repo:another/rcp:ref:refs/heads/main", "repo:wykurz/other:ref:refs/heads/main"]
+        for subject in subjects:
+            self.assertFalse(conditions_match(trust[0]["Condition"],
+                context | {"token.actions.githubusercontent.com:sub": subject}), subject)
+        for key in context:
+            missing = dict(context)
+            del missing[key]
+            self.assertFalse(conditions_match(trust[0]["Condition"], missing))
+            self.assertFalse(conditions_match(trust[0]["Condition"], context | {key: "different"}))
+
+    def test_publication_reads_only_exact_active_and_repository_run_records(self):
+        for key in ("active", RUN_PK, "run#repo-655073755-run-999999"):
+            self.assertTrue(permits(self.role, "dynamodb:GetItem", TABLE, db_context(key, transaction=False)))
+        for key in ("policy", "guard", "budget#total", "budget#month#2026-10", "rate#day#2026-10-22",
+                    "schedule#slot", "run#repo-1-run-1234", "active#other", "run#1234"):
+            self.assertFalse(permits(self.role, "dynamodb:GetItem", TABLE, db_context(key, transaction=False)), key)
+        self.assertFalse(permits(self.role, "dynamodb:GetItem", TABLE, {}))
+        self.assertFalse(permits(self.role, "dynamodb:GetItem", TABLE, db_context(RUN_PK, "policy")))
+        self.assertFalse(permits(self.role, "dynamodb:GetItem", TABLE + "-other", db_context(RUN_PK)))
+        for action in ("Scan", "Query", "BatchGetItem", "PutItem", "UpdateItem", "DeleteItem", "ConditionCheckItem"):
+            for key in ("active", RUN_PK, "policy", "budget#total"):
+                self.assertFalse(permits(self.role, "dynamodb:" + action, TABLE, db_context(key)), (action, key))
+
+    def test_publication_inventory_is_exact_repository_prefix_and_reader_page_size(self):
+        from infra.aws_benchmark.production_publication import PAGE_SIZE, Reader
+        reader = Reader(None, None, bucket=BUCKET, table="production", repository_id="655073755")
+        self.assertEqual(PAGE_SIZE, 500)
+        context = {"s3:prefix": reader.prefix, "s3:max-keys": PAGE_SIZE}
+        self.assertTrue(permits(self.role, "s3:ListBucket", BUCKET_ARN, context))
+        for prefix in ("", "production/", "production/runs/", "production/staging/", "production/instances/",
+                       "production/runs/repo-1-run-", reader.prefix + "1234/collection/"):
+            self.assertFalse(permits(self.role, "s3:ListBucket", BUCKET_ARN, context | {"s3:prefix": prefix}), prefix)
+        for max_keys in (1, 499, 501, 1000):
+            self.assertFalse(permits(self.role, "s3:ListBucket", BUCKET_ARN, context | {"s3:max-keys": max_keys}))
+        for key in context:
+            missing = dict(context)
+            del missing[key]
+            self.assertFalse(permits(self.role, "s3:ListBucket", BUCKET_ARN, missing))
+        self.assertFalse(permits(self.role, "s3:ListBucket", BUCKET_ARN + "-other", context))
+        self.assertFalse(permits(self.role, "s3:ListBucketVersions", BUCKET_ARN, context))
+        self.assertFalse(permits(self.role, "s3:ListAllMyBuckets", "*", context))
+
+    def test_publication_payload_reads_require_versions_and_only_fixed_collection_names(self):
+        from infra.aws_benchmark.production_publication import LIMITS
+        names = set(LIMITS) | {"manifest.json"}
+        self.assertEqual(names, {"manifest.json", "durable.json", "status.json", "results.zip",
+                                 "controller.json", "report.json", "summary.html"})
+        for name in names:
+            self.assertTrue(permits(self.role, "s3:GetObjectVersion", self.collection + name), name)
+            self.assertEqual(permits(self.role, "s3:GetObject", self.collection + name), name == "manifest.json", name)
+        forbidden = [self.collection + "credentials.json", self.collection + "manifest.json/extra",
+            self.collection.replace("repo-655073755-", "repo-1-") + "manifest.json",
+            BUCKET_ARN + "/production/runs/" + RUN + "/durable-receipt.json",
+            BUCKET_ARN + "/production/staging/" + RUN + "/baseline/rcp",
+            instance_key("output/results.zip"), self.collection.replace(BUCKET_ARN, BUCKET_ARN + "-other") + "manifest.json"]
+        for resource in forbidden:
+            for action in ("s3:GetObject", "s3:GetObjectVersion"):
+                self.assertFalse(permits(self.role, action, resource), (action, resource))
+
+    def test_publication_has_no_mutation_execution_role_passing_or_runtime_read_authority(self):
+        actions = {action for entry in statements(self.role) for action in sequence(entry["Action"])}
+        self.assertEqual(actions, {"dynamodb:GetItem", "s3:ListBucket", "s3:GetObject", "s3:GetObjectVersion"})
+        denied = [("s3:PutObject", self.collection + "manifest.json"),
+            ("s3:DeleteObject", self.collection + "manifest.json"),
+            ("s3:DeleteObjectVersion", self.collection + "manifest.json"),
+            ("s3:PutObjectTagging", self.collection + "manifest.json"),
+            ("ec2:RunInstances", INSTANCE), ("ec2:TerminateInstances", INSTANCE), ("ec2:DescribeInstances", "*"),
+            ("iam:PassRole", VALUES["WorkerRole.Arn"]), ("sts:AssumeRole", VALUES["WorkerRole.Arn"]),
+            ("lambda:InvokeFunction", VALUES["AdmissionFunction.Arn"]), ("states:StartExecution", MACHINE),
+            ("states:DescribeExecution", MACHINE.replace(":stateMachine:", ":execution:") + ":1234-1"),
+            ("scheduler:CreateSchedule", "*"), ("ssm:SendCommand", "*"), ("dynamodb:Scan", TABLE)]
+        for action, resource in denied:
+            self.assertFalse(permits(self.role, action, resource), (action, resource))
 
 
 if __name__ == "__main__":

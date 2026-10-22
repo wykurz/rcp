@@ -3,8 +3,9 @@
 This is an initially disabled replacement for manual AWS lease preparation. It is separate from
 [the existing qualification controller](DURABLE.md): deploying this template does not migrate an
 active lease or authorize a benchmark. The first acceptance path permits only the measured
-`bulk-1g-metadata` A/A workload. It does not yet provide A/B comparisons, an enabled benchmark
-schedule, or public history publication. Ordinary build and test workflows are independent.
+`bulk-1g-metadata` A/A workload. It does not yet provide A/B comparisons or an enabled benchmark
+schedule. Public history publication is implemented as a separate, initially disabled workflow.
+Ordinary build and test workflows are independent.
 
 ## Request boundary
 
@@ -87,16 +88,41 @@ with a newer renderer. A bounded diagnostic report can describe a failed archive
 its exact raw bytes. The local publication helpers discover only retired manifests, bind each to a
 consistent closed tombstone, and download exact retained versions through read-only clients.
 Discovery traverses the full retained prefix within page/count/time bounds; it is not an atomic
-snapshot, and later scans must revisit the prefix. It cannot describe active or held runs without
-manifests.
+snapshot, and later scans must revisit the prefix. A separate consistent active-pointer observation
+describes pending ownership before a manifest exists, without claiming physical teardown or a
+cross-service snapshot.
 
 A separate bounded bundle format binds the downloader revision and repository for credential-free
 processing. The public exporter renders escaped allowlisted fields and never publishes retained
 HTML. Failed qualifications retain diagnostics without performance measurements. Exact source replay
 preserves historical output without today's measurement parser. The history repository is trusted
 prior exporter storage: the retirement digest binds source evidence, not arbitrary edited
-measurement bytes. An embedded checksum would not replace that trust. These are local helpers;
-GitHub publication, Pages integration and a deployed read-only role remain later cutover steps.
+measurement bytes. An embedded checksum would not replace that trust. The manual-only
+`aws-benchmark-publish.yml` workflow separates three jobs: read-only AWS download, credential-free
+export, and a GitHub history writer. Each transfer uses the exact current-run artifact ID and a
+complete inventory digest passed through trusted job outputs. The embedded reader revision is an
+additional binding, not independent authentication. Raw handoff artifacts have one-day retention and
+the repository's normal Actions artifact access; they are never committed to history.
+
+Discovery is complete within its page/count bounds. Processing uses a 512 MiB aggregate byte budget
+and a ten-minute budget checked between runs, within a fifteen-minute job timeout. Completed subsets
+can publish while remaining runs are explicitly deferred. Subsequent scans skip already-published
+retirement digests without downloading raw archives again. Pending, held and deferred observations
+appear in workflow summaries and do not enter performance history. History has a separate
+2,000-record, 64 MiB bound; reaching a bound requires deliberate maintenance rather than silently
+dropping data.
+
+The writer receives only public JSON. It reads fixed Git objects in a bare repository, preserves
+identical prior records and rejects conflicting records. It creates commits through Git plumbing and
+pushes to `aws-benchmark-history` without force, with three bounded fetch/reconcile attempts. The
+history branch remains separate from Depot's `benchmark-history`. The GitHub `contents: write` job
+token is repository-wide: the reviewed writer restricts its target, but GitHub does not scope that
+token to this one branch. Protect main and review changes to this workflow.
+
+Pages renders the public JSON with trusted main code, never retained worker HTML. AWS navigation
+appears only when valid AWS history exists. Neither publication nor Pages launches a benchmark. The
+publication feature flag defaults off. Its read-only AWS role has a separate `PublicationEnabled`
+gate, also false by default; enabling it requires specific deployment approval.
 
 ## Storage and privileges
 
@@ -116,6 +142,16 @@ long-lived access key or remote shell is created.
 | Scheduled termination | Terminate only matching namespace-tagged instances                                                             |
 | State machine         | Invoke only the coordinator                                                                                    |
 | Collector             | Read terminal/physical proof, retain fixed evidence files and retire ownership; no launch or budget mutation   |
+| GitHub publication    | Read the active pointer, repository run records and fixed retained collection files; no writes or launches     |
+
+The separately disabled publication reader has exact-table `GetItem` for `active` and this
+repository's run records, exact-prefix `ListBucket` with `MaxKeys=500`, manifest `GetObject`, and
+`GetObjectVersion` for the seven fixed collection files. It has no write, launch, scan, collector
+invocation or `PassRole` authority. Its default main subject admits matching jobs from other main
+workflows when enabled; IAM does not bind the actor, workflow path or immutable repository/owner IDs
+for this read role. Listing exposes key names under the repository's run prefix. IAM also cannot
+enforce numeric run IDs, retirement state or manifest-selected versions; the reader validates those
+properties. These limits must remain explicit in the deployment approval.
 
 All Lambda reserved concurrencies are zero initially; watchdog and collector rules are disabled.
 Admission has a separate gate. There is no recurring benchmark trigger in this change. The
@@ -158,9 +194,14 @@ five-minute collector timer only reconciles existing ownership and never submits
    trust intentionally does not admit the historical debug branch; pre-merge cloud validation would
    require a separately reviewed exact temporary lane.
 7. Verify one complete A/A acceptance through retained collection and ownership retirement,
-   including cancelled/failed producer recovery. Broader comparisons, public reporting and a
-   few-times-weekly schedule require their reviewed contracts and activation decisions. Do not call
-   this initial acceptance foundation a complete production cutover.
+   including cancelled/failed producer recovery. Enable public reporting separately after approving
+   its exact read-only role, enabling the separate `PublicationEnabled` gate, and setting
+   `RCP_AWS_PRODUCTION_PUBLISH_ROLE`, `RCP_AWS_PRODUCTION_TABLE` and
+   `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`; it shares the existing production region/bucket variables.
+   Pages retains its independent `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in
+   this change. Broader comparisons and a few-times-weekly schedule require their reviewed
+   contracts, operating allowance and activation decisions. Do not call this initial acceptance
+   foundation a complete production cutover.
 
 Rollback closes admission and preserves the independent watchdog/collector while active work
 reconciles. Restore an older compatible package only after checking its state schema and immutable

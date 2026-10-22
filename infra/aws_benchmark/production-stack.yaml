@@ -22,6 +22,11 @@ Parameters:
     Default: 'false'
     AllowedValues: ['false', 'true']
     Description: Permit new submissions; disabling admission leaves an activated watchdog running.
+  PublicationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Separately approve read-only production evidence access from the existing main GitHub subject; independent of paid runtime.
   WorkerSubnetId: {Type: 'AWS::EC2::Subnet::Id'}
   WorkerSecurityGroupId: {Type: 'AWS::EC2::SecurityGroup::Id'}
   LaunchTemplateId: {Type: String, AllowedPattern: 'lt-[0-9a-f]{17}', Description: Reviewed external launch template referencing this stack worker
@@ -38,6 +43,10 @@ Parameters:
   AdmissionAudience: {Type: String, Default: rcp-production-benchmark-admission, AllowedPattern: '[A-Za-z0-9][A-Za-z0-9:/._-]{7,199}', Description: Exact
       second GitHub OIDC token audience; AWS role assumption still uses sts.amazonaws.com.}
 Conditions:
+  Publishing:
+    Fn::Equals:
+    - {Ref: PublicationEnabled}
+    - 'true'
   Enabled:
     Fn::Equals:
     - {Ref: RuntimeEnabled}
@@ -646,6 +655,54 @@ Resources:
           - Effect: {'Fn::If': [Admitting, Allow, Deny]}
             Action: lambda:InvokeFunction
             Resource: {'Fn::GetAtt': [AdmissionFunction, Arn]}
+  GitHubPublicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        # only supported default-subject claims; every OIDC job with this main subject can read
+        # this does not bind an actor, workflow path or immutable repository/owner ID
+        - Effect: {'Fn::If': [Publishing, Allow, Deny]}
+          Principal:
+            Federated: {Ref: GitHubOidcProviderArn}
+          Action: sts:AssumeRoleWithWebIdentity
+          Condition:
+            StringEquals: {'token.actions.githubusercontent.com:aud': sts.amazonaws.com,
+              'token.actions.githubusercontent.com:sub': 'repo:wykurz/rcp:ref:refs/heads/main'}
+      Policies:
+      - PolicyName: ReadProductionRetainedEvidenceOnly
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: {'Fn::If': [Publishing, Allow, Deny]}
+            Action: dynamodb:GetItem
+            Resource: {'Fn::GetAtt': [LeaseTable, Arn]}
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys: [active, run#repo-655073755-run-*]
+              'Null': {'dynamodb:LeadingKeys': 'false'}
+          - Effect: {'Fn::If': [Publishing, Allow, Deny]}
+            Action: s3:ListBucket
+            Resource: {'Fn::GetAtt': [ArtifactBucket, Arn]}
+            Condition:
+              # flat discovery sees other run-key names; content access remains collection-only
+              StringEquals: {'s3:prefix': production/runs/repo-655073755-run-}
+              NumericEquals: {'s3:max-keys': 500}
+          - Effect: {'Fn::If': [Publishing, Allow, Deny]}
+            Action: s3:GetObject
+            Resource: {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/manifest.json'}
+          - Effect: {'Fn::If': [Publishing, Allow, Deny]}
+            Action: s3:GetObjectVersion
+            Resource:
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/manifest.json'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/durable.json'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/status.json'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/results.zip'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/controller.json'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/report.json'}
+            - {'Fn::Sub': '${ArtifactBucket.Arn}/production/runs/repo-655073755-run-*/collection/summary.html'}
   AdmissionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -987,6 +1044,8 @@ Outputs:
     Value: {Ref: AdmissionAudience}
   GitHubSubmitRoleArn:
     Value: {'Fn::GetAtt': [GitHubSubmitRole, Arn]}
+  GitHubPublicationRoleArn:
+    Value: {'Fn::GetAtt': [GitHubPublicationRole, Arn]}
   ArtifactBucketName:
     Value: {Ref: ArtifactBucket}
   ProductionTableName:

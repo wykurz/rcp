@@ -28,12 +28,14 @@ def relative_url(target, page):
     return Path(os.path.relpath(target, page.parent)).as_posix()
 
 
-def site_header(route):
+def site_header(route, *, has_aws_history=False):
     """Share navigation while keeping landing-page anchors in the current document."""
     home = '' if route == Path('index.html') else relative_url(Path('index.html'), route)
     return Template((ASSETS / 'header.html').read_text(encoding='utf-8')).substitute(
         home=home, logo=relative_url(Path('assets/logo.svg'), route),
         reports=relative_url(Path('reports/index.html'), route), repository=REPOSITORY,
+        aws_benchmarks=(f'<a href="{relative_url(Path("aws-benchmarks/index.html"), route)}">AWS benchmarks</a>'
+                        if has_aws_history else ''),
     )
 
 
@@ -105,7 +107,7 @@ def redirect_script(target, *, run_links_only=False):
 </script>'''
 
 
-def landing_page(root, routes, has_dashboard):
+def landing_page(root, routes, has_dashboard, has_aws_history=False):
     """Render the project introduction with links to its maintained performance reports."""
     report_links = {}
     for key, name in (('reports', 'README'), ('performance', 'performance'), ('results', 'performance-results')):
@@ -114,7 +116,7 @@ def landing_page(root, routes, has_dashboard):
             raise ValueError(f'Missing landing-page report: {name}.md')
         report_links[key] = relative_url(routes[source], Path('index.html'))
     return Template((ASSETS / 'landing.html').read_text(encoding='utf-8')).substitute(
-        theme=read_theme(), header=site_header(Path('index.html')), repository=REPOSITORY,
+        theme=read_theme(), header=site_header(Path('index.html'), has_aws_history=has_aws_history), repository=REPOSITORY,
         legacy_redirect=redirect_script('ci-benchmarks/index.html', run_links_only=True) if has_dashboard else '',
         **report_links, **featured_measurements(root / 'docs/reports/performance.md'),
     )
@@ -172,7 +174,7 @@ def heading_ids(tokens, reserved=()):
         yield token, text, slug
 
 
-def render(source, root, route, routes):
+def render(source, root, route, routes, *, has_aws_history=False):
     """Resolve Markdown references and render a page with working heading navigation."""
     parser = MarkdownIt('commonmark', {'html': False}).enable('table')
     tokens = parser.parse(source.read_text(encoding='utf-8'))
@@ -239,7 +241,7 @@ def render(source, root, route, routes):
     parser.renderer.rules['table_close'] = lambda *_: '</table></div>\n'
     body = parser.renderer.render(tokens, parser.options, {})
     source_url = f'{REPOSITORY}/blob/main/{quote(source.relative_to(root).as_posix())}'
-    header = site_header(route)
+    header = site_header(route, has_aws_history=has_aws_history)
     repository_links.feed(header)
     sections.extend(repository_links.sections)
     page = Template((ASSETS / 'page.html').read_text(encoding='utf-8')).substitute(
@@ -253,7 +255,48 @@ def render(source, root, route, routes):
     return page, assets, seen, sections
 
 
-def build(root, output, *, has_dashboard=False):
+def aws_benchmark_pages(repository):
+    """Render only validated public records; Git history is data, never checked-out code."""
+    from infra.aws_benchmark import production_export, production_publish
+    records, commit = production_publish.history(repository)
+    if not records:
+        return {}
+    pages, rows = {}, []
+    for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
+        value = production_export.validate_public(production_publish.collection.results.json_value(
+            raw, production_export.MAX_PUBLIC_RECORD))
+        identity = value['identity']
+        report = Path('aws-benchmarks/runs') / (run_key + '.html')
+        record = Path('aws-benchmarks/records') / (run_key + '.json')
+        pages[record] = raw.decode('utf-8')
+        pages[report] = production_export.render(value) + (
+            '<p><a href="../index.html">AWS benchmark history</a> · '
+            f'<a href="../records/{run_key}.json">Public JSON record</a> · '
+            '<a href="../../index.html#top">RCP Tools</a></p>')
+        fields = (identity['run'], value.get('timestamp', '—'), identity['suite'], value['comparison'],
+                  'passed' if value['benchmark_valid'] else 'failed; excluded from performance history')
+        cells = '<td><a href="runs/' + run_key + '.html">' + html.escape(fields[0]) + '</a></td>'
+        cells += ''.join('<td>' + html.escape(field) + '</td>' for field in fields[1:])
+        rows.append('<tr>' + cells + '</tr>')
+    pages[Path('aws-benchmarks/index.html')] = f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWS benchmark history · RCP Tools</title>{read_theme()}
+<link rel="stylesheet" href="../assets/site.css"><link rel="stylesheet" href="../assets/report.css"></head>
+<body><a class="skip-link" href="#report-content">Skip to report</a>
+{site_header(Path('aws-benchmarks/index.html'), has_aws_history=True)}
+<main id="report-content"><h1>AWS benchmark history</h1>
+<p>Retired AWS qualifications with verified cleanup. Failed qualifications remain visible and are
+excluded from performance history. These records are separate from historical Depot measurements.</p>
+<p>{html.escape(production_export.VALIDATION)} Four copies form two local pairs; a small run does not
+establish broad variance. Compare only matching workload and measurement contracts.</p>
+<div class="table-scroll"><table><thead><tr><th>Run</th><th>Recorded at</th><th>Suite</th>
+<th>Comparison</th><th>Qualification</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+<p>History commit: <code>{html.escape(commit)}</code></p></main></body></html>
+'''
+    return pages
+
+
+def build(root, output, *, has_dashboard=False, aws_history=None):
     """Build the public project pages while preserving history under ci-benchmarks/."""
     root = root.resolve()
     sources = sorted((root / 'docs/reports').glob('*.md'))
@@ -264,12 +307,14 @@ def build(root, output, *, has_dashboard=False):
     dashboard = output / 'ci-benchmarks/index.html'
     if has_dashboard and not dashboard.is_file():
         raise ValueError(f'Missing benchmark dashboard: {dashboard}')
-    pages, assets, headings, sections = {}, {}, {}, {}
+    pages = aws_benchmark_pages(aws_history) if aws_history is not None else {}
+    has_aws_history = bool(pages)
+    assets, headings, sections = {}, {}, {}
     for source, route in routes.items():
-        page, referenced, headings[source], sections[route] = render(source, root, route, routes)
+        page, referenced, headings[source], sections[route] = render(source, root, route, routes, has_aws_history=has_aws_history)
         pages[route] = page
         assets.update(referenced)
-    pages[Path('index.html')] = landing_page(root, routes, has_dashboard)
+    pages[Path('index.html')] = landing_page(root, routes, has_dashboard, has_aws_history)
     sections[Path('index.html')] = RepositoryLinks(pages[Path('index.html')], root).sections
     for page, references in sections.items():
         for target, fragment, value in references:
@@ -314,9 +359,11 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('target/report-site'))
     parser.add_argument('--with-benchmark-history', action='store_true',
                         help='require an existing dashboard under the output directory\'s ci-benchmarks/')
+    parser.add_argument('--aws-history', type=Path,
+                        help='optional bare Git repository with the fixed aws-benchmark-history ref')
     args = parser.parse_args()
     try:
-        count = build(args.root, args.output, has_dashboard=args.with_benchmark_history)
+        count = build(args.root, args.output, has_dashboard=args.with_benchmark_history, aws_history=args.aws_history)
     except (OSError, ValueError) as error:
         parser.exit(1, f'report site: {error}\n')
     print(f'Wrote {count} project pages to {args.output}')

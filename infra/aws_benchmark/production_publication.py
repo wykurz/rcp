@@ -2,7 +2,7 @@
 
 This module does not collect, retire, publish, render retained HTML or execute
 archives. Its injected clients need only S3 List/Get and consistent DynamoDB Get.
-Discovery covers manifests only; it cannot describe active or pre-manifest holds.
+Manifest discovery is separate from a bounded observation of the one active owner.
 """
 
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ import time
 
 from . import production_collection as collection
 from .common import MAX_RESULT, digest, require
-from .production_store import RunStore
+from .production_store import PHASES, RunStore
 
 MAX_PAGES = 20
 PAGE_SIZE = 500
@@ -116,6 +116,24 @@ class Reader:
         epoch = item.get("epoch", {}).get("S")
         store = RunStore(None, self.table, run_key, epoch)
         return store._record(item), item
+
+    def active_observation(self):
+        """Observe the one owner without scanning or asserting a cross-service snapshot."""
+        args = dict(TableName=self.table, Key={"pk": {"S": "active"}}, ConsistentRead=True)
+        owner = self.db.get_item(**args).get("Item")
+        if owner is None:
+            return dict(state="idle", retired=False, reason="no active owner observed")
+        require(isinstance(owner, dict) and set(owner) == {"pk", "run_key", "epoch"} and
+                owner["pk"] == {"S": "active"}, "invalid active publication owner")
+        run_key = owner.get("run_key", {}).get("S")
+        record, _ = self.record(run_key)
+        require(RunStore(None, self.table, run_key, record.epoch)._owner(owner) and not record.closed,
+                "active owner differs from run record")
+        require(self.db.get_item(**args).get("Item") == owner, "active owner changed during observation")
+        phase = record.state["phase"]
+        require(phase in PHASES, "invalid active phase")
+        return dict(state="pending", retired=False, run_key=run_key, phase=phase,
+                    reason="ownership remains held until collection and retirement")
 
     def download(self, key):
         run_key = self.run_key(key)

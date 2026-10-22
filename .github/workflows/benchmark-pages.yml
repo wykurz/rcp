@@ -1,6 +1,12 @@
 name: Benchmark history and reports
 
 on:
+  workflow_call:
+    inputs:
+      aws_history_commit:
+        description: Exact public history commit returned by the successful history writer
+        type: string
+        required: true
   workflow_dispatch:
   push:
     branches: [main]
@@ -16,7 +22,7 @@ jobs:
   # report tests and link validation run on every PR through the required lint job
   publish:
     # enable after selecting GitHub Actions as the repository's Pages source
-    if: vars.RCP_BENCHMARK_PAGES == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && vars.RCP_BENCHMARK_PAGES == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -29,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,11 +43,52 @@ jobs:
           path: benchmark-history-data
           persist-credentials: false
       - uses: ./.depot/actions/setup-report-python
+      - name: Read the pinned AWS public history without checking out data
+        if: vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+        id: aws_history
+        timeout-minutes: 2
+        env:
+          AWS_HISTORY_COMMIT: ${{ inputs.aws_history_commit }}
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          history="$RUNNER_TEMP/aws-pages-history.git"
+          git init --bare "$history"
+          commit="$AWS_HISTORY_COMMIT"
+          if test -z "$commit"; then
+            if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/aws-pages-ref"; then
+              commit=$(python3 - "$RUNNER_TEMP/aws-pages-ref" <<'PY'
+          import re, sys
+          from pathlib import Path
+          value = Path(sys.argv[1]).read_text()
+          match = re.fullmatch(r'([0-9a-f]{40})\trefs/heads/aws-benchmark-history\n', value)
+          assert match, 'Invalid AWS history reference'
+          print(match[1])
+          PY
+              )
+            else
+              code=$?
+              test "$code" -eq 2
+            fi
+          fi
+          if test -n "$commit"; then
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git "$commit"
+            test "$(git --git-dir="$history" rev-parse --verify 'FETCH_HEAD^{commit}')" = "$commit"
+            git --git-dir="$history" update-ref refs/heads/aws-benchmark-history "$commit"
+          fi
+          echo "path=$history" >> "$GITHUB_OUTPUT"
       - name: Render history using trusted main-branch code
         id: render
         run: python3 -m benchmarks.report benchmark-history-data --output _site/ci-benchmarks --reports-url ../reports/index.html
       - name: Render project landing page and maintained reports
-        run: python3 scripts/report_site.py --output _site --with-benchmark-history
+        env:
+          AWS_HISTORY: ${{ steps.aws_history.outputs.path }}
+        run: |
+          args=()
+          if test -n "$AWS_HISTORY"; then args+=(--aws-history "$AWS_HISTORY"); fi
+          python3 scripts/report_site.py --output _site --with-benchmark-history "${args[@]}"
       # package directly because upload-pages-artifact pins its nested action to a tag
       - name: Package project site for Pages
         id: package
