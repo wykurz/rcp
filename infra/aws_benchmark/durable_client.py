@@ -167,6 +167,31 @@ def verify_cleanup(observation, request, binding):
     return True
 
 
+class _RetainedReceipt(Exception):
+    """A distinct earlier run's receipt has not yet been overwritten by this run."""
+
+
+def bind_receipt_request(observation, request, machine, *, running, now):
+    require(isinstance(observation, dict) and observation.get("protocol") == durable.PROTOCOL,
+            "invalid watchdog receipt")
+    if observation.get("request") == request:
+        return
+    # validate the old request's structure and scope, not its cleanup or results.
+    # those fields are retained only as raw diagnostics and never used for this run.
+    prior = durable.validate(observation.get("request"), exact=False)
+    require(running and prior["run"] != request["run"]
+            and utc(prior["created_at"]) < utc(request["created_at"]),
+            "watchdog receipt does not match the operator request")
+    require(all(prior["pins"][key] == request["pins"][key]
+                for key in ("bucket", "account", "region", "namespace")), "retained receipt scope differs")
+    require(observation.get("phase") == "complete"
+            and utc(prior["created_at"]) <= utc(observation["observed_at"]) <= utc(request["created_at"]) <= now,
+            "receipt does not precede the current request")
+    require("execution_arn" in observation and observation["execution_arn"] in (
+        None, execution_arn(machine, prior["run"])), "retained receipt execution binding differs")
+    raise _RetainedReceipt
+
+
 def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timezone.utc), budget=None):
     budget = budget or short_budget()
     request = operator_request(api, bucket, run=run, exact=False, budget=budget)
@@ -189,8 +214,7 @@ def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timez
         write(output, "durable.json", raw)
         stage = "watchdog receipt structure and request binding"
         observation = parse_json(raw.decode("utf-8"))
-        require(isinstance(observation, dict) and observation.get("protocol") == durable.PROTOCOL
-                and observation.get("request") == request, "watchdog receipt does not match the operator request")
+        bind_receipt_request(observation, request, machine, running=running, now=now())
         execution_bound = observation.get("execution_arn") == execution["executionArn"]
         no_launch = dict(execution_arn=None, attempt=None, attempts=0, allocation_consumed=False,
                          launch_outcome="none", known_instance_ids=[], binding=None, seen={},
@@ -236,6 +260,9 @@ def collect(api, bucket, machine, run, output, *, now=lambda: datetime.now(timez
             receipt["outcome"] = "success" if (execution["status"] == "SUCCEEDED" and admitted
                 and status.get("state") == "completed" and status.get("success") is True
                 and receipt["archive_sha256"]) else "failure"
+    except _RetainedReceipt:
+        receipt["collection_message"] = (
+            "Only an earlier run's watchdog receipt is published; collect this running execution again later.")
     except Exception as error:
         if stage == "watchdog receipt read" and code(error) == "NoSuchKey" and running:
             # the first watchdog publication may lag submission; absence proves neither no launch nor cleanup
