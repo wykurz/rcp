@@ -11,9 +11,11 @@ The trusted controller uploads `aws-benchmark-results`: `status.json`, `results.
 and a separate `controller.json` receipt. A fresh GitHub-hosted job downloads the exact artifact ID
 returned by that upload step, validates it, adds a job summary and uploads
 `aws-benchmark-report-<reporting-attempt>`. Both result artifacts have 90-day retention, subject to
-the repository's retention limit. Build artifacts remain at one day; the S3 mailbox remains at seven
-days. No new persistent AWS storage is created. Cancellation can prevent the controller upload or
-report job from running; these are best-effort diagnostics, not the shutdown safety boundary.
+the repository's retention limit. Build artifacts remain at one day. Mailbox payload, transient
+control and result objects expire after seven days; the exact `control/mailbox-owner.json` exclusion
+marker persists until deliberate, conditional [operator retirement](MAILBOX_RETIREMENT.md).
+Reporting adds no AWS storage resources. Cancellation can prevent the controller upload or report
+job from running; these are best-effort diagnostics, not the shutdown safety boundary.
 
 Use the artifact ID, SHA-256 digest and direct download link from the trusted `report` job's
 summary, then open `index.html` locally. The trusted `benchmark` job similarly identifies its raw
@@ -57,7 +59,11 @@ After structural archive and digest validation, supervisor metadata remains avai
 candidate-owned member names or measurement JSON exceed the reporting policy. Oversize or special
 files are not copied. Worker failure can still produce a valid partial dashboard; it never implies a
 successful comparison. Producer cancellation overrides any apparently successful worker record for
-history eligibility. Unknown observations remain unknown.
+history eligibility. Unknown observations remain unknown. Historical controller observations with a
+null image ID or instance type retain their worker evidence and measurement dashboard, but cannot
+qualify without the observed identity. Expected image pins never replace missing observations.
+Durable timing labels must be bounded, printable text or null; historical wording is retained, while
+current qualification requires the protocol's clock origin and explicit projected-runtime label.
 
 ## Provenance and trust
 
@@ -104,11 +110,14 @@ stays unchanged.
 Candidate binaries share the unprivileged harness UID and can forge candidate-owned measurement
 files. Hashes and validation establish integrity and traceability, **not honest-measurement
 attestation**. Root supervisor metadata and controller observations are separate evidence. The
-controller never parses the ZIP and the report job has only `contents: read`: no protected
-environment, OIDC, AWS credentials, history write token, candidate checkout or candidate execution.
-The report input is bound to the trusted producer upload ID and fails closed on input substitution;
-there is no fallback to names, newest artifacts, another workflow run or caller-supplied artifact
-IDs.
+durable collector cross-checks the worker request, admission, exit status, result schema, proofs and
+tool hashes against the pinned contract. These are consistency checks, not attestation that the
+candidate-controlled measurements or their reported proofs are honest. The collector's offline
+validation runs after AWS credentials are removed; the legacy ASG controller does not parse the ZIP.
+The report job has only `contents: read`: no protected environment, OIDC, AWS credentials, history
+write token, candidate checkout or candidate execution. The report input is bound to the trusted
+producer upload ID and fails closed on input substitution; there is no fallback to names, newest
+artifacts, another workflow run or caller-supplied artifact IDs.
 
 The cost boundary remains manual dispatch, reviewed exact main, the protected environment, explicit
 operator arming and independently scheduled closure. Reporting introduces no paid-launch trigger,

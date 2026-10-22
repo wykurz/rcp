@@ -4,14 +4,12 @@ import base64
 import copy
 from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-import yaml
-
 from infra.aws_benchmark import durable, mailbox
+from infra.aws_benchmark.ami_image import reviewed_startup
 from infra.aws_benchmark.common import BINARIES, timestamp
 from infra.aws_benchmark.durable_operator import arm, reservation, verify_image, verify_management
 from infra.aws_benchmark.test_durable_coordinator import configuration, launch_data
@@ -45,10 +43,7 @@ class OperatorTests(unittest.TestCase):
         self.calls.attach_mock(self.service.inventory, "inventory")
         self.calls.attach_mock(self.service.fresh_guard, "fresh_guard")
         self.data = launch_data(self.config)
-        template = yaml.safe_load(Path(__file__).with_name("stack.yaml").read_text())
-        userdata = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-        userdata = userdata.replace("${WorkerProtocol}", "direct").replace("${Artifacts}", self.config.bucket).replace(
-            "${AWS::Region}", self.config.region)
+        userdata = reviewed_startup("direct", self.config.bucket, self.config.region)
         self.data["UserData"] = base64.b64encode(userdata.encode()).decode()
         api["ec2"].describe_launch_template_versions.return_value = {"LaunchTemplateVersions": [
             {"VersionNumber": 9, "LaunchTemplateData": self.data}]}
@@ -113,7 +108,13 @@ class OperatorTests(unittest.TestCase):
     def test_exclusive_lease_precedes_mailbox_publication_without_launch(self):
         result = arm(self.service, self.request, self.quote)
         names = [call[0] for call in self.calls.mock_calls]
-        self.assertLess(names.index("s3.put_object"), names.index("dynamodb.put_item"))
+        lease_index = names.index("dynamodb.put_item")
+        publications = [(index, call.kwargs["Key"]) for index, call in enumerate(self.calls.mock_calls)
+                        if call[0] == "s3.put_object"]
+        self.assertLess(publications[0][0], lease_index)
+        self.assertEqual([key for _, key in publications],
+                         [mailbox.OWNER_KEY, "control/durable-request.json", "output/status.json"])
+        self.assertTrue(all(lease_index < index for index, _ in publications[1:]))
         puts = self.service.api["s3"].put_object.call_args_list
         self.assertEqual(puts[0].kwargs["Key"], mailbox.OWNER_KEY)
         self.assertEqual(puts[0].kwargs["IfNoneMatch"], "*")
@@ -125,6 +126,19 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(result["state"], "armed-not-launched")
         self.service.api["ec2"].run_instances.assert_not_called()
         self.service.api["ec2"].terminate_instances.assert_not_called()
+
+    def test_conditional_lease_conflict_preserves_existing_request_and_status(self):
+        for key in ("control/durable-request.json", "output/status.json"):
+            self.cloud.objects[key] = b"retained prior evidence"
+        self.service.api["dynamodb"].put_item.side_effect = ValueError("conditional lease conflict")
+        with self.assertRaisesRegex(ValueError, "conditional lease conflict"):
+            arm(self.service, self.request, self.quote)
+        puts = self.service.api["s3"].put_object.call_args_list
+        self.assertEqual([call.kwargs["Key"] for call in puts], [mailbox.OWNER_KEY])
+        for key in ("control/durable-request.json", "output/status.json"):
+            self.assertEqual(self.cloud.objects[key], b"retained prior evidence")
+        self.service.api["dynamodb"].delete_item.assert_not_called()
+        self.service.api["s3"].delete_object.assert_not_called()
 
     def test_mailbox_failure_preserves_lease_without_launch_or_cleanup_side_effects(self):
         self.cloud.fail = "control/durable-request.json"

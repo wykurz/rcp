@@ -4,10 +4,10 @@ Claims have no expiry or automatic takeover. Partial failures retain ownership;
 retirement requires separate physical, producer and result reconciliation.
 """
 
-import json
 import uuid
 
-from .common import DIRECT_PROTOCOL, digest, error_code, get_bytes, require
+from .common import DIRECT_PROTOCOL, WINDOW_KEY, digest, error_code, get_bytes, get_json, require, retry_io, utc
+from .json_bytes import encoded
 
 OWNER_KEY = "control/mailbox-owner.json"
 
@@ -26,13 +26,25 @@ def verify_retention(s3, bucket):
                 "mailbox lifecycle can expire ownership; migrate the closed bucket first")
 
 
+def verify_previous_window(s3, bucket, run, now, budget):
+    """Reject old active or reused windows before acquiring persistent ownership."""
+    try:
+        previous = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget)
+    except Exception as error:
+        if error_code(error) not in {"NoSuchKey", "404"}:
+            raise
+    else:
+        require(isinstance(previous, dict), "previous mailbox window is malformed")
+        require(utc(previous["deadline"]) < now(), "previous mailbox window has not expired")
+        require(previous["run"] != run, "a run attempt cannot be rearmed")
+
+
 def claim(s3, bucket, protocol, request):
     require(protocol in {"operator-window", DIRECT_PROTOCOL}, "unsupported mailbox owner protocol")
     verify_retention(s3, bucket)
-    encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     owner = dict(schema_version=1, token=uuid.uuid4().hex, bucket=bucket, protocol=protocol,
-                 run=request["run"], request_sha256=digest(encoded))
-    body = (json.dumps(owner, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                 run=request["run"], request_sha256=digest(encoded(request)))
+    body = encoded(owner)
     try:
         s3.put_object(Bucket=bucket, Key=OWNER_KEY, Body=body, ContentType="application/json",
                       IfNoneMatch="*")

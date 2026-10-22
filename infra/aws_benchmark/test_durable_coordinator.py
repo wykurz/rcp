@@ -73,7 +73,8 @@ class Cloud:
         self.api["s3"].head_object.side_effect = self.head_object
         self.api["s3"].get_object.side_effect = self.get_object
         self.api["s3"].put_object.side_effect = self.put_object
-        self.service = durable_aws.Service(self.api, self.config, now=lambda: self.now)
+        self.sleeps = []
+        self.service = durable_aws.Service(self.api, self.config, now=lambda: self.now, sleep=self.sleeps.append)
         self.event = dict(run="123-1", execution_name="123-1",
             execution_arn="arn:aws:states:us-east-1:123456789012:execution:capacity:123-1")
 
@@ -198,7 +199,7 @@ class ContractTests(unittest.TestCase):
     def test_mismatched_aa_bytes_are_rejected(self):
         c = Cloud()
         c.request["sha256"]["candidate/rcp"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "A/A binaries"):
+        with self.assertRaisesRegex(ValueError, "A/A binary digests differ"):
             durable.validate(c.request)
 
     def test_all_capacity_receipts_fit_the_lease_bound(self):
@@ -250,7 +251,8 @@ class LaunchTests(unittest.TestCase):
                 allocation = copy.deepcopy(c.state["attempt"])
                 c.now += timedelta(hours=1)
                 c.coordinator()
-                self.assertEqual(len(c.launches), 1)
+                self.assertEqual(len(c.launches), 3)
+                self.assertTrue(all(parameters == c.launches[0] for parameters in c.launches))
                 self.assertEqual(c.state["attempt"], allocation)
                 self.assertTrue(c.state["allocation_consumed"])
                 self.assertEqual(c.state["launch_outcome"], "uncertain")
@@ -262,7 +264,8 @@ class LaunchTests(unittest.TestCase):
         c.service.watchdog()
         self.assertNotIn(("terminate", [INSTANCE]), c.events)
         c.coordinator()
-        self.assertEqual(len(c.launches), 1)
+        self.assertEqual(len(c.launches), 3)
+        self.assertTrue(all(parameters == c.launches[0] for parameters in c.launches))
         self.assertTrue(c.state["worker_published"])
         self.assertEqual(c.state["launch_outcome"], "accepted")
 
@@ -293,7 +296,6 @@ class LaunchTests(unittest.TestCase):
     def test_watchdog_progress_during_artifact_reads_defers_without_failure(self):
         c = Cloud()
         def progress():
-            c.state["last_guard_at"] = common.timestamp(NOW)
             c.revision += 1
         c.get_hook = progress
         self.assertEqual(c.coordinator()["state"], "wait")
@@ -351,14 +353,18 @@ class JanitorTests(unittest.TestCase):
         self.assertTrue(c.state["runtime_verified"])
         self.assertEqual(len(c.schedules), 1)
 
-    def test_schedule_failure_terminates_before_admitting_worker(self):
+    def test_transient_schedule_create_with_missing_readback_defers_without_admission(self):
         c = Cloud()
         c.coordinator()
         c.schedule_error, c.schedule_store = TimeoutError(), False
-        with self.assertRaises(ApiError):
-            c.service.watchdog()
+        self.assertEqual(c.service.watchdog()["state"], "deferred")
         self.assertFalse(c.state["worker_published"])
-        self.assertIn(("terminate", [INSTANCE]), c.events)
+        self.assertNotIn(("terminate", [INSTANCE]), c.events)
+        c.schedule_error, c.schedule_store = None, True
+        c.service.watchdog()
+        self.assertTrue(c.state["worker_published"])
+        calls = c.api["scheduler"].create_schedule.call_args_list
+        self.assertEqual(calls[0], calls[1])
 
     def test_existing_later_cutoff_cannot_be_overwritten(self):
         c = Cloud()
@@ -480,7 +486,8 @@ class CleanupTests(unittest.TestCase):
             c.service.watchdog()
         self.assertIsNone(c.state["cleanup"])
         c.coordinator()
-        self.assertEqual(len(c.launches), 1)
+        self.assertEqual(len(c.launches), 3)
+        self.assertTrue(all(parameters == c.launches[0] for parameters in c.launches))
 
     def test_missing_retained_or_unreadable_roots_hold_the_lease(self):
         for kind in ("missing", "retained", "unreadable"):

@@ -81,11 +81,26 @@ class BuiltPackageTests(unittest.TestCase):
             self.assertEqual(outputs[0].read_bytes(), outputs[1].read_bytes())
             with zipfile.ZipFile(outputs[0]) as archive:
                 self.assertFalse(any(name.startswith("bin/") for name in archive.namelist()))
+                self.assertTrue(all(member.compress_type == zipfile.ZIP_STORED for member in archive.infolist()))
                 record = archive.read("local_fixture-1.0.dist-info/RECORD").decode()
                 self.assertNotIn("bin/", record)
                 rows = list(csv.reader(io.StringIO(record)))
                 self.assertTrue(all(row[0] in archive.namelist() for row in rows))
             imported = self.isolated_import(outputs[0], root)
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+
+    def test_build_needs_no_compression_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = self.wheel(root)
+            output = root / "stored.zip"
+            with patch.object(packager, "install_dependencies", self.installer(wheel, "/fixture/python")):
+                with patch.object(zipfile, "zlib", None):
+                    packager.package(output, root)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(archive.read("local_fixture.py"), b"VALUE = 1\n")
+                self.assertTrue(all(member.compress_size == member.file_size for member in archive.infolist()))
+            imported = self.isolated_import(output, root)
             self.assertEqual(imported.returncode, 0, imported.stderr)
 
     def test_built_package_missing_transitive_handler_dependency_fails_isolated_import(self):
@@ -104,11 +119,15 @@ class BuiltPackageTests(unittest.TestCase):
     def test_record_normalization_rejects_malformed_rows_before_creating_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            record = root / "fixture.dist-info/RECORD"
-            record.parent.mkdir()
-            record.write_text("broken,row\n")
-            with self.assertRaisesRegex(ValueError, "malformed"):
-                packager.package_files(root)
+            output = root / "invalid.zip"
+            def install(stage, wheels):
+                record = stage / "fixture.dist-info/RECORD"
+                record.parent.mkdir()
+                record.write_text("broken,row\n")
+            with patch.object(packager, "install_dependencies", install):
+                with self.assertRaisesRegex(ValueError, "malformed"):
+                    packager.package(output, root)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

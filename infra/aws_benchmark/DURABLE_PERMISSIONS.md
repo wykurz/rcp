@@ -179,9 +179,15 @@ bucket-scoped `s3:GetLifecycleConfiguration` to verify that owner expiration is 
 arming uses the same operator-owned reservation without adding DynamoDB permissions to the legacy
 runtime. Explicit later retirement needs `s3:DeleteObject` only on the owner key with the inspected
 `IfMatch` ETag, after physical/producer/drain/result checks; neither arm command deletes an owner.
-These operator actions and the artifact lifecycle update belong in the concrete deployment review.
-It does not open an ASG or create an outer cutoff in this protocol. The existing ASG must stay
-disabled. No unattended benchmark cron is enabled by this stack.
+The shared [retirement procedure](MAILBOX_RETIREMENT.md) requires producer quiescence and retained
+physical/drain/result evidence; an expired timestamp is insufficient. To confirm owner absence,
+operator `s3:ListBucket` must also allow the exact owner key, never an unrestricted listing. Direct
+lease retirement needs separately scoped `dynamodb:DeleteItem` on the exact table/key, conditioned
+on the inspected lease revision and payload/run. This privilege belongs only to the separately
+reviewed operator recovery action, never the coordinator, watchdog or GitHub roles. These operator
+actions and the artifact lifecycle update belong in the concrete deployment review. It does not open
+an ASG or create an outer cutoff in this protocol. The existing ASG must stay disabled. No
+unattended benchmark cron is enabled by this stack.
 
 Offline tests check positive/negative policy cases and CloudFormation schema; they are not AWS
 policy simulation. Deployment validation must verify actual role/key policies, creation tagging,

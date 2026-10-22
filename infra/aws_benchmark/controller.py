@@ -17,24 +17,31 @@ from .common import (BINARY_NAMES, COMPLETED, MAX_BINARY, MAX_RESULT, PENDING, R
                      validate_admission, validate_request, validate_window, verify_close, verify_group)
 
 
-def oidc_clients(region, role):
+def oidc_session(region, role, *, session_prefix, duration_seconds, budget, reserve):
+    """Exchange the workflow token under one bounded budget shared by both controllers."""
     import boto3
     from botocore.config import Config
     url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     def token_request():
         with urllib.request.urlopen(request, timeout=15) as response:
             return json.load(response)["value"]
-    token = retry_io(token_request, budget, reserve=5)
+    token = retry_io(token_request, budget, reserve=reserve)
     config = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 1})
     sts = boto3.client("sts", region_name=region, config=config)
     credentials = retry_io(lambda: sts.assume_role_with_web_identity(
-        RoleArn=role, RoleSessionName="rcp-benchmark-" + os.environ["GITHUB_RUN_ID"],
-        WebIdentityToken=token, DurationSeconds=7200), budget, reserve=5)["Credentials"]
+        RoleArn=role, RoleSessionName=session_prefix + os.environ["GITHUB_RUN_ID"],
+        WebIdentityToken=token, DurationSeconds=duration_seconds), budget, reserve=reserve)["Credentials"]
     session = boto3.Session(region_name=region, aws_access_key_id=credentials["AccessKeyId"],
         aws_secret_access_key=credentials["SecretAccessKey"], aws_session_token=credentials["SessionToken"])
+    return session, config
+
+
+def oidc_clients(region, role):
+    budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
+    session, config = oidc_session(region, role, session_prefix="rcp-benchmark-", duration_seconds=7200,
+                                   budget=budget, reserve=5)
     return checked_clients(session, config)
 
 

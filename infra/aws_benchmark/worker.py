@@ -28,7 +28,7 @@ from benchmarks.verification import METADATA_POLICY
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
                      DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
-                     measurement_contract, verification_contract, put_json, require, retry_io, timestamp,
+                     measurement_contract, verification_contract, put_json, require, retry_io, retryable_io, timestamp,
                      validate_admission, validate_request, validate_window,
                      WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
 from .cache_client import SOCKET
@@ -343,7 +343,9 @@ def durable_window(s3, bucket, identity, budget):
             value = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
         except Exception as error:
             # without ListBucket, a missing fixed key is reported as AccessDenied
-            if error_code(error) not in ("NoSuchKey", "404", "AccessDenied", "403"):
+            # exhausted transient read retries may poll again, but only under the
+            # original assignment budget and alarm; no new deadline is created
+            if error_code(error) not in ("NoSuchKey", "404", "AccessDenied", "403") and not retryable_io(error):
                 raise
         else:
             require(isinstance(value, dict), "invalid durable mailbox window")

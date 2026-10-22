@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from infra.aws_benchmark import common, controller, mailbox, operator, worker
+from infra.aws_benchmark.ami_image import reviewed_startup
 from infra.aws_benchmark.test_results import binding
 
 
@@ -40,11 +41,7 @@ class Missing(Exception):
 
 
 def startup(protocol="operator-window", bucket="bucket", region="us-east-1"):
-    import yaml
-    template = yaml.safe_load(Path(__file__).with_name("stack.yaml").read_text())
-    text = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-    return base64.b64encode(text.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", bucket).replace(
-        "${AWS::Region}", region).encode()).decode()
+    return base64.b64encode(reviewed_startup(protocol, bucket, region).encode()).decode()
 
 
 class ClaimConflict(Exception):

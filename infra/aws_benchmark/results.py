@@ -4,7 +4,6 @@ import argparse
 import copy
 import html
 import io
-import json
 import os
 from pathlib import Path
 import re
@@ -17,9 +16,10 @@ from benchmarks import changes, measurements, operations, pairs, report
 from benchmarks.strict_json import parse_json
 from benchmarks.verification import verification_label
 from . import identity
+from .json_bytes import encoded
 from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
                      digest, measurement_contract, verification_contract, verification_contracts, require, utc,
-                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_plan_contract, durable_worker_reserve, validate_durable_window, validate_request)
+                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_worker_reserve, validate_durable_hashes, validate_durable_window, validate_request)
 
 
 MAX_METADATA = 1024 * 1024
@@ -35,11 +35,6 @@ CONCLUSIONS = ("success", "failure", "cancelled", "skipped")
 def diagnostic(error):
     # generic parsers may echo candidate-controlled input; only our constants are safe
     return str(error) if isinstance(error, ValidationError) else type(error).__name__
-
-
-def encoded(value):
-    return (json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False,
-                       separators=(",", ":")) + "\n").encode()
 
 
 def read_file(path, maximum, *, single_link=True):
@@ -191,8 +186,7 @@ def historical_inputs(receipt, expected):
     require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                 for value in hashes.values()), "binary digests must be lowercase SHA-256")
     if "protocol" in window:
-        recorded = durable_plan_contract(window["plan"], exact=False)
-        require(set(hashes) == set(recorded["binaries"]), "unexpected recorded durable binary manifest")
+        validate_durable_hashes(hashes, window["plan"], exact=False)
     return window, request
 
 
@@ -201,6 +195,14 @@ def validate_recorded_verification(context, suite, *, exact=False):
     allowed = (verification_contract(suite),) if exact else verification_contracts(suite)
     require(recorded in allowed, "unexpected suite verification contract")
     return copy.deepcopy(recorded)
+
+
+def recorded_timing_labels(worker):
+    # optional historical observations remain unknown; labels are text, never arbitrary JSON
+    labels = dict(runtime_origin=worker.get("runtime_origin"), basis=worker.get("timing_basis"))
+    require(all(value is None or isinstance(value, str) and 0 < len(value) <= 256
+                and value.isprintable() for value in labels.values()), "invalid worker timing labels")
+    return labels
 
 
 def inspect(source, expected, conclusion):
@@ -225,7 +227,8 @@ def inspect(source, expected, conclusion):
                 and receipt["schema_version"] == 1 and receipt["identity"] == expected, "controller identity mismatch")
         instance = receipt.get("instance")
         require(instance is None or isinstance(instance, dict) and set(instance) == {
-            "instance_id", "image_id", "instance_type"} and all(isinstance(value, str) for value in instance.values()),
+            "instance_id", "image_id", "instance_type"} and isinstance(instance["instance_id"], str)
+            and all(instance[key] is None or isinstance(instance[key], str) for key in ("image_id", "instance_type")),
             "invalid controller instance observation")
         require(receipt.get("outcome") in ("incomplete", "success", "failure")
                 and receipt.get("cleanup") in ("not-requested", "unconfirmed", "verified"), "invalid controller outcome")
@@ -258,6 +261,8 @@ def inspect(source, expected, conclusion):
         require(worker["status"] == {key: value for key, value in status.items() if key != "sha256"},
                 "worker status mismatch")
         evidence["worker"] = worker
+        if window.get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
+            recorded_timing_labels(worker)
         if issues:
             evidence["errors"].extend(issues)
             return evidence, None, snapshots
@@ -302,6 +307,10 @@ def validate_qualification(evidence, result, policy):
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
     if receipt["window"].get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
         window = receipt["window"]
+        labels = recorded_timing_labels(worker)
+        require(labels == dict(runtime_origin="attempt_started_at" if window["protocol"] == DIRECT_PROTOCOL else "launch_at",
+                basis="projected workload with explicit headroom; not a measured complete run"),
+                "unverified worker timing labels")
         validate_durable_window(window, now=utc(window["launch_at"]), minimum=0, exact=True)
         validate_request(receipt["request"], window)
         required = durable_worker_reserve(window["plan"], exact=True)
@@ -368,9 +377,8 @@ def derived_record(evidence, raw):
             provenance["timing"].update({key: worker["window"][key]
                                         for key in ("attempt_id", "attempt_started_at")})
             provenance["timing"]["outer_deadline_role"] = "control reconciliation horizon; not instance expiry"
-        # supervisor observations remain verbatim; older missing observations stay unknown
-        provenance["timing"].update(runtime_origin=copy.deepcopy(worker.get("runtime_origin")),
-                                    basis=copy.deepcopy(worker.get("timing_basis")))
+        # valid supervisor text remains verbatim; older missing observations stay unknown
+        provenance["timing"].update(recorded_timing_labels(worker))
     result["context"]["aws_provenance"] = provenance
     for item in result["summaries"]:
         item["series_id"] = digest(encoded([SERIES_CONTRACT, item["series_id"],
