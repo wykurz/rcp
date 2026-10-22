@@ -39,7 +39,8 @@ class BuildContractTests(unittest.TestCase):
                        GITHUB_WORKFLOW_REF="wykurz/rcp/.github/workflows/aws-benchmark.yml@refs/heads/main",
                        GITHUB_WORKFLOW_SHA="c" * 40, GITHUB_EVENT_NAME="workflow_dispatch")
             subprocess.run([sys.executable, "-c", source], cwd=ROOT, env=env, check=True, timeout=10)
-            self.assertEqual(output.read_text(), f"max-binary={common.MAX_BINARY}\n")
+            self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines()),
+                             {"max-binary": str(common.MAX_BINARY), "build-roles": '["baseline"]'})
 
     def prepare_copies(self, directory, contents):
         root = Path(directory)
@@ -113,7 +114,9 @@ class BuildContractTests(unittest.TestCase):
         user_data = data["UserData"]["Fn::Base64"]["Fn::Sub"]
         self.assertIn("--property=FailureAction=poweroff", user_data)
         self.assertIn("--property=KillMode=control-group", user_data)
-        self.assertIn(f"--property=RuntimeMaxSec={common.MAX_WINDOW + common.MAX_OPEN_LEAD}", user_data)
+        self.assertIn(f"operator-window) mode=; runtime={common.MAX_WINDOW + common.MAX_OPEN_LEAD} ;;", user_data)
+        self.assertIn("--property=RuntimeMaxSec=$runtime", user_data)
+        self.assertEqual(user_data.count("systemd-run "), 1)
         self.assertIn("--property=SuccessAction=poweroff", user_data)
 
     def test_cache_shim_accepts_the_real_harness_drop_invocation(self):
@@ -144,7 +147,8 @@ class BuildContractTests(unittest.TestCase):
     def test_userdata_submission_failure_powers_off_without_requiring_worker_directory(self):
         stack = yaml.safe_load((ROOT / "infra/aws_benchmark/stack.yaml").read_text())
         user_data = stack["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
-        script = user_data.replace("$" + "{Artifacts}", "test-bucket").replace("$" + "{AWS::Region}", "us-east-1")
+        script = user_data.replace("$" + "{Artifacts}", "test-bucket").replace("$" + "{AWS::Region}", "us-east-1").replace(
+            "$" + "{WorkerProtocol}", "operator-window")
         for launch_status in (None, 0, 7):
             with self.subTest(launch_status=launch_status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

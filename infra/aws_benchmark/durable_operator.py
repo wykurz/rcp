@@ -12,12 +12,17 @@ import json
 import re
 from pathlib import Path
 
+from benchmarks.strict_json import parse_json
+
 from . import durable
+from .account_security import dhmc_arn, verify_dhmc_disabled
 from .ami_image import image_shape
-from .common import BINARIES, STATUS_KEY, digest, pending_status, put_json, require, utc
+from .common import (BINARIES, STATUS_KEY, WINDOW_KEY, digest, error_code, get_json,
+                     pending_status, put_json, require, utc)
 from .controller import read_binary
 from .durable_aws import Configuration, REQUEST, Service, clients, verify_launch_data
 from .identity import load as load_identity
+from .mailbox import claim
 
 
 def reservation(request, quote, now):
@@ -88,11 +93,9 @@ def verify_image(service):
 
 def verify_management(service):
     config = service.config
-    path = "/ssm/managed-instance/default-ec2-instance-management-role"
-    arn = "arn:aws:ssm:" + config.region + ":" + config.account + ":servicesetting" + path
+    arn = dhmc_arn(config.region, config.account)
     setting = service.api["ssm"].get_service_setting(SettingId=arn)["ServiceSetting"]
-    require(setting.get("SettingId") in {path, arn} and setting.get("Status") == "Default" and
-            setting.get("SettingValue") == "$None", "Default Host Management Configuration must be disabled before arming")
+    verify_dhmc_disabled(setting, arn)
 
 
 def arm(service, request, quote):
@@ -109,6 +112,15 @@ def arm(service, request, quote):
     verify_management(service)
     verify_image(service)
     service.fresh_guard()
+    owner = claim(service.api["s3"], service.config.bucket, durable.PROTOCOL, request)
+    try:
+        previous = get_json(service.api["s3"], service.config.bucket, WINDOW_KEY)
+    except Exception as error:
+        if error_code(error) not in {"NoSuchKey", "404"}:
+            raise
+    else:
+        require(isinstance(previous, dict) and utc(previous["deadline"]) < service.now(),
+                "previous mailbox window has not expired")
     state = durable.initial_lease(request)
     state["reservation"] = allocation
     service.api["dynamodb"].put_item(TableName=service.config.table,
@@ -117,14 +129,15 @@ def arm(service, request, quote):
     # failures retain ownership; no automatic retry can replace the armed lease
     put_json(service.api["s3"], service.config.bucket, REQUEST, request)
     put_json(service.api["s3"], service.config.bucket, STATUS_KEY, pending_status(request["run"]))
-    return dict(protocol=durable.PROTOCOL, state="armed-not-launched", request=request, reservation=allocation)
+    return dict(protocol=durable.PROTOCOL, state="armed-not-launched", request=request,
+                reservation=allocation, mailbox_owner=owner)
 
 
 def read_json(path, limit=16384):
     with Path(path).open(encoding="utf-8") as source:
         data = source.read(limit + 1)
     require(len(data) <= limit, "operator input exceeds bound")
-    return json.loads(data)
+    return parse_json(data)
 
 
 def main():

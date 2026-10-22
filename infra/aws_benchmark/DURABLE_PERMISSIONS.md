@@ -109,8 +109,10 @@ availability; no mechanism promises an exact termination time or dollar cap.
 RuntimeEnabled and AdmissionEnabled default false. Initially both functions have zero concurrency,
 the guard rule is disabled and GitHub StartExecution is denied. Activate the guard and validate it
 before enabling admission. Disabling admission stops new submissions while the active guard keeps
-scanning. Do not disable RuntimeEnabled until all allocation outcomes are reconciled, roots are
-deleted, scheduled-delivery horizons have drained and the execution is terminal.
+scanning and the coordinator continues existing executions, including capacity waiting. Admission
+does not set the coordinator concurrency to zero. Do not disable RuntimeEnabled until all allocation
+outcomes are reconciled, roots are deleted, scheduled-delivery horizons have drained and the
+execution is terminal.
 
 A 16-hour supervision allowance covers 960 planned minute ticks per function. At 256 MiB and a
 45-second limit each, that is 21,600 GB-seconds combined; using the verified public us-east-1 x86
@@ -129,13 +131,18 @@ is an operational assumption, not an AWS guarantee. The previous reviewed itemiz
 including 16-hour supervision, one 72-minute builder, one full 16 GiB snapshot for 30 days,
 EBS/IPv4, logs and artifacts, was approximately $17.23 with an $18 proposed allocation. Reprice and
 update the request/write counts for this protocol before admitting paid work. Existing reservations
-remain $44 of the $80 cap; this code allocates nothing. Existing retained images are already covered
-by the prior ledger and must not be counted twice or extended implicitly.
+are $62 of the $80 cap, including the once-allocated $18 preparation/qualification allowance; this
+code allocates nothing. Existing retained images are already covered by the prior ledger and must
+not be counted twice or extended implicitly.
 
 The 16-hour supervision allowance does not stop the rule automatically. After verified cleanup,
 operator deactivation is required; leaving it enabled creates ongoing serverless costs. Logs expire
 after seven days. Lease records, schedules and retained infrastructure require deliberate retirement
-only after reconciliation. The existing artifact lifecycle continues to bound mailbox retention.
+only after reconciliation. The artifact lifecycle expires input/output payloads and the two fixed
+control documents after seven days, but never expires `control/mailbox-owner.json`. Both trusted
+operators conditionally create that same owner before any schedule, lease or control publication.
+Runtime roles cannot write or delete it. A partial failure retains ownership; no TTL or automatic
+takeover is allowed.
 
 ## Concrete deployment review
 
@@ -153,7 +160,9 @@ Lambda invocation permission. PassRole must target only the corresponding execut
 GitHub OIDC role/environment, coordinator launch privilege and worker-role passing, namespace
 termination authority, Scheduler role passing and retained janitor resources are explicit access
 changes requiring approval. Do not grant a wildcard administrative deployment policy. No worker role
-or existing OIDC-provider edit is included.
+or existing OIDC-provider edit is included. The existing artifact bucket needs the separately
+reviewed owner-preserving lifecycle update; deployment must start from a quiescent mailbox because
+old-code producers do not participate in the new reservation.
 
 The operator separately validates the exact launch template and managed-key image, network and
 instance profile, active guard deployment, fresh scan, exclusive namespace and funded reservation.
@@ -162,9 +171,17 @@ It needs `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplateVersions`, `ec2:Des
 `ec2:DescribeSecurityGroups`; `kms:DescribeKey` for the account's AWS-managed EBS key;
 `ssm:GetServiceSetting` to verify Default Host Management Configuration remains disabled;
 `dynamodb:GetItem` for `lease` and `guard`, conditional `dynamodb:PutItem` for `lease`, and
-`s3:PutObject` only for `control/durable-request.json` and `output/status.json`. It does not open an
-ASG or create an outer cutoff in this protocol. The existing ASG must stay disabled. No unattended
-benchmark cron is enabled by this stack.
+`s3:PutObject` for `control/durable-request.json`, `output/status.json` and the fixed
+`control/mailbox-owner.json`, with conditional creation of the owner; `s3:GetObject` for the owner
+and existing worker window; bucket `s3:ListBucket` constrained by `s3:prefix` to
+`control/window.json` so a missing prior window is distinguishable from denied access; and
+bucket-scoped `s3:GetLifecycleConfiguration` to verify that owner expiration is disabled. Legacy
+arming uses the same operator-owned reservation without adding DynamoDB permissions to the legacy
+runtime. Explicit later retirement needs `s3:DeleteObject` only on the owner key with the inspected
+`IfMatch` ETag, after physical/producer/drain/result checks; neither arm command deletes an owner.
+These operator actions and the artifact lifecycle update belong in the concrete deployment review.
+It does not open an ASG or create an outer cutoff in this protocol. The existing ASG must stay
+disabled. No unattended benchmark cron is enabled by this stack.
 
 Offline tests check positive/negative policy cases and CloudFormation schema; they are not AWS
 policy simulation. Deployment validation must verify actual role/key policies, creation tagging,

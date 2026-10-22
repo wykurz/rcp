@@ -11,10 +11,11 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-from infra.aws_benchmark import durable
+from infra.aws_benchmark import durable, mailbox
 from infra.aws_benchmark.common import BINARIES, timestamp
 from infra.aws_benchmark.durable_operator import arm, reservation, verify_image, verify_management
 from infra.aws_benchmark.test_durable_coordinator import configuration, launch_data
+from infra.aws_benchmark.test_safety import FakeCloud
 
 
 class OperatorTests(unittest.TestCase):
@@ -32,8 +33,12 @@ class OperatorTests(unittest.TestCase):
         for name, value in api.items():
             self.calls.attach_mock(value, name)
         api["dynamodb"].get_item.return_value = {}
+        self.cloud = FakeCloud()
+        api["s3"] = self.cloud.api["s3"]
+        self.calls.attach_mock(api["s3"], "s3")
         api["ssm"].get_service_setting.return_value = {"ServiceSetting": {
             "SettingId": "/ssm/managed-instance/default-ec2-instance-management-role",
+            "ARN": "arn:aws:ssm:us-east-1:123456789012:servicesetting/ssm/managed-instance/default-ec2-instance-management-role",
             "SettingValue": "$None", "Status": "Default"}}
         self.service = SimpleNamespace(api=api, config=self.config, now=lambda: self.now,
             inventory=Mock(return_value=[]), fresh_guard=Mock(return_value=timestamp(self.now)))
@@ -108,7 +113,12 @@ class OperatorTests(unittest.TestCase):
     def test_exclusive_lease_precedes_mailbox_publication_without_launch(self):
         result = arm(self.service, self.request, self.quote)
         names = [call[0] for call in self.calls.mock_calls]
-        self.assertLess(names.index("dynamodb.put_item"), names.index("s3.put_object"))
+        self.assertLess(names.index("s3.put_object"), names.index("dynamodb.put_item"))
+        puts = self.service.api["s3"].put_object.call_args_list
+        self.assertEqual(puts[0].kwargs["Key"], mailbox.OWNER_KEY)
+        self.assertEqual(puts[0].kwargs["IfNoneMatch"], "*")
+        self.assertEqual([call.kwargs["Key"] for call in puts[1:]],
+                         ["control/durable-request.json", "output/status.json"])
         put = self.service.api["dynamodb"].put_item.call_args.kwargs
         self.assertEqual(put["ConditionExpression"], "attribute_not_exists(pk)")
         self.assertEqual(json.loads(put["Item"]["payload"]["S"])["attempts"], 0)
@@ -117,9 +127,10 @@ class OperatorTests(unittest.TestCase):
         self.service.api["ec2"].terminate_instances.assert_not_called()
 
     def test_mailbox_failure_preserves_lease_without_launch_or_cleanup_side_effects(self):
-        self.service.api["s3"].put_object.side_effect = TimeoutError()
-        with self.assertRaises(TimeoutError):
+        self.cloud.fail = "control/durable-request.json"
+        with self.assertRaises(RuntimeError):
             arm(self.service, self.request, self.quote)
+        self.assertIn(mailbox.OWNER_KEY, self.cloud.objects)
         self.service.api["dynamodb"].put_item.assert_called_once()
         self.service.api["dynamodb"].delete_item.assert_not_called()
         self.service.api["ec2"].run_instances.assert_not_called()
@@ -129,6 +140,16 @@ class OperatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Host Management"):
             arm(self.service, self.request, self.quote)
         self.service.api["dynamodb"].put_item.assert_not_called()
+
+    def test_management_response_arn_cannot_belong_to_another_account(self):
+        setting = self.service.api["ssm"].get_service_setting.return_value["ServiceSetting"]
+        for arn in (None, setting["ARN"].replace(self.config.account, "999999999999")):
+            with self.subTest(arn=arn):
+                setting["ARN"] = arn
+                with self.assertRaisesRegex(ValueError, "Host Management"):
+                    arm(self.service, self.request, self.quote)
+                self.service.api["dynamodb"].put_item.assert_not_called()
+                self.service.api["s3"].put_object.assert_not_called()
 
     def test_management_read_uses_actual_region_and_account_without_asg(self):
         verify_management(self.service)

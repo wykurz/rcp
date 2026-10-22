@@ -26,7 +26,7 @@ from benchmarks.run import load_manifest
 from benchmarks.verification import METADATA_POLICY
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
-                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
+                     DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, timestamp,
                      validate_admission, validate_request, validate_window,
@@ -42,6 +42,7 @@ STATE = Path("/run/rcp-benchmark")
 DATA = Path("/mnt/rcp-benchmark")
 UNIT = "rcp-measure"
 DURABLE_STATE = Path("/var/lib/rcp-benchmark")
+ASSIGNMENT_WAIT_SECONDS = 120
 
 
 def execute(argv, budget, **kwargs):
@@ -334,18 +335,19 @@ def instance_identity(budget):
     return identity
 
 
-def durable_window(s3, bucket, identity, budget, *, protocol=DURABLE_PROTOCOL):
+def durable_window(s3, bucket, identity, budget):
     """Wait briefly for this instance's assignment; stale mail cannot admit any work."""
     while True:
         budget.left(5)
         try:
             value = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
         except Exception as error:
-            if error_code(error) not in ("NoSuchKey", "404"):
+            # without ListBucket, a missing fixed key is reported as AccessDenied
+            if error_code(error) not in ("NoSuchKey", "404", "AccessDenied", "403"):
                 raise
         else:
             require(isinstance(value, dict), "invalid durable mailbox window")
-            if value.get("protocol") == protocol and value.get("instance_id") == identity:
+            if value.get("protocol") == DIRECT_PROTOCOL and value.get("instance_id") == identity:
                 return value
         time.sleep(min(3, budget.left(5)))
 
@@ -372,18 +374,17 @@ def consume_durable_assignment(window):
         os.close(directory)
 
 
-def run(s3, bucket, *, durable=False, direct=False):
-    require(not (durable and direct), "select exactly one explicit worker protocol")
-    protocol = DIRECT_PROTOCOL if direct else DURABLE_PROTOCOL if durable else None
-    bounded = durable or direct
+def run(s3, bucket, *, direct=False):
+    protocol = DIRECT_PROTOCOL if direct else None
+    bounded = direct
     # A failed initial control read has no trustworthy run identity to report.
     # Bound it anyway; an uncaught failure powers off via the supervisor unit.
     started = datetime.now(timezone.utc)
-    budget = Budget(started + timedelta(seconds=120 if bounded else 60))
+    budget = Budget(started + timedelta(seconds=ASSIGNMENT_WAIT_SECONDS if bounded else 60))
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     identity = instance_identity(budget) if bounded else None
-    window = durable_window(s3, bucket, identity, budget, protocol=protocol) if bounded else \
+    window = durable_window(s3, bucket, identity, budget) if bounded else \
         retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
     require(isinstance(window, dict), "invalid worker window")
     require(window.get("protocol") == protocol, "worker launch protocol mismatch")
@@ -396,7 +397,7 @@ def run(s3, bucket, *, durable=False, direct=False):
     metadata = {"window": window, "worker_started_at": timestamp(started)}
     if bounded:
         metadata.update(guest_instance_id=identity, timing_basis="projected workload with explicit headroom; not a measured complete run",
-                        runtime_origin="attempt_started_at" if direct else "launch_at")
+                        runtime_origin="attempt_started_at")
     stopped = True
     try:
         request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
@@ -469,13 +470,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--region", required=True)
     parser.add_argument("--bucket", required=True)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--durable", action="store_true", help="require a historical launch-bound durable assignment")
-    mode.add_argument("--direct", action="store_true", help="require an immutable attempt-bound direct assignment")
+    parser.add_argument("--direct", action="store_true", help="require an immutable attempt-bound direct assignment")
     args = parser.parse_args()
     require(os.geteuid() == 0, "supervisor requires root")
     os.chdir(ROOT)
-    run(clients(args.region)["s3"], args.bucket, durable=args.durable, direct=args.direct)
+    run(clients(args.region)["s3"], args.bucket, direct=args.direct)
 
 
 if __name__ == "__main__":

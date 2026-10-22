@@ -130,20 +130,23 @@ class DurableStackTests(unittest.TestCase):
                          {"Fn::If": ["Enabled", "ENABLED", "DISABLED"]})
         for name in ("CoordinatorFunction", "WatchdogFunction"):
             function = resources[name]["Properties"]
-            self.assertEqual(function["ReservedConcurrentExecutions"],
-                             {"Fn::If": ["Admitting" if name == "CoordinatorFunction" else "Enabled", 1, 0]})
-            self.assertEqual(function["Environment"]["Variables"]["RCP_DURABLE_ENABLED"],
-                             {"Fn::If": ["Admitting", "true", "false"]})
+            self.assertEqual(function["ReservedConcurrentExecutions"], {"Fn::If": ["Enabled", 1, 0]})
+            if name == "CoordinatorFunction":
+                self.assertEqual(function["Environment"]["Variables"]["RCP_DURABLE_ENABLED"],
+                                 {"Fn::If": ["Enabled", "true", "false"]})
+            else:
+                self.assertNotIn("RCP_DURABLE_ENABLED", function["Environment"]["Variables"])
         self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE, enabled=False))
         self.assertTrue(permits("GitHubSubmitRole", "states:StartExecution", MACHINE, enabled=True))
 
-    def test_closing_admission_keeps_active_watchdog_alive(self):
+    def test_closing_admission_keeps_existing_execution_and_watchdog_running(self):
         self.assertEqual(TEMPLATE["Parameters"]["AdmissionEnabled"]["Default"], "false")
         resources = TEMPLATE["Resources"]
         watchdog = resources["WatchdogFunction"]["Properties"]
         coordinator = resources["CoordinatorFunction"]["Properties"]
         self.assertEqual(resolve(watchdog["ReservedConcurrentExecutions"], True, False), 1)
-        self.assertEqual(resolve(coordinator["ReservedConcurrentExecutions"], True, False), 0)
+        self.assertEqual(resolve(coordinator["ReservedConcurrentExecutions"], True, False), 1)
+        self.assertEqual(resolve(coordinator["Environment"]["Variables"]["RCP_DURABLE_ENABLED"], True, False), "true")
         self.assertEqual(resolve(resources["WatchdogRule"]["Properties"]["State"], True, False), "ENABLED")
         self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE,
                                 enabled=True, admission=False))
@@ -169,7 +172,7 @@ class DurableStackTests(unittest.TestCase):
         extra = dict(context, **{"aws:TagKeys": TAG_KEYS + ["administrator"]})
         self.assertFalse(permits("CoordinatorRole", "ec2:RunInstances", ec2("instance/i-new"), extra))
 
-    def test_launch_instance_network_and_storage_constraints(self):
+    def test_launch_rejects_wrong_instance_network_storage_or_identity(self):
         cases = [("instance/i-new", "ec2:InstanceType", "c5d.metal"),
                  ("instance/i-new", "ec2:InstanceMarketType", "spot"),
                  ("instance/i-new", "ec2:InstanceProfile", VALUES["WorkerInstanceProfileArn"] + "-other"),
@@ -340,7 +343,8 @@ class DurableStackTests(unittest.TestCase):
                  "AMI", "SOURCE", "SUBNET", "SECURITY_GROUP", "PROFILE_ARN", "RUNTIME_GROUP", "TERMINATION_ROLE"}
         for name in ("CoordinatorFunction", "WatchdogFunction"):
             env = TEMPLATE["Resources"][name]["Properties"]["Environment"]["Variables"]
-            self.assertEqual(set(env), {"RCP_DURABLE_" + key for key in names})
+            self.assertEqual(set(env), {"RCP_DURABLE_" + key for key in
+                                       (names if name == "CoordinatorFunction" else names - {"ENABLED"})})
         for role in ("CoordinatorRole", "WatchdogRole"):
             self.assertFalse(permits(role, "kms:CreateGrant", "*"))
             self.assertFalse(permits(role, "kms:Decrypt", "*"))
@@ -364,7 +368,7 @@ class DurableStackTests(unittest.TestCase):
         for name in ("CoordinatorLogGroup", "WatchdogLogGroup"):
             self.assertEqual(TEMPLATE["Resources"][name]["Properties"]["RetentionInDays"], 7)
 
-    def test_state_machine_waits_without_retrying_mutating_tasks(self):
+    def test_state_machine_retries_service_failures_with_bound_execution_identity(self):
         machine = TEMPLATE["Resources"]["CoordinatorStateMachine"]["Properties"]
         self.assertEqual(machine["StateMachineType"], "STANDARD")
         definition = machine["Definition"]
@@ -372,12 +376,32 @@ class DurableStackTests(unittest.TestCase):
         observe = definition["States"]["Observe"]
         self.assertEqual(observe["Parameters"], {
             "run.$": "$.run", "execution_arn.$": "$$.Execution.Id", "execution_name.$": "$$.Execution.Name"})
-        self.assertNotIn("Retry", observe)
+        retry = observe["Retry"]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(set(retry[0]["ErrorEquals"]), {
+            "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException",
+            "Lambda.ClientExecutionTimeoutException", "Lambda.TooManyRequestsException"})
+        self.assertEqual(retry[0]["MaxAttempts"], 6)
+        self.assertEqual(retry[0]["MaxDelaySeconds"], 30)
+        self.assertEqual(retry[0]["JitterStrategy"], "FULL")
+        self.assertNotIn("States.ALL", retry[0]["ErrorEquals"])
         self.assertEqual(definition["States"]["Pause"], {"Type": "Wait", "Seconds": 60, "Next": "Observe"})
         self.assertEqual(definition["States"]["Decision"]["Default"], "Failed")
         self.assertEqual(observe["Catch"][0]["Next"], "Failed")
         for name in definition["States"]:
             self.assertNotIn("credentials", str(definition["States"][name]).lower())
+
+    def test_polling_intervals_fit_documented_nominal_startup_margins(self):
+        from infra.aws_benchmark import durable, worker
+        resources = TEMPLATE["Resources"]
+        invocation = max(resources[name]["Properties"]["Timeout"]
+                         for name in ("CoordinatorFunction", "WatchdogFunction"))
+        tick = resources["CoordinatorStateMachine"]["Properties"]["Definition"]["States"]["Pause"]["Seconds"]
+        self.assertEqual(resources["WatchdogRule"]["Properties"]["ScheduleExpression"], "rate(1 minute)")
+        self.assertLess(invocation, durable.LAUNCH_ACK_SECONDS)
+        self.assertLessEqual(durable.LAUNCH_ACK_SECONDS, worker.ASSIGNMENT_WAIT_SECONDS)
+        self.assertGreaterEqual(durable.GUARD_GAP_SECONDS, tick + invocation + 15)
+        self.assertGreaterEqual(worker.ASSIGNMENT_WAIT_SECONDS, tick + invocation + 15)
 
     def test_watchdog_delivery_has_no_day_long_stale_queue(self):
         rule = TEMPLATE["Resources"]["WatchdogRule"]["Properties"]

@@ -1,6 +1,10 @@
 """Offline submission, opaque collection and workflow credential-boundary tests."""
 
 import copy
+import base64
+import sys
+from types import SimpleNamespace
+from urllib.error import HTTPError
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -198,6 +202,97 @@ class SubmissionTests(unittest.TestCase):
             cloud.api["stepfunctions"].start_execution.assert_not_called()
 
 
+class RetryTests(unittest.TestCase):
+    def test_transient_upload_read_and_describe_errors_keep_the_original_attempt(self):
+        expected, request = fixture()
+        cloud = Cloud(request)
+        counts = dict(read=0, upload=0, describe=0)
+        def get(**args):
+            counts["read"] += 1
+            if counts["read"] == 1:
+                raise AwsError("SlowDown")
+            return cloud.get(**args)
+        def put(**args):
+            counts["upload"] += 1
+            if counts["upload"] == 3:
+                raise AwsError("SlowDown")
+            return cloud.put(**args)
+        def describe(**args):
+            counts["describe"] += 1
+            if counts["describe"] == 1:
+                raise AwsError("ThrottlingException")
+            return cloud.describe(**args)
+        cloud.api["s3"].get_object.side_effect = get
+        cloud.api["s3"].put_object.side_effect = put
+        cloud.api["stepfunctions"].describe_execution.side_effect = describe
+        with tempfile.TemporaryDirectory() as directory, patch.object(common.time, "sleep"):
+            binaries(Path(directory))
+            result = client.submit(cloud.api, "bucket", MACHINE, expected, directory, now=lambda: NOW)
+        self.assertEqual(result["run"], "123-1")
+        cloud.api["stepfunctions"].start_execution.assert_called_once()
+        self.assertEqual(counts["upload"], len(common.BINARIES) + 1)
+        for call in cloud.api["s3"].put_object.call_args_list:
+            data = call.kwargs["Body"]
+            self.assertEqual(call.kwargs["ChecksumSHA256"],
+                             base64.b64encode(bytes.fromhex(common.digest(data))).decode())
+
+    def test_upload_retries_are_bounded_and_permanent_denial_is_not_retried(self):
+        for error, count in (("SlowDown", 3), ("AccessDenied", 1)):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory, patch.object(common.time, "sleep"):
+                expected, request = fixture()
+                cloud = Cloud(request)
+                cloud.api["s3"].put_object.side_effect = AwsError(error)
+                binaries(Path(directory))
+                with self.assertRaises(AwsError):
+                    client.submit(cloud.api, "bucket", MACHINE, expected, directory, now=lambda: NOW)
+                self.assertEqual(cloud.api["s3"].put_object.call_count, count)
+                cloud.api["stepfunctions"].start_execution.assert_not_called()
+
+    def test_final_request_read_exhausting_budget_cannot_start_execution(self):
+        expected, request = fixture()
+        cloud = Cloud(request)
+        budget = Mock()
+        budget.left.return_value = 100
+        reads = 0
+        def get(**args):
+            nonlocal reads
+            reads += 1
+            result = cloud.get(**args)
+            if reads == 2:
+                budget.left.side_effect = TimeoutError("short job budget exhausted")
+            return result
+        cloud.api["s3"].get_object.side_effect = get
+        with tempfile.TemporaryDirectory() as directory:
+            binaries(Path(directory))
+            with self.assertRaisesRegex(TimeoutError, "short job budget exhausted"):
+                client.submit(cloud.api, "bucket", MACHINE, expected, directory, now=lambda: NOW, budget=budget)
+        self.assertEqual(cloud.api["s3"].put_object.call_count, len(common.BINARIES))
+        cloud.api["stepfunctions"].start_execution.assert_not_called()
+
+    def test_oidc_and_sts_transient_errors_retry_without_changing_short_credential_duration(self):
+        sts, session = Mock(), Mock()
+        sts.assume_role_with_web_identity.side_effect = [AwsError("Throttling"),
+            {"Credentials": dict(AccessKeyId="synthetic", SecretAccessKey="synthetic", SessionToken="synthetic")}]
+        boto = SimpleNamespace(client=Mock(return_value=sts), Session=Mock(return_value=session))
+        config = SimpleNamespace(Config=lambda **kwargs: kwargs)
+        env = dict(ACTIONS_ID_TOKEN_REQUEST_URL="https://example.invalid/token?request=1",
+                   ACTIONS_ID_TOKEN_REQUEST_TOKEN="synthetic", GITHUB_RUN_ID="123")
+        responses = [HTTPError(env["ACTIONS_ID_TOKEN_REQUEST_URL"], 503, "temporary", {}, None),
+                     io.BytesIO(b'{"value":"synthetic"}')]
+        with patch.dict(sys.modules, {"boto3": boto, "botocore.config": config}), patch.dict(client.os.environ, env),              patch.object(client.urllib.request, "urlopen", side_effect=responses) as token, patch.object(common.time, "sleep"):
+            client.oidc_clients("us-east-1", "arn:aws:iam::123456789012:role/worker")
+        responses[0].close()
+        self.assertEqual(token.call_count, 2)
+        self.assertEqual(sts.assume_role_with_web_identity.call_count, 2)
+        self.assertTrue(all(call.kwargs["DurationSeconds"] == 900 for call in sts.assume_role_with_web_identity.call_args_list))
+
+    def test_timeout_with_none_response_keeps_original_error_classification(self):
+        error = TimeoutError("synthetic")
+        error.response = None
+        self.assertIsNone(client.code(error))
+
+
+
 class CollectionTests(unittest.TestCase):
     def setup_cloud(self, *, complete=True, status_success=True):
         expected, request = fixture()
@@ -251,7 +346,7 @@ class CollectionTests(unittest.TestCase):
                 result = client.collect(cloud.api, "bucket", MACHINE, "123-1", output, now=lambda: now)
                 self.assertEqual(result["worker_reported_success"], success)
                 self.assertFalse(result["benchmark_success"])
-                self.assertEqual(result["conclusion"], "failure")
+                self.assertEqual(result["conclusion"], "failure" if complete else "pending")
 
     def test_missing_roots_and_early_cleanup_fail_with_diagnostic_receipt(self):
         for mutation in (lambda value: value["cleanup"].update(deleted_roots=[]),
@@ -292,7 +387,7 @@ class CollectionTests(unittest.TestCase):
         cloud.objects[RECEIPT] = client.encoded(observed)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "raw"
-            with self.assertRaisesRegex(ValueError, "physical inventory"):
+            with self.assertRaisesRegex(ValueError, "physical cleanup proof"):
                 client.collect(cloud.api, "bucket", MACHINE, "123-1", output, now=lambda: now)
             receipt = json.loads((output / "controller.json").read_text())
             self.assertEqual(receipt["cleanup"], "unconfirmed")
@@ -357,9 +452,10 @@ class CollectionTests(unittest.TestCase):
                 change(observed, cloud)
                 cloud.objects[RECEIPT] = client.encoded(observed)
                 output = Path(directory) / "raw"
-                with self.assertRaisesRegex(ValueError, "binding differs|operator request"):
+                with self.assertRaisesRegex(ValueError, "watchdog receipt structure and request binding"):
                     client.collect(cloud.api, "bucket", MACHINE, "123-1", output, now=lambda: now)
-                self.assertFalse(output.exists())
+                self.assertEqual(json.loads((output / "controller.json").read_text())["outcome"], "failure")
+                self.assertEqual((output / "durable.json").read_bytes(), cloud.objects[RECEIPT])
 
     def test_missing_admission_proof_preserves_cleanup_but_fails_qualification(self):
         expected, cloud, observed, now = self.setup_cloud()
@@ -414,7 +510,7 @@ class CollectionTests(unittest.TestCase):
             self.assertFalse(output.exists())
         cloud.objects[common.RESULTS_KEY] = b"corrupted"
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "archive differs"):
+            with self.assertRaisesRegex(ValueError, "worker archive"):
                 client.collect(cloud.api, "bucket", MACHINE, "123-1", Path(directory) / "raw", now=lambda: now)
 
     def test_capacity_expiry_without_worker_is_complete_failure(self):
@@ -428,6 +524,56 @@ class CollectionTests(unittest.TestCase):
             result = client.collect(cloud.api, "bucket", MACHINE, "123-1", Path(directory) / "raw", now=lambda: now)
         self.assertEqual(result["state"], "complete")
         self.assertEqual(result["conclusion"], "failure")
+
+    def test_matching_unlaunched_running_receipt_is_pending_without_claiming_cleanup(self):
+        expected, cloud, observed, now = self.setup_cloud(complete=False)
+        observed.update(execution_arn=None, attempt=None, attempts=0, allocation_consumed=False,
+                        launch_outcome="none", known_instance_ids=[], binding=None, seen={},
+                        runtime_verified=False, worker_published=False, phase="armed")
+        cloud.objects[RECEIPT] = client.encoded(observed)
+        cloud.objects[common.STATUS_KEY] = client.encoded(common.pending_status("123-1"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = client.collect(cloud.api, "bucket", MACHINE, "123-1", root / "raw", now=lambda: now)
+            self.assertEqual((result["state"], result["conclusion"], result["cleanup"]),
+                             ("pending", "pending", "unconfirmed"))
+            evidence, verdict = client.validate_offline(root / "raw", root / "report")
+            self.assertFalse(verdict["accepted"])
+            self.assertEqual(evidence["producer_conclusion"], "pending")
+            self.assertIn("still pending", (root / "report/summary.md").read_text())
+
+    def test_malformed_watchdog_receipt_keeps_bounded_raw_evidence_and_trusted_diagnostic(self):
+        _, request = fixture()
+        wrong_request = copy.deepcopy(request)
+        wrong_request["controller"] = "e" * 40
+        payloads = (b"[]", b"{not-json", b'{"protocol":"incorrect"}',
+                    client.encoded(dict(protocol="incorrect", request=request)),
+                    client.encoded(dict(protocol=durable.PROTOCOL, request=wrong_request)))
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                expected, cloud, observed, now = self.setup_cloud()
+                cloud.objects[RECEIPT] = payload
+                root = Path(directory)
+                with self.assertRaisesRegex(ValueError, "watchdog receipt structure and request binding"):
+                    client.collect(cloud.api, "bucket", MACHINE, "123-1", root / "raw", now=lambda: now)
+                receipt = json.loads((root / "raw/controller.json").read_text())
+                self.assertEqual((receipt["outcome"], receipt["cleanup"]), ("failure", "unconfirmed"))
+                self.assertEqual((root / "raw/durable.json").read_bytes(), payload)
+                evidence, verdict = client.validate_offline(root / "raw", root / "report")
+                self.assertFalse(verdict["accepted"])
+                self.assertIn("diagnostic", (root / "report/summary.md").read_text())
+
+    def test_historical_missing_observed_image_stays_unknown(self):
+        expected, cloud, observed, now = self.setup_cloud()
+        observed["binding"].pop("image_id")
+        observed["binding"].pop("instance_type")
+        cloud.objects[RECEIPT] = client.encoded(observed)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client.collect(cloud.api, "bucket", MACHINE, "123-1", root / "raw", now=lambda: now)
+            instance = json.loads((root / "raw/controller.json").read_text())["instance"]
+            self.assertIsNone(instance["image_id"])
+            self.assertIsNone(instance["instance_type"])
 
 
 class QualificationTests(unittest.TestCase):

@@ -94,6 +94,32 @@ class WorkflowPolicyTests(unittest.TestCase):
                     workflow=env["GITHUB_WORKFLOW_REF"], workflow_sha="c" * 40, event="workflow_dispatch",
                     run_url="https://github.com/wykurz/rcp/actions/runs/123/attempts/1"))
 
+    def test_equal_revisions_build_once_and_download_the_same_bytes_for_both_roles(self):
+        jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["build"]["strategy"]["matrix"]["role"],
+                         "${{ fromJSON(needs.validate.outputs.build-roles) }}")
+        script = next(step["run"] for step in jobs["validate"]["steps"] if step.get("id") == "protocol").splitlines()
+        program = compile("\n".join(script[1:-1]), "actual role selection", "exec")
+        for candidate, expected in (("a" * 40, ["baseline"]), ("b" * 40, ["baseline", "candidate"])):
+            with self.subTest(candidate=candidate), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "outputs"
+                env = dict(GITHUB_REF=identity.REF, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1",
+                    GITHUB_SHA="c" * 40, GITHUB_REPOSITORY=identity.REPOSITORY,
+                    GITHUB_WORKFLOW_REF=identity.WORKFLOW, GITHUB_WORKFLOW_SHA="c" * 40,
+                    BASELINE="a" * 40, CANDIDATE=candidate, SUITE="tiny", EXECUTION="operator-window",
+                    GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_OUTPUT=str(path))
+                with patch.dict(os.environ, env), redirect_stdout(io.StringIO()):
+                    exec(program, {})
+                outputs = dict(line.split("=", 1) for line in path.read_text().splitlines())
+                self.assertEqual(json.loads(outputs["build-roles"]), expected)
+        for job in (jobs["benchmark"], jobs["durable-submit"]):
+            downloads = [step["with"] for step in job["steps"]
+                         if step.get("uses", "").startswith("actions/download-artifact@")]
+            by_path = {item["path"].rsplit("/", 1)[-1]: item["name"] for item in downloads}
+            self.assertEqual(by_path["baseline"], "aws-baseline")
+            self.assertEqual(by_path["candidate"],
+                             "${{ inputs.baseline == inputs.candidate && 'aws-baseline' || 'aws-candidate' }}")
+
     def test_dispatch_choices_and_real_validation_exclude_disabled_suites(self):
         choices = self.workflow["on"]["workflow_dispatch"]["inputs"]["suite"]["options"]
         self.assertEqual(set(choices), set(common.ACTIVE_SUITES))
@@ -144,7 +170,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                          {"ref": "${{ github.sha }}", "persist-credentials": "false"})
         downloads = [s for s in steps if s.get("uses", "").startswith("actions/download-artifact@")]
         self.assertEqual(len(downloads), 2)
-        self.assertEqual({s["with"]["name"] for s in downloads}, {"aws-baseline", "aws-candidate"})
+        self.assertEqual({s["with"]["name"] for s in downloads}, {"aws-baseline", "${{ inputs.baseline == inputs.candidate && 'aws-baseline' || 'aws-candidate' }}"})
         for step in downloads:
             self.assertEqual(set(step["with"]), {"name", "path"})
 

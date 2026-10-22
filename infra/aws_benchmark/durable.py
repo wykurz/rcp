@@ -10,17 +10,19 @@ import hashlib
 import json
 import re
 
-from .common import (BINARIES, DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
-                     durable_worker_reserve, require, timestamp, utc, validate_identity)
+from .common import (DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
+                     durable_worker_reserve, durable_plan_contract, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
+                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity)
 
-PROTOCOL = "rcp-direct-v1"
+PROTOCOL = DIRECT_PROTOCOL
 CAPACITY_SECONDS = DURABLE_MAX_PROVISIONING
 RUNTIME_SECONDS = DURABLE_MAX_RUNTIME
 GUARD_GAP_SECONDS = 120
+LAUNCH_ACK_SECONDS = 90
 DELIVERY_DRAIN_SECONDS = 15 * 60
 SHUTDOWN_ALLOWANCE_SECONDS = 16 * 60
 RETRY_SECONDS = 60
-MAX_ATTEMPTS = 720
+MAX_ATTEMPTS = DIRECT_MAX_ATTEMPTS
 PLAN = DURABLE_PLAN
 worker_minimum = durable_worker_reserve
 TAG_NAMESPACE = "rcp:namespace"
@@ -33,11 +35,11 @@ PIN_KEYS = {"region", "account", "namespace", "bucket", "lt_id", "lt_version", "
             "subnet", "security_group", "profile_arn"}
 
 
-def minimum_runtime(plan=PLAN):
-    return worker_minimum(plan) + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
+def minimum_runtime(plan=PLAN, *, exact=True):
+    return worker_minimum(plan, exact=exact) + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
 
 
-def validate(value):
+def validate(value, *, exact=True):
     require(isinstance(value, dict) and set(value) == {
         "protocol", "run", "baseline", "candidate", "suite", "controller", "created_at",
         "capacity_deadline", "outer_deadline", "runtime_seconds", "plan", "sha256", "pins"},
@@ -47,14 +49,15 @@ def validate(value):
     require(value["suite"] == "bulk-1g-metadata", "direct qualification requires metadata suite")
     require(value["baseline"] == value["candidate"], "direct qualification requires A/A revisions")
     require(re.fullmatch(r"[0-9a-f]{40}", value["controller"]) is not None, "invalid controller revision")
+    contract = durable_plan_contract(value["plan"], exact=exact)
     seconds = value["runtime_seconds"]
-    require(type(seconds) is int and minimum_runtime(value["plan"]) <= seconds <= RUNTIME_SECONDS,
+    require(type(seconds) is int and minimum_runtime(value["plan"], exact=exact) <= seconds <= contract["max_runtime"],
             "runtime does not fit the explicit workload/headroom plan or exceeds 180 minutes")
     created, expiry, outer = (utc(value[k]) for k in ("created_at", "capacity_deadline", "outer_deadline"))
-    require(0 < (expiry - created).total_seconds() <= CAPACITY_SECONDS, "capacity wait exceeds twelve hours")
+    require(0 < (expiry - created).total_seconds() <= contract["max_provisioning"], "capacity wait exceeds the recorded policy")
     require(outer == expiry + timedelta(seconds=seconds), "control reconciliation horizon differs")
     hashes = value["sha256"]
-    require(isinstance(hashes, dict) and set(hashes) == set(BINARIES), "unexpected binary manifest")
+    require(isinstance(hashes, dict) and set(hashes) == set(contract["binaries"]), "unexpected binary manifest")
     require(all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in hashes.values()),
             "invalid binary digest")
     require(all(hashes["baseline/" + name] == hashes["candidate/" + name]
@@ -86,7 +89,7 @@ def request(identity, created, hashes, pins, *, runtime_seconds=RUNTIME_SECONDS,
 
 def initial_lease(value):
     validate(value)
-    return dict(request=value, phase="armed", last_guard_at=None, execution_arn=None, attempt=None,
+    return dict(request=value, phase="armed", execution_arn=None, attempt=None,
                 attempts=0, capacity_failures=[], next_attempt_at=value["created_at"], binding=None,
                 known_instance_ids=[], seen={}, close_reason=None, allocation_consumed=False,
                 runtime_verified=False, worker_published=False, cleanup=None, launch_outcome="none")
@@ -122,9 +125,7 @@ def tagged_expiry(instance, namespace, now):
     require(values.get(TAG_NAMESPACE) == namespace, "instance is outside managed namespace")
     require(TAG_KEYS <= set(values), "missing allocation deadline tags")
     require(re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,4}", values[TAG_RUN]), "invalid run tag")
-    prefix = values[TAG_RUN] + "-"
-    require(values[TAG_ATTEMPT].startswith(prefix) and values[TAG_ATTEMPT][len(prefix):].isdigit()
-            and 1 <= int(values[TAG_ATTEMPT][len(prefix):]) <= MAX_ATTEMPTS, "invalid attempt tag")
+    validate_attempt_id(values[TAG_RUN], values[TAG_ATTEMPT])
     start, close, launch = utc(values[TAG_CREATED]), utc(values[TAG_DEADLINE]), utc(instance["LaunchTime"])
     require(timestamp(start) == values[TAG_CREATED] and timestamp(close) == values[TAG_DEADLINE],
             "deadline tags must be canonical UTC")
@@ -142,7 +143,7 @@ def bind(value, instance, allocation):
             "allocation deadline changed")
     require(instance.get("ClientToken") == allocation["token"], "instance token differs from allocation")
     pins = value["pins"]
-    require(instance["ImageId"] == pins["ami"] and instance.get("InstanceType") == "c5d.24xlarge"
+    require(instance["ImageId"] == pins["ami"] and instance.get("InstanceType") == INSTANCE_TYPE
             and not instance.get("InstanceLifecycle"), "instance image, type or purchase path differs")
     require(instance.get("SubnetId") == pins["subnet"] and
             instance.get("IamInstanceProfile", {}).get("Arn") == pins["profile_arn"] and
@@ -150,20 +151,37 @@ def bind(value, instance, allocation):
             "instance network or profile differs")
     observed = instance_tags(instance)
     require(all(observed.get(k) == v for k, v in tags(value, allocation).items()), "allocation tags differ")
-    return dict(instance_id=instance["InstanceId"], launch_at=timestamp(launch),
+    return dict(instance_id=instance["InstanceId"], image_id=instance["ImageId"],
+                instance_type=instance["InstanceType"], launch_at=timestamp(launch),
                 close_at=allocation["close_at"], deadline=timestamp(utc(allocation["close_at"]) - timedelta(
                     seconds=value["plan"]["shutdown_reserve_seconds"])), attempt_id=allocation["id"],
                 attempt_started_at=allocation["started_at"])
 
 
-def window(value, binding):
-    validate(value)
+def window(value, binding, *, exact=True):
+    validate(value, exact=exact)
     result = {k: value[k] for k in ("protocol", "run", "baseline", "candidate", "suite", "runtime_seconds", "plan", "outer_deadline")}
     result.update(instance_id=binding["instance_id"], launch_at=binding["launch_at"],
                   opens=binding["attempt_started_at"], deadline=binding["deadline"],
                   request_expires=value["capacity_deadline"], attempt_id=binding["attempt_id"],
                   attempt_started_at=binding["attempt_started_at"])
     return result
+
+
+def worker_command(value, binding, *, exact=True):
+    validate(value, exact=exact)
+    command = {key: value[key] for key in ("run", "baseline", "candidate", "suite", "sha256")}
+    return dict(command, deadline=binding["deadline"])
+
+
+def launch_outcome(state, outcome):
+    """Keep accepted evidence monotonic and the compatibility receipt flag consistent."""
+    require(outcome in {"none", "not-sent", "capacity-rejected", "uncertain", "accepted"}, "unknown launch outcome")
+    require(state["launch_outcome"] != "accepted" or outcome == "accepted", "accepted allocation cannot be downgraded")
+    consumed = outcome in {"uncertain", "accepted"}
+    require(consumed or not (state["known_instance_ids"] or state["seen"]),
+            "no-allocation evidence conflicts with observed instances")
+    state.update(launch_outcome=outcome, allocation_consumed=consumed)
 
 
 def cost_projection(*, hourly, ancillary, runtime_seconds=RUNTIME_SECONDS,
