@@ -578,6 +578,114 @@ class CollectionTests(unittest.TestCase):
         cloud.api["s3"].put_object.assert_not_called()
         cloud.api["stepfunctions"].start_execution.assert_not_called()
 
+    def retained_receipt_cloud(self, *, bound=True):
+        _, old_cloud, observation, _ = self.setup_cloud()
+        if not bound:
+            observation.update(execution_arn=None, attempt=None, attempts=0, allocation_consumed=False,
+                               launch_outcome="none", known_instance_ids=[], binding=None, seen={},
+                               runtime_verified=False, worker_published=False)
+            observation["cleanup"].update(deleted_roots=[], allocation_consumed=False)
+        old_cloud.objects[RECEIPT] = client.encoded(observation)
+        provenance = dict(client.producer(observation["request"]), run="124-1")
+        current = durable.request(provenance, NOW + timedelta(days=2), observation["request"]["sha256"],
+                                  observation["request"]["pins"])
+        cloud = Cloud(current)
+        cloud.objects.update({key: value for key, value in old_cloud.objects.items() if key != REQUEST})
+        cloud.objects[common.STATUS_KEY] = client.encoded(common.pending_status(current["run"]))
+        cloud.start(stateMachineArn=MACHINE, name=current["run"], input=json.dumps({"run": current["run"]}))
+        return cloud, observation, current, common.utc(current["created_at"])
+
+    def test_retained_prior_receipt_is_pending_without_reusing_old_evidence(self):
+        for bound in (False, True):
+            with self.subTest(bound=bound), tempfile.TemporaryDirectory() as directory:
+                cloud, old, current, now = self.retained_receipt_cloud(bound=bound)
+                root = Path(directory)
+                result = client.collect(cloud.api, "bucket", MACHINE, current["run"], root / "raw", now=lambda: now)
+                self.assertEqual((result["state"], result["conclusion"], result["cleanup"]),
+                                 ("pending", "pending", "unconfirmed"))
+                self.assertEqual(result["execution_binding"], "unconfirmed")
+                self.assertFalse(result["worker_reported_success"])
+                self.assertFalse(result["benchmark_success"])
+                receipt = json.loads((root / "raw/controller.json").read_text())
+                self.assertEqual(receipt["outcome"], "incomplete")
+                self.assertNotIn("collection_error", receipt)
+                for field in ("instance", "window", "request", "archive_sha256", "status_sha256"):
+                    self.assertIsNone(receipt[field])
+                self.assertEqual((root / "raw/durable.json").read_bytes(), client.encoded(old))
+                self.assertFalse((root / "raw/status.json").exists())
+                self.assertFalse((root / "raw/results.zip").exists())
+                self.assertEqual([call.kwargs["Key"] for call in cloud.api["s3"].get_object.call_args_list],
+                                 [REQUEST, RECEIPT])
+                evidence, verdict = client.validate_offline(root / "raw", root / "report")
+                self.assertEqual((evidence["producer_conclusion"], verdict["state"]), ("pending", "pending"))
+                self.assertEqual(evidence["errors"], [])
+                self.assertFalse(evidence["history_eligible"])
+                self.assertFalse(verdict["accepted"])
+                self.assertFalse(verdict["history_published"])
+                self.assertEqual((root / "report/raw/durable.json").read_bytes(), client.encoded(old))
+                cloud.api["s3"].put_object.assert_not_called()
+                cloud.api["stepfunctions"].start_execution.assert_not_called()
+                # the first current receipt is checked normally on a later collection.
+                fresh = dict(durable.initial_lease(current), protocol=durable.PROTOCOL,
+                             observed_at=common.timestamp(now))
+                cloud.objects[RECEIPT] = client.encoded(fresh)
+                next_result = client.collect(cloud.api, "bucket", MACHINE, current["run"], root / "next", now=lambda: now)
+                self.assertEqual(next_result["execution_binding"], "not-launched")
+                self.assertEqual(next_result["conclusion"], "pending")
+                self.assertEqual(next_result["cleanup"], "unconfirmed")
+
+    def test_terminal_retained_prior_receipt_is_failure_online_and_offline(self):
+        for execution_status in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"):
+            with self.subTest(execution_status=execution_status), tempfile.TemporaryDirectory() as directory:
+                cloud, old, current, now = self.retained_receipt_cloud()
+                cloud.execution["status"] = execution_status
+                root = Path(directory)
+                with self.assertRaisesRegex(ValueError, "watchdog receipt structure and request binding"):
+                    client.collect(cloud.api, "bucket", MACHINE, current["run"], root / "raw", now=lambda: now)
+                result = json.loads((root / "raw/collection.json").read_text())
+                self.assertEqual((result["state"], result["conclusion"], result["cleanup"]),
+                                 ("held", "failure", "unconfirmed"))
+                evidence, verdict = client.validate_offline(root / "raw", root / "report")
+                self.assertEqual((evidence["producer_conclusion"], verdict["state"]), ("failure", "failure"))
+                self.assertFalse(verdict["accepted"])
+                self.assertFalse((root / "raw/status.json").exists())
+                self.assertFalse((root / "raw/results.zip").exists())
+
+    def test_retained_receipt_exception_does_not_hide_malformed_or_current_request_tamper(self):
+        mutations = {
+            "invalid request shape": lambda old, current: old["request"].pop("pins"),
+            "invalid prior run": lambda old, current: old["request"].update(run="not-a-run"),
+            "same-run changed request": lambda old, current: old["request"].update(run=current["run"]),
+            "same-run controller change": lambda old, current: old.update(request=dict(current, controller="e" * 40)),
+            "non-prior creation": lambda old, current: old["request"].update({
+                key: current[key] for key in ("created_at", "capacity_deadline", "outer_deadline")}),
+            "other mailbox": lambda old, current: old["request"]["pins"].update(bucket="other-bucket"),
+            "other account": lambda old, current: old["request"]["pins"].update(account="999999999999"),
+            "bad observation time": lambda old, current: old.update(observed_at="invalid"),
+            "newer observation": lambda old, current: old.update(observed_at=common.timestamp(
+                common.utc(current["created_at"]) + timedelta(seconds=1))),
+            "earlier observation": lambda old, current: old.update(observed_at=common.timestamp(NOW - timedelta(seconds=1))),
+            "different execution": lambda old, current: old.update(execution_arn=client.execution_arn(MACHINE, "999-1")),
+            "unfinished prior": lambda old, current: old.update(phase="closing"),
+            "wrong protocol": lambda old, current: old.update(protocol="wrong"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                cloud, old, current, now = self.retained_receipt_cloud()
+                mutate(old, current)
+                cloud.objects[RECEIPT] = client.encoded(old)
+                root = Path(directory)
+                with self.assertRaisesRegex(ValueError, "watchdog receipt structure and request binding"):
+                    client.collect(cloud.api, "bucket", MACHINE, current["run"], root / "raw", now=lambda: now)
+                result = json.loads((root / "raw/collection.json").read_text())
+                self.assertEqual((result["conclusion"], result["cleanup"]), ("failure", "unconfirmed"))
+                self.assertFalse((root / "raw/status.json").exists())
+                self.assertFalse((root / "raw/results.zip").exists())
+                evidence, verdict = client.validate_offline(root / "raw", root / "report")
+                self.assertEqual(evidence["producer_conclusion"], "failure")
+                self.assertFalse(verdict["accepted"])
+                self.assertFalse(evidence["history_eligible"])
+
     def test_terminal_execution_missing_watchdog_receipt_is_failure(self):
         for status in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
