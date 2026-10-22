@@ -164,7 +164,7 @@ benchmark-test:
 
 # Validate AWS window, IAM, and worker failure paths without AWS calls.
 aws-benchmark-test:
-    python3 -m unittest discover -s infra/aws_benchmark -p 'test_*.py'
+    python3 -m unittest discover -s infra/aws_benchmark -t . -p 'test_*.py'
 
 # Ingest bounded AWS evidence without credentials, extraction or network publication.
 aws-benchmark-report *ARGS:

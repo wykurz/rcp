@@ -1,5 +1,9 @@
 # Manually armed AWS benchmarks
 
+The separate [production admission and collection path](PRODUCTION.md) is initially disabled and
+requires its own deployment and activation review. The ASG instructions below describe the original
+manual experiment.
+
 This is an opt-in, single-worker experiment. Nothing deploys or launches from a PR, push, schedule,
 or default configuration. Infrastructure deployment, operator window arming, and benchmark execution
 are separate operations. Start with the A/A smoke pilot before using these results for comparisons.

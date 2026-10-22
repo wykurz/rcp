@@ -50,6 +50,9 @@
         pythonForChecks = pkgs.python3.withPackages (pythonPackages: [
           pythonPackages.pyyaml
           pythonPackages.markdown-it-py
+          pythonPackages.boto3
+          pythonPackages.pyjwt
+          pythonPackages.cryptography
         ]);
 
         depotPlatform = {

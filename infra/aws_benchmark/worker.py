@@ -29,13 +29,13 @@ from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, 
                      DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, retryable_io, timestamp,
-                     validate_admission, validate_request, validate_window,
-                     WINDOW_KEY, REQUEST_KEY, RESULTS_KEY, STATUS_KEY)
+                     validate_admission, validate_request, validate_window)
 from .cache_client import SOCKET
 from .maintenance import check_quiet
 from .guest_security import check_ssm_absent
 from .common import LARGE_SUITES
 from . import large_storage
+from .production_mailbox import MailboxPaths
 
 ROOT = Path("/opt/rcp-benchmark")
 STATE = Path("/run/rcp-benchmark")
@@ -290,7 +290,7 @@ def error_detail(error):
     return result
 
 
-def publish_report(s3, bucket, output, metadata, status, budget):
+def publish_report(s3, bucket, output, metadata, status, budget, *, paths=MailboxPaths.legacy()):
     """Attempt bounded archives independently, then always attempt terminal status."""
     data = None
     for index, candidate_output in enumerate((output, None)):
@@ -303,14 +303,18 @@ def publish_report(s3, bucket, output, metadata, status, budget):
             status.update(success=False, **{field: error_detail(error)})
     if data is not None:
         try:
-            retry_io(lambda: s3.put_object(Bucket=bucket, Key=RESULTS_KEY, Body=data,
-                     ContentType="application/zip"), budget, reserve=30)
+            retry_io(lambda: s3.put_object(Bucket=bucket, Key=paths.results, Body=data,
+                     ContentType="application/zip", **paths.write_conditions), budget, reserve=30)
             status["sha256"] = digest(data)
         except Exception as error:
             status.update(success=False, upload_error=error_detail(error))
     # DeadlineExpired escapes both archive handlers. Ordinary archive failures
     # never prevent status publication; exhausted status retries power off.
-    retry_io(lambda: put_json(s3, bucket, STATUS_KEY, status), budget)
+    if paths.scoped:
+        retry_io(lambda: s3.put_object(Bucket=bucket, Key=paths.status, Body=json.dumps(status).encode(),
+                 ContentType="application/json", **paths.write_conditions), budget)
+    else:
+        retry_io(lambda: put_json(s3, bucket, paths.status, status), budget)
 
 
 class NoMetadataRedirect(HTTPRedirectHandler):
@@ -335,12 +339,13 @@ def instance_identity(budget):
     return identity
 
 
-def durable_window(s3, bucket, identity, budget):
+def durable_window(s3, bucket, identity, budget, *, paths=MailboxPaths.legacy()):
     """Wait briefly for this instance's assignment; stale mail cannot admit any work."""
+    require(not paths.scoped or paths.instance_id == identity, "mailbox and worker instance differ")
     while True:
         budget.left(5)
         try:
-            value = retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+            value = retry_io(lambda: get_json(s3, bucket, paths.window), budget, reserve=5)
         except Exception as error:
             # without ListBucket, a missing fixed key is reported as AccessDenied
             # exhausted transient read retries may poll again, but only under the
@@ -376,7 +381,8 @@ def consume_durable_assignment(window):
         os.close(directory)
 
 
-def run(s3, bucket, *, direct=False):
+def run(s3, bucket, *, direct=False, production_account=None, region=None):
+    require(production_account is None or direct, "production mailbox requires direct launch mode")
     protocol = DIRECT_PROTOCOL if direct else None
     bounded = direct
     # A failed initial control read has no trustworthy run identity to report.
@@ -386,8 +392,10 @@ def run(s3, bucket, *, direct=False):
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     identity = instance_identity(budget) if bounded else None
-    window = durable_window(s3, bucket, identity, budget) if bounded else \
-        retry_io(lambda: get_json(s3, bucket, WINDOW_KEY), budget, reserve=5)
+    paths = MailboxPaths.for_instance(production_account, region, identity) if production_account is not None \
+        else MailboxPaths.legacy()
+    window = durable_window(s3, bucket, identity, budget, paths=paths) if bounded else \
+        retry_io(lambda: get_json(s3, bucket, paths.window), budget, reserve=5)
     require(isinstance(window, dict), "invalid worker window")
     require(window.get("protocol") == protocol, "worker launch protocol mismatch")
     # Trust no retained metadata or extended alarm until the complete window is
@@ -402,7 +410,7 @@ def run(s3, bucket, *, direct=False):
                         runtime_origin="attempt_started_at")
     stopped = True
     try:
-        request = retry_io(lambda: get_json(s3, bucket, REQUEST_KEY), budget, reserve=RESERVE)
+        request = retry_io(lambda: get_json(s3, bucket, paths.request), budget, reserve=RESERVE)
         validate_request(request, window)
         validate_admission(window, window=True)
         metadata["request"] = request
@@ -427,7 +435,7 @@ def run(s3, bucket, *, direct=False):
             argv, check=True, text=True, capture_output=True,
             timeout=min(timeout, budget.left(RESERVE))).stdout)
         for key in BINARIES:
-            data = retry_io(lambda: get_bytes(s3, bucket, "input/" + key, MAX_BINARY), budget, reserve=RESERVE)
+            data = retry_io(lambda: get_bytes(s3, bucket, paths.binary(key), MAX_BINARY), budget, reserve=RESERVE)
             require(digest(data) == request["sha256"][key], "binary digest mismatch")
             path = STATE / key
             path.parent.mkdir(exist_ok=True)
@@ -465,7 +473,7 @@ def run(s3, bucket, *, direct=False):
         status.update(success=False, error=error_detail(error))
     # Never read candidate-owned paths until all descendants are gone. Failed
     # teardown still reports the trusted outcome without touching those paths.
-    publish_report(s3, bucket, DATA / "output" if stopped else None, metadata, status, budget)
+    publish_report(s3, bucket, DATA / "output" if stopped else None, metadata, status, budget, paths=paths)
 
 
 def main():
@@ -473,10 +481,16 @@ def main():
     parser.add_argument("--region", required=True)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--direct", action="store_true", help="require an immutable attempt-bound direct assignment")
+    parser.add_argument("--production-account", help="use this account and the IMDS instance ID for an isolated mailbox")
     args = parser.parse_args()
+    require(args.production_account is None or args.direct, "production mailbox requires --direct")
     require(os.geteuid() == 0, "supervisor requires root")
     os.chdir(ROOT)
-    run(clients(args.region)["s3"], args.bucket, direct=args.direct)
+    if args.production_account is None:
+        run(clients(args.region)["s3"], args.bucket, direct=args.direct)
+    else:
+        run(clients(args.region)["s3"], args.bucket, direct=args.direct,
+            production_account=args.production_account, region=args.region)
 
 
 if __name__ == "__main__":

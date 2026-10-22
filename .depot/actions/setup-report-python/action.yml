@@ -1,7 +1,13 @@
 name: Set up report Python
-description: Install the pinned Markdown renderer while retaining CI's system Python packages
+description: Install pinned reporting dependencies and optional offline AWS test dependencies
 
 # shared by GitHub and Depot; Depot remaps local .github action paths to .depot
+
+inputs:
+  aws-benchmark-tests:
+    description: Install the pinned SDK and cryptography closure for offline AWS safety tests
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -15,3 +21,8 @@ runs:
       # reinstall even matching system packages so the wheel hashes are always checked
       "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install --ignore-installed --require-hashes -r scripts/report-site-requirements.txt
       echo "$RUNNER_TEMP/report-site-venv/bin" >> "$GITHUB_PATH"
+  - name: Install offline AWS test dependencies
+    if: inputs.aws-benchmark-tests == 'true'
+    shell: bash
+    run: |
+      "$RUNNER_TEMP/report-site-venv/bin/python" -m pip install --ignore-installed --require-hashes -r infra/aws_benchmark/production-requirements.txt

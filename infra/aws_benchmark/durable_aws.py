@@ -102,6 +102,8 @@ def verify_launch_data(config, data):
 
 
 class Service:
+    receipt_limit = MAX_RECEIPT
+
     def __init__(self, api, config, now=lambda: datetime.now(timezone.utc), *, sleep=time.sleep,
                  monotonic=time.monotonic):
         self.api, self.config, self.now = api, config, now
@@ -141,6 +143,25 @@ class Service:
             ExpressionAttributeNames={"#revision": "revision"}, ExpressionAttributeValues={
                 ":previous": {"N": str(revision)}, ":next": {"N": str(revision + 1)}, ":payload": {"S": data}})
         return revision + 1
+
+    def save_launch_intent(self, state, revision):
+        """Persist the allocation fence; production additionally checks central admission."""
+        return self.save(state, revision)
+
+    def validate_inputs(self, state):
+        request = state["request"]
+        for key in BINARIES:
+            head = self.api["s3"].head_object(Bucket=self.config.bucket, Key="input/" + key, ChecksumMode="ENABLED")
+            expected = base64.b64encode(bytes.fromhex(request["sha256"][key])).decode("ascii")
+            require(type(head.get("ContentLength")) is int and 0 < head["ContentLength"] <= MAX_BINARY and
+                    head.get("ChecksumSHA256") == expected and head.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT",
+                    "uploaded binary digest or size differs from operator manifest")
+
+    def read_worker_status(self, state):
+        return get_json(self.api["s3"], self.config.bucket, STATUS_KEY)
+
+    def watchdog_state(self, state, instances):
+        """Apply mode-specific closure obligations inside the watchdog cleanup tail."""
 
     def fresh_guard(self):
         response = self.api["dynamodb"].get_item(TableName=self.config.table,
@@ -210,9 +231,14 @@ class Service:
             "payload": {"S": json.dumps(dict(namespace=self.config.namespace, observed_at=timestamp(started), healthy=True))}})
         return instances
 
+    def verify_startup(self, data):
+        # legacy startup remains operator-verified; production overrides this hook
+        pass
+
     def launch_parameters(self, request, allocation):
         data = verify_launch_data(self.config, launch_template_data(
             self.api["ec2"], self.config.lt_id, self.config.lt_version))
+        self.verify_startup(data)
         interface = dict(data["NetworkInterfaces"][0], SubnetId=self.config.subnet)
         tags = [{"Key": k, "Value": v} for k, v in sorted(durable.tags(request, allocation).items())]
         return dict(LaunchTemplate={"LaunchTemplateId": self.config.lt_id, "Version": self.config.lt_version},
@@ -371,12 +397,7 @@ class Service:
             return dict(state="wait", run=request["run"])
         self.fresh_guard()
         require(not self.inventory(request), "previous or unexpected managed instance exists")
-        for key in BINARIES:
-            head = self.api["s3"].head_object(Bucket=self.config.bucket, Key="input/" + key, ChecksumMode="ENABLED")
-            expected = base64.b64encode(bytes.fromhex(request["sha256"][key])).decode("ascii")
-            require(type(head.get("ContentLength")) is int and 0 < head["ContentLength"] <= MAX_BINARY and
-                    head.get("ChecksumSHA256") == expected and head.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT",
-                    "uploaded binary digest or size differs from operator manifest")
+        self.validate_inputs(state)
         if not self.capacity_open(state, revision):
             return dict(state="wait", run=request["run"])
         allocation = durable.attempt(request, state["attempts"] + 1, self.now())
@@ -395,7 +416,7 @@ class Service:
                      attempts=allocation["ordinal"])
         durable.launch_outcome(state, "uncertain")
         try:
-            self.save(state, revision)
+            self.save_launch_intent(state, revision)
         except Exception as error:
             if retryable_io(error):
                 # RunInstances has not been called, including when this intent write committed invisibly
@@ -524,16 +545,17 @@ class Service:
         observed = state["cleanup"]["verified_at"] if state["phase"] == "complete" else timestamp(self.now())
         data = json.dumps(dict(protocol=durable.PROTOCOL, observed_at=observed, **state),
                           sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        require(len(data) <= MAX_RECEIPT, "durable receipt exceeds collector bound; manual reconciliation required")
+        require(len(data) <= self.receipt_limit, "durable receipt exceeds collector bound; manual reconciliation required")
         return data
 
     def receipt(self, state):
         self.api["s3"].put_object(Bucket=self.config.bucket, Key=RECEIPT,
                                   Body=self.receipt_bytes(state), ContentType="application/json")
 
-    def watchdog(self):
+    def watchdog(self, *, instances=None):
         # expiration is enforced before DynamoDB access, even if the lease is missing or unreadable
-        instances = self.independent_scan()
+        if instances is None:
+            instances = self.independent_scan()
         try:
             state, revision = self.load()
         except ValueError as error:
@@ -555,6 +577,7 @@ class Service:
                 saved = copy.deepcopy(state)
         try:
             if state["phase"] != "complete":
+                self.watchdog_state(state, relevant)
                 self.observe(state, relevant)
                 if not state["close_reason"]:
                     checkpoint()
@@ -570,7 +593,7 @@ class Service:
                             checkpoint()
                             self.publish_worker(state)
                             state["worker_published"] = True
-                        status = get_json(self.api["s3"], self.config.bucket, STATUS_KEY)
+                        status = self.read_worker_status(state)
                         if status.get("run") == state["request"]["run"] and status.get("state") == "completed":
                             state.update(phase="closing",
                                 close_reason="worker completed; result validity is separate from physical cleanup")

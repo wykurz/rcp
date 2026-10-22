@@ -63,6 +63,8 @@ jobs:
       run: ./scripts/check-doc-format.sh
 
     - uses: ./.depot/actions/setup-report-python
+      with:
+        aws-benchmark-tests: "true"
 
     - name: Check report publishing, links, and preserved measurement hashes
       run: just report-check

@@ -39,7 +39,7 @@ python3 -m venv /opt/rcp-benchmark/venv
 /opt/rcp-benchmark/venv/bin/pip install --require-hashes -r infra/aws_benchmark/requirements.txt
 progress harness
 cp -r benchmarks /opt/rcp-benchmark/
-cp infra/aws_benchmark/{__init__,common,worker,large_storage,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
+cp infra/aws_benchmark/{__init__,common,worker,production_mailbox,large_storage,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
 install -m 0755 infra/aws_benchmark/cache_client.py /opt/rcp-benchmark/bin/sudo
 python3 -m infra.aws_benchmark.maintenance
 python3 -m infra.aws_benchmark.guest_security
@@ -51,7 +51,7 @@ chmod -R a+rX,go-w /opt/rcp-benchmark/benchmarks /opt/rcp-benchmark/infra
 progress verify-unprivileged
 cd /opt/rcp-benchmark
 runuser -u rcp-benchmark -- /usr/bin/python3 -B -c \
-  'import benchmarks.run; import infra.aws_benchmark.cache_client'
+  'import benchmarks.run; import infra.aws_benchmark.cache_client; import infra.aws_benchmark.worker'
 progress complete
 # bake without credentials, SSH keys, prior instance data, or cloud-init state
 echo 'Worker installed. Sanitize the image and reset cloud-init before capturing the AMI.'
