@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -8,187 +9,39 @@ from pathlib import Path
 
 import yaml
 
-from benchmarks.test_publish import result as publication_result
 from benchmarks.test_changes import Fragment, observation
 
 
-# preserve stdin/file operand behavior without implementing hashing or option validation
-SHA256SUM_STUB = r'''sha256sum() {
-    local argument stdin_operand=0 file_operand=0 options=1
-    for argument in "$@"; do
-        if [[ "$argument" == - ]]; then
-            stdin_operand=1
-        elif (( options )) && [[ "$argument" == -- ]]; then
-            options=0
-        elif (( options )) && [[ "$argument" == -* ]]; then
-            :
-        else
-            file_operand=1
-        fi
-    done
-    if (( stdin_operand || !file_operand )); then cat >/dev/null; fi
-    printf "%064d  -\n" 0
-}
-'''
-
-
 class BenchmarkWorkflowTests(unittest.TestCase):
-    def workflow(self):
-        return yaml.safe_load((Path(__file__).resolve().parent.parent / ".depot/workflows/benchmarks.yml").read_text())
+    def test_depot_measurement_entrypoints_are_removed(self):
+        project = Path(__file__).resolve().parent.parent
+        self.assertFalse((project / ".depot/workflows/benchmarks.yml").exists())
+        self.assertNotRegex((project / "justfile").read_text(), r"(?m)^depot-benchmark\s*:")
+        for path in (project / ".depot/workflows").glob("*.y*ml"):
+            workflow = yaml.safe_load(path.read_text())
+            for job in workflow["jobs"].values():
+                self.assertNotIn("benchmarks.yml", job.get("uses", ""))
+                for step in job.get("steps", []):
+                    command = step.get("run", "")
+                    with self.subTest(workflow=path.name, step=step.get("name")):
+                        self.assertNotRegex(command, r"\bjust\s+benchmark(?:-run)?(?=\s|$)")
+                        self.assertNotRegex(command, r"\bpython[0-9.]*\s+-m\s+benchmarks\.run\b")
 
-    def measure_arguments(self, *, event, mode="loopback", baseline="", case="all", cache="linux-drop-caches"):
-        measure = next(step for step in self.workflow()["jobs"]["benchmark"]["steps"] if step.get("name") == "Measure copies")
-        script = 'just() { printf "%s\\n" "$@"; }\n' + SHA256SUM_STUB + measure["run"]
-        environment = {**os.environ, "BENCHMARK_EVENT": event, "BENCHMARK_MODE": mode, "SELECTED_CASE": case, "SELECTED_CACHE": cache, "RUNNER_TEMP": "/tmp", "RCP_BENCH_BASELINE_BIN": baseline}
-        result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10, check=True)
-        arguments = result.stdout.splitlines()
-        self.assertEqual(arguments[0], "benchmark-run")
-        return arguments
-
-    def test_hash_fixture_consumes_pipeline_input_under_pipefail(self):
-        for arguments in [[], ["-"], ["-b"], ["--tag"], ["-z"], ["--"], ["--", "-"], ["file", "-"]]:
-            with self.subTest(arguments=arguments):
-                script = SHA256SUM_STUB + "set -o pipefail\nprintf '%4194304s' '' | sha256sum \"$@\"\n"
-                result = subprocess.run(["bash", "-c", script, "fixture", *arguments], capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "0" * 64 + "  -\n")
-
-    def test_hash_fixture_file_operands_do_not_read_stdin(self):
-        for arguments in [["file"], ["-b", "file"], ["--", "-named-file"]]:
-            with self.subTest(arguments=arguments):
-                script = SHA256SUM_STUB + 'sha256sum "$@"\n'
-                with subprocess.Popen(["bash", "-c", script, "fixture", *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.communicate()
-                        self.fail("file-only hashing fixture attempted to drain held-open stdin")
-                    stdout, stderr = process.communicate()
-                    self.assertEqual(process.returncode, 0, stderr)
-                    self.assertEqual(stdout, "0" * 64 + "  -\n")
-
-    def values(self, arguments, option):
-        return [arguments[index + 1] for index, item in enumerate(arguments) if item == option]
-
-    def test_pr_smoke_checks_balance_each_mode_with_baseline(self):
-        for mode, repetitions in (("local", "5"), ("loopback", "4")):
-            with self.subTest(mode=mode):
-                arguments = self.measure_arguments(event="pull_request", mode=mode, baseline="/tmp/base-binaries")
-                self.assertEqual(self.values(arguments, "--repetitions"), [repetitions])
-                self.assertEqual(self.values(arguments, "--baseline-bin-dir"), ["/tmp/base-binaries"])
-                self.assertEqual(self.values(arguments, "--purpose"), ["smoke"])
-                self.assertEqual(self.values(arguments, "--cache"), ["source-warm"])
-                self.assertEqual(self.values(arguments, "--mode"), [mode])
-
-    def test_main_push_is_only_a_smoke_check(self):
-        arguments = self.measure_arguments(event="push")
-        self.assertEqual(self.values(arguments, "--purpose"), ["smoke"])
-        self.assertEqual(self.values(arguments, "--case"), ["tiny-10k", "medium-4k", "large-100"])
-        self.assertNotIn("--baseline-bin-dir", arguments)
-
-    def test_transport_profile_is_supplied_only_for_loopback(self):
-        for mode in ("local", "loopback"):
-            with self.subTest(mode=mode):
-                arguments = self.measure_arguments(event="schedule", mode=mode)
-                self.assertEqual(self.values(arguments, "--ssh-transport-profile"), ["0" * 64] if mode == "loopback" else [])
-
-    def test_scheduled_performance_runs_balance_each_mode(self):
-        for mode, repetitions in (("local", "4"), ("loopback", "3")):
-            with self.subTest(mode=mode):
-                arguments = self.measure_arguments(event="schedule", mode=mode)
-                self.assertEqual(self.values(arguments, "--repetitions"), [repetitions])
-                self.assertEqual(self.values(arguments, "--purpose"), ["performance"])
-                self.assertEqual(self.values(arguments, "--cache"), ["linux-drop-caches"])
-                self.assertEqual(self.values(arguments, "--case"), ["tiny-1m", "medium-128k", "large-120"])
-                self.assertEqual(self.values(arguments, "--timeout"), ["1200"])
-
-    def test_manual_performance_run_honors_case_and_cache(self):
-        arguments = self.measure_arguments(event="workflow_dispatch", mode="local", case="large-120", cache="source-warm")
-        self.assertEqual(self.values(arguments, "--case"), ["large-120"])
-        self.assertEqual(self.values(arguments, "--cache"), ["source-warm"])
-        self.assertEqual(self.values(arguments, "--purpose"), ["performance"])
-
-    def test_history_attempts_both_modes_and_dispatches_after_partial_failure(self):
-        history = self.workflow()["jobs"]["history"]
-        publish = next(step for step in history["steps"] if step.get("id") == "publish")
-        dispatch = next(step for step in history["steps"] if step.get("name") == "Request dashboard update")
-        self.assertEqual(dispatch["if"], "always() && steps.publish.outputs.published == 'true'")
-        for failed_mode in ("local", "loopback"):
-            with self.subTest(failed_mode=failed_mode), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                for mode in ("local", "loopback"):
-                    result = root / "downloaded-results" / f"benchmark-results-{mode}" / "results.json"
-                    result.parent.mkdir(parents=True)
-                    result.write_text("{}")
-                script = 'gh() { :; }\npython3() { printf "%s\\n" "$*" >> "$ATTEMPTS"; [[ "$*" != *"benchmark-results-$FAILED_MODE/"* ]]; }\n' + publish["run"]
-                environment = {**os.environ, "GITHUB_OUTPUT": str(root / "output"), "GITHUB_REPOSITORY": "test/repo", "ATTEMPTS": str(root / "attempts"), "FAILED_MODE": failed_mode}
-                result = subprocess.run(["bash", "-c", script], cwd=root, env=environment, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertEqual(len((root / "attempts").read_text().splitlines()), 2)
-                self.assertEqual((root / "output").read_text(), "published=true\n")
-
-    def test_history_publishes_from_checkout_without_origin(self):
-        history = self.workflow()["jobs"]["history"]
-        publish = next(step for step in history["steps"] if step.get("id") == "publish")
-        with tempfile.TemporaryDirectory(prefix="rcp-workflow-publish-") as directory:
-            root = Path(directory)
-            checkout = root / "checkout"
-            remote = root / "history.git"
-            environment = {
-                **os.environ,
-                "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
-                "GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_ALLOW_PROTOCOL": "file",
-                "GITHUB_OUTPUT": str(root / "output"),
-                "GITHUB_REPOSITORY": "test/repo",
-                "GH_TOKEN": "test-only-token",
-                "AUTH_SETUP": str(root / "auth-setup"),
-            }
-
-            def git(*arguments):
-                return subprocess.run(
-                    ["git", *arguments], env=environment,
-                    capture_output=True, text=True, check=True, timeout=10,
-                )
-
-            git("init", "--quiet", str(checkout))
-            git("init", "--quiet", "--bare", str(remote))
-            git("config", "--global", f"url.{remote.as_uri()}.insteadOf", "https://github.com/test/repo.git")
-            self.assertEqual(git("-C", str(checkout), "remote").stdout, "")
-            records = [publication_result(character * 32) for character in ("1", "2")]
-            for mode, record in zip(("local", "loopback"), records):
-                path = checkout / "downloaded-results" / f"benchmark-results-{mode}" / "results.json"
-                path.parent.mkdir(parents=True)
-                path.write_text(json.dumps(record))
-            script = (
-                'gh() { [[ "$*" == "auth setup-git --hostname github.com" && "$GH_TOKEN" == "test-only-token" ]] || return 1; '
-                'printf "configured\\n" > "$AUTH_SETUP"; }\n'
-            ) + publish["run"]
-            completed = subprocess.run(
-                ["bash", "-c", script], cwd=checkout, env=environment,
-                capture_output=True, text=True, timeout=25,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(publish["env"]["GH_TOKEN"], "${{ github.token }}")
-            self.assertEqual((root / "auth-setup").read_text(), "configured\n")
-            self.assertEqual((root / "output").read_text(), "published=true\n")
-            for record in records:
-                stored = git("-C", str(remote), "show", f"benchmark-history:runs/{record['run_id']}.json")
-                self.assertEqual(json.loads(stored.stdout), record)
-            self.assertEqual(git("-C", str(checkout), "remote").stdout, "")
-
-    def test_each_mode_keeps_a_distinct_artifact(self):
-        job = self.workflow()["jobs"]["benchmark"]
-        self.assertEqual(job["strategy"]["matrix"]["mode"], ["local", "loopback"])
-        upload = next(step for step in job["steps"] if step.get("name") == "Upload measurements and logs")
-        self.assertEqual(upload["with"]["name"], "benchmark-results-${{ matrix.mode }}")
-        history = self.workflow()["jobs"]["history"]
-        self.assertNotIn("'push'", history["if"])
-        download = next(step for step in history["steps"] if step.get("id") == "measurements")
-        self.assertEqual(download["with"]["pattern"], "benchmark-results-*")
-        self.assertNotIn("merge-multiple", download["with"])
+    def test_depot_build_and_test_jobs_remain_available(self):
+        project = Path(__file__).resolve().parent.parent
+        workflow = yaml.load((project / ".depot/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertIn("workflow_dispatch", workflow["on"])
+        jobs = workflow["jobs"]
+        expected = {"lint": "just lint", "doc": "just doc", "test": "just test --no-run",
+                    "doctest": "just doctest", "test-release": "just test-release --no-run",
+                    "doctest-release": "just doctest-release", "docker-test": "just docker-up",
+                    "docker-chaos-test": "just docker-up"}
+        for job, command in expected.items():
+            with self.subTest(job=job):
+                self.assertIn(command, [step.get("run") for step in jobs[job]["steps"]])
+        recipes = set(re.findall(r"(?m)^([a-z][a-z-]*)(?:[ :])", (project / "justfile").read_text()))
+        self.assertTrue({"benchmark", "benchmark-run", "benchmark-test", "benchmark-report",
+                         "depot-ci", "depot-test", "depot-test-release", "depot-docker-test"} <= recipes)
 
     def test_pages_packages_rendered_history_for_direct_pinned_upload(self):
         project = Path(__file__).resolve().parent.parent
