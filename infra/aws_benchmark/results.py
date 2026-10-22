@@ -5,7 +5,6 @@ import copy
 import html
 import io
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -14,13 +13,13 @@ import struct
 import tempfile
 import zipfile
 
-from benchmarks import changes, operations, pairs, report
+from benchmarks import changes, measurements, operations, pairs, report
 from benchmarks.strict_json import parse_json
 from benchmarks.verification import verification_label
 from . import identity
 from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
                      digest, measurement_contract, verification_contract, verification_contracts, require, utc,
-                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_worker_reserve, validate_durable_window, validate_request)
+                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_plan_contract, durable_worker_reserve, validate_durable_window, validate_request)
 
 
 MAX_METADATA = 1024 * 1024
@@ -168,8 +167,7 @@ def historical_inputs(receipt, expected):
     require(isinstance(window, dict), "unexpected window fields")
     if "protocol" in window:
         # the versioned plan is part of the historical receipt, never local clock time
-        validate_durable_window(window, now=utc(window.get("launch_at", "")), minimum=0)
-        validate_request(request, window)
+        validate_durable_window(window, now=utc(window.get("launch_at", "")), minimum=0, exact=False)
     else:
         require(set(window) == {"run", "baseline", "candidate", "suite", "opens", "deadline"},
                 "unexpected window fields")
@@ -192,6 +190,9 @@ def historical_inputs(receipt, expected):
             "unexpected binary digest map")
     require(all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                 for value in hashes.values()), "binary digests must be lowercase SHA-256")
+    if "protocol" in window:
+        recorded = durable_plan_contract(window["plan"], exact=False)
+        require(set(hashes) == set(recorded["binaries"]), "unexpected recorded durable binary manifest")
     return window, request
 
 
@@ -301,13 +302,15 @@ def validate_qualification(evidence, result, policy):
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
     if receipt["window"].get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
         window = receipt["window"]
-        required = durable_worker_reserve(window["plan"])
+        validate_durable_window(window, now=utc(window["launch_at"]), minimum=0, exact=True)
+        validate_request(receipt["request"], window)
+        required = durable_worker_reserve(window["plan"], exact=True)
         admission = worker.get("admission", {})
         remaining = admission.get("remaining_seconds")
         require(worker.get("guest_instance_id") == window["instance_id"] == instance.get("instance_id"),
                 "durable worker instance binding differs from controller")
-        require(admission.get("required_seconds") == required and type(remaining) in (int, float)
-                and math.isfinite(remaining) and remaining >= required,
+        require(admission.get("required_seconds") == required and measurements.nonnegative(remaining)
+                and required <= remaining <= window["runtime_seconds"],
                 "durable admission does not prove the disclosed workload headroom")
     contract = measurement_contract(expected["suite"])
     validate_recorded_verification(result["context"], expected["suite"], exact=True)
@@ -364,11 +367,10 @@ def derived_record(evidence, raw):
         if worker["window"]["protocol"] == DIRECT_PROTOCOL:
             provenance["timing"].update({key: worker["window"][key]
                                         for key in ("attempt_id", "attempt_started_at")})
-            provenance["timing"].update(runtime_origin="attempt_started_at",
-                                        outer_deadline_role="control reconciliation horizon; not instance expiry")
-        else:
-            provenance["timing"]["runtime_origin"] = "launch_at"
-        provenance["timing"]["basis"] = "projection with explicit headroom; not a measured complete run"
+            provenance["timing"]["outer_deadline_role"] = "control reconciliation horizon; not instance expiry"
+        # supervisor observations remain verbatim; older missing observations stay unknown
+        provenance["timing"].update(runtime_origin=copy.deepcopy(worker.get("runtime_origin")),
+                                    basis=copy.deepcopy(worker.get("timing_basis")))
     result["context"]["aws_provenance"] = provenance
     for item in result["summaries"]:
         item["series_id"] = digest(encoded([SERIES_CONTRACT, item["series_id"],

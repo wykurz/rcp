@@ -1,6 +1,7 @@
 """Offline direct-allocation and independent-janitor regressions; no AWS calls."""
 
 import copy
+import base64
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -66,9 +67,10 @@ class Cloud:
             {"VersionNumber": 9, "LaunchTemplateData": launch_data(self.config)}]}
         self.api["ec2"].run_instances.side_effect = self.run_instances
         self.api["ec2"].terminate_instances.side_effect = lambda **kw: self.events.append(("terminate", kw["InstanceIds"]))
-        self.api["ec2"].describe_volumes.side_effect = ApiError("InvalidVolume.NotFound")
+        self.api["ec2"].describe_volumes.side_effect = self.describe_volumes
         self.api["scheduler"].get_schedule.side_effect = self.get_schedule
         self.api["scheduler"].create_schedule.side_effect = self.create_schedule
+        self.api["s3"].head_object.side_effect = self.head_object
         self.api["s3"].get_object.side_effect = self.get_object
         self.api["s3"].put_object.side_effect = self.put_object
         self.service = durable_aws.Service(self.api, self.config, now=lambda: self.now)
@@ -116,7 +118,7 @@ class Cloud:
     def get_schedule(self, **kw):
         key = (kw["GroupName"], kw["Name"])
         if key not in self.schedules:
-            raise ApiError("ResourceNotFoundException")
+            raise ApiError("ResourceNotFoundException", status=400)
         return copy.deepcopy(self.schedules[key])
 
     def create_schedule(self, **kw):
@@ -127,6 +129,19 @@ class Cloud:
         if self.schedule_error:
             raise self.schedule_error
         return {}
+
+    def describe_volumes(self, **kw):
+        if "VolumeIds" in kw:
+            raise ApiError("InvalidVolume.NotFound", status=400)
+        return {"Volumes": []}
+
+    def head_object(self, **kw):
+        if self.get_hook:
+            hook, self.get_hook = self.get_hook, None
+            hook()
+        data = self.objects[kw["Key"]]
+        return dict(ContentLength=len(data), ChecksumType="FULL_OBJECT",
+                    ChecksumSHA256=base64.b64encode(bytes.fromhex(common.digest(data))).decode("ascii"))
 
     def get_object(self, **kw):
         if self.get_hook:
@@ -245,17 +260,18 @@ class LaunchTests(unittest.TestCase):
         c.launch_error, c.allocate_on_error = TimeoutError(), True
         c.coordinator()
         c.service.watchdog()
-        self.assertIn(("terminate", [INSTANCE]), c.events)
+        self.assertNotIn(("terminate", [INSTANCE]), c.events)
         c.coordinator()
         self.assertEqual(len(c.launches), 1)
-        self.assertFalse(c.state["worker_published"])
+        self.assertTrue(c.state["worker_published"])
+        self.assertEqual(c.state["launch_outcome"], "accepted")
 
     def test_process_death_after_intent_is_not_replayed(self):
         c = Cloud()
         c.launch_error = ProcessDeath()
         with self.assertRaises(ProcessDeath):
             c.coordinator()
-        c.now += timedelta(seconds=91)
+        c.now += timedelta(seconds=durable.LAUNCH_ACK_SECONDS + 1)
         c.service.watchdog()
         c.coordinator()
         self.assertEqual(len(c.launches), 1)
@@ -265,15 +281,13 @@ class LaunchTests(unittest.TestCase):
         for guard in (None, dict(namespace="benchmark", healthy=True, observed_at=common.timestamp(NOW - timedelta(seconds=121)))):
             c = Cloud()
             c.guard = guard
-            with self.assertRaises(ValueError):
-                c.coordinator()
+            self.assertEqual(c.handler("coordinator")["state"], "wait")
             self.assertEqual(c.launches, [])
 
     def test_guard_must_still_be_fresh_after_artifact_reads(self):
         c = Cloud()
         c.get_hook = lambda: setattr(c, "now", NOW + timedelta(seconds=121))
-        with self.assertRaisesRegex(ValueError, "janitor scan is stale"):
-            c.coordinator()
+        self.assertEqual(c.handler("coordinator")["state"], "wait")
         self.assertEqual(c.launches, [])
 
     def test_watchdog_progress_during_artifact_reads_defers_without_failure(self):
@@ -296,11 +310,11 @@ class LaunchTests(unittest.TestCase):
     def test_delayed_intent_write_cannot_launch_after_freshness_expires(self):
         c = Cloud()
         c.update_hook = lambda: setattr(c, "now", NOW + timedelta(seconds=121))
-        with self.assertRaisesRegex(ValueError, "expired after launch intent"):
-            c.coordinator()
+        self.assertEqual(c.coordinator()["state"], "wait")
         self.assertEqual(c.launches, [])
-        self.assertTrue(c.state["allocation_consumed"])
-        self.assertEqual(c.state["phase"], "launching")
+        self.assertFalse(c.state["allocation_consumed"])
+        self.assertEqual(c.state["launch_outcome"], "not-sent")
+        self.assertEqual(c.state["phase"], "armed")
 
     def test_candidate_binary_mismatch_never_launches(self):
         c = Cloud()
@@ -350,7 +364,7 @@ class JanitorTests(unittest.TestCase):
         c = Cloud()
         c.coordinator()
         binding = durable.bind(c.request, c.instances[0], c.state["attempt"])
-        schedule = c.service.schedule(c.request, binding=binding)
+        schedule = c.service.schedule(binding=binding)
         schedule["ScheduleExpression"] = "at(2099-01-01T00:00:00)"
         c.schedules[(schedule["GroupName"], schedule["Name"])] = schedule
         with self.assertRaises(ValueError):
@@ -439,13 +453,13 @@ class JanitorTests(unittest.TestCase):
             c.service.watchdog()
         c.api["dynamodb"].put_item.assert_not_called()
 
-    def test_admission_disabled_does_not_disable_janitor(self):
+    def test_runtime_disabled_does_not_disable_janitor(self):
         c = Cloud()
         environment = {"RCP_DURABLE_" + key.upper(): getattr(c.config, key) for key in c.config.__dataclass_fields__}
         with patch.dict(os.environ, environment | {"RCP_DURABLE_ENABLED": "false"}):
             self.assertEqual(durable_aws.Configuration.environment(), c.config)
             with self.assertRaisesRegex(ValueError, "disabled"):
-                durable_aws.Configuration.environment(admission=True)
+                durable_aws.Configuration.environment(runtime=True)
 
 
 class CleanupTests(unittest.TestCase):
@@ -480,8 +494,11 @@ class CleanupTests(unittest.TestCase):
                     c.api["ec2"].describe_volumes.return_value = {"Volumes": [{"VolumeId": ROOT}]}
                 else:
                     c.api["ec2"].describe_volumes.side_effect = TimeoutError()
-                with self.assertRaises((ValueError, TimeoutError)):
-                    c.service.watchdog()
+                if kind == "unreadable":
+                    self.assertEqual(c.service.watchdog()["state"], "deferred")
+                else:
+                    with self.assertRaises(ValueError):
+                        c.service.watchdog()
                 self.assertIsNone(c.state["cleanup"])
 
     def test_actual_root_absence_completes_without_releasing_lease(self):

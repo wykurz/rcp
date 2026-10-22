@@ -41,7 +41,7 @@ def request(window):
 @contextmanager
 def durable_fixture():
     with worker_fixture("bulk-1g-metadata") as (root, cloud, measure, stop):
-        lease = durable_window(datetime.now(timezone.utc) - timedelta(seconds=90))
+        lease = direct_window(datetime.now(timezone.utc) - timedelta(seconds=90))
         cloud.objects[common.WINDOW_KEY] = json.dumps(lease).encode()
         cloud.objects[common.REQUEST_KEY] = json.dumps(request(lease)).encode()
         (root / "benchmarks").mkdir()
@@ -51,7 +51,7 @@ def durable_fixture():
              patch.object(worker, "DURABLE_STATE", root / "persistent"), \
              patch.object(worker, "instance_identity", return_value=lease["instance_id"]) as identity, \
              patch.object(worker.large_storage, "prepare", return_value={}) as prepare:
-            clock["wall"] = common.utc(lease["launch_at"]).timestamp() + 90
+            clock["wall"] = common.utc(lease["attempt_started_at"]).timestamp() + 90
             yield root, cloud, measure, clock, identity, prepare
 
 
@@ -65,13 +65,13 @@ class WorkerProtocolTemplateTests(unittest.TestCase):
         template = yaml.safe_load((Path(__file__).with_name("stack.yaml")).read_text())
         parameter = template["Parameters"]["WorkerProtocol"]
         self.assertEqual(parameter["Default"], "operator-window")
-        self.assertEqual(parameter["AllowedValues"], ["operator-window", "durable", "direct"])
+        self.assertEqual(parameter["AllowedValues"], ["operator-window", "direct"])
         data = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
         self.assertEqual(template["Conditions"]["DirectWorker"], {"Fn::Equals": [{"Ref": "WorkerProtocol"}, "direct"]})
         self.assertEqual(data["InstanceInitiatedShutdownBehavior"],
                          {"Fn::If": ["DirectWorker", "terminate", {"Ref": "AWS::NoValue"}]})
         user_data = data["UserData"]["Fn::Base64"]["Fn::Sub"]
-        for protocol, limit in ((parameter["Default"], 3900), ("durable", 10800), ("direct", 10800)):
+        for protocol, limit in ((parameter["Default"], 3900), ("direct", 10800)):
             with self.subTest(protocol=protocol):
                 script = user_data.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", "bucket").replace(
                     "${AWS::Region}", "us-east-1")
@@ -80,12 +80,20 @@ class WorkerProtocolTemplateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 argv = result.stdout.splitlines()
                 self.assertIn(f"--property=RuntimeMaxSec={limit}", argv)
-                self.assertEqual("--durable" in argv, protocol == "durable")
+                self.assertNotIn("--durable", argv)
                 self.assertEqual("--direct" in argv, protocol == "direct")
                 self.assertIn("--property=FailureAction=poweroff", argv)
                 self.assertIn("--property=SuccessAction=poweroff", argv)
                 self.assertIn("--property=KillMode=control-group", argv)
                 self.assertEqual(argv.count("--unit=rcp-supervisor"), 1)
+        self.assertEqual(user_data.count("systemd-run "), 1)
+        for protocol in ("durable", "unknown"):
+            script = user_data.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", "bucket").replace(
+                "${AWS::Region}", "us-east-1")
+            stubs = "systemd-run() { printf 'unexpected launch'; }; systemctl() { exit 99; };\n"
+            result = subprocess.run(["bash", "-c", stubs + script], capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("unexpected launch", result.stdout)
         self.assertEqual(template["Resources"]["WorkerGroup"]["Properties"]["MinSize"], "0")
         self.assertEqual(template["Resources"]["WorkerGroup"]["Properties"]["DesiredCapacity"], "0")
         self.assertEqual(template["Resources"]["WorkerGroup"]["Properties"]["MaxSize"], "0")
@@ -176,7 +184,7 @@ class DurableWindowTests(unittest.TestCase):
 class DurableGuestTests(unittest.TestCase):
     def test_complete_worker_discloses_binding_and_keeps_metadata_copy_contract(self):
         with durable_fixture() as (root, cloud, measure, clock, identity, prepare):
-            worker.run(cloud.api["s3"], "bucket", durable=True)
+            worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertTrue(metadata["status"]["success"])
             self.assertEqual(metadata["guest_instance_id"], metadata["window"]["instance_id"])
@@ -198,7 +206,7 @@ class DurableGuestTests(unittest.TestCase):
             with self.subTest(remaining=remaining), durable_fixture() as (_, cloud, measure, clock, _, prepare):
                 deadline = common.utc(json.loads(cloud.objects[common.WINDOW_KEY])["deadline"]).timestamp()
                 advance(clock, deadline - remaining - clock["wall"])
-                worker.run(cloud.api["s3"], "bucket", durable=True)
+                worker.run(cloud.api["s3"], "bucket", direct=True)
                 metadata, _ = report(cloud)
                 self.assertEqual(metadata["admission"]["accepted"], remaining == 9852)
                 self.assertEqual(prepare.call_count, int(remaining == 9852))
@@ -213,7 +221,7 @@ class DurableGuestTests(unittest.TestCase):
                     advance(clock, 559)
                 return value
             cloud.api["s3"].get_object.side_effect = get
-            worker.run(cloud.api["s3"], "bucket", durable=True)
+            worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertFalse(metadata["admission"]["accepted"])
             self.assertEqual(metadata["admission"]["remaining_seconds"], 9851)
@@ -222,9 +230,9 @@ class DurableGuestTests(unittest.TestCase):
 
     def test_reboot_or_reentry_cannot_replay_a_consumed_assignment(self):
         with durable_fixture() as (root, cloud, measure, clock, _, prepare):
-            worker.run(cloud.api["s3"], "bucket", durable=True)
+            worker.run(cloud.api["s3"], "bucket", direct=True)
             marker = (root / "persistent/durable-started.json").read_bytes()
-            worker.run(cloud.api["s3"], "bucket", durable=True)
+            worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertFalse(metadata["status"]["success"])
             self.assertEqual(metadata["status"]["error"]["type"], "FileExistsError")
@@ -237,7 +245,7 @@ class DurableGuestTests(unittest.TestCase):
             identity.return_value = "i-" + "2" * 17
             with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)), \
                  self.assertRaises(TimeoutError):
-                worker.run(cloud.api["s3"], "bucket", durable=True)
+                worker.run(cloud.api["s3"], "bucket", direct=True)
             self.assertFalse((root / "persistent").exists())
             self.assertNotIn(common.STATUS_KEY, cloud.objects)
             self.assertNotIn(common.RESULTS_KEY, cloud.objects)
@@ -258,7 +266,7 @@ class DurableGuestTests(unittest.TestCase):
                 if clock["wall"] - started > 60:
                     cloud.objects[common.WINDOW_KEY] = matching
             with patch.object(worker.time, "sleep", side_effect=wait):
-                worker.run(cloud.api["s3"], "bucket", durable=True)
+                worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertTrue(metadata["status"]["success"])
             self.assertEqual(metadata["admission"]["remaining_seconds"], 10347)
@@ -280,18 +288,79 @@ class DurableGuestTests(unittest.TestCase):
                 return original(**kwargs)
             cloud.api["s3"].get_object.side_effect = get
             with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)):
-                worker.run(cloud.api["s3"], "bucket", durable=True)
+                worker.run(cloud.api["s3"], "bucket", direct=True)
             self.assertEqual(len(calls), 2)
             self.assertTrue(report(cloud)[0]["status"]["success"])
             prepare.assert_called_once()
             measure.assert_called_once()
+
+    def test_fixed_key_missing_403_can_arrive_late_without_a_fresh_deadline(self):
+        for code in ("AccessDenied", "403", "NoSuchKey", "404"):
+            with self.subTest(code=code), durable_fixture() as (_, cloud, measure, clock, _, prepare):
+                class Missing(Exception):
+                    response = {"Error": {"Code": code}}
+                original, started = cloud.get, clock["wall"]
+                def get(**kwargs):
+                    if kwargs["Key"] == common.WINDOW_KEY and clock["wall"] - started < 63:
+                        raise Missing()
+                    return original(**kwargs)
+                cloud.api["s3"].get_object.side_effect = get
+                with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)):
+                    worker.run(cloud.api["s3"], "bucket", direct=True)
+                metadata, _ = report(cloud)
+                self.assertTrue(metadata["status"]["success"])
+                self.assertEqual(metadata["admission"]["remaining_seconds"], 10347)
+                self.assertEqual(worker.signal.setitimer.call_args_list[0].args,
+                                 (signal.ITIMER_REAL, worker.ASSIGNMENT_WAIT_SECONDS))
+                prepare.assert_called_once()
+                measure.assert_called_once()
+
+    def test_persistent_missing_403_exhausts_original_bootstrap_without_unbound_work(self):
+        for code in ("AccessDenied", "403", "NoSuchKey", "404"):
+            with self.subTest(code=code), durable_fixture() as (root, cloud, measure, clock, _, prepare):
+                class Missing(Exception):
+                    response = {"Error": {"Code": code}}
+                started = clock["wall"]
+                cloud.api["s3"].get_object.side_effect = Missing()
+                with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)), \
+                     self.assertRaises(TimeoutError):
+                    worker.run(cloud.api["s3"], "bucket", direct=True)
+                self.assertLessEqual(clock["wall"] - started, worker.ASSIGNMENT_WAIT_SECONDS)
+                self.assertEqual(worker.signal.setitimer.call_count, 1)
+                self.assertFalse((root / "persistent").exists())
+                self.assertNotIn(common.STATUS_KEY, cloud.objects)
+                self.assertNotIn(common.RESULTS_KEY, cloud.objects)
+                prepare.assert_not_called()
+                measure.assert_not_called()
+                self.assertTrue(all(call.kwargs["Key"] == common.WINDOW_KEY
+                                    for call in cloud.api["s3"].get_object.call_args_list))
+
+    def test_other_window_errors_are_not_treated_as_missing(self):
+        with durable_fixture() as (_, cloud, measure, clock, _, prepare):
+            class InvalidCredentials(Exception):
+                response = {"Error": {"Code": "InvalidAccessKeyId"}}
+            cloud.api["s3"].get_object.side_effect = InvalidCredentials()
+            with patch.object(worker.time, "sleep") as sleep, self.assertRaises(InvalidCredentials):
+                worker.run(cloud.api["s3"], "bucket", direct=True)
+            sleep.assert_not_called()
+            self.assertEqual(cloud.api["s3"].get_object.call_count, 1)
+            prepare.assert_not_called()
+            measure.assert_not_called()
+
+    def test_historical_live_flag_is_rejected_before_client_creation(self):
+        with patch("sys.argv", ["worker", "--region", "us-east-1", "--bucket", "bucket", "--durable"]), \
+             patch.object(worker, "clients") as clients, patch("sys.stderr", io.StringIO()), \
+             self.assertRaises(SystemExit) as error:
+            worker.main()
+        self.assertEqual(error.exception.code, 2)
+        clients.assert_not_called()
 
     def test_same_revision_different_bytes_never_creates_one_shot_marker(self):
         with durable_fixture() as (root, cloud, measure, clock, _, prepare):
             value = json.loads(cloud.objects[common.REQUEST_KEY])
             value["sha256"]["candidate/filegen"] = "e" * 64
             cloud.objects[common.REQUEST_KEY] = json.dumps(value).encode()
-            worker.run(cloud.api["s3"], "bucket", durable=True)
+            worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertFalse(metadata["status"]["success"])
             self.assertEqual(metadata["status"]["error"]["message"], "A/A binary digests differ")
@@ -305,7 +374,7 @@ class DurableGuestTests(unittest.TestCase):
             value["runtime_seconds"] = 10801
             cloud.objects[common.WINDOW_KEY] = json.dumps(value).encode()
             with self.assertRaises(ValueError):
-                worker.run(cloud.api["s3"], "bucket", durable=True)
+                worker.run(cloud.api["s3"], "bucket", direct=True)
             self.assertEqual(worker.signal.setitimer.call_count, 1)
             prepare.assert_not_called()
             measure.assert_not_called()
@@ -382,7 +451,9 @@ def durable_bundle(root, *, direct=False):
     metadata = dict(window=lease, request=value,
         status={key: val for key, val in status.items() if key != "sha256"},
         harness_revision="f" * 40, admission=dict(accepted=True, required_seconds=9852, remaining_seconds=10410),
-        guest_instance_id=lease["instance_id"], service_returncode=0)
+        guest_instance_id=lease["instance_id"], service_returncode=0,
+        timing_basis="projected workload with explicit headroom; not a measured complete run",
+        runtime_origin="attempt_started_at" if direct else "launch_at")
     data = archive([("worker.json", results.encoded(metadata)),
                     (results.RESULT, results.encoded(measurement(expected)))])
     status["sha256"] = common.digest(data)
@@ -442,11 +513,6 @@ def direct_window(attempt=NOW, delay=60):
 @contextmanager
 def direct_fixture():
     with durable_fixture() as values:
-        root, cloud, measure, clock, identity, prepare = values
-        old = json.loads(cloud.objects[common.WINDOW_KEY])
-        value = direct_window(common.utc(old["launch_at"]))
-        cloud.objects[common.WINDOW_KEY] = json.dumps(value).encode()
-        cloud.objects[common.REQUEST_KEY] = json.dumps(request(value)).encode()
         yield values
 
 
@@ -543,6 +609,8 @@ class DirectGuestTests(unittest.TestCase):
 
     def test_direct_launch_never_accepts_historical_launch_clock_assignment(self):
         with durable_fixture() as (root, cloud, measure, clock, _, prepare):
+            lease = durable_window(datetime.fromtimestamp(clock["wall"] - 90, timezone.utc))
+            cloud.objects[common.WINDOW_KEY] = json.dumps(lease).encode()
             with patch.object(worker.time, "sleep", side_effect=lambda seconds: advance(clock, seconds)), \
                  self.assertRaises(TimeoutError):
                 worker.run(cloud.api["s3"], "bucket", direct=True)

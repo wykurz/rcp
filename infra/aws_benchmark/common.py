@@ -20,10 +20,7 @@ DURABLE_PROTOCOL = "rcp-durable-v1"
 DIRECT_PROTOCOL = "rcp-direct-v1"
 DURABLE_MAX_RUNTIME = 10800
 DURABLE_MAX_PROVISIONING = 43200
-# projected work, not a measured complete run; preserve this version in every receipt
-DURABLE_PLAN = dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
-                    report_seconds=180, safety_factor=3, boot_reserve_seconds=300,
-                    shutdown_reserve_seconds=300)
+DIRECT_MAX_ATTEMPTS = 720
 MAX_BINARY = 128 * 1024 * 1024
 MAX_RESULT = 64 * 1024 * 1024
 INSTANCE_TYPE = "c5d.24xlarge"
@@ -35,6 +32,18 @@ PENDING = "pending"
 COMPLETED = "completed"
 BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
+# append versions; recorded caps and manifests must not alias current admission globals
+_RECORDED_DURABLE_CONTRACTS = {
+    "bulk-metadata-plan-v1": dict(
+        plan=dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
+                  report_seconds=180, safety_factor=3, boot_reserve_seconds=300,
+                  shutdown_reserve_seconds=300),
+        max_runtime=10800, max_provisioning=43200, max_attempts=720,
+        binaries=tuple(f"{role}/{name}" for role in ("baseline", "candidate")
+                       for name in ("rcp", "rcpd", "filegen"))),
+}
+# projected work, not a measured complete run; preserve its version in every receipt
+DURABLE_PLAN = dict(_RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]["plan"])
 SUSPEND = {"AZRebalance", "InstanceRefresh", "HealthCheck", "ReplaceUnhealthy", "AlarmNotification"}
 
 # append versions when cloud tuning changes; never infer old settings from local defaults
@@ -139,15 +148,38 @@ def validate_identity(value):
         require(value["baseline"] == value["candidate"], "A/A pilot requires identical revisions")
 
 
-def durable_worker_reserve(plan):
-    """Return the disclosed projection plus threefold planning headroom."""
-    require(isinstance(plan, dict) and plan == DURABLE_PLAN, "unknown durable workload plan")
+def durable_plan_contract(plan, *, exact=True):
+    """Resolve a recorded version; current admission remains an explicit stricter check."""
+    require(isinstance(plan, dict) and isinstance(plan.get("version"), str), "unknown durable workload plan")
+    recorded = _RECORDED_DURABLE_CONTRACTS.get(plan["version"])
+    require(recorded is not None and plan == recorded["plan"], "unknown durable workload plan")
     require(all(type(value) is int for key, value in plan.items() if key != "version"),
             "durable plan durations must be integers")
+    contract = {**recorded, "plan": dict(recorded["plan"]), "binaries": tuple(recorded["binaries"])}
+    if exact:
+        require(plan == DURABLE_PLAN, "durable workload plan is not current")
+        contract.update(max_runtime=DURABLE_MAX_RUNTIME, max_provisioning=DURABLE_MAX_PROVISIONING,
+                        max_attempts=DIRECT_MAX_ATTEMPTS, binaries=tuple(BINARIES))
+    return contract
+
+
+def durable_worker_reserve(plan, *, exact=True):
+    """Return the recognized plan's projected work plus its recorded planning headroom."""
+    plan = durable_plan_contract(plan, exact=exact)["plan"]
     return (plan["work_seconds"] + plan["report_seconds"]) * plan["safety_factor"]
 
 
-def validate_durable_window(value, now=None, minimum=RESERVE):
+def validate_attempt_id(run, attempt_id, *, maximum=None):
+    """Return the canonical bounded attempt ordinal shared by tags and windows."""
+    maximum = DIRECT_MAX_ATTEMPTS if maximum is None else maximum
+    require(type(maximum) is int and maximum > 0, "invalid direct attempt bound")
+    require(isinstance(run, str) and isinstance(attempt_id, str), "invalid direct attempt identity")
+    identity = re.fullmatch(re.escape(run) + r"-([1-9][0-9]{0," + str(len(str(maximum)) - 1) + r"})", attempt_id)
+    require(identity is not None and int(identity[1]) <= maximum, "invalid direct attempt identity")
+    return int(identity[1])
+
+
+def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
     """Validate explicit clock origins without reinterpreting historical windows."""
     fields = {"run", "baseline", "candidate", "suite", "opens", "deadline", "protocol",
               "instance_id", "launch_at", "runtime_seconds", "outer_deadline", "request_expires", "plan"}
@@ -162,12 +194,13 @@ def validate_durable_window(value, now=None, minimum=RESERVE):
     require(value["suite"] == "bulk-1g-metadata" and value["baseline"] == value["candidate"],
             "durable qualification requires metadata-only A/A")
     require(re.fullmatch(r"i-[0-9a-f]{17}", value["instance_id"]), "invalid durable instance identity")
-    required = durable_worker_reserve(value["plan"])
+    contract = durable_plan_contract(value["plan"], exact=exact)
+    required = durable_worker_reserve(value["plan"], exact=exact)
     runtime = value["runtime_seconds"]
-    plan = value["plan"]
+    plan = contract["plan"]
     require(type(runtime) is int and
             required + plan["boot_reserve_seconds"] + plan["shutdown_reserve_seconds"]
-            <= runtime <= DURABLE_MAX_RUNTIME, "durable runtime does not fit the disclosed workload plan")
+            <= runtime <= contract["max_runtime"], "durable runtime does not fit the disclosed workload plan")
     try:
         start, launch = utc(value["opens"]), utc(value["launch_at"])
         deadline, outer, expires = (utc(value[key]) for key in ("deadline", "outer_deadline", "request_expires"))
@@ -175,25 +208,24 @@ def validate_durable_window(value, now=None, minimum=RESERVE):
         raise ValidationError("invalid durable window timestamp") from error
     if direct:
         attempt = utc(value["attempt_started_at"])
-        identity = re.fullmatch(re.escape(value["run"]) + r"-([1-9][0-9]{0,2})", value["attempt_id"])
-        require(identity is not None and int(identity[1]) <= 720, "invalid direct attempt identity")
+        validate_attempt_id(value["run"], value["attempt_id"], maximum=contract["max_attempts"])
         require(start == attempt, "direct window must begin at the immutable attempt start")
         require(attempt <= launch <= deadline and launch < expires,
                 "direct launch lies outside the attempt admission interval")
-        require(0 < (expires - attempt).total_seconds() <= DURABLE_MAX_PROVISIONING,
+        require(0 < (expires - attempt).total_seconds() <= contract["max_provisioning"],
                 "direct attempt lies outside the provisioning deadline")
         require(deadline == attempt + timedelta(seconds=runtime - plan["shutdown_reserve_seconds"]),
                 "direct worker deadline differs from fixed attempt runtime")
     else:
         require(start == launch, "durable window must begin at the bound launch time")
-        require(0 < (expires - launch).total_seconds() <= DURABLE_MAX_PROVISIONING,
+        require(0 < (expires - launch).total_seconds() <= contract["max_provisioning"],
                 "instance arrived outside the provisioning deadline")
         require(deadline == launch + timedelta(seconds=runtime - plan["shutdown_reserve_seconds"]),
                 "durable worker deadline differs from launch-bound runtime")
     require(outer == expires + timedelta(seconds=runtime), "durable reconciliation horizon mismatch")
     now = now or datetime.now(timezone.utc)
     require(launch <= now, "durable launch is in the future")
-    require(minimum <= (deadline - now).total_seconds() <= DURABLE_MAX_RUNTIME,
+    require(minimum <= (deadline - now).total_seconds() <= contract["max_runtime"],
             "expired or too short durable worker deadline")
     return deadline
 
@@ -289,7 +321,7 @@ def retryable_io(error):
             or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
             or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
                                     "RequestTimeout", "RequestTimeoutException", "Throttling",
-                                    "ThrottlingException", "RequestLimitExceeded"})
+                                    "ThrottlingException", "RequestLimitExceeded", "ProvisionedThroughputExceededException"})
 
 
 def retry_io(operation, budget, reserve=0, attempts=3):

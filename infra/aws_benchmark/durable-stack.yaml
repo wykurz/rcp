@@ -307,10 +307,10 @@ Resources:
         S3ObjectVersion: {Ref: CodeObjectVersion}
       Timeout: 45
       MemorySize: 256
-      ReservedConcurrentExecutions: {Fn::If: [Admitting, 1, 0]}
+      ReservedConcurrentExecutions: {Fn::If: [Enabled, 1, 0]}
       Environment:
         Variables:
-          RCP_DURABLE_ENABLED: {Fn::If: [Admitting, 'true', 'false']}
+          RCP_DURABLE_ENABLED: {Fn::If: [Enabled, 'true', 'false']}
           RCP_DURABLE_TABLE: {Ref: LeaseTable}
           RCP_DURABLE_REGION: {Ref: AWS::Region}
           RCP_DURABLE_ACCOUNT: {Ref: AWS::AccountId}
@@ -345,7 +345,6 @@ Resources:
       ReservedConcurrentExecutions: {Fn::If: [Enabled, 1, 0]}
       Environment:
         Variables:
-          RCP_DURABLE_ENABLED: {Fn::If: [Admitting, 'true', 'false']}
           RCP_DURABLE_TABLE: {Ref: LeaseTable}
           RCP_DURABLE_REGION: {Ref: AWS::Region}
           RCP_DURABLE_ACCOUNT: {Ref: AWS::AccountId}
@@ -435,6 +434,13 @@ Resources:
               execution_name.$: $$.Execution.Name
             ResultPath: $.observation
             TimeoutSeconds: 50
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.SdkClientException, Lambda.ClientExecutionTimeoutException, Lambda.TooManyRequestsException]
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 6
+                MaxDelaySeconds: 30
+                JitterStrategy: FULL
             Catch:
               - ErrorEquals: [States.ALL]
                 ResultPath: $.error

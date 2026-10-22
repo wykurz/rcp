@@ -6,6 +6,9 @@ credentials, worktree metadata or candidate binaries are included.
 """
 
 import argparse
+import base64
+import csv
+import io
 import hashlib
 from pathlib import Path
 import subprocess
@@ -32,34 +35,65 @@ def source_files(root):
         yield path
 
 
+def install_dependencies(stage, wheels):
+    subprocess.run([sys.executable, "-m", "pip", "--isolated", "install", "--no-compile",
+                    "--require-hashes", "--no-index", "--find-links", str(wheels), "--target", str(stage),
+                    "-r", str(ROOT / "infra/aws_benchmark/requirements.txt")], check=True)
+
+
+def package_files(stage):
+    files = {}
+    for path in sorted(stage.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("SDK package contains a symlink")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(stage)
+        if "__pycache__" in relative.parts or relative.parts[0] == "bin":
+            continue
+        files[relative.as_posix()] = path.read_bytes()
+    # pip records interpreter-specific hashes for rewritten scripts which we do not
+    # ship; regenerate RECORD from the retained members, never from excluded scripts
+    for name in sorted(files):
+        if not name.endswith(".dist-info/RECORD"):
+            continue
+        rows = []
+        for row in csv.reader(io.StringIO(files[name].decode("utf-8"))):
+            if len(row) != 3:
+                raise ValueError("malformed installed wheel RECORD")
+            member = row[0]
+            if member not in files or member == name:
+                continue
+            content = files[member]
+            digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+            rows.append((member, "sha256=" + digest, str(len(content))))
+        rows.append((name, "", ""))
+        normalized = io.StringIO(newline="")
+        csv.writer(normalized, lineterminator="\n").writerows(sorted(rows))
+        files[name] = normalized.getvalue().encode()
+    return files
+
+
 def package(output, wheels):
     output, wheels = Path(output), Path(wheels).resolve(strict=True)
     if output.exists() or not output.parent.is_dir():
         raise ValueError("output must be new and its parent must already exist")
     with tempfile.TemporaryDirectory(prefix="rcp-lambda-", dir=output.parent) as directory:
         stage = Path(directory)
-        subprocess.run([sys.executable, "-m", "pip", "--isolated", "install", "--no-compile",
-                        "--require-hashes", "--no-index", "--find-links", str(wheels), "--target", str(stage),
-                        "-r", str(ROOT / "infra/aws_benchmark/requirements.txt")], check=True)
+        install_dependencies(stage, wheels)
         for path in source_files(ROOT):
             destination = stage / path.relative_to(ROOT)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(path.read_bytes())
         # make the repository namespace importable directly from the Lambda ZIP
         (stage / "infra/__init__.py").write_text("", encoding="utf-8")
+        members = package_files(stage)
         with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(stage.rglob("*")):
-                if path.is_symlink():
-                    raise ValueError("SDK package contains a symlink")
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(stage)
-                if "__pycache__" in relative.parts or relative.parts[0] == "bin":
-                    continue
-                info = zipfile.ZipInfo(relative.as_posix(), date_time=(2020, 1, 1, 0, 0, 0))
+            for name, data in members.items():
+                info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o100644 << 16
-                archive.writestr(info, path.read_bytes())
+                archive.writestr(info, data)
     print("sha256=" + hashlib.sha256(output.read_bytes()).hexdigest())
 
 

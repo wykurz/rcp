@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 
+from .account_security import DHMC_SETTING, dhmc_arn, verify_dhmc_disabled
 from .ami_image import image_shape
 
 HERE = Path(__file__).resolve().parent
@@ -21,7 +22,6 @@ TIMEOUT = 3600
 POLL = 15
 # emit a diagnostic after a long console lag; only the original capture cutoff ends the wait
 CONSOLE_GRACE = 600
-DHMC_SETTING = "/ssm/managed-instance/default-ec2-instance-management-role"
 READ_OPERATIONS = {
     ("sts", "get-caller-identity"),
     ("cloudformation", "describe-stacks"), ("cloudformation", "describe-stack-resources"),
@@ -154,11 +154,9 @@ def identity(aws, m):
 
 def dhmc_disabled(aws, m):
     # no instance profile is not sufficient: DHMC can provide separate SSM credentials
-    arn = f"arn:aws:ssm:{m['region']}:{m['account']}:servicesetting{DHMC_SETTING}"
+    arn = dhmc_arn(m["region"], m["account"])
     setting = aws("ssm", "get-service-setting", SettingId=arn)["ServiceSetting"]
-    require(setting.get("ARN") == arn and setting.get("SettingId") in {DHMC_SETTING, arn}
-            and setting.get("Status") == "Default" and setting.get("SettingValue") == "$None",
-            "Default Host Management Configuration must already be disabled; no settings were changed")
+    verify_dhmc_disabled(setting, arn)
 
 
 def preflight(aws, m):

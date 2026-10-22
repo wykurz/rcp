@@ -1,5 +1,6 @@
 """Offline failure-path tests; no credentials, AWS calls, formatting, or launches."""
 
+import base64
 import copy
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
@@ -13,7 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from infra.aws_benchmark import common, controller, operator, worker
+from infra.aws_benchmark import common, controller, mailbox, operator, worker
 from infra.aws_benchmark.test_results import binding
 
 
@@ -38,6 +39,18 @@ class Missing(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
 
 
+def startup(protocol="operator-window", bucket="bucket", region="us-east-1"):
+    import yaml
+    template = yaml.safe_load(Path(__file__).with_name("stack.yaml").read_text())
+    text = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+    return base64.b64encode(text.replace("${WorkerProtocol}", protocol).replace("${Artifacts}", bucket).replace(
+        "${AWS::Region}", region).encode()).decode()
+
+
+class ClaimConflict(Exception):
+    response = {"Error": {"Code": "PreconditionFailed"}}
+
+
 class FakeCloud:
     def __init__(self):
         self.events, self.actions, self.objects = [], [], {}
@@ -45,6 +58,7 @@ class FakeCloud:
         self.api = {name: Mock() for name in ("s3", "autoscaling", "ec2", "ssm")}
         self.api["ssm"].get_service_setting.return_value = {"ServiceSetting": {
             "SettingId": "/ssm/managed-instance/default-ec2-instance-management-role",
+            "ARN": "arn:aws:ssm:us-east-1:123456789012:servicesetting/ssm/managed-instance/default-ec2-instance-management-role",
             "Status": "Default", "SettingValue": "$None"}}
         asg, ec2, s3 = (self.api[k] for k in ("autoscaling", "ec2", "s3"))
         asg.describe_auto_scaling_groups.return_value = {"AutoScalingGroups": [closed()]}
@@ -55,8 +69,12 @@ class FakeCloud:
         asg.describe_instance_refreshes.return_value = {"InstanceRefreshes": []}
         ec2.describe_instances.return_value = {"Reservations": []}
         ec2.describe_launch_template_versions.return_value = {"LaunchTemplateVersions": [
-            {"LaunchTemplateData": {"InstanceType": "c5d.24xlarge", "ImageId": "ami-123"}}]}
+            {"VersionNumber": 1, "LaunchTemplateData": {"InstanceType": "c5d.24xlarge", "ImageId": "ami-123",
+                                                      "UserData": startup()}}]}
         asg.put_scheduled_update_group_action.side_effect = self.schedule
+        s3.get_bucket_lifecycle_configuration.return_value = {"Rules": [
+            {"Status": "Enabled", "Filter": {"Prefix": prefix}, "Expiration": {"Days": 7}}
+            for prefix in ("input/", "output/", common.WINDOW_KEY, "control/durable-request.json")]}
         s3.get_object.side_effect = self.get
         s3.put_object.side_effect = self.put
 
@@ -70,7 +88,10 @@ class FakeCloud:
         self.events.append(Key)
         if self.fail == Key:
             raise RuntimeError("injected upload failure")
+        if kwargs.get("IfNoneMatch") == "*" and Key in self.objects:
+            raise ClaimConflict()
         self.objects[Key] = Body
+        return {"ETag": '"' + common.digest(Body) + '"'}
 
     def get(self, Bucket, Key):
         if Key not in self.objects:
@@ -83,7 +104,7 @@ class WindowTests(unittest.TestCase):
     def test_close_is_persisted_before_control_and_open(self):
         cloud = FakeCloud()
         operator.arm(cloud.api, "group", "bucket", window(), now=lambda: NOW)
-        self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "output/status.json", "open-123-1"])
+        self.assertEqual(cloud.events, [mailbox.OWNER_KEY, "close-123-1", "control/window.json", "output/status.json", "open-123-1"])
         self.assertEqual([a["MaxSize"] for a in cloud.actions], [0, 1])
         cloud.api["autoscaling"].update_auto_scaling_group.assert_not_called()
         cloud.api["autoscaling"].set_desired_capacity.assert_not_called()
@@ -104,7 +125,7 @@ class WindowTests(unittest.TestCase):
         cloud.api["autoscaling"].describe_scheduled_actions.side_effect = None
         with self.assertRaisesRegex(ValueError, "shutdown is missing"):
             operator.arm(cloud.api, "group", "bucket", window(), now=lambda: NOW)
-        self.assertEqual(cloud.events, ["close-123-1"])
+        self.assertEqual(cloud.events, [mailbox.OWNER_KEY, "close-123-1"])
 
     def test_active_or_old_pending_window_is_not_overwritten(self):
         for kind in ("capacity", "instance", "schedule", "control"):
@@ -135,7 +156,7 @@ class WindowTests(unittest.TestCase):
         clock = iter([NOW, NOW, NOW + timedelta(minutes=3)])
         with self.assertRaisesRegex(ValueError, "lead time"):
             operator.arm(cloud.api, "group", "bucket", window(), now=lambda: next(clock))
-        self.assertEqual(cloud.events, ["close-123-1", "control/window.json", "output/status.json"])
+        self.assertEqual(cloud.events, [mailbox.OWNER_KEY, "close-123-1", "control/window.json", "output/status.json"])
 
     def test_default_termination_is_accepted_in_closed_and_open_groups(self):
         for maximum in (0, 1):

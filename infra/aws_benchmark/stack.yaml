@@ -13,8 +13,8 @@ Parameters:
   WorkerProtocol:
     Type: String
     Default: operator-window
-    AllowedValues: [operator-window, durable, direct]
-    Description: Select durable or direct only with its reviewed control stack, immutable guards and matching AMI.
+    AllowedValues: [operator-window, direct]
+    Description: Select direct only with its reviewed control stack, immutable guards and matching AMI.
   GitHubOidcProviderArn:
     Type: String
     AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'
@@ -39,11 +39,27 @@ Resources:
               SSEAlgorithm: AES256
       LifecycleConfiguration:
         Rules:
-          - Id: ExpireMailbox
+          # the operator-owned mailbox reservation never expires or transfers automatically
+          - Id: AbortIncompleteUploads
             Status: Enabled
-            ExpirationInDays: 7
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
+          - Id: ExpireInputs
+            Status: Enabled
+            Prefix: input/
+            ExpirationInDays: 7
+          - Id: ExpireOutputs
+            Status: Enabled
+            Prefix: output/
+            ExpirationInDays: 7
+          - Id: ExpireWorkerWindow
+            Status: Enabled
+            Prefix: control/window.json
+            ExpirationInDays: 7
+          - Id: ExpireDurableRequest
+            Status: Enabled
+            Prefix: control/durable-request.json
+            ExpirationInDays: 7
   ArtifactPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -136,13 +152,12 @@ Resources:
               #!/bin/bash
               set -euo pipefail
               # trusted, root-owned code is baked into the pinned AMI
-              if [ '${WorkerProtocol}' = 'direct' ]; then
-                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=10800 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --direct --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
-              elif [ '${WorkerProtocol}' = 'durable' ]; then
-                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=10800 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --durable --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
-              else
-                systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=3900 --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
-              fi
+              case '${WorkerProtocol}' in
+                direct) mode=--direct; runtime=10800 ;;
+                operator-window) mode=; runtime=3900 ;;
+                *) exit 1 ;;
+              esac
+              systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark --property=RuntimeMaxSec=$runtime --property=KillMode=control-group --property=FailureAction=poweroff --property=SuccessAction=poweroff /opt/rcp-benchmark/venv/bin/python -m infra.aws_benchmark.worker $mode --bucket '${Artifacts}' --region '${AWS::Region}' || systemctl poweroff
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
