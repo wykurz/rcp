@@ -139,6 +139,16 @@ class TrustTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-m", "infra.aws_benchmark.production_trust", *args],
             cwd=ROOT, env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"), capture_output=True, text=True, timeout=10)
 
+    def test_real_cli_rejects_key_material_without_echoing_it(self):
+        for value in ("PRIVATE_MATERIAL_MUST_NOT_APPEAR", "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_CANARY\n-----END PRIVATE KEY-----", SECRET + "\nSYNTHETIC_CANARY"):
+            with self.subTest(kind="invalid resource identifier"):
+                result = self.cli("reader-policy", "--secret-arn=" + value, "--admission-role", ROLES[0],
+                                  "--collector-role", ROLES[1], "--recovery-role", ROLES[2])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(value, result.stdout + result.stderr)
+                self.assertNotIn("SYNTHETIC_CANARY", result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), "Trust proposal rejected: invalid or incomplete non-secret inputs.")
+
     def test_real_cli_renders_without_credentials_and_requires_missing_identities(self):
         args = ("--app-id", "1234", "--client-id", "Iv23.test-client", "--installation-id", "5678")
         result = self.cli("writer-plan", *args)

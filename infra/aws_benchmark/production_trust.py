@@ -117,19 +117,20 @@ def check_writer(plan, environment, branches, rulesets):
                 ruleset_ids=ids, app_id=plan["app"]["id"], installation_id=plan["app"]["installation_id"])
 
 
-def reader_policy(secret_arn, admission_role, collector_role, recovery_role):
-    require(isinstance(secret_arn, str) and (secret := SECRET.fullmatch(secret_arn)), "exact reader secret ARN required")
+def reader_policy(resource_arn, admission_role, collector_role, recovery_role):
+    """Render public resource identifiers only; key material is never an input."""
+    require(isinstance(resource_arn, str) and (resource := SECRET.fullmatch(resource_arn)), "exact reader secret ARN required")
     principals = [admission_role, collector_role, recovery_role]
     require(all(isinstance(x, str) for x in principals) and len(set(principals)) == 3, "three distinct explicitly selected role ARNs required")
     for principal in principals:
         require(isinstance(principal, str) and (role := ROLE.fullmatch(principal)) and
-                (role[1], role[2]) == (secret[1], secret[3]), "roles must be exact IAM role ARNs in the secret account/partition")
+                (role[1], role[2]) == (resource[1], resource[3]), "roles must be exact IAM role ARNs in the secret account/partition")
     return {"Version": "2012-10-17", "Statement": [
         dict(Sid="DenyReadOutsideSelectedRoles", Effect="Deny", Principal="*",
-             Action="secretsmanager:GetSecretValue", Resource=secret_arn,
+             Action="secretsmanager:GetSecretValue", Resource=resource_arn,
              Condition={"ArnNotEquals": {"aws:PrincipalArn": principals}}),
         dict(Sid="DenyReaderNonCurrentStage", Effect="Deny", Principal="*",
-             Action="secretsmanager:GetSecretValue", Resource=secret_arn,
+             Action="secretsmanager:GetSecretValue", Resource=resource_arn,
              Condition={"ArnEquals": {"aws:PrincipalArn": principals[:2]},
                         "StringNotEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}}),
     ]}
@@ -153,11 +154,12 @@ def main():
             for field in ("environment-readback", "branches-readback", "rulesets-readback"):
                 command.add_argument("--" + field, required=True, type=Path)
     command = commands.add_parser("reader-policy")
-    for field in ("secret-arn", "admission-role", "collector-role", "recovery-role"):
+    command.add_argument("--secret-arn", dest="resource_arn", required=True)
+    for field in ("admission-role", "collector-role", "recovery-role"):
         command.add_argument("--" + field, required=True)
     args = parser.parse_args()
     if args.command == "reader-policy":
-        value = reader_policy(args.secret_arn, args.admission_role, args.collector_role, args.recovery_role)
+        value = reader_policy(args.resource_arn, args.admission_role, args.collector_role, args.recovery_role)
     else:
         value = writer_plan(args.app_id, args.client_id, args.installation_id)
         if args.command == "writer-check":
