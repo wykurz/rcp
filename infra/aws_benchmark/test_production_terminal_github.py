@@ -1,9 +1,9 @@
-import copy
 import json
 import unittest
 from unittest.mock import Mock
+from contextlib import contextmanager
 
-from .production_github import TerminalProducerReader, GitHubRunError, _TERMINAL_PATH
+from .production_github import TerminalProducerReader, GitHubRunError
 from .production_policy import producer_identity
 from .test_production_policy import identity, run_json
 
@@ -25,15 +25,14 @@ class TerminalProducerReaderTests(unittest.TestCase):
             repository_id=self.identity.repository_id, repository_owner_id=self.identity.repository_owner_id,
             fetcher=self.fetch)
 
-    def test_reads_original_jobs_and_rechecks_current_attempt_without_credentials(self):
+    def test_reads_original_jobs_and_rechecks_current_attempt_with_explicit_test_fetcher(self):
         value = self.reader.read(self.producer)
         self.assertEqual(value["attempt_jobs"], self.jobs)
         self.assertEqual(value["current_jobs"], self.jobs)
         self.assertEqual(value["pending_deployments"], [])
         paths = [call.args[0] for call in self.fetch.call_args_list]
-        self.assertEqual(paths[0], self.path + "/attempts/1")
-        self.assertEqual(paths[-1], self.path)
-        self.assertTrue(all(_TERMINAL_PATH.fullmatch(path) for path in paths))
+        self.assertEqual(paths, [self.path + "/attempts/1", self.path,
+            self.path + "/attempts/1/jobs?per_page=100", self.path + "/pending_deployments", self.path])
 
     def test_newer_attempt_requires_its_complete_job_inventory(self):
         self.values[self.path] = self.run | dict(run_attempt=2)
@@ -81,9 +80,23 @@ class TerminalProducerReaderTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(GitHubRunError):
                 self.reader.read(self.producer | change)
         self.fetch.assert_not_called()
-        for path in ("https://evil.example", self.path + "/jobs?per_page=100", self.path + "/attempts/1/jobs?page=2",
-                     self.path + "/../secrets", self.path + "/pending_deployments?token=x"):
-            self.assertIsNone(_TERMINAL_PATH.fullmatch(path))
+
+    def test_whole_terminal_inventory_shares_one_authenticated_observation(self):
+        events = []
+        @contextmanager
+        def observation():
+            events.append("begin")
+            try:
+                yield self.fetch
+            finally:
+                events.append("end")
+        reader = TerminalProducerReader(repository=self.identity.repository,
+            repository_id=self.identity.repository_id, repository_owner_id=self.identity.repository_owner_id,
+            observation_factory=observation)
+        self.assertEqual(events, [])
+        reader.read(self.producer)
+        self.assertEqual(events, ["begin", "end"])
+        self.assertEqual(self.fetch.call_count, 5)
 
     def test_access_failure_is_sanitized_and_never_proof_of_no_pending_jobs(self):
         self.fetch.side_effect = RuntimeError("secret endpoint body")

@@ -1,6 +1,7 @@
-"""Offline tests for binding public GitHub run observations to signed identity."""
+"""Offline tests for binding authenticated GitHub run observations to signed identity."""
 
 from dataclasses import replace
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import traceback
@@ -41,9 +42,6 @@ def raw(value):
 
 class ProductionGitHubTests(unittest.TestCase):
     def setUp(self):
-        self.cooldown = patch.object(github, "_rate_limit_until", 0)
-        self.cooldown.start()
-        self.addCleanup(self.cooldown.stop)
         self.attempt = payload(created_at=(NOW - timedelta(minutes=1)).isoformat())
         self.original = payload()
         self.fetch = Mock(side_effect=lambda path: raw(self.attempt if "/attempts/" in path else self.original))
@@ -191,67 +189,37 @@ class ProductionGitHubTests(unittest.TestCase):
                 self.reader = self.make_reader(clock=lambda: value)
                 self.assert_rejected()
 
-    def test_default_fetch_uses_fixed_tls_host_versioned_get_and_no_credentials(self):
-        response = Mock(status=200)
-        response.getheader.return_value = "identity"
-        response.read1.side_effect = [raw(self.attempt), b""]
-        connection = Mock()
-        connection.getresponse.return_value = response
-        with patch.object(github.http.client, "HTTPSConnection", return_value=connection) as connect:
-            self.assertEqual(github._fetch_official(PATH + "/attempts/2"), raw(self.attempt))
-        self.assertEqual(connect.call_args.args, ("api.github.com",))
-        self.assertEqual(connect.call_args.kwargs["timeout"], github.SOCKET_TIMEOUT_SECONDS)
-        request = connection.request.call_args
-        self.assertEqual(request.args, ("GET", PATH + "/attempts/2"))
-        self.assertEqual(request.kwargs["headers"], {"Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "rcp-production-admission"})
-        self.assertEqual(response.read1.call_args_list[0].args, (github.MAX_RESPONSE_BYTES + 1,))
-        response.close.assert_called_once_with()
-        connection.close.assert_called_once_with()
+    def test_no_implicit_anonymous_fetcher_or_ambiguous_observation_configuration(self):
+        for updates in (dict(fetcher=None), dict(observation_factory=lambda: None),
+                        dict(fetcher=None, observation_factory="not callable")):
+            with self.subTest(fields=list(updates)), self.assertRaises(github.GitHubRunError):
+                self.make_reader(**updates)
+        self.fetch.assert_not_called()
 
-    def test_redirects_rate_limits_and_other_http_errors_never_yield_metadata(self):
-        for status in (301, 302, 307, 308, 304, 401, 403, 404, 410, 429, 500, 503):
-            with self.subTest(status=status):
-                github._rate_limit_until = 0
-                response = Mock(status=status)
-                connection = Mock()
-                connection.getresponse.return_value = response
-                with patch.object(github.http.client, "HTTPSConnection", return_value=connection):
-                    with self.assertRaises(github.GitHubRunError):
-                        github._fetch_official(PATH)
-                response.read1.assert_not_called()
-                connection.request.assert_called_once()
-                response.close.assert_called_once_with()
-                connection.close.assert_called_once_with()
+    def test_one_authenticated_context_covers_all_gets_and_is_fresh_for_each_read(self):
+        events = []
+        @contextmanager
+        def observation():
+            events.append("begin")
+            try:
+                yield self.fetch
+            finally:
+                events.append("end")
+        reader = self.make_reader(fetcher=None, observation_factory=observation)
+        self.assertEqual(events, [])
+        reader.read(identity())
+        reader.read(identity())
+        self.assertEqual(events, ["begin", "end", "begin", "end"])
+        self.assertEqual(self.fetch.call_count, 4)
 
-    def test_rate_limit_reset_blocks_warm_reads_without_sleeping_or_using_stale_proof(self):
-        response = Mock(status=429)
-        response.getheader.side_effect = lambda name, default=None: {
-            "Retry-After": "120", "X-RateLimit-Reset": "1400"}.get(name, default)
-        connection = Mock()
-        connection.getresponse.return_value = response
-        with patch.object(github.time, "time", return_value=1000), \
-                patch.object(github.http.client, "HTTPSConnection", return_value=connection):
-            with self.assertRaises(github.GitHubRateLimitError) as caught:
-                github._fetch_official(PATH)
-            self.assertEqual(caught.exception.retry_after_seconds, 401)
-            with self.assertRaises(github.GitHubRateLimitError):
-                github._fetch_terminal(PATH)
-        self.assertEqual(connection.request.call_count, 1)
-        response.close.assert_called_once()
-        connection.close.assert_called_once()
-        with patch.object(github.time, "time", return_value=1401):
-            github._cooldown()
-
-    def test_secondary_limit_missing_or_invalid_headers_uses_minimum_one_minute(self):
-        for headers in ({}, {"Retry-After": "bad", "X-RateLimit-Reset": "inf"}, {"Retry-After": "1"}):
-            with self.subTest(headers=headers), patch.object(github.time, "time", return_value=1000):
-                github._rate_limit_until = 0
-                response = Mock()
-                response.getheader.side_effect = lambda name, default=None: headers.get(name, default)
-                with self.assertRaises(github.GitHubRateLimitError) as caught:
-                    github._cooldown(response)
-                self.assertEqual(caught.exception.retry_after_seconds, 60)
+    def test_budget_failure_on_observation_exit_discards_otherwise_valid_proof(self):
+        @contextmanager
+        def observation():
+            yield self.fetch
+            raise github.GitHubRunError("observation expired")
+        self.reader = self.make_reader(fetcher=None, observation_factory=observation)
+        self.assert_rejected()
+        self.assertEqual(self.fetch.call_count, 2)
 
     def test_reader_preserves_sanitized_rate_limit_delay(self):
         self.fetch.side_effect = github.GitHubRateLimitError(120)
@@ -259,41 +227,6 @@ class ProductionGitHubTests(unittest.TestCase):
             self.reader.read(identity())
         self.assertEqual(caught.exception.retry_after_seconds, 120)
         self.assertEqual(self.fetch.call_count, 1)
-
-    def test_oversized_or_compressed_responses_are_rejected(self):
-        for compressed in (False, True):
-            response = Mock(status=200)
-            response.getheader.return_value = "gzip" if compressed else "identity"
-            response.read1.return_value = b"x" * (github.MAX_RESPONSE_BYTES + 1)
-            connection = Mock()
-            connection.getresponse.return_value = response
-            with patch.object(github.http.client, "HTTPSConnection", return_value=connection):
-                with self.assertRaises(github.GitHubRunError):
-                    github._fetch_official(PATH)
-            response.close.assert_called_once_with()
-            connection.close.assert_called_once_with()
-
-    def test_late_headers_are_rejected_when_control_returns_to_the_body_deadline_check(self):
-        response = Mock(status=200)
-        response.getheader.return_value = "identity"
-        connection = Mock()
-        connection.getresponse.return_value = response
-        with patch.object(github.http.client, "HTTPSConnection", return_value=connection), \
-                patch.object(github.time, "monotonic", side_effect=[0, 4]):
-            with self.assertRaises(github.GitHubRunError):
-                github._fetch_official(PATH)
-        response.read1.assert_not_called()
-        response.close.assert_called_once_with()
-        connection.close.assert_called_once_with()
-
-    def test_fetch_rejects_any_unexpected_path_before_opening_a_connection(self):
-        for path in ("https://attacker.invalid/path", "//attacker.invalid/path", PATH + "?next=1",
-                     PATH + "/logs", PATH + "/attempts/0", PATH.replace("project", ".."),
-                     PATH + "\r\nHeader: x"):
-            with self.subTest(path=path), patch.object(github.http.client, "HTTPSConnection") as connect:
-                with self.assertRaises(github.GitHubRunError):
-                    github._fetch_official(path)
-                connect.assert_not_called()
 
 
 if __name__ == "__main__":

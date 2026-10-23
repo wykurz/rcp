@@ -174,13 +174,104 @@ All Lambda reserved concurrencies are zero initially; watchdog and collector rul
 Admission has a separate gate. There is no recurring benchmark trigger in this change. The
 five-minute collector timer only reconciles existing ownership and never submits work.
 
+## Authenticated GitHub proof reads
+
+Admission and collection use a dedicated owner-managed GitHub App, proposed name
+`rcp-benchmark-reader-wykurz`, installed only on `wykurz/rcp` (repository ID `655073755`, owner ID
+`483465`). It needs repository **Actions: read** and **Metadata: read**, no account permissions,
+webhooks or user OAuth. The App is a proof reader, never a trigger or environment approver. Signed
+caller OIDC, exact main/workflow/requester checks, reservations, ownership and independent shutdown
+remain separate authorization boundaries.
+
+Actions read also permits reading workflow logs and artifacts; GitHub has no narrower run-metadata
+permission. The application restricts reads to its fixed run, attempt, jobs and pending-deployment
+paths. The installation token is read-only for this repository, but the App signing key has broader
+App-level authority: a signed App JWT can suspend or delete its own installation. The URL allowlist
+does not constrain a stolen key. Keep this a dedicated, owner-only App with only this installation.
+
+The template references an **external** Secrets Manager secret named
+`/rcp/production/github-read-app` in account `381183037896`, region `us-east-1`, encrypted with the
+AWS-managed `aws/secretsmanager` key. Its secret value is only the App's PEM private key. The
+template creates neither a secret nor a key. Only `AdmissionRole` and `CollectorRole` gain
+`secretsmanager:GetSecretValue` on the complete resolved ARN, including its six-character suffix,
+with `StringEquals: secretsmanager:VersionStage: AWSCURRENT`. Every read explicitly requests that
+stage. No list, describe, write, rotation, role-passing, extra KMS or trust permissions are added.
+Worker, coordinator, watchdog, publication and GitHub job roles receive no secret access; existing
+account administrators retain their existing powers.
+
+| Template parameter        | Non-secret Lambda configuration             |
+| ------------------------- | ------------------------------------------- |
+| `GitHubAppClientId`       | `RCP_PRODUCTION_GITHUB_APP_CLIENT_ID`       |
+| `GitHubAppInstallationId` | `RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID` |
+| `GitHubAppSecretArn`      | `RCP_PRODUCTION_GITHUB_APP_SECRET_ARN`      |
+
+These parameters default empty. The secret-read policies are absent until all three are supplied;
+CloudFormation rejects runtime or admission enablement with missing configuration. Parameter
+constraints reject malformed IDs, partial/wildcard ARNs and secrets outside the approved
+account/region/name. Porting this setup requires reviewing that explicit scope. Existing watchdog
+conditions are unchanged: a rejected configuration update must not silently disable active guards.
+Complete configuration can be deployed with all feature flags off for a separately approved
+no-worker canary; disabling runtime alone does not revoke configured secret-read policies.
+
+At runtime, fetch AWSCURRENT only to mint a token. Sign a short RS256 App JWT, then POST only to the
+fixed installation token endpoint with the exact repository ID and read permissions. A fixed,
+bounded `GET /installation/repositories?per_page=2` verifies the minted token sees exactly the
+configured repository; it is a scope check, separate from the four run-proof path families. Cache
+only the installation token in Lambda memory, until five minutes before its returned expiry and at
+most 55 minutes after minting. Do not cache proof responses or persist PEM/JWT/tokens in environment
+variables, disk, logs, artifacts or state. Dropping Python references does not guarantee secure
+memory erasure. Secret retrieval, minting, proof reads and at most one 401 refresh share finite call
+and time budgets: one observation allows 20 seconds and at most 13 remote calls, including Secrets
+Manager, minting and repository-scope validation. Socket timeouts do not hard-bound DNS resolution
+or header parsing; the outer Lambda limits remain 45 seconds for admission and 180 seconds for
+collection, and a late operation fails the shared-budget check. Missing/revoked credentials,
+malformed scope or timeout hold admission/retirement; there is no anonymous fallback. Quota backoff
+defers work rather than extending an invocation. GitHub failure must not disable the independent AWS
+watchdog or release uncertain ownership.
+
+The following setup is proposed, **not provisioned by this PR**:
+
+1. Obtain separate approval to create the owner-only App and install it on this selected repository,
+   acknowledging both the logs/artifacts read scope and App-key installation authority. Keep other
+   repository/account permissions off, webhook delivery inactive and user authorization unused.
+   Record the exact client and installation IDs from the owner's GitHub UI; these may be shared.
+2. Approve and review the one-time secure private-key import procedure, generate a key and store
+   only its PEM in the exact external secret with AWS-managed encryption. Never paste it into chat
+   or command arguments, put it in CloudFormation parameters, or commit it. The application requires
+   no App OAuth client secret. Record the full secret ARN and public key fingerprint, never the key.
+3. Prepare an account-resolved disabled change set using the three identifiers and immutable package
+   pins. Review the two exact secret-read grants and unchanged trust before deployment. App setup,
+   secret creation/import and live IAM deployment each remain outside code-preparation authority.
+4. With separate approval, perform the **no-worker** live canary: fresh token mint, exact scoped
+   metadata reads, expiry/refresh and sanitized denial behavior; verify AWSCURRENT succeeds while
+   other stages/secrets and other runtime principals are denied. Verify the watchdog remains
+   independent. Record rate-limit headroom without printing tokens. Offline tests are not this IAM
+   or operational evidence; **F13 remains open until the live acceptance gate passes**.
+
+The owner must maintain a key rotation and emergency procedure because App private keys never expire
+by themselves. Rotate with overlapping keys: securely update AWSCURRENT, verify fresh mint/read
+success, then retire the old key after the bounded token overlap. Moving AWSCURRENT or deleting a
+key must not be assumed to revoke already-issued installation tokens. For compromise, close AWS
+admission first, preserve watchdog/ownership, suspend the installation through the owner UI, and
+rotate/revoke the affected key. Access failure can delay retirement; it cannot justify another
+worker.
+
+References:
+[App token scope and lifetime](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app),
+[App installation authority](https://docs.github.com/en/rest/apps/apps#delete-an-installation-for-the-authenticated-app),
+[key rotation](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps),
+[installation suspension](https://docs.github.com/en/apps/maintaining-github-apps/suspending-a-github-app-installation),
+[secret access](https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html),
+[secret condition keys](https://docs.aws.amazon.com/service-authorization/latest/reference/list_secretsmanager.html).
+
 ## Deployment and acceptance checklist
 
 1. Approve the account-resolved disabled change set and exact role/trust policies. Inputs are the
    existing account/region, OIDC provider, public subnet/security group, immutable Lambda object
-   version and image/source/launch-template pins. No secret keys belong in GitHub or chat. This
-   template exceeds the inline `TemplateBody` limit; use a reviewed immutable `TemplateURL` or a
-   separately hashed compact JSON rendering of the same template.
+   version and image/source/launch-template pins, plus the non-secret App identifiers described
+   above. No secret keys belong in GitHub or chat. This template exceeds the inline `TemplateBody`
+   limit; use a reviewed immutable `TemplateURL` or a separately hashed compact JSON rendering of
+   the same template.
 2. Resolve the staged worker-profile dependency. Disabled creation may use reviewed placeholder
    launch pins; activation requires a compatible immutable image and numeric launch-template version
    that references the new profile and bucket. Verify the entire effective launch configuration. A
@@ -230,14 +321,13 @@ migration. Keep the collector's validator compatible until retirement too: if a 
 verdict conflicts after a package change, restore the exact compatible validator and reconcile its
 immutable evidence. Do not overwrite the manifest or release ownership to escape that hold.
 
-Admission and terminal proof currently use public unauthenticated GitHub REST reads, subject to the
-shared source-IP limit of 60 requests/hour. Warm processes honor rate-limit cooldowns and collection
-reuses one terminal producer observation within an invocation while repeating physical/execution
-checks before retirement. No stale producer proof is accepted across invocations. Reliable
-unattended production still requires a separately approved authenticated GitHub read design and live
-rate-limit acceptance; this PR creates no GitHub secret or wider AWS access. Admission failures and
-collector holds emit bounded structured diagnostics without tokens, upload URLs or SDK response
-bodies. An operator alarm/notification destination remains an activation decision.
+Authenticated GitHub proof reads still require separately approved App/secret setup, deployment and
+live no-worker acceptance. This PR prepares the narrow undeployed secret-read policies; it creates
+no credentials or live access. Collection reuses one terminal producer observation within an
+invocation while repeating physical/execution checks before retirement. No stale producer proof is
+accepted across invocations. Admission failures and collector holds emit bounded structured
+diagnostics without tokens, upload URLs or SDK response bodies. An operator alarm/notification
+destination remains an activation decision.
 
 The dormant scheduled policy requires its fixed baseline to equal main for this initial A/A
 contract; it is not a working recurring comparison policy as main advances. Keep schedule slots

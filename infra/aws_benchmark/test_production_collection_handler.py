@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from . import production_collection_handler as handler
 from .test_production_admission import Cloud
+from .test_production_handler import environment
 
 
 class CollectionHandlerTests(unittest.TestCase):
@@ -51,9 +52,7 @@ class CollectionHandlerTests(unittest.TestCase):
             clients.assert_not_called()
 
     def test_normal_held_result_emits_safe_diagnostic(self):
-        env = dict(RCP_PRODUCTION_ENABLED="true", RCP_PRODUCTION_REPOSITORY="wykurz/rcp",
-            RCP_PRODUCTION_REPOSITORY_ID="123", RCP_PRODUCTION_OWNER_ID="44",
-            RCP_PRODUCTION_MACHINE_ARN=self.cloud.machine)
+        env = environment(self.cloud)
         with patch.dict(os.environ, env, clear=True), patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
              patch.object(handler, "collection_clients", return_value=self.api), \
              patch.object(handler, "collect_active", return_value=dict(state="held", retired=False, reason="proof unavailable")), \
@@ -61,6 +60,41 @@ class CollectionHandlerTests(unittest.TestCase):
             self.assertEqual(handler.lambda_handler({}, None)["state"], "held")
         self.assertEqual(json.loads(logged.call_args.args[0]),
                          dict(event="production_collection_held", reason="proof unavailable"))
+
+    def test_idle_authenticated_reader_configuration_never_fetches_a_secret(self):
+        with patch.dict(os.environ, environment(self.cloud), clear=True), \
+                patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
+                patch.object(handler, "collection_clients", return_value=self.api), \
+                patch.object(handler, "cached_provider") as provider, \
+                patch.object(handler, "TerminalProducerReader") as reader:
+            self.assertEqual(handler.lambda_handler({}, None), dict(state="idle", retired=False))
+            config = provider.call_args.args[0]
+            self.assertEqual(config.repository, "wykurz/rcp")
+            self.assertEqual(config.repository_id, "123")
+            self.assertEqual(config.secret_arn, environment(self.cloud)["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
+            self.assertEqual(reader.call_args.kwargs["observation_factory"], provider.return_value.observation)
+            provider.return_value.observation.assert_not_called()
+
+    def test_real_app_reader_construction_is_lazy_for_idle_collection(self):
+        with patch.dict(os.environ, environment(self.cloud), clear=True), \
+                patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
+                patch.object(handler, "collection_clients", return_value=self.api), \
+                patch("boto3.client", side_effect=AssertionError("unexpected credential client")) as sdk, \
+                patch("http.client.HTTPSConnection", side_effect=AssertionError("unexpected GitHub connection")) as http:
+            self.assertEqual(handler.lambda_handler({}, None), dict(state="idle", retired=False))
+            sdk.assert_not_called()
+            http.assert_not_called()
+
+    def test_missing_app_config_holds_before_cloud_access_without_anonymous_fallback(self):
+        env = environment(self.cloud)
+        del env["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"]
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
+                patch.object(handler, "collection_clients") as clients, \
+                patch.object(handler, "TerminalProducerReader") as reader, patch("builtins.print"):
+            self.assertEqual(handler.lambda_handler({}, None)["state"], "held")
+            reader.assert_not_called()
+            clients.assert_not_called()
 
     def test_handler_error_response_does_not_expose_credentials(self):
         with patch.dict(os.environ, {"RCP_PRODUCTION_ENABLED": "true"}, clear=True), \

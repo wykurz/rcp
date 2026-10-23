@@ -30,6 +30,7 @@ from .durable_aws import Configuration
 from .production_admission import Admission
 from .production_auth import GitHubIdentityError, GitHubIdentityVerifier, MAX_TOKEN_BYTES
 from .production_github import GitHubRunError, GitHubRateLimitError, GitHubRunReader
+from .production_github_app import GitHubAppConfig, cached_provider
 from .production_policy import Policy, canonical, manifest
 
 
@@ -182,8 +183,13 @@ def build_admission(*, api=None, clock=time.time):
     verifier = _cached_verifier(repository, repository_id, owner_id, audience, workflow) if clock is time.time else \
         GitHubIdentityVerifier(repository=repository, repository_id=repository_id,
             repository_owner_id=owner_id, audience=audience, workflow_refs={workflow}, clock=clock)
+    app = GitHubAppConfig(repository=repository, repository_id=repository_id,
+        repository_owner_id=owner_id, region=config.region, account=config.account,
+        app_client_id=os.environ["RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"],
+        installation_id=os.environ["RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID"],
+        secret_arn=os.environ["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
     reader = GitHubRunReader(repository=repository, repository_id=repository_id,
-        repository_owner_id=owner_id, clock=clock)
+        repository_owner_id=owner_id, clock=clock, observation_factory=cached_provider(app).observation)
     clients = SubmissionClients(config.region) if api is None else api
     return Admission(clients, config, machine,
         lambda: read_policy(clients["dynamodb"], config.table, owner_id),

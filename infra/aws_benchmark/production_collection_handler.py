@@ -1,6 +1,7 @@
 """Initially disabled scheduled collection of the one active production lease.
 
-There is no request-selected run, no launch authority and no GitHub credential.
+There is no request-selected run or launch authority. GitHub metadata uses the
+separately provisioned repository-scoped App credential; it cannot trigger workflows.
 The independent watchdog is a different function/role and continues on failures.
 Publishing immutable evidence precedes the revision-fenced ownership release.
 """
@@ -14,6 +15,7 @@ from .common import require
 from .durable_aws import Configuration, clients
 from .production_collection import Collector
 from .production_github import TerminalProducerReader
+from .production_github_app import GitHubAppConfig, cached_provider
 from .production_runtime import ProductionService
 
 
@@ -53,9 +55,15 @@ def lambda_handler(event, context):
         return dict(state="held", retired=False, reason="unexpected collection invocation")
     try:
         config = Configuration.environment()
-        reader = TerminalProducerReader(repository=os.environ["RCP_PRODUCTION_REPOSITORY"],
+        app = GitHubAppConfig(repository=os.environ["RCP_PRODUCTION_REPOSITORY"],
             repository_id=os.environ["RCP_PRODUCTION_REPOSITORY_ID"],
-            repository_owner_id=os.environ["RCP_PRODUCTION_OWNER_ID"])
+            repository_owner_id=os.environ["RCP_PRODUCTION_OWNER_ID"],
+            region=config.region, account=config.account,
+            app_client_id=os.environ["RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"],
+            installation_id=os.environ["RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID"],
+            secret_arn=os.environ["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
+        reader = TerminalProducerReader(repository=app.repository, repository_id=app.repository_id,
+            repository_owner_id=app.repository_owner_id, observation_factory=cached_provider(app).observation)
         result = collect_active(collection_clients(config.region), config,
                                 os.environ["RCP_PRODUCTION_MACHINE_ARN"], reader)
         if result.get("state") == "held":
