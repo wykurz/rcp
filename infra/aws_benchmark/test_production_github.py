@@ -65,7 +65,7 @@ class ProductionGitHubTests(unittest.TestCase):
         self.assertNotEqual(proof.created_at, self.attempt["created_at"])
         self.assertEqual(proof.observed_at, NOW.isoformat())
         self.assertEqual(proof.producer_fingerprint, producer_fingerprint(identity()))
-        self.assertEqual([call.args[0] for call in self.fetch.call_args_list], [PATH + "/attempts/2", PATH])
+        self.assertEqual([call.args[0] for call in self.fetch.call_args_list], [PATH])
 
     def test_new_token_and_recent_attempt_cannot_refresh_stale_original_run(self):
         self.original["created_at"] = (NOW - timedelta(seconds=MAX_RUN_AGE_SECONDS + 1)).isoformat()
@@ -76,7 +76,7 @@ class ProductionGitHubTests(unittest.TestCase):
         self.original["created_at"] = (NOW - timedelta(seconds=MAX_RUN_AGE_SECONDS)).isoformat()
         self.reader.read(identity())
 
-    def test_each_response_must_match_the_exact_signed_producer_and_active_state(self):
+    def test_current_response_must_match_the_exact_signed_producer_and_active_state(self):
         changes = [dict(id=10002), dict(run_attempt=1), dict(head_sha="b" * 40),
             dict(head_branch="feature"), dict(event="pull_request"), dict(actor=dict(id=111)),
             dict(path=".github/workflows/other.yml"), dict(status="completed", conclusion="success"),
@@ -84,33 +84,31 @@ class ProductionGitHubTests(unittest.TestCase):
             dict(repository=dict(id=999, full_name=REPOSITORY, owner=dict(id=5678))),
             dict(repository=dict(id=1234, full_name="other/project", owner=dict(id=5678))),
             dict(repository=dict(id=1234, full_name=REPOSITORY, owner=dict(id=999)))]
-        for side in ("attempt", "original"):
-            for change in changes:
-                with self.subTest(side=side, fields=list(change)):
-                    before = getattr(self, side)
-                    setattr(self, side, payload(**change))
-                    self.assert_rejected()
-                    setattr(self, side, before)
+        for change in changes:
+            with self.subTest(fields=list(change)):
+                before = self.original
+                self.original = payload(**change)
+                self.assert_rejected()
+                self.original = before
 
     def test_current_run_must_not_have_advanced_to_another_attempt(self):
         self.original["run_attempt"] = 3
         self.assert_rejected()
 
     def test_future_stale_missing_and_unzoned_timestamps_fail_closed(self):
-        for side in ("attempt", "original"):
-            for created in ((NOW + timedelta(seconds=1)).isoformat(),
-                            (NOW - timedelta(hours=3)).isoformat(),
-                            NOW.replace(tzinfo=None).isoformat(), "not a timestamp", None, 123):
-                with self.subTest(side=side, timestamp_type=type(created)):
-                    before = getattr(self, side)["created_at"]
-                    getattr(self, side)["created_at"] = created
-                    self.assert_rejected()
-                    getattr(self, side)["created_at"] = before
+        for created in ((NOW + timedelta(seconds=1)).isoformat(),
+                        (NOW - timedelta(hours=3)).isoformat(),
+                        NOW.replace(tzinfo=None).isoformat(), "not a timestamp", None, 123):
+            with self.subTest(timestamp_type=type(created)):
+                before = self.original["created_at"]
+                self.original["created_at"] = created
+                self.assert_rejected()
+                self.original["created_at"] = before
 
-    def test_age_and_observed_time_are_evaluated_after_both_reads(self):
+    def test_age_and_observed_time_are_evaluated_after_the_read(self):
         self.original["created_at"] = (NOW - timedelta(seconds=MAX_RUN_AGE_SECONDS - 1)).isoformat()
         def clock():
-            self.assertEqual(self.fetch.call_count, 2)
+            self.assertEqual(self.fetch.call_count, 1)
             return NOW.timestamp() + 2
         self.reader = self.make_reader(clock=clock)
         self.assert_rejected()
@@ -150,7 +148,7 @@ class ProductionGitHubTests(unittest.TestCase):
             dict(repository=dict(id=1234, full_name=REPOSITORY, owner=dict(id=True)))]
         for update in changes:
             with self.subTest(fields=list(update)):
-                self.attempt = payload(**update)
+                self.original = payload(**update)
                 self.assert_rejected()
 
     def test_input_bytes_json_shape_depth_duplicates_and_nonfinite_values_are_bounded(self):
@@ -178,11 +176,6 @@ class ProductionGitHubTests(unittest.TestCase):
                 else:
                     self.fail("fetch failure was accepted")
                 self.assertEqual(self.fetch.call_count, 1)
-        self.fetch.reset_mock()
-        self.fetch.side_effect = [raw(self.attempt), TimeoutError("second read failure")]
-        with self.assertRaises(github.GitHubTransientError):
-            self.reader.read(identity())
-        self.assertEqual(self.fetch.call_count, 2)
 
     def test_invalid_clock_cannot_create_a_proof(self):
         for value in (None, True, float("nan"), float("inf"), -1, "time"):
@@ -211,7 +204,7 @@ class ProductionGitHubTests(unittest.TestCase):
         reader.read(identity())
         reader.read(identity())
         self.assertEqual(events, ["begin", "end", "begin", "end"])
-        self.assertEqual(self.fetch.call_count, 4)
+        self.assertEqual(self.fetch.call_count, 2)
 
     def test_budget_failure_on_observation_exit_discards_otherwise_valid_proof(self):
         @contextmanager
@@ -220,7 +213,7 @@ class ProductionGitHubTests(unittest.TestCase):
             raise github.GitHubRunError("observation expired")
         self.reader = self.make_reader(fetcher=None, observation_factory=observation)
         self.assert_rejected()
-        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(self.fetch.call_count, 1)
 
     def test_reader_preserves_typed_transient_and_delay(self):
         self.fetch.side_effect = github.GitHubTransientError(30)

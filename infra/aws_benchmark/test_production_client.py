@@ -321,7 +321,7 @@ class ProductionClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.NoRedirect().redirect_request(None, None, 302, "", {}, "https://evil.example")
         env = dict(ACTIONS_ID_TOKEN_REQUEST_URL="https://github.example/id?request=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN="secret")
-        result = Mock(status=200)
+        result = Mock(status=200, length=0)
         result.read.return_value = json.dumps(dict(value="signed-token")).encode()
         with patch.dict(os.environ, env), patch.object(client, "opener") as opener:
             opener.return_value.open.return_value.__enter__.return_value = result

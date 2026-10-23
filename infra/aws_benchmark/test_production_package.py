@@ -25,6 +25,7 @@ class InputsTests(unittest.TestCase):
         self.assertIn("infra/aws_benchmark/production_collection_handler.py", sources)
         self.assertIn("infra/aws_benchmark/production_startup.py", sources)
         self.assertIn("infra/aws_benchmark/production_errors.py", sources)
+        self.assertIn("infra/aws_benchmark/production_transport.py", sources)
         self.assertIn("infra/aws_benchmark/production_projection.py", sources)
         self.assertIn("infra/aws_benchmark/production_objects.py", sources)
         self.assertEqual(package.ENTRYPOINTS["infra.aws_benchmark.production_collection_handler"], ("lambda_handler",))
@@ -49,7 +50,7 @@ class InputsTests(unittest.TestCase):
             package.verify_source_closure(sources)
 
     def test_reconciliation_and_projection_dependencies_cannot_be_omitted(self):
-        for name in ("production_errors", "production_projection", "production_objects"):
+        for name in ("production_errors", "production_projection", "production_objects", "production_transport"):
             with self.subTest(name=name):
                 sources = package.source_snapshot(package.ROOT)
                 del sources["infra/aws_benchmark/" + name + ".py"]

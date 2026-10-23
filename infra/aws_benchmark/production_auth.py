@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Collection
 
 from benchmarks.strict_json import parse_json
+from .production_transport import retryable_transport
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -51,12 +52,6 @@ class GitHubIdentityTransientError(GitHubIdentityError):
     def __init__(self, retry_after_seconds=JWKS_REFRESH_SECONDS):
         super().__init__("GitHub signing key temporarily unavailable")
         self.retry_after_seconds = retry_after_seconds
-
-
-def _retryable_transport(error):
-    # certificate validation and malformed request configuration are not outages
-    return (isinstance(error, (OSError, http.client.HTTPException))
-            and not isinstance(error, (ssl.SSLCertVerificationError, http.client.InvalidURL)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,11 +147,13 @@ def _fetch_official_jwks() -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         _require(remaining > 0)
+        if response.length not in (None, 0):
+            raise GitHubIdentityTransientError()
         if time.monotonic() > deadline:
             raise GitHubIdentityTransientError()
         return b"".join(chunks)
     except Exception as error:
-        if _retryable_transport(error):
+        if retryable_transport(error):
             raise GitHubIdentityTransientError() from None
         raise
     finally:
@@ -287,7 +284,7 @@ class GitHubIdentityVerifier:
             try:
                 self._keys = self._parse_keys(self._fetch())
             except Exception as error:
-                if isinstance(error, GitHubIdentityTransientError) or _retryable_transport(error):
+                if isinstance(error, GitHubIdentityTransientError) or retryable_transport(error):
                     self._refresh_transient = True
                     raise GitHubIdentityTransientError() from None
                 raise GitHubIdentityError("GitHub signing key unavailable") from None

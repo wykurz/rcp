@@ -672,7 +672,7 @@ class WireSocket:
 
 class TransportTests(unittest.TestCase):
     def test_fixed_tls_header_transport_disables_debug_and_bounds_body(self):
-        reply, connection = Mock(status=200), Mock()
+        reply, connection = Mock(status=200, length=0), Mock()
         reply.getheader.return_value = None
         reply.read1.side_effect = [b"{}", b""]
         connection.getresponse.return_value = reply
@@ -688,7 +688,7 @@ class TransportTests(unittest.TestCase):
 
     def test_late_headers_oversized_and_compressed_responses_close_transport(self):
         for mode in ("late", "oversized", "compressed"):
-            reply, connection = Mock(status=200), Mock()
+            reply, connection = Mock(status=200, length=0), Mock()
             reply.getheader.side_effect = lambda name: "gzip" if mode == "compressed" and name == "content-encoding" else None
             reply.read1.return_value = b"x" * (app.MAX_RESPONSE_BYTES + 1)
             connection.getresponse.return_value = reply

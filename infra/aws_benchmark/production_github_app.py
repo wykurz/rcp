@@ -24,8 +24,7 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from .common import retryable_io
-from .production_auth import _retryable_transport
+from .production_transport import retryable_transport
 from .production_github import (API_HOST, API_VERSION, MAX_RESPONSE_BYTES,
                                 GitHubRunError, GitHubRateLimitError, GitHubTransientError, _bounded_document)
 
@@ -147,6 +146,8 @@ def _https(method, path, headers, body, *, timeout, deadline, monotonic):
             chunks.append(chunk)
             remaining -= len(chunk)
         _require(remaining > 0)
+        if response.length not in (None, 0):
+            raise GitHubTransientError()
         if _number(monotonic()) >= deadline:
             raise GitHubTransientError()
         return Response(response.status, selected, b"".join(chunks))
@@ -217,7 +218,7 @@ class GitHubAppProvider:
             _suppress_sdk_debug()
             result = self._secrets.get_secret_value(SecretId=self.config.secret_arn, VersionStage="AWSCURRENT")
         except Exception as error:
-            if retryable_io(error):
+            if retryable_transport(error):
                 raise GitHubTransientError() from None
             raise
         observation.check()
@@ -328,7 +329,7 @@ class GitHubAppProvider:
             response = self._transport(method, path, headers, body, timeout=min(SOCKET_SECONDS, timeout),
                                        deadline=observation.deadline, monotonic=self._monotonic)
         except Exception as error:
-            if _retryable_transport(error):
+            if retryable_transport(error):
                 raise GitHubTransientError() from None
             raise
         observation.check()

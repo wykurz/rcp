@@ -79,6 +79,15 @@ def capacity_rejection(error):
             metadata.get("HTTPStatusCode") in (400, 500, 503))
 
 
+def definitive_rejection(error):
+    """A first nonretryable client rejection proves this fresh request allocated nothing."""
+    metadata = (getattr(error, "response", None) or {}).get("ResponseMetadata", {})
+    code, request_id, status = error_code(error), metadata.get("RequestId"), metadata.get("HTTPStatusCode")
+    return (isinstance(code, str) and bool(code) and type(status) is int and 400 <= status < 500 and
+            isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id) is not None and
+            code not in {"IdempotentParameterMismatch", "IdempotentInstanceTerminated"} and not retryable_io(error))
+
+
 def verify_launch_data(config, data):
     require(data.get("ImageId") == config.ami and data.get("InstanceType") == INSTANCE_TYPE and
             not data.get("InstanceMarketOptions") and not data.get("InstanceRequirements") and
@@ -314,7 +323,7 @@ class Service:
         self.save(state, revision)
         return False
 
-    def finish_launch(self, run, allocation, *, response=None, failure=None, not_sent=False):
+    def finish_launch(self, run, allocation, *, response=None, failure=None, not_sent=False, sender=1):
         require(sum((response is not None, failure is not None, not_sent is True)) == 1,
                 "exactly one launch outcome is required")
         def mutate(state):
@@ -336,24 +345,29 @@ class Service:
             elif state["launch_outcome"] == "accepted":
                 # positive evidence is monotonic, even after an uncertain response or write
                 return
-            elif (not_sent or capacity_rejection(failure)) and state.get("launch_replayed") is True:
-                # this sender's negative result cannot disprove a later same-token replay.
+            elif (not_sent or capacity_rejection(failure) or definitive_rejection(failure)) and durable.launch_sender(state)["sequence"] > sender:
+                # this sender's negative result cannot disprove a later same-token replay
                 return
-            elif not_sent or capacity_rejection(failure):
+            elif not_sent or capacity_rejection(failure) or definitive_rejection(failure):
                 require(not state["known_instance_ids"] and not state["seen"] and not state["binding"],
                         "no-allocation evidence conflicts with observed allocation")
-                if not not_sent:
+                if capacity_rejection(failure):
                     proof = dict(attempt=allocation["ordinal"], at=allocation["started_at"],
                                  request_id=failure.response["ResponseMetadata"]["RequestId"])
                     previous = [p for p in state["capacity_failures"] if p["attempt"] == allocation["ordinal"]]
                     require(not previous or previous == [proof], "capacity rejection evidence changed")
                     if not previous:
                         state["capacity_failures"].append(proof)
-                durable.launch_outcome(state, "not-sent" if not_sent else "capacity-rejected")
+                rejected = not not_sent and not capacity_rejection(failure)
+                durable.launch_outcome(state, "not-sent" if not_sent else "rejected" if rejected else "capacity-rejected")
+                if rejected:
+                    state["launch_rejection"] = dict(code=error_code(failure),
+                        request_id=failure.response["ResponseMetadata"]["RequestId"], at=timestamp(self.now()))
+                    state["close_reason"] = state["close_reason"] or "EC2 rejected allocation: " + error_code(failure)
                 self.expire_capacity(state)
                 state.update(phase="closing" if state["close_reason"] else "armed",
                              next_attempt_at=timestamp(self.now() + timedelta(seconds=durable.RETRY_SECONDS)))
-            elif state["launch_outcome"] not in ("capacity-rejected", "not-sent"):
+            elif state["launch_outcome"] not in ("capacity-rejected", "not-sent", "rejected"):
                 durable.launch_outcome(state, "uncertain")
                 state["phase"] = "closing" if state["close_reason"] else "uncertain"
         self.reconcile_launch(run, allocation, mutate, not_sent=not_sent)
@@ -361,8 +375,7 @@ class Service:
     def launch_allowed(self, request, observed, allocation=None):
         return (self.now() < utc(request["capacity_deadline"]) and
                 0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS and
-                (allocation is None or (utc(allocation["close_at"]) - self.now()).total_seconds() >=
-                 durable.minimum_runtime(request["plan"])))
+                (allocation is None or self.now() < utc(allocation["close_at"])))
 
     def launch_recovery_open(self, state):
         # the legacy controller never replays persisted unknown outcomes
@@ -371,24 +384,24 @@ class Service:
     def observe_closed_worker(self, state):
         """Allow production to preserve output commitments independently of useful runtime."""
 
-    def launch(self, request, allocation, observed, *, prior_uncertain=False):
-        uncertain = TimeoutError("previous launch outcome is unresolved") if prior_uncertain else None
+    def launch(self, request, allocation, observed, *, sender=1):
+        uncertain = TimeoutError("previous sender outcome is unresolved") if sender > 1 else None
         for retry in range(3):
             try:
                 # every retry uses the identical persisted parameters, token, region, subnet and cutoff
                 response = self.api["ec2"].run_instances(**allocation["parameters"])
             except Exception as error:
-                if capacity_rejection(error) and uncertain is None:
-                    self.finish_launch(request["run"], allocation, failure=error)
+                if (capacity_rejection(error) or definitive_rejection(error)) and uncertain is None:
+                    self.finish_launch(request["run"], allocation, failure=error, sender=sender)
                     return
                 uncertain = uncertain or error
                 if (not retryable_io(error) or not self.launch_allowed(request, observed, allocation) or
                         not self.backoff(error, retry, reserve=24) or not self.launch_allowed(request, observed, allocation)):
                     # no later negative response can erase an earlier unknown allocation
-                    self.finish_launch(request["run"], allocation, failure=uncertain)
+                    self.finish_launch(request["run"], allocation, failure=uncertain, sender=sender)
                     return
             else:
-                self.finish_launch(request["run"], allocation, response=response)
+                self.finish_launch(request["run"], allocation, response=response, sender=sender)
                 return
 
     def coordinator(self, event):
@@ -426,14 +439,16 @@ class Service:
         if not self.capacity_open(state, revision):
             return dict(state="wait", run=request["run"])
         state.update(phase="launching", execution_arn=event["execution_arn"], attempt=allocation,
-                     attempts=allocation["ordinal"])
+                     attempts=allocation["ordinal"], launch_sender=dict(sequence=1, at=allocation["started_at"]))
         durable.launch_outcome(state, "uncertain")
         try:
             self.save_launch_intent(state, revision)
         except Exception as error:
-            if retryable_io(error):
-                # RunInstances has not been called, including when this intent write committed invisibly
+            # any pre-send exception permits only exact not-sent reconciliation, never another send
+            try:
                 self.finish_launch(request["run"], allocation, not_sent=True)
+            except Exception as reconciliation_error:
+                raise error from reconciliation_error
             raise
         # a delayed intent write cannot refresh the saved deadline or bypass admission
         if not self.launch_allowed(request, observed):
@@ -454,7 +469,7 @@ class Service:
             root_volumes=roots or (prior["root_volumes"] if prior else []),
             state="terminated" if prior and prior["state"] == "terminated" else instance["State"]["Name"])
 
-    def observe(self, state, instances, *, allow_binding=True):
+    def observe(self, state, instances, *, allow_binding):
         request, now = state["request"], self.now()
         for instance in instances:
             self.remember_instance(state, instance)
@@ -468,9 +483,9 @@ class Service:
                 state["attempt"] is not None and state["allocation_consumed"]):
             try:
                 require(utc(instances[0]["LaunchTime"]) <= now, "future launch timestamp")
-                durable.validate_allocation_instance(request, instances[0], state["attempt"], reconciliation=True)
+                durable.validate_allocation_instance(request, instances[0], state["attempt"])
                 # positive identity evidence survives closure and later EC2 record expiry;
-                # it does not grant runtime, publish a mailbox or reopen a closing lease.
+                # it does not grant runtime, publish a mailbox or reopen a closing lease
                 durable.launch_outcome(state, "accepted")
                 if state["phase"] in ("launching", "uncertain") and not reason:
                     state["phase"] = "requested"
@@ -607,7 +622,7 @@ class Service:
                 except Exception as error:
                     policy_ready = False
                     failed(error)
-                # policy availability gates useful runtime, never physical observations.
+                # policy availability gates useful runtime, never physical observations
                 self.observe(state, relevant, allow_binding=policy_ready)
                 if policy_ready and not state["close_reason"]:
                     checkpoint()

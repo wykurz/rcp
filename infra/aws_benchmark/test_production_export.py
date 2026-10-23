@@ -78,6 +78,7 @@ class ExportTests(unittest.TestCase):
                 patch.object(common, "DURABLE_PLAN", future_plan), \
                 patch.object(export.results, "verification_contract", return_value={"future": "contract"}), \
                 patch.object(export.results, "SERIES_CONTRACT", "future-series-v2"), \
+                patch.object(export.results, "BINARY_NAMES", (*common.BINARY_NAMES, "future-tool")), \
                 patch.object(operations, "CONTRACT_REVISION", "future-operation-contract"), \
                 patch.object(operations, "SUMMARY_LOCALE", "future-locale"), \
                 patch.object(export.results, "inspect", side_effect=AssertionError("retired projection must not reparse")):
@@ -94,6 +95,7 @@ class ExportTests(unittest.TestCase):
                 bundle = self.reader.download(self.key)
                 manifest = json.loads(bundle.manifest_bytes)
                 report = json.loads(bundle.payloads["report.json"])
+                report["public_projection"] = {key: value for key, value in golden.items() if key != "retirement_sha256"}
                 if failed:
                     manifest["benchmark_valid"] = False
                     report["benchmark_valid"] = False
@@ -171,6 +173,30 @@ class ExportTests(unittest.TestCase):
         html = export.render(export.project(changed))
         self.assertNotIn("UNTRUSTED_RETAINED_HTML", html)
         self.assertNotIn("<script", html)
+
+    def test_current_publication_uses_collector_time_and_explicit_unattested_labels(self):
+        value = export.project(self.reader.download(self.key))
+        self.assertEqual(value["schema"], "rcp-production-public-report-v3")
+        self.assertEqual(value["collected_at"], common.timestamp(self.fx.collector.now()))
+        value["timestamp"] = "1999-01-01\u202e00:00:00+00:00"
+        value["measurements"][0].update(median=0.001, samples=[0.001, 0.001])
+        rendered = export.render(value)
+        self.assertIn("consistency checks passed", rendered)
+        self.assertIn("self-reported", rendered)
+        self.assertIn("not independently attested", rendered)
+        self.assertIn(value["collected_at"], rendered)
+        self.assertNotIn("1999-01-01", rendered)
+        self.assertNotIn("\u202e", rendered)
+        self.assertNotIn("<td>passed</td>", rendered)
+
+    def test_collector_time_requires_canonical_utc_while_legacy_records_stay_readable(self):
+        value = export.project(self.reader.download(self.key))
+        changed = dict(value, collected_at="2026-10-22\u202e00:00:00+00:00")
+        with self.assertRaisesRegex(ValueError, "trusted collection time"):
+            export.validate_public(changed)
+        legacy = json.loads((Path(__file__).with_name("fixtures") / "production-public-report-v1.json").read_text())
+        self.assertIn("unavailable (legacy record)", export.render(legacy))
+        self.assertIn("self-reported", export.render(legacy))
 
     def test_renderer_escapes_fields_and_rejects_untrusted_link(self):
         value = export.project(self.reader.download(self.key))

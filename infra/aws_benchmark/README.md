@@ -364,17 +364,19 @@ layouts and a 10,240,000-file tiny layout. The four large full-content suites ar
 correctness diagnostics and historical parsing, with distinct storage/verification identities; they
 cannot enter performance history and are disabled for new AWS windows because runtime within 60
 minutes has not been established. The separate `bulk-1g-metadata` performance suite reuses the 1 TB
-case with metadata/size validation and requires independent per-attempt approval before history
-staging. These suites require a new reviewed AMI and an independently authorized, bounded
-qualification window.
+case with metadata/size validation. The legacy offline history gate requires independent per-attempt
+approval; the separate, initially disabled [production publisher](PRODUCTION.md) has its own
+reviewed publication authorization and history-protection gates. These suites require a new reviewed
+AMI and an independently authorized, bounded qualification window.
 
 ## Result reports
 
 The read-only report job validates bounded evidence and produces a standalone report with separate
 candidate, baseline, controller and baked-worker provenance. Raw results remain unchanged. See
 [result ingestion and reporting](RESULTS.md) for artifact contents, cancellation behavior, parser
-limits, the security boundary and offline-only future history staging. No history publisher is
-enabled, and Depot workflows remain operational.
+limits, the security boundary and legacy offline history staging. The separate production publisher
+remains disabled pending its acceptance gates. Depot benchmarking is retired; ordinary Depot builds
+and non-benchmark tests remain available.
 
 ## Offline validation and first live acceptance
 

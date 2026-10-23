@@ -20,11 +20,11 @@ import time
 from benchmarks.strict_json import parse_json
 
 from . import durable
-from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RevisionConflict, digest, durable_plan_contract, error_code, get_bytes,
+from .common import (BINARIES, MAX_BINARY, RevisionConflict, digest, durable_plan_contract, error_code, get_bytes,
                      pending_status, require, timestamp, utc)
 from .durable_aws import AllocationDeferred, Configuration, Service, clients, transient
 from .production_mailbox import MailboxPaths
-from .production_objects import Objects
+from .production_objects import Objects, committed_status
 from .production_store import MAX_STATE_BYTES, RunStore
 from .production_startup import verify_startup
 
@@ -90,13 +90,9 @@ class ProductionService(Service):
         return super().coordinator({key: event[key] for key in ("run", "execution_arn", "execution_name")})
 
     def launch_recovery_open(self, state):
-        allocation = state.get("attempt")
-        return (state["phase"] in ("launching", "uncertain") and state["launch_outcome"] == "uncertain" and
-                state["allocation_consumed"] and allocation is not None and not state["binding"] and
-                not state["known_instance_ids"] and not state["seen"] and not state["close_reason"] and
-                utc(allocation["started_at"]) <= self.now() < utc(state["request"]["capacity_deadline"]) and
-                (utc(allocation["close_at"]) - self.now()).total_seconds() >=
-                durable.minimum_runtime(state["request"]["plan"]))
+        return (durable.unresolved_launch(state) and
+                utc(state["attempt"]["started_at"]) <= self.now() < min(
+                    utc(state["request"]["capacity_deadline"]), utc(state["attempt"]["close_at"])))
 
     def retry_launch(self, state):
         if not self.launch_recovery_open(state):
@@ -114,12 +110,12 @@ class ProductionService(Service):
         if current != state or not self.launch_recovery_open(current):
             return
         observed = self.fresh_guard()
-        # the monotonic replay marker fences delayed negative proof from an older sender;
-        # a lost checkpoint response never grants this invocation permission to send.
-        current["launch_replayed"] = True
+        # a numbered sender fences delayed negative proof; a lost checkpoint reply cannot authorize a send
+        current["launch_sender"] = dict(sequence=durable.launch_sender(current)["sequence"] + 1,
+                                        at=timestamp(self.now()))
         self.store.save_launch_retry(current, revision)
         if self.launch_recovery_open(current) and self.launch_allowed(request, observed, allocation):
-            self.launch(request, allocation, observed, prior_uncertain=True)
+            self.launch(request, allocation, observed, sender=current["launch_sender"]["sequence"])
 
     def sealed_inputs(self, state):
         sealed = state.get("sealed_inputs")
@@ -212,10 +208,7 @@ class ProductionService(Service):
         paths, objects = self.paths(state), Objects(self.api["s3"], self.config.bucket)
         committed = state.get("worker_output")
         if committed is not None:
-            require(isinstance(committed, dict) and set(committed) == {"status", "results"},
-                    "worker output commitment differs")
-            data = objects.referenced(committed["status"], paths.status, 16_384)
-            reference = committed["status"]
+            data, reference, _ = committed_status(committed, paths.status)
         else:
             observed = objects.read(paths.status, 16_384, optional=True)
             if observed is None:
@@ -229,17 +222,14 @@ class ProductionService(Service):
             require(isinstance(value.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]),
                     "production status has no valid archive digest")
         if committed is None:
-            archive = objects.head(paths.results, MAX_RESULT, sha256=value["sha256"]) if "sha256" in value else None
-            state["worker_output"] = dict(status=reference, results=archive)
-        else:
-            require((committed["results"] is None and "sha256" not in value) or
-                    (isinstance(committed["results"], dict) and committed["results"].get("key") == paths.results and
-                     committed["results"].get("sha256") == value.get("sha256")), "archive commitment differs from status")
+            commitment = dict(status=reference, data_base64=base64.b64encode(data).decode("ascii"))
+            committed_status(commitment, paths.status)
+            state["worker_output"] = commitment
         return value
 
     def observe_closed_worker(self, state):
         if state["phase"] == "closing" and state["binding"] and not state.get("worker_output"):
-            # closure reason is not an evidence inventory; preserve late successful or failed output alike.
+            # closure reason is not an evidence inventory; preserve late successful or failed output alike
             self.read_worker_status(state)
 
     def watchdog_state(self, state, instances):
@@ -256,7 +246,7 @@ class ProductionService(Service):
 
     def root_cleanup(self, state):
         # exact-ID disappearance is useful only after every launch/producer horizon,
-        # and only together with the already bound root's independent deletion proof.
+        # and only together with the already bound root's independent deletion proof
         after = utc(state["request"]["outer_deadline"]) + timedelta(
             seconds=durable_plan_contract(state["request"]["plan"])["delivery_drain_seconds"])
         require(self.now() >= after, "physical reconciliation horizon has not passed")
@@ -278,8 +268,7 @@ class ProductionService(Service):
                 require(not response.get("NextToken") and len(instances) == 1 and instances[0].get("InstanceId") == identity and
                         instances[0].get("State", {}).get("Name") == "terminated",
                         "exact instance probe did not prove termination")
-                durable.validate_allocation_instance(candidate["request"], instances[0], candidate["attempt"],
-                                                     reconciliation=True)
+                durable.validate_allocation_instance(candidate["request"], instances[0], candidate["attempt"])
                 roots = [entry["Ebs"]["VolumeId"] for entry in instances[0].get("BlockDeviceMappings", [])
                          if "Ebs" in entry and entry.get("DeviceName") == instances[0].get("RootDeviceName")]
                 require((seen["launch_at"] is None or seen["launch_at"] == timestamp(instances[0]["LaunchTime"])) and

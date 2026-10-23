@@ -273,10 +273,8 @@ def aws_benchmark_pages(repository):
             '<p><a href="../index.html">AWS benchmark history</a> · '
             f'<a href="../records/{run_key}.json">Public JSON record</a> · '
             '<a href="../../index.html#top">RCP Tools</a></p>')
-        qualification = ('unavailable; workload outcome unknown'
-                         if value.get('qualification_outcome') == 'evidence-unavailable' else
-                         'passed' if value['benchmark_valid'] else 'failed; excluded from performance history')
-        fields = (identity['run'], value.get('timestamp', '—'), identity['suite'], value['comparison'], qualification)
+        qualification = production_export.projection.outcome_label(value)
+        fields = (identity['run'], production_export.projection.collected_time(value), identity['suite'], value['comparison'], qualification)
         cells = '<td><a href="runs/' + run_key + '.html">' + html.escape(fields[0]) + '</a></td>'
         cells += ''.join('<td>' + html.escape(field) + '</td>' for field in fields[1:])
         rows.append('<tr>' + cells + '</tr>')
@@ -287,11 +285,12 @@ def aws_benchmark_pages(repository):
 <body><a class="skip-link" href="#report-content">Skip to report</a>
 {site_header(Path('aws-benchmarks/index.html'), has_aws_history=True)}
 <main id="report-content"><h1>AWS benchmark history</h1>
-<p>Retired AWS qualifications with verified cleanup. Failed qualifications and unavailable evidence remain
+<p>Retired AWS runs with verified resource termination. Failed consistency checks and unavailable evidence remain
 visible and are excluded from performance history. These records are separate from historical Depot measurements.</p>
+<p>{html.escape(production_export.projection.MEASUREMENT_CAVEAT)}</p>
 <p>{html.escape(production_export.VALIDATION)} Four copies form two local pairs; a small run does not
 establish broad variance. Compare only matching workload and measurement contracts.</p>
-<div class="table-scroll"><table><thead><tr><th>Run</th><th>Recorded at</th><th>Suite</th>
+<div class="table-scroll"><table><thead><tr><th>Run</th><th>Collected at</th><th>Suite</th>
 <th>Comparison</th><th>Qualification</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 <p>History commit: <code>{html.escape(commit)}</code></p></main></body></html>
 '''

@@ -21,8 +21,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from benchmarks.strict_json import parse_json
-from .common import BINARIES, Budget, require, retryable_io, utc
+from .common import BINARIES, Budget, require, utc
 from .controller import oidc_session, read_binary
+from .production_transport import retryable_transport
 
 MAX_RESPONSE = 65536
 LAMBDA_READ_TIMEOUT = 60  # exceeds the admission function's 45-second execution limit
@@ -48,14 +49,6 @@ def lambda_config():
                   retries={"total_max_attempts": 1}, proxies={}, ignore_configured_endpoint_urls=True)
 
 
-def transport_retryable(error):
-    # certificate identity failures cannot be repaired by replaying the same request
-    if isinstance(error, ssl.SSLCertVerificationError) or (
-            isinstance(error, urllib.error.URLError) and isinstance(error.reason, ssl.SSLCertVerificationError)):
-        return False
-    return isinstance(error, (ssl.SSLError, http.client.HTTPException)) or retryable_io(error)
-
-
 def reconcile(operation, *, deadline, reserve, clock, sleep):
     """Bound same-attempt retries; an exhausted/ambiguous result never releases ownership."""
     for attempt in range(MAX_INVOKE_ATTEMPTS):
@@ -63,7 +56,7 @@ def reconcile(operation, *, deadline, reserve, clock, sleep):
         try:
             return operation()
         except Exception as error:
-            if not isinstance(error, AdmissionRetryable) and not transport_retryable(error):
+            if not isinstance(error, AdmissionRetryable) and not retryable_transport(error):
                 raise
             require(attempt < len(RETRY_DELAYS), "submission reconciliation remains pending; retain receipt")
             delay = max(RETRY_DELAYS[attempt], getattr(error, "delay", 0))
@@ -94,7 +87,9 @@ def token(audience):
     with opener().open(request, timeout=TOKEN_READ_TIMEOUT) as response:
         require(response.status == 200, "GitHub token request failed")
         data = response.read(MAX_RESPONSE + 1)
-    require(len(data) <= MAX_RESPONSE, "GitHub token response exceeds bound")
+        require(len(data) <= MAX_RESPONSE, "GitHub token response exceeds bound")
+        if response.length not in (None, 0):
+            raise AdmissionRetryable()
     value = parse_json(data.decode("utf-8")).get("value")
     require(isinstance(value, str) and 0 < len(value) <= 16384 and value.isascii(), "invalid GitHub token response")
     return value

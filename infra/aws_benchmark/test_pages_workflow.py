@@ -69,7 +69,8 @@ class PagesWorkflowTests(unittest.TestCase):
         for required in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                          "vars.RCP_BENCHMARK_PAGES == 'true'"):
             self.assertIn(required, self.job["if"])
-        self.assertEqual(self.step["if"], "vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'")
+        self.assertEqual(self.step["if"], "vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'")
+        self.assertIn("github.run_attempt == '1'", self.job["if"])
         checkouts = [step["with"] for step in self.job["steps"] if step.get("uses", "").startswith("actions/checkout@")]
         self.assertEqual(checkouts[0]["ref"], "${{ steps.source.outputs.commit }}")
         self.assertEqual(self.job["steps"][0]["id"], "source")
@@ -103,7 +104,7 @@ class PagesWorkflowTests(unittest.TestCase):
         guard = next(step for step in self.job["steps"] if step.get("id") == "current_main")
         self.assertEqual(guard["env"]["PAGES_SOURCE_COMMIT"], "${{ steps.source.outputs.commit }}")
 
-    def test_main_advance_during_render_fails_visibly_without_offering_deployment(self):
+    def test_main_advance_during_render_warns_and_skips_before_upload(self):
         older = self.seed()
         self.git("update-ref", "refs/heads/main", older)
         self.assertEqual(self.resolve_main().returncode, 0)
@@ -112,21 +113,39 @@ class PagesWorkflowTests(unittest.TestCase):
         newer = self.git("commit-tree", tree, "-p", older, "-m", "Concurrent merge")
         self.git("update-ref", "refs/heads/main", newer)
         stale = self.main_guard(older)
-        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(stale.returncode, 0, stale.stderr)
         self.assertEqual(self.output.read_text(), "current=false\n")
         summary = (self.root / "summary").read_text()
-        self.assertIn("Pages deployment blocked", summary)
-        self.assertIn("Re-run", summary)
+        self.assertIn("Pages deployment skipped", summary)
+        self.assertIn("fresh workflow dispatch", summary)
         self.assertIn(older, summary)
         self.assertIn(newer, summary)
-        self.assertIn("::error::", stale.stdout)
+        self.assertIn("::warning::", stale.stdout)
         steps = self.job["steps"]
         guard_index = next(i for i, step in enumerate(steps) if step.get("id") == "current_main")
-        deployment = steps[guard_index + 1]
+        deployment = next(step for step in steps if step.get("id") == "deployment")
+        upload_index = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertLess(guard_index, upload_index)
+        self.assertEqual(steps[upload_index]["if"], "steps.current_main.outputs.current == 'true'")
         self.assertTrue(deployment["uses"].startswith("actions/deploy-pages@"))
         self.assertEqual(deployment["if"], "steps.current_main.outputs.current == 'true'")
         self.assertEqual(self.workflow["concurrency"],
                          {"group": "benchmark-pages-publish", "cancel-in-progress": "false"})
+
+    def test_stale_pinned_history_cannot_roll_back_a_newer_deployment(self):
+        older = self.seed()
+        self.git("update-ref", "refs/heads/main", older)
+        tree = self.git("mktree", source="")
+        newer = self.git("commit-tree", tree, "-p", older, "-m", "Newer history")
+        self.git("update-ref", "refs/heads/aws-benchmark-history", newer)
+        result = self.main_guard(older, PAGES_AWS_HISTORY=str(self.root / "history.git"), PAGES_HISTORY_COMMIT=older)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "current=false\n")
+        self.assertIn("::warning::", result.stdout)
+        self.output.unlink()
+        result = self.main_guard(older, PAGES_AWS_HISTORY=str(self.root / "history.git"), PAGES_HISTORY_COMMIT=newer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), "current=true\n")
 
     def test_main_ref_suffixes_do_not_mask_or_impersonate_the_exact_branch(self):
         commit = self.seed()
@@ -166,7 +185,7 @@ class PagesWorkflowTests(unittest.TestCase):
         ref = subprocess.check_output([self.real_git, "--git-dir=" + str(history), "rev-parse",
             "refs/heads/aws-benchmark-history"], text=True).strip()
         self.assertEqual(ref, commit)
-        self.assertEqual(self.output.read_text(), "path=" + str(history) + "\n")
+        self.assertEqual(self.output.read_text(), "path=" + str(history) + "\ncommit=" + commit + "\n")
         calls = [json.loads(line) for line in self.commands.read_text().splitlines()]
         self.assertFalse(any("checkout" in call or "ls-remote" in call for call in calls))
         self.assertEqual(next(call[-1] for call in calls if "fetch" in call), commit)

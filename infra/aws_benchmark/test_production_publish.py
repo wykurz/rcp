@@ -36,6 +36,41 @@ class PublishTests(unittest.TestCase):
         digest = publish.export(downloaded, {}, exported, REVISION, bound)
         return downloaded, bound, exported, digest
 
+    def test_download_and_export_cli_emit_exact_workflow_outputs(self):
+        downloaded, exported = self.root / "cli-download", self.root / "cli-export"
+        output = self.root / "github-output"
+        summary = self.root / "github-summary"
+        common = ["--history", str(self.repository), "--reader-revision", REVISION]
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}), \
+                patch("infra.aws_benchmark.controller.oidc_session", return_value=(Mock(), Mock())), \
+                patch.object(publish.publication, "Reader", return_value=self.reader):
+            with patch("sys.argv", ["publication", "download", *common, "--region", "us-east-1",
+                    "--role", "arn:aws:iam::123456789012:role/reader", "--bucket", "example",
+                    "--table", "example", "--output", str(downloaded)]):
+                publish.main()
+            bound = publish.inventory(downloaded)
+            self.assertEqual(output.read_text(), "inventory_sha256=" + bound + "\nreader_revision=" + REVISION + "\n")
+            output.write_text("")
+            with patch("sys.argv", ["publication", "export", *common, "--input", str(downloaded),
+                    "--output", str(exported), "--expected-sha256", bound]):
+                publish.main()
+            self.assertEqual(output.read_text(), "inventory_sha256=" + publish.inventory(exported) +
+                             "\nreader_revision=" + REVISION + "\n")
+            self.assertTrue((exported / (self.fx.store.record.run_key + ".json")).is_file())
+            text = summary.read_text()
+            self.assertIn('"candidate":"' + self.fx.store.record.state["request"]["candidate"] + '"', text)
+            self.assertIn('"median":', text)
+            self.assertIn('"collected_at":', text)
+            self.assertIn("not independently attested", text)
+
+    def test_workflow_output_rejects_command_delimiters_and_invalid_keys(self):
+        output = self.root / "outputs"
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            for values in ({"1invalid": "value"}, {"valid": "line\nbreak"}, {"valid": "line\rbreak"}):
+                with self.subTest(values=values), self.assertRaisesRegex(ValueError, "invalid workflow output"):
+                    publish.outputs(**values)
+        self.assertEqual(output.read_text(), "")
+
     def test_end_to_end_offline_append_and_exact_replay(self):
         downloaded, bound, exported, digest = self.batch()
         commit = publish.publish(exported, self.repository, REVISION, digest)

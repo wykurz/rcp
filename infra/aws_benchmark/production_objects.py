@@ -3,6 +3,31 @@
 import base64
 
 from .common import digest, require
+from .results import json_value
+
+
+MAX_COMMITTED_STATUS = 16 * 1024
+
+
+def committed_status(commitment, key):
+    """Recover exact service-committed bytes without relying on mailbox retention."""
+    require(isinstance(commitment, dict) and set(commitment) == {"status", "data_base64"} and
+            isinstance(commitment["data_base64"], str), "worker output commitment differs")
+    encoded = commitment["data_base64"]
+    require(0 < len(encoded) <= 4 * ((MAX_COMMITTED_STATUS + 2) // 3) and encoded.isascii(),
+            "committed status encoding exceeds bound or is not ASCII")
+    raw, ref = base64.b64decode(encoded, validate=True), commitment["status"]
+    require(base64.b64encode(raw).decode("ascii") == encoded, "committed status encoding is not canonical")
+    require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
+            ref["key"] == key and isinstance(ref["version"], str) and
+            ref["version"] not in ("", "null") and len(ref["version"]) <= 1024 and
+            all(32 < ord(char) < 127 for char in ref["version"]) and
+            0 < len(raw) <= MAX_COMMITTED_STATUS and type(ref["bytes"]) is int and
+            ref["bytes"] == len(raw) and ref["sha256"] == digest(raw),
+            "committed status bytes or reference differ")
+    value = json_value(raw, MAX_COMMITTED_STATUS)
+    require(isinstance(value, dict), "committed status is not an object")
+    return raw, ref, value
 
 
 class Objects:
@@ -45,19 +70,6 @@ class Objects:
         finally:
             body.close()
         return raw, dict(key=key, version=found, sha256=sha256, bytes=len(raw))
-
-    def head(self, key, limit, *, sha256):
-        """Commit exact immutable source metadata; read() still verifies its bytes later."""
-        response = self.api.head_object(Bucket=self.bucket, Key=key, ChecksumMode="ENABLED")
-        size, version = response.get("ContentLength"), response.get("VersionId")
-        require(type(size) is int and 0 < size <= limit and isinstance(version, str) and
-                version not in ("", "null") and len(version) <= 1024 and
-                all(32 < ord(char) < 127 for char in version) and
-                response.get("ServerSideEncryption") == "AES256" and
-                response.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT" and
-                response.get("ChecksumSHA256") == base64.b64encode(bytes.fromhex(sha256)).decode(),
-                "object commitment metadata differs")
-        return dict(key=key, version=version, sha256=sha256, bytes=size)
 
     def once(self, key, raw, limit):
         require(isinstance(raw, bytes) and 0 < len(raw) <= limit, "retained object exceeds bound")

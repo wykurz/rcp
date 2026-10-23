@@ -148,6 +148,20 @@ class ReportSiteTests(unittest.TestCase):
                 if url.fragment and target.suffix == '.html':
                     self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
 
+    def test_public_history_explains_unattested_timings_and_hides_legacy_worker_time(self):
+        value = self.aws_record()
+        value['timestamp'] = '1999-01-01\u202e00:00:00+00:00'
+        history = self.aws_history({value['run_key'] + '.json': ('100644', value)})
+        result = self.build('--aws-history', str(history))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for relative in ('aws-benchmarks/index.html', 'aws-benchmarks/runs/' + value['run_key'] + '.html'):
+            text = (self.output / relative).read_text()
+            self.assertIn('consistency checks passed', text)
+            self.assertIn('not independently attested', text)
+            self.assertIn('self-reported', text)
+            self.assertNotIn('1999-01-01', text)
+            self.assertNotIn('\u202e', text)
+
     def test_unavailable_evidence_is_not_labeled_as_a_failed_workload(self):
         value = self.aws_record('125', passed=False)
         value.update(schema='rcp-production-public-report-v2', qualification_outcome='evidence-unavailable',

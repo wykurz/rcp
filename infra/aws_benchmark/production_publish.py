@@ -355,12 +355,12 @@ def outputs(**values):
     if path:
         with open(path, "a", encoding="utf-8") as stream:
             for key, value in values.items():
-                require(re.fullmatch(r"[a-z_]+", key) and isinstance(value, str) and "\n" not in value,
+                require(re.fullmatch(r"[a-z][a-z0-9_]*", key) and isinstance(value, str) and "\n" not in value and "\r" not in value,
                         "invalid workflow output")
                 stream.write(key + "=" + value + "\n")
 
 
-def summary(index):
+def summary(index, records=()):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         counts = {state: sum(item["state"] == state for item in index["observations"])
@@ -374,7 +374,20 @@ def summary(index):
                 reason = encoded(item.get("reason", "unspecified")).decode().strip()
                 reason = reason.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "&#96;")
                 text += "- " + item.get("run_key", "unnamed") + ": " + item["state"] + " — `" + reason + "`\n"
-        text += "\nThese are observations, not a new teardown proof. Metadata validation does not prove content integrity.\n"
+        for value in records:
+            public.validate_public(value)
+            detail = dict(run=value["identity"]["run"], baseline=value["identity"]["baseline"],
+                candidate=value["identity"]["candidate"], comparison=value["comparison"],
+                collected_at=public.projection.collected_time(value),
+                qualification=public.projection.outcome_label(value),
+                measurements=[{key: item[key] for key in ("case_id", "variant_id", "median")} for item in value["measurements"]])
+            rendered = encoded(detail).decode().strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "&#96;")
+            if len(text.encode()) + len(rendered.encode()) > 60000:
+                text += "\nFurther record details are available in the bounded public JSON artifact.\n"
+                break
+            text += "\n- Exported record: `" + rendered + "`\n"
+        text += "\nThese are observations, not a new teardown proof. Metadata validation does not prove content integrity. "
+        text += public.projection.MEASUREMENT_CAVEAT + "\n"
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(text)
 
@@ -413,7 +426,11 @@ def main():
         commit = publish(args.input, args.history, args.reader_revision, args.expected_sha256)
         outputs(commit=commit)
         return
-    summary(index)
+    records = []
+    if args.phase == "export":
+        records = [collection.results.json_value(read(args.output / (ref["run_key"] + ".json"), public.MAX_PUBLIC_RECORD))
+                   for ref in index["records"]]
+    summary(index, records)
     outputs(inventory_sha256=value, reader_revision=args.reader_revision)
 
 
