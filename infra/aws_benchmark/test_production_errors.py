@@ -41,7 +41,7 @@ class ErrorClassificationTests(unittest.TestCase):
                         [{"Code": "TransactionConflict"}, {}], [None], [{"Code": None}],
                         [{"Code": ["TransactionConflict"]}], {"Code": "TransactionConflict"}):
             with self.subTest(reasons=reasons):
-                # a contradictory HTTP status cannot override a known permanent reason.
+                # a contradictory HTTP status cannot override a known permanent reason
                 self.assertFalse(retryable_io(api_error("TransactionCanceledException", reasons=reasons, status=500)))
 
     def test_transport_throttle_and_server_errors_remain_retryable(self):

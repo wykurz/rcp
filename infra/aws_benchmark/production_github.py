@@ -1,8 +1,8 @@
 """Read and bind authenticated GitHub run metadata to a verified admission identity.
 
-The attempt endpoint's created_at is the attempt creation time on reruns. The
-run endpoint preserves the original creation time, so both responses are checked
-and only the run endpoint supplies the admission age proof.
+The run endpoint preserves the original creation time on reruns and identifies
+the current attempt. Admission binds that single fresh response to the exact
+signed attempt; historical attempt reads are reserved for terminal collection.
 
 REST contract: https://docs.github.com/en/rest/actions/workflow-runs
 Production readers require an authenticated observation factory. Each observation
@@ -19,7 +19,8 @@ import re
 import time
 
 from benchmarks.strict_json import parse_json
-from .production_auth import VerifiedGitHubIdentity, _retryable_transport
+from .production_auth import VerifiedGitHubIdentity
+from .production_transport import retryable_transport
 from .production_policy import WorkflowRun
 
 
@@ -92,7 +93,7 @@ class GitHubRunReader:
 
     Trust settings match the JWT verifier. Production supplies observation_factory;
     explicit raw fetcher injection is reserved for trusted tests/integration.
-    The clock is sampled after both network reads finish.
+    The clock is sampled after the fresh network read finishes.
     """
 
     def __init__(self, *, repository: str, repository_id: str, repository_owner_id: str,
@@ -119,18 +120,16 @@ class GitHubRunReader:
                          and identity.repository_owner == self._repository.split("/")[0])
                 _require(_matches(_ID, identity.run_id) and _matches(_ID, identity.run_attempt))
                 path = f"/repos/{self._repository}/actions/runs/{identity.run_id}"
-                attempt = _document(fetch(path + "/attempts/" + identity.run_attempt))
-                # read current run last: it must still identify this exact active attempt
+                # the current response binds original age and the exact signed active attempt
                 original = _document(fetch(path))
                 seconds = self._clock()
                 _require(type(seconds) in (int, float) and math.isfinite(seconds) and seconds > 0)
                 now = datetime.fromtimestamp(seconds, timezone.utc)
-                WorkflowRun.verify(attempt, identity, now)
                 return WorkflowRun.verify(original, identity, now)
         except (GitHubRateLimitError, GitHubTransientError):
             raise
         except Exception as error:
-            if _retryable_transport(error):
+            if retryable_transport(error):
                 raise GitHubTransientError() from None
             raise GitHubRunError("GitHub workflow run could not be verified") from None
 
@@ -177,6 +176,6 @@ class TerminalProducerReader(GitHubRunReader):
         except (GitHubRateLimitError, GitHubTransientError):
             raise
         except Exception as error:
-            if _retryable_transport(error):
+            if retryable_transport(error):
                 raise GitHubTransientError() from None
             raise GitHubRunError("GitHub terminal producer could not be verified") from None

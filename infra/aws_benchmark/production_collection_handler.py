@@ -11,11 +11,9 @@ import os
 import json
 import re
 
-from .common import require, error_code
+from .common import require
 from .durable_aws import Configuration, clients
-from .results import diagnostic
-from .production_errors import transient
-from .production_collection import Collector
+from .production_collection import Collector, held_diagnostic
 from .production_github import TerminalProducerReader
 from .production_github_app import GitHubAppConfig, cached_provider
 from .production_runtime import ProductionService
@@ -63,13 +61,10 @@ def lambda_handler(event, context):
         result = collect_active(collection_clients(config.region), config,
                                 os.environ["RCP_PRODUCTION_MACHINE_ARN"], reader)
         if result.get("state") == "held":
-            print(json.dumps(dict(event="production_collection_held", reason=result.get("reason", "unknown")[:256])))
+            print(json.dumps(dict(event="production_collection_held", **{key: result[key] for key in
+                ("reason", "category", "retryable", "service_error") if key in result}), sort_keys=True))
         return result
     except Exception as error:
-        detail = dict(event="production_collection_held", category=type(error).__name__,
-                      reason=diagnostic(error)[:256], retryable=transient(error))
-        code = error_code(error)
-        if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9.]{0,79}", code):
-            detail["service_error"] = code
+        detail = dict(event="production_collection_held", **held_diagnostic(error))
         print(json.dumps(detail, sort_keys=True))
         return dict(state="held", retired=False, reason="collection requires reconciliation")

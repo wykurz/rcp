@@ -154,10 +154,13 @@ receipt shape, chronology and identity/hash bindings, without reapplying the che
 window-duration or binary-admission limits to historical receipts. Admission limits are enforced by
 the operator, controller and worker when the benchmark runs.
 
-Future history admission is implemented **only as an offline gate and local staging operation**.
-There is no activated publisher, write permission or dispatch to Pages. `benchmarks.publish` is a
-storage helper, not a provenance gate; never feed it arbitrary AWS worker files or a diagnostic
-record. A later publisher requires a separate reviewed authorization design.
+The legacy history-admission path below is an offline gate and local staging operation.
+`benchmarks.publish` is a storage helper, not a provenance gate; never feed it arbitrary AWS worker
+files or a diagnostic record. The separate [production publisher](PRODUCTION.md) prepares a bounded
+retired-evidence pipeline and public pages, initially disabled. Its history-writer authorization and
+live acceptance gates require separate approval before activation. Both paths must disclose that
+candidate-controlled measurements are self-reported and unattested; consistency and cleanup checks
+do not prove measurement honesty.
 
 For an offline staging test, an independently reviewed per-attempt policy has exactly these fields:
 

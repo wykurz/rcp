@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   download:
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -32,6 +32,7 @@ jobs:
           assert os.environ['GITHUB_REF'] == 'refs/heads/main'
           assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
           assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
           assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
           assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
           assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA']
@@ -45,7 +46,9 @@ jobs:
           history="$RUNNER_TEMP/download-history.git"
           git init --bare "$history"
           if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/download-history-ref"; then
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/download-history-ref"; then
+              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            fi
           else
             code=$?
             test "$code" -eq 2
@@ -77,7 +80,7 @@ jobs:
 
   export:
     needs: download
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -104,6 +107,7 @@ jobs:
           assert os.environ['GITHUB_REF'] == 'refs/heads/main'
           assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
           assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
           assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
           assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
           assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
@@ -125,7 +129,9 @@ jobs:
           history="$RUNNER_TEMP/export-history.git"
           git init --bare "$history"
           if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/history-ref"; then
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/history-ref"; then
+              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            fi
           else
             code=$?
             test "$code" -eq 2
@@ -149,7 +155,7 @@ jobs:
 
   publish:
     needs: export
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -181,6 +187,7 @@ jobs:
           assert os.environ['GITHUB_REF'] == 'refs/heads/main'
           assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
           assert os.environ['GITHUB_ACTOR_ID'] == '483465'
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
           assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
           assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
           assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
@@ -209,8 +216,10 @@ jobs:
             git init --bare "$history"
             has_history=false
             if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-$attempt"; then
-              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-              has_history=true
+              if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-$attempt"; then
+                git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+                has_history=true
+              fi
             else
               code=$?
               test "$code" -eq 2
@@ -253,7 +262,7 @@ jobs:
 
   pages:
     needs: publish
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
     permissions:
       contents: read
       pages: write

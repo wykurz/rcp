@@ -3,7 +3,7 @@
 import re
 
 from . import results
-from .common import digest, require
+from .common import digest, durable_plan_contract, require, timestamp
 from .json_bytes import encoded
 
 SCHEMA = "rcp-production-public-report-v1"
@@ -16,6 +16,10 @@ PUBLIC_CONTRACTS = {
         "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
         "series_contract": "aws-local-ext4-v1",
     },
+    "rcp-production-public-report-v3": {
+        "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
+        "series_contract": "aws-local-ext4-v1",
+    },
     "rcp-production-public-report-v2": {
         "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
         "series_contract": "aws-local-ext4-v1",
@@ -25,16 +29,58 @@ VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 
 
 
-def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execution_status=None):
+MEASUREMENT_CAVEAT = ("Measurements are self-reported by the benchmark worker and are not independently attested. "
+    "Candidate code can alter measurement files; consistency checks and verified resource cleanup do not prove honest timings.")
+
+
+def comparison_label(identity, controller):
+    """Derive frozen comparison wording from the recorded plan's binary contract."""
+    if identity["baseline"] != identity["candidate"]:
+        return "A/B (different source revisions)"
+    request = controller.get("request")
+    if not isinstance(request, dict):
+        return "Same source revision; binary identity unavailable"
+    window = controller.get("window")
+    require(isinstance(window, dict), "recorded comparison window is unavailable")
+    names = durable_plan_contract(window.get("plan"), exact=False)["binary_names"]
+    hashes = request.get("sha256")
+    if not isinstance(hashes, dict) or not all(isinstance(hashes.get(role + "/" + name), str) and
+            re.fullmatch(r"[0-9a-f]{64}", hashes[role + "/" + name])
+            for role in ("baseline", "candidate") for name in names):
+        return "Same source revision; binary identity unavailable"
+    if all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in names):
+        return "A/A (identical source revision and binary digests)"
+    return "Same source revision; different binary digests (not A/A)"
+
+
+def qualification_outcome(value):
+    return value.get("qualification_outcome", "passed" if value["benchmark_valid"] else "failed")
+
+
+def outcome_label(value):
+    if value.get("qualification_outcome") == "evidence-unavailable":
+        return "unavailable; workload outcome unknown"
+    return "consistency checks passed" if value["benchmark_valid"] else "failed; excluded from performance history"
+
+
+def collected_time(value):
+    return value.get("collected_at", "unavailable (legacy record)")
+
+
+def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execution_status=None, collected_at=None):
     """Create a public projection at qualification time, before validators can drift."""
-    schema = "rcp-production-public-report-v2" if outcome == "evidence-unavailable" else SCHEMA
+    schema = "rcp-production-public-report-v3" if collected_at is not None else (
+        "rcp-production-public-report-v2" if outcome == "evidence-unavailable" else SCHEMA)
     contract = PUBLIC_CONTRACTS[schema]
     value = dict(schema=schema, run_key=run_key, retirement_sha256="0" * 64,
         benchmark_valid=valid, cleanup_verified=True, validation=contract["validation"],
         identity={key: identity[key] for key in ("run", "run_url", "suite", "baseline", "candidate", "controller")},
-        comparison=results.comparison_label(identity, evidence["controller"]), measurements=[],
+        comparison=comparison_label(identity, evidence["controller"]), measurements=[],
         series_contract=contract["series_contract"],
         note="Four copies form two local pairs; this small run does not establish broad variance.")
+    if collected_at is not None:
+        value.update(collected_at=timestamp(results.utc(collected_at)),
+                     qualification_outcome=outcome or ("passed" if valid else "failed"))
     if valid:
         require(raw is not None and raw["status"] == "complete", "successful projection requires complete measurements")
         value["measurements"] = [{
@@ -75,11 +121,15 @@ def validate_public(value):
             value.get("validation") == contract["validation"], "invalid public report")
     fields = {"schema", "run_key", "retirement_sha256", "benchmark_valid", "cleanup_verified", "validation",
               "identity", "comparison", "measurements", "series_contract", "note"}
-    if value["schema"] == "rcp-production-public-report-v2":
+    if value["schema"] in {"rcp-production-public-report-v2", "rcp-production-public-report-v3"}:
         fields.add("qualification_outcome")
         require(value.get("qualification_outcome") in {"passed", "failed", "evidence-unavailable"} and
                 (value["qualification_outcome"] == "passed") == value["benchmark_valid"],
                 "invalid public qualification outcome")
+    if value["schema"] == "rcp-production-public-report-v3":
+        fields.add("collected_at")
+        require(isinstance(value.get("collected_at"), str) and
+                value["collected_at"] == timestamp(results.utc(value["collected_at"])), "invalid trusted collection time")
     if value["benchmark_valid"]:
         fields.update({"verification", "timestamp"})
     require(set(value) == fields and value.get("series_contract") == contract["series_contract"] and

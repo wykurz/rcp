@@ -378,7 +378,7 @@ class ProductionAuthTests(unittest.TestCase):
                     self.make_verifier(**updates)
 
     def test_official_fetch_uses_fixed_tls_host_path_limits_and_no_redirects(self):
-        response = Mock(status=200)
+        response = Mock(status=200, length=0)
         response.getheader.return_value = "identity"
         response.read1.side_effect = [self.jwks, b""]
         connection = Mock()
@@ -401,7 +401,7 @@ class ProductionAuthTests(unittest.TestCase):
             response.read1.assert_not_called()
 
     def test_official_fetch_rejects_oversize_compression_and_elapsed_deadline(self):
-        response = Mock(status=200)
+        response = Mock(status=200, length=0)
         response.getheader.return_value = "identity"
         response.read1.side_effect = [b"x" * (auth.MAX_JWKS_BYTES + 1)]
         connection = Mock()

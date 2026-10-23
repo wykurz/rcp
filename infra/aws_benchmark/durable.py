@@ -115,7 +115,7 @@ def tagged_expiry(instance, namespace, now):
     return close
 
 
-def validate_allocation_instance(value, instance, allocation, *, reconciliation=False):
+def validate_allocation_instance(value, instance, allocation):
     """Identify accepted allocation evidence without authorizing useful worker runtime."""
     validate(value)
     start, launch = utc(allocation["started_at"]), utc(instance["LaunchTime"])
@@ -128,11 +128,11 @@ def validate_allocation_instance(value, instance, allocation, *, reconciliation=
     pins = value["pins"]
     require(instance["ImageId"] == pins["ami"] and instance.get("InstanceType") == INSTANCE_TYPE
             and not instance.get("InstanceLifecycle"), "instance image, type or purchase path differs")
-    terminal = reconciliation and instance.get("State", {}).get("Name") in ("shutting-down", "terminated")
+    terminal = instance.get("State", {}).get("Name") in ("shutting-down", "terminated")
     require((terminal and "SubnetId" not in instance or instance.get("SubnetId") == pins["subnet"]) and
             (terminal and "IamInstanceProfile" not in instance or
              instance.get("IamInstanceProfile", {}).get("Arn") == pins["profile_arn"]) and
-            (terminal and "SecurityGroups" not in instance or
+            (terminal and not instance.get("SecurityGroups") or
              {g["GroupId"] for g in instance.get("SecurityGroups", [])} == {pins["security_group"]}),
             "instance network or profile differs")
     observed = instance_tags(instance)
@@ -167,9 +167,31 @@ def worker_command(value, binding, *, exact=True):
     return dict(command, deadline=binding["deadline"])
 
 
+def unresolved_launch(state):
+    """One unobserved immutable attempt can be replayed, never replaced by a new one."""
+    return (state.get("phase") in {"launching", "uncertain"} and state.get("launch_outcome") == "uncertain" and
+            state.get("allocation_consumed") is True and isinstance(state.get("attempt"), dict) and
+            state.get("binding") is None and state.get("known_instance_ids") == [] and
+            state.get("seen") == {} and state.get("close_reason") is None)
+
+
+def launch_sender(state):
+    """Identify a potential sender; elapsed time never proves an earlier send failed."""
+    require("launch_replayed" not in state, "obsolete launch sender marker is unsupported")
+    attempt = state.get("attempt")
+    require(isinstance(attempt, dict), "launch sender has no attempt")
+    value = state.get("launch_sender", dict(sequence=1, at=attempt["started_at"]))
+    require(isinstance(value, dict) and set(value) == {"sequence", "at"} and
+            type(value["sequence"]) is int and 1 <= value["sequence"] <= 2 ** 63 - 1 and
+            isinstance(value["at"], str) and timestamp(utc(value["at"])) == value["at"] and
+            utc(attempt["started_at"]) <= utc(value["at"]) < utc(attempt["close_at"]),
+            "invalid launch sender sequence or timestamp")
+    return value
+
+
 def launch_outcome(state, outcome):
     """Keep accepted evidence monotonic and the compatibility receipt flag consistent."""
-    require(outcome in {"none", "not-sent", "capacity-rejected", "uncertain", "accepted"}, "unknown launch outcome")
+    require(outcome in {"none", "not-sent", "rejected", "capacity-rejected", "uncertain", "accepted"}, "unknown launch outcome")
     require(state["launch_outcome"] != "accepted" or outcome == "accepted", "accepted allocation cannot be downgraded")
     consumed = outcome in {"uncertain", "accepted"}
     require(consumed or not (state["known_instance_ids"] or state["seen"]),

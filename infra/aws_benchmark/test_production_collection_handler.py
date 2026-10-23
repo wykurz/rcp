@@ -1,6 +1,7 @@
 import os
 import json
 import unittest
+import tempfile
 from unittest.mock import Mock, patch
 
 from . import production_collection_handler as handler
@@ -111,6 +112,32 @@ class CollectionHandlerTests(unittest.TestCase):
             self.assertEqual(detail["reason"], reason)
             self.assertEqual(detail.get("service_error"), code)
             self.assertNotIn("private credential", str(result) + str(logged.call_args))
+
+    def test_real_collector_holds_preserve_safe_categories_in_handler_logs(self):
+        from botocore.exceptions import ClientError
+        from .test_production_collection import Fixture
+        from .production_github import GitHubTransientError
+        errors = [
+            (ClientError({"Error": {"Code": "AccessDenied", "Message": "private credential"}}, "GetItem"), False, "AccessDenied"),
+            (ClientError({"Error": {"Code": "ThrottlingException", "Message": "private credential"}}, "GetItem"), True, "ThrottlingException"),
+            (GitHubTransientError("private credential"), True, None),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for error, retryable, code in errors:
+                fx = Fixture(directory)
+                with self.subTest(error=type(error).__name__), patch.dict(os.environ, environment(self.cloud), clear=True), \
+                        patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
+                        patch.object(handler, "collection_clients", return_value=self.api), \
+                        patch.object(handler, "collect_active", side_effect=lambda *args: fx.collector.collect(retire=True)), \
+                        patch.object(fx.store, "read", side_effect=error), patch("builtins.print") as logged:
+                    result = handler.lambda_handler({}, None)
+                detail = json.loads(logged.call_args.args[0])
+                self.assertEqual(result["state"], "held")
+                self.assertEqual(detail["category"], type(error).__name__)
+                self.assertEqual(detail["retryable"], retryable)
+                self.assertEqual(detail.get("service_error"), code)
+                self.assertNotIn("private credential", str(result) + str(detail))
+                self.assertEqual(fx.store.retire_calls, [])
 
     def test_handler_error_response_does_not_expose_credentials(self):
         with patch.dict(os.environ, {"RCP_PRODUCTION_ENABLED": "true"}, clear=True), \

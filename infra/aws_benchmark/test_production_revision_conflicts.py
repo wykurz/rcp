@@ -6,6 +6,7 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
+from . import common, durable
 from .common import retryable_io
 from .production_auth import GitHubIdentityError, GitHubIdentityTransientError
 from .production_errors import RevisionConflict, transient
@@ -113,7 +114,7 @@ class RevisionConflictTests(unittest.TestCase):
                 self.assertEqual(len(cloud.writes), writes)
 
     def test_newly_committed_marker_or_output_requires_stale_writer_to_reload(self):
-        for key, value in (("launch_replayed", True), ("worker_output", {"status": {}, "results": None})):
+        for key, value in (("worker_output", {"status": {}, "data_base64": "e30="}),):
             with self.subTest(key=key):
                 cloud = DynamoTransactions()
                 owner = store(cloud)
@@ -128,7 +129,7 @@ class RevisionConflictTests(unittest.TestCase):
 
     def test_committed_worker_output_is_preserved_by_every_later_save(self):
         commitment = {"status": {"key": "status.json", "version": "v1", "sha256": "a" * 64, "bytes": 1},
-                      "results": {"key": "results.zip", "version": "v2", "sha256": "b" * 64, "bytes": 10}}
+                      "data_base64": "eA=="}
         state, revision = self.store.load()
         state["worker_output"] = commitment
         revision = self.store.save(state, revision)
@@ -143,7 +144,7 @@ class RevisionConflictTests(unittest.TestCase):
                 elif mutation == "version":
                     changed["worker_output"]["status"]["version"] = "v3"
                 elif mutation == "digest":
-                    changed["worker_output"]["results"]["sha256"] = "c" * 64
+                    changed["worker_output"]["data_base64"] = "eQ=="
                 else:
                     changed["worker_output"]["status"]["bytes"] = True
                 writes = len(self.cloud.writes)
@@ -173,9 +174,10 @@ class RevisionConflictTests(unittest.TestCase):
                                     state={"S": json.dumps(dict(state, phase="complete"))})
                     raise cancellation("None", "ConditionalCheckFailed")
                 cloud.before_write = rejected
-                with self.assertRaises(ReconciliationRequired) as caught:
+                expected = TimeoutError if variant == "unreadable" else ReconciliationRequired
+                with self.assertRaises(expected) as caught:
                     owner.save(state, revision)
-                self.assertFalse(transient(caught.exception))
+                self.assertEqual(transient(caught.exception), variant == "unreadable")
 
 
 class RuntimeRevisionRaceTests(unittest.TestCase):
@@ -236,47 +238,52 @@ class LaunchRetryCheckpointTests(unittest.TestCase):
     def unresolved(self):
         cloud = ProductionCloud()
         state, revision = cloud.owner.load()
-        from . import durable
         allocation = durable.attempt(state["request"], 1, cloud.now)
         allocation["parameters"] = cloud.service.launch_parameters(state["request"], allocation)
-        state.update(phase="launching", attempt=allocation, attempts=1)
+        state.update(phase="launching", attempt=allocation, attempts=1,
+                     launch_sender=dict(sequence=1, at=allocation["started_at"]))
         durable.launch_outcome(state, "uncertain")
         cloud.owner.save_launch_intent(state, revision)
         return cloud
 
+    def retry(self, cloud):
+        state, revision = cloud.owner.load()
+        state["launch_sender"] = dict(sequence=durable.launch_sender(state)["sequence"] + 1,
+                                       at=common.timestamp(cloud.now))
+        return state, revision
+
     def test_checkpoint_preserves_allocation_and_rechecks_policy(self):
         cloud = self.unresolved()
-        state, revision = cloud.owner.load()
-        state["launch_replayed"] = True
+        state, revision = self.retry(cloud)
         before = copy.deepcopy(state)
         self.assertEqual(cloud.owner.save_launch_retry(state, revision), revision + 1)
         self.assertEqual(cloud.owner.load(), (before, revision + 1))
         for change in ({"enabled": {"BOOL": False}}, {"version": {"S": "rotated"}}):
             with self.subTest(change=change):
                 cloud.database.items["policy"].update(change)
+                next_state, next_revision = self.retry(cloud)
                 with self.assertRaises(ReconciliationRequired):
-                    cloud.owner.save_launch_retry(state, revision + 1)
+                    cloud.owner.save_launch_retry(next_state, next_revision)
                 self.assertEqual(cloud.owner.read().state, before)
                 self.assertEqual(cloud.launches, [])
 
     def test_lost_retry_response_requires_fresh_policy_acknowledgement(self):
         cloud = self.unresolved()
-        state, revision = cloud.owner.load()
-        state["launch_replayed"] = True
+        state, revision = self.retry(cloud)
         cloud.database.after_commit = Mock(side_effect=TimeoutError("response lost"))
         with self.assertRaises(RevisionConflict):
             cloud.owner.save_launch_retry(state, revision)
         cloud.database.after_commit = None
         self.assertEqual(cloud.owner.load(), (state, revision + 1))
         cloud.database.items["policy"]["enabled"] = {"BOOL": False}
+        next_state, next_revision = self.retry(cloud)
         with self.assertRaises(ReconciliationRequired):
-            cloud.owner.save_launch_retry(state, revision + 1)
+            cloud.owner.save_launch_retry(next_state, next_revision)
         self.assertEqual(cloud.launches, [])
 
     def test_other_writer_cannot_certify_policy_rejected_retry(self):
         cloud = self.unresolved()
-        state, revision = cloud.owner.load()
-        state["launch_replayed"] = True
+        state, revision = self.retry(cloud)
         def competing_write_then_policy_rejection():
             cloud.database.items[cloud.owner.pk]["state"] = {"S": json.dumps(state)}
             cloud.database.items[cloud.owner.pk]["revision"] = {"N": str(revision + 1)}
@@ -288,67 +295,75 @@ class LaunchRetryCheckpointTests(unittest.TestCase):
         self.assertEqual(cloud.owner.load(), (state, revision + 1))
         self.assertEqual(cloud.launches, [])
 
-    def test_sender_marker_is_required_monotonic_and_the_only_permitted_change(self):
-        for marker in (None, False, "true", 1):
-            with self.subTest(marker=marker):
+    def test_sender_sequence_must_advance_once_and_preserve_other_fields(self):
+        for sequence in (None, False, "2", 0, 1, 3, 2 ** 63):
+            with self.subTest(sequence=sequence):
                 cloud = self.unresolved()
-                state, revision = cloud.owner.load()
-                if marker is not None:
-                    state["launch_replayed"] = marker
-                with self.assertRaisesRegex(ValueError, "exact unresolved|replay sender marker"):
+                state, revision = self.retry(cloud)
+                state["launch_sender"]["sequence"] = sequence
+                with self.assertRaises(ValueError):
                     cloud.owner.save_launch_retry(state, revision)
-                self.assertNotIn("launch_replayed", cloud.owner.read().state)
+                self.assertEqual(cloud.owner.read().state["launch_sender"]["sequence"], 1)
         cloud = self.unresolved()
-        state, revision = cloud.owner.load()
-        state["launch_replayed"] = True
-        revision = cloud.owner.save_launch_retry(state, revision)
-        self.assertEqual(cloud.owner.save_launch_retry(state, revision), revision + 1)
-        self.assertTrue(cloud.owner.read().state["launch_replayed"])
-        for marker in (None, False, "true", 1):
-            with self.subTest(stored_marker=marker):
-                malformed = dict(state, launch_replayed=marker)
-                cloud.database.items[cloud.owner.pk]["state"] = {"S": json.dumps(malformed)}
-                with self.assertRaisesRegex(ValueError, "replay sender marker"):
-                    cloud.owner.save_launch_retry(state, revision + 1)
+        state, revision = self.retry(cloud)
+        cloud.owner.save_launch_retry(state, revision)
+        with self.assertRaises(ValueError):
+            cloud.owner.save_launch_retry(state, revision + 1)
+        third, revision = self.retry(cloud)
+        cloud.owner.save_launch_retry(third, revision)
+        self.assertEqual(cloud.owner.read().state["launch_sender"]["sequence"], 3)
 
-    def test_generic_save_cannot_remove_or_change_committed_replay_marker(self):
-        for marker in (None, False, "true", 1):
-            with self.subTest(marker=marker):
+    def test_generic_save_cannot_remove_or_change_committed_sender(self):
+        for mutation in ("remove", "advance", "time", "bool"):
+            with self.subTest(mutation=mutation):
                 cloud = self.unresolved()
-                state, revision = cloud.owner.load()
-                state["launch_replayed"] = True
+                state, revision = self.retry(cloud)
                 revision = cloud.owner.save_launch_retry(state, revision)
-                next_state = dict(state, phase="uncertain")
-                if marker is None:
-                    del next_state["launch_replayed"]
+                next_state = copy.deepcopy(dict(state, phase="uncertain"))
+                if mutation == "remove":
+                    del next_state["launch_sender"]
+                elif mutation == "advance":
+                    next_state["launch_sender"]["sequence"] += 1
+                elif mutation == "bool":
+                    next_state["launch_sender"]["sequence"] = True
                 else:
-                    next_state["launch_replayed"] = marker
+                    next_state["launch_sender"]["at"] = "2099-01-01T00:00:00+00:00"
                 writes = len(cloud.database.writes)
-                with self.assertRaisesRegex(ValueError, "replay sender marker"):
+                with self.assertRaises(ValueError):
                     cloud.owner.save(next_state, revision)
                 self.assertEqual(len(cloud.database.writes), writes)
-                self.assertTrue(cloud.owner.read().state["launch_replayed"])
+                self.assertEqual(cloud.owner.read().state["launch_sender"], state["launch_sender"])
                 current = dict(state, phase="closing", close_reason="safe closure")
                 self.assertEqual(cloud.owner.save(current, revision), revision + 1)
 
-    def test_malformed_stored_marker_prevents_generic_save(self):
-        for marker in (None, False, "true", 1):
+    def test_malformed_stored_sender_prevents_generic_save(self):
+        for marker in (None, False, "true", 1, {}, {"sequence": 1, "at": "bad"}):
             with self.subTest(marker=marker):
                 cloud = self.unresolved()
                 state, revision = cloud.owner.load()
-                corrupt = dict(state, launch_replayed=marker)
+                corrupt = dict(state, launch_sender=marker)
                 cloud.database.items[cloud.owner.pk]["state"] = {"S": json.dumps(corrupt)}
                 writes = len(cloud.database.writes)
-                with self.assertRaisesRegex(ValueError, "replay sender marker"):
+                with self.assertRaises(ValueError):
                     cloud.owner.save(dict(state, phase="uncertain"), revision)
                 self.assertEqual(len(cloud.database.writes), writes)
+
+    def test_obsolete_boolean_sender_cannot_be_misread_as_original_send(self):
+        cloud = self.unresolved()
+        state, revision = cloud.owner.load()
+        state.pop("launch_sender")
+        state["launch_replayed"] = True
+        cloud.database.items[cloud.owner.pk]["state"] = {"S": json.dumps(state)}
+        with self.assertRaisesRegex(ValueError, "obsolete launch sender"):
+            cloud.owner.load()
+        with self.assertRaisesRegex(ValueError, "obsolete launch sender"):
+            durable.launch_sender(state)
 
     def test_changed_attempt_observed_instance_or_close_cannot_be_replayed(self):
         for variant in ("parameters", "deadline", "outcome", "consumed", "binding", "ids", "seen", "close"):
             with self.subTest(variant=variant):
                 cloud = self.unresolved()
-                state, revision = cloud.owner.load()
-                state["launch_replayed"] = True
+                state, revision = self.retry(cloud)
                 if variant == "parameters":
                     state["attempt"]["parameters"]["ClientToken"] = "changed"
                 elif variant == "deadline":
@@ -358,11 +373,10 @@ class LaunchRetryCheckpointTests(unittest.TestCase):
                                "binding": {"binding": {}}, "ids": {"known_instance_ids": ["i-" + "1" * 17]},
                                "seen": {"seen": {"instance": {}}}, "close": {"close_reason": "stopped"}}
                     state.update(changes[variant])
-                    # also reject unsafe fields already persisted by an independent observer.
                     item = cloud.database.items[cloud.owner.pk]
                     item["state"] = {"S": json.dumps(state)}
                 writes = len(cloud.database.writes)
-                with self.assertRaisesRegex(ValueError, "exact unresolved|replay sender marker"):
+                with self.assertRaises(ValueError):
                     cloud.owner.save_launch_retry(state, revision)
                 self.assertEqual(len(cloud.database.writes), writes)
                 self.assertEqual(cloud.launches, [])

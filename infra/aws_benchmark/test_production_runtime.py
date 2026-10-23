@@ -283,15 +283,39 @@ class ProductionLaunchTests(unittest.TestCase):
         for entry in state["sealed_inputs"].values():
             # escaped printable ASCII is the longest JSON representation accepted for a source version
             entry["version"] = chr(92) * 1024
-        payload = cloud.service.receipt_bytes(state)
-        self.assertGreater(len(payload), 100_000)
-        self.assertLess(len(payload), 128 * 1024)
-        self.assertEqual(cloud.service.receipt_limit, 128 * 1024)
-        cloud.service.save(state, revision)
-        self.assertEqual(cloud.owner.load()[0], state)
-        with self.assertRaisesRegex(ValueError, "receipt exceeds"):
-            Service(cloud.api, cloud.config, now=lambda: cloud.now).receipt_bytes(state)
-        state["unexpected_padding"] = "x" * (128 * 1024)
+        instance = cloud.instance(allocation=state["attempt"], state="terminated")
+        state.update(phase="complete", allocation_consumed=True, launch_outcome="accepted",
+                     launch_sender=dict(sequence=2 ** 63 - 1, at=state["attempt"]["started_at"]),
+                     known_instance_ids=[instance["InstanceId"]], runtime_verified=True, worker_published=True)
+        cloud.service.remember_instance(state, instance)
+        live = copy.deepcopy(instance)
+        live["State"]["Name"] = "running"
+        state["binding"] = durable.bind(cloud.request, live, state["attempt"])
+        state["publication"] = {key: state["binding"][key] for key in ("attempt_id", "instance_id", "deadline")}
+        state["cleanup"] = dict(verified_at=common.timestamp(NOW), deleted_roots=state["seen"][instance["InstanceId"]]["root_volumes"],
+                                live_instances=[], allocation_consumed=True, unresolved_allocation=False, lease_released=False)
+        for character in (chr(92), chr(127), chr(128)):
+            with self.subTest(status_character=ord(character)):
+                base = json.dumps(dict(run="123-1", state="completed", success=False, error=""), ensure_ascii=False).encode()
+                width = len(json.dumps(character, ensure_ascii=False).encode()) - 2
+                count, padding = divmod(16_384 - len(base), width)
+                raw = json.dumps(dict(run="123-1", state="completed", success=False,
+                                      error=character * count + "x" * padding), ensure_ascii=False).encode()
+                self.assertEqual(len(raw), 16_384)
+                state["worker_output"] = dict(data_base64=base64.b64encode(raw).decode("ascii"), status=dict(key=cloud.paths().status,
+                    version=chr(92) * 1024, bytes=len(raw), sha256=common.digest(raw)))
+                from .production_objects import committed_status
+                committed_status(state["worker_output"], cloud.paths().status)
+                payload = cloud.service.receipt_bytes(state)
+                self.assertGreater(len(payload), 128 * 1024)
+                self.assertLess(len(payload), 192 * 1024)
+                self.assertEqual(cloud.service.receipt_limit, 192 * 1024)
+                with self.assertRaisesRegex(ValueError, "receipt exceeds"):
+                    Service(cloud.api, cloud.config, now=lambda: cloud.now).receipt_bytes(state)
+        from .production_store import _encoded, _item_bytes, MAX_STATE_BYTES
+        stored = dict(cloud.database.items[cloud.owner.pk], state={"S": _encoded(state, MAX_STATE_BYTES)})
+        self.assertLess(_item_bytes(stored), 400 * 1024)
+        state["unexpected_padding"] = "x" * (192 * 1024)
         with self.assertRaisesRegex(ValueError, "receipt exceeds"):
             cloud.service.receipt_bytes(state)
 
@@ -302,6 +326,7 @@ class ProductionLaunchTests(unittest.TestCase):
         original = copy.deepcopy(cloud.state["attempt"])
         self.assertTrue(cloud.state["allocation_consumed"])
         cloud.now += timedelta(hours=1)
+        cloud.guard["observed_at"] = common.timestamp(cloud.now)
         cloud.coordinator()
         self.assertEqual(cloud.state["attempt"], original)
         self.assertTrue(all(value == cloud.launches[0] for value in cloud.launches))

@@ -26,7 +26,7 @@ def source_fields(bundle, manifest):
     fields = dict(run_key=bundle.run_key, retirement_sha256=bundle.record.retirement_sha256,
         benchmark_valid=manifest["benchmark_valid"],
         identity={key: identity[key] for key in ("run", "run_url", "suite", "baseline", "candidate", "controller")},
-        comparison=results.comparison_label(identity, controller))
+        comparison=projection.comparison_label(identity, controller))
     if manifest["benchmark_valid"]:
         report = results.json_value(bundle.payloads["report.json"], collection.MAX_REPORT)
         recorded = report.get("evidence", {}).get("expected_verification")
@@ -46,28 +46,8 @@ def project(bundle):
     manifest = bundle.validate()
     fields = source_fields(bundle, manifest)
     report = results.json_value(bundle.payloads["report.json"], collection.MAX_REPORT)
-    if "public_projection" in report:
-        # trusted retirement/inventory authenticates these collector-produced bytes;
-        # the embedded digest is consistency, not independent authentication.
-        value = projection.bind(report["public_projection"], bundle.record.retirement_sha256)
-    else:
-        # compatibility for pre-projection retained evidence. new collections always
-        # freeze the projection; this legacy parser is never used for those records.
-        identity, raw = manifest["identity"], None
-        evidence = report["evidence"]
-        if manifest["benchmark_valid"]:
-            with tempfile.TemporaryDirectory(prefix="production-export-") as directory:
-                root = Path(directory)
-                for name in ("controller.json", "status.json", "results.zip"):
-                    if name in bundle.payloads:
-                        (root / name).write_bytes(bundle.payloads[name])
-                evidence, raw, _ = results.inspect(root, identity, manifest["producer_conclusion"])
-            require(not evidence["errors"] and raw is not None and raw["status"] == "complete",
-                    "legacy projection inspect: " + "; ".join(evidence["errors"])[:1024])
-            require(evidence["expected_verification"] == fields["verification"],
-                    "retired verification identity differs from measurements")
-        value = projection.bind(projection.freeze(bundle.run_key, identity, bundle.record.state["request"]["pins"],
-            manifest["benchmark_valid"], evidence, raw), bundle.record.retirement_sha256)
+    # retirement and the cross-job inventory authenticate collector-produced bytes
+    value = projection.bind(report["public_projection"], bundle.record.retirement_sha256)
     require(all(value.get(key) == expected for key, expected in fields.items()),
             "public projection differs from retained source identity")
     return value
@@ -112,8 +92,8 @@ def render(value):
     identity = value["identity"]
     fields = [("Run", identity["run"]), ("Suite", identity["suite"]), ("Comparison", value["comparison"]),
         ("Baseline", identity["baseline"]), ("Candidate", identity["candidate"]),
-        ("Qualification", "unavailable; workload outcome unknown" if value.get("qualification_outcome") == "evidence-unavailable"
-         else "passed" if value["benchmark_valid"] else "failed"), ("Cleanup", "verified"),
+        ("Qualification", projection.outcome_label(value)), ("Cleanup", "resource termination verified"),
+        ("Collected at", projection.collected_time(value)),
         ("Validation", value["validation"])]
     rows = "".join("<tr><th>" + escape(name) + "</th><td>" + escape(str(item)) + "</td></tr>" for name, item in fields)
     metrics = "".join("<tr>" + "".join("<td>" + escape(str(item[key])) + "</td>" for key in
@@ -121,7 +101,7 @@ def render(value):
     html = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
         "<title>AWS benchmark " + escape(identity["run"]) + "</title><h1>AWS benchmark</h1>"
         "<p><a href='" + escape(identity["run_url"], quote=True) + "'>Workflow attempt</a></p><table>" + rows + "</table>"
-        "<p>" + escape(value["note"]) + "</p><table><tr><th>Case</th><th>Variant</th><th>Median seconds</th>"
+        "<p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" + escape(value["note"]) + "</p><table><tr><th>Case</th><th>Variant</th><th>Median seconds</th>"
         "<th>Samples in seconds</th></tr>" + metrics + "</table>")
     require(len(html.encode()) <= MAX_PUBLIC_HTML, "rendered public HTML exceeds bound")
     return html

@@ -298,7 +298,7 @@ class CollectionTests(unittest.TestCase):
         cloud = Cloud(request)
         cloud.start(stateMachineArn=MACHINE, name="123-1", input='{"run":"123-1"}')
         cloud.execution["status"] = "SUCCEEDED" if complete else "RUNNING"
-        # the historical binding was created while live; the final receipt below records termination.
+        # the historical binding was created while live; the final receipt below records termination
         instance = dict(InstanceId="i-" + "3" * 17, LaunchTime=NOW + timedelta(seconds=60),
             State={"Name": "running"}, ImageId=request["pins"]["ami"], InstanceType="c5d.24xlarge",
             LaunchTemplate={"LaunchTemplateId": request["pins"]["lt_id"], "Version": request["pins"]["lt_version"]})

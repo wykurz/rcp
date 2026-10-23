@@ -110,6 +110,7 @@ class Fixture:
         state.update(phase="complete", execution_arn=self.execution_arn, submission_arn=self.execution_arn,
             attempt=attempt, attempts=1, binding=bound, allocation_consumed=True, launch_outcome="accepted",
             known_instance_ids=[INSTANCE], runtime_verified=True, worker_published=True,
+            publication=dict(instance_id=INSTANCE, attempt_id=bound["attempt_id"], deadline=bound["deadline"]),
             cleanup=dict(verified_at=common.timestamp(self.finish), live_instances=[], deleted_roots=[ROOT],
                 unresolved_allocation=False, allocation_consumed=True, lease_released=False),
             seen={INSTANCE: dict(state="terminated", launch_at=bound["launch_at"], root_volumes=[ROOT])})
@@ -232,24 +233,39 @@ class CollectionTests(unittest.TestCase):
                         ami_id=fx.config.ami, harness_revision=fx.config.source))
 
     def commit_outputs(self, fx):
-        fx.store.record.state["worker_output"] = {
-            "status": fx.collector.objects.read(fx.paths.status, collection.MAX_DOCUMENT)[1],
-            "results": fx.collector.objects.read(fx.paths.results, common.MAX_RESULT)[1]}
+        raw, reference = fx.collector.objects.read(fx.paths.status, collection.MAX_DOCUMENT)
+        fx.store.record.state["worker_output"] = dict(status=reference, data_base64=base64.b64encode(raw).decode("ascii"))
         fx.publish()
 
-    def test_committed_versions_survive_new_current_versions_and_shutdown_reason(self):
-        self.commit_outputs(self.fx)
-        self.fx.store.record.state["close_reason"] = "bound instance stopped or terminated"
-        self.fx.publish()
-        self.fx.s3.seed(self.fx.paths.status, b"unrelated later status")
-        self.fx.s3.seed(self.fx.paths.results, b"unrelated later result")
-        value = self.fx.collector.collect(retire=True)
-        self.assertEqual((value["state"], value["retired"]), ("success", True), value)
-        manifest = json.loads(self.fx.s3.objects[value["retention"]["key"]]["1"])
-        self.assertEqual(manifest["sources"]["status.json"], self.fx.store.record.state["worker_output"]["status"])
-        self.assertEqual(manifest["sources"]["results.zip"], self.fx.store.record.state["worker_output"]["results"])
+    def test_committed_status_survives_expiry_or_new_current_version_without_version_reads(self):
+        for later in (None, b"unrelated later status"):
+            with self.subTest(later=later):
+                fx = Fixture(self.directory.name)
+                self.commit_outputs(fx)
+                fx.store.record.state["close_reason"] = "bound instance stopped or terminated"
+                fx.publish()
+                del fx.s3.objects[fx.paths.status]
+                if later is not None:
+                    fx.s3.seed(fx.paths.status, later)
+                original = fx.s3.get_object
+                def unavailable(**args):
+                    if args["Key"] == fx.paths.status:
+                        raise Error("AccessDenied")
+                    return original(**args)
+                with patch.object(fx.s3, "get_object", side_effect=unavailable):
+                    value = fx.collector.collect(retire=True)
+                self.assertEqual((value["state"], value["retired"]), ("success", True), value)
+                manifest = json.loads(fx.s3.objects[value["retention"]["key"]]["1"])
+                self.assertEqual(manifest["sources"]["status.json"], fx.store.record.state["worker_output"]["status"])
+                self.assertEqual(manifest["sources"]["results.zip"]["sha256"],
+                    json.loads(base64.b64decode(fx.store.record.state["worker_output"]["data_base64"]))["sha256"])
 
-    def test_committed_missing_evidence_has_bounded_unknown_outcome_not_failed_workload(self):
+    def test_committed_archive_digest_rejects_conflicting_current_version(self):
+        self.commit_outputs(self.fx)
+        self.fx.s3.seed(self.fx.paths.results, b"unrelated later result")
+        self.assertIn("archive differs", self.assertHeld()["reason"])
+
+    def test_committed_missing_archive_has_bounded_unknown_outcome_not_failed_workload(self):
         self.commit_outputs(self.fx)
         del self.fx.s3.objects[self.fx.paths.status]
         del self.fx.s3.objects[self.fx.paths.results]
@@ -261,7 +277,7 @@ class CollectionTests(unittest.TestCase):
                          ("unavailable", True, "evidence-unavailable"), value)
         self.assertFalse(value["benchmark_valid"])
         report = json.loads(self.fx.s3.objects[self.fx.collector.prefix + "report.json"]["1"])
-        self.assertEqual(report["evidence_availability"]["missing"], ["results.zip", "status.json"])
+        self.assertEqual(report["evidence_availability"]["missing"], ["results.zip"])
         self.assertIn("unknown", report["public_projection"]["note"])
         with patch.object(results, "inspect", side_effect=AssertionError("historical parser")), \
                 patch.object(results, "validate_qualification", side_effect=AssertionError("historical admission")), \
@@ -281,11 +297,9 @@ class CollectionTests(unittest.TestCase):
         value = self.fx.collector.collect(retire=True)
         self.assertEqual((value["state"], value["retired"]), ("unavailable", True), value)
 
-    def test_failed_archive_capture_then_expiry_is_unknown_not_failed_workload(self):
-        with patch.object(self.fx.s3, "head_object", create=True, side_effect=Error("AccessDenied")):
-            with self.assertRaises(Error):
-                self.fx.service.read_worker_status(self.fx.store.record.state)
-        self.assertNotIn("worker_output", self.fx.store.record.state)
+    def test_lost_published_save_still_uses_durable_publication_intent_for_expiry_grace(self):
+        self.fx.store.record.state["worker_published"] = False
+        self.fx.publish()
         del self.fx.s3.objects[self.fx.paths.status]
         del self.fx.s3.objects[self.fx.paths.results]
         self.fx.finish = common.utc(self.fx.store.record.state["binding"]["deadline"]) + timedelta(
@@ -294,6 +308,23 @@ class CollectionTests(unittest.TestCase):
         self.fx.finish += timedelta(seconds=1)
         value = self.fx.collector.collect(retire=True)
         self.assertEqual((value["state"], value["retired"]), ("unavailable", True), value)
+
+    def test_failure_without_advertised_archive_stays_failed_after_expiry(self):
+        for committed in (False, True):
+            for days in (0, 8, 30):
+                with self.subTest(committed=committed, days=days):
+                    fx = Fixture(self.directory.name)
+                    fx.s3.seed(fx.paths.status, collection.encoded(common.completed_status("123-1", False)))
+                    del fx.s3.objects[fx.paths.results]
+                    if committed:
+                        self.commit_outputs(fx)
+                        del fx.s3.objects[fx.paths.status]
+                    fx.finish += timedelta(days=days)
+                    value = fx.collector.collect(retire=True)
+                    self.assertEqual((value["state"], value["retired"]), ("failed", True), value)
+                    report = json.loads(fx.s3.objects[fx.collector.prefix + "report.json"]["1"])
+                    self.assertIsNone(report["evidence_availability"])
+                    self.assertEqual(fx.collector.collect(retire=True), value)
 
     def test_expired_missing_indicated_archive_is_explicitly_unavailable(self):
         del self.fx.s3.objects[self.fx.paths.results]
@@ -304,20 +335,219 @@ class CollectionTests(unittest.TestCase):
         report = json.loads(self.fx.s3.objects[self.fx.collector.prefix + "report.json"]["1"])
         self.assertEqual(report["evidence_availability"]["missing"], ["results.zip"])
 
-    def test_aged_inaccessible_or_corrupt_committed_evidence_still_holds(self):
+    def test_aged_inaccessible_or_corrupt_archive_still_holds(self):
         self.commit_outputs(self.fx)
         self.fx.finish = NOW + timedelta(days=30)
         original = self.fx.s3.get_object
         for error in (Error("AccessDenied"), TimeoutError(), Error("InternalError")):
             with self.subTest(error=type(error).__name__):
                 def inaccessible(**args):
-                    if args["Key"] == self.fx.paths.status:
+                    if args["Key"] == self.fx.paths.results:
                         raise error
                     return original(**args)
                 with patch.object(self.fx.s3, "get_object", side_effect=inaccessible):
                     self.assertHeld()
-        self.fx.s3.objects[self.fx.paths.status]["1"] = b"corrupt"
+        self.fx.s3.objects[self.fx.paths.results]["1"] = b"corrupt"
         self.assertHeld()
+
+    def test_exact_committed_status_rejects_bad_reference_or_data(self):
+        from .production_objects import committed_status, MAX_COMMITTED_STATUS
+        self.commit_outputs(self.fx)
+        original = copy.deepcopy(self.fx.store.record.state["worker_output"])
+        changes = [lambda value: value.update(data_base64=value["data_base64"] + " "),
+            lambda value: value["status"].update(sha256="0" * 64),
+            lambda value: value["status"].update(bytes=True),
+            lambda value: value["status"].update(key="another/status.json"),
+            lambda value: value["status"].update(version="null"),
+            lambda value: value["status"].update(version="newline\n"),
+            lambda value: value.update(extra=True)]
+        for change in changes:
+            value = copy.deepcopy(original)
+            change(value)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                committed_status(value, self.fx.paths.status)
+        for raw in (b"[]", b'{"duplicate":1,"duplicate":2}', b" " * (MAX_COMMITTED_STATUS + 1)):
+            value = dict(data_base64=base64.b64encode(raw).decode("ascii"), status=dict(original["status"], bytes=len(raw), sha256=common.digest(raw)))
+            with self.subTest(raw=raw[:40]), self.assertRaises(ValueError):
+                committed_status(value, self.fx.paths.status)
+
+    def test_committed_status_base64_is_canonical_bounded_and_preserves_exact_json_bytes(self):
+        from .production_objects import committed_status, MAX_COMMITTED_STATUS
+        self.commit_outputs(self.fx)
+        reference = self.fx.store.record.state["worker_output"]["status"]
+        def commitment(raw, encoded=None):
+            return dict(status=dict(reference, sha256=common.digest(raw), bytes=len(raw)),
+                        data_base64=base64.b64encode(raw).decode("ascii") if encoded is None else encoded)
+        for raw in (b'{ "value" : "' + b"\x7f" * (MAX_COMMITTED_STATUS - 16) + b'" }',
+                    b'{"value":"' + "\u0080".encode() * ((MAX_COMMITTED_STATUS - 12) // 2) + b'"}',
+                    b' { "unordered": 1, "a": 2 } '):
+            value = commitment(raw)
+            recovered, actual, parsed = committed_status(value, self.fx.paths.status)
+            self.assertEqual(recovered, raw)
+            self.assertEqual(actual, value["status"])
+            self.assertEqual(parsed, json.loads(raw))
+            self.assertTrue(value["data_base64"].isascii())
+            self.assertNotIn("\\", value["data_base64"])
+        for encoded in ("e31=", "e30=\n", "e30===", "e3_", "\u0080", "!!!!"):
+            with self.subTest(encoded=encoded), self.assertRaises(ValueError):
+                committed_status(commitment(b"{}", encoded), self.fx.paths.status)
+        excessive = "A" * (4 * ((MAX_COMMITTED_STATUS + 2) // 3) + 4)
+        with patch("base64.b64decode", side_effect=AssertionError("oversized encoding must not decode")) as decode:
+            with self.assertRaises(ValueError):
+                committed_status(commitment(b"{}", excessive), self.fx.paths.status)
+            decode.assert_not_called()
+        with self.assertRaises(ValueError):
+            committed_status(dict(status=reference, data="{}"), self.fx.paths.status)
+
+    def test_complete_empty_instance_response_uses_prior_bound_termination_and_fresh_cleanup(self):
+        original = self.fx.ec2.describe_instances.side_effect
+        response = dict(Reservations=[], ResponseMetadata=dict(HTTPStatusCode=200, RequestId="request-id"))
+        self.fx.ec2.describe_instances.side_effect = lambda **args: copy.deepcopy(response) if "InstanceIds" in args else original(**args)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("success", True), value)
+        self.assertEqual(len(self.fx.store.retire_calls), 1)
+
+    def test_empty_instance_response_without_complete_metadata_or_prior_proof_holds(self):
+        complete = dict(Reservations=[], ResponseMetadata=dict(HTTPStatusCode=200, RequestId="request-id"))
+        malformed = [dict(Reservations=[]), dict(Reservations=[], ResponseMetadata=None),
+            dict(complete, NextToken="next"), dict(complete, NextToken=""),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=503, RequestId="request-id")),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=200.0, RequestId="request-id")),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=200)),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=200, RequestId="")),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=200, RequestId=" ")),
+            dict(complete, ResponseMetadata=dict(HTTPStatusCode=200, RequestId=1)),
+            dict(complete, Reservations=[dict(Instances=[])]), dict(complete, Reservations=None)]
+        for response in malformed:
+            with self.subTest(response=response):
+                fx = Fixture(self.directory.name)
+                original = fx.ec2.describe_instances.side_effect
+                fx.ec2.describe_instances.side_effect = lambda **args: copy.deepcopy(response) if "InstanceIds" in args else original(**args)
+                self.assertEqual(fx.collector.collect(retire=True)["state"], "held")
+                self.assertEqual(fx.store.retire_calls, [])
+        changes = [lambda fx: fx.store.record.state["seen"][INSTANCE].update(state="running"),
+            lambda fx: fx.store.record.state.update(launch_outcome="uncertain"),
+            lambda fx: fx.store.record.state["seen"][INSTANCE].update(launch_at=common.timestamp(NOW)),
+            lambda fx: fx.store.record.state["cleanup"].update(unresolved_allocation=True),
+            lambda fx: fx.store.record.state["cleanup"].update(deleted_roots=[]),
+            lambda fx: setattr(fx, "root_present", True),
+            lambda fx: setattr(fx, "live", True), lambda fx: setattr(fx, "orphan", True)]
+        for change in changes:
+            fx = Fixture(self.directory.name)
+            change(fx)
+            fx.publish()
+            original = fx.ec2.describe_instances.side_effect
+            fx.ec2.describe_instances.side_effect = lambda **args: copy.deepcopy(complete) if "InstanceIds" in args else original(**args)
+            self.assertEqual(fx.collector.collect(retire=True)["state"], "held")
+            self.assertEqual(fx.store.retire_calls, [])
+
+    def test_aged_out_late_terminal_allocation_without_mailbox_binding_retires(self):
+        state = self.fx.store.record.state
+        state.update(binding=None, runtime_verified=False, worker_published=False, publication=None)
+        state["seen"][INSTANCE]["launch_at"] = common.timestamp(
+            common.utc(state["attempt"]["close_at"]) + timedelta(seconds=30))
+        self.fx.publish()
+        original = self.fx.ec2.describe_instances.side_effect
+        response = dict(Reservations=[], ResponseMetadata=dict(HTTPStatusCode=200, RequestId="request-id"))
+        self.fx.ec2.describe_instances.side_effect = lambda **args: copy.deepcopy(response) if "InstanceIds" in args else original(**args)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("failed", True), value)
+        self.assertEqual(len(self.fx.store.retire_calls), 1)
+
+    def test_aged_out_unbound_allocation_requires_exact_attempt_and_canonical_terminal_time(self):
+        changes = [lambda state: state["attempt"].update(token="0" * 64),
+            lambda state: state["attempt"].update(id="other"),
+            lambda state: state["attempt"].update(ordinal=2),
+            lambda state: state.update(attempts=2),
+            lambda state: state["seen"][INSTANCE].update(launch_at=common.timestamp(NOW - timedelta(seconds=1))),
+            lambda state: state["seen"][INSTANCE].update(launch_at=common.timestamp(self.fx.finish + timedelta(seconds=1))),
+            lambda state: state["seen"][INSTANCE].update(launch_at=state["seen"][INSTANCE]["launch_at"].replace("+00:00", "Z")),
+            lambda state: state["seen"][INSTANCE].update(launch_at=None),
+            lambda state: state["seen"][INSTANCE].update(state="running"),
+            lambda state: state.update(launch_outcome="uncertain"),
+            lambda state: state.update(known_instance_ids=[]),
+            lambda state: state["cleanup"].update(unresolved_allocation=True)]
+        for change in changes:
+            fx = Fixture(self.directory.name)
+            state = fx.store.record.state
+            state.update(binding=None, runtime_verified=False, worker_published=False, publication=None)
+            change(state)
+            fx.publish()
+            original = fx.ec2.describe_instances.side_effect
+            response = dict(Reservations=[], ResponseMetadata=dict(HTTPStatusCode=200, RequestId="request-id"))
+            fx.ec2.describe_instances.side_effect = lambda **args: copy.deepcopy(response) if "InstanceIds" in args else original(**args)
+            self.assertEqual(fx.collector.collect(retire=True)["state"], "held")
+            self.assertEqual(fx.store.retire_calls, [])
+
+    def test_closed_replay_reads_retained_report_only_once(self):
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual(value["state"], "success", value)
+        with patch.object(self.fx.s3, "get_object", wraps=self.fx.s3.get_object) as gets:
+            self.assertEqual(self.fx.collector.collect(retire=True), value)
+        reads = [call for call in gets.call_args_list if call.kwargs["Key"] == self.fx.collector.prefix + "report.json"]
+        self.assertEqual(len(reads), 1)
+
+    def test_frozen_projection_and_outcome_are_mandatory_retained_fields(self):
+        value = self.fx.collector.collect(retire=True)
+        manifest = json.loads(self.fx.s3.objects[value["retention"]["key"]][value["retention"]["version"]])
+        payloads = {name: self.fx.s3.objects[ref["key"]][ref["version"]] for name, ref in manifest["retained"].items()}
+        for field in ("public_projection", "qualification_outcome"):
+            changed = copy.deepcopy(payloads)
+            report = json.loads(changed["report.json"])
+            del report[field]
+            changed["report.json"] = collection.encoded(report)
+            with self.subTest(field=field), self.assertRaises((KeyError, ValueError)):
+                collection.Collector.retained_provenance(self.fx.store.record, manifest, changed)
+
+    def test_collection_s3_calls_fit_existing_role_with_or_without_current_archive(self):
+        from .test_production_stack import permits, BUCKET, BUCKET_ARN
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                fx = Fixture(self.directory.name)
+                fx.store.run_key = "repo-655073755-run-123"
+                fx.store.record = replace(fx.store.record, run_key=fx.store.run_key)
+                fx.store.record.admission["initial_payload"]["producer"]["repository_id"] = "655073755"
+                for kind in ("attempt", "current"):
+                    fx.documents[kind]["repository"]["id"] = 655073755
+                fx.service.run_key = fx.store.run_key
+                fx.execution["input"] = collection.encoded(dict(run_key=fx.store.run_key, epoch=fx.store.epoch, run="123-1")).decode()
+                fx.collector.prefix = "production/runs/" + fx.store.run_key + "/collection/"
+                fx.config.bucket = BUCKET
+                fx.store.record.state["request"]["pins"]["bucket"] = BUCKET
+                fx.store.record.admission["initial_payload"]["state"]["request"]["pins"]["bucket"] = BUCKET
+                fx.collector.objects.bucket = BUCKET
+                self.commit_outputs(fx)
+                del fx.s3.objects[fx.paths.status]
+                if expired:
+                    del fx.s3.objects[fx.paths.results]
+                    fx.finish += timedelta(days=30)
+                calls = []
+                get, put, listing = fx.s3.get_object, fx.s3.put_object, fx.s3.list_objects_v2
+                def read(**args):
+                    action = "s3:GetObjectVersion" if "VersionId" in args else "s3:GetObject"
+                    resource = BUCKET_ARN + "/" + args["Key"]
+                    self.assertTrue(permits("CollectorRole", action, resource), (action, resource))
+                    calls.append((action, args["Key"]))
+                    return get(**args)
+                def write(**args):
+                    context = {"s3:if-none-match": args.get("IfNoneMatch"),
+                               "s3:x-amz-server-side-encryption": args.get("ServerSideEncryption")}
+                    self.assertTrue(permits("CollectorRole", "s3:PutObject", BUCKET_ARN + "/" + args["Key"], context))
+                    calls.append(("s3:PutObject", args["Key"]))
+                    return put(**args)
+                def list_current(**args):
+                    context = {"s3:prefix": args["Prefix"], "s3:max-keys": args["MaxKeys"]}
+                    self.assertTrue(permits("CollectorRole", "s3:ListBucket", BUCKET_ARN, context))
+                    calls.append(("s3:ListBucket", args["Prefix"]))
+                    return listing(**args)
+                with patch.object(fx.s3, "get_object", side_effect=read), \
+                        patch.object(fx.s3, "put_object", side_effect=write), \
+                        patch.object(fx.s3, "list_objects_v2", side_effect=list_current):
+                    value = fx.collector.collect(retire=True)
+                self.assertEqual(value["state"], "unavailable" if expired else "success", value)
+                self.assertTrue(value["retired"])
+                self.assertFalse(any(key == fx.paths.status for _, key in calls))
+                self.assertNotIn(("s3:GetObjectVersion", fx.paths.results), calls)
 
     def test_terminal_coordinator_failure_does_not_invalidate_bound_successful_worker(self):
         for status in ("FAILED", "TIMED_OUT", "ABORTED"):
@@ -702,7 +932,7 @@ class CollectionTests(unittest.TestCase):
         raw = self.fx.service.receipt_bytes(state)
         self.assertGreater(len(raw), LEGACY_LIMIT)
         self.assertEqual(LEGACY_LIMIT, 100_000)
-        self.assertEqual(collection.MAX_RECEIPT, 128 * 1024)
+        self.assertEqual(collection.MAX_RECEIPT, 192 * 1024)
         self.assertLess(len(raw), collection.MAX_RECEIPT)
         self.fx.publish()
         value = self.fx.collector.collect(retire=True)

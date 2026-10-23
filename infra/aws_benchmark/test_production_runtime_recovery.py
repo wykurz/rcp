@@ -1,5 +1,6 @@
 """Repeated offline ticks preserve ambiguous allocation and immutable output evidence."""
 
+import base64
 import copy
 from datetime import timedelta
 import json
@@ -61,7 +62,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
         self.assertEqual(cloud.launches, [original["parameters"]])
         self.assertEqual(cloud.state["attempt"], original)
         self.assertEqual(cloud.state["attempts"], 1)
-        self.assertTrue(cloud.state["launch_replayed"])
+        self.assertGreaterEqual(cloud.state["launch_sender"]["sequence"], 2)
         self.assertEqual(cloud.state["launch_outcome"], "accepted")
 
     def test_lost_capacity_checkpoint_recovers_same_token_not_new_allocation(self):
@@ -98,7 +99,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
                     cloud.service.finish_launch("123-1", original, **outcome)
                     self.assertEqual(cloud.state["launch_outcome"], "uncertain")
                     self.assertTrue(cloud.state["allocation_consumed"])
-                    self.assertTrue(cloud.state["launch_replayed"])
+                    self.assertGreaterEqual(cloud.state["launch_sender"]["sequence"], 2)
                     return cloud.run_instances(**parameters)
                 cloud.api["ec2"].run_instances.side_effect = delayed
                 cloud.launch_error = None
@@ -132,8 +133,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
                 cloud = self.uncertain()
                 original = copy.deepcopy(cloud.state["attempt"])
                 if cause == "deadline":
-                    cloud.now = common.utc(original["close_at"]) - timedelta(
-                        seconds=durable.minimum_runtime(cloud.request["plan"]) - 1)
+                    cloud.now = common.utc(original["close_at"])
                     self.fresh(cloud)
                 elif cause == "stale-guard":
                     cloud.now += timedelta(seconds=121)
@@ -163,7 +163,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
         with patch.object(cloud.owner, "save_launch_retry", side_effect=lost), self.assertRaises(TimeoutError):
             cloud.coordinator()
         self.assertEqual(len(cloud.launches), before)
-        self.assertTrue(cloud.state["launch_replayed"])
+        self.assertGreaterEqual(cloud.state["launch_sender"]["sequence"], 2)
         cloud.launch_error = None
         cloud.coordinator()
         self.assertEqual(len(cloud.launches), before + 1)
@@ -285,7 +285,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
     def test_received_identity_from_launching_state_survives_transient_policy_failure(self):
         cloud = self.uncertain(allocated=True)
         state, revision = cloud.service.load()
-        # reproduce a process dying after the intent but before committing its unknown outcome.
+        # reproduce a process dying after the intent but before committing its unknown outcome
         state["phase"] = "launching"
         item = cloud.database.items[cloud.owner.pk]
         item["state"]["S"] = json.dumps(state)
@@ -373,7 +373,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
         self.output(cloud)
         cloud.service.watchdog()
         commitment = copy.deepcopy(cloud.state["worker_output"])
-        self.assertEqual(commitment["results"]["sha256"], common.digest(cloud.objects[cloud.paths().results]))
+        self.assertEqual(json.loads(base64.b64decode(commitment["data_base64"]))["sha256"], common.digest(cloud.objects[cloud.paths().results]))
         cloud.objects[cloud.paths().status] = b"foreign current object"
         cloud.objects[cloud.paths().results] = b"foreign archive"
         self.assertTrue(cloud.service.read_worker_status(cloud.state)["success"])
@@ -383,7 +383,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
         self.assertEqual(cloud.state["phase"], "complete")
         self.assertEqual(cloud.state["worker_output"], commitment)
 
-    def test_closing_capture_retries_head_failure_without_skipping_termination(self):
+    def test_closing_capture_does_not_need_archive_head_and_preserves_termination(self):
         cloud = ProductionCloud()
         cloud.coordinator()
         cloud.service.watchdog()
@@ -395,9 +395,9 @@ class RuntimeRecoveryTests(unittest.TestCase):
                 raise TimeoutError("archive HEAD unavailable")
             return original(**parameters)
         cloud.api["s3"].head_object.side_effect = head
-        self.assertEqual(cloud.service.watchdog()["state"], "deferred")
+        self.assertEqual(cloud.service.watchdog()["state"], "closing")
         self.assertEqual(cloud.state["phase"], "closing")
-        self.assertNotIn("worker_output", cloud.state)
+        self.assertIn("worker_output", cloud.state)
         self.assertIn(("terminate", [INSTANCE]), cloud.events)
         cloud.api["s3"].head_object.side_effect = original
         cloud.instances[0]["State"]["Name"] = "terminated"

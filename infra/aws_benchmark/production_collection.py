@@ -5,9 +5,9 @@ The active pointer is released only after the fixed outer deadline plus delivery
 drain, fresh physical reconciliation, a terminal original/current GitHub producer
 and Standard execution (or separately labeled never-submitted/never-started proof),
 and read-back of bounded retained evidence. An expired
-EC2 terminated record is accepted only for exact InvalidInstanceID.NotFound with
-service-only committed watchdog termination/root evidence; an empty successful
-response is not absence proof. These are control-plane observations, not a claim
+EC2 terminated record may age out to exact InvalidInstanceID.NotFound or a complete
+HTTP 200 empty response. These require service-only committed watchdog termination/root
+evidence; an empty response alone is never absence proof. These are control-plane observations, not a claim
 that simultaneous control-plane failures cannot conceal resources.
 
 The GitHub reader is trusted integration code, not request data. Its read(producer)
@@ -27,7 +27,9 @@ from . import durable, durable_client, production_projection as projection, resu
 from .common import MAX_RESULT, digest, durable_plan_contract, error_code, require, timestamp, utc
 from .production_store import MAX_STATE_BYTES as MAX_RECEIPT
 from .production_mailbox import MailboxPaths
-from .production_objects import Objects
+from .production_objects import Objects, committed_status
+from .production_errors import transient
+import re
 
 SCHEMA = "rcp-production-collection-v1"
 MAX_DOCUMENT = 1024 * 1024
@@ -45,6 +47,29 @@ CONCLUSIONS = results.SUBMISSION_CONCLUSIONS
 
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def expected_worker_files(payloads):
+    """An archive is required only when terminal status advertises one."""
+    expected = {"status.json"}
+    if "status.json" in payloads:
+        try:
+            status = results.json_value(payloads["status.json"])
+        except (ValueError, UnicodeError):
+            status = {}
+        if isinstance(status, dict) and status.get("sha256") is not None:
+            expected.add("results.zip")
+    return expected
+
+
+def held_diagnostic(error):
+    """Expose bounded categories and service codes, never SDK response text."""
+    detail = dict(category=type(error).__name__, reason=results.diagnostic(error)[:256],
+                  retryable=transient(error))
+    code = error_code(error)
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9.]{0,79}", code):
+        detail["service_error"] = code
+    return detail
 
 
 def identity(record):
@@ -149,6 +174,15 @@ def validate_retained(record, manifest, payloads):
         committed = (record.state.get("worker_output") or {}).get(field) if field else None
         if committed is not None:
             require(ref == committed, "retained source differs from committed worker version")
+    commitment = record.state.get("worker_output")
+    if commitment is not None:
+        require(paths is not None, "committed status has no bound worker")
+        raw, reference, status = committed_status(commitment, paths.status)
+        require(payloads.get("status.json") == raw and sources.get("status.json") == reference,
+                "retained status differs from committed bytes")
+        if "results.zip" in payloads and status.get("sha256") is not None:
+            require(digest(payloads["results.zip"]) == status["sha256"],
+                    "retained archive differs from committed status digest")
     return binding["identity"]
 
 
@@ -222,7 +256,7 @@ class Collector:
         require(execution.get("status") in TERMINAL, "execution is not terminal")
         require(state.get("execution_arn") == expected or
                 state.get("execution_arn") is None and state.get("allocation_consumed") is False and
-                state.get("launch_outcome") in {"none", "not-sent", "capacity-rejected"}, "execution binding differs")
+                state.get("launch_outcome") in {"none", "not-sent", "capacity-rejected", "rejected"}, "execution binding differs")
         return dict(proof="terminal-execution", **{key: execution[key] for key in
             ("executionArn", "stateMachineArn", "name", "status", "input")})
 
@@ -236,7 +270,7 @@ class Collector:
             require(state.get("launch_outcome") == "accepted", "consumed allocation is not reconciled")
         else:
             require(not state["known_instance_ids"] and state.get("binding") is None and
-                    state.get("launch_outcome") in {"none", "not-sent", "capacity-rejected"}, "no-allocation proof conflicts")
+                    state.get("launch_outcome") in {"none", "not-sent", "capacity-rejected", "rejected"}, "no-allocation proof conflicts")
         require(all(item["State"]["Name"] == "terminated" for item in self.service.inventory()),
                 "namespace has live or unclassified instances")
         ec2 = self.service.api["ec2"]
@@ -248,6 +282,24 @@ class Collector:
                 if error_code(error) == "InvalidInstanceID.NotFound":
                     continue
                 raise
+            if response.get("Reservations") == []:
+                metadata = response.get("ResponseMetadata", {})
+                require(isinstance(metadata, dict) and type(metadata.get("HTTPStatusCode")) is int and
+                        metadata["HTTPStatusCode"] == 200 and
+                        isinstance(metadata.get("RequestId"), str) and bool(metadata["RequestId"].strip()) and
+                        response.get("NextToken") is None and
+                        state.get("launch_outcome") == "accepted" and state.get("allocation_consumed") is True and
+                        state.get("known_instance_ids") == [instance_id] and seen.get("state") == "terminated",
+                        "empty known instance response lacks committed termination proof")
+                allocation = state["attempt"]
+                expected = durable.attempt(request, state["attempts"], utc(allocation["started_at"]))
+                launch = utc(seen["launch_at"])
+                require(all(allocation.get(key) == value for key, value in expected.items() if key != "parameters") and
+                        isinstance(seen["launch_at"], str) and timestamp(launch) == seen["launch_at"] and
+                        utc(allocation["started_at"]) <= launch <= utc(state["cleanup"]["verified_at"]) and
+                        (binding is None or binding["instance_id"] == instance_id and binding["launch_at"] == seen["launch_at"]),
+                        "aged-out instance lacks exact accepted allocation identity")
+                continue
             found = [item for group in response["Reservations"] for item in group["Instances"]]
             require(len(found) == 1 and not response.get("NextToken"), "known instance read is incomplete")
             item = found[0]
@@ -300,49 +352,29 @@ class Collector:
                 "published cleanup differs from committed state")
         payloads["durable.json"], sources["durable.json"] = data, source
         committed = state.get("worker_output")
-        if committed is not None:
-            require(isinstance(committed, dict) and set(committed) == {"status", "results"} and
-                    isinstance(committed["status"], dict) and
-                    (committed["results"] is None or isinstance(committed["results"], dict)),
-                    "worker output commitment differs")
-        missing_committed = set()
         if state.get("binding"):
             paths = MailboxPaths.for_instance(state["request"]["pins"]["account"],
                 state["request"]["pins"]["region"], state["binding"]["instance_id"])
-            for name, field, key, limit in (("status.json", "status", paths.status, MAX_DOCUMENT),
-                                           ("results.zip", "results", paths.results, MAX_RESULT)):
-                ref = committed[field] if committed else None
-                if ref is not None:
-                    # a commitment names a specific version, even behind a delete marker.
-                    # only exact service absence is recoverable; denied reads and checksum
-                    # errors remain held, regardless of the age of the run.
-                    require(set(ref) == {"key", "version", "sha256", "bytes"} and ref["key"] == key,
-                            "committed worker source differs")
-                    try:
-                        raw = self.objects.referenced(ref, key, limit)
-                    except Exception as error:
-                        if error_code(error) not in {"NoSuchKey", "NoSuchVersion"}:
-                            raise
-                        missing_committed.add(name)
-                        continue
-                    value = raw, ref
-                else:
-                    value = self.objects.read(key, limit, optional=True)
+            if committed is not None:
+                raw, ref, status = committed_status(committed, paths.status)
+                payloads["status.json"], sources["status.json"] = raw, ref
+            else:
+                value = self.objects.read(paths.status, MAX_DOCUMENT, optional=True)
                 if value:
-                    payloads[name], sources[name] = value
-        try:
-            status = results.json_value(payloads.get("status.json", b"{}"))
-        except (ValueError, UnicodeError):
-            status = {}
-        missing_archive = isinstance(status, dict) and status.get("sha256") is not None and "results.zip" not in payloads
-        missing = {name for name in ("status.json", "results.zip") if name not in payloads}
+                    payloads["status.json"], sources["status.json"] = value
+            value = self.objects.read(paths.results, MAX_RESULT, optional=True)
+            if value:
+                if committed is not None and status.get("sha256") is not None:
+                    require(value[1]["sha256"] == status["sha256"], "archive differs from committed status digest")
+                payloads["results.zip"], sources["results.zip"] = value
+        missing = expected_worker_files(payloads) - set(payloads)
         availability = None
         if state.get("binding") and missing:
             started = utc(state["binding"]["attempt_started_at"])
             recovery = utc(state["binding"]["deadline"]) + timedelta(seconds=EVIDENCE_RECOVERY_SECONDS)
-            possibly_expired = (state.get("worker_published") is True and
-                                self.now() >= started + timedelta(seconds=MAILBOX_EXPIRY_SECONDS))
-            if missing_committed or missing_archive or possibly_expired:
+            possibly_expired = (state.get("publication") is not None and
+                                 self.now() >= started + timedelta(seconds=MAILBOX_EXPIRY_SECONDS))
+            if "results.zip" in missing or possibly_expired:
                 require(self.now() >= recovery, "worker evidence is missing; bounded recovery grace has not elapsed")
                 availability = dict(outcome="evidence-unavailable", policy=EVIDENCE_RECOVERY_POLICY, missing=sorted(missing),
                     recovery_deadline=timestamp(recovery),
@@ -383,7 +415,8 @@ class Collector:
             validation="metadata/size only; does not prove content integrity", execution_proof=execution, evidence=evidence,
             presentation=dict(report="full", summary="full"),
             public_projection=projection.freeze(record.run_key, expected, request["pins"], valid, evidence, result,
-                                                outcome=outcome, execution_status=execution["status"]))
+                                                outcome=outcome, execution_status=execution["status"],
+                                                collected_at=timestamp(self.now())))
         try:
             if availability:
                 summary = ("<!doctype html><meta charset=utf-8><title>Benchmark evidence unavailable</title>"
@@ -461,7 +494,7 @@ class Collector:
                 evidence.get("controller") == controller and evidence.get("files") == {
                     name: digest(payloads[name]) for name in ("controller.json", "status.json", "results.zip") if name in payloads},
                 "retained report provenance differs")
-        outcome = report.get("qualification_outcome", "passed" if manifest["benchmark_valid"] else "failed")
+        outcome = report["qualification_outcome"]
         require(outcome in {"passed", "failed", "evidence-unavailable"} and
                 (outcome == "passed") == manifest["benchmark_valid"], "retained qualification outcome differs")
         availability = report.get("evidence_availability")
@@ -471,19 +504,19 @@ class Collector:
             require(isinstance(availability, dict) and set(availability) == {
                 "outcome", "policy", "missing", "recovery_deadline", "reason"} and
                 availability["policy"] in EVIDENCE_RECOVERY_POLICIES and availability["outcome"] == outcome and state.get("binding") is not None and
-                availability["missing"] == sorted({"status.json", "results.zip"} - set(payloads)) and
+                availability["missing"] == sorted(expected_worker_files(payloads) - set(payloads)) and
                 availability["missing"] and availability["recovery_deadline"] == timestamp(
                     utc(state["binding"]["deadline"]) + timedelta(seconds=EVIDENCE_RECOVERY_POLICIES[availability["policy"]])),
                     "retained evidence loss proof differs")
-        if "public_projection" in report:
-            public = projection.bind(report["public_projection"], "0" * 64)
-            require(public["run_key"] == record.run_key and public["benchmark_valid"] == manifest["benchmark_valid"] and
-                    public["identity"] == {key: expected[key] for key in
-                        ("run", "run_url", "suite", "baseline", "candidate", "controller")} and
-                    public["comparison"] == results.comparison_label(expected, controller) and
-                    public.get("qualification_outcome", "passed" if public["benchmark_valid"] else "failed") == outcome and
-                    (not manifest["benchmark_valid"] or public["verification"] == evidence.get("expected_verification")),
-                    "retained public projection provenance differs")
+        public = projection.bind(report["public_projection"], "0" * 64)
+        require(public["run_key"] == record.run_key and public["benchmark_valid"] == manifest["benchmark_valid"] and
+                public["identity"] == {key: expected[key] for key in
+                    ("run", "run_url", "suite", "baseline", "candidate", "controller")} and
+                public["comparison"] == projection.comparison_label(expected, controller) and
+                projection.qualification_outcome(public) == outcome and
+                (not manifest["benchmark_valid"] or public["verification"] == evidence.get("expected_verification")),
+                "retained public projection provenance differs")
+        return outcome
 
 
     def retained(self, record, expected, execution, conclusion):
@@ -504,26 +537,25 @@ class Collector:
                     <= set(limits), "retained file set differs")
             payloads = {name: self.objects.referenced(ref, self.prefix + name, limits[name]) for name, ref in refs.items()}
             validate_retained(record, manifest, payloads)
+            outcome = results.json_value(payloads["report.json"], MAX_REPORT)["qualification_outcome"]
             if not record.closed:
                 # an open run still needs today's qualification verdict before retirement.
                 # Presentation bytes are historical and are never regenerated for equality.
                 saved_report = results.json_value(payloads["report.json"], MAX_REPORT)
                 valid, _ = self.analyze(record, expected, execution, conclusion, payloads, saved_report.get("evidence_availability"))
                 require(valid == manifest["benchmark_valid"], "retained qualification verdict differs")
-            return manifest, existing[1]
+            return manifest, existing[1], outcome
         payloads, sources, availability = self.raw(record)
         valid, derived = self.analyze(record, expected, execution, conclusion, payloads, availability)
         payloads.update(derived)
         retained = {name: self.objects.once(self.prefix + name, raw, limits[name]) for name, raw in payloads.items()}
         manifest = dict(binding, sources=sources, retained=retained, benchmark_valid=valid)
-        return manifest, self.objects.once(key, encoded(manifest), MAX_DOCUMENT)
+        validate_retained(record, manifest, payloads)
+        outcome = results.json_value(payloads["report.json"], MAX_REPORT)["qualification_outcome"]
+        return manifest, self.objects.once(key, encoded(manifest), MAX_DOCUMENT), outcome
 
-    def outcome(self, manifest, ref, *, retired):
-        report_ref = manifest["retained"]["report.json"]
-        report = results.json_value(self.objects.referenced(report_ref, self.prefix + "report.json", MAX_REPORT), MAX_REPORT)
-        outcome = report.get("qualification_outcome", "passed" if manifest["benchmark_valid"] else "failed")
-        require(outcome in {"passed", "failed", "evidence-unavailable"} and
-                (outcome == "passed") == manifest["benchmark_valid"], "retained qualification outcome differs")
+    @staticmethod
+    def outcome(manifest, ref, outcome, *, retired):
         return dict(state="success" if outcome == "passed" else "unavailable" if outcome == "evidence-unavailable" else "failed",
                     retired=retired, benchmark_valid=manifest["benchmark_valid"],
                     qualification_outcome=outcome, retention=ref)
@@ -547,22 +579,22 @@ class Collector:
                 saved = results.json_value(raw)
                 require(saved.get("producer_conclusion") in CONCLUSIONS and
                         saved.get("execution", {}).get("status") in TERMINAL | {"NEVER_SUBMITTED", "NEVER_STARTED"}, "closed proof is not terminal")
-                manifest, verified = self.retained(record, identity(record), saved["execution"], saved["producer_conclusion"])
+                manifest, verified, outcome = self.retained(record, identity(record), saved["execution"], saved["producer_conclusion"])
                 require(verified == ref, "closed retention version differs")
-                return self.outcome(manifest, ref, retired=True)
+                return self.outcome(manifest, ref, outcome, retired=True)
             expected, execution, conclusion = self.proof(record)
-            manifest, ref = self.retained(record, expected, execution, conclusion)
+            manifest, ref, outcome = self.retained(record, expected, execution, conclusion)
             # repeat physical/execution observations after retention; the final store CAS is the atomic
             # fence. Reuse this invocation's terminal producer observation: a later rerun cannot
             # resume uploads or submit the already complete, deduplicated run.
             require(self.runtime_proof(record) == (expected, execution), "runtime proof changed during retention")
             current = self.store.read()
             require(current == record, "run changed during collection")
-            outcome = self.outcome(manifest, ref, retired=retire)
+            outcome = self.outcome(manifest, ref, outcome, retired=retire)
             if retire:
                 closed = self.store.retire(ref["sha256"], record.revision)
                 require(closed.closed and closed.retirement_sha256 == ref["sha256"], "retirement outcome is uncertain")
             return outcome
         except Exception as error:
             # avoid exposing SDK response bodies, URLs or credentials in user-visible diagnostics
-            return dict(state="held", retired=known_retired, benchmark_valid=False, reason=results.diagnostic(error))
+            return dict(state="held", retired=known_retired, benchmark_valid=False, **held_diagnostic(error))

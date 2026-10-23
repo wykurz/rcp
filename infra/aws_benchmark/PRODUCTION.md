@@ -59,6 +59,21 @@ successful or ambiguous allocation consumes the opportunity: uncertainty retains
 parameters and deadline, and does not justify another allocation after an empty EC2 read. There is
 no replacement worker after successful allocation.
 
+Launch evidence distinguishes a request that was never sent, a definitive rejection, an accepted
+allocation and an unknown outcome. A persisted send sequence fences a late negative response from
+superseding a later send or positive allocation evidence. Retrying the exact unresolved token is
+separate from admitting useful benchmark work: a replay keeps the original capacity/allocation
+cutoffs and guard checks, while publication still requires the workload's remaining-time budget. A
+fresh request rejected definitively for permissions, quota or parameters closes without claiming an
+allocation; it does not start another paid attempt automatically.
+
+An earlier ambiguous send followed by a capacity error remains unresolved. EC2 documents successful
+idempotent replay after an original request completes, but does not provide a 60-second upper bound
+on an original in-flight operation. Waiting that long is not proof of no allocation. Keep the owner
+and independent guard until positive allocation/termination evidence resolves the uncertainty; do
+not release ownership or choose a new token from an empty Describe response or elapsed time. See
+[EC2 idempotency](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html).
+
 The 180-minute allocation envelope starts at the allocation attempt, covering boot, fixture
 generation, copies, validation, packaging and upload. A healthy independent expiry scan must precede
 launch. Immutable deadline tags accompany instance creation, and an exact-instance shutdown schedule
@@ -99,29 +114,40 @@ invalidate independently successful worker measurements; the original conclusion
 Likewise, a failed, aborted or timed-out coordinator loop does not invalidate successful worker
 measurements after exact allocation binding, physical cleanup and terminal producer proofs pass. The
 coordinator's terminal status remains in the retained report and public note. Legacy controller
-results still require their execution job to succeed. The watchdog commits exact status/archive
-versions and SHA-256 digests, including during closing ticks; collection prefers those versions.
-Missing committed or indicated output holds for recovery until nine days after the bound allocation
-deadline. That grace accounts for seven-day expiry, UTC rounding and one-day noncurrent retention;
-time alone does not prove deletion. Only confirmed object absence after that grace can retire the
-run as **evidence unavailable**, with unknown workload outcome, never as a proven failed benchmark.
-Uncommitted missing output also holds from seven days until that boundary. Access denial, transient
-reads and checksum failures still hold rather than becoming absence evidence. The frozen
-`mailbox-loss-v1` recovery policy prevents later defaults from reinterpreting unavailable outcomes.
+results still require their execution job to succeed. The watchdog commits the bounded terminal
+status and its exact version/hash evidence, including during closing ticks. That status carries the
+archive digest when an archive was produced. The watchdog does not HEAD the archive or read old
+object versions; the collector binds archive bytes using its existing output-read permissions.
+Committed status survives mailbox lifecycle expiry in the service record. Generic access denial
+never proves deletion, and this path adds no ListBucketVersions grant. Production state/receipts
+share a 192 KiB bound, including the 720-attempt failure inventory and the exact bounded status
+bytes stored as canonical base64. This avoids JSON control-character expansion; decoding still
+verifies the original length and digest. The independent 400 KiB DynamoDB item check and legacy
+receipt limits are unchanged. Missing committed or indicated output holds for recovery until nine
+days after the bound allocation deadline. That grace accounts for seven-day expiry, UTC rounding and
+one-day noncurrent retention; time alone does not prove deletion. Only confirmed object absence
+after that grace can retire the run as **evidence unavailable**, with unknown workload outcome,
+never as a proven failed benchmark. Uncommitted missing output also holds from seven days until that
+boundary. Access denial, transient reads and checksum failures still hold rather than becoming
+absence evidence. The frozen `mailbox-loss-v1` recovery policy prevents later defaults from
+reinterpreting unavailable outcomes.
 
 Collection retains version-bound raw evidence, a report, HTML and a hashed manifest before a
 revision-fenced retirement transaction releases the active pointer. Missing or inaccessible proof
 holds ownership except for the explicit evidence-unavailable outcome above. The collector freezes
 the public projection in the retained report before retirement; later first publication of those
-records does not use today's measurement parser. Older pre-projection evidence still requires its
-compatible parser until first publication. Already-published history is never rewritten. Public v1
-success/failure records remain unchanged; v2 adds the distinct evidence-unavailable outcome. A
-bounded diagnostic report can describe a failed archive while preserving its exact raw bytes. The
-local publication helpers discover only retired manifests, bind each to a consistent closed
-tombstone, and download exact retained versions through read-only clients. Discovery traverses the
-full retained prefix within page/count/time bounds; it is not an atomic snapshot, and later scans
-must revisit the prefix. A separate consistent active-pointer observation describes pending
-ownership before a manifest exists, without claiming physical teardown or a cross-service snapshot.
+records does not use today's measurement parser. Both the frozen projection and explicit
+qualification outcome are required; no pre-deployment legacy fallback reinterprets missing fields.
+Already-published history is never rewritten. Public v1 success/failure records and v2's distinct
+evidence-unavailable outcome remain readable. New v3 records carry a canonical collector-recorded
+`collected_at`; old records display no trusted collection time instead of presenting the
+candidate-controlled harness timestamp as trusted. A bounded diagnostic report can describe a failed
+archive while preserving its exact raw bytes. The local publication helpers discover only retired
+manifests, bind each to a consistent closed tombstone, and download exact retained versions through
+read-only clients. Discovery traverses the full retained prefix within page/count/time bounds; it is
+not an atomic snapshot, and later scans must revisit the prefix. A separate consistent
+active-pointer observation describes pending ownership before a manifest exists, without claiming
+physical teardown or a cross-service snapshot.
 
 A separate bounded bundle format binds the downloader revision and repository for credential-free
 processing. The public exporter renders escaped allowlisted fields and never publishes retained
@@ -149,6 +175,45 @@ pushes to `aws-benchmark-history` without force, with three bounded fetch/reconc
 history branch remains separate from Depot's `benchmark-history`. The GitHub `contents: write` job
 token is repository-wide: the reviewed writer restricts its target, but GitHub does not scope that
 token to this one branch. Protect main and review changes to this workflow.
+
+### Publication trust gate
+
+Publication remains disabled pending the separate history-writer decision and live acceptance (F55).
+A schema-valid Git record and a retirement digest are not independent authentication of its
+measurement bytes. Another repository Contents-write credential can alter an unprotected history
+branch, including through a fast-forward commit. Do not enable publication or AWS history rendering
+by treating `RCP_AWS_HISTORY_TRUST_READY=true` alone as evidence of a protected branch. That
+repository variable defaults off and gates both publication and AWS history rendering, independently
+of `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`. Publication and Pages reject reruns; submit a fresh manual
+workflow after a hold instead of executing an old revision's write path.
+
+The proposed setup requires separate approval before implementation or live configuration:
+
+- Create an owner-managed, repository-selected App named `rcp-benchmark-history-writer`, installed
+  only on `wykurz/rcp`, with Contents write and Metadata read. It must be separate from the
+  Actions-read proof App. Approve its key custody, secret location and short-lived token minting
+  workflow before generating or importing a key.
+- Add an active branch ruleset matching exactly `refs/heads/aws-benchmark-history`: restrict
+  creation, updates and deletion, and block force pushes. Give only that exact writer App the
+  required bypass. Do not add an all-Actions, collaborator, role-wide or unrelated-App bypass.
+  Preserve main protections; the App token itself is repository-scoped, not branch-scoped.
+- Replace the writer's repository-wide job token with the reviewed dedicated token path, keep the
+  exact refspec and credential-free export boundary, and verify denial with an ordinary workflow
+  token and success only through the dedicated writer. Protect the token-minting job/configuration
+  so arbitrary repository code cannot obtain the App key. Record resolved App/installation IDs,
+  ruleset ID and evidence before enabling the readiness and publication gates.
+
+This PR does not create that App, secret, ruleset or bypass and does not claim the current job token
+satisfies this gate. Removing persisted checkout credentials from release jobs reduces exposure but
+is not a replacement for history protection. Anchoring public digests in DynamoDB is a possible
+additional integrity layer; it would still require a trusted verification path for standalone Pages
+and does not replace the publication authorization decision.
+
+Public pages distinguish consistency checks from measurement honesty. Candidate binaries share the
+harness UID and can forge measurement files; the displayed values are self-reported, unattested
+performance measurements. Verified cleanup describes independent teardown evidence only. Metadata
+validation does not establish content integrity. Do not turn these labels into an accuracy or
+performance claim without reviewing the candidate and measurement methodology.
 
 Pages renders the public JSON with trusted main code, never retained worker HTML. AWS navigation
 appears only when valid AWS history exists. Neither publication nor Pages launches a benchmark. The
@@ -491,10 +556,13 @@ References:
    its exact read-only role, enabling the separate `PublicationEnabled` gate, and setting
    `RCP_AWS_PRODUCTION_PUBLISH_ROLE`, `RCP_AWS_PRODUCTION_TABLE` and
    `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`; it shares the existing production region/bucket variables.
-   Pages retains its independent `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in
-   this change. Broader comparisons and a few-times-weekly schedule require their reviewed
-   contracts, operating allowance and activation decisions. Do not call this initial acceptance
-   foundation a complete production cutover.
+   Keep `RCP_AWS_HISTORY_TRUST_READY` false until the separate history-writer/ruleset implementation
+   and live positive/negative trust canary above are approved and verified. Only then enable that
+   readiness flag for both publication and AWS history rendering. Pages retains its independent
+   `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in this change. Broader
+   comparisons and a few-times-weekly schedule require their reviewed contracts, operating allowance
+   and activation decisions. Do not call this initial acceptance foundation a complete production
+   cutover.
 
 ## Maintenance and unresolved production prerequisites
 
