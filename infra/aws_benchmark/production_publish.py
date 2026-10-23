@@ -394,8 +394,8 @@ def summary(index, records=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("download", "export", "publish"))
-    parser.add_argument("--history", required=True, type=Path)
+    parser.add_argument("phase", choices=("download", "export", "validate", "publish"))
+    parser.add_argument("--history", type=Path)
     parser.add_argument("--reader-revision", required=True)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
@@ -404,6 +404,8 @@ def main():
         parser.add_argument("--" + name)
     args = parser.parse_args()
     codec.revision(args.reader_revision)
+    if args.phase != "validate":
+        require(args.history is not None, "history directory required")
     if args.phase == "download":
         from .controller import oidc_session
         require(args.output is not None and re.fullmatch(r"[a-z]{2}-[a-z]+-[1-9][0-9]?", args.region or "") and
@@ -421,6 +423,10 @@ def main():
         prior, _ = history(args.history)
         value = export(args.input, prior, args.output, args.reader_revision, args.expected_sha256)
         index = index_at(args.output, PUBLIC_SCHEMA, args.reader_revision)
+    elif args.phase == "validate":
+        require(args.input is not None, "public batch required")
+        public_batch(args.input, args.reader_revision, args.expected_sha256)
+        return
     else:
         require(args.input is not None, "public batch required")
         commit = publish(args.input, args.history, args.reader_revision, args.expected_sha256)
