@@ -16,6 +16,11 @@ MAX_ENVELOPE = 512 * 1024
 
 
 def record_item(value):
+    """Reconstruct parser input, not an independent signature or tamper proof.
+
+    load() checks shape and internal byte bindings. Authenticity comes from the
+    download job's independently supplied inventory digest before load() is called.
+    """
     require(isinstance(value, dict) and set(value) == {"run_key", "epoch", "fingerprint", "admission", "state",
         "revision", "closed", "terminal", "retirement_sha256"}, "invalid saved run record")
     require(type(value["revision"]) is int and type(value["closed"]) is bool and type(value["terminal"]) is bool,

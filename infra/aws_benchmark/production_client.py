@@ -12,15 +12,51 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from benchmarks.strict_json import parse_json
-from .common import BINARIES, Budget, require
+from .common import BINARIES, Budget, require, retryable_io, utc
 from .controller import oidc_session, read_binary
 
 MAX_RESPONSE = 65536
+LAMBDA_READ_TIMEOUT = 60  # exceeds the admission function's 45-second execution limit
+TOKEN_READ_TIMEOUT = 10
+INVOKE_RESERVE_SECONDS = TOKEN_READ_TIMEOUT + 3 + LAMBDA_READ_TIMEOUT
+SUBMISSION_SECONDS = 600
+MAX_INVOKE_ATTEMPTS = 4
+ACTIVE_SUBMISSION_STATES = frozenset({"armed", "launching", "uncertain", "requested"})
+
+
+class AdmissionRetryable(ValueError):
+    """A sanitized transient response; retry only this exact action and producer."""
+
+    def __init__(self, delay=5):
+        super().__init__("admission temporarily unavailable; retain existing reservation")
+        self.delay = delay
+
+
+def lambda_config():
+    from botocore.config import Config
+    return Config(connect_timeout=3, read_timeout=LAMBDA_READ_TIMEOUT,
+                  retries={"total_max_attempts": 1}, proxies={}, ignore_configured_endpoint_urls=True)
+
+
+def reconcile(operation, *, deadline, reserve, clock, sleep):
+    """Bound same-attempt retries; an exhausted/ambiguous result never releases ownership."""
+    for attempt in range(MAX_INVOKE_ATTEMPTS):
+        require(clock() + reserve < deadline, "submission reconciliation window exhausted")
+        try:
+            return operation()
+        except Exception as error:
+            if not isinstance(error, AdmissionRetryable) and not retryable_io(error):
+                raise
+            delay = max((5, 15, 45, 45)[attempt], getattr(error, "delay", 0))
+            require(attempt + 1 < MAX_INVOKE_ATTEMPTS and clock() + delay + reserve < deadline,
+                    "submission reconciliation remains pending; retain receipt")
+            sleep(delay)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -43,7 +79,7 @@ def token(audience):
     url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query + [("audience", audience)])))
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-    with opener().open(request, timeout=10) as response:
+    with opener().open(request, timeout=TOKEN_READ_TIMEOUT) as response:
         require(response.status == 200, "GitHub token request failed")
         data = response.read(MAX_RESPONSE + 1)
     require(len(data) <= MAX_RESPONSE, "GitHub token response exceeds bound")
@@ -78,6 +114,11 @@ def invoke(api, function, value):
         stream.close()
     require(len(body) <= MAX_RESPONSE, "admission response exceeds bound")
     envelope = parse_json(body.decode("utf-8"))
+    if isinstance(envelope, dict) and envelope.get("ok") is False and envelope.get("error") == "admission_retryable":
+        delay = envelope.get("retry_after_seconds")
+        require(set(envelope) == {"ok", "error", "retry_after_seconds"}
+                and type(delay) is int and 1 <= delay <= 86400, "invalid admission retry interval")
+        raise AdmissionRetryable(delay)
     require(isinstance(envelope, dict) and set(envelope) == {"ok", "result"}
             and envelope["ok"] is True and isinstance(envelope["result"], dict),
             "admission rejected or requires reconciliation")
@@ -127,26 +168,60 @@ def upload(capability, data, *, bucket, region):
             require(len(response.read(1025)) <= 1024, "upload response exceeds bound")
     except urllib.error.HTTPError as error:
         error.close()
+        if error.code in (429, 500, 502, 503, 504):
+            raise AdmissionRetryable() from None
         if error.code != 412:
             raise ValueError("binary upload failed; retain admission receipt") from None
         # create-only replay does not prove equality; the server verifies the pinned checksum/version
 
 
+def submitted(value, *, function, expected_run):
+    require(value.get("state") in ACTIVE_SUBMISSION_STATES and value.get("run") == expected_run
+            and value.get("execution_status") in {"submitted", "RUNNING"},
+            "submission is not active/running; retain receipt for reconciliation")
+    parts = function.split(":")
+    require(len(parts) == 7 and parts[:3] == ["arn", "aws", "lambda"], "invalid admission function")
+    pattern = r"arn:aws:states:" + re.escape(parts[3] + ":" + parts[4]) + \
+        r":execution:[A-Za-z0-9_-]{1,80}:" + re.escape(expected_run)
+    require(isinstance(value.get("execution_arn"), str)
+            and re.fullmatch(pattern, value["execution_arn"]), "submission execution differs")
+    return public_receipt(value)
+
+
 def submit(api, function, manifest, binaries, receipt_path, *, audience, bucket, region,
-           token_reader=token, uploader=upload):
-    admitted = invoke(api, function, dict(action="begin", token=token_reader(audience), manifest=manifest))
+           token_reader=token, uploader=upload, clock=time.monotonic, wall_clock=time.time, sleep=time.sleep,
+           expected_run=None):
+    if expected_run is None:
+        expected_run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    require(re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,4}", expected_run), "invalid producer run")
+    deadline = clock() + SUBMISSION_SECONDS
+    def call(action):
+        value = dict(action=action, token=token_reader(audience))
+        if action == "begin":
+            value["manifest"] = manifest
+        return invoke(api, function, value)
+    admitted = reconcile(lambda: call("begin"), deadline=deadline, reserve=INVOKE_RESERVE_SECONDS,
+                         clock=clock, sleep=sleep)
     persist(receipt_path, admitted)
+    require(admitted.get("run") == expected_run, "workflow rerun cannot submit an earlier producer")
     capabilities = admitted.get("uploads")
     if capabilities is None:
-        return public_receipt(admitted)
-    require(isinstance(capabilities, dict) and set(capabilities) == set(BINARIES), "upload set differs")
-    for name in BINARIES:
-        uploader(capabilities[name], binaries[name], bucket=bucket, region=region)
-    sealed = invoke(api, function, dict(action="seal", token=token_reader(audience)))
+        # a lost begin response may have been followed by a successful same-attempt seal.
+        # otherwise only seal can prove the pinned execution; pending receipts never succeed.
+        require(admitted.get("state") in ACTIVE_SUBMISSION_STATES, "admission is held or closed; retain receipt")
+    else:
+        require(admitted.get("state") == "awaiting-inputs" and isinstance(capabilities, dict)
+                and set(capabilities) == set(BINARIES), "upload set differs")
+        deadline = min(deadline, clock() + utc(admitted["upload_deadline"]).timestamp() - wall_clock())
+        for name in BINARIES:
+            reconcile(lambda: uploader(capabilities[name], binaries[name], bucket=bucket, region=region),
+                      deadline=deadline, reserve=30, clock=clock, sleep=sleep)
+    sealed = reconcile(lambda: call("seal"), deadline=deadline, reserve=INVOKE_RESERVE_SECONDS,
+                       clock=clock, sleep=sleep)
     require(sealed.get("run_key") == admitted["run_key"] and sealed.get("epoch") == admitted.get("epoch"),
             "sealed receipt differs from admitted owner")
     persist(receipt_path, sealed)
-    return public_receipt(sealed)
+    return submitted(sealed, function=function, expected_run=expected_run)
 
 
 def main():
@@ -168,9 +243,10 @@ def main():
     require(re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", args.bucket), "invalid production bucket")
     manifest, binaries = prepare(args.binaries, args.revision)
     budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
-    session, config = oidc_session(args.region, args.role, session_prefix="rcp-production-",
+    session, _ = oidc_session(args.region, args.role, session_prefix="rcp-production-",
         duration_seconds=900, budget=budget, reserve=10)
-    result = submit(session.client("lambda", config=config), args.function, manifest, binaries, args.receipt,
+    result = submit(session.client("lambda", config=lambda_config(),
+        endpoint_url=f"https://lambda.{args.region}.amazonaws.com"), args.function, manifest, binaries, args.receipt,
                     audience=args.audience, bucket=args.bucket, region=args.region)
     print(json.dumps(result, sort_keys=True))
 

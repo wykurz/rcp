@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -49,12 +50,27 @@ class CollectionHandlerTests(unittest.TestCase):
             self.assertEqual(handler.lambda_handler(dict(run_key="untrusted"), None)["state"], "held")
             clients.assert_not_called()
 
+    def test_normal_held_result_emits_safe_diagnostic(self):
+        env = dict(RCP_PRODUCTION_ENABLED="true", RCP_PRODUCTION_REPOSITORY="wykurz/rcp",
+            RCP_PRODUCTION_REPOSITORY_ID="123", RCP_PRODUCTION_OWNER_ID="44",
+            RCP_PRODUCTION_MACHINE_ARN=self.cloud.machine)
+        with patch.dict(os.environ, env, clear=True), patch.object(handler.Configuration, "environment", return_value=self.cloud.config), \
+             patch.object(handler, "collection_clients", return_value=self.api), \
+             patch.object(handler, "collect_active", return_value=dict(state="held", retired=False, reason="proof unavailable")), \
+             patch("builtins.print") as logged:
+            self.assertEqual(handler.lambda_handler({}, None)["state"], "held")
+        self.assertEqual(json.loads(logged.call_args.args[0]),
+                         dict(event="production_collection_held", reason="proof unavailable"))
+
     def test_handler_error_response_does_not_expose_credentials(self):
         with patch.dict(os.environ, {"RCP_PRODUCTION_ENABLED": "true"}, clear=True), \
-             patch.object(handler.Configuration, "environment", side_effect=RuntimeError("secret credential")):
+             patch.object(handler.Configuration, "environment", side_effect=RuntimeError("secret credential")), \
+             patch("builtins.print") as logged:
             result = handler.lambda_handler({}, None)
         self.assertEqual(result["state"], "held")
         self.assertNotIn("secret", str(result))
+        self.assertNotIn("secret", str(logged.call_args))
+        self.assertEqual(json.loads(logged.call_args.args[0])["category"], "RuntimeError")
 
 
 if __name__ == "__main__":

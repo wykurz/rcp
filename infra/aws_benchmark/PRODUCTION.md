@@ -26,7 +26,10 @@ PR pushes, forks, comments and arbitrary OIDC callers do not authorize paid work
 concurrency is only a convenience. A single DynamoDB transaction creates the run, reserves its full
 allowance, increments daily/monthly/total accounting and claims the exclusive active pointer. The
 run key includes the immutable repository ID and GitHub run ID, so reruns cannot obtain another
-reservation or allocation. The table retains closed tombstones and has no TTL.
+reservation or allocation. Only attempt 1 can create the initial reservation: GitHub reruns retain
+the original actor identity and therefore are not proof that the owner pressed rerun. A failed
+initial request needs a new owner-requested workflow run, not an attempt that reuses another actor's
+authority. The table retains closed tombstones and has no TTL.
 
 The server policy is disabled by default, with zero allowances and no schedule slots. All policy
 fields are required in its canonical stored payload. Pricing must have evidence no older than 31
@@ -79,7 +82,16 @@ A separate collector periodically checks the one active run. It cannot launch or
 the fixed outer horizon plus drain, it requires terminal state-machine and GitHub producer proof, no
 pending environment approvals, exact instance/root-volume reconciliation and no live namespace
 instances. A failed upload that never submitted a state machine has a separate strict no-submission
-proof. Elapsed time alone does not resolve uncertain allocation.
+proof. A sealed request whose exact named execution never started has a separate `NEVER_STARTED`
+proof only after the full horizon and drain, with no allocation intent or worker evidence, exact
+execution absence and an empty namespace. Neither proof refunds its reservation. Elapsed time alone
+does not resolve uncertain allocation.
+
+GitHub is the submitter, not the worker. A terminal cancelled or failed submission job does not
+invalidate independently successful worker measurements; the original conclusion remains visible.
+Legacy controller results still require their execution job to succeed. If the watchdog previously
+observed worker completion but its status/archive has since expired, collection holds for evidence
+recovery instead of relabeling it as a proven failed benchmark.
 
 Collection retains version-bound raw evidence, a report, HTML and a hashed manifest before a
 revision-fenced retirement transaction releases the active pointer. Missing or inaccessible proof
@@ -153,6 +165,11 @@ for this read role. Listing exposes key names under the repository's run prefix.
 enforce numeric run IDs, retirement state or manifest-selected versions; the reader validates those
 properties. These limits must remain explicit in the deployment approval.
 
+DynamoDB condition checks retain exact table/item fences without relying on an undocumented
+`EnclosingOperation` context key. Put/Update/Delete remain transaction-only with their attribute
+fences. The service authorization reference and transaction guide disagree about that condition on
+`ConditionCheckItem`; offline tests do not replace the no-worker live canary.
+
 All Lambda reserved concurrencies are zero initially; watchdog and collector rules are disabled.
 Admission has a separate gate. There is no recurring benchmark trigger in this change. The
 five-minute collector timer only reconciles existing ownership and never submits work.
@@ -202,6 +219,30 @@ five-minute collector timer only reconciles existing ownership and never submits
    this change. Broader comparisons and a few-times-weekly schedule require their reviewed
    contracts, operating allowance and activation decisions. Do not call this initial acceptance
    foundation a complete production cutover.
+
+## Maintenance and unresolved production prerequisites
+
+Close the separate admission gate and wait for ownership retirement before rotating policy version,
+price/cap configuration, image/template pins, workload plan, or Lambda package/validator semantics.
+Keep the admitted policy enabled during an ordinary drain; setting its enabled field false is the
+intentional emergency kill switch. The exact version and pin fences are safety checks, not automatic
+migration. Keep the collector's validator compatible until retirement too: if a retained-open
+verdict conflicts after a package change, restore the exact compatible validator and reconcile its
+immutable evidence. Do not overwrite the manifest or release ownership to escape that hold.
+
+Admission and terminal proof currently use public unauthenticated GitHub REST reads, subject to the
+shared source-IP limit of 60 requests/hour. Warm processes honor rate-limit cooldowns and collection
+reuses one terminal producer observation within an invocation while repeating physical/execution
+checks before retirement. No stale producer proof is accepted across invocations. Reliable
+unattended production still requires a separately approved authenticated GitHub read design and live
+rate-limit acceptance; this PR creates no GitHub secret or wider AWS access. Admission failures and
+collector holds emit bounded structured diagnostics without tokens, upload URLs or SDK response
+bodies. An operator alarm/notification destination remains an activation decision.
+
+The dormant scheduled policy requires its fixed baseline to equal main for this initial A/A
+contract; it is not a working recurring comparison policy as main advances. Keep schedule slots
+empty. A future scheduled contract, baseline selection and operating budget need their own tests and
+approval before adding a timer.
 
 Rollback closes admission and preserves the independent watchdog/collector while active work
 reconciles. Restore an older compatible package only after checking its state schema and immutable

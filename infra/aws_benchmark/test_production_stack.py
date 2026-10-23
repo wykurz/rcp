@@ -230,12 +230,10 @@ class ProductionStackTests(unittest.TestCase):
         self.assertNotIn("collect", str(env).lower())
 
     def test_admission_reservation_writes_are_transaction_only_and_policy_is_read_only(self):
-        for action, keys in (("PutItem", ["active", RUN_PK, "schedule#2026-10-22T03:00Z"]),
-                            ("ConditionCheckItem", ["policy", "active"])):
-            for key in keys:
-                self.assertTrue(permits("AdmissionRole", "dynamodb:" + action, TABLE, db_context(key)), (action, key))
-                self.assertFalse(permits("AdmissionRole", "dynamodb:" + action, TABLE,
-                                        db_context(key, transaction=False)), (action, key))
+        for key in ("active", RUN_PK, "schedule#2026-10-22T03:00Z"):
+            self.assertTrue(permits("AdmissionRole", "dynamodb:PutItem", TABLE, db_context(key)), key)
+            self.assertFalse(permits("AdmissionRole", "dynamodb:PutItem", TABLE,
+                                    db_context(key, transaction=False)), key)
         self.assertTrue(permits("AdmissionRole", "dynamodb:GetItem", TABLE, db_context("policy", transaction=False)))
         for action in ("PutItem", "UpdateItem", "DeleteItem"):
             self.assertFalse(permits("AdmissionRole", "dynamodb:" + action, TABLE, db_context("policy")))
@@ -246,6 +244,32 @@ class ProductionStackTests(unittest.TestCase):
         self.assertFalse(permits("AdmissionRole", "dynamodb:UpdateItem", TABLE, db_context(RUN_PK, "policy")))
         self.assertFalse(permits("AdmissionRole", "dynamodb:UpdateItem", TABLE, {}))
         self.assertFalse(permits("AdmissionRole", "dynamodb:UpdateItem", TABLE + "-other", db_context(RUN_PK)))
+
+    def test_condition_checks_preserve_item_scope_without_enclosing_operation(self):
+        # condition checks exist only within TransactWriteItems, but the action reference
+        # does not list EnclosingOperation; do not invent that context for their tests
+        scopes = {
+            "AdmissionRole": ["policy", "active"],
+            "CoordinatorRole": ["policy", "active"],
+            "WatchdogRole": ["active"],
+            "CollectorRole": ["active", RUN_PK],
+        }
+        candidates = {"policy", "active", RUN_PK, "guard", "budget#total", "budget#month#2026-10",
+                      "rate#day#2026-10-22", "schedule#slot", "run#repo-999-run-1234", "unrelated"}
+        for role, allowed in scopes.items():
+            for transaction in (False, True):
+                for key in candidates:
+                    with self.subTest(role=role, key=key, enclosing_operation=transaction):
+                        context = db_context(key, transaction=transaction)
+                        self.assertEqual(permits(role, "dynamodb:ConditionCheckItem", TABLE, context), key in allowed)
+                        self.assertFalse(permits(role, "dynamodb:ConditionCheckItem", TABLE + "-other", context))
+                self.assertTrue(permits(role, "dynamodb:ConditionCheckItem", TABLE,
+                                        db_context(*allowed, transaction=transaction)), role)
+                self.assertFalse(permits(role, "dynamodb:ConditionCheckItem", TABLE,
+                                         db_context(allowed[0], "unrelated", transaction=transaction)), role)
+            self.assertFalse(permits(role, "dynamodb:ConditionCheckItem", TABLE, {}), role)
+            self.assertFalse(permits(role, "dynamodb:ConditionCheckItem", TABLE,
+                                     {"dynamodb:EnclosingOperation": ["TransactWriteItems"]}), role)
 
     def test_runtime_cannot_reserve_refund_seed_policy_or_release_owner(self):
         for role in ("CoordinatorRole", "WatchdogRole"):
@@ -276,9 +300,6 @@ class ProductionStackTests(unittest.TestCase):
                 for attributes in (["pk", forbidden], context["dynamodb:Attributes"] + [forbidden]):
                     self.assertFalse(permits(role, "dynamodb:UpdateItem", TABLE,
                         context | {"dynamodb:Attributes": attributes}), (role, forbidden))
-        self.assertTrue(permits("CoordinatorRole", "dynamodb:ConditionCheckItem", TABLE, db_context("policy")))
-        self.assertFalse(permits("CoordinatorRole", "dynamodb:ConditionCheckItem", TABLE,
-                                db_context("policy", transaction=False)))
 
     def test_admission_counter_attributes_are_separate_from_progress_and_each_other(self):
         store = RunStore(None, "production", RUN, "a" * 64)

@@ -3,7 +3,8 @@
 Collection never launches, terminates, changes guards or refunds a reservation.
 The active pointer is released only after the fixed outer deadline plus delivery
 drain, fresh physical reconciliation, a terminal original/current GitHub producer
-and Standard execution (or a separately labeled never-submitted proof), and read-back of bounded retained evidence. An expired
+and Standard execution (or separately labeled never-submitted/never-started proof),
+and read-back of bounded retained evidence. An expired
 EC2 terminated record is accepted only for exact InvalidInstanceID.NotFound with
 service-only committed watchdog termination/root evidence; an empty successful
 response is not absence proof. These are control-plane observations, not a claim
@@ -16,7 +17,7 @@ and an outer execution timeout; failures hold ownership. No GitHub secret is nee
 """
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 import json
 from pathlib import Path
@@ -104,7 +105,7 @@ def validate_retained(record, manifest, payloads):
         all(manifest.get(k) == v for k, v in binding.items()) and
         type(manifest["benchmark_valid"]) is bool and manifest["producer_conclusion"] in CONCLUSIONS and
         isinstance(manifest["execution"], dict) and
-        manifest["execution"].get("status") in TERMINAL | {"NEVER_SUBMITTED"},
+        manifest["execution"].get("status") in TERMINAL | {"NEVER_SUBMITTED", "NEVER_STARTED"},
         "retained manifest belongs to different evidence")
     prefix = "production/runs/" + record.run_key + "/collection/"
     limits = {"durable.json": MAX_RECEIPT, "status.json": MAX_DOCUMENT, "results.zip": MAX_RESULT,
@@ -134,7 +135,8 @@ def validate_retained(record, manifest, payloads):
     for name, ref in sources.items():
         require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
                 ref["key"] == keys[name] and isinstance(ref["version"], str) and
-                ref["version"] not in ("", "null") and ref["sha256"] == digest(payloads[name]) and
+                ref["version"] not in ("", "null") and len(ref["version"]) <= 1024 and
+                all(32 < ord(char) < 127 for char in ref["version"]) and ref["sha256"] == digest(payloads[name]) and
                 type(ref["bytes"]) is int and ref["bytes"] == len(payloads[name]), "source binding differs")
     return binding["identity"]
 
@@ -170,9 +172,10 @@ class Objects:
                     (version is None or found == version) and response.get("ServerSideEncryption") == "AES256",
                     "object size, version or encryption differs")
             raw = body.read(limit + 1)
-            require(isinstance(raw, bytes) and len(raw) == size, "object read is incomplete")
+            require(isinstance(raw, bytes) and len(raw) == size and body.read(1) == b"",
+                    "object read is incomplete")
             checksum = base64.b64encode(bytes.fromhex(digest(raw))).decode()
-            require(response.get("ChecksumSHA256", checksum) == checksum and
+            require(response.get("ChecksumSHA256") == checksum and
                     response.get("ChecksumType", "FULL_OBJECT") == "FULL_OBJECT", "object checksum differs")
         finally:
             body.close()
@@ -242,7 +245,23 @@ class Collector:
             return dict(proof="never-submitted", status="NEVER_SUBMITTED", executionArn=expected,
                         stateMachineArn=self.machine, name=request["run"], input=None)
         require(state["submission_arn"] == expected, "sealed execution differs")
-        execution = api.describe_execution(executionArn=expected)
+        try:
+            execution = api.describe_execution(executionArn=expected)
+        except Exception as error:
+            if error_code(error) != "ExecutionDoesNotExist":
+                raise
+            absent = dict(execution_arn=None, binding=None, attempt=None, attempts=0,
+                allocation_consumed=False, launch_outcome="none", known_instance_ids=[], seen={},
+                runtime_verified=False, worker_published=False)
+            require(all(key in state and type(state[key]) is type(value) and state[key] == value
+                        for key, value in absent.items()) and isinstance(state.get("sealed_inputs"), dict) and
+                    set(state["sealed_inputs"]) == set(request["sha256"]), "never-started state is ambiguous")
+            require(record.terminal and state["phase"] == "complete" and
+                    self.now() >= utc(request["outer_deadline"]) + timedelta(seconds=durable.DELIVERY_DRAIN_SECONDS),
+                    "never-started delivery horizon has not closed")
+            require(self.service.inventory() == [], "never-started namespace is not empty")
+            return dict(proof="sealed-never-started", status="NEVER_STARTED", executionArn=expected,
+                        stateMachineArn=self.machine, name=request["run"], input=None)
         require(execution.get("executionArn") == expected and execution.get("stateMachineArn") == self.machine and
                 execution.get("name") == request["run"] and results.json_value(execution["input"].encode()) == {
                     "run_key": record.run_key, "epoch": record.epoch, "run": request["run"]}, "execution input differs")
@@ -304,12 +323,16 @@ class Collector:
             require(binding is not None, "runtime schedule has no instance binding")
             self.service.verify_schedule(self.service.schedule(binding=binding))
 
-    def proof(self, record):
+    def runtime_proof(self, record):
         self.service.validate_state(record.state)
         require(record.terminal and record.state["phase"] == "complete", "cleanup is still pending")
         expected = identity(record)
         execution = self.execution(record)
         self.physical(record.state)
+        return expected, execution
+
+    def proof(self, record):
+        expected, execution = self.runtime_proof(record)
         producer = record.admission["initial_payload"]["producer"]
         documents = self.reader.read(producer)
         conclusion = verify_producer(documents, producer, self.now())
@@ -333,6 +356,9 @@ class Collector:
             status = results.json_value(payloads.get("status.json", b"{}"))
         except (ValueError, UnicodeError):
             status = {}
+        if state.get("close_reason") == "worker completed; result validity is separate from physical cleanup":
+            require(isinstance(status, dict) and status.get("state") == "completed",
+                    "previously observed worker completion evidence is missing")
         if isinstance(status, dict) and status.get("sha256") is not None:
             require("results.zip" in payloads, "indicated worker archive is missing")
         return payloads, sources
@@ -345,7 +371,7 @@ class Collector:
             status = {}
         worker_ok = isinstance(status, dict) and status.get("state") == "completed" and status.get("success") is True
         controller = dict(schema_version=1, identity=expected, cleanup="verified",
-            outcome="success" if worker_ok and execution["status"] == "SUCCEEDED" and conclusion == "success" else "failure",
+            outcome="success" if worker_ok and execution["status"] == "SUCCEEDED" else "failure",
             instance=None if binding is None else dict(instance_id=binding["instance_id"], image_id=request["pins"]["ami"], instance_type="c5d.24xlarge"),
             window=None if binding is None else durable.window(request, binding, exact=False),
             request=None if binding is None else durable.worker_command(request, binding, exact=False),
@@ -361,7 +387,7 @@ class Collector:
         valid = False
         try:
             results.validate_qualification(evidence, result, dict(schema_version=1, identity=expected,
-                archive_sha256=controller["archive_sha256"], ami_id=request["pins"]["ami"], harness_revision=request["pins"]["source"]))
+                archive_sha256=controller["archive_sha256"], ami_id=request["pins"]["ami"], harness_revision=request["pins"]["source"]), producer_role="submission")
             valid = execution["status"] == "SUCCEEDED"
         except (ValueError, KeyError, TypeError) as error:
             evidence["errors"].append("qualification: " + results.diagnostic(error))
@@ -489,16 +515,17 @@ class Collector:
                 require(ref["sha256"] == record.retirement_sha256, "closed tombstone evidence differs")
                 saved = results.json_value(raw)
                 require(saved.get("producer_conclusion") in CONCLUSIONS and
-                        saved.get("execution", {}).get("status") in TERMINAL | {"NEVER_SUBMITTED"}, "closed proof is not terminal")
+                        saved.get("execution", {}).get("status") in TERMINAL | {"NEVER_SUBMITTED", "NEVER_STARTED"}, "closed proof is not terminal")
                 manifest, verified = self.retained(record, identity(record), saved["execution"], saved["producer_conclusion"])
                 require(verified == ref, "closed retention version differs")
                 return dict(state="success" if manifest["benchmark_valid"] else "failed", retired=True,
                             benchmark_valid=manifest["benchmark_valid"], retention=ref)
             expected, execution, conclusion = self.proof(record)
             manifest, ref = self.retained(record, expected, execution, conclusion)
-            # repeat observations after retention; these are observations, while the final store CAS
-            # is the atomic fence. A later rerun still cannot reserve this retained run tombstone.
-            self.proof(record)
+            # repeat physical/execution observations after retention; the final store CAS is the atomic
+            # fence. Reuse this invocation's terminal producer observation: a later rerun cannot
+            # resume uploads or submit the already complete, deduplicated run.
+            require(self.runtime_proof(record) == (expected, execution), "runtime proof changed during retention")
             current = self.store.read()
             require(current == record, "run changed during collection")
             if retire:

@@ -33,6 +33,9 @@ class Bundle:
     payloads: dict
 
     def validate(self):
+        # live downloads retain both the SDK item and decoded record. offline loading
+        # reconstructs the item, so equality there checks consistency, not authenticity;
+        # the caller must bind that bundle to the trusted download inventory.
         decoded = RunStore(None, "offline", self.run_key, self.record.epoch)._record(self.record_item)
         require(decoded == self.record, "downloaded tombstone differs from decoded record")
         require(self.record.run_key == self.run_key and self.record.closed and self.record.terminal,

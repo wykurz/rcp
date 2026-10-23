@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from . import production_bundle as codec
+from . import production_bundle as codec, production_publish as publish
 from . import test_production_publication as fixtures
 
 REVISION = "c" * 40
@@ -29,6 +29,21 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(loaded, bundle)
             with self.assertRaises(FileExistsError):
                 codec.save(bundle, root, REVISION)
+
+    def test_embedded_record_is_consistency_only_external_inventory_detects_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle, root = self.saved(temporary)
+            expected = publish.inventory(root)
+            path = root / "bundle.json"
+            value = json.loads(path.read_bytes())
+            value["record"]["revision"] += 1
+            path.write_bytes(publish.encoded(value))
+            # a self-consistent envelope is not authentication. only the separately
+            # trusted predecessor digest detects this otherwise valid local rewrite.
+            loaded = codec.load(root, repository_id="123", reader_revision=REVISION)
+            self.assertEqual(loaded.record.revision, bundle.record.revision + 1)
+            with self.assertRaisesRegex(ValueError, "inventory differs"):
+                publish.verify_inventory(root, expected)
 
     def test_wrong_repository_and_reader_revision_fail(self):
         with tempfile.TemporaryDirectory() as temporary:

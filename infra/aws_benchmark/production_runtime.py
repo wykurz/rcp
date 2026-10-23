@@ -19,7 +19,7 @@ import time
 from benchmarks.strict_json import parse_json
 
 from . import durable
-from .common import BINARIES, MAX_BINARY, error_code, get_bytes, pending_status, require, retryable_io, utc
+from .common import BINARIES, MAX_BINARY, digest, error_code, get_bytes, pending_status, require, retryable_io, utc
 from .durable_aws import AllocationDeferred, Configuration, Service, clients
 from .production_mailbox import MailboxPaths
 from .production_store import MAX_STATE_BYTES, RunStore
@@ -206,9 +206,11 @@ class ProductionService(Service):
     def receipt(self, state):
         current, _ = self.load()
         require(state == current, "production receipt is not the current committed state")
+        data = self.receipt_bytes(state)
         self.api["s3"].put_object(Bucket=self.config.bucket,
             Key="production/runs/" + self.run_key + "/durable-receipt.json",
-            Body=self.receipt_bytes(state), ContentType="application/json", ServerSideEncryption="AES256")
+            Body=data, ContentType="application/json", ServerSideEncryption="AES256",
+            ChecksumSHA256=base64.b64encode(bytes.fromhex(digest(data))).decode("ascii"))
 
 
 def retry_budget(service, context):

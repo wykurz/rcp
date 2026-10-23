@@ -117,7 +117,13 @@ def history(repository):
 
 
 def inventory(root, *, limit=MAX_TOTAL):
-    """Hash the exact bounded regular-file tree; symlinks and special files fail closed."""
+    """Hash a bounded artifact tree in a job-owned directory without concurrent writers.
+
+    Reject observed symlinks/special files and bind each file read to its descriptor.
+    Directory traversal uses pathnames: a hostile concurrent directory replacement is
+    outside this contract, so this is not a general TOCTOU-safe filesystem snapshot.
+    The separately trusted predecessor digest supplies the cross-job byte binding.
+    """
     root = Path(root)
     require(stat.S_ISDIR(root.lstat().st_mode), "artifact root must be a real directory")
     rows, total, directories, pending = [], 0, 0, [root]
@@ -198,19 +204,21 @@ def download(reader, output, prior, reader_revision, *, clock=time.monotonic):
             observations.append(dict(run_key=run_key, state="deferred", retired=False,
                 reason="bounded batch exhausted; rescan after publishing completed records"))
             continue
+        retired = False
         try:
             record, _ = reader.record(run_key)
+            retired = record.closed
+            if record.closed and run_key in prior:
+                saved = public.validate_public(collection.results.json_value(prior[run_key]))
+                require(saved["retirement_sha256"] == record.retirement_sha256,
+                        "published source conflicts with retirement record")
+                observations.append(dict(run_key=run_key, state="published", retired=True))
+                continue
+            value = reader.observe(key)
         except Exception as error:
-            observations.append(dict(run_key=run_key, state="held", retired=False,
+            observations.append(dict(run_key=run_key, state="held", retired=retired,
                 reason=collection.results.diagnostic(error)))
             continue
-        if record.closed and run_key in prior:
-            saved = public.validate_public(collection.results.json_value(prior[run_key]))
-            require(saved["retirement_sha256"] == record.retirement_sha256,
-                    "published source conflicts with retirement record")
-            observations.append(dict(run_key=run_key, state="published", retired=True))
-            continue
-        value = reader.observe(key)
         if value["state"] == "ready":
             bundle = value.pop("bundle")
             total += sum(map(len, bundle.payloads.values())) + len(bundle.manifest_bytes) + codec.MAX_ENVELOPE
@@ -243,7 +251,8 @@ def index_at(root, schema, revision):
     return value
 
 
-def export(source, prior, output, revision, expected):
+def export(source, prior, output, revision, expected, *, clock=time.monotonic):
+    started = clock()
     verify_inventory(source, expected)
     source, output = Path(source), Path(output)
     index = index_at(source, DOWNLOAD_SCHEMA, revision)
@@ -252,21 +261,39 @@ def export(source, prior, output, revision, expected):
             index["processing_complete"] == (not any(item["state"] == "deferred" for item in index["observations"])) and
             isinstance(names, list) and names == sorted(set(names)) and
             all(isinstance(name, str) and RUN.fullmatch(name) for name in names), "invalid download inventory")
+    observed = [item.get("run_key") for item in index["observations"]]
+    require(len(observed) == len(set(observed)) and None not in observed and
+            set(names) == {item["run_key"] for item in index["observations"] if item["state"] == "ready"} and
+            all(item["retired"] is True for item in index["observations"] if item["state"] == "ready"),
+            "download bundle observations differ")
     require({p.name for p in source.iterdir()} == set(names) | {"index.json"}, "download root file set differs")
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    records = []
+    records, held = [], {}
+    observations = {item["run_key"]: item for item in index["observations"]}
     for name in names:
-        bundle = codec.load(source / name, repository_id=REPOSITORY_ID, reader_revision=revision)
-        if name in prior:
-            raw = prior[name]
-            public.verify_replay(collection.results.json_value(raw), bundle)
-        else:
-            raw = encoded(public.validate_public(public.project(bundle)))
-        require(len(raw) <= public.MAX_PUBLIC_RECORD, "public record exceeds bound")
+        if clock() - started >= MAX_SECONDS:
+            held[name] = observation(dict(run_key=name, state="deferred", retired=observations[name]["retired"],
+                phase="export", reason="bounded export exhausted; rescan after publishing completed records"))
+            continue
+        try:
+            bundle = codec.load(source / name, repository_id=REPOSITORY_ID, reader_revision=revision)
+            if name in prior:
+                raw = prior[name]
+                public.verify_replay(collection.results.json_value(raw), bundle)
+            else:
+                raw = encoded(public.validate_public(public.project(bundle)))
+            require(len(raw) <= public.MAX_PUBLIC_RECORD, "public record exceeds bound")
+        except Exception as error:
+            # preserve the named hold without discarding other completed projections.
+            # the trusted download observation, not a failed local parse, says retired.
+            held[name] = observation(dict(run_key=name, state="held", retired=observations[name]["retired"],
+                phase="export", reason=collection.results.diagnostic(error)))
+            continue
         (output / (name + ".json")).write_bytes(raw)
         records.append(dict(run_key=name, sha256=digest(raw), bytes=len(raw)))
     value = {k: v for k, v in index.items() if k not in {"bundles", "discovery_complete", "processing_complete"}}
-    value.update(schema=PUBLIC_SCHEMA, records=records)
+    value.update(schema=PUBLIC_SCHEMA, records=records,
+        observations=[held.get(item.get("run_key"), item) for item in index["observations"]])
     persist(output / "index.json", value)
     return inventory(output, limit=MAX_HISTORY)
 
@@ -340,7 +367,14 @@ def summary(index):
                   for state in ("ready", "published", "pending", "held", "deferred")}
         text = "AWS publication: " + ", ".join(str(count) + " " + state for state, count in counts.items())
         text += ". Active owner: " + index["active"]["state"] + ".\n\n"
-        text += "These are observations, not a new teardown proof. Metadata validation does not prove content integrity.\n"
+        for item in index["observations"]:
+            if item["state"] in {"held", "deferred"}:
+                # keep bounded diagnostics on one line and inside a code span.
+                # escape embedded delimiters and HTML without echoing SDK messages.
+                reason = encoded(item.get("reason", "unspecified")).decode().strip()
+                reason = reason.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "&#96;")
+                text += "- " + item.get("run_key", "unnamed") + ": " + item["state"] + " — `" + reason + "`\n"
+        text += "\nThese are observations, not a new teardown proof. Metadata validation does not prove content integrity.\n"
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(text)
 

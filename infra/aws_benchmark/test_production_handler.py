@@ -173,7 +173,7 @@ class HandlerTests(unittest.TestCase):
                                  {"ok": False, "error": "invalid_request"})
                 build.assert_not_called()
 
-    def test_errors_return_no_token_exception_text_or_stdout_logs_and_do_not_retry(self):
+    def test_errors_log_only_safe_categories_without_token_exception_text_or_retry(self):
         for action in ("begin", "seal"):
             service = Mock()
             service.begin.side_effect = RuntimeError(TOKEN)
@@ -185,9 +185,39 @@ class HandlerTests(unittest.TestCase):
                 result = handler.lambda_handler(request(action), None)
             self.assertEqual(result, {"ok": False, "error": "admission_unavailable"})
             self.assertNotIn(TOKEN, json.dumps(result) + out.getvalue() + err.getvalue())
-            self.assertEqual(out.getvalue() + err.getvalue(), "")
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(json.loads(out.getvalue()), dict(event="admission_failure", action=action,
+                category="validation_or_service", retryable=False))
             route = service.begin if action == "begin" else service.seal_and_start
             route.assert_called_once()
+
+    def test_transient_failure_has_typed_delay_and_safe_request_id(self):
+        for error, delay, category in ((TimeoutError(TOKEN), 5, "transient_service"),
+                (handler.GitHubRateLimitError(120), 120, "github_rate_limit")):
+            service = Mock()
+            service.begin.side_effect = error
+            out = io.StringIO()
+            with patch.dict(os.environ, environment(), clear=True), \
+                    patch.object(handler, "build_admission", return_value=service), redirect_stdout(out):
+                result = handler.lambda_handler(request(), Mock(aws_request_id="safe-request-123"))
+            self.assertEqual(result, dict(ok=False, error="admission_retryable", retry_after_seconds=delay))
+            self.assertEqual(json.loads(out.getvalue()), dict(event="admission_failure", action="begin",
+                category=category, retryable=True, request_id="safe-request-123"))
+            self.assertNotIn(TOKEN, out.getvalue())
+            service.begin.assert_called_once()
+
+    def test_signing_key_cache_reused_only_for_identical_immutable_trust_config(self):
+        handler._cached_verifier.cache_clear()
+        self.addCleanup(handler._cached_verifier.cache_clear)
+        with patch.dict(os.environ, environment(), clear=True), patch("boto3.client") as client:
+            first, second = handler.build_admission(), handler.build_admission()
+            self.assertIs(first.verifier.verifier, second.verifier.verifier)
+            self.assertIsNot(first, second)
+            self.assertIsNot(first.run_reader, second.run_reader)
+            os.environ["RCP_PRODUCTION_AUDIENCE"] = "different-admission-audience"
+            third = handler.build_admission()
+            self.assertIsNot(first.verifier.verifier, third.verifier.verifier)
+            client.assert_not_called()
 
     def test_configuration_failure_is_sanitized(self):
         with patch.dict(os.environ, environment(), clear=True), \

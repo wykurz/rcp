@@ -1,0 +1,49 @@
+{
+  "benchmark_valid": true,
+  "cleanup_verified": true,
+  "comparison": "A/A (identical source revision and binary digests)",
+  "identity": {
+    "baseline": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "controller": "cccccccccccccccccccccccccccccccccccccccc",
+    "run": "123-1",
+    "run_url": "https://github.com/wykurz/rcp/actions/runs/123/attempts/1",
+    "suite": "bulk-1g-metadata"
+  },
+  "measurements": [
+    {
+      "case_id": "bulk-1g-1tb",
+      "median": 1.0,
+      "samples": [
+        1.0,
+        1.0
+      ],
+      "series_id": "75abaff72b84b8fffdae9a8fbdc8c935489bf7fcb8d71a470735d82c81b5e7b5",
+      "variant_id": "rcp-default"
+    },
+    {
+      "case_id": "bulk-1g-1tb",
+      "median": 2.0,
+      "samples": [
+        2.0,
+        2.0
+      ],
+      "series_id": "75abaff72b84b8fffdae9a8fbdc8c935489bf7fcb8d71a470735d82c81b5e7b5",
+      "variant_id": "rcp-baseline"
+    }
+  ],
+  "note": "Four copies form two local pairs; this small run does not establish broad variance.",
+  "retirement_sha256": "d4c08dd5d37d0045c2d7802d35643f9beeac5f20b7f48690e4610a393c48e034",
+  "run_key": "repo-123-run-123",
+  "schema": "rcp-production-public-report-v1",
+  "series_contract": "aws-local-ext4-v1",
+  "timestamp": "2026-09-26T12:00:00Z",
+  "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
+  "verification": {
+    "batch_depth": 2,
+    "inline_bytes": 1048576,
+    "policy": "metadata-size-tree-v1",
+    "read_bytes": 1048576,
+    "workers": 8
+  }
+}

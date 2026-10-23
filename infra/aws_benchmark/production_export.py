@@ -19,7 +19,15 @@ from .common import digest, require
 SCHEMA = "rcp-production-public-report-v1"
 MAX_PUBLIC_RECORD = 1024 * 1024
 MAX_PUBLIC_HTML = 2 * 1024 * 1024
-VALIDATION = "Metadata/size only; does not prove content integrity or detect same-size corruption."
+# public schemas are frozen history contracts. change these labels or the series-ID
+# algorithm only by adding a new schema; old records keep their original namespace.
+PUBLIC_CONTRACTS = {
+    "rcp-production-public-report-v1": {
+        "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
+        "series_contract": "aws-local-ext4-v1",
+    },
+}
+VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 
 
 def source_fields(bundle, manifest):
@@ -47,31 +55,36 @@ def verify_replay(saved, bundle):
 def project(bundle):
     manifest = bundle.validate()
     identity = manifest["identity"]
+    contract = PUBLIC_CONTRACTS[SCHEMA]
     value = dict(schema=SCHEMA, run_key=bundle.run_key, retirement_sha256=bundle.record.retirement_sha256,
-        benchmark_valid=manifest["benchmark_valid"], cleanup_verified=True, validation=VALIDATION,
+        benchmark_valid=manifest["benchmark_valid"], cleanup_verified=True, validation=contract["validation"],
         identity={key: identity[key] for key in ("run", "run_url", "suite", "baseline", "candidate", "controller")},
         comparison=results.comparison_label(identity, results.json_value(bundle.payloads["controller.json"])),
-        measurements=[], series_contract=results.SERIES_CONTRACT,
+        measurements=[], series_contract=contract["series_contract"],
         note="Four copies form two local pairs; this small run does not establish broad variance.")
     if manifest["benchmark_valid"]:
-        # recheck new exports through the established measurement contract. The retired
-        # manifest supplies authenticated policy; callers cannot request eligibility.
+        # the authenticated retirement binds the collector's original verdict. inspect
+        # retained bytes with their recorded contract, never today's launch/admission
+        # rules. the offline bundle itself is not an authentication mechanism.
         with tempfile.TemporaryDirectory(prefix="production-export-") as directory:
             root = Path(directory)
             for name in ("controller.json", "status.json", "results.zip"):
                 if name in bundle.payloads:
                     (root / name).write_bytes(bundle.payloads[name])
             evidence, raw, _ = results.inspect(root, identity, manifest["producer_conclusion"])
+        require(not evidence["errors"] and raw is not None and raw["status"] == "complete",
+                "retired successful measurements cannot be read")
+        require(evidence["expected_verification"] == source_fields(bundle, manifest)["verification"],
+                "retired verification identity differs from measurements")
         pins = bundle.record.state["request"]["pins"]
-        policy = dict(schema_version=1, identity=identity,
-            archive_sha256=digest(bundle.payloads["results.zip"]), ami_id=pins["ami"], harness_revision=pins["source"])
-        results.approve(evidence, raw, policy)
-        accepted = results.derived_record(evidence, raw)
         value["comparison"] = results.comparison_label(identity, evidence["controller"])
-        value["measurements"] = [{key: item[key] for key in (
-            "case_id", "variant_id", "series_id", "median", "samples")} for item in accepted["summaries"]]
+        value["measurements"] = [{
+            **{key: item[key] for key in ("case_id", "variant_id", "median", "samples")},
+            "series_id": digest(collection.encoded([
+                contract["series_contract"], item["series_id"], pins["ami"], pins["source"]])),
+        } for item in raw["summaries"]]
         value["verification"] = evidence["expected_verification"]
-        value["timestamp"] = accepted["timestamp"]
+        value["timestamp"] = raw["timestamp"]
     else:
         value["note"] = "Safely retired failed qualification; excluded from performance history."
     require(all(value.get(key) == expected for key, expected in source_fields(bundle, manifest).items()),
@@ -82,16 +95,18 @@ def project(bundle):
 
 
 def validate_public(value):
-    require(isinstance(value, dict) and value.get("schema") == SCHEMA and
-            isinstance(value.get("run_key"), str) and re.fullmatch(r"repo-[1-9][0-9]{0,19}-run-[1-9][0-9]{0,19}", value["run_key"]) and
+    require(isinstance(value, dict) and isinstance(value.get("schema"), str) and
+            value["schema"] in PUBLIC_CONTRACTS, "unsupported public report schema")
+    contract = PUBLIC_CONTRACTS[value["schema"]]
+    require(isinstance(value.get("run_key"), str) and re.fullmatch(r"repo-[1-9][0-9]{0,19}-run-[1-9][0-9]{0,19}", value["run_key"]) and
             isinstance(value.get("retirement_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["retirement_sha256"]) and
             type(value.get("benchmark_valid")) is bool and value.get("cleanup_verified") is True and
-            value.get("validation") == VALIDATION, "invalid public report")
+            value.get("validation") == contract["validation"], "invalid public report")
     fields = {"schema", "run_key", "retirement_sha256", "benchmark_valid", "cleanup_verified", "validation",
               "identity", "comparison", "measurements", "series_contract", "note"}
     if value["benchmark_valid"]:
         fields.update({"verification", "timestamp"})
-    require(set(value) == fields and value.get("series_contract") == results.SERIES_CONTRACT and
+    require(set(value) == fields and value.get("series_contract") == contract["series_contract"] and
             isinstance(value.get("comparison"), str) and 0 < len(value["comparison"]) <= 256 and
             isinstance(value.get("note"), str) and 0 < len(value["note"]) <= 512,
             "unexpected or unbounded public report fields")

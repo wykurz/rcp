@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -63,14 +64,18 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(index["bundles"], [])
         self.assertEqual(index["observations"][0]["state"], "published")
 
-    def test_checkpoint_conflict_fails_without_marker(self):
+    def test_checkpoint_conflict_is_named_held_without_overwriting_history(self):
         bundle = self.reader.download(self.key)
         value = public.project(bundle)
         value["retirement_sha256"] = "0" * 64
         output = self.root / "bad-checkpoint"
-        with self.assertRaisesRegex(ValueError, "conflicts"):
-            publish.download(self.reader, output, {bundle.run_key: publish.encoded(value)}, REVISION)
-        self.assertFalse((output / "index.json").exists())
+        prior = {bundle.run_key: publish.encoded(value)}
+        publish.download(self.reader, output, prior, REVISION)
+        index = json.loads((output / "index.json").read_bytes())
+        self.assertEqual(index["bundles"], [])
+        self.assertEqual(index["observations"], [dict(run_key=bundle.run_key, state="held", retired=True,
+            reason="published source conflicts with retirement record")])
+        self.assertEqual(prior, {bundle.run_key: publish.encoded(value)})
 
     def test_cross_job_digest_corruption_is_rejected_before_parsing(self):
         source, _, _, _ = self.batch()
@@ -128,6 +133,79 @@ class PublishTests(unittest.TestCase):
         self.reader.discover = Mock(return_value=[self.key])
         with patch.object(self.reader, "observe", side_effect=AssertionError("already published")):
             publish.download(self.reader, self.root / "rescan", records, REVISION)
+
+    def test_frozen_v1_git_history_survives_current_contract_changes(self):
+        raw = (Path(__file__).with_name("fixtures") / "production-public-report-v1.json").read_bytes()
+        value = json.loads(raw)
+        blob = git(self.repository, "hash-object", "-w", "--stdin", input_text=raw.decode()).stdout.strip()
+        tree = git(self.repository, "mktree", input_text="100644 blob " + blob + "\t" + value["run_key"] + ".json\n").stdout.strip()
+        root = git(self.repository, "mktree", input_text="040000 tree " + tree + "\trecords\n").stdout.strip()
+        commit = git(self.repository, "commit-tree", root, "-m", "Frozen v1 history", environment=publish.git_env()).stdout.strip()
+        git(self.repository, "update-ref", publish.HISTORY_REF, commit)
+        with patch.object(public, "SCHEMA", "future-public-report-v2"), \
+                patch.object(public, "VALIDATION", "future wording"), \
+                patch.object(public.results, "SERIES_CONTRACT", "future-series-v2"):
+            records, parent = publish.history(self.repository)
+        self.assertEqual((records, parent), ({value["run_key"]: raw}, commit))
+
+    def test_export_failure_is_named_held_and_completed_subset_is_publishable(self):
+        downloaded, bound, _, _ = self.batch()
+        first = self.fx.store.record.run_key
+        second = "repo-123-run-456"
+        (downloaded / second).mkdir()
+        (downloaded / second / "unreadable.json").write_text("{}")
+        index_path = downloaded / "index.json"
+        index = json.loads(index_path.read_bytes())
+        index["bundles"].append(second)
+        index["observations"].append(dict(run_key=second, state="ready", retired=True))
+        index_path.write_bytes(publish.encoded(index))
+        output = self.root / "mixed-export"
+        bound = publish.export(downloaded, {}, output, REVISION, publish.inventory(downloaded))
+        records, index = publish.public_batch(output, REVISION, bound)
+        self.assertEqual(list(records), [first])
+        held = next(item for item in index["observations"] if item["run_key"] == second)
+        self.assertEqual((held["state"], held["retired"], held["phase"]), ("held", True, "export"))
+        self.assertFalse((output / (second + ".json")).exists())
+        commit = publish.publish(output, self.repository, REVISION, bound)
+        git(self.repository, "update-ref", publish.HISTORY_REF, commit)
+        self.assertEqual(list(publish.history(self.repository)[0]), [first])
+        summary = self.root / "job-summary"
+        with patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(summary)):
+            publish.summary(index)
+        self.assertIn(second + ": held", summary.read_text())
+        self.assertIn("1 ready, 0 published, 0 pending, 1 held", summary.read_text())
+
+    def test_export_project_failure_preserves_named_retirement_and_does_not_claim_ready(self):
+        downloaded, bound, _, _ = self.batch()
+        output = self.root / "unsupported-export"
+        with patch.object(public, "project", side_effect=ValueError("future format")):
+            result = publish.export(downloaded, {}, output, REVISION, bound)
+        records, index = publish.public_batch(output, REVISION, result)
+        self.assertEqual(records, {})
+        self.assertEqual(index["observations"], [dict(run_key=self.fx.store.record.run_key,
+            state="held", retired=True, phase="export", reason="ValueError")])
+        self.assertEqual(publish.publish(output, self.repository, REVISION, result), "")
+
+    def test_export_time_bound_defers_remaining_named_runs_without_loading(self):
+        downloaded, bound, _, _ = self.batch()
+        output = self.root / "deferred-export"
+        with patch.object(publish.codec, "load", side_effect=AssertionError("must defer before loading")):
+            result = publish.export(downloaded, {}, output, REVISION, bound, clock=Mock(side_effect=[0, 601]))
+        records, index = publish.public_batch(output, REVISION, result)
+        self.assertEqual(records, {})
+        observed = index["observations"][0]
+        self.assertEqual((observed["run_key"], observed["state"], observed["retired"], observed["phase"]),
+                         (self.fx.store.record.run_key, "deferred", True, "export"))
+
+    def test_bundle_without_unique_ready_observation_is_rejected_before_loading(self):
+        downloaded, _, _, _ = self.batch()
+        path = downloaded / "index.json"
+        index = json.loads(path.read_bytes())
+        index["observations"] = []
+        path.write_bytes(publish.encoded(index))
+        with patch.object(publish.codec, "load", side_effect=AssertionError("must reject first")):
+            with self.assertRaisesRegex(ValueError, "observations differ"):
+                publish.export(downloaded, {}, self.root / "orphan-export", REVISION, publish.inventory(downloaded))
 
     def test_git_object_read_enforces_byte_bound(self):
         blob = git(self.repository, "hash-object", "-w", "--stdin", input_text="bounded").stdout.strip()

@@ -115,11 +115,13 @@ def tagged_expiry(instance, namespace, now):
     return close
 
 
-def bind(value, instance, allocation):
+def validate_allocation_instance(value, instance, allocation):
+    """Identify accepted allocation evidence without authorizing useful worker runtime."""
     validate(value)
     start, launch = utc(allocation["started_at"]), utc(instance["LaunchTime"])
-    require(utc(value["created_at"]) <= start <= launch < utc(value["capacity_deadline"]),
+    require(utc(value["created_at"]) <= start < utc(value["capacity_deadline"]) and start <= launch,
             "instance launch is outside this allocation interval")
+    require(re.fullmatch(r"i-[0-9a-f]{17}", instance.get("InstanceId", "")), "invalid allocated instance identity")
     require(allocation["close_at"] == timestamp(start + timedelta(seconds=value["runtime_seconds"])),
             "allocation deadline changed")
     require(instance.get("ClientToken") == allocation["token"], "instance token differs from allocation")
@@ -132,6 +134,12 @@ def bind(value, instance, allocation):
             "instance network or profile differs")
     observed = instance_tags(instance)
     require(all(observed.get(k) == v for k, v in tags(value, allocation).items()), "allocation tags differ")
+    return launch
+
+
+def bind(value, instance, allocation):
+    launch = validate_allocation_instance(value, instance, allocation)
+    require(launch < utc(value["capacity_deadline"]), "instance launch is outside this allocation interval")
     return dict(instance_id=instance["InstanceId"], image_id=instance["ImageId"],
                 instance_type=instance["InstanceType"], launch_at=timestamp(launch),
                 close_at=allocation["close_at"], deadline=timestamp(utc(allocation["close_at"]) - timedelta(

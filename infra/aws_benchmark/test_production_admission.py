@@ -4,10 +4,14 @@ import base64
 import copy
 from datetime import timedelta
 import json
+import io
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
+from . import production_client
 from .common import BINARIES
 from .durable_aws import Configuration
 from .production_admission import Admission, UPLOAD_SECONDS, staged_key
@@ -147,6 +151,57 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.assertEqual(again["execution_status"], "RUNNING")
         self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
 
+    def test_progressed_execution_readback_never_restarts_it(self):
+        self.cloud.begin()
+        self.cloud.upload()
+        self.cloud.seal()
+        store = self.cloud.service.store(self.cloud.who)
+        for phase in ("launching", "uncertain", "requested"):
+            with self.subTest(phase=phase):
+                state, revision = store.load()
+                state["phase"] = phase
+                if phase == "launching":
+                    store.save_launch_intent(state, revision)
+                else:
+                    store.save(state, revision)
+                value = self.cloud.seal()
+                self.assertEqual(value["state"], phase)
+                self.assertEqual(value["execution_status"], "RUNNING")
+        self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
+        self.cloud.execution["input"] = "{}"
+        with self.assertRaisesRegex(ValueError, "immutable submission"):
+            self.cloud.seal()
+        self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
+
+    def test_client_server_reconciles_fast_progress_and_lost_success_reply(self):
+        real_start = self.cloud.start
+        def start(**kwargs):
+            response = real_start(**kwargs)
+            store = self.cloud.service.store(self.cloud.who)
+            state, revision = store.load()
+            state.update(phase="launching", execution_arn=response["executionArn"])
+            store.save_launch_intent(state, revision)
+            return response
+        self.cloud.api["stepfunctions"].start_execution.side_effect = start
+        def invoke(**kwargs):
+            value = json.loads(kwargs["Payload"])
+            result = self.cloud.service.begin(value["token"], value["manifest"]) if value["action"] == "begin" else \
+                self.cloud.service.seal_and_start(value["token"])
+            return dict(StatusCode=200, Payload=io.BytesIO(json.dumps(dict(ok=True, result=result)).encode()))
+        api = Mock()
+        api.invoke.side_effect = invoke
+        function = "arn:aws:lambda:us-east-1:123456789012:function:admission"
+        with tempfile.TemporaryDirectory() as directory:
+            for _ in range(2):
+                value = production_client.submit(api, function, inputs(), dict.fromkeys(BINARIES, b"test"),
+                    Path(directory) / "receipt.json", audience="audience", bucket=self.cloud.config.bucket,
+                    region=self.cloud.config.region, token_reader=lambda _: "verified-by-test", expected_run="100-1",
+                    uploader=lambda *args, **kwargs: self.cloud.upload(), wall_clock=lambda: self.cloud.now.timestamp())
+                self.assertEqual(value["state"], "launching")
+                self.assertIn(value["execution_status"], ("submitted", "RUNNING"))
+        self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
+        self.assertEqual(self.cloud.ddb.items["rate#day#2026-10-22"]["runs"]["N"], "1")
+
     def test_lost_start_response_reconciles_only_exact_execution(self):
         self.cloud.begin()
         self.cloud.upload()
@@ -160,7 +215,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.cloud.begin()
         self.cloud.upload()
         self.cloud.api["stepfunctions"].start_execution.side_effect = TimeoutError("uncertain")
-        with self.assertRaises(ApiError):
+        with self.assertRaises(TimeoutError):
             self.cloud.seal()
         self.assertIn("active", self.cloud.ddb.items)
         self.assertEqual(self.cloud.service.store(self.cloud.who).read().state["phase"], "armed")
@@ -193,6 +248,47 @@ class AdmissionIntegrationTests(unittest.TestCase):
             self.cloud.seal()
         self.assertEqual(self.cloud.service.store(self.cloud.who).read().state["request"], request)
         self.cloud.api["stepfunctions"].start_execution.assert_not_called()
+
+    def test_short_capacity_expires_before_seal_without_armed_intent(self):
+        self.cloud.policy = policy(capacity_seconds=60)
+        response = self.cloud.begin()
+        self.assertTrue(all(call.kwargs["ExpiresIn"] == 60 for call in
+                            self.cloud.api["s3"].generate_presigned_url.call_args_list))
+        self.cloud.upload()
+        self.cloud.now += timedelta(seconds=60)
+        with self.assertRaisesRegex(ValueError, "capacity period expired"):
+            self.cloud.seal()
+        state = self.cloud.service.store(self.cloud.who).read().state
+        self.assertEqual(state["phase"], "awaiting-inputs")
+        self.assertIsNone(state["submission_arn"])
+        self.cloud.api["stepfunctions"].start_execution.assert_not_called()
+
+    def test_capacity_expiring_during_heads_never_persists_seal(self):
+        self.cloud.policy = policy(capacity_seconds=60)
+        self.cloud.begin()
+        self.cloud.upload()
+        def head(**kwargs):
+            self.cloud.now += timedelta(seconds=10)
+            return copy.deepcopy(self.cloud.objects[kwargs["Key"]])
+        self.cloud.api["s3"].head_object.side_effect = head
+        with self.assertRaisesRegex(ValueError, "exceeded upload or capacity"):
+            self.cloud.seal()
+        state = self.cloud.service.store(self.cloud.who).read().state
+        self.assertEqual(state["phase"], "awaiting-inputs")
+        self.assertIsNone(state["sealed_inputs"])
+        self.cloud.api["stepfunctions"].start_execution.assert_not_called()
+
+    def test_first_admission_from_rerun_cannot_spend_original_actors_allowance(self):
+        self.cloud.who = identity(run_attempt="2")
+        with self.assertRaisesRegex(ValueError, "reruns cannot create"):
+            self.cloud.begin()
+        self.assertEqual(self.cloud.ddb.writes, [])
+
+    def test_near_stale_run_is_rejected_before_reserving_upload_budget(self):
+        self.cloud.now += timedelta(seconds=4800)
+        with self.assertRaisesRegex(ValueError, "insufficient time"):
+            self.cloud.begin()
+        self.assertEqual(self.cloud.ddb.writes, [])
 
     def test_invalid_token_never_touches_admission(self):
         self.cloud.verifier.verify.side_effect = ValueError("invalid signed identity")

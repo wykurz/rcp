@@ -441,7 +441,7 @@ class Service:
             root_volumes=roots or (prior["root_volumes"] if prior else []),
             state="terminated" if prior and prior["state"] == "terminated" else instance["State"]["Name"])
 
-    def observe(self, state, instances):
+    def observe(self, state, instances, *, allow_binding=True):
         request, now = state["request"], self.now()
         for instance in instances:
             self.remember_instance(state, instance)
@@ -451,15 +451,19 @@ class Service:
             reason = reason or "multiple managed instances; no new allocation permitted"
         if instances and not state["allocation_consumed"]:
             reason = reason or "instance appeared without an allocated intent"
-        if instances and state["attempt"] is not None and not state["binding"] and not reason:
+        if (len(instances) == 1 and len(state["known_instance_ids"]) == 1 and
+                state["attempt"] is not None and state["allocation_consumed"]):
             try:
                 require(utc(instances[0]["LaunchTime"]) <= now, "future launch timestamp")
-                binding = durable.bind(request, instances[0], state["attempt"])
-                state["binding"] = binding
+                durable.validate_allocation_instance(request, instances[0], state["attempt"])
+                # positive identity evidence survives closure and later EC2 record expiry;
+                # it does not grant runtime, publish a mailbox or reopen a closing lease.
                 durable.launch_outcome(state, "accepted")
-                state["phase"] = "requested"
+                if not state["binding"] and not reason and allow_binding:
+                    state["binding"] = durable.bind(request, instances[0], state["attempt"])
+                    state["phase"] = "requested"
             except (ValueError, KeyError, TypeError) as error:
-                reason = str(error)
+                reason = reason or str(error)
         if state["phase"] in ("launching", "uncertain") and state["attempt"] is not None and (
                 now - utc(state["attempt"]["started_at"])).total_seconds() >= durable.LAUNCH_ACK_SECONDS:
             reason = reason or "launch acknowledgement expired; allocation outcome uncertain"
@@ -526,6 +530,8 @@ class Service:
         require(set(state["known_instance_ids"]) == set(state["seen"]), "known instance is absent from physical proof")
         require(not state["allocation_consumed"] or bool(state["known_instance_ids"]),
                 "uncertain allocation cannot be disproved by an empty Describe response")
+        require(not state["allocation_consumed"] or state["launch_outcome"] == "accepted",
+                "observed instance identity has not reconciled the uncertain allocation")
         deleted = []
         for seen in state["seen"].values():
             require(seen["state"] == "terminated", "physical worker is not terminated")
@@ -577,9 +583,15 @@ class Service:
                 saved = copy.deepcopy(state)
         try:
             if state["phase"] != "complete":
-                self.watchdog_state(state, relevant)
-                self.observe(state, relevant)
-                if not state["close_reason"]:
+                policy_ready = True
+                try:
+                    self.watchdog_state(state, relevant)
+                except Exception as error:
+                    policy_ready = False
+                    failed(error)
+                # policy availability gates useful runtime, never physical observations.
+                self.observe(state, relevant, allow_binding=policy_ready)
+                if policy_ready and not state["close_reason"]:
                     checkpoint()
                     roots_attempted = True
                     self.discover_roots(state)
