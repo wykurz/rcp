@@ -42,7 +42,40 @@ Parameters:
   GitHubOidcProviderArn: {Type: String, AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'}
   AdmissionAudience: {Type: String, Default: rcp-production-benchmark-admission, AllowedPattern: '[A-Za-z0-9][A-Za-z0-9:/._-]{7,199}', Description: Exact
       second GitHub OIDC token audience; AWS role assumption still uses sts.amazonaws.com.}
+  GitHubAppClientId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(|[A-Za-z0-9][A-Za-z0-9_.-]{0,99})'
+    Description: Non-secret client ID of the separately approved owner-only GitHub App; empty keeps credential access absent.
+  GitHubAppInstallationId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(|[1-9][0-9]{0,19})'
+    Description: Non-secret exact installation ID selected only for wykurz/rcp.
+  GitHubAppSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(|arn:aws:secretsmanager:us-east-1:381183037896:secret:/rcp/production/github-read-app-[A-Za-z0-9]{6})'
+    Description: Complete ARN of the separately provisioned external App PEM secret; this template never creates or receives the key.
+Rules:
+  GitHubAppRequiredForRuntime:
+    RuleCondition:
+      Fn::Or:
+      - Fn::Equals: [{Ref: RuntimeEnabled}, 'true']
+      - Fn::Equals: [{Ref: AdmissionEnabled}, 'true']
+    Assertions:
+    - Assert:
+        Fn::And:
+        - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppClientId}, '']}]
+        - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppInstallationId}, '']}]
+        - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppSecretArn}, '']}]
+      AssertDescription: Runtime or admission enablement requires all reviewed external GitHub App identifiers.
 Conditions:
+  GitHubAppConfigured:
+    Fn::And:
+    - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppClientId}, '']}]
+    - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppInstallationId}, '']}]
+    - Fn::Not: [{Fn::Equals: [{Ref: GitHubAppSecretArn}, '']}]
   Publishing:
     Fn::Equals:
     - {Ref: PublicationEnabled}
@@ -709,6 +742,18 @@ Resources:
           Principal: {Service: lambda.amazonaws.com}
           Action: sts:AssumeRole
       Policies:
+      - Fn::If:
+        - GitHubAppConfigured
+        - PolicyName: GitHubReadAppCredential
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: {Ref: GitHubAppSecretArn}
+              Condition:
+                StringEquals: {secretsmanager:VersionStage: AWSCURRENT}
+        - {Ref: 'AWS::NoValue'}
       - PolicyName: ScopedProductionAccess
         PolicyDocument:
           Version: '2012-10-17'
@@ -839,6 +884,9 @@ Resources:
           RCP_DURABLE_TERMINATION_ROLE: {'Fn::GetAtt': [SchedulerTerminationRole, Arn]}
           RCP_PRODUCTION_ENABLED: {'Fn::If': [Enabled, 'true', 'false']}
           RCP_PRODUCTION_ADMISSION_ENABLED: {'Fn::If': [Admitting, 'true', 'false']}
+          RCP_PRODUCTION_GITHUB_APP_CLIENT_ID: {Ref: GitHubAppClientId}
+          RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID: {Ref: GitHubAppInstallationId}
+          RCP_PRODUCTION_GITHUB_APP_SECRET_ARN: {Ref: GitHubAppSecretArn}
           RCP_PRODUCTION_REPOSITORY: wykurz/rcp
           RCP_PRODUCTION_REPOSITORY_ID: '655073755'
           RCP_PRODUCTION_OWNER_ID: '483465'
@@ -857,6 +905,18 @@ Resources:
           Principal: {Service: lambda.amazonaws.com}
           Action: sts:AssumeRole
       Policies:
+      - Fn::If:
+        - GitHubAppConfigured
+        - PolicyName: GitHubReadAppCredential
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: {Ref: GitHubAppSecretArn}
+              Condition:
+                StringEquals: {secretsmanager:VersionStage: AWSCURRENT}
+        - {Ref: 'AWS::NoValue'}
       - PolicyName: RetainVerifiedProductionEvidence
         PolicyDocument:
           Version: '2012-10-17'
@@ -993,6 +1053,9 @@ Resources:
           RCP_DURABLE_RUNTIME_GROUP: {Ref: RuntimeScheduleGroup}
           RCP_DURABLE_TERMINATION_ROLE: {'Fn::GetAtt': [SchedulerTerminationRole, Arn]}
           RCP_PRODUCTION_ENABLED: {'Fn::If': [Enabled, 'true', 'false']}
+          RCP_PRODUCTION_GITHUB_APP_CLIENT_ID: {Ref: GitHubAppClientId}
+          RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID: {Ref: GitHubAppInstallationId}
+          RCP_PRODUCTION_GITHUB_APP_SECRET_ARN: {Ref: GitHubAppSecretArn}
           RCP_PRODUCTION_REPOSITORY: wykurz/rcp
           RCP_PRODUCTION_REPOSITORY_ID: '655073755'
           RCP_PRODUCTION_OWNER_ID: '483465'

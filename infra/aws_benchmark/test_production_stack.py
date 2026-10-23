@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -32,7 +33,14 @@ RUN = "repo-655073755-run-1234"
 RUN_PK = "run#" + RUN
 BINARY_NAMES = [variant + "/" + name for variant in ("baseline", "candidate")
                 for name in ("rcp", "rcpd", "filegen")]
+APP_CONFIG = {
+    "GitHubAppClientId": "Iv23.example-client",
+    "GitHubAppInstallationId": "123456789",
+    "GitHubAppSecretArn": "arn:aws:secretsmanager:us-east-1:381183037896:secret:/rcp/production/github-read-app-Ab1Cd2",
+}
+NO_VALUE = object()
 VALUES = {
+    **APP_CONFIG,
     "AWS::Partition": "aws", "AWS::Region": REGION, "AWS::AccountId": ACCOUNT,
     "ResourcePrefix": PREFIX, "ArtifactBucket": BUCKET, "ArtifactBucket.Arn": BUCKET_ARN,
     "RuntimeScheduleGroup": PREFIX + "-runtime", "LeaseTable": "production", "LeaseTable.Arn": TABLE,
@@ -56,17 +64,18 @@ def sequence(value):
 
 def resolve(value, enabled=True, admission=True, publication=True):
     if isinstance(value, list):
-        return [resolve(item, enabled, admission, publication) for item in value]
+        resolved = [resolve(item, enabled, admission, publication) for item in value]
+        return [item for item in resolved if item is not NO_VALUE]
     if not isinstance(value, dict):
         return value
     if set(value) == {"Ref"}:
-        return VALUES[value["Ref"]]
+        return NO_VALUE if value["Ref"] == "AWS::NoValue" else VALUES[value["Ref"]]
     if set(value) == {"Fn::GetAtt"}:
         return VALUES[".".join(value["Fn::GetAtt"])]
     if set(value) == {"Fn::If"}:
         condition, yes, no = value["Fn::If"]
-        assert condition in {"Enabled", "Admitting", "Publishing"}
-        active = {"Enabled": enabled, "Admitting": enabled and admission, "Publishing": publication}[condition]
+        active = {"Enabled": enabled, "Admitting": enabled and admission, "Publishing": publication,
+                  "GitHubAppConfigured": all(VALUES[key] for key in APP_CONFIG)}[condition]
         return resolve(yes if active else no, enabled, admission, publication)
     if set(value) == {"Fn::Sub"}:
         def replace(match):
@@ -77,9 +86,8 @@ def resolve(value, enabled=True, admission=True, publication=True):
 
 
 def statements(role, enabled=True, admission=True, publication=True):
-    return [resolve(statement, enabled, admission, publication)
-            for policy in TEMPLATE["Resources"][role]["Properties"]["Policies"]
-            for statement in policy["PolicyDocument"]["Statement"]]
+    policies = resolve(TEMPLATE["Resources"][role]["Properties"]["Policies"], enabled, admission, publication)
+    return [statement for policy in policies for statement in policy["PolicyDocument"]["Statement"]]
 
 
 def conditions_match(conditions, context):
@@ -498,7 +506,7 @@ class ProductionStackTests(unittest.TestCase):
                 self.assertFalse(actions & {"dynamodb:Scan", "dynamodb:BatchWriteItem", "dynamodb:DeleteTable",
                                            "s3:DeleteObject", "s3:DeleteObjectVersion", "lambda:UpdateFunctionCode"})
             total = sum(len(json.dumps(policy["PolicyDocument"], separators=(",", ":")))
-                        for policy in value["Properties"]["Policies"])
+                        for policy in resolve(value["Properties"]["Policies"]))
             self.assertLess(total, 10_240, name)
 
     def test_collector_is_disabled_scheduled_retention_with_no_submission_credentials(self):
@@ -642,6 +650,117 @@ class ProductionStackTests(unittest.TestCase):
             self.assertNotIn("VpcConfig", props)
             self.assertEqual(TEMPLATE["Resources"][name + "LogGroup"]["Properties"]["RetentionInDays"], 7)
         self.assertIsNone(re.fullmatch(TEMPLATE["Parameters"]["CodeObjectVersion"]["AllowedPattern"], "null"))
+
+
+class GitHubAppConfigurationTests(unittest.TestCase):
+    @staticmethod
+    def accepted(overrides):
+        # evaluate the declared parameter constraints and Rules, not AWS authorization
+        values = {key: definition.get("Default", VALUES.get(key))
+                  for key, definition in TEMPLATE["Parameters"].items()}
+        values.update(overrides)
+        def evaluate(expression):
+            if not isinstance(expression, dict):
+                return expression
+            if set(expression) == {"Ref"}:
+                return values[expression["Ref"]]
+            operator, terms = next(iter(expression.items()))
+            resolved = [evaluate(term) for term in terms]
+            if operator == "Fn::Equals":
+                return resolved[0] == resolved[1]
+            if operator == "Fn::Not":
+                return not resolved[0]
+            if operator == "Fn::And":
+                return all(resolved)
+            if operator == "Fn::Or":
+                return any(resolved)
+            raise AssertionError("unsupported rule operator: " + operator)
+        for key, definition in TEMPLATE["Parameters"].items():
+            if key not in overrides and key not in APP_CONFIG:
+                continue
+            value = values[key]
+            if "AllowedPattern" in definition and re.fullmatch(definition["AllowedPattern"], value) is None:
+                return False
+            if "AllowedValues" in definition and value not in definition["AllowedValues"]:
+                return False
+        return all(not evaluate(rule.get("RuleCondition", True))
+                   or all(evaluate(assertion["Assert"]) for assertion in rule["Assertions"])
+                   for rule in TEMPLATE["Rules"].values())
+
+    def test_empty_and_partial_configuration_never_grant_secret_access(self):
+        self.assertTrue(self.accepted({}))
+        for key in APP_CONFIG:
+            self.assertEqual(TEMPLATE["Parameters"][key]["Default"], "")
+        for present in range(8):
+            values = {key: value if present & (1 << index) else ""
+                      for index, (key, value) in enumerate(APP_CONFIG.items())}
+            with patch.dict(VALUES, values):
+                for role in ("AdmissionRole", "CollectorRole"):
+                    self.assertEqual(permits(role, "secretsmanager:GetSecretValue", APP_CONFIG["GitHubAppSecretArn"],
+                        {"secretsmanager:VersionStage": "AWSCURRENT"}, enabled=False, admission=False), present == 7)
+                for enabled, admission in ((False, False), (False, True), (True, False), (True, True)):
+                    parameters = values | {"RuntimeEnabled": str(enabled).lower(),
+                                           "AdmissionEnabled": str(admission).lower()}
+                    self.assertEqual(self.accepted(parameters), present == 7 or not (enabled or admission), parameters)
+        # auth absence must not silently turn an already-enabled watchdog off
+        self.assertEqual(TEMPLATE["Conditions"]["Enabled"],
+                         {"Fn::Equals": [{"Ref": "RuntimeEnabled"}, "true"]})
+        self.assertEqual(TEMPLATE["Conditions"]["GitHubAppConfigured"], {"Fn::And": [
+            {"Fn::Not": [{"Fn::Equals": [{"Ref": key}, ""]}]} for key in APP_CONFIG]})
+
+    def test_identifier_constraints_reject_wrong_locations_wildcards_and_partial_arns(self):
+        secret = APP_CONFIG["GitHubAppSecretArn"]
+        invalid = {
+            "GitHubAppClientId": [" ", "../client", "x" * 101, "client\n", "*"],
+            "GitHubAppInstallationId": ["0", "01", "-1", "1.0", "1" * 21, "*"],
+            "GitHubAppSecretArn": [secret[:-7], secret + "*", secret + "/extra", secret + "\n",
+                secret.replace("381183037896", "123456789012"), secret.replace("us-east-1", "us-west-2"),
+                secret.replace("github-read-app", "other"), secret[:-6] + "*", secret[:-6] + "ab_cd1"],
+        }
+        for key, candidates in invalid.items():
+            for value in candidates:
+                self.assertFalse(self.accepted(APP_CONFIG | {key: value, "RuntimeEnabled": "true"}), (key, value))
+        for client in ("Iv1.0123456789abcdef", "Iv23liOpaqueNoDot", "A" * 100):
+            self.assertTrue(self.accepted(APP_CONFIG | {"GitHubAppClientId": client, "RuntimeEnabled": "true"}))
+
+    def test_only_admission_and_collector_can_read_exact_current_external_secret(self):
+        secret = APP_CONFIG["GitHubAppSecretArn"]
+        readers = {"AdmissionRole", "CollectorRole"}
+        roles = [name for name, resource in TEMPLATE["Resources"].items() if resource["Type"] == "AWS::IAM::Role"]
+        for role in roles:
+            scoped = [entry for entry in statements(role) if any(action.startswith(("secretsmanager:", "kms:"))
+                      for action in sequence(entry["Action"]))]
+            self.assertEqual(scoped, [{"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": secret,
+                "Condition": {"StringEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}}}] if role in readers else [])
+            self.assertEqual(permits(role, "secretsmanager:GetSecretValue", secret,
+                {"secretsmanager:VersionStage": "AWSCURRENT"}), role in readers)
+            for stage in (None, "AWSPREVIOUS", "AWSPENDING", "AWSCURRENT*"):
+                context = {} if stage is None else {"secretsmanager:VersionStage": stage}
+                self.assertFalse(permits(role, "secretsmanager:GetSecretValue", secret, context), (role, stage))
+            for other in (secret + "-other", secret[:-6] + "New123", secret.replace("github-read-app", "unrelated")):
+                self.assertFalse(permits(role, "secretsmanager:GetSecretValue", other,
+                    {"secretsmanager:VersionStage": "AWSCURRENT"}), (role, other))
+            for action in ("secretsmanager:DescribeSecret", "secretsmanager:ListSecrets", "secretsmanager:PutSecretValue",
+                           "secretsmanager:UpdateSecretVersionStage", "secretsmanager:DeleteSecret", "kms:Decrypt"):
+                self.assertFalse(permits(role, action, secret, {"secretsmanager:VersionStage": "AWSCURRENT"}), (role, action))
+        self.assertFalse(any(resource["Type"].startswith(("AWS::SecretsManager::", "AWS::KMS::"))
+                             for resource in TEMPLATE["Resources"].values()))
+
+    def test_only_proof_readers_receive_non_secret_app_configuration(self):
+        expected = {"RCP_PRODUCTION_GITHUB_APP_CLIENT_ID": "GitHubAppClientId",
+                    "RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID": "GitHubAppInstallationId",
+                    "RCP_PRODUCTION_GITHUB_APP_SECRET_ARN": "GitHubAppSecretArn"}
+        for name, resource in TEMPLATE["Resources"].items():
+            if resource["Type"] != "AWS::Lambda::Function":
+                continue
+            env = resource["Properties"]["Environment"]["Variables"]
+            actual = {key: value for key, value in env.items() if key.startswith("RCP_PRODUCTION_GITHUB_APP_")}
+            self.assertEqual(actual, {key: {"Ref": value} for key, value in expected.items()}
+                             if name in {"AdmissionFunction", "CollectorFunction"} else {}, name)
+        for role in ("AdmissionRole", "CollectorRole"):
+            trust = TEMPLATE["Resources"][role]["Properties"]["AssumeRolePolicyDocument"]
+            self.assertEqual(trust, {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
 
 
 class PublicationRoleTests(unittest.TestCase):

@@ -38,7 +38,10 @@ def environment(cloud=None):
         RCP_PRODUCTION_REPOSITORY="wykurz/rcp", RCP_PRODUCTION_REPOSITORY_ID="123",
         RCP_PRODUCTION_OWNER_ID="483465", RCP_PRODUCTION_AUDIENCE="test-admission-audience",
         RCP_PRODUCTION_SUBMIT_WORKFLOW="wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads/main",
-        RCP_PRODUCTION_MACHINE_ARN=cloud.machine)
+        RCP_PRODUCTION_MACHINE_ARN=cloud.machine,
+        RCP_PRODUCTION_GITHUB_APP_CLIENT_ID="Iv23testclientid123456",
+        RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID="12345",
+        RCP_PRODUCTION_GITHUB_APP_SECRET_ARN=f"arn:aws:secretsmanager:{cloud.config.region}:{cloud.config.account}:secret:/rcp/production/github-read-app-AbCd12")
     return result
 
 
@@ -218,6 +221,34 @@ class HandlerTests(unittest.TestCase):
             third = handler.build_admission()
             self.assertIsNot(first.verifier.verifier, third.verifier.verifier)
             client.assert_not_called()
+
+    def test_app_reader_uses_only_server_config_and_has_no_eager_secret_read(self):
+        with patch.dict(os.environ, environment(), clear=True), patch("boto3.client") as client, \
+                patch.object(handler, "cached_provider") as provider, \
+                patch.object(handler, "GitHubRunReader") as reader:
+            handler.build_admission()
+            config = provider.call_args.args[0]
+            self.assertEqual(config.repository, "wykurz/rcp")
+            self.assertEqual(config.repository_id, "123")
+            self.assertEqual(config.repository_owner_id, "483465")
+            self.assertEqual(config.app_client_id, environment()["RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"])
+            self.assertEqual(config.installation_id, "12345")
+            self.assertEqual(config.secret_arn, environment()["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
+            self.assertEqual(reader.call_args.kwargs["observation_factory"], provider.return_value.observation)
+            provider.return_value.observation.assert_not_called()
+            client.assert_not_called()
+
+    def test_missing_app_config_cannot_build_an_anonymous_reader_or_touch_cloud(self):
+        for key in ("RCP_PRODUCTION_GITHUB_APP_CLIENT_ID", "RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID",
+                    "RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"):
+            env = environment()
+            del env[key]
+            with self.subTest(key=key), patch.dict(os.environ, env, clear=True), \
+                    patch("boto3.client") as client, patch.object(handler, "GitHubRunReader") as reader:
+                with self.assertRaises((KeyError, ValueError)):
+                    handler.build_admission()
+                reader.assert_not_called()
+                client.assert_not_called()
 
     def test_configuration_failure_is_sanitized(self):
         with patch.dict(os.environ, environment(), clear=True), \
