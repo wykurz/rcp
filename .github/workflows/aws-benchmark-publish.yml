@@ -158,8 +158,10 @@ jobs:
     if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # This new environment must be separately configured for main and the owner before activation.
+    environment: aws-benchmark-history
     permissions:
-      contents: write
+      contents: read
     outputs:
       history_commit: ${{ steps.append.outputs.history_commit }}
     concurrency:
@@ -204,11 +206,46 @@ jobs:
           path: ${{ runner.temp }}/public-records
           merge-multiple: true
           digest-mismatch: error
+      - name: Validate public data and writer configuration before minting credentials
+        env:
+          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
+          CLIENT_ID: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
+          INSTALLATION_ID: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from infra.aws_benchmark.production_trust import writer_config
+          writer_config(os.environ['CLIENT_ID'], os.environ['INSTALLATION_ID'])
+          PY
+          python3 -m infra.aws_benchmark.production_publish validate \
+            --input "$RUNNER_TEMP/public-records" \
+            --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
+      - name: Mint the repository-selected history writer token
+        id: history-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}
+          owner: wykurz
+          repositories: rcp
+          permission-contents: write
+          permission-metadata: read
+          skip-token-revoke: false
+      - name: Require the approved installation before using its token
+        env:
+          EXPECTED_INSTALLATION: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
+          ACTUAL_INSTALLATION: ${{ steps.history-token.outputs.installation-id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from infra.aws_benchmark.production_trust import identifier
+          assert identifier(os.environ['EXPECTED_INSTALLATION']) == identifier(os.environ['ACTUAL_INSTALLATION'])
+          PY
       - name: Append to freshly read history with bounded conflict reconciliation
         id: append
         env:
           EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.history-token.outputs.token }}
         run: |
           for attempt in 1 2 3; do
             history="$RUNNER_TEMP/publish-history-$attempt.git"

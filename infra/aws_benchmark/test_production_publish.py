@@ -63,6 +63,19 @@ class PublishTests(unittest.TestCase):
             self.assertIn('"collected_at":', text)
             self.assertIn("not independently attested", text)
 
+    def test_validate_cli_checks_real_public_artifact_without_git_or_cloud_access(self):
+        _, _, exported, digest = self.batch()
+        args = ["publication", "validate", "--input", str(exported), "--history", str(self.root / "unused"),
+                "--reader-revision", REVISION, "--expected-sha256", digest]
+        with patch.object(publish, "git", side_effect=AssertionError("validation must not invoke git")), \
+                patch("infra.aws_benchmark.controller.oidc_session", side_effect=AssertionError("no cloud credentials")), \
+                patch("sys.argv", args):
+            publish.main()
+            record = exported / (self.fx.store.record.run_key + ".json")
+            record.write_bytes(record.read_bytes() + b" ")
+            with self.assertRaises(ValueError):
+                publish.main()
+
     def test_workflow_output_rejects_command_delimiters_and_invalid_keys(self):
         output = self.root / "outputs"
         with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):

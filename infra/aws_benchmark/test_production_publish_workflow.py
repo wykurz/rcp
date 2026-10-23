@@ -11,6 +11,8 @@ import unittest
 
 import yaml
 
+from . import production_publish as publish
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/aws-benchmark-publish.yml"
 SHA = "a" * 40
@@ -40,12 +42,15 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertEqual(set(self.jobs), {"download", "export", "publish", "pages"})
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         expected = {"download": {"contents": "read", "id-token": "write"},
-                    "export": {"contents": "read"}, "publish": {"contents": "write"}}
+                    "export": {"contents": "read"}, "publish": {"contents": "read"}}
         for name, job in self.phases.items():
             self.assertEqual(job["permissions"], expected[name])
             self.assertEqual(job["runs-on"], "ubuntu-24.04")
             self.assertLessEqual(int(job["timeout-minutes"]), 15)
-            self.assertNotIn("environment", job)
+            if name == "publish":
+                self.assertEqual(job["environment"], "aws-benchmark-history")
+            else:
+                self.assertNotIn("environment", job)
             for guard in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                           "github.event_name == 'workflow_dispatch'", "github.actor_id == '483465'",
                           "vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'", "github.run_attempt == '1'",
@@ -124,6 +129,53 @@ class PublicationWorkflowTests(unittest.TestCase):
                 self.assertNotIn(forbidden, source)
             self.assertEqual(job["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
             self.assertEqual(job["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_actual_pre_mint_shell_runs_real_validation_cli_and_rejects_bad_data_or_configuration(self):
+        step = next(x for x in self.jobs["publish"]["steps"] if "production_publish validate" in x.get("run", ""))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "public-records"
+            source.mkdir()
+            value = json.loads((ROOT / "infra/aws_benchmark/fixtures/production-public-report-v1.json").read_text())
+            value["run_key"] = key = "repo-655073755-run-123"
+            raw = publish.encoded(value)
+            record = source / (key + ".json")
+            record.write_bytes(raw)
+            publish.persist(source / "index.json", dict(schema=publish.PUBLIC_SCHEMA, repository_id="655073755",
+                reader_revision=SHA, observed_at="2026-10-23T00:00:00Z", active=dict(state="idle", retired=False),
+                observations=[dict(run_key=key, state="ready", retired=True)],
+                records=[dict(run_key=key, bytes=len(raw), sha256=publish.digest(raw))]))
+            env = dict(trusted_environment(directory), CLIENT_ID="Iv23.test-client", INSTALLATION_ID="5678",
+                       EXPECTED_INVENTORY=publish.inventory(source), AWS_EC2_METADATA_DISABLED="true")
+            for change in ({}, {"CLIENT_ID": ""}, {"INSTALLATION_ID": "not-an-id"}, {"EXPECTED_INVENTORY": "0" * 64}):
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
+                    env={**env, **change}, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, not change, result.stderr)
+            record.write_bytes(raw + b" ")
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
+                env=env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((Path(directory) / "unused-history").exists())
+
+    def test_writer_mints_only_after_validation_and_uses_a_narrow_environment_app_token(self):
+        steps = self.jobs["publish"]["steps"]
+        mint = next(i for i, item in enumerate(steps) if item.get("id") == "history-token")
+        self.assertIn("production_publish validate", steps[mint - 1]["run"])
+        self.assertEqual(steps[mint]["with"], {
+            "client-id": "${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}",
+            "private-key": "${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}",
+            "owner": "wykurz", "repositories": "rcp", "permission-contents": "write",
+            "permission-metadata": "read", "skip-token-revoke": "false"})
+        self.assertEqual(steps[-1]["env"]["GH_TOKEN"], "${{ steps.history-token.outputs.token }}")
+        self.assertNotIn("github.token", str(self.jobs["publish"]))
+        self.assertNotIn("id-token", str(self.jobs["publish"]))
+        self.assertEqual(sum("secrets." in str(item) for item in steps), 1)
+        self.assertNotIn("continue-on-error", str(steps))
+        for actual in ("5678", "5679", "", "5678\n", "0"):
+            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as directory:
+                env = dict(trusted_environment(directory), EXPECTED_INSTALLATION="5678", ACTUAL_INSTALLATION=actual)
+                result = subprocess.run(["bash", "-e", "-c", steps[mint + 1]["run"]], cwd=ROOT,
+                    env=env, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, actual == "5678")
 
     def test_pages_reuses_reviewed_workflow_only_with_verified_history_commit(self):
         job = self.jobs["pages"]
