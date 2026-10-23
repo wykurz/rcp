@@ -28,7 +28,7 @@ def encoded(value):
 
 def fixture_claims(**updates):
     claims = dict(iss=auth.ISSUER, aud=AUDIENCE, sub="repo:example/project:ref:refs/heads/main",
-        exp=NOW + 300, iat=NOW, nbf=NOW - 5, jti="test-only-jti", repository=REPOSITORY,
+        exp=NOW + 300, iat=NOW, nbf=NOW - 300, jti="test-only-jti", repository=REPOSITORY,
         repository_id="1234", repository_owner="example", repository_owner_id="5678",
         ref=auth.MAIN_REF, workflow_ref=WORKFLOW, workflow_sha="a" * 40, sha="a" * 40,
         run_id="10001", run_attempt="1", actor="test-owner", actor_id="9876",
@@ -174,15 +174,32 @@ class ProductionAuthTests(unittest.TestCase):
         self.assert_rejected(self.token(fixture_claims(sub="x" * 1025)))
 
     def test_expired_future_overlong_and_inconsistent_times_are_rejected(self):
-        for updates in ({"exp": NOW}, {"exp": NOW - 1}, {"iat": NOW + 1}, {"nbf": NOW + 1},
-                        {"exp": NOW + 601}, {"iat": NOW - 301}, {"nbf": NOW - 61},
-                        {"iat": NOW - 10, "nbf": NOW - 5}, {"exp": 2**53}):
+        for updates in ({"exp": NOW}, {"exp": NOW - 1}, {"iat": NOW + 61}, {"nbf": NOW + 61},
+                        {"exp": NOW + 601}, {"iat": NOW - 301}, {"nbf": NOW + 300},
+                        {"iat": NOW - 600, "exp": NOW + 1}, {"exp": 2**53}):
             with self.subTest(updates=updates):
                 self.assert_rejected(self.token(fixture_claims(**updates)))
         for name in ("exp", "iat", "nbf"):
             for value in (True, False, str(NOW), float(NOW), 0, -1, None, []):
                 with self.subTest(name=name, value=value):
                     self.assert_rejected(self.token(fixture_claims(**{name: value})))
+
+    def test_github_documented_and_current_backdated_nbf_samples_are_valid(self):
+        # github.com/en/actions/concepts/security/openid-connect documents the first tuple.
+        for before, issued, expires in ((1632492967, 1632493567, 1632493867),
+                                       (1784379753, 1784380053, 1784380353)):
+            with self.subTest(issued=issued):
+                self.now = issued
+                verifier = self.make_verifier()
+                result = verifier.verify(self.token(fixture_claims(nbf=before, iat=issued, exp=expires)))
+                self.assertEqual(result.issued_at, issued)
+
+    def test_forward_clock_skew_is_bounded_and_does_not_extend_expiry(self):
+        self.verifier.verify(self.token(fixture_claims(iat=NOW + 60, nbf=NOW + 60, exp=NOW + 360)))
+        self.assert_rejected(self.token(fixture_claims(iat=NOW + 61, nbf=NOW, exp=NOW + 360)))
+        self.assert_rejected(self.token(fixture_claims(iat=NOW, nbf=NOW + 61)))
+        self.assert_rejected(self.token(fixture_claims(iat=NOW - 300, nbf=NOW - 900, exp=NOW)))
+        self.assert_rejected(self.token(fixture_claims(exp=NOW + 6 * 3600)))
 
     def test_exact_lifetime_limit_is_valid_and_expiration_has_no_grace_period(self):
         token = self.token(fixture_claims(exp=NOW + auth.MAX_TOKEN_LIFETIME_SECONDS))

@@ -207,6 +207,142 @@ class CollectionTests(unittest.TestCase):
         again = self.fx.collector.collect(retire=True)
         self.assertEqual(again, value)
         self.assertEqual(len(self.fx.s3.writes), writes)
+    def test_cancelled_or_failed_submission_does_not_invalidate_successful_worker(self):
+        for conclusion in ("cancelled", "failure", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                fx = Fixture(self.directory.name)
+                for kind in ("attempt", "current"):
+                    fx.documents[kind]["conclusion"] = conclusion
+                    fx.documents[kind + "_jobs"]["jobs"][0]["conclusion"] = conclusion
+                value = fx.collector.collect(retire=True)
+                self.assertEqual(value["state"], "success", value)
+                report = json.loads(fx.s3.objects[fx.collector.prefix + "report.json"]["1"])
+                self.assertEqual(report["evidence"]["producer_conclusion"], conclusion)
+                fx.reader.read.assert_called_once()
+                evidence = report["evidence"]
+                with self.assertRaisesRegex(ValueError, "diagnostic run"):
+                    results.validate_qualification(evidence, {}, dict(schema_version=1,
+                        identity=evidence["identity"], archive_sha256=evidence["files"]["results.zip"],
+                        ami_id=fx.config.ami, harness_revision=fx.config.source))
+
+    def test_observed_completion_cannot_be_reclassified_after_output_expiry(self):
+        self.fx.store.record.state["close_reason"] = "worker completed; result validity is separate from physical cleanup"
+        self.fx.publish()
+        del self.fx.s3.objects[self.fx.paths.status]
+        del self.fx.s3.objects[self.fx.paths.results]
+        result = self.assertHeld()
+        self.assertIn("completion evidence is missing", result["reason"])
+
+    def test_missing_checksum_and_trailing_stream_bytes_hold(self):
+        original = self.fx.s3.get_object
+        def missing(**kwargs):
+            response = original(**kwargs)
+            del response["ChecksumSHA256"]
+            return response
+        self.fx.s3.get_object = missing
+        self.assertHeld()
+        class Extra(io.BytesIO):
+            def __init__(self, raw):
+                super().__init__(raw)
+                self.first = True
+            def read(self, size=-1):
+                if self.first:
+                    self.first = False
+                    return super().read(size)
+                return b"x"
+        def trailing(**kwargs):
+            response = original(**kwargs)
+            response["Body"] = Extra(response["Body"].read())
+            return response
+        self.fx.s3.get_object = trailing
+        self.assertHeld()
+
+    def never_started(self):
+        self.never_submitted()
+        state = self.fx.store.record.state
+        state["submission_arn"] = self.fx.execution_arn
+        state["sealed_inputs"] = {name: dict(key="production/staging/" + self.fx.store.run_key + "/" + name,
+            version="1", sha256="d" * 64, bytes=1) for name in common.BINARIES}
+        self.fx.publish()
+
+    def test_sealed_never_started_retires_after_full_horizon_without_refund(self):
+        self.never_started()
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual(value["state"], "failed", value)
+        self.assertTrue(value["retired"])
+        saved = json.loads(self.fx.s3.objects[value["retention"]["key"]]["1"])
+        self.assertEqual(saved["execution"]["status"], "NEVER_STARTED")
+        self.assertEqual(self.fx.collector.collect(retire=True), value)
+        self.fx.sfn.start_execution.assert_not_called()
+
+    def test_never_started_allocation_intent_or_unknown_absence_holds(self):
+        self.never_started()
+        original = copy.deepcopy(self.fx.store.record.state)
+        for field, value in dict(attempts=1, attempt={}, allocation_consumed=True,
+                launch_outcome="uncertain", execution_arn=self.fx.execution_arn,
+                known_instance_ids=[INSTANCE], seen={INSTANCE: {}}, worker_published=True).items():
+            with self.subTest(field=field):
+                self.fx.store.record = replace(self.fx.store.record, state=copy.deepcopy(original))
+                self.fx.store.record.state[field] = value
+                self.fx.publish()
+                self.assertHeld()
+        self.fx.store.record = replace(self.fx.store.record, state=copy.deepcopy(original))
+        self.fx.publish()
+        for error in (Error("AccessDenied"), TimeoutError()):
+            self.fx.sfn.describe_execution.side_effect = error
+            self.assertHeld()
+        self.fx.sfn.describe_execution.side_effect = Error("ExecutionDoesNotExist")
+        self.fx.finish -= timedelta(seconds=1)
+        self.assertHeld()
+
+    def test_retained_open_verdict_change_holds_until_compatible_validator_restored(self):
+        self.assertEqual(self.fx.collector.collect()["state"], "success")
+        with patch.object(results, "validate_qualification", side_effect=ValueError("new contract")):
+            value = self.assertHeld()
+        self.assertIn("retained qualification verdict differs", value["reason"])
+        self.assertEqual(self.fx.collector.collect(retire=True)["state"], "success")
+
+    def test_retained_source_version_metadata_rejects_control_and_oversized_values(self):
+        self.fx.collector.collect()
+        key = self.fx.collector.prefix + "manifest.json"
+        original = self.fx.s3.objects[key]["1"]
+        for version in ("bad\nversion", "x" * 1025):
+            with self.subTest(version_length=len(version)):
+                manifest = json.loads(original)
+                manifest["sources"]["durable.json"]["version"] = version
+                self.fx.s3.objects[key]["1"] = collection.encoded(manifest)
+                self.assertHeld()
+
+    def test_late_runtime_change_after_retention_prevents_release(self):
+        for change in (lambda fx: setattr(fx, "live", True), lambda fx: setattr(fx, "root_present", True),
+                       lambda fx: fx.execution.update(status="RUNNING")):
+            with self.subTest(change=change):
+                fx = Fixture(self.directory.name)
+                original = fx.collector.retained
+                def retain(*args):
+                    value = original(*args)
+                    change(fx)
+                    return value
+                fx.collector.retained = retain
+                result = fx.collector.collect(retire=True)
+                self.assertEqual(result["state"], "held", result)
+                self.assertFalse(result["retired"])
+                self.assertEqual(fx.store.retire_calls, [])
+
+    def test_later_rerun_cannot_reopen_completed_run_after_terminal_observation(self):
+        original = self.fx.collector.retained
+        def retain(*args):
+            value = original(*args)
+            self.fx.documents["current"].update(run_attempt=2, status="queued", conclusion=None)
+            return value
+        self.fx.collector.retained = retain
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual(value["state"], "success", value)
+        self.assertTrue(value["retired"])
+        self.fx.reader.read.assert_called_once()
+        self.assertEqual(self.fx.sfn.describe_execution.call_count, 2)
+        self.assertGreaterEqual(self.fx.ec2.describe_instances.call_count, 4)
+
     def test_collection_without_retirement_keeps_active_ownership(self):
         value = self.fx.collector.collect()
         self.assertEqual(value["state"], "success", value)

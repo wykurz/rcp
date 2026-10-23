@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from . import production_collection as collection, production_export as export
+from . import common, production_collection as collection, production_export as export
 from .common import digest, completed_status
 from .production_store import AdmissionDecision
 from .test_production_collection import Fixture
@@ -53,6 +53,30 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(projected["verification"], report["evidence"]["expected_verification"])
             with patch.object(export, "project", side_effect=AssertionError("historical replay")):
                 self.assertEqual(export.stage(bundle, output), projected)
+
+    def test_frozen_v1_record_survives_current_exporter_and_series_changes(self):
+        for name in ("production-public-report-v1.json", "production-public-report-v1-failed.json"):
+            with self.subTest(fixture=name):
+                path = Path(__file__).with_name("fixtures") / name
+                raw = path.read_bytes()
+                value = json.loads(raw)
+                self.assertEqual(value["schema"], "rcp-production-public-report-v1")
+                with patch.object(export, "SCHEMA", "future-public-report-v2"), \
+                        patch.object(export, "VALIDATION", "future wording"), \
+                        patch.object(export.results, "SERIES_CONTRACT", "future-series-v2"):
+                    self.assertEqual(export.validate_public(value), value)
+                    self.assertIn("Metadata/size only", export.render(value))
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_retired_projection_uses_recorded_verdict_not_current_admission(self):
+        bundle = self.reader.download(self.key)
+        original = export.project(bundle)
+        future_plan = dict(common.DURABLE_PLAN, work_seconds=common.DURABLE_PLAN["work_seconds"] + 10)
+        with patch.object(export.results, "approve", side_effect=AssertionError("new-run-only gate")), \
+                patch.object(common, "DURABLE_PLAN", future_plan), \
+                patch.object(export.results, "verification_contract", return_value={"future": "contract"}), \
+                patch.object(export.results, "SERIES_CONTRACT", "future-series-v2"):
+            self.assertEqual(export.project(bundle), original)
 
     def test_projection_has_explicit_validation_and_only_public_fields(self):
         bundle = self.reader.download(self.key)
@@ -135,7 +159,7 @@ class ExportTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "conflicting"):
                         export.stage(bundle, root)
 
-    def test_exact_schema_and_rendered_bound(self):
+    def test_public_schema_rejects_extra_missing_and_unbounded_fields(self):
         original = export.project(self.reader.download(self.key))
         for change in (dict(original, admission={"private": "data"}), dict(original, note="&" * 900000),
                        {key: value for key, value in original.items() if key != "comparison"}):

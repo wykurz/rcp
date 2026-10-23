@@ -1,0 +1,20 @@
+{
+  "benchmark_valid": false,
+  "cleanup_verified": true,
+  "comparison": "A/A (identical source revision and binary digests)",
+  "identity": {
+    "baseline": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "controller": "cccccccccccccccccccccccccccccccccccccccc",
+    "run": "123-1",
+    "run_url": "https://github.com/wykurz/rcp/actions/runs/123/attempts/1",
+    "suite": "bulk-1g-metadata"
+  },
+  "measurements": [],
+  "note": "Safely retired failed qualification; excluded from performance history.",
+  "retirement_sha256": "d4c08dd5d37d0045c2d7802d35643f9beeac5f20b7f48690e4610a393c48e034",
+  "run_key": "repo-123-run-123",
+  "schema": "rcp-production-public-report-v1",
+  "series_contract": "aws-local-ext4-v1",
+  "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption."
+}

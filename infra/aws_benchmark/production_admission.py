@@ -12,9 +12,9 @@ import json
 import re
 
 from . import durable
-from .common import BINARIES, require, timestamp, utc, error_code
+from .common import BINARIES, require, timestamp, utc, error_code, retryable_io
 from .durable_client import execution_arn
-from .production_policy import authorize, canonical, manifest, Policy
+from .production_policy import authorize, canonical, manifest, Policy, MAX_RUN_AGE_SECONDS
 from .production_store import AdmissionDecision, RunStore
 
 UPLOAD_SECONDS = 600
@@ -65,7 +65,8 @@ class Admission:
         original = record.admission["initial_payload"]
         require(identity.run_attempt == original["producer"]["run_attempt"],
                 "a workflow rerun cannot resume an earlier producer's uploads")
-        remaining = int((utc(original["upload_deadline"]) - self.now()).total_seconds())
+        deadline = min(utc(original["upload_deadline"]), utc(record.state["request"]["capacity_deadline"]))
+        remaining = int((deadline - self.now()).total_seconds())
         require(0 < remaining <= UPLOAD_SECONDS and record.state["phase"] == "awaiting-inputs",
                 "input upload period is closed")
         result = receipt(record)
@@ -97,9 +98,12 @@ class Admission:
             self.run_reader.read(identity)
             store.load()  # require the same active slot before issuing scoped upload capabilities
             return self.upload_urls(identity, existing)
+        require(identity.run_attempt == "1", "workflow reruns cannot create a new reservation")
         policy = self.policy()
         observed = self.run_reader.read(identity)
         approved = authorize(policy, identity, observed, checked, self.now())
+        require((self.now() - utc(observed.created_at)).total_seconds() + UPLOAD_SECONDS < MAX_RUN_AGE_SECONDS,
+                "workflow run has insufficient time for input upload")
         created = self.now()
         producer = dict(run=identity.run_id + "-" + identity.run_attempt,
             baseline=checked["baseline"], candidate=checked["candidate"], suite=checked["suite"],
@@ -150,18 +154,29 @@ class Admission:
         store = self.store(identity)
         record = store.read()
         require(record is not None, "no admitted run exists")
-        if record.closed or record.state["phase"] not in ("awaiting-inputs", "armed"):
+        if record.closed:
             return receipt(record)
         original = record.admission["initial_payload"]
         require(identity.run_attempt == original["producer"]["run_attempt"], "workflow reruns cannot submit another allocation")
+        if record.state["phase"] in {"launching", "uncertain", "requested"}:
+            # a successful start may advance before its reply, or that reply may be lost.
+            # reconcile only the existing exact execution; this path cannot start anything.
+            state, _ = store.load()
+            require(state["submission_arn"] == execution_arn(self.machine, state["request"]["run"]),
+                    "progressed submission differs")
+            found = self.api["stepfunctions"].describe_execution(executionArn=state["submission_arn"])
+            return receipt(store.read()) | self.verify_execution(found, state, record)
+        if record.state["phase"] not in ("awaiting-inputs", "armed"):
+            return receipt(record)
         policy = self.policy()
         require(policy.enabled and policy.version == record.admission["policy_version"], "admission policy changed or is disabled")
         self.run_reader.read(identity)
         state, revision = store.load()
         if state["phase"] == "awaiting-inputs":
-            require(self.now() < utc(original["upload_deadline"]), "input upload period expired")
+            deadline = min(utc(original["upload_deadline"]), utc(state["request"]["capacity_deadline"]))
+            require(self.now() < deadline, "input upload or capacity period expired")
             state["sealed_inputs"] = self.sealed_inputs(record)
-            require(self.now() < utc(original["upload_deadline"]), "input sealing exceeded upload period")
+            require(self.now() < deadline, "input sealing exceeded upload or capacity period")
             state["submission_arn"] = execution_arn(self.machine, state["request"]["run"])
             state["phase"] = "armed"
             store.save(state, revision)
@@ -178,9 +193,14 @@ class Admission:
         try:
             started = self.api["stepfunctions"].start_execution(stateMachineArn=self.machine,
                 name=state["request"]["run"], input=canonical(inputs).decode())
-        except Exception:
-            # exact-name lookup only; absence or a read failure leaves a retained ownership hold
-            found = self.api["stepfunctions"].describe_execution(executionArn=state["submission_arn"])
+        except Exception as start_error:
+            # the exact name/input remains idempotent; only typed transient failures may retry
+            try:
+                found = self.api["stepfunctions"].describe_execution(executionArn=state["submission_arn"])
+            except Exception as read_error:
+                if error_code(read_error) == "ExecutionDoesNotExist" and retryable_io(start_error):
+                    raise start_error
+                raise
             return receipt(store.read()) | self.verify_execution(found, state, record)
         require(started.get("executionArn") == state["submission_arn"], "submission returned another execution")
         return receipt(store.read()) | dict(execution_arn=started["executionArn"], execution_status="submitted")

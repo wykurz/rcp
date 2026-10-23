@@ -101,7 +101,31 @@ jobs:
           path: ${{ runner.temp }}/artifact.tar
           retention-days: 1
           if-no-files-found: error
+      # serialization prevents a newer Pages deployment overtaking this final check.
+      # a delayed publisher from an older main must not roll the site back.
+      - name: Check that this site still belongs to current main
+        id: current_main
+        timeout-minutes: 1
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/main > "$RUNNER_TEMP/pages-main-ref"
+          python3 - "$RUNNER_TEMP/pages-main-ref" <<'PY'
+          import os, re, sys
+          from pathlib import Path
+          match = re.fullmatch(r'([0-9a-f]{40})\trefs/heads/main\n', Path(sys.argv[1]).read_text())
+          assert match, 'Invalid main reference'
+          current = match[1] == os.environ['GITHUB_SHA']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('current=' + str(current).lower() + '\n')
+          if not current:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('Skipped stale Pages deployment: main has advanced. Public history remains retained.\n')
+          PY
       - name: Deploy project site
+        if: steps.current_main.outputs.current == 'true'
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
       - name: Summarize historical changes

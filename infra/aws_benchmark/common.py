@@ -339,6 +339,17 @@ def error_code(error):
 
 
 def retryable_io(error):
+    """Classify a transient failure, not whether the operation committed or is safe to replay."""
+    if error_code(error) == "TransactionCanceledException":
+        # a canceled transaction can mix retryable contention with a failed fence or
+        # validation error. Missing/unknown reasons are not evidence of a transient.
+        reasons = (getattr(error, "response", None) or {}).get("CancellationReasons")
+        if not isinstance(reasons, list) or not reasons:
+            return False
+        codes = [reason.get("Code") if isinstance(reason, dict) else None for reason in reasons]
+        transient = {"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"}
+        return (all(isinstance(code, str) and code in transient | {"None"} for code in codes)
+                and any(code in transient for code in codes))
     # the SDK is optional for stdlib-only offline tests, but always installed on AWS paths
     transport_errors = (ConnectionError, TimeoutError)
     try:
@@ -356,7 +367,8 @@ def retryable_io(error):
             or response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {500, 502, 503, 504}
             or error_code(error) in {"InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
                                     "RequestTimeout", "RequestTimeoutException", "Throttling", "IDPCommunicationError",
-                                    "ThrottlingException", "RequestLimitExceeded", "ProvisionedThroughputExceededException"})
+                                    "ThrottlingException", "TooManyRequestsException", "RequestLimitExceeded",
+                                    "ProvisionedThroughputExceededException"})
 
 
 def retry_io(operation, budget, reserve=0, attempts=3):

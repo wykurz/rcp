@@ -284,7 +284,7 @@ def inspect(source, expected, conclusion):
     return evidence, result, snapshots
 
 
-def validate_qualification(evidence, result, policy):
+def validate_qualification(evidence, result, policy, *, producer_role="execution"):
     """Validate an authenticated attempt contract without authorizing history publication."""
     expected = evidence["identity"]
     require(isinstance(policy, dict) and set(policy) == {"schema_version", "identity", "archive_sha256",
@@ -295,7 +295,11 @@ def validate_qualification(evidence, result, policy):
     require(isinstance(policy["ami_id"], str) and re.fullmatch(r"ami-[0-9a-f]{17}", policy["ami_id"])
             and isinstance(policy["harness_revision"], str)
             and re.fullmatch(r"[0-9a-f]{40}", policy["harness_revision"]), "invalid approved AMI provenance")
-    require(not evidence["errors"] and result is not None and evidence["producer_conclusion"] == "success"
+    require(producer_role in {"execution", "submission"}, "unknown producer responsibility")
+    producer_ok = evidence["producer_conclusion"] == "success" or (producer_role == "submission" and
+        evidence["producer_conclusion"] in {"failure", "cancelled", "timed_out", "neutral", "skipped",
+                                           "action_required", "stale", "startup_failure"})
+    require(not evidence["errors"] and result is not None and producer_ok
             and measurement_contract(expected["suite"])["purpose"] == "performance", "diagnostic run cannot enter performance history")
     receipt, worker = evidence["controller"], evidence["worker"]
     instance = receipt.get("instance") or {}

@@ -7,7 +7,6 @@ run deduplication belong to admission policy. Never log the token or request bod
 import base64
 from dataclasses import dataclass
 import http.client
-import json
 import math
 import re
 import ssl
@@ -15,17 +14,20 @@ import threading
 import time
 from collections.abc import Callable, Collection
 
+from benchmarks.strict_json import parse_json
+
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 ISSUER = "https://token.actions.githubusercontent.com"
-JWKS_URL = ISSUER + "/.well-known/jwks"
 MAIN_REF = "refs/heads/main"
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_JWKS_BYTES = 64 * 1024
 MAX_JWKS_KEYS = 16
 MAX_TOKEN_LIFETIME_SECONDS = 600
+MAX_TOKEN_AGE_SECONDS = 600
+CLOCK_SKEW_SECONDS = 60
 JWKS_CACHE_SECONDS = 300
 JWKS_REFRESH_SECONDS = 30
 JWKS_TIMEOUT_SECONDS = 3
@@ -79,27 +81,8 @@ def _matches(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
-def _unique_pairs(pairs):
-    value = {}
-    for key, item in pairs:
-        _require(key not in value)
-        value[key] = item
-    return value
-
-
-def _invalid_constant(value):
-    raise GitHubIdentityError("invalid GitHub admission JSON")
-
-
-def _finite_float(value):
-    number = float(value)
-    _require(math.isfinite(number))
-    return number
-
-
 def _json(raw):
-    value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs,
-                       parse_constant=_invalid_constant, parse_float=_finite_float)
+    value = parse_json(raw.decode("utf-8"))
     _require(isinstance(value, dict))
     pending = [(value, 0)]
     while pending:
@@ -241,8 +224,11 @@ class GitHubIdentityVerifier:
         _require(all(type(claims[name]) is int and 0 < claims[name] < 2**53
                      for name in ("iat", "nbf", "exp")))
         issued, before, expires = (claims[name] for name in ("iat", "nbf", "exp"))
-        _require(issued - 60 <= before <= issued <= now < expires)
-        _require(0 < expires - issued <= MAX_TOKEN_LIFETIME_SECONDS)
+        # github backdates nbf independently of iat (including by 600s in its docs).
+        # tolerate bounded forward clock skew, but never extend expiration or token age.
+        _require(before <= now + CLOCK_SKEW_SECONDS and before < expires)
+        _require(issued <= now + CLOCK_SKEW_SECONDS and now - issued < MAX_TOKEN_AGE_SECONDS)
+        _require(now < expires and 0 < expires - issued <= MAX_TOKEN_LIFETIME_SECONDS)
         _require(_matches(_KEY_ID, claims["jti"]))
         _require(claims["repository"] == self._repository
                  and claims["repository_id"] == self._repository_id

@@ -7,6 +7,7 @@ Publishing immutable evidence precedes the revision-fenced ownership release.
 
 from datetime import datetime, timezone
 import os
+import json
 import re
 
 from .common import require
@@ -55,7 +56,11 @@ def lambda_handler(event, context):
         reader = TerminalProducerReader(repository=os.environ["RCP_PRODUCTION_REPOSITORY"],
             repository_id=os.environ["RCP_PRODUCTION_REPOSITORY_ID"],
             repository_owner_id=os.environ["RCP_PRODUCTION_OWNER_ID"])
-        return collect_active(collection_clients(config.region), config,
-                              os.environ["RCP_PRODUCTION_MACHINE_ARN"], reader)
-    except Exception:
+        result = collect_active(collection_clients(config.region), config,
+                                os.environ["RCP_PRODUCTION_MACHINE_ARN"], reader)
+        if result.get("state") == "held":
+            print(json.dumps(dict(event="production_collection_held", reason=result.get("reason", "unknown")[:256])))
+        return result
+    except Exception as error:
+        print(json.dumps(dict(event="production_collection_held", category=type(error).__name__)))
         return dict(state="held", retired=False, reason="collection requires reconciliation")

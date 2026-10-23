@@ -265,14 +265,14 @@ class AdmissionTests(unittest.TestCase):
 
     def test_timeout_before_commit_is_uncertain_and_never_retried_internally(self):
         self.cloud.before_write = Mock(side_effect=TimeoutError("outcome unknown"))
-        with self.assertRaisesRegex(ReconciliationRequired, "no committed matching run"):
+        with self.assertRaisesRegex(TimeoutError, "outcome unknown"):
             self.store.admit(self.decision)
         self.assertEqual(len(self.cloud.writes), 1)
         self.assertEqual(set(self.cloud.items), {"policy", "budget#total"})
 
     def test_unreadable_committed_outcome_retains_hold(self):
         self.cloud.after_commit = lambda: setattr(self.cloud, "read_error", TimeoutError("read failed"))
-        with self.assertRaisesRegex(ReconciliationRequired, "committed"):
+        with self.assertRaisesRegex(TimeoutError, "read failed"):
             self.store.admit(self.decision)
         self.assertIn("active", self.cloud.items)
         self.assertEqual(len(self.cloud.writes), 1)
@@ -446,7 +446,7 @@ class StateFenceTests(unittest.TestCase):
         state["phase"] = "complete"
         revision = self.store.save(state, revision)
         self.cloud.after_commit = lambda: setattr(self.cloud, "read_error", TimeoutError("read failed"))
-        with self.assertRaisesRegex(ReconciliationRequired, "committed"):
+        with self.assertRaisesRegex(TimeoutError, "read failed"):
             self.store.retire("d" * 64, revision)
         self.assertTrue(self.cloud.items[self.store.pk]["closed"]["BOOL"])
         self.assertNotIn("active", self.cloud.items)

@@ -43,7 +43,8 @@ class PagesWorkflowTests(unittest.TestCase):
         shim.chmod(0o755)
         self.env.update(PATH=str(binary) + os.pathsep + self.env["PATH"], REAL_GIT=self.real_git,
             LOCAL_REMOTE=str(self.remote), RECORDED_COMMANDS=str(self.commands),
-            RUNNER_TEMP=str(self.root), GITHUB_OUTPUT=str(self.output))
+            RUNNER_TEMP=str(self.root), GITHUB_OUTPUT=str(self.output),
+            GITHUB_STEP_SUMMARY=str(self.root / "summary"))
 
     def git(self, *args, source=None):
         result = subprocess.run([self.real_git, "--git-dir=" + str(self.remote), *args],
@@ -75,6 +76,39 @@ class PagesWorkflowTests(unittest.TestCase):
         self.assertEqual([step["ref"] for step in checkouts[1:]], ["benchmark-history"])
         self.assertEqual(self.job["permissions"], {"contents": "read", "pages": "write", "id-token": "write"})
         self.assertEqual(self.workflow["concurrency"]["cancel-in-progress"], "false")
+
+    def main_guard(self, revision, **extra):
+        step = next(step for step in self.job["steps"] if step.get("id") == "current_main")
+        return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+            text=True, capture_output=True, env=dict(self.env, GITHUB_SHA=revision, **extra))
+
+    def test_delayed_workflow_cannot_redeploy_older_main(self):
+        older = self.seed()
+        tree = self.git("mktree", source="")
+        newer = self.git("commit-tree", tree, "-p", older, "-m", "Newer main")
+        self.git("update-ref", "refs/heads/main", newer)
+        stale = self.main_guard(older)
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        self.assertEqual(self.output.read_text(), "current=false\n")
+        self.assertIn("Skipped stale Pages deployment", (self.root / "summary").read_text())
+        self.output.unlink()
+        current = self.main_guard(newer)
+        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertEqual(self.output.read_text(), "current=true\n")
+        steps = self.job["steps"]
+        guard_index = next(i for i, step in enumerate(steps) if step.get("id") == "current_main")
+        deployment = steps[guard_index + 1]
+        self.assertTrue(deployment["uses"].startswith("actions/deploy-pages@"))
+        self.assertEqual(deployment["if"], "steps.current_main.outputs.current == 'true'")
+        self.assertEqual(self.workflow["concurrency"],
+                         {"group": "benchmark-pages-publish", "cancel-in-progress": "false"})
+
+    def test_unavailable_main_cannot_offer_deployment(self):
+        for change in ({}, {"REMOTE_FAILURE": "yes"}):
+            with self.subTest(change=change):
+                result = self.main_guard("a" * 40, **change)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
 
     def test_exact_history_commit_is_fetched_without_a_data_checkout(self):
         commit = self.seed()

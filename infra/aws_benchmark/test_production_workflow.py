@@ -38,6 +38,7 @@ class ProductionWorkflowTests(unittest.TestCase):
     def test_candidate_builds_without_cloud_credentials_or_shared_cache(self):
         job = self.workflow["jobs"]["build"]
         self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["cache-mode"], "none")
         self.assertNotIn("environment", job)
         self.assertEqual(job["runs-on"], "ubuntu-24.04")
         steps = job["steps"]

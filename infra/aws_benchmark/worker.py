@@ -1,6 +1,7 @@
 """Root-owned one-shot supervisor, baked into the AMI; never execute mailbox scripts."""
 
 import argparse
+import base64
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import errno
@@ -290,6 +291,26 @@ def error_detail(error):
     return result
 
 
+def put_report_object(s3, bucket, key, data, content_type, budget, paths, *, reserve=0):
+    """Preserve expected bytes after an ambiguous create; the collector proves delivery."""
+    ambiguous = False
+    checksum = {"ChecksumSHA256": base64.b64encode(bytes.fromhex(digest(data))).decode("ascii")} if paths.scoped else {}
+    def put():
+        nonlocal ambiguous
+        try:
+            return s3.put_object(Bucket=bucket, Key=key, Body=data,
+                                 ContentType=content_type, **paths.write_conditions, **checksum)
+        except Exception as error:
+            if paths.scoped and ambiguous and error_code(error) in ("PreconditionFailed", "412"):
+                # a retry cannot distinguish our committed write from another writer.
+                # retain the expected digest; only independent collection can certify it.
+                return None
+            if retryable_io(error):
+                ambiguous = True
+            raise
+    return retry_io(put, budget, reserve=reserve)
+
+
 def publish_report(s3, bucket, output, metadata, status, budget, *, paths=MailboxPaths.legacy()):
     """Attempt bounded archives independently, then always attempt terminal status."""
     data = None
@@ -303,16 +324,14 @@ def publish_report(s3, bucket, output, metadata, status, budget, *, paths=Mailbo
             status.update(success=False, **{field: error_detail(error)})
     if data is not None:
         try:
-            retry_io(lambda: s3.put_object(Bucket=bucket, Key=paths.results, Body=data,
-                     ContentType="application/zip", **paths.write_conditions), budget, reserve=30)
+            put_report_object(s3, bucket, paths.results, data, "application/zip", budget, paths, reserve=30)
             status["sha256"] = digest(data)
         except Exception as error:
             status.update(success=False, upload_error=error_detail(error))
     # DeadlineExpired escapes both archive handlers. Ordinary archive failures
     # never prevent status publication; exhausted status retries power off.
     if paths.scoped:
-        retry_io(lambda: s3.put_object(Bucket=bucket, Key=paths.status, Body=json.dumps(status).encode(),
-                 ContentType="application/json", **paths.write_conditions), budget)
+        put_report_object(s3, bucket, paths.status, json.dumps(status).encode(), "application/json", budget, paths)
     else:
         retry_io(lambda: put_json(s3, bucket, paths.status, status), budget)
 

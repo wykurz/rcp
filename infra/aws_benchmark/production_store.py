@@ -14,7 +14,7 @@ import uuid
 
 from benchmarks.strict_json import parse_json
 
-from .common import require
+from .common import require, retryable_io
 
 MAX_INTEGER = 2 ** 63 - 1
 MAX_STATE_BYTES = 128 * 1024
@@ -25,6 +25,19 @@ PHASES = frozenset({"awaiting-inputs", "armed", "launching", "uncertain", "reque
 
 class ReconciliationRequired(RuntimeError):
     """The exact operation must be reconciled before any further side effect."""
+
+
+def _unresolved(message, error, observed_error=None):
+    """Preserve transient I/O without treating it as evidence that a write did not commit.
+
+    Callers must reload the exact run/revision before further side effects. This helper
+    never retries a write, follows arbitrary cause chains, or hides an invalid readback.
+    """
+    if retryable_io(error) and (observed_error is None or retryable_io(observed_error)):
+        if observed_error is not None:
+            raise error from observed_error
+        raise error
+    raise ReconciliationRequired(message) from (observed_error or error)
 
 
 def _integer(value, *, minimum=0):
@@ -290,7 +303,7 @@ class RunStore:
             if existing is not None:
                 return existing
         except Exception as error:
-            raise ReconciliationRequired("cannot reconcile the existing admission") from error
+            _unresolved("cannot reconcile the existing admission", error)
         try:
             self._write(self._admission_items(decision))
         except Exception as error:
@@ -299,14 +312,14 @@ class RunStore:
                 if recorded is not None:
                     return recorded
             except Exception as observed:
-                raise ReconciliationRequired("admission failed; recorded outcome is inconsistent or unavailable") from observed
-            raise ReconciliationRequired("admission rejected or uncertain; no committed matching run observed") from error
+                _unresolved("admission failed; recorded outcome is inconsistent or unavailable", error, observed)
+            _unresolved("admission rejected or uncertain; no committed matching run observed", error)
         try:
             result = self._admitted(decision)
             require(result is not None, "successful transaction has no matching run")
             return result
         except Exception as error:
-            raise ReconciliationRequired("admission committed; readback requires reconciliation") from error
+            _unresolved("admission committed; readback requires reconciliation", error)
 
     def _state_update(self, state, revision, *, retire=None):
         _integer(revision)
@@ -360,7 +373,9 @@ class RunStore:
                         observed.revision == revision + 1 and observed.state == state):
                     return observed.revision
             except Exception as observed_error:
-                raise ReconciliationRequired("state write failed and its outcome is unreadable") from observed_error
+                _unresolved("state write failed and its outcome is unreadable", error, observed_error)
+            if observed == record and self._owner(owner):
+                _unresolved("state write rejected or uncertain; reconcile the exact revision", error)
             raise ReconciliationRequired("state write rejected or uncertain; reconcile the exact revision") from error
         return revision + 1
 
@@ -393,7 +408,9 @@ class RunStore:
                         observed.retirement_sha256 == evidence_sha256 and not self._owner(owner)):
                     return observed
             except Exception as observed_error:
-                raise ReconciliationRequired("retirement failed and its outcome is unreadable") from observed_error
+                _unresolved("retirement failed and its outcome is unreadable", error, observed_error)
+            if observed == record and self._owner(owner):
+                _unresolved("retirement rejected or uncertain; retain the ownership hold", error)
             raise ReconciliationRequired("retirement rejected or uncertain; retain the ownership hold") from error
         try:
             item, owner = self._read_items([self.pk, "active"])
@@ -402,4 +419,4 @@ class RunStore:
                     observed.retirement_sha256 == evidence_sha256 and not self._owner(owner), "retirement readback differs")
             return observed
         except Exception as error:
-            raise ReconciliationRequired("retirement committed; readback requires reconciliation") from error
+            _unresolved("retirement committed; readback requires reconciliation", error)

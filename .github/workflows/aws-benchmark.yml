@@ -71,6 +71,7 @@ jobs:
   build:
     needs: validate
     runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 45
     env:
       RUSTFLAGS: --cfg tokio_unstable

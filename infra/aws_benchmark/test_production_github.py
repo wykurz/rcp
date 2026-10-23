@@ -41,6 +41,9 @@ def raw(value):
 
 class ProductionGitHubTests(unittest.TestCase):
     def setUp(self):
+        self.cooldown = patch.object(github, "_rate_limit_until", 0)
+        self.cooldown.start()
+        self.addCleanup(self.cooldown.stop)
         self.attempt = payload(created_at=(NOW - timedelta(minutes=1)).isoformat())
         self.original = payload()
         self.fetch = Mock(side_effect=lambda path: raw(self.attempt if "/attempts/" in path else self.original))
@@ -209,6 +212,7 @@ class ProductionGitHubTests(unittest.TestCase):
     def test_redirects_rate_limits_and_other_http_errors_never_yield_metadata(self):
         for status in (301, 302, 307, 308, 304, 401, 403, 404, 410, 429, 500, 503):
             with self.subTest(status=status):
+                github._rate_limit_until = 0
                 response = Mock(status=status)
                 connection = Mock()
                 connection.getresponse.return_value = response
@@ -219,6 +223,42 @@ class ProductionGitHubTests(unittest.TestCase):
                 connection.request.assert_called_once()
                 response.close.assert_called_once_with()
                 connection.close.assert_called_once_with()
+
+    def test_rate_limit_reset_blocks_warm_reads_without_sleeping_or_using_stale_proof(self):
+        response = Mock(status=429)
+        response.getheader.side_effect = lambda name, default=None: {
+            "Retry-After": "120", "X-RateLimit-Reset": "1400"}.get(name, default)
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(github.time, "time", return_value=1000), \
+                patch.object(github.http.client, "HTTPSConnection", return_value=connection):
+            with self.assertRaises(github.GitHubRateLimitError) as caught:
+                github._fetch_official(PATH)
+            self.assertEqual(caught.exception.retry_after_seconds, 401)
+            with self.assertRaises(github.GitHubRateLimitError):
+                github._fetch_terminal(PATH)
+        self.assertEqual(connection.request.call_count, 1)
+        response.close.assert_called_once()
+        connection.close.assert_called_once()
+        with patch.object(github.time, "time", return_value=1401):
+            github._cooldown()
+
+    def test_secondary_limit_missing_or_invalid_headers_uses_minimum_one_minute(self):
+        for headers in ({}, {"Retry-After": "bad", "X-RateLimit-Reset": "inf"}, {"Retry-After": "1"}):
+            with self.subTest(headers=headers), patch.object(github.time, "time", return_value=1000):
+                github._rate_limit_until = 0
+                response = Mock()
+                response.getheader.side_effect = lambda name, default=None: headers.get(name, default)
+                with self.assertRaises(github.GitHubRateLimitError) as caught:
+                    github._cooldown(response)
+                self.assertEqual(caught.exception.retry_after_seconds, 60)
+
+    def test_reader_preserves_sanitized_rate_limit_delay(self):
+        self.fetch.side_effect = github.GitHubRateLimitError(120)
+        with self.assertRaises(github.GitHubRateLimitError) as caught:
+            self.reader.read(identity())
+        self.assertEqual(caught.exception.retry_after_seconds, 120)
+        self.assertEqual(self.fetch.call_count, 1)
 
     def test_oversized_or_compressed_responses_are_rejected(self):
         for compressed in (False, True):

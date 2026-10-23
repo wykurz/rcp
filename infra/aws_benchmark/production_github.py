@@ -7,7 +7,10 @@ and only the run endpoint supplies the admission age proof.
 REST contract: https://docs.github.com/en/rest/actions/workflow-runs
 The socket timeout and body deadline checks are not a hard wall-clock bound on
 DNS resolution or HTTP headers. The caller must enforce a finite outer Lambda
-execution timeout. No request is retried, and failures never yield an age proof.
+execution timeout. No request is retried within a read, and failures never yield an
+age proof. Rate-limit cooldowns survive warm invocations, without caching proofs.
+Public REST access shares GitHub's 60/hour per-IP allowance; production reliability
+still requires a separately approved authenticated read channel.
 """
 
 from collections.abc import Callable
@@ -16,6 +19,7 @@ import http.client
 import math
 import re
 import ssl
+import threading
 import time
 
 from benchmarks.strict_json import parse_json
@@ -38,6 +42,33 @@ class GitHubRunError(ValueError):
     """A sanitized failure to obtain metadata bound to the signed run identity."""
 
 
+class GitHubRateLimitError(GitHubRunError):
+    """A sanitized retry delay, never a substitute for fresh producer metadata."""
+
+    def __init__(self, retry_after_seconds):
+        super().__init__("GitHub public API rate limit; producer verification remains pending")
+        self.retry_after_seconds = retry_after_seconds
+
+
+_rate_limit_until = 0
+_rate_limit_lock = threading.Lock()
+
+
+def _cooldown(response=None):
+    global _rate_limit_until
+    now = time.time()
+    with _rate_limit_lock:
+        if response is not None:
+            def number(name):
+                value = response.getheader(name)
+                return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value) else 0
+            # github requires Retry-After/reset, or at least a minute for secondary limits.
+            delay = max(60, number("Retry-After"), number("X-RateLimit-Reset") - now + 1)
+            _rate_limit_until = max(_rate_limit_until, now + delay)
+        if now < _rate_limit_until:
+            raise GitHubRateLimitError(min(86400, math.ceil(_rate_limit_until - now)))
+
+
 def _require(condition):
     if not condition:
         raise GitHubRunError("GitHub workflow run could not be verified")
@@ -50,6 +81,7 @@ def _matches(pattern, value):
 def _fetch_path(path: str, allowed) -> bytes:
     # only fixed host requests are possible; no proxy lookup, redirect handling or credentials
     _require(_matches(allowed, path) and "/../" not in path and "/./" not in path)
+    _cooldown()
     connection = http.client.HTTPSConnection(API_HOST, timeout=SOCKET_TIMEOUT_SECONDS,
                                               context=ssl.create_default_context())
     deadline = time.monotonic() + SOCKET_TIMEOUT_SECONDS
@@ -59,6 +91,8 @@ def _fetch_path(path: str, allowed) -> bytes:
             "X-GitHub-Api-Version": API_VERSION, "User-Agent": "rcp-production-admission"})
         transport = connection.sock
         response = connection.getresponse()
+        if response.status in (403, 429):
+            _cooldown(response)
         _require(response.status == 200)
         _require(response.getheader("Content-Encoding", "identity") == "identity")
         remaining = MAX_RESPONSE_BYTES + 1
@@ -108,17 +142,8 @@ def _bounded_document(raw):
 
 
 def _document(raw):
-    _require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_RESPONSE_BYTES)
-    value = parse_json(raw.decode("utf-8"))
+    value = _bounded_document(raw)
     _require(isinstance(value, dict))
-    pending = [(value, 0)]
-    while pending:
-        item, depth = pending.pop()
-        _require(depth <= MAX_JSON_DEPTH)
-        if isinstance(item, dict):
-            pending.extend((child, depth + 1) for child in item.values())
-        elif isinstance(item, list):
-            pending.extend((child, depth + 1) for child in item)
     repository = value.get("repository")
     actor = value.get("actor")
     _require(isinstance(repository, dict) and isinstance(actor, dict))
@@ -169,6 +194,8 @@ class GitHubRunReader:
             now = datetime.fromtimestamp(seconds, timezone.utc)
             WorkflowRun.verify(attempt, identity, now)
             return WorkflowRun.verify(original, identity, now)
+        except GitHubRateLimitError:
+            raise
         except Exception:
             raise GitHubRunError("GitHub workflow run could not be verified") from None
 
@@ -209,5 +236,7 @@ class TerminalProducerReader(GitHubRunReader):
                 ("id", "run_attempt", "head_sha", "status", "conclusion", "path", "event", "head_branch")))
             return dict(attempt=original, current=after, attempt_jobs=original_jobs,
                         current_jobs=current_jobs, pending_deployments=deployments)
+        except GitHubRateLimitError:
+            raise
         except Exception:
             raise GitHubRunError("GitHub terminal producer could not be verified") from None

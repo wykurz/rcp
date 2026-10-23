@@ -155,6 +155,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         jobs = self.workflow["jobs"]
         self.assertEqual(jobs["build"]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["build"]["cache-mode"], "none")
         for name in ("validate", "build", "report"):
             self.assertNotIn("environment", jobs[name])
             self.assertNotIn("id-token", jobs[name].get("permissions", {}))

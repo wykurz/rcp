@@ -1,8 +1,8 @@
 # disabled engineering only; deployment and activation require separate approval
 # external pinned launch template must reference the new profile; operators seed policy and ledger
 # trusted admission code enforces positive reservations and conditional fences; IAM bounds attributes, not ADD sign
-# EnclosingOperation follows the transaction IAM guide despite String typing in the service reference;
-# the approved no-worker canary must check transaction success and direct-write denial before activation
+# ConditionCheckItem has no standalone API and does not document EnclosingOperation support
+# write actions retain EnclosingOperation; the approved no-worker canary must verify their transaction fence
 # worker outputs require create-only writes; code bounds bytes and lifecycle bounds retention
 # collector only retains evidence and retires ownership; it has no launch authority
 # preactivation requires an approved tiny no-worker conditional-copy + IAM canary: the current
@@ -327,8 +327,6 @@ Resources:
               ForAllValues:StringLike:
                 dynamodb:LeadingKeys: [policy, active]
               'Null': {'dynamodb:LeadingKeys': 'false'}
-              ForAnyValue:StringEquals:
-                dynamodb:EnclosingOperation: [TransactWriteItems]
           - Effect: Allow
             Action: dynamodb:UpdateItem
             Resource: {'Fn::GetAtt': [LeaseTable, Arn]}
@@ -399,8 +397,6 @@ Resources:
               ForAllValues:StringLike:
                 dynamodb:LeadingKeys: [active]
               'Null': {'dynamodb:LeadingKeys': 'false'}
-              ForAnyValue:StringEquals:
-                dynamodb:EnclosingOperation: [TransactWriteItems]
           - Effect: Allow
             Action: dynamodb:UpdateItem
             Resource: {'Fn::GetAtt': [LeaseTable, Arn]}
@@ -731,8 +727,6 @@ Resources:
               ForAllValues:StringLike:
                 dynamodb:LeadingKeys: [policy, active]
               'Null': {'dynamodb:LeadingKeys': 'false'}
-              ForAnyValue:StringEquals:
-                dynamodb:EnclosingOperation: [TransactWriteItems]
           - Effect: Allow
             Action: dynamodb:PutItem
             Resource: {'Fn::GetAtt': [LeaseTable, Arn]}
@@ -881,8 +875,6 @@ Resources:
               ForAllValues:StringLike:
                 dynamodb:LeadingKeys: [active, run#repo-655073755-run-*]
               'Null': {'dynamodb:LeadingKeys': 'false'}
-              ForAnyValue:StringEquals:
-                dynamodb:EnclosingOperation: [TransactWriteItems]
           - Effect: Allow
             Action: dynamodb:UpdateItem
             Resource: {'Fn::GetAtt': [LeaseTable, Arn]}

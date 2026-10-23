@@ -3,7 +3,8 @@
 The invocation role must be restricted by IAM; its request also carries the
 original admission-audience GitHub JWT. Never log events, tokens or upload URLs.
 An admission_unavailable response can follow a committed reservation or uncertain
-start: it does not authorize retries, refunds, ownership release or another run.
+start: it does not authorize refunds, ownership release or another run. Only typed
+transient responses permit bounded retries of the same action and producer attempt.
 
 RCP_PRODUCTION_ENABLED and RCP_PRODUCTION_ADMISSION_ENABLED default false and
 must both be literal "true". Deployment also supplies RCP_PRODUCTION_REPOSITORY,
@@ -16,17 +17,19 @@ SDK socket timeouts alone are not a hard wall-clock bound.
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timezone
+from functools import lru_cache
+import json
 import os
 import re
 import time
 
 from benchmarks.strict_json import parse_json
 from . import durable
-from .common import require, validate_durable_pins
+from .common import require, validate_durable_pins, retryable_io
 from .durable_aws import Configuration
 from .production_admission import Admission
-from .production_auth import GitHubIdentityVerifier, MAX_TOKEN_BYTES
-from .production_github import GitHubRunReader
+from .production_auth import GitHubIdentityError, GitHubIdentityVerifier, MAX_TOKEN_BYTES
+from .production_github import GitHubRunError, GitHubRateLimitError, GitHubRunReader
 from .production_policy import Policy, canonical, manifest
 
 
@@ -97,7 +100,9 @@ def read_policy(dynamodb, table, owner_id):
         value["manual_actor_ids"] = tuple(value["manual_actor_ids"])
         value["schedule_slots"] = tuple(tuple(slot) for slot in value["schedule_slots"])
         return Policy(**value)
-    except Exception:
+    except Exception as error:
+        if retryable_io(error):
+            raise
         raise ValueError("server admission policy unavailable") from None
 
 
@@ -145,6 +150,13 @@ class _StandardMachineVerifier:
         return identity
 
 
+@lru_cache(maxsize=1)
+def _cached_verifier(repository, repository_id, owner_id, audience, workflow):
+    # reuse signing keys only; policy, state-machine and producer observations stay fresh.
+    return GitHubIdentityVerifier(repository=repository, repository_id=repository_id,
+        repository_owner_id=owner_id, audience=audience, workflow_refs={workflow})
+
+
 def build_admission(*, api=None, clock=time.time):
     """Build the submit-only service from validated deployment environment values."""
     config = Configuration.environment()
@@ -167,8 +179,9 @@ def build_admission(*, api=None, clock=time.time):
     machine = os.environ["RCP_PRODUCTION_MACHINE_ARN"]
     require(re.fullmatch(r"arn:aws:states:" + re.escape(config.region) + ":" + re.escape(config.account)
                         + r":stateMachine:[A-Za-z0-9_-]{1,80}", machine), "state machine scope differs")
-    verifier = GitHubIdentityVerifier(repository=repository, repository_id=repository_id,
-        repository_owner_id=owner_id, audience=audience, workflow_refs={workflow}, clock=clock)
+    verifier = _cached_verifier(repository, repository_id, owner_id, audience, workflow) if clock is time.time else \
+        GitHubIdentityVerifier(repository=repository, repository_id=repository_id,
+            repository_owner_id=owner_id, audience=audience, workflow_refs={workflow}, clock=clock)
     reader = GitHubRunReader(repository=repository, repository_id=repository_id,
         repository_owner_id=owner_id, clock=clock)
     clients = SubmissionClients(config.region) if api is None else api
@@ -191,6 +204,20 @@ def lambda_handler(event, context):
         service = build_admission()
         result = service.begin(token, checked) if action == "begin" else service.seal_and_start(token)
         return {"ok": True, "result": result}
-    except Exception:
-        # a failed response may hide a retained reservation; no rollback or retry occurs here
+    except Exception as error:
+        # log fixed categories only, never bearer input, capabilities or raw exception text.
+        retryable = isinstance(error, GitHubRateLimitError) or retryable_io(error)
+        category = "github_rate_limit" if isinstance(error, GitHubRateLimitError) else \
+            "github_identity" if isinstance(error, GitHubIdentityError) else \
+            "github_metadata" if isinstance(error, GitHubRunError) else \
+            "transient_service" if retryable else "validation_or_service"
+        detail = dict(event="admission_failure", action=action, category=category, retryable=retryable)
+        request_id = getattr(context, "aws_request_id", None)
+        if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,80}", request_id):
+            detail["request_id"] = request_id
+        print(json.dumps(detail, sort_keys=True))
+        if retryable:
+            return {"ok": False, "error": "admission_retryable",
+                    "retry_after_seconds": error.retry_after_seconds if isinstance(error, GitHubRateLimitError) else 5}
+        # failures may hide a reservation; only same-attempt reconciliation is permitted.
         return {"ok": False, "error": "admission_unavailable"}
