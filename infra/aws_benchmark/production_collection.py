@@ -32,6 +32,8 @@ from .production_errors import transient
 import re
 
 SCHEMA = "rcp-production-collection-v1"
+CHECKPOINT_SCHEMA = "rcp-production-collection-checkpoint-v1"
+CHECKPOINT_RESERVE = 32 * 1024
 MAX_DOCUMENT = 1024 * 1024
 MAX_REPORT = 2 * 1024 * 1024
 # mailbox lifecycle eligibility starts after seven days; nine days also allow
@@ -155,6 +157,15 @@ def validate_retained(record, manifest, payloads):
                 isinstance(raw, bytes) and 0 < len(raw) <= limits[name] and type(ref["bytes"]) is int and
                 ref["bytes"] == len(raw) and ref["sha256"] == digest(raw), "retained reference differs")
     Collector.retained_provenance(record, manifest, payloads)
+    report = results.json_value(payloads["report.json"], MAX_REPORT)
+    if "collection_checkpoint" in report:
+        checkpoint_binding = {key: manifest[key] for key in (*binding, "execution", "producer_conclusion")}
+        require(report["collection_checkpoint"] == dict(schema=CHECKPOINT_SCHEMA, binding=checkpoint_binding,
+            sources=manifest["sources"], derived={name: Collector.fingerprint(payloads[name])
+                for name in ("controller.json", "summary.html")}), "retained collection checkpoint differs")
+        collected_at = report["public_projection"]["collected_at"]
+        require(timestamp(utc(collected_at)) == collected_at and
+            utc(collected_at) >= utc(record.state["cleanup"]["verified_at"]), "retained collection time differs")
     sources = manifest["sources"]
     require(isinstance(sources, dict) and set(sources) == set(refs) - {
         "controller.json", "report.json", "summary.html"}, "source references differ")
@@ -381,7 +392,7 @@ class Collector:
                     reason="confirmed missing output after recovery grace; workload success or failure is unknown")
         return payloads, sources, availability
 
-    def analyze(self, record, expected, execution, conclusion, payloads, availability=None):
+    def analyze(self, record, expected, execution, conclusion, payloads, availability=None, *, collected_at=None):
         state, request, binding = record.state, record.state["request"], record.state.get("binding")
         try:
             status = results.json_value(payloads.get("status.json", b"{}"))
@@ -416,7 +427,7 @@ class Collector:
             presentation=dict(report="full", summary="full"),
             public_projection=projection.freeze(record.run_key, expected, request["pins"], valid, evidence, result,
                                                 outcome=outcome, execution_status=execution["status"],
-                                                collected_at=timestamp(self.now())))
+                                                collected_at=collected_at or timestamp(self.now())))
         try:
             if availability:
                 summary = ("<!doctype html><meta charset=utf-8><title>Benchmark evidence unavailable</title>"
@@ -435,7 +446,7 @@ class Collector:
                 "The original raw evidence and its versioned manifest are retained.</p>"
                 "<p>Metadata/size checks do not prove content integrity.</p>").encode()
         raw_report = encoded(report)
-        if len(raw_report) > MAX_REPORT:
+        if len(raw_report) > MAX_REPORT - CHECKPOINT_RESERVE:
             # archive member names and diagnostic strings are attacker-controlled. Retain
             # their original bytes, but publish a fixed-size projection instead of turning
             # a valid physical cleanup into a permanent oversized-report hold.
@@ -519,6 +530,103 @@ class Collector:
         return outcome
 
 
+    @staticmethod
+    def fingerprint(raw):
+        return dict(sha256=digest(raw), bytes=len(raw))
+
+    def checkpoint_sources(self, record, sources, limits):
+        """Recover the frozen input snapshot, preferring already retained copies."""
+        require(isinstance(sources, dict) and {"durable.json"} <= set(sources) <= {
+            "durable.json", "status.json", "results.zip"}, "checkpoint source set differs")
+        paths = None if record.state.get("binding") is None else MailboxPaths.for_instance(
+            record.state["request"]["pins"]["account"], record.state["request"]["pins"]["region"],
+            record.state["binding"]["instance_id"])
+        keys = {"durable.json": "production/runs/" + record.run_key + "/durable-receipt.json"}
+        if paths:
+            keys.update({"status.json": paths.status, "results.zip": paths.results})
+        payloads = {}
+        for name, ref in sources.items():
+            require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
+                ref["key"] == keys.get(name) and isinstance(ref["version"], str) and
+                ref["version"] not in ("", "null") and len(ref["version"]) <= 1024 and
+                all(32 < ord(char) < 127 for char in ref["version"]) and
+                isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) and
+                type(ref["bytes"]) is int and 0 < ref["bytes"] <= limits[name], "checkpoint source reference differs")
+            retained = self.objects.read(self.prefix + name, limits[name], optional=True)
+            if retained is not None:
+                raw = retained[0]
+            elif name == "status.json" and record.state.get("worker_output") is not None:
+                raw, actual, _ = committed_status(record.state["worker_output"], paths.status)
+                require(actual == ref, "checkpoint committed source differs")
+            else:
+                # never substitute a new source version or add a dependency on mailbox
+                # version reads when the frozen current version is no longer available
+                raw, actual = self.objects.read(ref["key"], limits[name])
+                require(actual == ref, "checkpoint source version changed")
+            require(self.fingerprint(raw) == {key: ref[key] for key in ("sha256", "bytes")},
+                    "checkpoint source bytes changed")
+            payloads[name] = raw
+        return payloads
+
+    def prepared(self, record, binding, limits):
+        """Commit one input/output identity before writing the rest of the immutable set."""
+        saved = self.objects.read(self.prefix + "report.json", MAX_REPORT, optional=True)
+        expected, execution, conclusion = (binding[key] for key in ("identity", "execution", "producer_conclusion"))
+        if saved is None:
+            # no new transaction may adopt or omit an older partial set with no root
+            for name in limits.keys() - {"report.json"}:
+                require(self.objects.read(self.prefix + name, limits[name], optional=True) is None,
+                        "partial collection has no checkpoint; explicit recovery is required")
+            payloads, sources, availability = self.raw(record)
+            collected_at = timestamp(self.now())
+        else:
+            report = results.json_value(saved[0], MAX_REPORT)
+            checkpoint = report.get("collection_checkpoint")
+            require(isinstance(checkpoint, dict) and set(checkpoint) == {
+                "schema", "binding", "sources", "derived"} and checkpoint["schema"] == CHECKPOINT_SCHEMA and
+                checkpoint["binding"] == binding, "collection checkpoint belongs to different evidence or is incompatible")
+            collected_at = report["public_projection"]["collected_at"]
+            require(timestamp(utc(collected_at)) == collected_at and
+                utc(record.state["cleanup"]["verified_at"]) <= utc(collected_at) <= self.now(),
+                "checkpoint collection time differs")
+            sources, availability = checkpoint["sources"], report.get("evidence_availability")
+            payloads = self.checkpoint_sources(record, sources, limits)
+            for name in {"durable.json", "status.json", "results.zip"} - set(sources):
+                require(self.objects.read(self.prefix + name, limits[name], optional=True) is None,
+                        "checkpoint has unexpected retained source")
+        valid, derived = self.analyze(record, expected, execution, conclusion, payloads, availability,
+                                      collected_at=collected_at)
+        if saved is None:
+            report = results.json_value(derived["report.json"], MAX_REPORT)
+            report["collection_checkpoint"] = dict(schema=CHECKPOINT_SCHEMA, binding=binding, sources=sources,
+                derived={name: self.fingerprint(derived[name]) for name in ("controller.json", "summary.html")})
+            derived["report.json"] = encoded(report)
+            require(len(derived["report.json"]) <= MAX_REPORT, "collection checkpoint exceeds report bound")
+        else:
+            require(valid == report["benchmark_valid"], "checkpoint qualification verdict differs")
+            current_report = results.json_value(derived["report.json"], MAX_REPORT)
+            require(report["public_projection"] == current_report["public_projection"],
+                    "checkpoint public measurements or qualification identity differ")
+            require(isinstance(checkpoint["derived"], dict) and set(checkpoint["derived"]) == {
+                "controller.json", "summary.html"}, "checkpoint derived set differs")
+            for name in checkpoint["derived"]:
+                prior = self.objects.read(self.prefix + name, limits[name], optional=True)
+                if prior is not None:
+                    derived[name] = prior[0]
+                require(self.fingerprint(derived[name]) == checkpoint["derived"][name],
+                        "checkpoint derived evidence changed or is unavailable")
+            # saved presentation is historical; cosmetic renderer changes cannot rewrite it
+            # or block completion when all committed presentation bytes already exist
+            derived["report.json"] = saved[0]
+        payloads.update(derived)
+        # validate before the first write; placeholder versions are used only by this pure
+        # byte/provenance check and are replaced by exact S3 versions in the final manifest
+        planned = {name: dict(key=self.prefix + name, version="pending", **self.fingerprint(raw))
+                   for name, raw in payloads.items()}
+        validate_retained(record, dict(binding, sources=sources, retained=planned, benchmark_valid=valid), payloads)
+        self.objects.once(self.prefix + "report.json", derived["report.json"], MAX_REPORT)
+        return payloads, sources, valid
+
     def retained(self, record, expected, execution, conclusion):
         key = self.prefix + "manifest.json"
         existing = self.objects.read(key, MAX_DOCUMENT, optional=True)
@@ -545,9 +653,7 @@ class Collector:
                 valid, _ = self.analyze(record, expected, execution, conclusion, payloads, saved_report.get("evidence_availability"))
                 require(valid == manifest["benchmark_valid"], "retained qualification verdict differs")
             return manifest, existing[1], outcome
-        payloads, sources, availability = self.raw(record)
-        valid, derived = self.analyze(record, expected, execution, conclusion, payloads, availability)
-        payloads.update(derived)
+        payloads, sources, valid = self.prepared(record, binding, limits)
         retained = {name: self.objects.once(self.prefix + name, raw, limits[name]) for name, raw in payloads.items()}
         manifest = dict(binding, sources=sources, retained=retained, benchmark_valid=valid)
         validate_retained(record, manifest, payloads)

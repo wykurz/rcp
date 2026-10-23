@@ -166,6 +166,10 @@ class ExportTests(unittest.TestCase):
         payloads = dict(bundle.payloads, **{"summary.html": b"<script>UNTRUSTED_RETAINED_HTML</script>"})
         manifest = json.loads(bundle.manifest_bytes)
         manifest["retained"]["summary.html"].update(sha256=digest(payloads["summary.html"]), bytes=len(payloads["summary.html"]))
+        report = json.loads(payloads["report.json"])
+        report["collection_checkpoint"]["derived"]["summary.html"] = collection.Collector.fingerprint(payloads["summary.html"])
+        payloads["report.json"] = collection.encoded(report)
+        manifest["retained"]["report.json"].update(collection.Collector.fingerprint(payloads["report.json"]))
         raw = collection.encoded(manifest)
         record = replace(bundle.record, retirement_sha256=digest(raw))
         changed = replace(bundle, payloads=payloads, record=record, record_item=stored(record), manifest_bytes=raw,
@@ -289,7 +293,8 @@ class ExportTests(unittest.TestCase):
         report["benchmark_valid"] = False
         report["qualification_outcome"] = "failed"
         report["public_projection"] = export.projection.freeze(bundle.run_key, manifest["identity"],
-            bundle.record.state["request"]["pins"], False, report["evidence"], None)
+            bundle.record.state["request"]["pins"], False, report["evidence"], None,
+            outcome="failed", collected_at=report["public_projection"]["collected_at"])
         payloads = dict(bundle.payloads, **{"report.json": collection.encoded(report)})
         manifest["retained"]["report.json"].update(sha256=digest(payloads["report.json"]), bytes=len(payloads["report.json"]))
         raw = collection.encoded(manifest)
