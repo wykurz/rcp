@@ -3,6 +3,8 @@
 import base64
 from dataclasses import FrozenInstanceError
 import json
+import ssl
+import http.client
 from pathlib import Path
 import traceback
 import unittest
@@ -253,8 +255,49 @@ class ProductionAuthTests(unittest.TestCase):
                 self.fail("fetch failure accepted")
         self.fetch.assert_called_once_with()
         self.now += auth.JWKS_REFRESH_SECONDS
-        self.assert_rejected(token)
+        with self.assertRaises(auth.GitHubIdentityTransientError):
+            self.verifier.verify(token)
         self.assertEqual(self.fetch.call_count, 2)
+
+    def test_transient_key_fetch_and_cooldown_preserve_type_then_recover_with_fresh_proof(self):
+        token = self.token()
+        self.fetch.side_effect = TimeoutError("synthetic sensitive upstream")
+        for advance in (0, 5, 10):
+            self.now += advance
+            with self.assertRaises(auth.GitHubIdentityTransientError) as caught:
+                self.verifier.verify(token)
+            self.assertEqual(caught.exception.retry_after_seconds, auth.JWKS_REFRESH_SECONDS)
+            self.assertNotIn("synthetic sensitive upstream", "".join(traceback.format_exception(caught.exception)))
+        self.assertEqual(self.fetch.call_count, 1)
+        self.now = NOW + auth.JWKS_REFRESH_SECONDS
+        self.fetch.side_effect = None
+        self.verifier.verify(token)
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_invalid_keys_and_certificate_validation_never_become_transient(self):
+        for value in (b"malformed", ssl.SSLCertVerificationError("bad certificate"),
+                      http.client.InvalidURL("bad url")):
+            self.verifier = self.make_verifier()
+            self.fetch.side_effect = value if isinstance(value, Exception) else None
+            self.fetch.return_value = value
+            for _ in range(2):
+                with self.assertRaises(auth.GitHubIdentityError) as caught:
+                    self.verifier.verify(self.token())
+                self.assertNotIsInstance(caught.exception, auth.GitHubIdentityTransientError)
+
+    def test_official_key_fetch_server_errors_and_late_response_are_transient(self):
+        reply, connection = Mock(status=503), Mock()
+        connection.getresponse.return_value = reply
+        with patch.object(auth.http.client, "HTTPSConnection", return_value=connection):
+            with self.assertRaises(auth.GitHubIdentityTransientError):
+                auth._fetch_official_jwks()
+        reply.read1.assert_not_called()
+        reply.status = 200
+        reply.getheader.return_value = "identity"
+        with patch.object(auth.http.client, "HTTPSConnection", return_value=connection), \
+                patch.object(auth.time, "monotonic", side_effect=[0, 4]):
+            with self.assertRaises(auth.GitHubIdentityTransientError):
+                auth._fetch_official_jwks()
 
     def test_unknown_key_refresh_is_bounded_and_rotation_can_recover(self):
         self.verifier.verify(self.token())
@@ -275,8 +318,11 @@ class ProductionAuthTests(unittest.TestCase):
         self.verifier.verify(token)
         self.now += auth.JWKS_CACHE_SECONDS
         self.fetch.side_effect = OSError("offline")
-        self.assert_rejected(token)
-        self.assert_rejected(token)
+        for _ in range(2):
+            with self.assertRaises(auth.GitHubIdentityTransientError):
+                self.verifier.verify(token)
+        self.assertEqual(self.verifier._keys, {})
+        self.assertIsNone(self.verifier._fetched_at)
         self.assertEqual(self.fetch.call_count, 2)
 
     def test_clock_rollback_does_not_extend_cached_key_validity(self):

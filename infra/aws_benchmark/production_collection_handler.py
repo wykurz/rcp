@@ -11,8 +11,10 @@ import os
 import json
 import re
 
-from .common import require
+from .common import require, error_code
 from .durable_aws import Configuration, clients
+from .results import diagnostic
+from .production_errors import transient
 from .production_collection import Collector
 from .production_github import TerminalProducerReader
 from .production_github_app import GitHubAppConfig, cached_provider
@@ -55,13 +57,7 @@ def lambda_handler(event, context):
         return dict(state="held", retired=False, reason="unexpected collection invocation")
     try:
         config = Configuration.environment()
-        app = GitHubAppConfig(repository=os.environ["RCP_PRODUCTION_REPOSITORY"],
-            repository_id=os.environ["RCP_PRODUCTION_REPOSITORY_ID"],
-            repository_owner_id=os.environ["RCP_PRODUCTION_OWNER_ID"],
-            region=config.region, account=config.account,
-            app_client_id=os.environ["RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"],
-            installation_id=os.environ["RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID"],
-            secret_arn=os.environ["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
+        app = GitHubAppConfig.from_environment(os.environ, region=config.region, account=config.account)
         reader = TerminalProducerReader(repository=app.repository, repository_id=app.repository_id,
             repository_owner_id=app.repository_owner_id, observation_factory=cached_provider(app).observation)
         result = collect_active(collection_clients(config.region), config,
@@ -70,5 +66,10 @@ def lambda_handler(event, context):
             print(json.dumps(dict(event="production_collection_held", reason=result.get("reason", "unknown")[:256])))
         return result
     except Exception as error:
-        print(json.dumps(dict(event="production_collection_held", category=type(error).__name__)))
+        detail = dict(event="production_collection_held", category=type(error).__name__,
+                      reason=diagnostic(error)[:256], retryable=transient(error))
+        code = error_code(error)
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9.]{0,79}", code):
+            detail["service_error"] = code
+        print(json.dumps(detail, sort_keys=True))
         return dict(state="held", retired=False, reason="collection requires reconciliation")

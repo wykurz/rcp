@@ -96,6 +96,22 @@ class CollectionHandlerTests(unittest.TestCase):
             reader.assert_not_called()
             clients.assert_not_called()
 
+    def test_trusted_validation_and_scoped_service_codes_identify_holds_without_raw_errors(self):
+        from .common import ValidationError
+        from botocore.exceptions import ClientError
+        cases = ((ValidationError("retention bucket versioning is required"), "retention bucket versioning is required", None),
+            (ClientError({"Error": {"Code": "AccessDenied", "Message": "private credential"}}, "Read"), "ClientError", "AccessDenied"),
+            (ClientError({"Error": {"Code": "private credential"}}, "Read"), "ClientError", None),
+            (json.JSONDecodeError("private credential", "private credential", 0), "JSONDecodeError", None))
+        for error, reason, code in cases:
+            with self.subTest(kind=type(error).__name__), patch.dict(os.environ, {"RCP_PRODUCTION_ENABLED": "true"}, clear=True), \
+                    patch.object(handler.Configuration, "environment", side_effect=error), patch("builtins.print") as logged:
+                result = handler.lambda_handler({}, None)
+            detail = json.loads(logged.call_args.args[0])
+            self.assertEqual(detail["reason"], reason)
+            self.assertEqual(detail.get("service_error"), code)
+            self.assertNotIn("private credential", str(result) + str(logged.call_args))
+
     def test_handler_error_response_does_not_expose_credentials(self):
         with patch.dict(os.environ, {"RCP_PRODUCTION_ENABLED": "true"}, clear=True), \
              patch.object(handler.Configuration, "environment", side_effect=RuntimeError("secret credential")), \

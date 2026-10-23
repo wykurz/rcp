@@ -231,10 +231,60 @@ class ProductionClientTests(unittest.TestCase):
 
     def test_lambda_transport_outlives_handler_and_has_no_hidden_sdk_retries(self):
         config = client.lambda_config()
-        self.assertGreater(config.read_timeout, 45)
+        import yaml
+        template = yaml.safe_load(Path(__file__).with_name("production-stack.yaml").read_text())
+        handler_timeout = template["Resources"]["AdmissionFunction"]["Properties"]["Timeout"]
+        self.assertGreater(config.read_timeout, handler_timeout)
+        self.assertGreaterEqual(client.INVOKE_RESERVE_SECONDS,
+            client.TOKEN_READ_TIMEOUT + config.connect_timeout + config.read_timeout)
         self.assertEqual(config.retries, {"total_max_attempts": 1})
         self.assertEqual(config.proxies, {})
         self.assertTrue(config.ignore_configured_endpoint_urls)
+
+    def test_function_error_retries_exact_payload_and_closes_untrusted_body(self):
+        api = Mock()
+        body = io.BytesIO(b'sensitive timeout payload')
+        api.invoke.side_effect = [dict(StatusCode=200, FunctionError="Unhandled", Payload=body),
+                                  response(receipt(state="armed"))]
+        self.assertEqual(client.reconcile(lambda: client.invoke(api, FUNCTION, {"action": "seal"}),
+            deadline=NOW + 120, reserve=10, clock=lambda: NOW, sleep=Mock())["state"], "armed")
+        self.assertTrue(body.closed)
+        self.assertEqual(api.invoke.call_args_list[0], api.invoke.call_args_list[1])
+
+    def test_upload_request_timeout_replays_same_capability_but_other_400_is_permanent(self):
+        data = b"test"
+        capability = dict(url="https://bucket.s3.amazonaws.com/object", headers={
+            "Content-Length": "4", "x-amz-checksum-sha256": base64.b64encode(client.hashlib.sha256(data).digest()).decode(),
+            "If-None-Match": "*", "Content-Type": "application/octet-stream", "x-amz-server-side-encryption": "AES256"})
+        for body, calls in ((b"<Error><Code>RequestTimeout</Code></Error>", 4),
+                (b"<Error><Code>AccessDenied</Code></Error>", 1), (b"invalid", 1),
+                (b"<!DOCTYPE Error><Error><Code>RequestTimeout</Code></Error>", 1), (b"x" * 4097, 1)):
+            with self.subTest(body=body[:40]), patch.object(client, "opener") as opener:
+                bodies = []
+                def fail(*args, **kwargs):
+                    stream = io.BytesIO(body)
+                    bodies.append(stream)
+                    raise urllib.error.HTTPError("sensitive URL", 400, "bad", {}, stream)
+                opener.return_value.open.side_effect = fail
+                with self.assertRaises(ValueError) as caught:
+                    client.reconcile(lambda: client.upload(capability, data, bucket="bucket", region="us-east-1"),
+                        deadline=NOW + 600, reserve=30, clock=lambda: NOW, sleep=Mock())
+                self.assertEqual(opener.return_value.open.call_count, calls)
+                self.assertTrue(all(stream.closed for stream in bodies))
+                self.assertNotIn("sensitive", str(caught.exception))
+                requests = [call.args[0] for call in opener.return_value.open.call_args_list]
+                self.assertTrue(all(request.full_url == capability["url"] and request.data == data for request in requests))
+
+    def test_tls_and_http_transport_failures_retry_without_retrying_bad_certificates(self):
+        for error, count in ((client.ssl.SSLError("connection interrupted"), 4),
+                (client.http.client.IncompleteRead(b"private"), 4),
+                (client.http.client.RemoteDisconnected("private"), 4),
+                (client.ssl.SSLCertVerificationError("private"), 1),
+                (urllib.error.URLError(client.ssl.SSLCertVerificationError("private")), 1)):
+            operation = Mock(side_effect=error)
+            with self.subTest(kind=type(error).__name__), self.assertRaises(Exception):
+                client.reconcile(operation, deadline=NOW + 600, reserve=30, clock=lambda: NOW, sleep=Mock())
+            self.assertEqual(operation.call_count, count)
 
     def test_rejects_service_errors_and_oversized_responses(self):
         api = Mock()

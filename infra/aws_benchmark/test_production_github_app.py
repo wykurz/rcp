@@ -5,6 +5,8 @@ from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
 import logging
+import ssl
+import http.client
 import traceback
 import unittest
 from unittest.mock import Mock, patch
@@ -14,7 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from . import production_github_app as app
-from .production_github import GitHubRunError, GitHubRateLimitError
+from .production_github import GitHubRunError, GitHubRateLimitError, GitHubTransientError
 
 NOW = 1800000000
 PATH = "/repos/example/project/actions/runs/100/attempts/1"
@@ -58,6 +60,7 @@ class GitHubAppTests(unittest.TestCase):
         self.secrets.get_secret_value.side_effect = lambda **kwargs: self.secret
         self.minted, self.proofs = [], []
         self.mint_update, self.scope_update = {}, None
+        self.app_update, self.installation_update = {}, {}
         self.proof_statuses = []
         self.transport = Mock(side_effect=self.http)
         self.provider = app.GitHubAppProvider(config(), secrets=self.secrets, transport=self.transport,
@@ -70,6 +73,10 @@ class GitHubAppTests(unittest.TestCase):
 
     def http(self, method, path, headers, body, **kwargs):
         self.assertIn("Authorization", headers)
+        if path == "/app":
+            return response(self.app_document() | self.app_update)
+        if path == "/app/installations/789":
+            return response(self.installation_document() | self.installation_update)
         if method == "POST":
             self.minted.append((path, headers["Authorization"][7:], json.loads(body)))
             return response(dict(token=TOKEN + str(len(self.minted)), permissions=dict(app.PERMISSIONS),
@@ -81,6 +88,15 @@ class GitHubAppTests(unittest.TestCase):
         self.proofs.append((path, headers["Authorization"]))
         status = self.proof_statuses.pop(0) if self.proof_statuses else 200
         return response(dict(proof=True), status)
+
+    def app_document(self):
+        return dict(id=321, client_id="Iv23.test-client", owner=dict(id=456, login="example"),
+                    permissions=dict(app.PERMISSIONS), events=[], installations_count=1)
+
+    def installation_document(self):
+        return dict(id=789, app_id=321, account=dict(id=456, login="example"), target_id=456,
+                    permissions=dict(app.PERMISSIONS), events=[], repository_selection="selected",
+                    suspended_at=None, suspended_by=None)
 
     def read(self, path=PATH):
         with self.provider.observation() as fetch:
@@ -96,10 +112,76 @@ class GitHubAppTests(unittest.TestCase):
                            options={"verify_exp": False, "verify_iat": False})
         self.assertEqual(claims, dict(iat=NOW - 60, exp=NOW + 300, iss="Iv23.test-client"))
         self.assertEqual([call.args[1] for call in self.transport.call_args_list],
-                         [path, app.REPOSITORIES_PATH, PATH])
+                         ["/app", "/app/installations/789", path, app.REPOSITORIES_PATH, PATH])
         self.assertEqual(self.proofs[0][1], "Bearer " + TOKEN + "1")
         self.assertNotIn(TOKEN, repr(self.provider._cached))
         self.assertNotIn(self.pem[:50], repr(self.provider.__dict__))
+
+    def test_app_and_installation_drift_fails_before_mint_and_proof(self):
+        app_cases = [dict(id=True), dict(id="321"), dict(id=0), dict(client_id="other"),
+            dict(owner=dict(id=457, login="example")), dict(owner=dict(id="456", login="example")),
+            dict(owner=dict(id=456, login="other")), dict(installations_count=True),
+            dict(installations_count="1"), dict(installations_count=2), dict(events=["push"]),
+            dict(permissions=app.PERMISSIONS | {"contents": "write"})]
+        install_cases = [dict(id="789"), dict(id=True), dict(id=790), dict(app_id="321"),
+            dict(app_id=True), dict(app_id=322), dict(target_id="456"), dict(target_id=True),
+            dict(target_id=457), dict(account=dict(id=457, login="example")),
+            dict(account=dict(id=456, login="other")), dict(account=dict(id="456", login="example")),
+            dict(permissions={"actions": "write", "metadata": "read"}), dict(events=["workflow_run"]),
+            dict(repository_selection="all"), dict(suspended_at="now"), dict(suspended_by={})]
+        for target, cases in (("app_update", app_cases), ("installation_update", install_cases)):
+            for update in cases:
+                with self.subTest(target=target, fields=list(update)):
+                    setattr(self, target, update)
+                    with self.assertRaises(GitHubRunError) as caught:
+                        self.read()
+                    self.assertNotIsInstance(caught.exception, GitHubTransientError)
+                    self.assertIsNone(self.provider._cached)
+            setattr(self, target, {})
+        self.assertEqual(self.minted, [])
+        self.assertEqual(self.proofs, [])
+
+    def test_missing_required_app_and_installation_fields_fail_closed(self):
+        for path, original in (("/app", self.app_document()),
+                               ("/app/installations/789", self.installation_document())):
+            for key in original:
+                incomplete = {name: value for name, value in original.items() if name != key}
+                def missing(method, requested, headers, body, **kwargs):
+                    return response(incomplete) if requested == path else self.http(method, requested, headers, body, **kwargs)
+                self.transport.side_effect = missing
+                with self.subTest(path=path, missing=key), self.assertRaises(GitHubRunError):
+                    self.read()
+                self.assertIsNone(self.provider._cached)
+        self.assertEqual(self.minted, [])
+        self.assertEqual(self.proofs, [])
+
+    def test_each_remint_rechecks_drift_with_no_anonymous_or_unscoped_fallback(self):
+        self.read()
+        self.proof_statuses = [401]
+        self.app_update = dict(permissions=app.PERMISSIONS | {"contents": "write"})
+        with self.assertRaises(GitHubRunError):
+            self.read()
+        self.assertEqual(len(self.minted), 1)
+        self.assertEqual(self.proofs[-1][0], PATH)
+        self.assertIsNone(self.provider._cached)
+        self.assertEqual(self.transport.call_args_list[-1].args[:2], ("GET", "/app"))
+
+    def test_app_metadata_errors_remain_bounded_and_preserve_retry_class(self):
+        for path in ("/app", "/app/installations/789"):
+            for status in (401, 403, 404, 429, 503):
+                self.transport.reset_mock()
+                def fail(method, requested, headers, body, **kwargs):
+                    return response({}, status) if requested == path else self.http(method, requested, headers, body, **kwargs)
+                self.transport.side_effect = fail
+                with self.subTest(path=path, status=status), self.assertRaises(GitHubRunError) as caught:
+                    self.read()
+                self.assertEqual(isinstance(caught.exception, GitHubTransientError), status == 503)
+                self.assertEqual(isinstance(caught.exception, GitHubRateLimitError), status == 429)
+                self.assertIsNone(self.provider._cached)
+                self.assertLessEqual(self.transport.call_count, 2)
+                self.clock.advance(61)
+        self.assertEqual(self.minted, [])
+        self.assertEqual(self.proofs, [])
 
     def test_configuration_rejects_cross_account_region_secret_and_unsafe_identifiers(self):
         cases = [dict(repository="../project"), dict(repository="example/.."), dict(repository_id="01"),
@@ -114,6 +196,45 @@ class GitHubAppTests(unittest.TestCase):
         self.transport.assert_not_called()
         config(app_client_id="Iv1.ab1112223334445c")
         config(app_client_id="Iv23newOpaqueClientId")
+
+    def test_environment_factory_copies_only_non_secret_pins_and_is_lazy(self):
+        expected = config()
+        env = dict(RCP_PRODUCTION_REPOSITORY=expected.repository,
+            RCP_PRODUCTION_REPOSITORY_ID=expected.repository_id,
+            RCP_PRODUCTION_OWNER_ID=expected.repository_owner_id,
+            RCP_PRODUCTION_GITHUB_APP_CLIENT_ID=expected.app_client_id,
+            RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID=expected.installation_id,
+            RCP_PRODUCTION_GITHUB_APP_SECRET_ARN=expected.secret_arn,
+            UNRELATED_SECRET="synthetic-unused-secret")
+        with patch("boto3.client") as client:
+            actual = app.GitHubAppConfig.from_environment(env, region=expected.region, account=expected.account)
+            self.assertEqual(actual, expected)
+            env["RCP_PRODUCTION_REPOSITORY"] = "other/repository"
+            self.assertEqual(actual.repository, expected.repository)
+            self.assertNotIn("synthetic-unused-secret", repr(actual))
+            client.assert_not_called()
+        self.secrets.get_secret_value.assert_not_called()
+        self.transport.assert_not_called()
+
+    def test_environment_factory_rejects_missing_malformed_and_cross_scope_values(self):
+        expected = config()
+        env = dict(RCP_PRODUCTION_REPOSITORY=expected.repository,
+            RCP_PRODUCTION_REPOSITORY_ID=expected.repository_id,
+            RCP_PRODUCTION_OWNER_ID=expected.repository_owner_id,
+            RCP_PRODUCTION_GITHUB_APP_CLIENT_ID=expected.app_client_id,
+            RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID=expected.installation_id,
+            RCP_PRODUCTION_GITHUB_APP_SECRET_ARN=expected.secret_arn)
+        for key in env:
+            for value in (None, ""):
+                with self.subTest(key=key, value=value), self.assertRaises(GitHubRunError):
+                    app.GitHubAppConfig.from_environment(env | {key: value}, region=expected.region, account=expected.account)
+        for value in (None, [], "environment"):
+            with self.assertRaises(GitHubRunError):
+                app.GitHubAppConfig.from_environment(value, region=expected.region, account=expected.account)
+        for region, account in (("us-west-2", expected.account), (expected.region, "999999999999")):
+            with self.assertRaises(GitHubRunError):
+                app.GitHubAppConfig.from_environment(env, region=region, account=account)
+        self.transport.assert_not_called()
 
     def test_cache_binds_whole_configuration_and_constructs_no_sdk_clients(self):
         with patch("boto3.client") as client:
@@ -143,7 +264,7 @@ class GitHubAppTests(unittest.TestCase):
         self.assertEqual(len(self.minted), 1)
         self.assertEqual(len(self.proofs), 2)
         self.assertEqual(self.secrets.get_secret_value.call_count, 1)
-        self.assertEqual(self.transport.call_count, 4)
+        self.assertEqual(self.transport.call_count, 6)
         self.assertNotIn("key", self.provider.__dict__)
         self.assertNotIn("pem", self.provider.__dict__)
 
@@ -182,12 +303,12 @@ class GitHubAppTests(unittest.TestCase):
         self.assertEqual(len(self.minted), 2)
         self.assertEqual(len(self.proofs), 3)
 
-    def test_cold_six_read_observation_including_one_refresh_fits_exact_13_calls(self):
+    def test_cold_six_read_observation_including_one_refresh_fits_exact_17_calls(self):
         self.proof_statuses = [200] * 5 + [401, 200]
         with self.provider.observation() as fetch:
             for _ in range(6):
                 fetch(PATH)
-            self.assertEqual(fetch.calls, 13)
+            self.assertEqual(fetch.calls, 17)
             with self.assertRaises(GitHubRunError):
                 fetch(PATH)
         self.assertEqual(len(self.proofs), 7)
@@ -204,7 +325,7 @@ class GitHubAppTests(unittest.TestCase):
         with self.assertRaises(GitHubRunError):
             self.read()
         self.assertEqual(len(self.proofs), 2)
-        self.assertEqual(len(self.minted), 2)
+        self.assertEqual(len(self.minted), 1)
         self.provider._cached = None
         self.transport.reset_mock()
         def slow_secret(**kwargs):
@@ -354,7 +475,7 @@ class GitHubAppTests(unittest.TestCase):
 
     def test_quota_cooldown_blocks_new_secret_reads_and_preserves_reset_delay(self):
         self.transport.side_effect = lambda *a, **k: response({}, 429,
-            {"retry-after": "120", "x-ratelimit-reset": str(NOW + 400)})
+            {"retry-after": "120", "x-ratelimit-reset": str(NOW + 400), "x-ratelimit-remaining": "0"})
         with self.assertRaises(GitHubRateLimitError) as caught:
             self.read()
         self.assertEqual(caught.exception.retry_after_seconds, 401)
@@ -362,6 +483,142 @@ class GitHubAppTests(unittest.TestCase):
             self.read()
         self.assertEqual(self.secrets.get_secret_value.call_count, 1)
         self.assertEqual(self.transport.call_count, 1)
+
+    def test_secondary_quota_ignores_primary_reset_when_quota_remains(self):
+        for status in (403, 429):
+            for remaining in ("4990", None):
+                with self.subTest(status=status, remaining=remaining):
+                    self.provider._quota_wall = self.provider._quota_mono = 0
+                    self.transport.side_effect = lambda *a, **k: response({}, status,
+                        {"retry-after": "120", "x-ratelimit-reset": str(NOW + 3500),
+                         "x-ratelimit-remaining": remaining})
+                    with self.assertRaises(GitHubRateLimitError) as caught:
+                        self.read()
+                    self.assertEqual(caught.exception.retry_after_seconds, 120)
+                    self.clock.advance(120)
+                    self.transport.side_effect = self.http
+                    self.read()
+
+    def test_transport_and_server_failures_are_typed_sanitized_transients_at_each_phase(self):
+        for phase in ("mint", "scope", "proof"):
+            for error in (TimeoutError(TOKEN), ConnectionResetError(TOKEN),
+                          ssl.SSLEOFError(TOKEN), http.client.RemoteDisconnected(TOKEN), 502):
+                self.provider._cached = None
+                self.transport.reset_mock()
+                def fail(method, path, headers, body, **kwargs):
+                    actual = "mint" if method == "POST" else "scope" if path == app.REPOSITORIES_PATH else "proof"
+                    if actual == phase:
+                        if isinstance(error, int):
+                            return response({}, error)
+                        raise error
+                    return self.http(method, path, headers, body, **kwargs)
+                self.transport.side_effect = fail
+                with self.subTest(phase=phase, error=type(error)), self.assertRaises(GitHubTransientError) as caught:
+                    self.read()
+                self.assertEqual(caught.exception.retry_after_seconds, 5)
+                self.assertNotIn(TOKEN, "".join(traceback.format_exception(caught.exception)))
+                self.assertLessEqual(self.transport.call_count, 5)
+
+    def test_secret_transients_are_typed_but_access_denial_and_invalid_data_are_permanent(self):
+        from botocore.exceptions import ClientError, ReadTimeoutError
+        for failure, transient in ((ReadTimeoutError(endpoint_url="https://synthetic.invalid"), True),
+                (ClientError({"Error": {"Code": "ThrottlingException"}}, "GetSecretValue"), True),
+                (ClientError({"Error": {"Code": "InternalServiceError"},
+                              "ResponseMetadata": {"HTTPStatusCode": 500}}, "GetSecretValue"), True),
+                (ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetSecretValue"), False),
+                (ValueError("synthetic-private-key"), False)):
+            self.secrets.get_secret_value.side_effect = failure
+            with self.subTest(kind=type(failure)), self.assertRaises(GitHubRunError) as caught:
+                self.read()
+            self.assertEqual(isinstance(caught.exception, GitHubTransientError), transient)
+            self.assertNotIn("synthetic-private-key", "".join(traceback.format_exception(caught.exception)))
+        self.transport.assert_not_called()
+
+    def test_lazy_secret_client_construction_transport_failure_is_retryable(self):
+        self.provider._secrets = None
+        with patch("boto3.client", side_effect=TimeoutError("synthetic credentials endpoint")):
+            with self.assertRaises(GitHubTransientError):
+                self.read()
+        self.assertIsNone(self.provider._secrets)
+        self.transport.assert_not_called()
+
+    def test_certificate_invalid_response_and_post_mint_401_remain_permanent(self):
+        failures = [ssl.SSLCertVerificationError("synthetic certificate"), http.client.InvalidURL("bad url")]
+        for failure in failures:
+            self.transport.side_effect = failure
+            with self.assertRaises(GitHubRunError) as caught:
+                self.read()
+            self.assertNotIsInstance(caught.exception, GitHubTransientError)
+        for status in (401, 403, 404):
+            self.transport.side_effect = lambda method, path, headers, body, **kwargs: (
+                response({}, status) if path == app.REPOSITORIES_PATH
+                else self.http(method, path, headers, body, **kwargs))
+            with self.subTest(status=status), self.assertRaises(GitHubRunError) as caught:
+                self.read()
+            self.assertNotIsInstance(caught.exception, GitHubTransientError)
+            self.assertIsNone(self.provider._cached)
+        self.assertEqual(self.proofs, [])
+
+    def test_observation_and_lock_deadlines_are_transient_without_resetting_limits(self):
+        with self.assertRaises(GitHubTransientError), self.provider.observation() as fetch:
+            self.clock.advance(app.OBSERVATION_SECONDS)
+            fetch(PATH)
+        self.transport.assert_not_called()
+        self.provider._lock = Mock()
+        self.provider._lock.acquire.return_value = False
+        with self.assertRaises(GitHubTransientError):
+            self.read()
+        self.provider._lock.acquire.assert_called_once_with(timeout=app.OBSERVATION_SECONDS)
+
+    def test_real_https_request_serialization_pins_method_path_headers_body_and_verified_tls(self):
+        expiry = datetime.fromtimestamp(NOW + 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        replies = [response(self.app_document()), response(self.installation_document()),
+            response(dict(token=TOKEN, permissions=app.PERMISSIONS,
+            repository_selection="selected", expires_at=expiry), 201),
+            response(dict(total_count=1, repositories=[dict(id=123, full_name="example/project",
+                owner=dict(id=456, login="example"))])), response(dict(proof=True))]
+        sockets = [WireSocket(item) for item in replies]
+        tls = []
+        def wrap(context, sock, *, server_hostname, **kwargs):
+            tls.append((context.verify_mode, context.check_hostname, server_hostname))
+            return sock
+        self.provider._transport = app._https
+        with patch("socket.create_connection", side_effect=sockets) as connect, \
+                patch.object(ssl.SSLContext, "wrap_socket", wrap):
+            self.assertEqual(json.loads(self.read()), dict(proof=True))
+        self.assertEqual([call.args[0] for call in connect.call_args_list], [("api.github.com", 443)] * 5)
+        self.assertEqual(tls, [(ssl.CERT_REQUIRED, True, "api.github.com")] * 5)
+        expected = [("GET", "/app"), ("GET", "/app/installations/789"),
+            ("POST", "/app/installations/789/access_tokens"), ("GET", app.REPOSITORIES_PATH), ("GET", PATH)]
+        for sock, (method, path) in zip(sockets, expected):
+            head, body = b"".join(sock.sent).split(b"\r\n\r\n", 1)
+            lines = head.decode().split("\r\n")
+            self.assertEqual(lines[0], f"{method} {path} HTTP/1.1")
+            headers = dict(line.split(": ", 1) for line in lines[1:])
+            self.assertEqual(headers["Host"], "api.github.com")
+            self.assertEqual(headers["Accept"], "application/vnd.github+json")
+            self.assertEqual(headers["X-GitHub-Api-Version"], "2026-03-10")
+            self.assertEqual(headers["User-Agent"], "rcp-production-reader")
+            self.assertEqual(headers["Accept-Encoding"], "identity")
+            self.assertTrue(sock.closed)
+            if method == "POST":
+                self.assertEqual(headers["Content-Type"], "application/json")
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+                self.assertEqual(json.loads(body), dict(repository_ids=[123], permissions=app.PERMISSIONS))
+                self.assertTrue(headers["Authorization"].startswith("Bearer "))
+                claims = jwt.decode(headers["Authorization"][7:], self.key.public_key(), algorithms=["RS256"],
+                                   options={"verify_exp": False, "verify_iat": False})
+                self.assertEqual(claims["iss"], config().app_client_id)
+            elif path in ("/app", "/app/installations/789"):
+                claims = jwt.decode(headers["Authorization"][7:], self.key.public_key(), algorithms=["RS256"],
+                                   options={"verify_exp": False, "verify_iat": False})
+                self.assertEqual(claims["iss"], config().app_client_id)
+                self.assertEqual(body, b"")
+                self.assertNotIn("Content-Type", headers)
+            else:
+                self.assertEqual(headers["Authorization"], "Bearer " + TOKEN)
+                self.assertEqual(body, b"")
+                self.assertNotIn("Content-Type", headers)
 
     def test_invalid_clock_fails_closed(self):
         for clock in (float("nan"), float("inf"), -1, True):
@@ -393,6 +650,24 @@ class GitHubAppTests(unittest.TestCase):
         finally:
             log.setLevel(old_level)
             log.handlers, log.filters, log.propagate = old_handlers, old_filters, old_propagate
+
+
+class WireSocket:
+    """Capture real http.client serialization without a socket or TLS handshake."""
+    def __init__(self, response):
+        self.sent, self.closed = [], False
+        self.reply = io.BytesIO(f"HTTP/1.1 {response.status} Synthetic\r\nContent-Length: {len(response.body)}\r\n\r\n".encode()
+                                + response.body)
+    def setsockopt(self, *args):
+        pass
+    def settimeout(self, *args):
+        pass
+    def sendall(self, value):
+        self.sent.append(value)
+    def makefile(self, *args):
+        return self.reply
+    def close(self):
+        self.closed = True
 
 
 class TransportTests(unittest.TestCase):

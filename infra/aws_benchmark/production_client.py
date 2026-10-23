@@ -8,14 +8,17 @@ This client never prints JWTs, presigned URLs, credentials or raw service errors
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 from benchmarks.strict_json import parse_json
 from .common import BINARIES, Budget, require, retryable_io, utc
@@ -26,7 +29,8 @@ LAMBDA_READ_TIMEOUT = 60  # exceeds the admission function's 45-second execution
 TOKEN_READ_TIMEOUT = 10
 INVOKE_RESERVE_SECONDS = TOKEN_READ_TIMEOUT + 3 + LAMBDA_READ_TIMEOUT
 SUBMISSION_SECONDS = 600
-MAX_INVOKE_ATTEMPTS = 4
+RETRY_DELAYS = (5, 15, 45)
+MAX_INVOKE_ATTEMPTS = len(RETRY_DELAYS) + 1
 ACTIVE_SUBMISSION_STATES = frozenset({"armed", "launching", "uncertain", "requested"})
 
 
@@ -44,6 +48,14 @@ def lambda_config():
                   retries={"total_max_attempts": 1}, proxies={}, ignore_configured_endpoint_urls=True)
 
 
+def transport_retryable(error):
+    # certificate identity failures cannot be repaired by replaying the same request
+    if isinstance(error, ssl.SSLCertVerificationError) or (
+            isinstance(error, urllib.error.URLError) and isinstance(error.reason, ssl.SSLCertVerificationError)):
+        return False
+    return isinstance(error, (ssl.SSLError, http.client.HTTPException)) or retryable_io(error)
+
+
 def reconcile(operation, *, deadline, reserve, clock, sleep):
     """Bound same-attempt retries; an exhausted/ambiguous result never releases ownership."""
     for attempt in range(MAX_INVOKE_ATTEMPTS):
@@ -51,11 +63,11 @@ def reconcile(operation, *, deadline, reserve, clock, sleep):
         try:
             return operation()
         except Exception as error:
-            if not isinstance(error, AdmissionRetryable) and not retryable_io(error):
+            if not isinstance(error, AdmissionRetryable) and not transport_retryable(error):
                 raise
-            delay = max((5, 15, 45, 45)[attempt], getattr(error, "delay", 0))
-            require(attempt + 1 < MAX_INVOKE_ATTEMPTS and clock() + delay + reserve < deadline,
-                    "submission reconciliation remains pending; retain receipt")
+            require(attempt < len(RETRY_DELAYS), "submission reconciliation remains pending; retain receipt")
+            delay = max(RETRY_DELAYS[attempt], getattr(error, "delay", 0))
+            require(clock() + delay + reserve < deadline, "submission reconciliation remains pending; retain receipt")
             sleep(delay)
 
 
@@ -106,8 +118,15 @@ def invoke(api, function, value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     require(len(raw) <= MAX_RESPONSE, "admission invocation exceeds bound")
     result = api.invoke(FunctionName=function, InvocationType="RequestResponse", LogType="None", Payload=raw)
-    require(result.get("StatusCode") == 200 and not result.get("FunctionError"), "admission invocation failed")
-    stream = result["Payload"]
+    stream = result.get("Payload")
+    if result.get("StatusCode") != 200 or result.get("FunctionError"):
+        if stream is not None:
+            stream.close()
+        # a timeout may follow a committed reservation/start; replay only this exact action
+        if result.get("StatusCode") == 200 and result.get("FunctionError") in {"Handled", "Unhandled"}:
+            raise AdmissionRetryable()
+        require(False, "admission invocation failed")
+    require(stream is not None, "admission response has no payload")
     try:
         body = stream.read(MAX_RESPONSE + 1)
     finally:
@@ -167,8 +186,19 @@ def upload(capability, data, *, bucket, region):
             require(response.status == 200, "binary upload failed")
             require(len(response.read(1025)) <= 1024, "upload response exceeds bound")
     except urllib.error.HTTPError as error:
-        error.close()
-        if error.code in (429, 500, 502, 503, 504):
+        request_timeout = False
+        try:
+            if error.code == 400:
+                body = error.read(4097)
+                if len(body) <= 4096 and body.lstrip().startswith(b"<") and b"<!" not in body:
+                    try:
+                        root = ET.fromstring(body)
+                        request_timeout = root.tag == "Error" and root.findtext("Code") == "RequestTimeout"
+                    except ET.ParseError:
+                        pass
+        finally:
+            error.close()
+        if request_timeout or error.code in (429, 500, 502, 503, 504):
             raise AdmissionRetryable() from None
         if error.code != 412:
             raise ValueError("binary upload failed; retain admission receipt") from None

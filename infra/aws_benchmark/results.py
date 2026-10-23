@@ -30,6 +30,10 @@ SERIES_CONTRACT = "aws-local-ext4-v1"
 
 
 CONCLUSIONS = ("success", "failure", "cancelled", "skipped")
+# submission-only production workflows may end with any terminal GitHub conclusion;
+# this does not relax the legacy execution producer's required successful outcome.
+SUBMISSION_CONCLUSIONS = frozenset({"success", "failure", "cancelled", "timed_out", "neutral", "skipped",
+                                    "action_required", "stale", "startup_failure"})
 
 
 def diagnostic(error):
@@ -297,8 +301,7 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
             and re.fullmatch(r"[0-9a-f]{40}", policy["harness_revision"]), "invalid approved AMI provenance")
     require(producer_role in {"execution", "submission"}, "unknown producer responsibility")
     producer_ok = evidence["producer_conclusion"] == "success" or (producer_role == "submission" and
-        evidence["producer_conclusion"] in {"failure", "cancelled", "timed_out", "neutral", "skipped",
-                                           "action_required", "stale", "startup_failure"})
+        evidence["producer_conclusion"] in SUBMISSION_CONCLUSIONS)
     require(not evidence["errors"] and result is not None and producer_ok
             and measurement_contract(expected["suite"])["purpose"] == "performance", "diagnostic run cannot enter performance history")
     receipt, worker = evidence["controller"], evidence["worker"]

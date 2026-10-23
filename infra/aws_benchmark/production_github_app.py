@@ -7,6 +7,7 @@ Socket timeouts cannot hard-bound DNS/header parsing; the outer Lambda deadline
 remains required. A late operation fails its next shared-budget check.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -23,11 +24,13 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from .common import retryable_io
+from .production_auth import _retryable_transport
 from .production_github import (API_HOST, API_VERSION, MAX_RESPONSE_BYTES,
-                                GitHubRunError, GitHubRateLimitError, _bounded_document)
+                                GitHubRunError, GitHubRateLimitError, GitHubTransientError, _bounded_document)
 
 OBSERVATION_SECONDS = 20
-MAX_CALLS = 13
+MAX_CALLS = 17
 SOCKET_SECONDS = 3
 MAX_PEM_BYTES = 16384
 PERMISSIONS = {"actions": "read", "metadata": "read"}
@@ -55,6 +58,17 @@ class GitHubAppConfig:
     app_client_id: str
     installation_id: str
     secret_arn: str
+
+    @classmethod
+    def from_environment(cls, environment, *, region, account):
+        """Copy only non-secret deployment pins; construct no clients or credentials."""
+        _require(isinstance(environment, Mapping))
+        return cls(repository=environment.get("RCP_PRODUCTION_REPOSITORY"),
+            repository_id=environment.get("RCP_PRODUCTION_REPOSITORY_ID"),
+            repository_owner_id=environment.get("RCP_PRODUCTION_OWNER_ID"), region=region, account=account,
+            app_client_id=environment.get("RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"),
+            installation_id=environment.get("RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID"),
+            secret_arn=environment.get("RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"))
 
     def __post_init__(self):
         _require(all(isinstance(value, str) for value in self.__dict__.values()))
@@ -123,15 +137,18 @@ def _https(method, path, headers, body, *, timeout, deadline, monotonic):
         remaining, chunks = MAX_RESPONSE_BYTES + 1, []
         while remaining:
             left = deadline - _number(monotonic())
-            _require(left > 0)
-            if transport is not None:
+            if left <= 0:
+                raise GitHubTransientError()
+            if transport is not None and not response.isclosed():
                 transport.settimeout(min(SOCKET_SECONDS, left))
             chunk = response.read1(remaining)
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
-        _require(remaining > 0 and _number(monotonic()) < deadline)
+        _require(remaining > 0)
+        if _number(monotonic()) >= deadline:
+            raise GitHubTransientError()
         return Response(response.status, selected, b"".join(chunks))
     finally:
         if response is not None:
@@ -151,7 +168,8 @@ class GitHubAppProvider:
         self._quota_wall = self._quota_mono = 0
         self._path = re.compile(r"/repos/" + re.escape(config.repository) + r"/actions/runs/" + _ID
             + r"(?:/attempts/" + _ID + r"(?:/jobs\?per_page=100)?|/pending_deployments)?")
-        self._mint_path = "/app/installations/" + config.installation_id + "/access_tokens"
+        self._installation_path = "/app/installations/" + config.installation_id
+        self._mint_path = self._installation_path + "/access_tokens"
 
     def observation(self):
         return _Observation(self)
@@ -163,7 +181,8 @@ class GitHubAppProvider:
 
     def _token(self, observation):
         self._check_quota()
-        _require(self._lock.acquire(timeout=observation.remaining()))
+        if not self._lock.acquire(timeout=observation.remaining()):
+            raise GitHubTransientError()
         try:
             observation.check()
             if not self._usable(self._cached):
@@ -175,7 +194,8 @@ class GitHubAppProvider:
 
     def _invalidate(self, token, observation):
         # do not evict a newer token minted by a concurrent observation.
-        _require(self._lock.acquire(timeout=observation.remaining()))
+        if not self._lock.acquire(timeout=observation.remaining()):
+            raise GitHubTransientError()
         try:
             observation.check()
             if self._cached is token:
@@ -186,15 +206,20 @@ class GitHubAppProvider:
     def _secret(self, observation):
         observation.step()
         _suppress_sdk_debug()
-        if self._secrets is None:
-            import boto3
-            from botocore.config import Config
-            self._secrets = boto3.client("secretsmanager", region_name=self.config.region,
-                endpoint_url=f"https://secretsmanager.{self.config.region}.amazonaws.com",
-                config=Config(connect_timeout=1, read_timeout=3, retries={"total_max_attempts": 1},
-                              proxies={}, ignore_configured_endpoint_urls=True))
-        _suppress_sdk_debug()
-        result = self._secrets.get_secret_value(SecretId=self.config.secret_arn, VersionStage="AWSCURRENT")
+        try:
+            if self._secrets is None:
+                import boto3
+                from botocore.config import Config
+                self._secrets = boto3.client("secretsmanager", region_name=self.config.region,
+                    endpoint_url=f"https://secretsmanager.{self.config.region}.amazonaws.com",
+                    config=Config(connect_timeout=1, read_timeout=3, retries={"total_max_attempts": 1},
+                                  proxies={}, ignore_configured_endpoint_urls=True))
+            _suppress_sdk_debug()
+            result = self._secrets.get_secret_value(SecretId=self.config.secret_arn, VersionStage="AWSCURRENT")
+        except Exception as error:
+            if retryable_io(error):
+                raise GitHubTransientError() from None
+            raise
         observation.check()
         _require(isinstance(result, dict) and result.get("ARN") == self.config.secret_arn
             and result.get("Name") == "/rcp/production/github-read-app"
@@ -221,6 +246,7 @@ class GitHubAppProvider:
         body = json.dumps(dict(repository_ids=[int(self.config.repository_id)], permissions=PERMISSIONS),
                           separators=(",", ":"), sort_keys=True).encode()
         try:
+            self._verify_app(observation, bearer)
             response = self._request(observation, "POST", self._mint_path, bearer, body)
         finally:
             del bearer
@@ -252,6 +278,36 @@ class GitHubAppProvider:
         _require(self._usable(token))
         return token
 
+    def _verify_app(self, observation, bearer):
+        def read(path):
+            response = self._request(observation, "GET", path, bearer)
+            _require(response.status == 200)
+            value = _bounded_document(response.body)
+            _require(isinstance(value, dict) and value.get("permissions") == PERMISSIONS
+                     and value.get("events") == [])
+            return value
+        def exact_owner(owner):
+            return (isinstance(owner, dict) and type(owner.get("id")) is int
+                and owner["id"] == int(self.config.repository_owner_id)
+                and owner.get("login") == self.config.repository.split("/")[0])
+        application = read("/app")
+        app_id = application.get("id")
+        _require(type(app_id) is int and 0 < app_id < 10 ** 20
+                 and application.get("client_id") == self.config.app_client_id
+                 and exact_owner(application.get("owner"))
+                 and type(application.get("installations_count")) is int
+                 and application["installations_count"] == 1)
+        installation = read(self._installation_path)
+        _require(type(installation.get("id")) is int
+                 and installation["id"] == int(self.config.installation_id)
+                 and type(installation.get("app_id")) is int and installation["app_id"] == app_id
+                 and exact_owner(installation.get("account"))
+                 and type(installation.get("target_id")) is int
+                 and installation["target_id"] == int(self.config.repository_owner_id)
+                 and installation.get("repository_selection") == "selected"
+                 and "suspended_at" in installation and installation["suspended_at"] is None
+                 and "suspended_by" in installation and installation["suspended_by"] is None)
+
     def _check_quota(self):
         wall, mono = _number(self._clock()), _number(self._monotonic())
         delay = max(self._quota_wall - wall, self._quota_mono - mono)
@@ -261,15 +317,20 @@ class GitHubAppProvider:
     def _request(self, observation, method, path, bearer, body=None):
         _require((method == "POST" and path == self._mint_path and isinstance(body, bytes))
                  or (method == "GET" and body is None
-                     and (path == REPOSITORIES_PATH or self._path.fullmatch(path))))
+                     and (path in ("/app", self._installation_path, REPOSITORIES_PATH) or self._path.fullmatch(path))))
         self._check_quota()
         timeout = observation.step()
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": API_VERSION,
                    "User-Agent": "rcp-production-reader", "Authorization": "Bearer " + bearer}
         if body is not None:
             headers["Content-Type"] = "application/json"
-        response = self._transport(method, path, headers, body, timeout=min(SOCKET_SECONDS, timeout),
-                                   deadline=observation.deadline, monotonic=self._monotonic)
+        try:
+            response = self._transport(method, path, headers, body, timeout=min(SOCKET_SECONDS, timeout),
+                                       deadline=observation.deadline, monotonic=self._monotonic)
+        except Exception as error:
+            if _retryable_transport(error):
+                raise GitHubTransientError() from None
+            raise
         observation.check()
         _require(isinstance(response, Response) and type(response.status) is int and isinstance(response.headers, dict)
                  and isinstance(response.body, bytes) and len(response.body) <= MAX_RESPONSE_BYTES
@@ -292,9 +353,12 @@ class GitHubAppProvider:
                 value = response.headers.get(name)
                 return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value) else 0
             wall, mono = _number(self._clock()), _number(self._monotonic())
-            delay = max(60, number("retry-after"), number("x-ratelimit-reset") - wall + 1)
+            reset = number("x-ratelimit-reset") - wall + 1 if response.headers.get("x-ratelimit-remaining") == "0" else 0
+            delay = max(60, number("retry-after"), reset)
             self._quota_wall, self._quota_mono = wall + delay, mono + delay
             raise GitHubRateLimitError(min(86400, math.ceil(delay)))
+        if 500 <= response.status < 600:
+            raise GitHubTransientError()
         return response
 
 
@@ -317,9 +381,10 @@ class _Observation:
         self.deadline = 0
 
     def remaining(self):
-        _require(self.deadline is not None)
+        _require(self.deadline is not None and self.deadline > 0)
         left = self.deadline - _number(self.provider._monotonic())
-        _require(left > 0)
+        if left <= 0:
+            raise GitHubTransientError()
         return left
 
     def check(self):
@@ -351,7 +416,7 @@ class _Observation:
                 response = self.provider._request(self, "GET", path, self._current.value)
             _require(response.status == 200)
             return response.body
-        except GitHubRateLimitError:
+        except (GitHubRateLimitError, GitHubTransientError):
             raise
         except Exception:
             raise GitHubRunError("GitHub App reader unavailable") from None

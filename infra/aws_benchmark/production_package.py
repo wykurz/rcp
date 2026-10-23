@@ -37,10 +37,12 @@ SOURCES = (
     "infra/aws_benchmark/durable_aws.py", "infra/aws_benchmark/durable_client.py", "infra/aws_benchmark/identity.py",
     "infra/aws_benchmark/json_bytes.py", "infra/aws_benchmark/production_admission.py",
     "infra/aws_benchmark/production_auth.py", "infra/aws_benchmark/production_collection.py",
-    "infra/aws_benchmark/production_collection_handler.py",
+    "infra/aws_benchmark/production_collection_handler.py", "infra/aws_benchmark/production_errors.py",
     "infra/aws_benchmark/production_github.py", "infra/aws_benchmark/production_github_app.py",
     "infra/aws_benchmark/production_handler.py",
-    "infra/aws_benchmark/production_mailbox.py", "infra/aws_benchmark/production_policy.py",
+    "infra/aws_benchmark/production_mailbox.py", "infra/aws_benchmark/production_objects.py",
+    "infra/aws_benchmark/production_policy.py",
+    "infra/aws_benchmark/production_projection.py",
     "infra/aws_benchmark/production_runtime.py", "infra/aws_benchmark/production_startup.py",
     "infra/aws_benchmark/production_store.py",
     "infra/aws_benchmark/results.py", "assets/site-theme.html",
@@ -146,6 +148,28 @@ def install_dependencies(stage, wheels, requirements, python312):
                    check=True, capture_output=True, text=True, timeout=180)
 
 
+S3_COPY_PROBE = r"""
+import botocore
+from pathlib import Path
+from botocore.loaders import Loader
+from botocore.session import get_session
+from botocore.serialize import create_serializer
+model_session = get_session()
+model_session.register_component('data_loader', Loader(
+    extra_search_paths=[str(Path(botocore.__file__).resolve().parent / 'data')], include_default_search_paths=False))
+copy_operation = model_session.get_service_model('s3').operation_model('CopyObject')
+annotation = copy_operation.input_shape.members.get('AnnotationDirective')
+if annotation is None or 'EXCLUDE' not in annotation.enum:
+    raise RuntimeError('packaged SDK lacks required CopyObject AnnotationDirective=EXCLUDE support')
+copy_parameters = dict(Bucket='offline-package-probe', Key='destination', CopySource='/source/key?versionId=version-1',
+                       AnnotationDirective='EXCLUDE', ChecksumAlgorithm='SHA256', ServerSideEncryption='AES256',
+                       MetadataDirective='REPLACE', ContentType='application/octet-stream', IfNoneMatch='*')
+copy_wire = create_serializer('rest-xml').serialize_to_request(copy_parameters, copy_operation)
+if copy_wire['headers'].get('x-amz-object-annotation-directive') != 'EXCLUDE':
+    raise RuntimeError('packaged SDK failed required CopyObject annotation exclusion wire contract')
+"""
+
+
 ISOLATED_PROBE = r"""
 import importlib, json, pathlib, platform, socket, sys
 root = pathlib.Path(sys.argv[1]).resolve()
@@ -174,6 +198,7 @@ for name in ('boto3', 'botocore', 'jwt', 'cryptography', 'cffi', '_cffi_backend'
     module = importlib.import_module(name)
     if not pathlib.Path(module.__file__).resolve().is_relative_to(root):
         raise RuntimeError('dependency imported outside the package')
+""" + S3_COPY_PROBE + r"""
 from cryptography.hazmat.primitives.asymmetric import rsa
 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 import jwt
@@ -191,7 +216,8 @@ for module in tuple(sys.modules.values()):
 print(json.dumps({'python': platform.python_version(), 'platform': platform.system(),
                   'machine': platform.machine(), 'network_blocked': True,
                   'external_site_packages': False, 'entrypoints': entrypoints,
-                  'native_crypto_verified': True, 'report_theme_verified': True}, sort_keys=True))
+                  'native_crypto_verified': True, 'report_theme_verified': True,
+                   'botocore_version': botocore.__version__, 's3_copy_annotation_exclude_verified': True}, sort_keys=True))
 """
 
 
@@ -228,6 +254,8 @@ def archive_members(output, members):
 
 def package(output, wheels, python312):
     output = Path(output)
+    # keep the caller's interpreter path when the probe changes cwd, without resolving venv links
+    python312 = Path(python312).absolute()
     if output.exists() or output.is_symlink() or not output.parent.is_dir():
         raise ValueError("output must be new and its parent must already exist")
     sources = source_snapshot(ROOT)

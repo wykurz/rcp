@@ -32,6 +32,20 @@ secret keys in chat or source files. Supply only:
   maintenance helper from that commit's Git blobs, so staged or unstaged edits cannot enter the
   generated template. The guest fetches only that SHA without credentials.
 
+For the separate [production controller](PRODUCTION.md), use a fresh image from the final reviewed
+source containing the `production-mailbox-sha256-v1` output contract. The installer verifies the
+installed `worker.py` digest against `production_startup.OUTPUT_WORKER_SHA256`, then writes
+`/opt/rcp-benchmark/production-output-contract.txt` as root with mode `0444` after the unprivileged
+import checks. Production UserData verifies the marker and actual worker digest before starting
+fixture preparation or copies. Missing, mutable, foreign-owned or mismatched metadata/worker bytes
+cause poweroff; an older image cannot be approved merely by adding the marker. This is a boot-time
+compatibility guard, not remote image attestation or protection against trusted root administrators.
+Preserve the reviewed source, capture/snapshot receipts and exact immutable AMI/numeric launch pins;
+rebuild and regenerate startup after a worker digest change. Earlier PR images that upload only
+SDK-default CRC32 are incompatible with the strict SHA-256 collector. The marker is not required by
+the legacy ASG or direct-worker startup, whose behavior is unchanged. No new image is built by this
+PR, and a separately approved production acceptance still needs that compatible build.
+
 The account/region must already have Systems Manager Default Host Management Configuration (DHMC)
 **disabled**. Before requesting a stack, the helper reads the exact service setting and requires
 `Status: Default` and the literal `SettingValue: "$None"`; unknown, enabled, pending or unreadable

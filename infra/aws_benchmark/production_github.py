@@ -19,7 +19,7 @@ import re
 import time
 
 from benchmarks.strict_json import parse_json
-from .production_auth import VerifiedGitHubIdentity
+from .production_auth import VerifiedGitHubIdentity, _retryable_transport
 from .production_policy import WorkflowRun
 
 
@@ -31,6 +31,14 @@ _ID = re.compile(r"[1-9][0-9]{0,19}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 class GitHubRunError(ValueError):
     """A sanitized failure to obtain metadata bound to the signed run identity."""
+
+
+class GitHubTransientError(GitHubRunError):
+    """A sanitized observation outage; retries must obtain fresh complete proofs."""
+
+    def __init__(self, retry_after_seconds=5):
+        super().__init__("GitHub observation temporarily unavailable")
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GitHubRateLimitError(GitHubRunError):
@@ -119,9 +127,11 @@ class GitHubRunReader:
                 now = datetime.fromtimestamp(seconds, timezone.utc)
                 WorkflowRun.verify(attempt, identity, now)
                 return WorkflowRun.verify(original, identity, now)
-        except GitHubRateLimitError:
+        except (GitHubRateLimitError, GitHubTransientError):
             raise
-        except Exception:
+        except Exception as error:
+            if _retryable_transport(error):
+                raise GitHubTransientError() from None
             raise GitHubRunError("GitHub workflow run could not be verified") from None
 
 class TerminalProducerReader(GitHubRunReader):
@@ -164,7 +174,9 @@ class TerminalProducerReader(GitHubRunReader):
                     ("id", "run_attempt", "head_sha", "status", "conclusion", "path", "event", "head_branch")))
                 return dict(attempt=original, current=after, attempt_jobs=original_jobs,
                             current_jobs=current_jobs, pending_deployments=deployments)
-        except GitHubRateLimitError:
+        except (GitHubRateLimitError, GitHubTransientError):
             raise
-        except Exception:
+        except Exception as error:
+            if _retryable_transport(error):
+                raise GitHubTransientError() from None
             raise GitHubRunError("GitHub terminal producer could not be verified") from None

@@ -334,6 +334,10 @@ class Budget:
         return remaining
 
 
+class RevisionConflict(RuntimeError):
+    """The same open owner advanced; reload before recomputing any state transition."""
+
+
 def error_code(error):
     return (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
 

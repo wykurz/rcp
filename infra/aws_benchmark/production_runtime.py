@@ -10,7 +10,8 @@ to that immutable instance expiry.
 """
 
 import base64
-from datetime import datetime, timezone
+import copy
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -19,9 +20,11 @@ import time
 from benchmarks.strict_json import parse_json
 
 from . import durable
-from .common import BINARIES, MAX_BINARY, digest, error_code, get_bytes, pending_status, require, retryable_io, utc
-from .durable_aws import AllocationDeferred, Configuration, Service, clients
+from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RevisionConflict, digest, durable_plan_contract, error_code, get_bytes,
+                     pending_status, require, timestamp, utc)
+from .durable_aws import AllocationDeferred, Configuration, Service, clients, transient
 from .production_mailbox import MailboxPaths
+from .production_objects import Objects
 from .production_store import MAX_STATE_BYTES, RunStore
 from .production_startup import verify_startup
 
@@ -81,7 +84,42 @@ class ProductionService(Service):
                     r"arn:aws:states:" + re.escape(self.config.region) + ":" + self.config.account
                     + r":execution:[A-Za-z0-9_-]{1,80}:" + re.escape(event["run"]), event["execution_arn"]),
                 "production execution differs from sealed submission")
+        if state["phase"] in ("launching", "uncertain"):
+            self.retry_launch(state)
+            return dict(state="wait", run=state["request"]["run"])
         return super().coordinator({key: event[key] for key in ("run", "execution_arn", "execution_name")})
+
+    def launch_recovery_open(self, state):
+        allocation = state.get("attempt")
+        return (state["phase"] in ("launching", "uncertain") and state["launch_outcome"] == "uncertain" and
+                state["allocation_consumed"] and allocation is not None and not state["binding"] and
+                not state["known_instance_ids"] and not state["seen"] and not state["close_reason"] and
+                utc(allocation["started_at"]) <= self.now() < utc(state["request"]["capacity_deadline"]) and
+                (utc(allocation["close_at"]) - self.now()).total_seconds() >=
+                durable.minimum_runtime(state["request"]["plan"]))
+
+    def retry_launch(self, state):
+        if not self.launch_recovery_open(state):
+            return
+        request, allocation = state["request"], state["attempt"]
+        self.fresh_guard()
+        if self.inventory(request):
+            return
+        expected = durable.attempt(request, allocation["ordinal"], utc(allocation["started_at"]))
+        expected["parameters"] = self.launch_parameters(request, expected)
+        require(allocation == expected and state["attempts"] == allocation["ordinal"],
+                "saved allocation parameters differ from the immutable attempt")
+        self.validate_inputs(state)
+        current, revision = self.load()
+        if current != state or not self.launch_recovery_open(current):
+            return
+        observed = self.fresh_guard()
+        # the monotonic replay marker fences delayed negative proof from an older sender;
+        # a lost checkpoint response never grants this invocation permission to send.
+        current["launch_replayed"] = True
+        self.store.save_launch_retry(current, revision)
+        if self.launch_recovery_open(current) and self.launch_allowed(request, observed, allocation):
+            self.launch(request, allocation, observed, prior_uncertain=True)
 
     def sealed_inputs(self, state):
         sealed = state.get("sealed_inputs")
@@ -139,7 +177,7 @@ class ProductionService(Service):
         try:
             self.api["s3"].copy_object(Bucket=self.config.bucket, Key=destination,
                 CopySource={"Bucket": self.config.bucket, "Key": entry["key"], "VersionId": entry["version"]},
-                ChecksumAlgorithm="SHA256", ServerSideEncryption="AES256", MetadataDirective="REPLACE",
+                ChecksumAlgorithm="SHA256", ServerSideEncryption="AES256", MetadataDirective="REPLACE", AnnotationDirective="EXCLUDE",
                 ContentType="application/octet-stream", IfNoneMatch="*")
         except Exception as error:
             if error_code(error) not in ("PreconditionFailed", "412"):
@@ -171,17 +209,18 @@ class ProductionService(Service):
         self.immutable_json(paths.window, durable.window(state["request"], state["binding"]))
 
     def read_worker_status(self, state):
-        key = self.paths(state).status
-        response = self.api["s3"].list_objects_v2(Bucket=self.config.bucket, Prefix=key, MaxKeys=1)
-        contents = response.get("Contents", [])
-        require(response.get("IsTruncated") is False and not response.get("NextContinuationToken") and
-                isinstance(contents, list) and len(contents) <= 1 and
-                all(isinstance(item, dict) and item.get("Key") == key for item in contents),
-                "production status inventory differs from the exact key")
-        if not contents:
-            # absence is a pending observation, never evidence that a worker or producer has stopped
-            return pending_status(state["request"]["run"])
-        data = get_bytes(self.api["s3"], self.config.bucket, key, 16_384)
+        paths, objects = self.paths(state), Objects(self.api["s3"], self.config.bucket)
+        committed = state.get("worker_output")
+        if committed is not None:
+            require(isinstance(committed, dict) and set(committed) == {"status", "results"},
+                    "worker output commitment differs")
+            data = objects.referenced(committed["status"], paths.status, 16_384)
+            reference = committed["status"]
+        else:
+            observed = objects.read(paths.status, 16_384, optional=True)
+            if observed is None:
+                return pending_status(state["request"]["run"])
+            data, reference = observed
         value = parse_json(data.decode("utf-8"))
         require(isinstance(value, dict) and set(value) <= STATUS_FIELDS and
                 value.get("run") == state["request"]["run"] and value.get("state") == "completed" and
@@ -189,7 +228,19 @@ class ProductionService(Service):
         if value["success"] or "sha256" in value:
             require(isinstance(value.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]),
                     "production status has no valid archive digest")
+        if committed is None:
+            archive = objects.head(paths.results, MAX_RESULT, sha256=value["sha256"]) if "sha256" in value else None
+            state["worker_output"] = dict(status=reference, results=archive)
+        else:
+            require((committed["results"] is None and "sha256" not in value) or
+                    (isinstance(committed["results"], dict) and committed["results"].get("key") == paths.results and
+                     committed["results"].get("sha256") == value.get("sha256")), "archive commitment differs from status")
         return value
+
+    def observe_closed_worker(self, state):
+        if state["phase"] == "closing" and state["binding"] and not state.get("worker_output"):
+            # closure reason is not an evidence inventory; preserve late successful or failed output alike.
+            self.read_worker_status(state)
 
     def watchdog_state(self, state, instances):
         response = self.api["dynamodb"].get_item(TableName=self.config.table,
@@ -203,8 +254,45 @@ class ProductionService(Service):
             if self.now() >= utc(expiry):
                 state.update(phase="closing", close_reason=state["close_reason"] or "production input upload expired")
 
+    def root_cleanup(self, state):
+        # exact-ID disappearance is useful only after every launch/producer horizon,
+        # and only together with the already bound root's independent deletion proof.
+        after = utc(state["request"]["outer_deadline"]) + timedelta(
+            seconds=durable_plan_contract(state["request"]["plan"])["delivery_drain_seconds"])
+        require(self.now() >= after, "physical reconciliation horizon has not passed")
+        candidate = copy.deepcopy(state)
+        for identity in candidate["known_instance_ids"]:
+            seen = candidate["seen"].get(identity)
+            if seen is None or seen["state"] == "terminated":
+                continue
+            require(candidate["launch_outcome"] == "accepted" and len(seen["root_volumes"]) == 1,
+                    "exact instance reconciliation lacks accepted identity or root proof")
+            try:
+                response = self.api["ec2"].describe_instances(InstanceIds=[identity])
+            except Exception as error:
+                if error_code(error) != "InvalidInstanceID.NotFound":
+                    raise
+                seen["state"] = "terminated"
+            else:
+                instances = [instance for reservation in response["Reservations"] for instance in reservation["Instances"]]
+                require(not response.get("NextToken") and len(instances) == 1 and instances[0].get("InstanceId") == identity and
+                        instances[0].get("State", {}).get("Name") == "terminated",
+                        "exact instance probe did not prove termination")
+                durable.validate_allocation_instance(candidate["request"], instances[0], candidate["attempt"],
+                                                     reconciliation=True)
+                roots = [entry["Ebs"]["VolumeId"] for entry in instances[0].get("BlockDeviceMappings", [])
+                         if "Ebs" in entry and entry.get("DeviceName") == instances[0].get("RootDeviceName")]
+                require((seen["launch_at"] is None or seen["launch_at"] == timestamp(instances[0]["LaunchTime"])) and
+                        (not roots or roots == seen["root_volumes"]), "exact instance proof changed its binding")
+                self.remember_instance(candidate, instances[0])
+        deleted = super().root_cleanup(candidate)
+        state["seen"] = candidate["seen"]
+        return deleted
+
     def receipt(self, state):
         current, _ = self.load()
+        if current != state and current["phase"] != "complete" and current["request"] == state["request"]:
+            raise RevisionConflict("receipt state advanced under the same active owner; retry from a fresh load")
         require(state == current, "production receipt is not the current committed state")
         data = self.receipt_bytes(state)
         self.api["s3"].put_object(Bucket=self.config.bucket,
@@ -228,7 +316,7 @@ def coordinator(event, context):
     try:
         return service.coordinator(event)
     except Exception as error:
-        if isinstance(error, AllocationDeferred) or retryable_io(error) or error_code(error) == "ConditionalCheckFailedException":
+        if isinstance(error, AllocationDeferred) or transient(error):
             return dict(state="wait", run=event["run"])
         raise
 
@@ -251,6 +339,6 @@ def watchdog(event, context):
     try:
         return service.watchdog(instances=instances)
     except Exception as error:
-        if retryable_io(error) or error_code(error) == "ConditionalCheckFailedException":
+        if transient(error):
             return dict(state="deferred")
         raise

@@ -8,7 +8,8 @@ transient responses permit bounded retries of the same action and producer attem
 
 RCP_PRODUCTION_ENABLED and RCP_PRODUCTION_ADMISSION_ENABLED default false and
 must both be literal "true". Deployment also supplies RCP_PRODUCTION_REPOSITORY,
-REPOSITORY_ID, OWNER_ID, AUDIENCE, SUBMIT_WORKFLOW and MACHINE_ARN (each with the
+REPOSITORY_ID, OWNER_ID, AUDIENCE, SUBMIT_WORKFLOW, MACHINE_ARN, GITHUB_APP_CLIENT_ID,
+GITHUB_APP_INSTALLATION_ID and GITHUB_APP_SECRET_ARN (each with the
 same RCP_PRODUCTION_ prefix). Service pins use Configuration.environment's
 RCP_DURABLE_ variables. Lambda must impose a finite outer execution timeout;
 SDK socket timeouts alone are not a hard wall-clock bound.
@@ -32,6 +33,7 @@ from .production_auth import GitHubIdentityError, GitHubIdentityVerifier, MAX_TO
 from .production_github import GitHubRunError, GitHubRateLimitError, GitHubRunReader
 from .production_github_app import GitHubAppConfig, cached_provider
 from .production_policy import Policy, canonical, manifest
+from .production_errors import transient
 
 
 MAX_EVENT_BYTES = 32 * 1024
@@ -183,11 +185,7 @@ def build_admission(*, api=None, clock=time.time):
     verifier = _cached_verifier(repository, repository_id, owner_id, audience, workflow) if clock is time.time else \
         GitHubIdentityVerifier(repository=repository, repository_id=repository_id,
             repository_owner_id=owner_id, audience=audience, workflow_refs={workflow}, clock=clock)
-    app = GitHubAppConfig(repository=repository, repository_id=repository_id,
-        repository_owner_id=owner_id, region=config.region, account=config.account,
-        app_client_id=os.environ["RCP_PRODUCTION_GITHUB_APP_CLIENT_ID"],
-        installation_id=os.environ["RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID"],
-        secret_arn=os.environ["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"])
+    app = GitHubAppConfig.from_environment(os.environ, region=config.region, account=config.account)
     reader = GitHubRunReader(repository=repository, repository_id=repository_id,
         repository_owner_id=owner_id, clock=clock, observation_factory=cached_provider(app).observation)
     clients = SubmissionClients(config.region) if api is None else api
@@ -205,6 +203,7 @@ def lambda_handler(event, context):
     try:
         action, token, checked = _event(event)
     except InvalidRequest:
+        print(json.dumps(dict(event="admission_failure", category="invalid_request", retryable=False), sort_keys=True))
         return {"ok": False, "error": "invalid_request"}
     try:
         service = build_admission()
@@ -212,7 +211,7 @@ def lambda_handler(event, context):
         return {"ok": True, "result": result}
     except Exception as error:
         # log fixed categories only, never bearer input, capabilities or raw exception text.
-        retryable = isinstance(error, GitHubRateLimitError) or retryable_io(error)
+        retryable = transient(error)
         category = "github_rate_limit" if isinstance(error, GitHubRateLimitError) else \
             "github_identity" if isinstance(error, GitHubIdentityError) else \
             "github_metadata" if isinstance(error, GitHubRunError) else \
@@ -224,6 +223,6 @@ def lambda_handler(event, context):
         print(json.dumps(detail, sort_keys=True))
         if retryable:
             return {"ok": False, "error": "admission_retryable",
-                    "retry_after_seconds": error.retry_after_seconds if isinstance(error, GitHubRateLimitError) else 5}
+                    "retry_after_seconds": getattr(error, "retry_after_seconds", 5)}
         # failures may hide a reservation; only same-attempt reconciliation is permitted.
         return {"ok": False, "error": "admission_unavailable"}

@@ -10,24 +10,14 @@ arbitrary saved measurement bytes. Publication must use the protected history pa
 from html import escape
 import os
 from pathlib import Path
-import re
 import tempfile
 
 from . import production_collection as collection, results
-from .common import digest, require
+from .common import require
 
-SCHEMA = "rcp-production-public-report-v1"
-MAX_PUBLIC_RECORD = 1024 * 1024
-MAX_PUBLIC_HTML = 2 * 1024 * 1024
-# public schemas are frozen history contracts. change these labels or the series-ID
-# algorithm only by adding a new schema; old records keep their original namespace.
-PUBLIC_CONTRACTS = {
-    "rcp-production-public-report-v1": {
-        "validation": "Metadata/size only; does not prove content integrity or detect same-size corruption.",
-        "series_contract": "aws-local-ext4-v1",
-    },
-}
-VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
+from . import production_projection as projection
+from .production_projection import (SCHEMA, MAX_PUBLIC_RECORD, MAX_PUBLIC_HTML,
+                                    PUBLIC_CONTRACTS, VALIDATION, validate_public)
 
 
 def source_fields(bundle, manifest):
@@ -54,89 +44,32 @@ def verify_replay(saved, bundle):
 
 def project(bundle):
     manifest = bundle.validate()
-    identity = manifest["identity"]
-    contract = PUBLIC_CONTRACTS[SCHEMA]
-    value = dict(schema=SCHEMA, run_key=bundle.run_key, retirement_sha256=bundle.record.retirement_sha256,
-        benchmark_valid=manifest["benchmark_valid"], cleanup_verified=True, validation=contract["validation"],
-        identity={key: identity[key] for key in ("run", "run_url", "suite", "baseline", "candidate", "controller")},
-        comparison=results.comparison_label(identity, results.json_value(bundle.payloads["controller.json"])),
-        measurements=[], series_contract=contract["series_contract"],
-        note="Four copies form two local pairs; this small run does not establish broad variance.")
-    if manifest["benchmark_valid"]:
-        # the authenticated retirement binds the collector's original verdict. inspect
-        # retained bytes with their recorded contract, never today's launch/admission
-        # rules. the offline bundle itself is not an authentication mechanism.
-        with tempfile.TemporaryDirectory(prefix="production-export-") as directory:
-            root = Path(directory)
-            for name in ("controller.json", "status.json", "results.zip"):
-                if name in bundle.payloads:
-                    (root / name).write_bytes(bundle.payloads[name])
-            evidence, raw, _ = results.inspect(root, identity, manifest["producer_conclusion"])
-        require(not evidence["errors"] and raw is not None and raw["status"] == "complete",
-                "retired successful measurements cannot be read")
-        require(evidence["expected_verification"] == source_fields(bundle, manifest)["verification"],
-                "retired verification identity differs from measurements")
-        pins = bundle.record.state["request"]["pins"]
-        value["comparison"] = results.comparison_label(identity, evidence["controller"])
-        value["measurements"] = [{
-            **{key: item[key] for key in ("case_id", "variant_id", "median", "samples")},
-            "series_id": digest(collection.encoded([
-                contract["series_contract"], item["series_id"], pins["ami"], pins["source"]])),
-        } for item in raw["summaries"]]
-        value["verification"] = evidence["expected_verification"]
-        value["timestamp"] = raw["timestamp"]
+    fields = source_fields(bundle, manifest)
+    report = results.json_value(bundle.payloads["report.json"], collection.MAX_REPORT)
+    if "public_projection" in report:
+        # trusted retirement/inventory authenticates these collector-produced bytes;
+        # the embedded digest is consistency, not independent authentication.
+        value = projection.bind(report["public_projection"], bundle.record.retirement_sha256)
     else:
-        value["note"] = "Safely retired failed qualification; excluded from performance history."
-    require(all(value.get(key) == expected for key, expected in source_fields(bundle, manifest).items()),
+        # compatibility for pre-projection retained evidence. new collections always
+        # freeze the projection; this legacy parser is never used for those records.
+        identity, raw = manifest["identity"], None
+        evidence = report["evidence"]
+        if manifest["benchmark_valid"]:
+            with tempfile.TemporaryDirectory(prefix="production-export-") as directory:
+                root = Path(directory)
+                for name in ("controller.json", "status.json", "results.zip"):
+                    if name in bundle.payloads:
+                        (root / name).write_bytes(bundle.payloads[name])
+                evidence, raw, _ = results.inspect(root, identity, manifest["producer_conclusion"])
+            require(not evidence["errors"] and raw is not None and raw["status"] == "complete",
+                    "legacy projection inspect: " + "; ".join(evidence["errors"])[:1024])
+            require(evidence["expected_verification"] == fields["verification"],
+                    "retired verification identity differs from measurements")
+        value = projection.bind(projection.freeze(bundle.run_key, identity, bundle.record.state["request"]["pins"],
+            manifest["benchmark_valid"], evidence, raw), bundle.record.retirement_sha256)
+    require(all(value.get(key) == expected for key, expected in fields.items()),
             "public projection differs from retained source identity")
-    raw = collection.encoded(value)
-    require(len(raw) <= MAX_PUBLIC_RECORD, "public report exceeds bound")
-    return value
-
-
-def validate_public(value):
-    require(isinstance(value, dict) and isinstance(value.get("schema"), str) and
-            value["schema"] in PUBLIC_CONTRACTS, "unsupported public report schema")
-    contract = PUBLIC_CONTRACTS[value["schema"]]
-    require(isinstance(value.get("run_key"), str) and re.fullmatch(r"repo-[1-9][0-9]{0,19}-run-[1-9][0-9]{0,19}", value["run_key"]) and
-            isinstance(value.get("retirement_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["retirement_sha256"]) and
-            type(value.get("benchmark_valid")) is bool and value.get("cleanup_verified") is True and
-            value.get("validation") == contract["validation"], "invalid public report")
-    fields = {"schema", "run_key", "retirement_sha256", "benchmark_valid", "cleanup_verified", "validation",
-              "identity", "comparison", "measurements", "series_contract", "note"}
-    if value["benchmark_valid"]:
-        fields.update({"verification", "timestamp"})
-    require(set(value) == fields and value.get("series_contract") == contract["series_contract"] and
-            isinstance(value.get("comparison"), str) and 0 < len(value["comparison"]) <= 256 and
-            isinstance(value.get("note"), str) and 0 < len(value["note"]) <= 512,
-            "unexpected or unbounded public report fields")
-    if value["benchmark_valid"]:
-        require(isinstance(value["verification"], dict) and value["verification"] and
-                len(collection.encoded(value["verification"])) <= 4096 and
-                isinstance(value["timestamp"], str) and 0 < len(value["timestamp"]) <= 64,
-                "invalid public verification or timestamp")
-        results.utc(value["timestamp"])
-    require(isinstance(value.get("identity"), dict) and set(value["identity"]) == {
-        "run", "run_url", "suite", "baseline", "candidate", "controller"}, "invalid public identity")
-    identity = value["identity"]
-    require(isinstance(identity["suite"], str) and 0 < len(identity["suite"]) <= 128, "invalid public suite")
-    require(isinstance(identity["run"], str) and re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,9}", identity["run"]),
-            "invalid public run")
-    run, attempt = identity["run"].split("-")
-    require(value["run_key"].endswith("-run-" + run) and
-            identity["run_url"] == "https://github.com/wykurz/rcp/actions/runs/" + run + "/attempts/" + attempt and
-            all(isinstance(identity[key], str) and re.fullmatch(r"[0-9a-f]{40}", identity[key])
-                for key in ("baseline", "candidate", "controller")), "invalid public revision or link")
-    require(isinstance(value.get("measurements"), list) and len(value["measurements"]) <= 100 and
-            (value["benchmark_valid"] or not value["measurements"]), "failed run has performance measurements")
-    for item in value["measurements"]:
-        require(isinstance(item, dict) and set(item) == {"case_id", "variant_id", "series_id", "median", "samples"} and
-                all(isinstance(item[key], str) and 0 < len(item[key]) <= 256 for key in ("case_id", "variant_id", "series_id")) and
-                collection.results.measurements.nonnegative(item["median"]) and
-                isinstance(item["samples"], list) and 0 < len(item["samples"]) <= 100 and
-                all(collection.results.measurements.nonnegative(sample) for sample in item["samples"]),
-                "invalid public measurements")
-    require(len(collection.encoded(value)) <= MAX_PUBLIC_RECORD, "public report exceeds bound")
     return value
 
 
@@ -179,7 +112,8 @@ def render(value):
     identity = value["identity"]
     fields = [("Run", identity["run"]), ("Suite", identity["suite"]), ("Comparison", value["comparison"]),
         ("Baseline", identity["baseline"]), ("Candidate", identity["candidate"]),
-        ("Qualification", "passed" if value["benchmark_valid"] else "failed"), ("Cleanup", "verified"),
+        ("Qualification", "unavailable; workload outcome unknown" if value.get("qualification_outcome") == "evidence-unavailable"
+         else "passed" if value["benchmark_valid"] else "failed"), ("Cleanup", "verified"),
         ("Validation", value["validation"])]
     rows = "".join("<tr><th>" + escape(name) + "</th><td>" + escape(str(item)) + "</td></tr>" for name, item in fields)
     metrics = "".join("<tr>" + "".join("<td>" + escape(str(item[key])) + "</td>" for key in

@@ -173,14 +173,15 @@ class ProductionGitHubTests(unittest.TestCase):
                 self.fetch.side_effect = error
                 try:
                     self.reader.read(identity())
-                except github.GitHubRunError as caught:
+                except github.GitHubTransientError as caught:
                     self.assertNotIn("secret fixture response", "".join(traceback.format_exception(caught)))
                 else:
                     self.fail("fetch failure was accepted")
                 self.assertEqual(self.fetch.call_count, 1)
         self.fetch.reset_mock()
         self.fetch.side_effect = [raw(self.attempt), TimeoutError("second read failure")]
-        self.assert_rejected()
+        with self.assertRaises(github.GitHubTransientError):
+            self.reader.read(identity())
         self.assertEqual(self.fetch.call_count, 2)
 
     def test_invalid_clock_cannot_create_a_proof(self):
@@ -220,6 +221,13 @@ class ProductionGitHubTests(unittest.TestCase):
         self.reader = self.make_reader(fetcher=None, observation_factory=observation)
         self.assert_rejected()
         self.assertEqual(self.fetch.call_count, 2)
+
+    def test_reader_preserves_typed_transient_and_delay(self):
+        self.fetch.side_effect = github.GitHubTransientError(30)
+        with self.assertRaises(github.GitHubTransientError) as caught:
+            self.reader.read(identity())
+        self.assertEqual(caught.exception.retry_after_seconds, 30)
+        self.assertEqual(self.fetch.call_count, 1)
 
     def test_reader_preserves_sanitized_rate_limit_delay(self):
         self.fetch.side_effect = github.GitHubRateLimitError(120)

@@ -202,6 +202,39 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
         self.assertEqual(self.cloud.ddb.items["rate#day#2026-10-22"]["runs"]["N"], "1")
 
+    def test_progress_during_seal_proof_reads_reconciles_fresh_phase_without_start(self):
+        for phase in ("launching", "uncertain", "requested", "closing"):
+            with self.subTest(phase=phase):
+                self.cloud = Cloud()
+                self.cloud.begin()
+                self.cloud.upload()
+                self.cloud.seal()
+                def progress(who):
+                    store = self.cloud.service.store(who)
+                    state, revision = store.load()
+                    state["phase"] = phase
+                    if phase == "launching":
+                        store.save_launch_intent(state, revision)
+                    else:
+                        store.save(state, revision)
+                    return WorkflowRun.verify(run_json(who), who, self.cloud.now)
+                self.cloud.reader.read.side_effect = progress
+                value = self.cloud.seal()
+                self.assertEqual(value["state"], phase)
+                if phase != "closing":
+                    self.assertEqual(value["execution_status"], "RUNNING")
+                else:
+                    self.assertNotIn("execution_status", value)
+                self.assertEqual(self.cloud.api["stepfunctions"].start_execution.call_count, 1)
+                self.assertEqual(self.cloud.ddb.items["rate#day#2026-10-22"]["runs"]["N"], "1")
+
+    def test_disabled_policy_stops_before_github_reads_or_reservation(self):
+        self.cloud.policy = policy(enabled=False)
+        with self.assertRaises(ValueError):
+            self.cloud.begin()
+        self.cloud.reader.read.assert_not_called()
+        self.assertEqual(self.cloud.ddb.writes, [])
+
     def test_lost_start_response_reconciles_only_exact_execution(self):
         self.cloud.begin()
         self.cloud.upload()
@@ -252,6 +285,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
     def test_short_capacity_expires_before_seal_without_armed_intent(self):
         self.cloud.policy = policy(capacity_seconds=60)
         response = self.cloud.begin()
+        self.assertEqual(response["upload_deadline"], response["capacity_deadline"])
         self.assertTrue(all(call.kwargs["ExpiresIn"] == 60 for call in
                             self.cloud.api["s3"].generate_presigned_url.call_args_list))
         self.cloud.upload()

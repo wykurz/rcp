@@ -33,9 +33,27 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Pin current main for this site
+        id: source
+        timeout-minutes: 1
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/main > "$RUNNER_TEMP/pages-source-ref"
+          python3 - "$RUNNER_TEMP/pages-source-ref" <<'PY'
+          import os, re, sys
+          from pathlib import Path
+          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
+          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/main']
+          assert len(commits) == 1 and re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact main reference'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('commit=' + commits[0] + '\n')
+          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ steps.source.outputs.commit }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,10 +79,12 @@ jobs:
               commit=$(python3 - "$RUNNER_TEMP/aws-pages-ref" <<'PY'
           import re, sys
           from pathlib import Path
-          value = Path(sys.argv[1]).read_text()
-          match = re.fullmatch(r'([0-9a-f]{40})\trefs/heads/aws-benchmark-history\n', value)
-          assert match, 'Invalid AWS history reference'
-          print(match[1])
+          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
+          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/aws-benchmark-history']
+          assert len(commits) <= 1, 'Ambiguous exact AWS history reference'
+          if commits:
+              assert re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact AWS history reference'
+              print(commits[0])
           PY
               )
             else
@@ -101,12 +121,13 @@ jobs:
           path: ${{ runner.temp }}/artifact.tar
           retention-days: 1
           if-no-files-found: error
-      # serialization prevents a newer Pages deployment overtaking this final check.
-      # a delayed publisher from an older main must not roll the site back.
+      # serialize deployments and recheck the pinned render source immediately before publishing
+      # a concurrent merge must produce a visible retry request instead of a green skipped update
       - name: Check that this site still belongs to current main
         id: current_main
         timeout-minutes: 1
         env:
+          PAGES_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           GIT_CONFIG_NOSYSTEM: '1'
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_TERMINAL_PROMPT: '0'
@@ -115,14 +136,21 @@ jobs:
           python3 - "$RUNNER_TEMP/pages-main-ref" <<'PY'
           import os, re, sys
           from pathlib import Path
-          match = re.fullmatch(r'([0-9a-f]{40})\trefs/heads/main\n', Path(sys.argv[1]).read_text())
-          assert match, 'Invalid main reference'
-          current = match[1] == os.environ['GITHUB_SHA']
+          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
+          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/main']
+          assert len(commits) == 1 and re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact main reference'
+          source = os.environ['PAGES_SOURCE_COMMIT']
+          assert re.fullmatch(r'[0-9a-f]{40}', source), 'Invalid pinned Pages source'
+          current = commits[0] == source
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('current=' + str(current).lower() + '\n')
           if not current:
+              message = (f'Pages deployment blocked: main advanced from {source} to {commits[0]}. '
+                         'Re-run this workflow to render current main with the same pinned history.')
+              print('::error::' + message)
               with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                  summary.write('Skipped stale Pages deployment: main has advanced. Public history remains retained.\n')
+                  summary.write(message + '\n')
+              raise SystemExit(1)
           PY
       - name: Deploy project site
         if: steps.current_main.outputs.current == 'true'

@@ -1,5 +1,6 @@
 """Offline production package isolation, reproducibility and input-boundary tests."""
 
+from contextlib import chdir
 import csv
 import hashlib
 import io
@@ -7,9 +8,10 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 from infra.aws_benchmark import production_package as package
@@ -22,6 +24,9 @@ class InputsTests(unittest.TestCase):
         self.assertIn("infra/aws_benchmark/production_collection.py", sources)
         self.assertIn("infra/aws_benchmark/production_collection_handler.py", sources)
         self.assertIn("infra/aws_benchmark/production_startup.py", sources)
+        self.assertIn("infra/aws_benchmark/production_errors.py", sources)
+        self.assertIn("infra/aws_benchmark/production_projection.py", sources)
+        self.assertIn("infra/aws_benchmark/production_objects.py", sources)
         self.assertEqual(package.ENTRYPOINTS["infra.aws_benchmark.production_collection_handler"], ("lambda_handler",))
         self.assertIn("assets/site-theme.html", sources)
         self.assertNotIn("infra/aws_benchmark/production_client.py", sources)
@@ -42,6 +47,14 @@ class InputsTests(unittest.TestCase):
         del sources["infra/aws_benchmark/production_startup.py"]
         with self.assertRaisesRegex(ValueError, "unreviewed or missing source dependency.*production_startup"):
             package.verify_source_closure(sources)
+
+    def test_reconciliation_and_projection_dependencies_cannot_be_omitted(self):
+        for name in ("production_errors", "production_projection", "production_objects"):
+            with self.subTest(name=name):
+                sources = package.source_snapshot(package.ROOT)
+                del sources["infra/aws_benchmark/" + name + ".py"]
+                with self.assertRaisesRegex(ValueError, "unreviewed or missing source dependency.*" + name):
+                    package.verify_source_closure(sources)
 
     def test_unpinned_external_dependency_cannot_silently_enter_package(self):
         sources = package.source_snapshot(package.ROOT)
@@ -79,6 +92,55 @@ class InputsTests(unittest.TestCase):
             (root / "linked.whl").symlink_to(root / "ordinary")
             with self.assertRaisesRegex(ValueError, "ordinary file"):
                 package.wheel_snapshot(root)
+
+
+class CopyContractProbeTests(unittest.TestCase):
+    def operation(self, *, present=True, exclude=True, header="x-amz-object-annotation-directive"):
+        from botocore.model import StringShape
+        from botocore.session import get_session
+        operation = get_session().get_service_model("s3").operation_model("CopyObject")
+        # explicit model fixture tests both paths on an older optional development SDK
+        if present:
+            operation.input_shape.members["AnnotationDirective"] = StringShape("AnnotationDirective", {
+                "type": "string", "enum": ["COPY", "EXCLUDE"] if exclude else ["COPY"],
+                "location": "header", "locationName": header})
+        else:
+            operation.input_shape.members.pop("AnnotationDirective", None)
+        return operation
+
+    def probe(self, operation):
+        session = Mock()
+        session.get_service_model.return_value.operation_model.return_value = operation
+        namespace = {}
+        with patch("botocore.session.get_session", return_value=session):
+            exec(package.S3_COPY_PROBE, namespace)
+        import botocore
+        session.register_component.assert_called_once()
+        name, loader = session.register_component.call_args.args
+        self.assertEqual(name, "data_loader")
+        self.assertEqual(loader.search_paths, [str(Path(botocore.__file__).resolve().parent / "data")])
+        return namespace
+
+    def test_deployment_probe_requires_supported_model_and_exact_wire_header(self):
+        self.assertIn(package.S3_COPY_PROBE, package.ISOLATED_PROBE)
+        result = self.probe(self.operation())
+        self.assertEqual(result["copy_wire"]["headers"]["x-amz-object-annotation-directive"], "EXCLUDE")
+        for operation, message in ((self.operation(present=False), "lacks required"),
+                                   (self.operation(exclude=False), "lacks required"),
+                                   (self.operation(header="x-amz-wrong-header"), "wire contract")):
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.probe(operation)
+
+    def test_unmodified_development_sdk_is_rejected_if_it_lacks_deployed_capability(self):
+        from botocore.session import get_session
+        operation = get_session().get_service_model("s3").operation_model("CopyObject")
+        if "AnnotationDirective" not in operation.input_shape.members:
+            with self.assertRaisesRegex(RuntimeError, "lacks required"):
+                exec(package.S3_COPY_PROBE, {})
+        else:
+            namespace = {}
+            exec(package.S3_COPY_PROBE, namespace)
+            self.assertEqual(namespace["copy_wire"]["headers"]["x-amz-object-annotation-directive"], "EXCLUDE")
 
 
 class BuiltPackageTests(unittest.TestCase):
@@ -131,6 +193,28 @@ class BuiltPackageTests(unittest.TestCase):
                                     member.date_time == (2020, 1, 1, 0, 0, 0) for member in archive.infolist()))
                 rows = csv.reader(io.StringIO(archive.read("fixture-1.0.dist-info/RECORD").decode()))
                 self.assertTrue(all(row[0] in archive.namelist() for row in rows))
+
+    def test_relative_interpreter_survives_the_probe_working_directory_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, wheels = self.fixture(directory)
+            interpreter = Path(directory) / "tools/python312"
+            interpreter.parent.mkdir()
+            interpreter.symlink_to(sys.executable)
+            output = Path(directory) / "relative.zip"
+            observed = []
+            install = self.install("/one")
+            def installer(stage, wheel_stage, requirements, python312):
+                observed.append(python312)
+                install(stage, wheel_stage, requirements, python312)
+            probe = "import json, os; print(json.dumps({'probe_cwd': os.getcwd()}))"
+            with patch.object(package, "ROOT", root), patch.object(package, "install_dependencies", installer), \
+                    patch.object(package, "ISOLATED_PROBE", probe), chdir(directory):
+                receipt = package.package(output, wheels, Path("tools/python312"))
+            self.assertEqual(observed, [interpreter])
+            probe_cwd = Path(receipt["verification"]["probe_cwd"])
+            self.assertTrue(probe_cwd.is_relative_to(directory))
+            self.assertNotEqual(probe_cwd, Path(directory))
+            self.assertTrue(output.is_file())
 
     def test_missing_source_fails_without_creating_partial_archive(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock
 from contextlib import contextmanager
 
-from .production_github import TerminalProducerReader, GitHubRunError
+from .production_github import TerminalProducerReader, GitHubRunError, GitHubTransientError
 from .production_policy import producer_identity
 from .test_production_policy import identity, run_json
 
@@ -33,6 +33,13 @@ class TerminalProducerReaderTests(unittest.TestCase):
         paths = [call.args[0] for call in self.fetch.call_args_list]
         self.assertEqual(paths, [self.path + "/attempts/1", self.path,
             self.path + "/attempts/1/jobs?per_page=100", self.path + "/pending_deployments", self.path])
+
+    def test_terminal_reader_preserves_typed_transient_without_partial_proof(self):
+        self.fetch.side_effect = [json.dumps(self.run).encode(), GitHubTransientError(30)]
+        with self.assertRaises(GitHubTransientError) as caught:
+            self.reader.read(self.producer)
+        self.assertEqual(caught.exception.retry_after_seconds, 30)
+        self.assertEqual(self.fetch.call_count, 2)
 
     def test_newer_attempt_requires_its_complete_job_inventory(self):
         self.values[self.path] = self.run | dict(run_attempt=2)
