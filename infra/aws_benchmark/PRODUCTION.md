@@ -138,6 +138,18 @@ holds ownership except for the explicit evidence-unavailable outcome above. The 
 the public projection in the retained report before retirement; later first publication of those
 records does not use today's measurement parser. Both the frozen projection and explicit
 qualification outcome are required; no pre-deployment legacy fallback reinterprets missing fields.
+Collection first commits a bounded `report.json` checkpoint containing the run/state binding, exact
+source references and presence, collection time, verdict, and controller/summary digests. Only then
+are the other immutable objects and final versioned manifest written. An interrupted retry recovers
+matching retained input copies before consulting the original sources and preserves committed
+presentation bytes. It still revalidates the current qualification verdict and repeats physical and
+execution checks before the fenced retirement transaction. Competing collectors cannot replace the
+winning checkpoint or retire twice. Missing input bytes that were never copied cannot be
+reconstructed from a digest after source expiry: collection holds rather than changing the frozen
+verdict. Partial sets from an older collector without a checkpoint also require explicit recovery;
+they are never silently omitted or adopted. Completed older manifests remain readable. A missing
+derived object whose renderer has changed requires compatible code to reproduce its committed bytes.
+
 Already-published history is never rewritten. Public v1 success/failure records and v2's distinct
 evidence-unavailable outcome remain readable. New v3 records carry a canonical collector-recorded
 `collected_at`; old records display no trusted collection time instead of presenting the
