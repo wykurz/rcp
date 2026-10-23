@@ -637,10 +637,15 @@ class AmiBuildTests(unittest.TestCase):
         script = (ami.HERE / "install-worker.sh").read_text()
         script = script.split("cp -r benchmarks", 1)[1].split("progress complete", 1)[0]
         script = ("cp -r benchmarks" + script).replace("/opt/rcp-benchmark", str(destination))
-        stubs = ("set -euo pipefail\numask 077\nprogress() { :; }\npython3() { :; }\n"
+        stubs = ("set -euo pipefail\numask 077\nprogress() { :; }\n"
+                 'python3() { if [[ "${*: -1}" == *"install_output_contract("* ]]; then command python3 "$@"; fi; }\n'
                  "git() { echo pinned-revision; }\nchown() { :; }\n"
                  'runuser() { shift 3; "$@"; }\n')
         subprocess.run(["bash"], input=stubs + script, cwd=source, text=True, check=True)
+        from infra.aws_benchmark import production_startup
+        marker = destination / production_startup.OUTPUT_CONTRACT_FILE
+        self.assertEqual(marker.read_text(), production_startup.OUTPUT_CONTRACT + "\n")
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o444)
         for tree in [destination / "benchmarks", destination / "infra"]:
             for path in [tree, *tree.rglob("*")]:
                 mode = path.stat().st_mode

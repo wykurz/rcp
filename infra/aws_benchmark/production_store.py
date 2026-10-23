@@ -14,7 +14,8 @@ import uuid
 
 from benchmarks.strict_json import parse_json
 
-from .common import require, retryable_io
+from .common import error_code, require, retryable_io
+from .production_errors import RevisionConflict
 
 MAX_INTEGER = 2 ** 63 - 1
 MAX_STATE_BYTES = 128 * 1024
@@ -27,13 +28,13 @@ class ReconciliationRequired(RuntimeError):
     """The exact operation must be reconciled before any further side effect."""
 
 
-def _unresolved(message, error, observed_error=None):
+def _unresolved(message, error, observed_error=None, *, allow_retry=True):
     """Preserve transient I/O without treating it as evidence that a write did not commit.
 
     Callers must reload the exact run/revision before further side effects. This helper
     never retries a write, follows arbitrary cause chains, or hides an invalid readback.
     """
-    if retryable_io(error) and (observed_error is None or retryable_io(observed_error)):
+    if allow_retry and retryable_io(error) and (observed_error is None or retryable_io(observed_error)):
         if observed_error is not None:
             raise error from observed_error
         raise error
@@ -88,6 +89,8 @@ def _string(value):
 def _state(value, request=None):
     require(isinstance(value, dict) and isinstance(value.get("request"), dict), "state has no immutable request")
     require(value.get("phase") in PHASES, "invalid production state phase")
+    require("launch_replayed" not in value or value["launch_replayed"] is True,
+            "replay sender marker must be literal true")
     if request is not None:
         require(value["request"] == request, "state changed the immutable request")
     return _encoded(value, MAX_STATE_BYTES)
@@ -351,17 +354,53 @@ class RunStore:
         require(isinstance(state, dict) and state.get("phase") == "launching", "launch intent must enter launching")
         return self._save(state, revision, launch_intent=True)
 
-    def _save(self, state, revision, *, launch_intent):
+    def save_launch_retry(self, state, revision):
+        """Fence the exact unresolved attempt and persist its monotonic replay-sender marker."""
+        require(isinstance(state, dict) and state.get("phase") in {"launching", "uncertain"},
+                "launch retry requires an unresolved attempt")
+        return self._save(state, revision, launch_intent=True, launch_retry=True)
+
+    def _revision_conflict(self, record, owner, revision, error=None):
+        if error is not None and not retryable_io(error):
+            code = error_code(error)
+            reasons = (getattr(error, "response", None) or {}).get("CancellationReasons")
+            revision_rejected = (code == "ConditionalCheckFailedException" or
+                code == "TransactionCanceledException" and isinstance(reasons, list) and len(reasons) in (2, 3) and
+                all(isinstance(reason, dict) and reason.get("Code") == (
+                    "ConditionalCheckFailed" if index == 1 else "None") for index, reason in enumerate(reasons)))
+            if not revision_rejected:
+                return
+        if (record is not None and not record.closed and not record.terminal and
+                self._owner(owner) and record.revision > revision):
+            raise RevisionConflict("same owner advanced the state revision; reload before retry")
+
+    def _save(self, state, revision, *, launch_intent, launch_retry=False):
+        _integer(revision)
         item, owner = self._read_items([self.pk, "active"])
         record = self._record(item)
         require(record is not None and not record.closed and self._owner(owner), "run no longer owns the active slot")
         _state(state, record.admission["initial_payload"]["state"]["request"])
+        self._revision_conflict(record, owner, revision)
         require(record.revision == revision and not record.terminal, "state is stale or already terminal")
+        require(record.state.get("launch_replayed") is not True or state.get("launch_replayed") is True,
+                "replay sender marker cannot be removed")
+        if record.state.get("worker_output") is not None:
+            require(_encoded(state.get("worker_output"), MAX_STATE_BYTES) ==
+                    _encoded(record.state["worker_output"], MAX_STATE_BYTES), "worker output commitment cannot change")
         _item_bytes(dict(item, state=_string(_state(state)), revision=_number(revision + 1),
                          terminal={"BOOL": state["phase"] == "complete"}))
         items = [{"ConditionCheck": self._owner_condition()}, self._state_update(state, revision)]
         if launch_intent:
-            require(record.state["phase"] == "armed", "launch intent requires an armed run")
+            if launch_retry:
+                require(state.get("launch_replayed") is True and
+                        ("launch_replayed" not in record.state or record.state["launch_replayed"] is True) and
+                        state == dict(record.state, launch_replayed=True) and state.get("launch_outcome") == "uncertain" and
+                        state.get("allocation_consumed") is True and isinstance(state.get("attempt"), dict) and
+                        state.get("binding") is None and state.get("known_instance_ids") == [] and
+                        state.get("seen") == {} and state.get("close_reason") is None,
+                        "launch retry must preserve the exact unresolved unobserved attempt")
+            else:
+                require(record.state["phase"] == "armed", "launch intent requires an armed run")
             items.append({"ConditionCheck": self._policy_condition(record.admission["policy_version"])})
         try:
             self._write(items)
@@ -369,14 +408,16 @@ class RunStore:
             try:
                 item, owner = self._read_items([self.pk, "active"])
                 observed = self._record(item)
-                if (observed is not None and not observed.closed and self._owner(owner) and
+                # a retry checkpoint needs its own acknowledged policy check;
+                # another writer can produce identical state without checking that policy.
+                if (not launch_retry and observed is not None and not observed.closed and self._owner(owner) and
                         observed.revision == revision + 1 and observed.state == state):
                     return observed.revision
             except Exception as observed_error:
                 _unresolved("state write failed and its outcome is unreadable", error, observed_error)
-            if observed == record and self._owner(owner):
-                _unresolved("state write rejected or uncertain; reconcile the exact revision", error)
-            raise ReconciliationRequired("state write rejected or uncertain; reconcile the exact revision") from error
+            self._revision_conflict(observed, owner, revision, error)
+            _unresolved("state write rejected or uncertain; reconcile the exact revision", error,
+                        allow_retry=observed == record and self._owner(owner))
         return revision + 1
 
     def retire(self, evidence_sha256, revision):
@@ -409,9 +450,8 @@ class RunStore:
                     return observed
             except Exception as observed_error:
                 _unresolved("retirement failed and its outcome is unreadable", error, observed_error)
-            if observed == record and self._owner(owner):
-                _unresolved("retirement rejected or uncertain; retain the ownership hold", error)
-            raise ReconciliationRequired("retirement rejected or uncertain; retain the ownership hold") from error
+            _unresolved("retirement rejected or uncertain; retain the ownership hold", error,
+                        allow_retry=observed == record and self._owner(owner))
         try:
             item, owner = self._read_items([self.pk, "active"])
             observed = self._record(item)

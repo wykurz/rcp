@@ -148,6 +148,22 @@ class ReportSiteTests(unittest.TestCase):
                 if url.fragment and target.suffix == '.html':
                     self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
 
+    def test_unavailable_evidence_is_not_labeled_as_a_failed_workload(self):
+        value = self.aws_record('125', passed=False)
+        value.update(schema='rcp-production-public-report-v2', qualification_outcome='evidence-unavailable',
+            note='Safely retired with unavailable evidence; workload success or failure is unknown.')
+        repository = self.aws_history({value['run_key'] + '.json': ('100644', value)})
+        result = self.build('--aws-history', str(repository))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('unavailable; workload outcome unknown', index)
+        self.assertNotIn('failed; excluded from performance history', index)
+        record = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
+        self.assertEqual(json.loads(record.read_text()), value)
+        page = self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')
+        self.assertIn('unavailable; workload outcome unknown', page.read_text())
+        self.assertNotIn('<td>failed</td>', page.read_text())
+
     def test_aws_public_record_strings_are_escaped(self):
         value = self.aws_record()
         value['identity']['suite'] = '<script>alert(1)</script>'

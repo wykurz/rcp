@@ -209,6 +209,29 @@ class HandlerTests(unittest.TestCase):
             self.assertNotIn(TOKEN, out.getvalue())
             service.begin.assert_called_once()
 
+    def test_sanitized_auth_transients_and_revision_races_retry_the_same_producer(self):
+        from .production_auth import GitHubIdentityTransientError
+        from .production_github import GitHubTransientError
+        from .production_errors import RevisionConflict
+        for error in (GitHubIdentityTransientError(), GitHubTransientError(), RevisionConflict("same owner")):
+            service = Mock()
+            service.begin.side_effect = error
+            with self.subTest(kind=type(error).__name__), patch.dict(os.environ, environment(), clear=True), \
+                    patch.object(handler, "build_admission", return_value=service), patch("builtins.print") as logged:
+                result = handler.lambda_handler(request(), None)
+            self.assertEqual(result["error"], "admission_retryable")
+            self.assertEqual(result["retry_after_seconds"], getattr(error, "retry_after_seconds", 5))
+            self.assertTrue(json.loads(logged.call_args.args[0])["retryable"])
+            service.begin.assert_called_once()
+
+    def test_invalid_request_logs_fixed_category_without_bearer_input(self):
+        with patch.dict(os.environ, environment(), clear=True), patch("builtins.print") as logged:
+            result = handler.lambda_handler({"token": TOKEN}, None)
+        self.assertEqual(result["error"], "invalid_request")
+        self.assertEqual(json.loads(logged.call_args.args[0]),
+            dict(event="admission_failure", category="invalid_request", retryable=False))
+        self.assertNotIn(TOKEN, str(logged.call_args))
+
     def test_signing_key_cache_reused_only_for_identical_immutable_trust_config(self):
         handler._cached_verifier.cache_clear()
         self.addCleanup(handler._cached_verifier.cache_clear)

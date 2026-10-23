@@ -115,7 +115,7 @@ def tagged_expiry(instance, namespace, now):
     return close
 
 
-def validate_allocation_instance(value, instance, allocation):
+def validate_allocation_instance(value, instance, allocation, *, reconciliation=False):
     """Identify accepted allocation evidence without authorizing useful worker runtime."""
     validate(value)
     start, launch = utc(allocation["started_at"]), utc(instance["LaunchTime"])
@@ -128,9 +128,12 @@ def validate_allocation_instance(value, instance, allocation):
     pins = value["pins"]
     require(instance["ImageId"] == pins["ami"] and instance.get("InstanceType") == INSTANCE_TYPE
             and not instance.get("InstanceLifecycle"), "instance image, type or purchase path differs")
-    require(instance.get("SubnetId") == pins["subnet"] and
-            instance.get("IamInstanceProfile", {}).get("Arn") == pins["profile_arn"] and
-            {g["GroupId"] for g in instance.get("SecurityGroups", [])} == {pins["security_group"]},
+    terminal = reconciliation and instance.get("State", {}).get("Name") in ("shutting-down", "terminated")
+    require((terminal and "SubnetId" not in instance or instance.get("SubnetId") == pins["subnet"]) and
+            (terminal and "IamInstanceProfile" not in instance or
+             instance.get("IamInstanceProfile", {}).get("Arn") == pins["profile_arn"]) and
+            (terminal and "SecurityGroups" not in instance or
+             {g["GroupId"] for g in instance.get("SecurityGroups", [])} == {pins["security_group"]}),
             "instance network or profile differs")
     observed = instance_tags(instance)
     require(all(observed.get(k) == v for k, v in tags(value, allocation).items()), "allocation tags differ")
@@ -140,6 +143,7 @@ def validate_allocation_instance(value, instance, allocation):
 def bind(value, instance, allocation):
     launch = validate_allocation_instance(value, instance, allocation)
     require(launch < utc(value["capacity_deadline"]), "instance launch is outside this allocation interval")
+    require(instance.get("State", {}).get("Name") in ("pending", "running"), "instance is not eligible for runtime")
     return dict(instance_id=instance["InstanceId"], image_id=instance["ImageId"],
                 instance_type=instance["InstanceType"], launch_at=timestamp(launch),
                 close_at=allocation["close_at"], deadline=timestamp(utc(allocation["close_at"]) - timedelta(

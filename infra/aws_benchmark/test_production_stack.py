@@ -36,8 +36,9 @@ BINARY_NAMES = [variant + "/" + name for variant in ("baseline", "candidate")
 APP_CONFIG = {
     "GitHubAppClientId": "Iv23.example-client",
     "GitHubAppInstallationId": "123456789",
-    "GitHubAppSecretArn": "arn:aws:secretsmanager:us-east-1:381183037896:secret:/rcp/production/github-read-app-Ab1Cd2",
+    "GitHubAppSecretSuffix": "Ab1Cd2",
 }
+APP_SECRET_ARN = f"arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:/rcp/production/github-read-app-Ab1Cd2"
 NO_VALUE = object()
 VALUES = {
     **APP_CONFIG,
@@ -62,6 +63,11 @@ def sequence(value):
     return value if isinstance(value, list) else [value]
 
 
+def condition_enabled(name, enabled=True, admission=True, publication=True):
+    return {"Enabled": enabled, "Admitting": enabled and admission, "Publishing": publication,
+            "GitHubAppConfigured": all(VALUES[key] for key in APP_CONFIG)}[name]
+
+
 def resolve(value, enabled=True, admission=True, publication=True):
     if isinstance(value, list):
         resolved = [resolve(item, enabled, admission, publication) for item in value]
@@ -74,8 +80,7 @@ def resolve(value, enabled=True, admission=True, publication=True):
         return VALUES[".".join(value["Fn::GetAtt"])]
     if set(value) == {"Fn::If"}:
         condition, yes, no = value["Fn::If"]
-        active = {"Enabled": enabled, "Admitting": enabled and admission, "Publishing": publication,
-                  "GitHubAppConfigured": all(VALUES[key] for key in APP_CONFIG)}[condition]
+        active = condition_enabled(condition, enabled, admission, publication)
         return resolve(yes if active else no, enabled, admission, publication)
     if set(value) == {"Fn::Sub"}:
         def replace(match):
@@ -87,7 +92,13 @@ def resolve(value, enabled=True, admission=True, publication=True):
 
 def statements(role, enabled=True, admission=True, publication=True):
     policies = resolve(TEMPLATE["Resources"][role]["Properties"]["Policies"], enabled, admission, publication)
-    return [statement for policy in policies for statement in policy["PolicyDocument"]["Statement"]]
+    documents = [policy["PolicyDocument"] for policy in policies]
+    for resource in TEMPLATE["Resources"].values():
+        if resource["Type"] != "AWS::IAM::RolePolicy" or resource["Properties"]["RoleName"] != {"Ref": role}:
+            continue
+        if "Condition" not in resource or condition_enabled(resource["Condition"], enabled, admission, publication):
+            documents.append(resolve(resource["Properties"]["PolicyDocument"], enabled, admission, publication))
+    return [statement for document in documents for statement in document["Statement"]]
 
 
 def conditions_match(conditions, context):
@@ -696,8 +707,12 @@ class GitHubAppConfigurationTests(unittest.TestCase):
                       for index, (key, value) in enumerate(APP_CONFIG.items())}
             with patch.dict(VALUES, values):
                 for role in ("AdmissionRole", "CollectorRole"):
-                    self.assertEqual(permits(role, "secretsmanager:GetSecretValue", APP_CONFIG["GitHubAppSecretArn"],
+                    self.assertEqual(permits(role, "secretsmanager:GetSecretValue", APP_SECRET_ARN,
                         {"secretsmanager:VersionStage": "AWSCURRENT"}, enabled=False, admission=False), present == 7)
+                for function in ("AdmissionFunction", "CollectorFunction"):
+                    env = TEMPLATE["Resources"][function]["Properties"]["Environment"]["Variables"]
+                    self.assertEqual(resolve(env["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"]),
+                                     APP_SECRET_ARN if present == 7 else "")
                 for enabled, admission in ((False, False), (False, True), (True, False), (True, True)):
                     parameters = values | {"RuntimeEnabled": str(enabled).lower(),
                                            "AdmissionEnabled": str(admission).lower()}
@@ -708,14 +723,12 @@ class GitHubAppConfigurationTests(unittest.TestCase):
         self.assertEqual(TEMPLATE["Conditions"]["GitHubAppConfigured"], {"Fn::And": [
             {"Fn::Not": [{"Fn::Equals": [{"Ref": key}, ""]}]} for key in APP_CONFIG]})
 
-    def test_identifier_constraints_reject_wrong_locations_wildcards_and_partial_arns(self):
-        secret = APP_CONFIG["GitHubAppSecretArn"]
+    def test_identifier_constraints_reject_wildcards_arns_and_invalid_suffixes(self):
         invalid = {
             "GitHubAppClientId": [" ", "../client", "x" * 101, "client\n", "*"],
             "GitHubAppInstallationId": ["0", "01", "-1", "1.0", "1" * 21, "*"],
-            "GitHubAppSecretArn": [secret[:-7], secret + "*", secret + "/extra", secret + "\n",
-                secret.replace("381183037896", "123456789012"), secret.replace("us-east-1", "us-west-2"),
-                secret.replace("github-read-app", "other"), secret[:-6] + "*", secret[:-6] + "ab_cd1"],
+            "GitHubAppSecretSuffix": [APP_SECRET_ARN, "12345", "1234567", "*", "Ab1Cd*", "ab_cd1",
+                "Ab1Cd2\n", "Ab1Cd2/extra", "../abc", "Ab1Cd-", "Ab1Cdé"],
         }
         for key, candidates in invalid.items():
             for value in candidates:
@@ -723,8 +736,27 @@ class GitHubAppConfigurationTests(unittest.TestCase):
         for client in ("Iv1.0123456789abcdef", "Iv23liOpaqueNoDot", "A" * 100):
             self.assertTrue(self.accepted(APP_CONFIG | {"GitHubAppClientId": client, "RuntimeEnabled": "true"}))
 
+    def test_secret_arn_is_bound_to_deployment_account_region_and_exact_suffix(self):
+        context = {"secretsmanager:VersionStage": "AWSCURRENT"}
+        for account, region in ((ACCOUNT, REGION), ("210987654321", "eu-west-1")):
+            for suffix in ("Ab1Cd2", "123456", "abcdef", "ABCDEF"):
+                with self.subTest(account=account, region=region, suffix=suffix), patch.dict(VALUES, {
+                        "AWS::AccountId": account, "AWS::Region": region, "GitHubAppSecretSuffix": suffix}):
+                    secret = f"arn:aws:secretsmanager:{region}:{account}:secret:/rcp/production/github-read-app-{suffix}"
+                    self.assertTrue(self.accepted(APP_CONFIG | {"GitHubAppSecretSuffix": suffix,
+                                                               "RuntimeEnabled": "true"}))
+                    for name in ("Admission", "Collector"):
+                        env = TEMPLATE["Resources"][name + "Function"]["Properties"]["Environment"]["Variables"]
+                        self.assertEqual(resolve(env["RCP_PRODUCTION_GITHUB_APP_SECRET_ARN"]), secret)
+                        self.assertTrue(permits(name + "Role", "secretsmanager:GetSecretValue", secret, context))
+                        for other in (secret.replace(account, "999999999999"),
+                                      secret.replace(region, "ap-southeast-2"),
+                                      secret.replace("arn:aws:", "arn:aws-cn:"), secret[:-6] + "New123",
+                                      secret.replace("github-read-app", "another-secret")):
+                            self.assertFalse(permits(name + "Role", "secretsmanager:GetSecretValue", other, context))
+
     def test_only_admission_and_collector_can_read_exact_current_external_secret(self):
-        secret = APP_CONFIG["GitHubAppSecretArn"]
+        secret = APP_SECRET_ARN
         readers = {"AdmissionRole", "CollectorRole"}
         roles = [name for name, resource in TEMPLATE["Resources"].items() if resource["Type"] == "AWS::IAM::Role"]
         for role in roles:
@@ -746,16 +778,37 @@ class GitHubAppConfigurationTests(unittest.TestCase):
         self.assertFalse(any(resource["Type"].startswith(("AWS::SecretsManager::", "AWS::KMS::"))
                              for resource in TEMPLATE["Resources"].values()))
 
+    def test_app_policies_are_deleted_independently_of_retained_service_roles(self):
+        resources = TEMPLATE["Resources"]
+        expected = {name + "GitHubAppPolicy" for name in ("Admission", "Collector")}
+        self.assertEqual({name for name, value in resources.items() if value["Type"] == "AWS::IAM::RolePolicy"}, expected)
+        for name in ("Admission", "Collector"):
+            policy = resources[name + "GitHubAppPolicy"]
+            self.assertEqual(policy["Condition"], "GitHubAppConfigured")
+            self.assertEqual(policy["DeletionPolicy"], "Delete")
+            self.assertEqual(policy["UpdateReplacePolicy"], "Delete")
+            self.assertEqual(policy["Properties"]["RoleName"], {"Ref": name + "Role"})
+            self.assertEqual(policy["Properties"]["PolicyName"], "GitHubReadAppCredential")
+            self.assertNotIn("secretsmanager:", json.dumps(resources[name + "Role"]["Properties"]["Policies"]))
+        self.assertEqual(resources["CollectorRole"]["DeletionPolicy"], "Retain")
+        self.assertEqual(resources["CollectorRole"]["UpdateReplacePolicy"], "Retain")
+        # stack deletion retains the collector but removes these separately managed policies
+        remaining = {name: value for name, value in resources.items() if name not in expected}
+        with patch.dict(TEMPLATE, {"Resources": remaining}):
+            for role in ("AdmissionRole", "CollectorRole"):
+                self.assertFalse(permits(role, "secretsmanager:GetSecretValue", APP_SECRET_ARN,
+                                 {"secretsmanager:VersionStage": "AWSCURRENT"}))
+
     def test_only_proof_readers_receive_non_secret_app_configuration(self):
-        expected = {"RCP_PRODUCTION_GITHUB_APP_CLIENT_ID": "GitHubAppClientId",
-                    "RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID": "GitHubAppInstallationId",
-                    "RCP_PRODUCTION_GITHUB_APP_SECRET_ARN": "GitHubAppSecretArn"}
+        expected = {"RCP_PRODUCTION_GITHUB_APP_CLIENT_ID": APP_CONFIG["GitHubAppClientId"],
+                    "RCP_PRODUCTION_GITHUB_APP_INSTALLATION_ID": APP_CONFIG["GitHubAppInstallationId"],
+                    "RCP_PRODUCTION_GITHUB_APP_SECRET_ARN": APP_SECRET_ARN}
         for name, resource in TEMPLATE["Resources"].items():
             if resource["Type"] != "AWS::Lambda::Function":
                 continue
             env = resource["Properties"]["Environment"]["Variables"]
             actual = {key: value for key, value in env.items() if key.startswith("RCP_PRODUCTION_GITHUB_APP_")}
-            self.assertEqual(actual, {key: {"Ref": value} for key, value in expected.items()}
+            self.assertEqual(resolve(actual), expected
                              if name in {"AdmissionFunction", "CollectorFunction"} else {}, name)
         for role in ("AdmissionRole", "CollectorRole"):
             trust = TEMPLATE["Resources"][role]["Properties"]["AssumeRolePolicyDocument"]

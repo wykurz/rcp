@@ -87,15 +87,20 @@ class ProductionCloud(Cloud):
 
     def list_objects_v2(self, **parameters):
         keys = sorted(key for key in self.objects if key.startswith(parameters["Prefix"]))
-        return dict(IsTruncated=len(keys) > parameters["MaxKeys"],
+        return dict(IsTruncated=len(keys) > parameters["MaxKeys"], KeyCount=min(len(keys), parameters["MaxKeys"]),
                     Contents=[dict(Key=key) for key in keys[:parameters["MaxKeys"]]])
 
     def get_object(self, **parameters):
+        key, version = parameters["Key"], parameters.get("VersionId")
         try:
-            data = self.objects[parameters["Key"]]
+            data = self.versions[(key, version)] if version is not None else self.objects[key]
         except KeyError:
-            raise ApiError("NoSuchKey", status=404)
-        return {"ContentLength": len(data), "Body": io.BytesIO(data)}
+            raise ApiError("NoSuchVersion" if version else "NoSuchKey", status=404)
+        version = version or self.object_versions.get(key, "test-version-" + common.digest(data))
+        self.versions[(key, version)] = data
+        return dict(ContentLength=len(data), Body=io.BytesIO(data), VersionId=version,
+                    ServerSideEncryption="AES256", ChecksumType="FULL_OBJECT",
+                    ChecksumSHA256=base64.b64encode(bytes.fromhex(common.digest(data))).decode("ascii"))
 
     def put_object(self, **parameters):
         key = parameters["Key"]
@@ -463,7 +468,7 @@ class ProductionWatchdogTests(unittest.TestCase):
                 call = cloud.api["s3"].list_objects_v2.call_args.kwargs
                 self.assertEqual(call, dict(Bucket=cloud.config.bucket, Prefix=paths.status, MaxKeys=1))
 
-    def test_copy_and_status_parameters_match_current_sdk(self):
+    def test_copy_requires_annotation_support_and_status_parameters_match_sdk(self):
         import boto3
         from botocore.stub import Stubber
         cloud = ProductionCloud()
@@ -475,16 +480,30 @@ class ProductionWatchdogTests(unittest.TestCase):
         cloud.service.api = {**cloud.api, "s3": s3}
         expected = dict(Bucket=cloud.config.bucket, Key=paths.binary("candidate/rcp"),
             CopySource=dict(Bucket=cloud.config.bucket, Key=entry["key"], VersionId=entry["version"]),
-            ChecksumAlgorithm="SHA256", ServerSideEncryption="AES256", MetadataDirective="REPLACE",
+            ChecksumAlgorithm="SHA256", ServerSideEncryption="AES256", MetadataDirective="REPLACE", AnnotationDirective="EXCLUDE",
             ContentType="application/octet-stream", IfNoneMatch="*")
+        operation = s3.meta.service_model.operation_model("CopyObject")
+        if "AnnotationDirective" not in operation.input_shape.members:
+            # older optional development SDKs must reject the unchanged request, never omit the guard
+            from botocore.exceptions import ParamValidationError
+            with patch.object(s3._endpoint, "make_request", side_effect=AssertionError("network must not be reached")) as send:
+                with self.assertRaisesRegex(ParamValidationError, "AnnotationDirective"):
+                    cloud.service.copy_binary(paths.binary("candidate/rcp"), entry)
+                send.assert_not_called()
+        else:
+            wire_parameters = dict(expected, CopySource="/bucket/source?versionId=source-version-3")
+            wire = s3._serializer.serialize_to_request(wire_parameters, operation)
+            self.assertEqual(wire["headers"]["x-amz-object-annotation-directive"], "EXCLUDE")
+            with Stubber(s3) as stub:
+                stub.add_response("copy_object", dict(VersionId="sdk-version"), expected)
+                head = cloud.head_object(Key=paths.binary("candidate/rcp"))
+                stub.add_response("head_object", head,
+                                  dict(Bucket=cloud.config.bucket, Key=paths.binary("candidate/rcp"), ChecksumMode="ENABLED"))
+                cloud.service.copy_binary(paths.binary("candidate/rcp"), entry)
+                stub.assert_no_pending_responses()
         with Stubber(s3) as stub:
-            stub.add_response("copy_object", dict(VersionId="sdk-version"), expected)
-            head = cloud.head_object(Key=paths.binary("candidate/rcp"))
-            stub.add_response("head_object", head,
-                              dict(Bucket=cloud.config.bucket, Key=paths.binary("candidate/rcp"), ChecksumMode="ENABLED"))
-            stub.add_response("list_objects_v2", dict(IsTruncated=False, Contents=[]),
+            stub.add_response("list_objects_v2", dict(IsTruncated=False, KeyCount=0, Contents=[]),
                               dict(Bucket=cloud.config.bucket, Prefix=paths.status, MaxKeys=1))
-            cloud.service.copy_binary(paths.binary("candidate/rcp"), entry)
             self.assertEqual(cloud.service.read_worker_status(cloud.state), common.pending_status("123-1"))
             stub.assert_no_pending_responses()
 

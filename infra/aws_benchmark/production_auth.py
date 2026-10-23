@@ -45,6 +45,20 @@ class GitHubIdentityError(ValueError):
     """A token or trusted key set could not be verified; messages exclude input."""
 
 
+class GitHubIdentityTransientError(GitHubIdentityError):
+    """A sanitized key-source outage; no unverified identity may be returned."""
+
+    def __init__(self, retry_after_seconds=JWKS_REFRESH_SECONDS):
+        super().__init__("GitHub signing key temporarily unavailable")
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _retryable_transport(error):
+    # certificate validation and malformed request configuration are not outages
+    return (isinstance(error, (OSError, http.client.HTTPException))
+            and not isinstance(error, (ssl.SSLCertVerificationError, http.client.InvalidURL)))
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedGitHubIdentity:
     """Identity derived exclusively from validated, signed GitHub claims."""
@@ -119,23 +133,32 @@ def _fetch_official_jwks() -> bytes:
         connection.request("GET", "/.well-known/jwks", headers={"Accept": "application/json"})
         transport = connection.sock
         response = connection.getresponse()
+        if response.status == 429 or 500 <= response.status < 600:
+            raise GitHubIdentityTransientError()
         _require(response.status == 200)
         _require(response.getheader("Content-Encoding", "identity") == "identity")
         chunks = []
         remaining = MAX_JWKS_BYTES + 1
         while remaining:
             timeout = deadline - time.monotonic()
-            _require(timeout > 0)
+            if timeout <= 0:
+                raise GitHubIdentityTransientError()
             # read1 performs at most one underlying read; reset to the remaining budget
-            if transport is not None:
+            if transport is not None and not response.isclosed():
                 transport.settimeout(timeout)
             chunk = response.read1(remaining)
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
-        _require(remaining > 0 and time.monotonic() <= deadline)
+        _require(remaining > 0)
+        if time.monotonic() > deadline:
+            raise GitHubIdentityTransientError()
         return b"".join(chunks)
+    except Exception as error:
+        if _retryable_transport(error):
+            raise GitHubIdentityTransientError() from None
+        raise
     finally:
         if response is not None:
             response.close()
@@ -175,12 +198,15 @@ class GitHubIdentityVerifier:
         self._keys = {}
         self._fetched_at = None
         self._last_refresh = None
+        self._refresh_transient = False
         self._lock = threading.Lock()
 
     def verify(self, token: str) -> VerifiedGitHubIdentity:
         """Return verified identity, or raise a sanitized GitHubIdentityError."""
         try:
             return self._verify(token)
+        except GitHubIdentityTransientError:
+            raise
         except (jwt.PyJWTError, ValueError, TypeError, UnicodeError, RecursionError,
                 OverflowError):
             raise GitHubIdentityError("invalid GitHub admission token") from None
@@ -250,14 +276,20 @@ class GitHubIdentityVerifier:
             if fresh and kid in self._keys:
                 return self._keys[kid]
             if self._last_refresh is not None and now - self._last_refresh < JWKS_REFRESH_SECONDS:
+                if self._refresh_transient and now >= self._last_refresh:
+                    raise GitHubIdentityTransientError(JWKS_REFRESH_SECONDS)
                 raise GitHubIdentityError("GitHub signing key unavailable")
             self._last_refresh = now
+            self._refresh_transient = False
             # a failed refresh invalidates the previous set; never use stale keys
             self._keys = {}
             self._fetched_at = None
             try:
                 self._keys = self._parse_keys(self._fetch())
-            except Exception:
+            except Exception as error:
+                if isinstance(error, GitHubIdentityTransientError) or _retryable_transport(error):
+                    self._refresh_transient = True
+                    raise GitHubIdentityTransientError() from None
                 raise GitHubIdentityError("GitHub signing key unavailable") from None
             self._fetched_at = now
             _require(kid in self._keys)

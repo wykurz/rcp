@@ -101,7 +101,9 @@ class Fixture:
             IamInstanceProfile=dict(Arn=pins["profile_arn"]),
             Tags=[dict(Key=k, Value=v) for k, v in durable.tags(request, attempt).items()],
             LaunchTemplate=dict(LaunchTemplateId=pins["lt_id"], Version=pins["lt_version"]))
+        self.instance["State"] = dict(Name="running", Code=16)
         bound = durable.bind(request, self.instance, attempt)
+        self.instance["State"] = dict(Name="terminated", Code=48)
         self.finish = common.utc(request["outer_deadline"]) + timedelta(seconds=durable.DELIVERY_DRAIN_SECONDS)
         self.execution_arn = durable_client.execution_arn(MACHINE, request["run"])
         state = durable.initial_lease(request)
@@ -207,8 +209,12 @@ class CollectionTests(unittest.TestCase):
         again = self.fx.collector.collect(retire=True)
         self.assertEqual(again, value)
         self.assertEqual(len(self.fx.s3.writes), writes)
+    def test_production_submission_proof_does_not_broaden_legacy_cli_conclusions(self):
+        self.assertEqual(results.CONCLUSIONS, ("success", "failure", "cancelled", "skipped"))
+        self.assertIs(collection.CONCLUSIONS, results.SUBMISSION_CONCLUSIONS)
+
     def test_cancelled_or_failed_submission_does_not_invalidate_successful_worker(self):
-        for conclusion in ("cancelled", "failure", "timed_out"):
+        for conclusion in sorted(results.SUBMISSION_CONCLUSIONS - {"success"}):
             with self.subTest(conclusion=conclusion):
                 fx = Fixture(self.directory.name)
                 for kind in ("attempt", "current"):
@@ -225,13 +231,114 @@ class CollectionTests(unittest.TestCase):
                         identity=evidence["identity"], archive_sha256=evidence["files"]["results.zip"],
                         ami_id=fx.config.ami, harness_revision=fx.config.source))
 
-    def test_observed_completion_cannot_be_reclassified_after_output_expiry(self):
-        self.fx.store.record.state["close_reason"] = "worker completed; result validity is separate from physical cleanup"
+    def commit_outputs(self, fx):
+        fx.store.record.state["worker_output"] = {
+            "status": fx.collector.objects.read(fx.paths.status, collection.MAX_DOCUMENT)[1],
+            "results": fx.collector.objects.read(fx.paths.results, common.MAX_RESULT)[1]}
+        fx.publish()
+
+    def test_committed_versions_survive_new_current_versions_and_shutdown_reason(self):
+        self.commit_outputs(self.fx)
+        self.fx.store.record.state["close_reason"] = "bound instance stopped or terminated"
+        self.fx.publish()
+        self.fx.s3.seed(self.fx.paths.status, b"unrelated later status")
+        self.fx.s3.seed(self.fx.paths.results, b"unrelated later result")
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("success", True), value)
+        manifest = json.loads(self.fx.s3.objects[value["retention"]["key"]]["1"])
+        self.assertEqual(manifest["sources"]["status.json"], self.fx.store.record.state["worker_output"]["status"])
+        self.assertEqual(manifest["sources"]["results.zip"], self.fx.store.record.state["worker_output"]["results"])
+
+    def test_committed_missing_evidence_has_bounded_unknown_outcome_not_failed_workload(self):
+        self.commit_outputs(self.fx)
+        del self.fx.s3.objects[self.fx.paths.status]
+        del self.fx.s3.objects[self.fx.paths.results]
+        self.assertIn("recovery grace", self.assertHeld()["reason"])
+        self.fx.finish = common.utc(self.fx.store.record.state["binding"]["deadline"]) + timedelta(
+            seconds=collection.EVIDENCE_RECOVERY_SECONDS)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"], value["qualification_outcome"]),
+                         ("unavailable", True, "evidence-unavailable"), value)
+        self.assertFalse(value["benchmark_valid"])
+        report = json.loads(self.fx.s3.objects[self.fx.collector.prefix + "report.json"]["1"])
+        self.assertEqual(report["evidence_availability"]["missing"], ["results.zip", "status.json"])
+        self.assertIn("unknown", report["public_projection"]["note"])
+        with patch.object(results, "inspect", side_effect=AssertionError("historical parser")), \
+                patch.object(results, "validate_qualification", side_effect=AssertionError("historical admission")), \
+                patch.object(collection.projection, "freeze", side_effect=AssertionError("historical projection")), \
+                patch.object(collection, "EVIDENCE_RECOVERY_SECONDS", 1):
+            self.assertEqual(self.fx.collector.collect(retire=True), value)
+
+    def test_uncommitted_expired_outputs_do_not_turn_success_unknown_into_failure(self):
+        self.fx.store.record.state["close_reason"] = "bound instance stopped or terminated"
         self.fx.publish()
         del self.fx.s3.objects[self.fx.paths.status]
         del self.fx.s3.objects[self.fx.paths.results]
-        result = self.assertHeld()
-        self.assertIn("completion evidence is missing", result["reason"])
+        self.fx.finish = NOW + timedelta(seconds=collection.MAILBOX_EXPIRY_SECONDS)
+        self.assertHeld()
+        self.fx.finish = common.utc(self.fx.store.record.state["binding"]["deadline"]) + timedelta(
+            seconds=collection.EVIDENCE_RECOVERY_SECONDS)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("unavailable", True), value)
+
+    def test_failed_archive_capture_then_expiry_is_unknown_not_failed_workload(self):
+        with patch.object(self.fx.s3, "head_object", create=True, side_effect=Error("AccessDenied")):
+            with self.assertRaises(Error):
+                self.fx.service.read_worker_status(self.fx.store.record.state)
+        self.assertNotIn("worker_output", self.fx.store.record.state)
+        del self.fx.s3.objects[self.fx.paths.status]
+        del self.fx.s3.objects[self.fx.paths.results]
+        self.fx.finish = common.utc(self.fx.store.record.state["binding"]["deadline"]) + timedelta(
+            seconds=collection.EVIDENCE_RECOVERY_SECONDS - 1)
+        self.assertHeld()
+        self.fx.finish += timedelta(seconds=1)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("unavailable", True), value)
+
+    def test_expired_missing_indicated_archive_is_explicitly_unavailable(self):
+        del self.fx.s3.objects[self.fx.paths.results]
+        self.fx.finish = common.utc(self.fx.store.record.state["binding"]["deadline"]) + timedelta(
+            seconds=collection.EVIDENCE_RECOVERY_SECONDS)
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("unavailable", True), value)
+        report = json.loads(self.fx.s3.objects[self.fx.collector.prefix + "report.json"]["1"])
+        self.assertEqual(report["evidence_availability"]["missing"], ["results.zip"])
+
+    def test_aged_inaccessible_or_corrupt_committed_evidence_still_holds(self):
+        self.commit_outputs(self.fx)
+        self.fx.finish = NOW + timedelta(days=30)
+        original = self.fx.s3.get_object
+        for error in (Error("AccessDenied"), TimeoutError(), Error("InternalError")):
+            with self.subTest(error=type(error).__name__):
+                def inaccessible(**args):
+                    if args["Key"] == self.fx.paths.status:
+                        raise error
+                    return original(**args)
+                with patch.object(self.fx.s3, "get_object", side_effect=inaccessible):
+                    self.assertHeld()
+        self.fx.s3.objects[self.fx.paths.status]["1"] = b"corrupt"
+        self.assertHeld()
+
+    def test_terminal_coordinator_failure_does_not_invalidate_bound_successful_worker(self):
+        for status in ("FAILED", "TIMED_OUT", "ABORTED"):
+            with self.subTest(status=status):
+                fx = Fixture(self.directory.name)
+                fx.execution["status"] = status
+                value = fx.collector.collect(retire=True)
+                self.assertEqual((value["state"], value["retired"]), ("success", True), value)
+                report = json.loads(fx.s3.objects[fx.collector.prefix + "report.json"]["1"])
+                self.assertEqual(report["execution_proof"]["status"], status)
+                self.assertIn(status, report["public_projection"]["note"])
+                self.assertEqual(fx.collector.collect(retire=True), value)
+
+    def test_terminal_failed_execution_does_not_bypass_invalid_worker_evidence(self):
+        self.fx.execution["status"] = "TIMED_OUT"
+        self.fx.s3.seed(self.fx.paths.results, b"invalid worker archive")
+        self.fx.s3.seed(self.fx.paths.status, collection.encoded(dict(common.completed_status("123-1", True),
+            sha256=common.digest(b"invalid worker archive"))))
+        value = self.fx.collector.collect(retire=True)
+        self.assertEqual((value["state"], value["retired"]), ("failed", True), value)
+        self.assertFalse(value["benchmark_valid"])
 
     def test_missing_checksum_and_trailing_stream_bytes_hold(self):
         original = self.fx.s3.get_object

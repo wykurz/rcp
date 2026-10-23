@@ -13,7 +13,6 @@ import re
 from .common import BINARIES, MAX_BINARY, require, timestamp, utc
 from . import durable
 
-MICRO_USD = 1_000_000
 MAX_RUN_AGE_SECONDS = 7200
 MAX_PRICE_AGE_SECONDS = 31 * 86400
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -145,7 +144,7 @@ def manifest(value):
     require(all(isinstance(value[side], str) and SHA.fullmatch(value[side]) for side in ("baseline", "candidate")),
             "benchmark revisions must be pinned full SHAs")
     require(value["suite"] == "bulk-1g-metadata", "production suite is not allowlisted")
-    # The first unattended acceptance uses the measured A/A workload. A/B admission
+    # the first unattended acceptance uses the measured A/A workload. A/B admission
     # needs its own reviewed contract and must not reinterpret historical A/A proof.
     require(value["baseline"] == value["candidate"], "initial production acceptance requires A/A")
     binaries = value["binaries"]

@@ -70,7 +70,7 @@ class Admission:
         require(0 < remaining <= UPLOAD_SECONDS and record.state["phase"] == "awaiting-inputs",
                 "input upload period is closed")
         result = receipt(record)
-        result["upload_deadline"] = original["upload_deadline"]
+        result["upload_deadline"] = timestamp(deadline)
         result["uploads"] = {}
         for binary, entry in original["manifest"]["binaries"].items():
             checksum = base64.b64encode(bytes.fromhex(entry["sha256"])).decode("ascii")
@@ -100,6 +100,7 @@ class Admission:
             return self.upload_urls(identity, existing)
         require(identity.run_attempt == "1", "workflow reruns cannot create a new reservation")
         policy = self.policy()
+        policy.reservation(self.now())
         observed = self.run_reader.read(identity)
         approved = authorize(policy, identity, observed, checked, self.now())
         require((self.now() - utc(observed.created_at)).total_seconds() + UPLOAD_SECONDS < MAX_RUN_AGE_SECONDS,
@@ -158,20 +159,20 @@ class Admission:
             return receipt(record)
         original = record.admission["initial_payload"]
         require(identity.run_attempt == original["producer"]["run_attempt"], "workflow reruns cannot submit another allocation")
-        if record.state["phase"] in {"launching", "uncertain", "requested"}:
-            # a successful start may advance before its reply, or that reply may be lost.
-            # reconcile only the existing exact execution; this path cannot start anything.
-            state, _ = store.load()
+        state, revision = store.load()
+        if state["phase"] in ("awaiting-inputs", "armed"):
+            policy = self.policy()
+            require(policy.enabled and policy.version == record.admission["policy_version"], "admission policy changed or is disabled")
+            self.run_reader.read(identity)
+            # proof reads can race normal coordinator progress; branch on the fresh owner snapshot
+            state, revision = store.load()
+        if state["phase"] in {"launching", "uncertain", "requested"}:
             require(state["submission_arn"] == execution_arn(self.machine, state["request"]["run"]),
                     "progressed submission differs")
             found = self.api["stepfunctions"].describe_execution(executionArn=state["submission_arn"])
             return receipt(store.read()) | self.verify_execution(found, state, record)
-        if record.state["phase"] not in ("awaiting-inputs", "armed"):
-            return receipt(record)
-        policy = self.policy()
-        require(policy.enabled and policy.version == record.admission["policy_version"], "admission policy changed or is disabled")
-        self.run_reader.read(identity)
-        state, revision = store.load()
+        if state["phase"] not in ("awaiting-inputs", "armed"):
+            return receipt(store.read())
         if state["phase"] == "awaiting-inputs":
             deadline = min(utc(original["upload_deadline"]), utc(state["request"]["capacity_deadline"]))
             require(self.now() < deadline, "input upload or capacity period expired")

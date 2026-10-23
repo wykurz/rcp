@@ -62,7 +62,7 @@ class RuntimeReviewTests(unittest.TestCase):
                     self.assertEqual(len(cloud.launches), before)
 
     def test_late_inventory_recovers_after_ack_closure_and_capacity_expiry(self):
-        for delay in (durable.LAUNCH_ACK_SECONDS + 1, durable.CAPACITY_SECONDS + 1):
+        for delay in (durable.RUNTIME_SECONDS, durable.CAPACITY_SECONDS + 1):
             with self.subTest(delay=delay):
                 cloud = self.uncertain()
                 instances, cloud.instances = cloud.instances, []

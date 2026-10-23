@@ -19,7 +19,7 @@ from . import durable
 from .ami_image import launch_template_data
 from .common import (BINARIES, MAX_BINARY, REQUEST_KEY, STATUS_KEY, WINDOW_KEY,
                      get_json, put_json, error_code, retryable_io, INSTANCE_TYPE, require, timestamp, utc,
-                     durable_plan_contract)
+                     durable_plan_contract, RevisionConflict)
 
 REQUEST = "control/durable-request.json"
 RECEIPT = "output/durable-receipt.json"
@@ -67,7 +67,7 @@ class AllocationDeferred(Exception):
 
 
 def transient(error):
-    return retryable_io(error) or error_code(error) == "ConditionalCheckFailedException"
+    return isinstance(error, RevisionConflict) or retryable_io(error) or error_code(error) == "ConditionalCheckFailedException"
 
 
 def capacity_rejection(error):
@@ -161,7 +161,7 @@ class Service:
         return get_json(self.api["s3"], self.config.bucket, STATUS_KEY)
 
     def watchdog_state(self, state, instances):
-        """Apply mode-specific closure obligations inside the watchdog cleanup tail."""
+        """Read mode-specific policy before useful binding; physical observations still follow."""
 
     def fresh_guard(self):
         response = self.api["dynamodb"].get_item(TableName=self.config.table,
@@ -302,7 +302,8 @@ class Service:
                     raise
 
     def expire_capacity(self, state):
-        if not state["binding"] and self.now() >= utc(state["request"]["capacity_deadline"]):
+        if (not state["binding"] and state["launch_outcome"] != "accepted" and
+                self.now() >= utc(state["request"]["capacity_deadline"])):
             state.update(phase="closing", close_reason=state["close_reason"] or "capacity wait expired")
             return True
         return False
@@ -335,6 +336,9 @@ class Service:
             elif state["launch_outcome"] == "accepted":
                 # positive evidence is monotonic, even after an uncertain response or write
                 return
+            elif (not_sent or capacity_rejection(failure)) and state.get("launch_replayed") is True:
+                # this sender's negative result cannot disprove a later same-token replay.
+                return
             elif not_sent or capacity_rejection(failure):
                 require(not state["known_instance_ids"] and not state["seen"] and not state["binding"],
                         "no-allocation evidence conflicts with observed allocation")
@@ -354,23 +358,32 @@ class Service:
                 state["phase"] = "closing" if state["close_reason"] else "uncertain"
         self.reconcile_launch(run, allocation, mutate, not_sent=not_sent)
 
-    def launch_allowed(self, request, observed):
+    def launch_allowed(self, request, observed, allocation=None):
         return (self.now() < utc(request["capacity_deadline"]) and
-                0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS)
+                0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS and
+                (allocation is None or (utc(allocation["close_at"]) - self.now()).total_seconds() >=
+                 durable.minimum_runtime(request["plan"])))
 
-    def launch(self, request, allocation, observed):
-        uncertain = None
+    def launch_recovery_open(self, state):
+        # the legacy controller never replays persisted unknown outcomes
+        return False
+
+    def observe_closed_worker(self, state):
+        """Allow production to preserve output commitments independently of useful runtime."""
+
+    def launch(self, request, allocation, observed, *, prior_uncertain=False):
+        uncertain = TimeoutError("previous launch outcome is unresolved") if prior_uncertain else None
         for retry in range(3):
             try:
-                # retries use the identical saved parameters/token/region/subnet, within this invocation only
+                # every retry uses the identical persisted parameters, token, region, subnet and cutoff
                 response = self.api["ec2"].run_instances(**allocation["parameters"])
             except Exception as error:
                 if capacity_rejection(error) and uncertain is None:
                     self.finish_launch(request["run"], allocation, failure=error)
                     return
                 uncertain = uncertain or error
-                if (not retryable_io(error) or not self.launch_allowed(request, observed) or
-                        not self.backoff(error, retry, reserve=24) or not self.launch_allowed(request, observed)):
+                if (not retryable_io(error) or not self.launch_allowed(request, observed, allocation) or
+                        not self.backoff(error, retry, reserve=24) or not self.launch_allowed(request, observed, allocation)):
                     # no later negative response can erase an earlier unknown allocation
                     self.finish_launch(request["run"], allocation, failure=uncertain)
                     return
@@ -455,21 +468,26 @@ class Service:
                 state["attempt"] is not None and state["allocation_consumed"]):
             try:
                 require(utc(instances[0]["LaunchTime"]) <= now, "future launch timestamp")
-                durable.validate_allocation_instance(request, instances[0], state["attempt"])
+                durable.validate_allocation_instance(request, instances[0], state["attempt"], reconciliation=True)
                 # positive identity evidence survives closure and later EC2 record expiry;
                 # it does not grant runtime, publish a mailbox or reopen a closing lease.
                 durable.launch_outcome(state, "accepted")
-                if not state["binding"] and not reason and allow_binding:
+                if state["phase"] in ("launching", "uncertain") and not reason:
+                    state["phase"] = "requested"
+                if instances[0]["State"]["Name"] not in ("pending", "running"):
+                    reason = reason or "allocated instance stopped or terminated"
+                elif not state["binding"] and not reason and allow_binding:
                     state["binding"] = durable.bind(request, instances[0], state["attempt"])
                     state["phase"] = "requested"
             except (ValueError, KeyError, TypeError) as error:
                 reason = reason or str(error)
-        if state["phase"] in ("launching", "uncertain") and state["attempt"] is not None and (
-                now - utc(state["attempt"]["started_at"])).total_seconds() >= durable.LAUNCH_ACK_SECONDS:
+        if (state["launch_outcome"] != "accepted" and state["phase"] in ("launching", "uncertain") and
+                state["attempt"] is not None and not self.launch_recovery_open(state) and (
+                now - utc(state["attempt"]["started_at"])).total_seconds() >= durable.LAUNCH_ACK_SECONDS):
             reason = reason or "launch acknowledgement expired; allocation outcome uncertain"
+        if state["attempt"] is not None and state["allocation_consumed"] and now >= utc(state["attempt"]["close_at"]):
+            reason = reason or "immutable allocation runtime exhausted"
         if state["binding"]:
-            if now >= utc(state["binding"]["close_at"]):
-                reason = reason or "immutable allocation runtime exhausted"
             bound = [i for i in instances if i["InstanceId"] == state["binding"]["instance_id"]]
             if bound and bound[0]["State"]["Name"] not in ("pending", "running"):
                 reason = reason or "bound instance stopped or terminated"
@@ -611,6 +629,10 @@ class Service:
                                 close_reason="worker completed; result validity is separate from physical cleanup")
         except Exception as error:
             failed(error)
+        try:
+            self.observe_closed_worker(state)
+        except Exception as error:
+            failed(error)
         # one tail attempts every independent obligation; a save failure cannot skip termination,
         # and a failed termination cannot hide the original contract failure or its state write
         if state["close_reason"] or state["phase"] == "complete":
@@ -657,7 +679,7 @@ def coordinator(event, context):
     try:
         return service.coordinator(event)
     except Exception as error:
-        if isinstance(error, AllocationDeferred) or retryable_io(error) or error_code(error) == "ConditionalCheckFailedException":
+        if isinstance(error, AllocationDeferred) or transient(error):
             return dict(state="wait", run=event["run"])
         raise
 
@@ -668,6 +690,6 @@ def watchdog(event, context):
     try:
         return service.watchdog()
     except Exception as error:
-        if retryable_io(error) or error_code(error) == "ConditionalCheckFailedException":
+        if transient(error):
             return dict(state="deferred")
         raise

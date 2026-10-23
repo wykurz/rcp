@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 
 from infra.aws_benchmark.common import retryable_io
 from infra.aws_benchmark.production_store import ReconciliationRequired
+from infra.aws_benchmark.production_errors import RevisionConflict, transient
 from infra.aws_benchmark.test_production_store import DynamoTransactions, decision, store
 
 
@@ -40,7 +41,7 @@ class ErrorClassificationTests(unittest.TestCase):
                         [{"Code": "TransactionConflict"}, {}], [None], [{"Code": None}],
                         [{"Code": ["TransactionConflict"]}], {"Code": "TransactionConflict"}):
             with self.subTest(reasons=reasons):
-                # A contradictory HTTP status cannot override a known permanent reason.
+                # a contradictory HTTP status cannot override a known permanent reason.
                 self.assertFalse(retryable_io(api_error("TransactionCanceledException", reasons=reasons, status=500)))
 
     def test_transport_throttle_and_server_errors_remain_retryable(self):
@@ -101,7 +102,7 @@ class StoreFailureTests(unittest.TestCase):
         self.cloud.after_commit, self.cloud.read_error = None, None
         recorded, next_revision = self.store.load()
         self.assertEqual((recorded, next_revision), (state, revision + 1))
-        with self.assertRaisesRegex(ValueError, "stale"):
+        with self.assertRaisesRegex(RevisionConflict, "revision"):
             self.store.save_launch_intent(state, revision)
         self.assertEqual(len(self.cloud.writes), 2)
 
@@ -147,7 +148,7 @@ class StoreFailureTests(unittest.TestCase):
         self.assertFalse(retryable_io(caught.exception))
         self.assertEqual(self.cloud.items[self.store.pk]["revision"], {"N": str(revision)})
 
-    def test_changed_owner_or_conflicting_revision_is_not_hidden_by_transport_error(self):
+    def test_changed_owner_and_verified_revision_conflict_have_distinct_outcomes(self):
         for changed in ("owner", "revision"):
             with self.subTest(changed=changed):
                 cloud = DynamoTransactions()
@@ -162,9 +163,10 @@ class StoreFailureTests(unittest.TestCase):
                         cloud.items[owner.pk]["revision"] = {"N": str(revision + 2)}
                     raise TimeoutError("write response lost")
                 cloud.after_commit = lost_response
-                with self.assertRaises(ReconciliationRequired) as caught:
+                expected = ReconciliationRequired if changed == "owner" else RevisionConflict
+                with self.assertRaises(expected) as caught:
                     owner.save(state, revision)
-                self.assertFalse(retryable_io(caught.exception))
+                self.assertEqual(transient(caught.exception), changed == "revision")
                 self.assertEqual(len(cloud.writes), 2)
 
     def test_corrupt_readback_is_not_hidden_by_transport_error(self):

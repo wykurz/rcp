@@ -1,6 +1,7 @@
 """Credential-free public projection, safe HTML and immutable historical replay."""
 
 from dataclasses import replace
+from datetime import timedelta
 import json
 import io
 import zipfile
@@ -8,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from benchmarks import operations
 
 from . import common, production_collection as collection, production_export as export
 from .common import digest, completed_status
@@ -75,8 +77,32 @@ class ExportTests(unittest.TestCase):
         with patch.object(export.results, "approve", side_effect=AssertionError("new-run-only gate")), \
                 patch.object(common, "DURABLE_PLAN", future_plan), \
                 patch.object(export.results, "verification_contract", return_value={"future": "contract"}), \
-                patch.object(export.results, "SERIES_CONTRACT", "future-series-v2"):
+                patch.object(export.results, "SERIES_CONTRACT", "future-series-v2"), \
+                patch.object(operations, "CONTRACT_REVISION", "future-operation-contract"), \
+                patch.object(operations, "SUMMARY_LOCALE", "future-locale"), \
+                patch.object(export.results, "inspect", side_effect=AssertionError("retired projection must not reparse")):
             self.assertEqual(export.project(bundle), original)
+
+    def test_project_reproduces_frozen_v1_success_and_failure_records(self):
+        # the projection boundary receives an authenticated bundle; its retirement
+        # digest is supplied independently here to keep the original golden records
+        # unchanged when collector diagnostics or retained envelope bytes evolve.
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                name = "production-public-report-v1" + ("-failed" if failed else "") + ".json"
+                golden = json.loads((Path(__file__).with_name("fixtures") / name).read_bytes())
+                bundle = self.reader.download(self.key)
+                manifest = json.loads(bundle.manifest_bytes)
+                report = json.loads(bundle.payloads["report.json"])
+                if failed:
+                    manifest["benchmark_valid"] = False
+                    report["benchmark_valid"] = False
+                    report["public_projection"] = export.projection.freeze(bundle.run_key, manifest["identity"],
+                        bundle.record.state["request"]["pins"], False, report["evidence"], None)
+                value = replace(bundle, record=replace(bundle.record, retirement_sha256=golden["retirement_sha256"]),
+                    payloads=dict(bundle.payloads, **{"report.json": collection.encoded(report)}))
+                with patch.object(type(value), "validate", return_value=manifest):
+                    self.assertEqual(export.project(value), golden)
 
     def test_projection_has_explicit_validation_and_only_public_fields(self):
         bundle = self.reader.download(self.key)
@@ -89,6 +115,49 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("arn:aws", json.dumps(value))
         self.assertNotIn("bucket", json.dumps(value))
         self.assertIn("Metadata/size", export.render(value))
+
+    def test_unavailable_public_record_uses_explicit_v2_unknown_outcome(self):
+        bundle = self.reader.download(self.key)
+        manifest = bundle.validate()
+        report = json.loads(bundle.payloads["report.json"])
+        frozen = export.projection.freeze(bundle.run_key, manifest["identity"], bundle.record.state["request"]["pins"],
+            False, report["evidence"], None, outcome="evidence-unavailable")
+        value = export.projection.bind(frozen, bundle.record.retirement_sha256)
+        self.assertEqual(value["schema"], "rcp-production-public-report-v2")
+        self.assertEqual(value["qualification_outcome"], "evidence-unavailable")
+        html = export.render(value)
+        self.assertIn("unavailable; workload outcome unknown", html)
+        self.assertNotIn("<td>failed</td>", html)
+        changed = dict(value, benchmark_valid=True)
+        with self.assertRaisesRegex(ValueError, "qualification outcome"):
+            export.validate_public(changed)
+        changed = dict(value, schema="rcp-production-public-report-v1")
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            export.validate_public(changed)
+
+    def test_unavailable_retention_exports_without_reinterpreting_historical_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fx = Fixture(temporary)
+            old = fx.store.record
+            decision = AdmissionDecision(old.run_key, old.epoch, old.fingerprint, "v1", 1, 3, 2, 1,
+                "2026-10", "2026-10-22", old.admission["initial_payload"])
+            fx.store.record = replace(old, admission=json.loads(decision.immutable_json()))
+            del fx.s3.objects[fx.paths.status]
+            del fx.s3.objects[fx.paths.results]
+            fx.finish = common.utc(old.state["binding"]["deadline"]) + timedelta(seconds=collection.EVIDENCE_RECOVERY_SECONDS)
+            result = fx.collector.collect(retire=True)
+            self.assertEqual((result["state"], result["retired"]), ("unavailable", True), result)
+            self.item = stored(fx.store.record)
+            self.reader.s3 = fixtures.ReadOnlyS3(fx.s3)
+            self.reader.objects = collection.Objects(self.reader.s3, "bucket")
+            bundle = self.reader.download(result["retention"]["key"])
+            with patch.object(export.results, "inspect", side_effect=AssertionError("historical parser")), \
+                    patch.object(export.projection, "freeze", side_effect=AssertionError("historical projection")):
+                value = export.stage(bundle, Path(temporary) / "public")
+            self.assertEqual(value["qualification_outcome"], "evidence-unavailable")
+            self.assertEqual(value["measurements"], [])
+            self.assertIn("workload outcome unknown", export.render(value))
+            self.assertIn(b"Workload success or failure is unknown", bundle.payloads["summary.html"])
 
     def test_retained_html_is_never_the_public_html(self):
         bundle = self.reader.download(self.key)
@@ -192,6 +261,9 @@ class ExportTests(unittest.TestCase):
         manifest["benchmark_valid"] = False
         report = json.loads(bundle.payloads["report.json"])
         report["benchmark_valid"] = False
+        report["qualification_outcome"] = "failed"
+        report["public_projection"] = export.projection.freeze(bundle.run_key, manifest["identity"],
+            bundle.record.state["request"]["pins"], False, report["evidence"], None)
         payloads = dict(bundle.payloads, **{"report.json": collection.encoded(report)})
         manifest["retained"]["report.json"].update(sha256=digest(payloads["report.json"]), bytes=len(payloads["report.json"]))
         raw = collection.encoded(manifest)

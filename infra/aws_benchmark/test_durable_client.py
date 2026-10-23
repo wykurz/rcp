@@ -298,8 +298,9 @@ class CollectionTests(unittest.TestCase):
         cloud = Cloud(request)
         cloud.start(stateMachineArn=MACHINE, name="123-1", input='{"run":"123-1"}')
         cloud.execution["status"] = "SUCCEEDED" if complete else "RUNNING"
+        # the historical binding was created while live; the final receipt below records termination.
         instance = dict(InstanceId="i-" + "3" * 17, LaunchTime=NOW + timedelta(seconds=60),
-            ImageId=request["pins"]["ami"], InstanceType="c5d.24xlarge",
+            State={"Name": "running"}, ImageId=request["pins"]["ami"], InstanceType="c5d.24xlarge",
             LaunchTemplate={"LaunchTemplateId": request["pins"]["lt_id"], "Version": request["pins"]["lt_version"]})
         attempt = durable.attempt(request, 1, NOW + timedelta(seconds=30))
         instance.update(ClientToken=attempt["token"], SubnetId=request["pins"]["subnet"],

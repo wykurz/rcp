@@ -6,12 +6,13 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
+from infra.aws_benchmark.production_errors import RevisionConflict
 from infra.aws_benchmark.production_store import (AdmissionDecision, MAX_INTEGER, MAX_STATE_BYTES,
                                                  ReconciliationRequired, RunStore)
 
 
 class ConditionalFailure(Exception):
-    pass
+    response = {"Error": {"Code": "ConditionalCheckFailedException"}}
 
 
 class DynamoTransactions:
@@ -203,7 +204,7 @@ class AdmissionTests(unittest.TestCase):
         def admit(value):
             try:
                 outcomes.append(store(self.cloud, value).admit(value))
-            except ReconciliationRequired as error:
+            except (ReconciliationRequired, RevisionConflict) as error:
                 outcomes.append(error)
         threads = [threading.Thread(target=admit, args=(value,)) for value in (self.decision, other)]
         for thread in threads:
@@ -372,7 +373,7 @@ class StateFenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "immutable request"):
             self.store.save(changed, revision)
         self.store.save(state, revision)
-        with self.assertRaisesRegex(ValueError, "stale"):
+        with self.assertRaisesRegex(RevisionConflict, "revision"):
             self.store.save(state, revision)
 
     def test_owner_changes_after_read_are_caught_by_transaction(self):
@@ -393,7 +394,7 @@ class StateFenceTests(unittest.TestCase):
                 state["phase"] = phase
                 outcomes.append(self.store.save_launch_intent(state, revision) if phase == "launching" else
                                 self.store.save(state, revision))
-            except ReconciliationRequired as error:
+            except (ReconciliationRequired, RevisionConflict) as error:
                 outcomes.append(error)
         threads = [threading.Thread(target=save, args=(phase,)) for phase in ("launching", "closing")]
         for thread in threads:
