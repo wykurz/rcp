@@ -1,6 +1,6 @@
 name: Publish retired AWS benchmark history
 
-# Publishing is separate from paid execution and remains inert until explicitly enabled.
+# publishing is separate from paid execution and remains inert until explicitly enabled
 on:
   workflow_dispatch:
 
@@ -24,23 +24,13 @@ jobs:
       inventory_sha256: ${{ steps.download.outputs.inventory_sha256 }}
       reader_revision: ${{ steps.download.outputs.reader_revision }}
     steps:
-      - name: Require the exact main publication workflow
-        run: |
-          python3 - <<'PY'
-          import os, re
-          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
-          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
-          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
-          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
-          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
-          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
-          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA']
-          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Require the exact main publication workflow
+        run: |
+          python3 -m infra.aws_benchmark.publication_identity identity
       - name: Read published identities before downloading raw evidence
         run: |
           history="$RUNNER_TEMP/download-history.git"
@@ -89,35 +79,24 @@ jobs:
       artifact_id: ${{ steps.public.outputs.artifact-id }}
       inventory_sha256: ${{ steps.export.outputs.inventory_sha256 }}
       reader_revision: ${{ steps.export.outputs.reader_revision }}
+      record_count: ${{ steps.export.outputs.record_count }}
     env:
       GIT_CONFIG_NOSYSTEM: '1'
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_TERMINAL_PROMPT: '0'
       AWS_EC2_METADATA_DISABLED: 'true'
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Bind download provenance to this workflow revision
         env:
           EXPECTED_READER: ${{ needs.download.outputs.reader_revision }}
           EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
           EXPECTED_ARTIFACT: ${{ needs.download.outputs.artifact_id }}
         run: |
-          python3 - <<'PY'
-          import os, re
-          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
-          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
-          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
-          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
-          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
-          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
-          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
-          assert re.fullmatch(r'[0-9a-f]{64}', os.environ['EXPECTED_INVENTORY'])
-          assert re.fullmatch(r'[1-9][0-9]*', os.environ['EXPECTED_ARTIFACT'])
-          PY
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
+          python3 -m infra.aws_benchmark.publication_identity identity --artifact
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.download.outputs.artifact_id }}
@@ -155,15 +134,17 @@ jobs:
 
   publish:
     needs: export
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && needs.export.outputs.record_count != '' && needs.export.outputs.record_count != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # This new environment must be separately configured for main and the owner before activation.
-    environment: aws-benchmark-history
+    # configure the main-only owner approval gate separately before activation
+    environment:
+      name: aws-benchmark-history
+      deployment: false
     permissions:
       contents: read
     outputs:
-      history_commit: ${{ steps.append.outputs.history_commit }}
+      history_commit: ${{ steps.append.outputs.history_commit || steps.prepare.outputs.history_commit }}
     concurrency:
       group: aws-production-history-publish
       cancel-in-progress: false
@@ -172,55 +153,78 @@ jobs:
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_TERMINAL_PROMPT: '0'
       AWS_EC2_METADATA_DISABLED: 'true'
-      GIT_AUTHOR_NAME: github-actions[bot]
-      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
-      GIT_COMMITTER_NAME: github-actions[bot]
-      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
-      - name: Bind public artifact provenance to this workflow revision
-        env:
-          EXPECTED_READER: ${{ needs.export.outputs.reader_revision }}
-          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
-          EXPECTED_ARTIFACT: ${{ needs.export.outputs.artifact_id }}
-        run: |
-          python3 - <<'PY'
-          import os, re
-          assert os.environ['GITHUB_REPOSITORY'] == 'wykurz/rcp'
-          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
-          assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-          assert os.environ['GITHUB_ACTOR_ID'] == '483465'
-          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
-          assert os.environ['GITHUB_WORKFLOW_REF'] == 'wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main'
-          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['GITHUB_SHA'])
-          assert os.environ['GITHUB_WORKFLOW_SHA'] == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_READER']
-          assert re.fullmatch(r'[0-9a-f]{64}', os.environ['EXPECTED_INVENTORY'])
-          assert re.fullmatch(r'[1-9][0-9]*', os.environ['EXPECTED_ARTIFACT'])
-          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Bind public provenance and recheck publication gates after approval
+        env:
+          EXPECTED_READER: ${{ needs.export.outputs.reader_revision }}
+          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
+          EXPECTED_ARTIFACT: ${{ needs.export.outputs.artifact_id }}
+          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
+        run: |
+          python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.export.outputs.artifact_id }}
           path: ${{ runner.temp }}/public-records
           merge-multiple: true
           digest-mismatch: error
-      - name: Validate public data and writer configuration before minting credentials
+      - name: Prepare a verified append without writer credentials
+        id: prepare
         env:
           EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
           CLIENT_ID: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
           INSTALLATION_ID: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
         run: |
+          python3 -m infra.aws_benchmark.publication_identity current-main
           python3 - <<'PY'
           import os
           from infra.aws_benchmark.production_trust import writer_config
           writer_config(os.environ['CLIENT_ID'], os.environ['INSTALLATION_ID'])
           PY
-          python3 -m infra.aws_benchmark.production_publish validate \
-            --input "$RUNNER_TEMP/public-records" \
+          history="$RUNNER_TEMP/publish-history-1.git"
+          receipt="$RUNNER_TEMP/publish-commit-1.txt"
+          git init --bare "$history"
+          has_history=false
+          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-1"; then
+            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-1"; then
+              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+              has_history=true
+            fi
+          else
+            code=$?
+            test "$code" -eq 2
+          fi
+          GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
+            --input "$RUNNER_TEMP/public-records" --history "$history" \
             --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
+          commit=$(python3 - "$receipt" <<'PY'
+          import re, sys
+          from pathlib import Path
+          from infra.aws_benchmark.common import require
+          value = Path(sys.argv[1]).read_text()
+          require(re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'invalid append receipt')
+          print(value.removeprefix('commit=').strip())
+          PY
+          )
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+          if test -z "$commit"; then
+            if test "$has_history" = true; then
+              commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            fi
+            printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+            echo 'History already contains all verified records; no writer token is needed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Require current main immediately before minting
+        if: steps.prepare.outputs.commit != ''
+        run: python3 -m infra.aws_benchmark.publication_identity current-main
       - name: Mint the repository-selected history writer token
+        if: steps.prepare.outputs.commit != ''
         id: history-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -231,56 +235,60 @@ jobs:
           permission-contents: write
           permission-metadata: read
           skip-token-revoke: false
-      - name: Require the approved installation before using its token
+      - name: Require installation continuity before using its token
+        if: steps.prepare.outputs.commit != ''
         env:
           EXPECTED_INSTALLATION: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
           ACTUAL_INSTALLATION: ${{ steps.history-token.outputs.installation-id }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from infra.aws_benchmark.production_trust import identifier
-          assert identifier(os.environ['EXPECTED_INSTALLATION']) == identifier(os.environ['ACTUAL_INSTALLATION'])
-          PY
-      - name: Append to freshly read history with bounded conflict reconciliation
+        run: python3 -m infra.aws_benchmark.publication_identity installation
+      - name: Append the prepared commit with bounded conflict reconciliation
+        if: steps.prepare.outputs.commit != ''
         id: append
         env:
+          PREPARED_COMMIT: ${{ steps.prepare.outputs.commit }}
           EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
           GH_TOKEN: ${{ steps.history-token.outputs.token }}
         run: |
+          commit="$PREPARED_COMMIT"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           for attempt in 1 2 3; do
             history="$RUNNER_TEMP/publish-history-$attempt.git"
-            receipt="$RUNNER_TEMP/publish-commit-$attempt.txt"
-            git init --bare "$history"
-            has_history=false
-            if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-$attempt"; then
-              if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-$attempt"; then
-                git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-                has_history=true
+            if test "$attempt" -gt 1; then
+              receipt="$RUNNER_TEMP/publish-commit-$attempt.txt"
+              git init --bare "$history"
+              has_history=false
+              if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-$attempt"; then
+                if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-$attempt"; then
+                  git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+                  has_history=true
+                fi
+              else
+                code=$?
+                test "$code" -eq 2
               fi
-            else
-              code=$?
-              test "$code" -eq 2
-            fi
-            GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
-              --input "$RUNNER_TEMP/public-records" --history "$history" \
-              --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
-            commit=$(python3 - "$receipt" <<'PY'
+              GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
+                --input "$RUNNER_TEMP/public-records" --history "$history" \
+                --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
+              commit=$(python3 - "$receipt" <<'PY'
           import re, sys
           from pathlib import Path
+          from infra.aws_benchmark.common import require
           value = Path(sys.argv[1]).read_text()
-          assert re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'Invalid append receipt'
+          require(re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'invalid append receipt')
           print(value.removeprefix('commit=').strip())
           PY
-            )
-            if test -z "$commit"; then
-              if test "$has_history" = true; then
-                commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
-                [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+              )
+              if test -z "$commit"; then
+                if test "$has_history" = true; then
+                  commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
+                  [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+                fi
+                printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+                echo 'History already contains all verified records.' >> "$GITHUB_STEP_SUMMARY"
+                exit 0
               fi
-              printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-              echo 'History already contains all verified records.' >> "$GITHUB_STEP_SUMMARY"
-              exit 0
             fi
+            python3 -m infra.aws_benchmark.publication_identity current-main
             authorization=$(python3 - <<'PY'
           import base64, os
           print('AUTHORIZATION: basic ' + base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode())

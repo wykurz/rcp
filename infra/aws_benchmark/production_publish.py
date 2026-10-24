@@ -23,9 +23,8 @@ from benchmarks.publish import git
 from . import production_bundle as codec, production_collection as collection
 from . import production_export as public, production_publication as publication
 from .common import Budget, digest, require
+from .history_contract import REPOSITORY_ID, HISTORY_REF
 
-REPOSITORY_ID = "655073755"
-HISTORY_REF = "refs/heads/aws-benchmark-history"
 DOWNLOAD_SCHEMA = "rcp-production-download-index-v1"
 PUBLIC_SCHEMA = "rcp-production-public-batch-v1"
 MAX_TOTAL = 512 * 1024 * 1024
@@ -394,8 +393,8 @@ def summary(index, records=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("download", "export", "validate", "publish"))
-    parser.add_argument("--history", type=Path)
+    parser.add_argument("phase", choices=("download", "export", "publish"))
+    parser.add_argument("--history", type=Path, required=True)
     parser.add_argument("--reader-revision", required=True)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
@@ -404,8 +403,6 @@ def main():
         parser.add_argument("--" + name)
     args = parser.parse_args()
     codec.revision(args.reader_revision)
-    if args.phase != "validate":
-        require(args.history is not None, "history directory required")
     if args.phase == "download":
         from .controller import oidc_session
         require(args.output is not None and re.fullmatch(r"[a-z]{2}-[a-z]+-[1-9][0-9]?", args.region or "") and
@@ -423,10 +420,6 @@ def main():
         prior, _ = history(args.history)
         value = export(args.input, prior, args.output, args.reader_revision, args.expected_sha256)
         index = index_at(args.output, PUBLIC_SCHEMA, args.reader_revision)
-    elif args.phase == "validate":
-        require(args.input is not None, "public batch required")
-        public_batch(args.input, args.reader_revision, args.expected_sha256)
-        return
     else:
         require(args.input is not None, "public batch required")
         commit = publish(args.input, args.history, args.reader_revision, args.expected_sha256)
@@ -437,7 +430,10 @@ def main():
         records = [collection.results.json_value(read(args.output / (ref["run_key"] + ".json"), public.MAX_PUBLIC_RECORD))
                    for ref in index["records"]]
     summary(index, records)
-    outputs(inventory_sha256=value, reader_revision=args.reader_revision)
+    values = dict(inventory_sha256=value, reader_revision=args.reader_revision)
+    if args.phase == "export":
+        values["record_count"] = str(len(records))
+    outputs(**values)
 
 
 if __name__ == "__main__":

@@ -1101,6 +1101,8 @@ Resources:
       MaximumEventAgeInSeconds: 60
       MaximumRetryAttempts: 0
 Outputs:
+  AdmissionRoleArn:
+    Value: {'Fn::GetAtt': [AdmissionRole, Arn]}
   AdmissionFunctionArn:
     Value: {'Fn::GetAtt': [AdmissionFunction, Arn]}
   AdmissionAudience:
