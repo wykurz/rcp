@@ -50,7 +50,7 @@ class InputsTests(unittest.TestCase):
             package.verify_source_closure(sources)
 
     def test_reconciliation_and_projection_dependencies_cannot_be_omitted(self):
-        for name in ("production_errors", "production_projection", "production_objects", "production_transport"):
+        for name in ("production_errors", "production_projection", "production_objects", "production_transport", "reader_identity"):
             with self.subTest(name=name):
                 sources = package.source_snapshot(package.ROOT)
                 del sources["infra/aws_benchmark/" + name + ".py"]

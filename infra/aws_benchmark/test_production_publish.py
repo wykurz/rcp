@@ -55,7 +55,7 @@ class PublishTests(unittest.TestCase):
                     "--output", str(exported), "--expected-sha256", bound]):
                 publish.main()
             self.assertEqual(output.read_text(), "inventory_sha256=" + publish.inventory(exported) +
-                             "\nreader_revision=" + REVISION + "\n")
+                             "\nreader_revision=" + REVISION + "\nrecord_count=1\n")
             self.assertTrue((exported / (self.fx.store.record.run_key + ".json")).is_file())
             text = summary.read_text()
             self.assertIn('"candidate":"' + self.fx.store.record.state["request"]["candidate"] + '"', text)
@@ -63,18 +63,36 @@ class PublishTests(unittest.TestCase):
             self.assertIn('"collected_at":', text)
             self.assertIn("not independently attested", text)
 
-    def test_validate_cli_checks_real_public_artifact_without_git_or_cloud_access(self):
-        _, _, exported, digest = self.batch()
-        args = ["publication", "validate", "--input", str(exported), "--history", str(self.root / "unused"),
-                "--reader-revision", REVISION, "--expected-sha256", digest]
-        with patch.object(publish, "git", side_effect=AssertionError("validation must not invoke git")), \
-                patch("infra.aws_benchmark.controller.oidc_session", side_effect=AssertionError("no cloud credentials")), \
-                patch("sys.argv", args):
+    def test_export_cli_reports_zero_records_for_empty_batch(self):
+        self.reader.discover = Mock(return_value=[])
+        downloaded, bound, _, _ = self.batch()
+        output = self.root / "empty-cli-output"
+        exported = self.root / "empty-cli-export"
+        with patch.dict(os.environ, GITHUB_OUTPUT=str(output)), \
+                patch("sys.argv", ["publication", "export", "--input", str(downloaded), "--output", str(exported),
+                    "--history", str(self.repository), "--reader-revision", REVISION, "--expected-sha256", bound]):
             publish.main()
-            record = exported / (self.fx.store.record.run_key + ".json")
-            record.write_bytes(record.read_bytes() + b" ")
-            with self.assertRaises(ValueError):
-                publish.main()
+        self.assertEqual(output.read_text(), "inventory_sha256=" + publish.inventory(exported) +
+                         "\nreader_revision=" + REVISION + "\nrecord_count=0\n")
+
+    def test_publish_cli_rejects_semantic_tampering_even_with_recomputed_inventory(self):
+        _, _, exported, digest = self.batch()
+        args = ["publication", "publish", "--input", str(exported), "--history", str(self.repository),
+                "--reader-revision", REVISION, "--expected-sha256", digest]
+        record = exported / (self.fx.store.record.run_key + ".json")
+        value = json.loads(record.read_bytes())
+        value["schema"] = "unrecognized-record-format"
+        raw = publish.encoded(value)
+        record.write_bytes(raw)
+        index_path = exported / "index.json"
+        index = json.loads(index_path.read_bytes())
+        index["records"][0].update(sha256=publish.digest(raw), bytes=len(raw))
+        index_path.write_bytes(publish.encoded(index))
+        args[-1] = publish.inventory(exported)
+        with patch.object(publish, "git", side_effect=AssertionError("must validate before preparing Git objects")), \
+                patch("infra.aws_benchmark.controller.oidc_session", side_effect=AssertionError("no cloud credentials")), \
+                patch("sys.argv", args), self.assertRaises(ValueError):
+            publish.main()
 
     def test_workflow_output_rejects_command_delimiters_and_invalid_keys(self):
         output = self.root / "outputs"

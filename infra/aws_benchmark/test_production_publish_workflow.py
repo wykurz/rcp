@@ -12,6 +12,7 @@ import unittest
 import yaml
 
 from . import production_publish as publish
+from . import history_contract as contract
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/aws-benchmark-publish.yml"
@@ -27,7 +28,8 @@ def trusted_environment(directory):
         GITHUB_WORKFLOW_SHA=SHA, GITHUB_RUN_ATTEMPT="1",
         GITHUB_WORKFLOW_REF="wykurz/rcp/.github/workflows/aws-benchmark-publish.yml@refs/heads/main",
         EXPECTED_READER=SHA, EXPECTED_INVENTORY=INVENTORY, EXPECTED_ARTIFACT="123",
-        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"), GITHUB_OUTPUT=str(Path(directory) / "job-output"))
+        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"), GITHUB_OUTPUT=str(Path(directory) / "job-output"),
+        PUBLICATION_ENABLED="true", TRUST_READY="true", CLIENT_ID="Iv23.test-client", INSTALLATION_ID="5678")
 
 
 class PublicationWorkflowTests(unittest.TestCase):
@@ -48,7 +50,7 @@ class PublicationWorkflowTests(unittest.TestCase):
             self.assertEqual(job["runs-on"], "ubuntu-24.04")
             self.assertLessEqual(int(job["timeout-minutes"]), 15)
             if name == "publish":
-                self.assertEqual(job["environment"], "aws-benchmark-history")
+                self.assertEqual(job["environment"], {"name": contract.ENVIRONMENT, "deployment": "false"})
             else:
                 self.assertNotIn("environment", job)
             for guard in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
@@ -63,7 +65,7 @@ class PublicationWorkflowTests(unittest.TestCase):
 
     def test_actual_revision_guards_reject_foreign_or_malformed_runtime_inputs(self):
         for name, job in self.phases.items():
-            source = job["steps"][0]["run"]
+            source = next(item["run"] for item in job["steps"] if "publication_identity identity" in item.get("run", ""))
             mutations = ({}, {"GITHUB_REPOSITORY": "other/rcp"}, {"GITHUB_REF": "refs/heads/debug"},
                 {"GITHUB_EVENT_NAME": "pull_request"}, {"GITHUB_ACTOR_ID": "1"}, {"GITHUB_SHA": "main"},
                 {"GITHUB_WORKFLOW_SHA": "c" * 40}, {"GITHUB_WORKFLOW_REF": "other"}, {"GITHUB_RUN_ATTEMPT": "2"})
@@ -73,7 +75,7 @@ class PublicationWorkflowTests(unittest.TestCase):
             for change in mutations:
                 with self.subTest(job=name, change=change), tempfile.TemporaryDirectory() as directory:
                     env = {**trusted_environment(directory), **change}
-                    result = subprocess.run(["bash", "-e", "-c", source], env=env, capture_output=True, timeout=5)
+                    result = subprocess.run(["bash", "-e", "-c", source], cwd=ROOT, env={**env, "PYTHONOPTIMIZE": "1"}, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode == 0, not change)
 
     def test_actions_are_immutable_and_controller_checkout_is_always_current_sha(self):
@@ -94,7 +96,7 @@ class PublicationWorkflowTests(unittest.TestCase):
             self.assertEqual(values["merge-multiple"], "true")
             self.assertEqual(values["digest-mismatch"], "error")
             self.assertEqual(set(values), {"artifact-ids", "path", "merge-multiple", "digest-mismatch"})
-            guard = job["steps"][0]["env"]
+            guard = next(item["env"] for item in job["steps"] if "publication_identity identity" in item.get("run", ""))
             for field, output in (("EXPECTED_READER", "reader_revision"), ("EXPECTED_INVENTORY", "inventory_sha256"),
                                   ("EXPECTED_ARTIFACT", "artifact_id")):
                 self.assertEqual(guard[field], "${{ needs." + previous + ".outputs." + output + " }}")
@@ -130,52 +132,93 @@ class PublicationWorkflowTests(unittest.TestCase):
             self.assertEqual(job["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
             self.assertEqual(job["env"]["GIT_TERMINAL_PROMPT"], "0")
 
-    def test_actual_pre_mint_shell_runs_real_validation_cli_and_rejects_bad_data_or_configuration(self):
-        step = next(x for x in self.jobs["publish"]["steps"] if "production_publish validate" in x.get("run", ""))
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "public-records"
-            source.mkdir()
-            value = json.loads((ROOT / "infra/aws_benchmark/fixtures/production-public-report-v1.json").read_text())
-            value["run_key"] = key = "repo-655073755-run-123"
-            raw = publish.encoded(value)
-            record = source / (key + ".json")
-            record.write_bytes(raw)
-            publish.persist(source / "index.json", dict(schema=publish.PUBLIC_SCHEMA, repository_id="655073755",
-                reader_revision=SHA, observed_at="2026-10-23T00:00:00Z", active=dict(state="idle", retired=False),
-                observations=[dict(run_key=key, state="ready", retired=True)],
-                records=[dict(run_key=key, bytes=len(raw), sha256=publish.digest(raw))]))
-            env = dict(trusted_environment(directory), CLIENT_ID="Iv23.test-client", INSTALLATION_ID="5678",
-                       EXPECTED_INVENTORY=publish.inventory(source), AWS_EC2_METADATA_DISABLED="true")
-            for change in ({}, {"CLIENT_ID": ""}, {"INSTALLATION_ID": "not-an-id"}, {"EXPECTED_INVENTORY": "0" * 64}):
+    def test_real_preparation_rejects_semantic_tampering_after_correct_inventory(self):
+        step = next(item for item in self.jobs["publish"]["steps"] if item.get("id") == "prepare")
+        for malformed, empty, expected_success in ((False, False, True), (True, False, False), (False, True, True)):
+            with self.subTest(malformed=malformed, empty=empty), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "public-records"
+                source.mkdir()
+                value = json.loads((ROOT / "infra/aws_benchmark/fixtures/production-public-report-v1.json").read_text())
+                value["run_key"] = key = "repo-655073755-run-123"
+                if malformed:
+                    value["schema"] = "unrecognized-format"
+                raw = publish.encoded(value)
+                refs = []
+                if not empty:
+                    (source / (key + ".json")).write_bytes(raw)
+                    refs.append(dict(run_key=key, bytes=len(raw), sha256=publish.digest(raw)))
+                publish.persist(source / "index.json", dict(schema=publish.PUBLIC_SCHEMA, repository_id=contract.REPOSITORY_ID,
+                    reader_revision=SHA, observed_at="2026-10-23T00:00:00Z", active=dict(state="idle", retired=False),
+                    observations=[] if empty else [dict(run_key=key, state="ready", retired=True)], records=refs))
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                git = bin_dir / "git"
+                real_git = __import__("shutil").which("git")
+                git.write_text("#!" + sys.executable + "\n" +
+                    "import os, sys\n" +
+                    "if 'ls-remote' in sys.argv:\n" +
+                    "    if sys.argv[-1] == 'refs/heads/main':\n" +
+                    "        print('a' * 40 + '\\trefs/heads/main')\n" +
+                    "        raise SystemExit(0)\n" +
+                    "    raise SystemExit(2)\n" +
+                    "if 'push' in sys.argv: raise SystemExit('preparation must never push')\n" +
+                    "os.execv(" + repr(real_git) + ", [" + repr(real_git) + ", *sys.argv[1:]])\n")
+                git.chmod(0o700)
+                env = dict(trusted_environment(directory), EXPECTED_INVENTORY=publish.inventory(source),
+                           PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], PYTHONOPTIMIZE="1")
+                env.pop("GH_TOKEN", None)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
-                    env={**env, **change}, text=True, capture_output=True, timeout=10)
-                self.assertEqual(result.returncode == 0, not change, result.stderr)
-            record.write_bytes(raw + b" ")
-            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
-                env=env, text=True, capture_output=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse((Path(directory) / "unused-history").exists())
+                    env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode == 0, expected_success, result.stdout + result.stderr)
+                if expected_success:
+                    output = (root / "job-output").read_text()
+                    self.assertRegex(output, r"^commit=(?:[0-9a-f]{40})?\n")
+                    self.assertEqual(output == "commit=\nhistory_commit=\n", empty)
+                else:
+                    self.assertFalse((root / "job-output").exists())
 
-    def test_writer_mints_only_after_validation_and_uses_a_narrow_environment_app_token(self):
+    def test_writer_mints_only_for_prepared_additions_and_secrets_never_reach_preparation(self):
         steps = self.jobs["publish"]["steps"]
         mint = next(i for i, item in enumerate(steps) if item.get("id") == "history-token")
-        self.assertIn("production_publish validate", steps[mint - 1]["run"])
+        prepare = next(i for i, item in enumerate(steps) if item.get("id") == "prepare")
+        self.assertLess(prepare, mint)
+        self.assertIn("production_publish publish", steps[prepare]["run"])
+        self.assertEqual(steps[mint - 1]["run"], "python3 -m infra.aws_benchmark.publication_identity current-main")
+        for step in steps[mint - 1:]:
+            self.assertEqual(step["if"], "steps.prepare.outputs.commit != ''")
         self.assertEqual(steps[mint]["with"], {
-            "client-id": "${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}",
-            "private-key": "${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}",
-            "owner": "wykurz", "repositories": "rcp", "permission-contents": "write",
-            "permission-metadata": "read", "skip-token-revoke": "false"})
+            "client-id": "${{ vars." + contract.CLIENT_VARIABLE + " }}",
+            "private-key": "${{ secrets." + contract.WRITER_SECRET_NAME + " }}",
+            "owner": contract.REPOSITORY.split("/")[0], "repositories": contract.REPOSITORY.split("/")[1],
+            "permission-contents": "write", "permission-metadata": "read", "skip-token-revoke": "false"})
         self.assertEqual(steps[-1]["env"]["GH_TOKEN"], "${{ steps.history-token.outputs.token }}")
-        self.assertNotIn("github.token", str(self.jobs["publish"]))
-        self.assertNotIn("id-token", str(self.jobs["publish"]))
+        for item in steps[:mint]:
+            for forbidden in ("secrets.", "GH_TOKEN", "github.token", "id-token", "production_publish validate"):
+                self.assertNotIn(forbidden, str(item))
         self.assertEqual(sum("secrets." in str(item) for item in steps), 1)
         self.assertNotIn("continue-on-error", str(steps))
-        for actual in ("5678", "5679", "", "5678\n", "0"):
-            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as directory:
-                env = dict(trusted_environment(directory), EXPECTED_INSTALLATION="5678", ACTUAL_INSTALLATION=actual)
-                result = subprocess.run(["bash", "-e", "-c", steps[mint + 1]["run"]], cwd=ROOT,
-                    env=env, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode == 0, actual == "5678")
+        self.assertNotIn("assert ", str(steps))
+        self.assertIn("needs.export.outputs.record_count != '0'", self.jobs["publish"]["if"])
+        self.assertIn("needs.export.outputs.record_count != ''", self.jobs["publish"]["if"])
+        self.assertEqual(self.jobs["export"]["outputs"]["record_count"], "${{ steps.export.outputs.record_count }}")
+        guard = next(x for x in steps if "publication_identity identity" in x.get("run", ""))
+        self.assertEqual(guard["env"]["PUBLICATION_ENABLED"], "${{ vars." + contract.PUBLICATION_FLAG + " }}")
+        self.assertEqual(guard["env"]["TRUST_READY"], "${{ vars." + contract.TRUST_FLAG + " }}")
+        self.assertNotIn("GIT_AUTHOR_NAME", self.jobs["publish"]["env"])
+
+    def test_only_reviewed_publisher_and_canary_may_reference_writer_environment_or_key(self):
+        allowed = {contract.PUBLICATION_WORKFLOW, contract.CANARY_WORKFLOW}
+        found = set()
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            for job in workflow.get("jobs", {}).values():
+                environment = job.get("environment")
+                name = environment.get("name") if isinstance(environment, dict) else environment
+                if name == contract.ENVIRONMENT or contract.WRITER_SECRET_NAME in str(job):
+                    self.assertIn(path.name, allowed)
+                    found.add(path.name)
+        self.assertIn(contract.PUBLICATION_WORKFLOW, found)
 
     def test_pages_reuses_reviewed_workflow_only_with_verified_history_commit(self):
         job = self.jobs["pages"]
@@ -189,7 +232,7 @@ class PublicationWorkflowTests(unittest.TestCase):
             self.assertIn(guard, job["if"])
         self.assertNotIn("secrets", job)
         self.assertNotIn("concurrency", job)
-        self.assertEqual(self.jobs["publish"]["outputs"], {"history_commit": "${{ steps.append.outputs.history_commit }}"})
+        self.assertEqual(self.jobs["publish"]["outputs"], {"history_commit": "${{ steps.append.outputs.history_commit || steps.prepare.outputs.history_commit }}"})
 
     def test_every_embedded_shell_program_has_valid_syntax(self):
         for name, job in self.phases.items():
@@ -199,7 +242,7 @@ class PublicationWorkflowTests(unittest.TestCase):
                         result = subprocess.run(["bash", "-n"], input=item["run"], text=True, capture_output=True, timeout=5)
                         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def writer(self, directory, *, push_results="0", ls_status="0", no_change="0", malformed=False, shadow_only=False):
+    def writer(self, directory, *, push_results="0", ls_status="0", no_change="0", malformed=False, shadow_only=False, main_fail_after="99"):
         root = Path(directory)
         bin_dir = root / "bin"
         bin_dir.mkdir()
@@ -209,11 +252,17 @@ class PublicationWorkflowTests(unittest.TestCase):
 import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ['COMMAND_LOG'], 'a') as stream:
-    stream.write(json.dumps(dict(args=args, header=bool(os.environ.get('GIT_CONFIG_VALUE_0')))) + '\n')
+    stream.write(json.dumps(dict(args=args, header=os.environ.get('GIT_CONFIG_KEY_0') == 'http.https://github.com/.extraheader')) + '\n')
 if 'init' in args:
     pathlib.Path(args[-1]).mkdir()
     raise SystemExit(0)
 if 'ls-remote' in args:
+    if args[-1] == 'refs/heads/main':
+        counter = pathlib.Path(os.environ['RUNNER_TEMP']) / 'main-count'
+        index = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(index + 1))
+        print(('a' if index < int(os.environ['MAIN_FAIL_AFTER']) else 'b') * 40 + '\trefs/heads/main')
+        raise SystemExit(0)
     if os.environ['LS_STATUS'] == '0':
         print('c' * 40 + '\t' + ('refs/heads/shadow/refs/heads/aws-benchmark-history' if os.environ['SHADOW_ONLY'] == '1' else 'refs/heads/aws-benchmark-history'))
     raise SystemExit(int(os.environ['LS_STATUS']))
@@ -247,12 +296,45 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
         python.chmod(0o700)
         env = dict(trusted_environment(directory), PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
                    COMMAND_LOG=str(log), PUSH_RESULTS=push_results, LS_STATUS=ls_status, NO_CHANGE=no_change,
-                   MALFORMED="1" if malformed else "0", GH_TOKEN="synthetic-test-token", SHADOW_ONLY="1" if shadow_only else "0")
-        source = self.jobs["publish"]["steps"][-1]["run"]
-        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", source], env=env,
-                                text=True, capture_output=True, timeout=10)
-        commands = [json.loads(line) for line in log.read_text().splitlines()]
+                   MALFORMED="1" if malformed else "0", SHADOW_ONLY="1" if shadow_only else "0", MAIN_FAIL_AFTER=main_fail_after)
+        steps = self.jobs["publish"]["steps"]
+        source = next(x["run"] for x in steps if x.get("id") == "prepare")
+        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", source], cwd=ROOT, env=env,
+                                text=True, capture_output=True, timeout=15)
+        if result.returncode == 0:
+            output = Path(env["GITHUB_OUTPUT"])
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            output.write_text("")
+            if values["commit"]:
+                gate = next(x["run"] for x in steps if x.get("name") == "Require current main immediately before minting")
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", gate], cwd=ROOT, env=env,
+                    text=True, capture_output=True, timeout=15)
+                if result.returncode == 0:
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", steps[-1]["run"]], cwd=ROOT,
+                        env=dict(env, PREPARED_COMMIT=values["commit"], GH_TOKEN="synthetic-test-token"),
+                        text=True, capture_output=True, timeout=15)
+            else:
+                output.write_text("history_commit=" + values["history_commit"] + "\n")
+        commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         return result, commands
+
+    def test_actual_shell_stops_if_main_moves_before_prepare_mint_or_any_push(self):
+        for allowed_reads, expected_pushes in (("0", 0), ("1", 0), ("2", 0), ("3", 1)):
+            with self.subTest(allowed_reads=allowed_reads), tempfile.TemporaryDirectory() as directory:
+                result, commands = self.writer(directory, main_fail_after=allowed_reads, push_results="1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(sum("push" in item["args"] for item in commands), expected_pushes)
+                self.assertIn("identity check failed", result.stderr)
+
+    def test_actual_postapproval_guard_rejects_closed_or_missing_values_without_asserts(self):
+        guard = next(x for x in self.jobs["publish"]["steps"] if "publication_identity identity" in x.get("run", ""))
+        for key in ("PUBLICATION_ENABLED", "TRUST_READY"):
+            for value in ("false", "", "true\n"):
+                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", guard["run"]], cwd=ROOT,
+                        env={**trusted_environment(directory), key: value, "PYTHONOPTIMIZE": "2"},
+                        text=True, capture_output=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
 
     def test_writer_reconciles_push_conflict_against_fresh_bare_history(self):
         with tempfile.TemporaryDirectory() as directory:

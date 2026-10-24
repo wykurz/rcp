@@ -186,9 +186,12 @@ identical prior records and rejects conflicting records. It creates commits thro
 pushes to `aws-benchmark-history` without force, with three bounded fetch/reconcile attempts. The
 history branch remains separate from Depot's `benchmark-history`. The job's default token is
 Contents read. A dedicated, repository-selected writer App supplies Contents write and Metadata read
-only after public-artifact validation, in the proposed main-only `aws-benchmark-history`
-environment. Its installation ID must match before use. The App token remains repository-scoped;
-protect main and review every workflow able to request the environment secret.
+only after credential-free commit preparation finds new validated records, in the proposed main-only
+`aws-benchmark-history` environment. Its installation ID must match before use; this checks
+continuity, not drift in installation permissions or repository selection. The App token remains
+repository-scoped; protect main and review every workflow able to request the environment secret.
+See [TRUST.md](TRUST.md) for approval-delay cancellation, broader Contents-write reach, and live
+gates.
 
 ### Publication trust gate
 

@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from .production_transport import retryable_transport
+from .reader_identity import reader_resource_identity
 from .production_github import (API_HOST, API_VERSION, MAX_RESPONSE_BYTES,
                                 GitHubRunError, GitHubRateLimitError, GitHubTransientError, _bounded_document)
 
@@ -78,8 +79,7 @@ class GitHubAppConfig:
         _require(re.fullmatch(r"[a-z]{2}-[a-z]+-[1-9][0-9]?", self.region)
                  and re.fullmatch(r"[0-9]{12}", self.account))
         _require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", self.app_client_id))
-        _require(re.fullmatch(r"arn:aws:secretsmanager:" + re.escape(self.region + ":" + self.account)
-            + r":secret:/rcp/production/github-read-app-[A-Za-z0-9]{6}", self.secret_arn))
+        _require(reader_resource_identity(self.secret_arn) == (self.region, self.account))
 
 
 @dataclass(frozen=True, repr=False)

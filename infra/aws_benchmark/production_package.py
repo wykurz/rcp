@@ -45,7 +45,7 @@ SOURCES = (
     "infra/aws_benchmark/production_projection.py",
     "infra/aws_benchmark/production_runtime.py", "infra/aws_benchmark/production_startup.py",
     "infra/aws_benchmark/production_store.py", "infra/aws_benchmark/production_transport.py",
-    "infra/aws_benchmark/results.py", "assets/site-theme.html",
+    "infra/aws_benchmark/reader_identity.py", "infra/aws_benchmark/results.py", "assets/site-theme.html",
 )
 ENTRYPOINTS = {"infra.aws_benchmark.production_handler": ("lambda_handler",),
               "infra.aws_benchmark.production_runtime": ("coordinator", "watchdog"),
