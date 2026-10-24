@@ -789,6 +789,8 @@ class GitHubAppConfigurationTests(unittest.TestCase):
             self.assertEqual(policy["UpdateReplacePolicy"], "Delete")
             self.assertEqual(policy["Properties"]["RoleName"], {"Ref": name + "Role"})
             self.assertEqual(policy["Properties"]["PolicyName"], "GitHubReadAppCredential")
+            self.assertEqual(TEMPLATE["Outputs"][name + "RoleArn"]["Value"],
+                             {"Fn::GetAtt": [policy["Properties"]["RoleName"]["Ref"], "Arn"]})
             self.assertNotIn("secretsmanager:", json.dumps(resources[name + "Role"]["Properties"]["Policies"]))
         self.assertEqual(resources["CollectorRole"]["DeletionPolicy"], "Retain")
         self.assertEqual(resources["CollectorRole"]["UpdateReplacePolicy"], "Retain")

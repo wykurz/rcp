@@ -19,6 +19,11 @@
             }
           }
         ]
+      },
+      {
+        "id": 123,
+        "node_id": "synthetic-branch-policy",
+        "type": "branch_policy"
       }
     ]
   },
@@ -172,7 +177,7 @@
     "repository_variables": {
       "pages": [
         {
-          "endpoint": "https://api.github.com/repos/wykurz/rcp/actions/variables?per_page=100&page=1",
+          "endpoint": "https://api.github.com/repos/wykurz/rcp/actions/variables?per_page=30&page=1",
           "response": {
             "total_count": 3,
             "variables": [
@@ -225,7 +230,7 @@
       "aws-benchmark-history": {
         "pages": [
           {
-            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/variables?per_page=100&page=1",
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/variables?per_page=30&page=1",
             "response": {
               "total_count": 2,
               "variables": [
@@ -245,7 +250,7 @@
       "other": {
         "pages": [
           {
-            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/other/variables?per_page=100&page=1",
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/other/variables?per_page=30&page=1",
             "response": {
               "total_count": 0,
               "variables": []
@@ -253,6 +258,13 @@
           }
         ]
       }
+    }
+  },
+  "custom_rules": {
+    "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/deployment_protection_rules",
+    "response": {
+      "total_count": 0,
+      "custom_deployment_protection_rules": []
     }
   }
 }

@@ -29,19 +29,24 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Require the exact main publication workflow
+        env:
+          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
         run: |
-          python3 -m infra.aws_benchmark.publication_identity identity
+          python3 -m infra.aws_benchmark.publication_identity identity --flags
       - name: Read published identities before downloading raw evidence
         run: |
           history="$RUNNER_TEMP/download-history.git"
           git init --bare "$history"
           if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/download-history-ref"; then
-            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/download-history-ref"; then
-              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/download-history-ref"; then
+              echo 'Protected history missing; reconcile before publishing.' >&2
+              exit 1
             fi
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
           else
-            code=$?
-            test "$code" -eq 2
+            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
+            exit 1
           fi
       - name: Install the pinned read-only SDK
         run: |
@@ -95,8 +100,10 @@ jobs:
           EXPECTED_READER: ${{ needs.download.outputs.reader_revision }}
           EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
           EXPECTED_ARTIFACT: ${{ needs.download.outputs.artifact_id }}
+          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
         run: |
-          python3 -m infra.aws_benchmark.publication_identity identity --artifact
+          python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.download.outputs.artifact_id }}
@@ -108,12 +115,14 @@ jobs:
           history="$RUNNER_TEMP/export-history.git"
           git init --bare "$history"
           if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/history-ref"; then
-            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/history-ref"; then
-              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/history-ref"; then
+              echo 'Protected history missing; reconcile before publishing.' >&2
+              exit 1
             fi
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
           else
-            code=$?
-            test "$code" -eq 2
+            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
+            exit 1
           fi
       - name: Validate and export without cloud or write credentials
         id: export
@@ -189,16 +198,18 @@ jobs:
           history="$RUNNER_TEMP/publish-history-1.git"
           receipt="$RUNNER_TEMP/publish-commit-1.txt"
           git init --bare "$history"
-          has_history=false
           if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-1"; then
-            if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-1"; then
-              git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-              has_history=true
+            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-1"; then
+              echo 'Protected history missing; reconcile before publishing.' >&2
+              exit 1
             fi
+            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
           else
-            code=$?
-            test "$code" -eq 2
+            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
+            exit 1
           fi
+          baseline=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
           GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
             --input "$RUNNER_TEMP/public-records" --history "$history" \
             --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
@@ -211,12 +222,10 @@ jobs:
           print(value.removeprefix('commit=').strip())
           PY
           )
+          printf 'baseline=%s\n' "$baseline" >> "$GITHUB_OUTPUT"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
           if test -z "$commit"; then
-            if test "$has_history" = true; then
-              commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
-              [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            fi
+            commit="$baseline"
             printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
             echo 'History already contains all verified records; no writer token is needed.' >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -241,69 +250,14 @@ jobs:
           EXPECTED_INSTALLATION: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
           ACTUAL_INSTALLATION: ${{ steps.history-token.outputs.installation-id }}
         run: python3 -m infra.aws_benchmark.publication_identity installation
-      - name: Append the prepared commit with bounded conflict reconciliation
+      - name: Append only the prepared commit with exact-baseline reconciliation
         if: steps.prepare.outputs.commit != ''
         id: append
         env:
           PREPARED_COMMIT: ${{ steps.prepare.outputs.commit }}
-          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
+          PREPARED_BASELINE: ${{ steps.prepare.outputs.baseline }}
           GH_TOKEN: ${{ steps.history-token.outputs.token }}
-        run: |
-          commit="$PREPARED_COMMIT"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          for attempt in 1 2 3; do
-            history="$RUNNER_TEMP/publish-history-$attempt.git"
-            if test "$attempt" -gt 1; then
-              receipt="$RUNNER_TEMP/publish-commit-$attempt.txt"
-              git init --bare "$history"
-              has_history=false
-              if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-$attempt"; then
-                if awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-$attempt"; then
-                  git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-                  has_history=true
-                fi
-              else
-                code=$?
-                test "$code" -eq 2
-              fi
-              GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
-                --input "$RUNNER_TEMP/public-records" --history "$history" \
-                --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
-              commit=$(python3 - "$receipt" <<'PY'
-          import re, sys
-          from pathlib import Path
-          from infra.aws_benchmark.common import require
-          value = Path(sys.argv[1]).read_text()
-          require(re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'invalid append receipt')
-          print(value.removeprefix('commit=').strip())
-          PY
-              )
-              if test -z "$commit"; then
-                if test "$has_history" = true; then
-                  commit=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
-                  [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-                fi
-                printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-                echo 'History already contains all verified records.' >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-            fi
-            python3 -m infra.aws_benchmark.publication_identity current-main
-            authorization=$(python3 - <<'PY'
-          import base64, os
-          print('AUTHORIZATION: basic ' + base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode())
-          PY
-            )
-            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="$authorization" \
-              git -c credential.helper= --git-dir="$history" push https://github.com/wykurz/rcp.git "$commit:refs/heads/aws-benchmark-history"; then
-              printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-              echo 'Appended verified public records to aws-benchmark-history.' >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            unset authorization
-          done
-          echo 'History publication requires reconciliation after three bounded attempts.' >&2
-          exit 1
+        run: python3 -m infra.aws_benchmark.publication_push
 
   pages:
     needs: publish

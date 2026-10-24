@@ -7,6 +7,7 @@ It is intentionally not built from writer_plan().
 
 from copy import deepcopy
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import quote
 
 from . import production_trust as trust
 from .reader_identity import reader_resource_identity
@@ -24,7 +26,7 @@ FIXTURE = Path(__file__).with_name("fixtures") / "history-trust-readbacks-v2.jso
 RESOURCE = "arn:aws:secretsmanager:us-east-1:123456789012:secret:/rcp/production/github-read-app-Ab1Cd2"
 ROLES = ["arn:aws:iam::123456789012:role/production/" + name for name in ("admission", "collector", "recovery")]
 STACK = "arn:aws:cloudformation:us-east-1:123456789012:stack/rcp-production-test/12345678-1234-1234-1234-123456789abc"
-FIELDS = ("environment", "branches", "rulesets", "repository", "app", "inventory")
+FIELDS = ("environment", "branches", "rulesets", "repository", "app", "inventory", "custom_rules")
 ARGS = ("--app-id", "1234", "--client-id", "Iv23.test-client", "--installation-id", "5678")
 
 
@@ -40,9 +42,13 @@ def stack_readback():
     return dict(operation="DescribeStacks", region="us-east-1", parameters=dict(StackName=STACK),
         response=dict(Stacks=[dict(StackId=STACK, StackName="rcp-production-test", StackStatus="CREATE_COMPLETE",
             Parameters=[dict(ParameterKey=key, ParameterValue="false") for key in
-                        ("RuntimeEnabled", "AdmissionEnabled", "PublicationEnabled")],
+                        ("RuntimeEnabled", "AdmissionEnabled", "PublicationEnabled")] +
+                        [dict(ParameterKey=key, ParameterValue="") for key in
+                         ("GitHubAppClientId", "GitHubAppInstallationId", "GitHubAppSecretSuffix")],
             Outputs=[dict(OutputKey=key, OutputValue=value) for key, value in
-                     zip(("AdmissionRoleArn", "CollectorRoleArn"), ROLES[:2])])]))
+                     zip(("AdmissionRoleArn", "CollectorRoleArn"), ROLES[:2])] +
+                     [dict(OutputKey=key + "Arn", OutputValue="arn:aws:iam::123456789012:role/production/" + key)
+                      for key in ("GitHubPublicationRole", "GitHubSubmitRole", "WorkerRole", "SchedulerTerminationRole")])]))
 
 
 def rendered_deny(policy, resource, principal, stage=None, action="secretsmanager:GetSecretValue"):
@@ -105,8 +111,9 @@ class TrustTests(unittest.TestCase):
             paths = []
             for name, value in data.items():
                 path = Path(directory) / (name + ".json"); path.write_text(json.dumps(value))
-                paths.extend(["--" + name + "-readback", path])
-            result = self.cli("writer-check", *ARGS, *paths, "--key-state", "absent")
+                paths.extend(["--" + name.replace("_", "-") + "-readback", path])
+            plan = Path(directory) / "plan.json"; plan.write_text(json.dumps(self.plan))
+            result = self.cli("writer-check", "--plan", plan, *paths, "--key-state", "absent")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["key_metadata_state"], "absent")
 
@@ -182,7 +189,8 @@ class TrustTests(unittest.TestCase):
             lambda i: page_response(i["environment_variables"][trust.ENVIRONMENT])["variables"][0].update(value="Iv23.other"),
             lambda i: page_response(i["environment_variables"]["other"]).update(total_count=1, variables=[{"name": trust.REPOSITORY_FLAGS[0], "value": "false"}]),
             lambda i: page_response(i["repository_variables"])["variables"][0].update(value="true"),
-            lambda i: page_response(i["repository_variables"])["variables"].append({"name": trust.CLIENT_VARIABLE, "value": "Iv23.test-client"}),
+            lambda i: page_response(i["repository_variables"]).update(total_count=4,
+                variables=page_response(i["repository_variables"])["variables"] + [{"name": trust.CLIENT_VARIABLE, "value": "Iv23.test-client"}]),
         ])
         for mutate in variants:
             data = readbacks(); mutate(data["inventory"])
@@ -239,7 +247,7 @@ class TrustTests(unittest.TestCase):
             lambda d: d["response"]["Stacks"][0].update(StackId=STACK + "other"),
             lambda d: d["response"]["Stacks"][0].update(StackStatus="UPDATE_IN_PROGRESS"),
             lambda d: d["response"]["Stacks"][0]["Parameters"][0].update(ParameterValue="true"),
-            lambda d: d["response"]["Stacks"][0]["Outputs"].pop(),
+            lambda d: d["response"]["Stacks"][0]["Outputs"].pop(0),
             lambda d: d["response"]["Stacks"][0]["Outputs"].append(deepcopy(d["response"]["Stacks"][0]["Outputs"][0])),
             lambda d: d["response"]["Stacks"][0]["Outputs"][0].update(OutputValue=ROLES[2]),
         ]
@@ -247,6 +255,230 @@ class TrustTests(unittest.TestCase):
             value = stack_readback(); mutate(value)
             with self.subTest(mutation=mutate), self.assertRaises(ValueError):
                 trust.reader_proposal(RESOURCE, STACK, value, ROLES[2])
+
+    def test_github_branch_policy_shape_and_security_negative_readbacks(self):
+        baseline = readbacks()
+        self.assertIn("branch_policy", [x["type"] for x in baseline["environment"]["protection_rules"]])
+        self.check(baseline)
+        variants = [
+            ("branch policy absent", "explicitly configured branches", lambda d: d["environment"].update(deployment_branch_policy=None)),
+            ("all protected branches", "explicitly configured branches", lambda d: d["environment"].update(deployment_branch_policy={"protected_branches": True})),
+            ("review removed", "owner-only review", lambda d: d["environment"].update(protection_rules=[])),
+            ("wrong owner", "selected owner", lambda d: d["environment"]["protection_rules"][0]["reviewers"][0]["reviewer"].update(id=123)),
+            ("tag main", "only the main branch", lambda d: d["branches"]["response"]["branch_policies"][0].update(type="tag")),
+            ("source type absent", "repository identity", lambda d: d["rulesets"][0].pop("source_type")),
+            ("extra bypass", "approved history namespace", lambda d: d["rulesets"][0]["bypass_actors"].append({"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always"})),
+            ("deletion unprotected", "ruleset rules differ", lambda d: d["rulesets"][1]["rules"].pop(0)),
+            ("App variable repository copy", "environment scoped", lambda d: page_response(d["inventory"]["repository_variables"]).update(total_count=4,
+                variables=page_response(d["inventory"]["repository_variables"])["variables"] + [{"name": trust.CLIENT_VARIABLE, "value": "Iv23.test-client"}])),
+            ("App variable environment copy", "another environment", lambda d: page_response(d["inventory"]["environment_variables"]["other"]).update(total_count=1,
+                variables=[{"name": trust.INSTALLATION_VARIABLE, "value": "5678"}])),
+            ("writer environment omitted", "writer environment is absent", lambda d: page_response(d["inventory"]["environments"]).update(total_count=1,
+                environments=[page_response(d["inventory"]["environments"])["environments"][1]])),
+            ("case collision", "environment names collide", lambda d: page_response(d["inventory"]["environments"]).update(total_count=3,
+                environments=page_response(d["inventory"]["environments"])["environments"] + [{"name": trust.ENVIRONMENT.upper(), "url": trust.ENVIRONMENT_URL.upper()}])),
+        ]
+        for name, reason, mutate in variants:
+            data = readbacks(); mutate(data)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, reason): self.check(data)
+
+    def test_variables_use_thirty_item_pages_and_keep_complete_inventory_checks(self):
+        for location in ("repository", "environment"):
+            data = readbacks()
+            inventory = data["inventory"]["repository_variables"] if location == "repository" else data["inventory"]["environment_variables"]["other"]
+            initial = page_response(inventory)["variables"]
+            items = initial + [{"name": "EXTRA_" + str(n), "value": "public"} for n in range(31 - len(initial))]
+            endpoint = inventory["pages"][0]["endpoint"].split("?")[0]
+            inventory["pages"] = [{"endpoint": endpoint + "?per_page=30&page=" + str(n),
+                "response": {"total_count": 31, "variables": items[(n - 1) * 30:n * 30]}} for n in (1, 2)]
+            with self.subTest(location=location): self.check(data)
+            for mutate in (lambda p: p["pages"].pop(),
+                           lambda p: p["pages"][0].update(endpoint=endpoint + "?per_page=100&page=1"),
+                           lambda p: p["pages"][1]["response"].update(total_count=32),
+                           lambda p: p["pages"][1]["response"]["variables"][0].update(name=items[0]["name"])):
+                bad = deepcopy(inventory); mutate(bad)
+                with self.assertRaises(ValueError): trust.inventory_items(bad, endpoint, "variables")
+
+    def test_raw_environment_list_urls_encoded_requests_and_ruleset_pattern_order(self):
+        data = readbacks()
+        name = "Preview – preview/pr-18"
+        item = page_response(data["inventory"]["environments"])["environments"][1]
+        item.update(name=name, url=trust.API_ROOT + "/environments/" + name)
+        for field in ("environment_secrets", "environment_variables"):
+            inventory = data["inventory"][field].pop("other")
+            inventory["pages"][0]["endpoint"] = inventory["pages"][0]["endpoint"].replace("/other/", "/" + quote(name, safe="") + "/")
+            data["inventory"][field][name] = inventory
+        for rule in data["rulesets"]:
+            rule["conditions"]["ref_name"]["include"].reverse()
+            rule["conditions"]["ref_name"]["include"].append(trust.HISTORY_REF)
+        self.check(data)
+        item["url"] = trust.API_ROOT + "/environments/other"
+        with self.assertRaisesRegex(ValueError, "environment inventory identity"): self.check(data)
+        for include, exclude in (([trust.HISTORY_REF], []), ([trust.HISTORY_REF, "refs/heads/*"], []),
+                                 ([trust.HISTORY_REF, trust.HISTORY_NAMESPACE], [trust.HISTORY_REF])):
+            data = readbacks(); data["rulesets"][0]["conditions"]["ref_name"] = dict(include=include, exclude=exclude)
+            with self.assertRaisesRegex(ValueError, "history namespace"): self.check(data)
+
+    def test_approved_plan_is_validated_and_receipt_binds_exact_plan_and_declared_installation(self):
+        result = self.check(readbacks())
+        expected = hashlib.sha256(json.dumps(self.plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(result["approved_plan_sha256"], expected)
+        self.assertEqual(result["configured_installation_id"], 5678)
+        self.assertFalse(result["installation_scope_proven"])
+        for mutate in (
+            lambda p: p["environment"]["settings"]["reviewers"][0].update(id=123),
+            lambda p: p["environment"].update(name="other"),
+            lambda p: p["secret"].update(scope="repository"),
+            lambda p: p["secret"].update(name="OTHER_KEY"),
+            lambda p: p["app"].update(id=True),
+            lambda p: p["app"].update(installation_id=True),
+            lambda p: p["rulesets"][1].update(bypass_actors=[{"actor_id": 1234}]),
+        ):
+            plan = deepcopy(self.plan); mutate(plan)
+            with self.assertRaises(ValueError): trust.check_writer(plan, *(readbacks()[key] for key in FIELDS))
+        with tempfile.TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.json"; plan_path.write_text(json.dumps(self.plan))
+            paths = []
+            for key, value in readbacks().items():
+                path = Path(directory) / (key + ".json"); path.write_text(json.dumps(value)); paths.extend(["--" + key.replace("_", "-") + "-readback", path])
+            good = self.cli("writer-check", "--plan", plan_path, *paths)
+            self.assertEqual(good.returncode, 0, good.stderr)
+            self.assertEqual(json.loads(good.stdout)["approved_plan_sha256"], expected)
+            old = self.cli("writer-check", *ARGS, *paths)
+            self.assertNotEqual(old.returncode, 0)
+
+    def test_phase_checks_support_later_readbacks_without_accepting_mixed_flags(self):
+        for phase in ("setup", "canary", "publication"):
+            data = readbacks()
+            expected = {name: "false" for name in trust.REPOSITORY_FLAGS}
+            if phase == "canary": expected["RCP_AWS_HISTORY_CANARY_ENABLED"] = "true"
+            if phase == "publication": expected.update(RCP_AWS_HISTORY_TRUST_READY="true", RCP_AWS_PRODUCTION_PUBLISH_ENABLED="true")
+            for item in page_response(data["inventory"]["repository_variables"])["variables"]: item["value"] = expected[item["name"]]
+            result = trust.check_writer(self.plan, *(data[key] for key in FIELDS), phase=phase)
+            self.assertEqual(result["phase"], phase)
+            for key in expected:
+                bad = deepcopy(data)
+                next(x for x in page_response(bad["inventory"]["repository_variables"])["variables"] if x["name"] == key)["value"] = "false" if expected[key] == "true" else "true"
+                with self.assertRaisesRegex(ValueError, "repository flags"):
+                    trust.check_writer(self.plan, *(bad[key] for key in FIELDS), phase=phase)
+            if phase != "setup":
+                with self.assertRaisesRegex(ValueError, "present key metadata"):
+                    trust.check_writer(self.plan, *(data[key] for key in FIELDS), phase=phase, key_state="absent")
+
+    def test_reader_bootstrap_precedes_app_grants_and_rebind_matches_actual_secret(self):
+        value = stack_readback()
+        config = value["response"]["Stacks"][0]["Parameters"]
+        for key, val in (("GitHubAppClientId", "Iv23.test-client"), ("GitHubAppInstallationId", "5678"), ("GitHubAppSecretSuffix", "Ab1Cd2")):
+            next(x for x in config if x["ParameterKey"] == key)["ParameterValue"] = val
+        with self.assertRaisesRegex(ValueError, "empty App parameters"):
+            trust.reader_proposal(RESOURCE, STACK, value, ROLES[2])
+        result = trust.reader_proposal(RESOURCE, STACK, value, ROLES[2], phase="rebind")
+        self.assertEqual(result["phase"], "rebind")
+        self.assertFalse(result["key_absence_proven"])
+        for key, val in (("GitHubAppClientId", ""), ("GitHubAppInstallationId", "0"), ("GitHubAppSecretSuffix", "Other1"), ("GitHubAppSecretSuffix", "")):
+            bad = deepcopy(value)
+            next(x for x in bad["response"]["Stacks"][0]["Parameters"] if x["ParameterKey"] == key)["ParameterValue"] = val
+            with self.subTest(key=key, value=val), self.assertRaises(ValueError):
+                trust.reader_proposal(RESOURCE, STACK, bad, ROLES[2], phase="rebind")
+        missing = stack_readback(); missing["response"]["Stacks"][0]["Parameters"].pop()
+        with self.assertRaisesRegex(ValueError, "empty App parameters"):
+            trust.reader_proposal(RESOURCE, STACK, missing, ROLES[2])
+
+    def test_recovery_excludes_every_production_stack_role_output(self):
+        value = stack_readback()
+        for output in value["response"]["Stacks"][0]["Outputs"]:
+            with self.subTest(output=output["OutputKey"]), self.assertRaisesRegex(ValueError, "must not be a production stack role"):
+                trust.reader_proposal(RESOURCE, STACK, value, output["OutputValue"])
+
+    def test_emit_cleanup_failure_does_not_replace_original_publish_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "out.json"
+            with patch.object(trust.os, "link", side_effect=ValueError("primary")), patch.object(Path, "unlink", side_effect=OSError("cleanup")):
+                with self.assertRaisesRegex(ValueError, "primary"): trust.emit({"ok": True}, path)
+            self.assertFalse(path.exists())
+
+    def test_custom_protection_rules_must_be_explicitly_absent_at_the_exact_endpoint(self):
+        self.check(readbacks())
+        mutations = [
+            lambda d: d["custom_rules"].update(endpoint=trust.ENVIRONMENT_URL + "/deployment_protection_rules/apps"),
+            lambda d: d["custom_rules"].update(endpoint=trust.ENVIRONMENT_URL.replace("wykurz", "other") + "/deployment_protection_rules"),
+            lambda d: d["custom_rules"]["response"].pop("total_count"),
+            lambda d: d["custom_rules"]["response"].update(total_count=False),
+            lambda d: d["custom_rules"]["response"].update(total_count=0.0),
+            lambda d: d["custom_rules"]["response"].pop("custom_deployment_protection_rules"),
+            lambda d: d["custom_rules"]["response"].update(custom_deployment_protection_rules=None),
+            lambda d: d["custom_rules"]["response"].update(total_count=1, custom_deployment_protection_rules=[{"id": 123, "enabled": True}]),
+            lambda d: d["custom_rules"]["response"].update(custom_deployment_protection_rules=[{"id": 123, "enabled": False}]),
+        ]
+        for mutate in mutations:
+            data = readbacks(); mutate(data)
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError): self.check(data)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for key, value in readbacks().items():
+                if key == "custom_rules": continue
+                path = Path(directory) / (key + ".json"); path.write_text(json.dumps(value))
+                paths.extend(["--" + key.replace("_", "-") + "-readback", path])
+            plan = Path(directory) / "plan.json"; plan.write_text(json.dumps(self.plan))
+            result = self.cli("writer-check", "--plan", plan, *paths)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    def test_trust_digest_binds_exact_raw_bytes_and_independently_recomputed_manifest(self):
+        values = {"plan": self.plan, **readbacks()}
+        blobs = {key: (json.dumps(value, indent=2) + "\n").encode("utf-8") for key, value in values.items()}
+        result = trust.check_writer_blobs(blobs)
+        expected = {"schema": "rcp-history-trust-captures-v1", "phase": "setup", "key_state": "present",
+                    "capture_sha256": {key: hashlib.sha256(raw).hexdigest() for key, raw in blobs.items()}}
+        self.assertEqual(result["trust_manifest"], expected)
+        independent = json.dumps(expected, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(result["trust_sha256"], hashlib.sha256(independent).hexdigest())
+        for key in blobs:
+            changed = dict(blobs); changed[key] += b" "
+            after = trust.check_writer_blobs(changed)
+            self.assertNotEqual(after["trust_sha256"], result["trust_sha256"], key)
+            self.assertNotEqual(after["trust_manifest"]["capture_sha256"][key], expected["capture_sha256"][key])
+            self.assertEqual(after["approved_plan_sha256"], result["approved_plan_sha256"])
+        changed = deepcopy(values)
+        changed["environment"]["id"] = 111
+        extra = trust.check_writer_blobs({key: json.dumps(value).encode() for key, value in changed.items()})
+        self.assertTrue(extra["settings_match"])
+        self.assertNotEqual(extra["trust_sha256"], result["trust_sha256"])
+        for mutate in (lambda d: d.pop("plan"), lambda d: d.update(extra=b"{}"), lambda d: d.update(plan="{}"),
+                       lambda d: d.update(plan=b"{"), lambda d: d.update(plan=b" " * (trust.MAX_CAPTURE + 1))):
+            bad = dict(blobs); mutate(bad)
+            with self.assertRaises(ValueError): trust.check_writer_blobs(bad)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for key, raw in blobs.items():
+                path = Path(directory) / (key + ".json"); path.write_bytes(raw)
+                paths.extend(["--plan" if key == "plan" else "--" + key.replace("_", "-") + "-readback", path])
+            first = self.cli("writer-check", *paths)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["trust_sha256"], result["trust_sha256"])
+            (Path(directory) / "environment.json").write_bytes(blobs["environment"] + b"\n")
+            second = self.cli("writer-check", *paths)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertNotEqual(json.loads(second.stdout)["trust_sha256"], result["trust_sha256"])
+
+    def test_trust_manifest_records_exact_selected_phase_and_key_state(self):
+        for phase, key_state in (("setup", "absent"), ("setup", "present"), ("canary", "present"), ("publication", "present")):
+            values = {"plan": self.plan, **readbacks()}
+            if key_state == "absent":
+                page_response(values["inventory"]["environment_secrets"][trust.ENVIRONMENT]).update(total_count=0, secrets=[])
+            if phase != "setup":
+                for item in page_response(values["inventory"]["repository_variables"])["variables"]:
+                    item["value"] = "true" if (item["name"] == trust.CANARY_FLAG) == (phase == "canary") else "false"
+            blobs = {key: json.dumps(value).encode() for key, value in values.items()}
+            result = trust.check_writer_blobs(blobs, phase=phase, key_state=key_state)
+            self.assertEqual(result["trust_manifest"]["phase"], phase)
+            self.assertEqual(result["trust_manifest"]["key_state"], key_state)
+            for key, replacement in (("phase", "other"), ("key_state", "other")):
+                manifest = deepcopy(result["trust_manifest"]); manifest[key] = replacement
+                altered = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+                self.assertNotEqual(altered, result["trust_sha256"])
+            self.assertFalse(result["key_custody_proven"])
+            self.assertFalse(result["live_enforcement_proven"])
 
     def cli(self, *args):
         return subprocess.run([sys.executable, "-B", "-m", "infra.aws_benchmark.production_trust", *map(str, args)],
@@ -292,13 +524,15 @@ class TrustTests(unittest.TestCase):
             paths = []
             for name, value in readbacks().items():
                 path = Path(directory) / (name + ".json"); path.write_text(json.dumps(value))
-                paths.extend(["--" + name + "-readback", path])
-            result = self.cli("writer-check", *ARGS, *paths)
+                paths.extend(["--" + name.replace("_", "-") + "-readback", path])
+            plan = Path(directory) / "plan.json"; plan.write_text(json.dumps(self.plan))
+            result = self.cli("writer-check", "--plan", plan, *paths)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(json.loads(result.stdout)["key_custody_proven"])
             env = readbacks()["environment"]; env["can_admins_bypass"] = True
             (Path(directory) / "environment.json").write_text(json.dumps(env))
-            result = self.cli("writer-check", *ARGS, *paths)
+            plan = Path(directory) / "plan.json"; plan.write_text(json.dumps(self.plan))
+            result = self.cli("writer-check", "--plan", plan, *paths)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
             self.assertIn("administrator bypass disabled is unproven", result.stderr)

@@ -40,11 +40,11 @@ class PublicationIdentityTests(unittest.TestCase):
 
     def test_main_requires_one_exact_successful_ref_and_no_token_for_read(self):
         good = SHA + "\trefs/heads/main\n"
-        for status, raw in ((0, good), (0, "b" * 40 + "\trefs/heads/main\n"), (0, good + good),
+        for status, raw in ((0, good), (0, good + "b" * 40 + "\trefs/heads/x/refs/heads/main\n"), (0, "b" * 40 + "\trefs/heads/main\n"), (0, good + good),
                             (0, good.replace("heads/main", "heads/shadow/main")), (0, ""), (2, ""), (128, good)):
             with self.subTest(status=status, raw=raw), patch.dict(os.environ, GH_TOKEN="never-pass", GITHUB_TOKEN="never-pass"), \
                     patch.object(identity.subprocess, "run", return_value=Mock(returncode=status, stdout=raw)) as run:
-                if (status, raw) == (0, good):
+                if status == 0 and (raw == good or raw == good + "b" * 40 + "\trefs/heads/x/refs/heads/main\n"):
                     identity.current_main(SHA)
                 else:
                     with self.assertRaises(ValueError):
@@ -70,6 +70,37 @@ class PublicationIdentityTests(unittest.TestCase):
                     result = subprocess.run([sys.executable, "-m", "infra.aws_benchmark.publication_identity", command],
                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
+
+    def test_canary_identity_checks_configuration_and_flags_before_any_mutation(self):
+        env = dict(environment(CANARY_WORKFLOW), CANARY_ENABLED="true", TRUST_READY="false", PUBLISH_ENABLED="false",
+            CLIENT_ID="Iv23.test-client", INSTALLATION_ID="5678")
+        for key, value in ((None, None), ("CLIENT_ID", ""), ("CLIENT_ID", "bad value"), ("INSTALLATION_ID", ""),
+                ("INSTALLATION_ID", "05678"), ("CANARY_ENABLED", "True"), ("TRUST_READY", "true"),
+                ("PUBLISH_ENABLED", "true"), ("GITHUB_REF", "refs/heads/other")):
+            with self.subTest(key=key, value=value):
+                current = {**os.environ, **env, "PYTHONOPTIMIZE": "2"}
+                if key:
+                    current[key] = value
+                result = subprocess.run([sys.executable, "-m", "infra.aws_benchmark.publication_identity", "canary"],
+                    cwd=ROOT, env=current, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, key is None, result.stderr)
+                if key:
+                    self.assertIn("Publication identity check failed:", result.stderr)
+
+    def test_canary_main_observation_authenticates_without_inheriting_token_environment(self):
+        with patch.dict(os.environ, GH_TOKEN="ordinary-secret", WRITER_TOKEN="writer-secret"), \
+                patch.object(identity.subprocess, "run", return_value=Mock(returncode=0, stdout=SHA + "\trefs/heads/main\n")) as run:
+            identity.current_main(SHA, token="ordinary-secret")
+        args, kwargs = run.call_args
+        self.assertFalse(any("ordinary-secret" in arg or "writer-secret" in arg for arg in args[0]))
+        self.assertNotIn("GH_TOKEN", kwargs["env"])
+        self.assertNotIn("WRITER_TOKEN", kwargs["env"])
+        fields = {kwargs["env"]["GIT_CONFIG_KEY_" + str(index)]: kwargs["env"]["GIT_CONFIG_VALUE_" + str(index)]
+                  for index in range(int(kwargs["env"]["GIT_CONFIG_COUNT"]))}
+        self.assertIn("http.https://github.com/.extraheader", fields)
+        with patch.object(identity.subprocess, "run", side_effect=AssertionError("no credential must fail before read")):
+            with self.assertRaisesRegex(ValueError, "read credential missing"):
+                identity.current_main(SHA, token="")
 
 
 if __name__ == "__main__":
