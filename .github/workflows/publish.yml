@@ -23,24 +23,33 @@ permissions:
   contents: read
 
 jobs:
+  resolve-release:
+    uses: ./.github/workflows/resolve-release-tag.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
+
   validate:
+    needs: resolve-release
+    if: ${{ needs.resolve-release.result == 'success' }}
     uses: ./.github/workflows/validate.yml
     with:
-      ref: ${{ inputs.release_tag }}
+      ref: ${{ needs.resolve-release.outputs.commit }}
 
   publish:
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [resolve-release, validate]
+    if: ${{ needs.resolve-release.result == 'success' }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
 
       - name: Verify version matches release tag
         env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
           TAG_VERSION="${RELEASE_TAG#v}"
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
