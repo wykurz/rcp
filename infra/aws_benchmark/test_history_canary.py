@@ -61,7 +61,7 @@ class Fake:
         return dict(accepted=allowed, rule_denial=not allowed and self.mode != "rename_ambiguous", status=201 if allowed else 422,
                     response_sha256="0" * 64)
 
-    def settled_rename(self, source, destination, expected):
+    def settled_rename(self, source, destination, expected, observe=None):
         if source in self.values or self.values.get(destination) != expected:
             raise ValidationError("rename unsettled")
         return self.refs()
@@ -86,7 +86,7 @@ class CanaryTests(unittest.TestCase):
             rows = [json.loads(row) for row in path.read_text().splitlines()]
             self.assertEqual(rows[-1]["stage"], "complete")
             self.assertFalse(rows[-1]["readiness_changed"])
-            self.assertEqual([row["stage"] for row in rows if not row["stage"].endswith(("_intent", "_outcome"))], ["initial_absence", "ordinary_create_control",
+            self.assertEqual([row["stage"] for row in rows if not row["stage"].endswith(("_intent", "_outcome", "_baseline", "_observed")) and row["stage"] not in ("initial_observation", "sentinels", "writer_precondition", "ordinary_rename_control_poll")], ["initial_absence", "ordinary_create_control",
                 "ordinary_rename_control", "ordinary_create_history", "ordinary_rename_history", "ordinary_complete",
                 "writer_create_history", "writer_fast_forward", "ordinary_fast_forward", "writer_non_fast_forward",
                 "writer_delete", "ordinary_non_fast_forward", "ordinary_delete", "publisher_compatible", "control_cleanup", "complete"])
@@ -107,8 +107,8 @@ class CanaryTests(unittest.TestCase):
                 with self.assertRaises(TimeoutError):
                     run.positive("writer_create_history", "writer", HISTORY_REF, commit)
             rows = [json.loads(row) for row in path.read_text().splitlines()]
-            self.assertEqual(rows[0]["stage"], "writer_create_history_intent")
-            self.assertEqual((rows[0]["ref"], rows[0]["commit"], rows[0]["expected"]), (HISTORY_REF, commit, None))
+            self.assertEqual(rows[1]["stage"], "writer_create_history_intent")
+            self.assertEqual((rows[1]["ref"], rows[1]["commit"], rows[1]["expected"]), (HISTORY_REF, commit, None))
             self.assertEqual(rows[-1]["stage"], "writer_create_history_uncertain")
             self.assertNotIn("must not echo", path.read_text())
 
@@ -122,8 +122,8 @@ class CanaryTests(unittest.TestCase):
                 with self.assertRaises(TimeoutError):
                     run.positive("writer_create_history", "writer", HISTORY_REF, commit)
             rows = [json.loads(row) for row in path.read_text().splitlines()]
-            self.assertEqual(rows[-1]["stage"], "writer_create_history_outcome")
-            self.assertTrue(rows[-1]["outcome"]["accepted"])
+            self.assertEqual(rows[-1]["stage"], "writer_create_history_observed_read_failed")
+            self.assertTrue(rows[-2]["outcome"]["accepted"])
             self.assertEqual(remote.values[HISTORY_REF], commit)
 
     def test_existing_exact_or_descendant_history_is_never_repaired(self):
@@ -249,8 +249,8 @@ class CanaryTests(unittest.TestCase):
         value = yaml.safe_load((ROOT / ".github/workflows" / CANARY_WORKFLOW).read_text())
         self.assertEqual(set(value[True]), {"workflow_dispatch"})
         job = value["jobs"]["verify"]
-        self.assertEqual(job["permissions"], {"contents": "write"})
-        self.assertEqual(job["environment"], ENVIRONMENT)
+        self.assertEqual(job["permissions"], {"contents": "write", "actions": "read"})
+        self.assertEqual(job["environment"], {"name": ENVIRONMENT, "deployment": False})
         self.assertIn("RCP_AWS_HISTORY_CANARY_ENABLED == 'true'", job["if"])
         self.assertIn("RCP_AWS_HISTORY_TRUST_READY == 'false'", job["if"])
         self.assertIn("RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'false'", job["if"])
@@ -268,16 +268,8 @@ class CanaryTests(unittest.TestCase):
         self.assertNotIn("id-token", str(value))
 
     def test_only_reviewed_lanes_reference_writer_environment_or_key(self):
-        references = set()
-        for path in (ROOT / ".github/workflows").glob("*.yml"):
-            value = yaml.safe_load(path.read_text())
-            for job in value.get("jobs", {}).values():
-                environment = job.get("environment")
-                if environment == ENVIRONMENT or isinstance(environment, dict) and environment.get("name") == ENVIRONMENT:
-                    references.add(path.name)
-            if WRITER_SECRET_NAME in path.read_text():
-                self.assertIn(path.name, {PUBLICATION_WORKFLOW, CANARY_WORKFLOW})
-        self.assertEqual(references, {PUBLICATION_WORKFLOW, CANARY_WORKFLOW})
+        from .workflow_inventory import check_workflows
+        check_workflows(ROOT / ".github/workflows")
 
 
 if __name__ == "__main__":

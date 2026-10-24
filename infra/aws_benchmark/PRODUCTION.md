@@ -183,8 +183,10 @@ dropping data.
 
 The writer receives only public JSON. It reads fixed Git objects in a bare repository, preserves
 identical prior records and rejects conflicting records. It creates commits through Git plumbing and
-pushes to `aws-benchmark-history` without force, with three bounded fetch/reconcile attempts. The
-history branch remains separate from Depot's `benchmark-history`. The job's default token is
+pushes one fixed prepared commit to `aws-benchmark-history` with an exact expected-tip lease and
+three bounded attempts. The prepared commit must be a fast-forward from its recorded baseline;
+reconciliation accepts only that baseline or the exact prepared tip, never a foreign fast-forward.
+The history branch remains separate from Depot's `benchmark-history`. The job's default token is
 Contents read. A dedicated, repository-selected writer App supplies Contents write and Metadata read
 only after credential-free commit preparation finds new validated records, in the proposed main-only
 `aws-benchmark-history` environment. Its installation ID must match before use; this checks
@@ -210,13 +212,13 @@ is tightened Secrets Manager, without a KMS implementation. Its deny-only policy
 the exact two deployed reader roles and a recovery role selected by the user; it chooses no recovery
 principal and grants no access.
 
-History protection uses two exact-branch rulesets: an App-only creation/update restriction and a
-separate deletion/non-fast-forward prohibition with no bypass. The workflow's App key must be an
-environment secret, never shared with the AWS reader. An authorized operator must verify complete
-settings readbacks and live positive/negative canaries before setting the readiness flag. Other
-trusted main workflows can request that environment; this is not workflow-specific secret isolation.
-The initial environment policy requires owner approval, with no administrator bypass. A future
-unattended policy needs a separate decision.
+History protection reserves the root and all descendant names with two rulesets: an App-only
+creation/update restriction and a separate deletion/non-fast-forward prohibition with no bypass. The
+workflow's App key must be an environment secret, never shared with the AWS reader. An authorized
+operator must verify complete settings readbacks and live positive/negative canaries before setting
+the readiness flag. Other trusted main workflows can request that environment; this is not
+workflow-specific secret isolation. The initial environment policy requires owner approval, with no
+administrator bypass. A future unattended policy needs a separate decision.
 
 No App, secret, policy, ruleset or environment is created by the code. Runtime tokens and repository
 flags cannot prove these settings exist. Anchoring public digests in DynamoDB remains a possible
@@ -363,18 +365,20 @@ The following setup is proposed, **not provisioned by this PR**:
    acknowledging both the logs/artifacts read scope and App-key installation authority. Keep other
    repository/account permissions off, webhook delivery inactive and user authorization unused.
    Record the exact client and installation IDs from the owner's GitHub UI; these may be shared.
-2. Approve and review the one-time secure private-key import procedure, generate a key and store
-   only its PEM in the exact external secret with AWS-managed encryption. Never paste it into chat
-   or command arguments, put it in CloudFormation parameters, or commit it. The application requires
-   no App OAuth client secret. Record the full secret ARN, its six-character suffix and public key
-   fingerprint, never the key.
-3. Prepare an account-resolved disabled change set using the client ID, installation ID, secret
-   suffix and immutable package pins. The production stack is still undeployed: review the full
-   nine-role/resource inventory and trust, including the two exact secret-read policy resources.
-   Those App additions do not replace approval of the wider deployment. Preview generated role ARNs
-   symbolically, then verify their actual values and resolved policies after approved disabled
-   creation and before any same-role canary. App setup, secret creation/import and live IAM
-   deployment each remain outside code-preparation authority.
+2. Follow the single
+   [reader bootstrap order in TRUST.md](TRUST.md#explicit-secrets-manager-reader-boundary):
+   approve/deploy the disabled stack with empty App parameters, create an empty external secret,
+   derive the actual reader roles from its captured outputs, and approve/attach/read back the
+   mandatory deny boundary **before importing a PEM**. Select a separate recovery role outside the
+   production stack. Review the full nine-role/resource inventory and immutable artifact pins; this
+   sequence does not replace approval of the wider deployment.
+3. Only after that empty-secret policy verification, approve the secure key import and complete App
+   configuration. Record the secret ARN, suffix, App key ID and public-key SHA256 fingerprint, never
+   the PEM. Bind the configured suffix to that exact protected secret and verify resolved grants
+   while runtime/admission/publication remain disabled. The application needs no OAuth client
+   secret. Never put a PEM in chat, command arguments, CloudFormation parameters or source. Role
+   replacements require the same approved policy rebinding before use. App setup, empty-secret
+   creation, policy attachment, PEM import and live IAM deployment remain separate live approvals.
 4. Approve the exact **no-worker** probe mechanism below after the disabled deployment and App
    configuration review. Production handlers cannot establish this evidence with feature flags off
    and reserved concurrency zero. Nor does enabling the normal handler with a disabled server policy
@@ -384,13 +388,14 @@ The following setup is proposed, **not provisioned by this PR**:
 
 ### No-worker App and IAM acceptance
 
-First review the resolved identity/resource policies and any secret resource policy. IAM simulation
-can check expected AWSCURRENT, omitted-stage, VersionId-only, AWSPREVIOUS, other-secret and
-unrelated Secrets Manager/KMS outcomes. Record all supplied context and unsupported policy types;
-simulation is not proof of live service authorization and cannot substitute for exercising each
-actual reader role. The `SimulatePrincipalPolicy` API documents resource-policy evaluation for IAM
-users; do not present a supplied secret resource policy as proof of effective reader-role
-authorization. An operator's own successful secret read is not evidence for either Lambda role.
+First review the resolved identity/resource policies and the mandatory attached secret deny policy.
+IAM simulation can check expected AWSCURRENT, omitted-stage, VersionId-only, AWSPREVIOUS,
+other-secret and unrelated Secrets Manager/KMS outcomes. Record all supplied context and unsupported
+policy types; simulation is not proof of live service authorization and cannot substitute for
+exercising each actual reader role. The `SimulatePrincipalPolicy` API documents resource-policy
+evaluation for IAM users; do not present a supplied secret resource policy as proof of effective
+reader-role authorization. An operator's own successful secret read is not evidence for either
+Lambda role.
 
 The proposed live mechanism is two temporary functions:
 `rcp-production-benchmark-f13-admission-probe` using the exact deployed `AdmissionRole`, and
@@ -455,13 +460,13 @@ For suspected compromise, obtain approval for the exact incident actions and pre
    Do not blank App parameters by turning all runtime off: that would disable guards needed by an
    active run. Collection may hold while access is contained; that does not authorize another worker
    or an ownership reset.
-2. Contain AWS access **before storing a replacement key**. Review the current secret resource
-   policy and apply a separately approved explicit `Deny` for `secretsmanager:GetSecretValue` to the
-   affected reader role ARNs, or a reviewed deny-except recovery-principal boundary if incident
-   scope requires it. Preserve unrelated statements, use `BlockPublicPolicy`, and verify the
-   effective denial with approved same-role evidence. Closing admission or zeroing Lambda
-   concurrency alone leaves the secret grants in place. Do not claim account-wide exclusivity from
-   the template's two allows.
+2. Contain AWS access **before storing a replacement key**. The baseline secret policy already
+   denies readers outside the selected roles. Review that policy and tighten it with a separately
+   approved explicit `Deny` for `secretsmanager:GetSecretValue` to the affected reader role ARNs, or
+   a reviewed deny-except recovery-principal boundary if incident scope requires it. Preserve
+   unrelated statements, use `BlockPublicPolicy`, and verify the effective denial with approved
+   same-role evidence. Closing admission or zeroing Lambda concurrency alone leaves the secret
+   grants in place. Do not claim account-wide exclusivity from the template's two allows.
 3. Quarantine compromised reader functions and revoke affected role sessions under the incident's
    separate approval, without disabling the watchdog or termination role. Session revocation also
    denies other AWS operations for those sessions and does not stop a compromised function obtaining
@@ -477,7 +482,8 @@ For suspected compromise, obtain approval for the exact incident actions and pre
 
 If a separately approved KMS signing design replaces readable PEM storage, its incident procedure
 must instead specify exact signing-key denial/disablement and cached-token handling. This document
-does not provision or approve that alternative, a secret resource policy or a recovery role.
+does not provision or approve that alternative or any live policy/recovery identity. The current
+Secrets Manager design requires the deny boundary in TRUST.md; it is not an optional hardening step.
 
 For final decommissioning, obtain a separate approval listing the exact App/installation/key IDs,
 secret ARN, reader policies, retained collector resources and evidence retention:
@@ -565,17 +571,17 @@ References:
    trust intentionally does not admit the historical debug branch; pre-merge cloud validation would
    require a separately reviewed exact temporary lane.
 7. Verify one complete A/A acceptance through retained collection and ownership retirement,
-   including cancelled/failed producer recovery. Enable public reporting separately after approving
-   its exact read-only role, enabling the separate `PublicationEnabled` gate, and setting
-   `RCP_AWS_PRODUCTION_PUBLISH_ROLE`, `RCP_AWS_PRODUCTION_TABLE` and
-   `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`; it shares the existing production region/bucket variables.
-   Keep `RCP_AWS_HISTORY_TRUST_READY` false until the separately approved history-writer/ruleset
-   setup and live positive/negative trust canary in TRUST.md are verified. Only then enable that
-   readiness flag for both publication and AWS history rendering. Pages retains its independent
-   `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in this change. Broader
-   comparisons and a few-times-weekly schedule require their reviewed contracts, operating allowance
-   and activation decisions. Do not call this initial acceptance foundation a complete production
-   cutover.
+   including cancelled/failed producer recovery. Prepare the exact read-only reporting role and
+   non-secret `RCP_AWS_PRODUCTION_PUBLISH_ROLE` / `RCP_AWS_PRODUCTION_TABLE` variables under
+   separate approval; reporting shares the production region/bucket variables. Keep both
+   `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and `RCP_AWS_HISTORY_TRUST_READY` explicitly false through
+   TRUST.md's present-key readback and writer canary. After those live gates pass, separately
+   approve the `PublicationEnabled` deployment gate and enable publication/readiness together, with
+   canary disabled. Verify the publication-phase readback before the first publication. Pages
+   retains its independent `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in this
+   change. Broader comparisons and a few-times-weekly schedule require their reviewed contracts,
+   operating allowance and activation decisions. Do not call this initial acceptance foundation a
+   complete production cutover.
 
 ## Maintenance and unresolved production prerequisites
 

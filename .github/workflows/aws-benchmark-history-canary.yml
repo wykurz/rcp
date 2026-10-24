@@ -1,15 +1,35 @@
 name: Verify protected AWS benchmark history
 
-# this separate live acceptance lane requires its own exact approval before enabling.
+# this separate live acceptance lane requires its own exact approval before enabling
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Bootstrap, or separately approved recovery of a failed canary at the same main revision
+        required: true
+        default: bootstrap
+        type: choice
+        options:
+          - bootstrap
+          - resume
+      source_run_id:
+        description: Resume only - approved failed canary run ID
+        required: false
+        type: string
+      source_artifact_id:
+        description: Resume only - exact retained canary artifact ID from that run
+        required: false
+        type: string
+      source_sha256:
+        description: Resume only - operator-approved SHA256 of the retained canary.jsonl
+        required: false
+        type: string
       probe_id:
         description: Approved unique 16-hex probe ID (names two disposable control branches)
         required: true
         type: string
       trust_sha256:
-        description: SHA256 of the operator-verified trust readback receipt
+        description: writer-check trust_sha256 for the approved canary capture manifest
         required: true
         type: string
 
@@ -21,9 +41,12 @@ jobs:
     if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_HISTORY_CANARY_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'false' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: aws-benchmark-history
+    environment:
+      name: aws-benchmark-history
+      deployment: false
     permissions:
       contents: write
+      actions: read
     concurrency:
       group: aws-production-history-publish
       cancel-in-progress: false
@@ -31,30 +54,51 @@ jobs:
       GIT_CONFIG_NOSYSTEM: '1'
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_TERMINAL_PROMPT: '0'
+      CANARY_MODE: ${{ inputs.mode }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
+      SOURCE_SHA256: ${{ inputs.source_sha256 }}
       PROBE_ID: ${{ inputs.probe_id }}
       TRUST_SHA256: ${{ inputs.trust_sha256 }}
       CANARY_ENABLED: ${{ vars.RCP_AWS_HISTORY_CANARY_ENABLED }}
       TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
       PUBLISH_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+      CLIENT_ID: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
+      INSTALLATION_ID: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Require the reviewed main canary after approval
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import os
-          from infra.aws_benchmark.common import require
-          from infra.aws_benchmark.history_contract import CANARY_WORKFLOW
-          from infra.aws_benchmark.history_canary import identity
-          from infra.aws_benchmark.publication_identity import check_identity, current_main
-          check_identity(os.environ, workflow=CANARY_WORKFLOW)
-          require(os.environ['CANARY_ENABLED'] == 'true' and os.environ['TRUST_READY'] == 'false' and os.environ['PUBLISH_ENABLED'] == 'false', 'Canary flags differ; reject pending approvals when closing flags')
-          identity(os.environ['PROBE_ID'], os.environ['TRUST_SHA256'], os.environ['GITHUB_SHA'])
-          current_main(os.environ['GITHUB_SHA'])
-          PY
+          python3 -m infra.aws_benchmark.publication_identity canary-current-main
+      - name: Bind approved failed-run source before download
+        if: inputs.mode == 'resume'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m infra.aws_benchmark.canary_recovery
+      - name: Download only the approved source artifact
+        if: inputs.mode == 'resume'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs.source_artifact_id }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/canary-source
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Validate retained mutation evidence before writer mint
+        if: inputs.mode == 'resume'
+        run: |
+          python3 -m infra.aws_benchmark.history_canary resume-check \
+            --probe "$PROBE_ID" --trust-sha256 "$TRUST_SHA256" --revision "$GITHUB_SHA" \
+            --directory "$RUNNER_TEMP/canary.git" --evidence "$RUNNER_TEMP/canary.jsonl" \
+            --source-evidence "$RUNNER_TEMP/canary-source/canary.jsonl" --source-sha256 "$SOURCE_SHA256"
       - name: Prove ordinary write authority and protected bootstrap denial
+        if: inputs.mode == 'bootstrap'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -62,12 +106,9 @@ jobs:
             --probe "$PROBE_ID" --trust-sha256 "$TRUST_SHA256" --revision "$GITHUB_SHA" \
             --directory "$RUNNER_TEMP/canary.git" --evidence "$RUNNER_TEMP/canary.jsonl"
       - name: Recheck current main before minting
-        run: |
-          python3 - <<'PY'
-          import os
-          from infra.aws_benchmark.publication_identity import current_main
-          current_main(os.environ['GITHUB_SHA'])
-          PY
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m infra.aws_benchmark.publication_identity canary-current-main
       - name: Mint only after ordinary controls pass
         id: writer
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -86,22 +127,27 @@ jobs:
           ACTUAL_INSTALLATION: ${{ steps.writer.outputs.installation-id }}
           EXPECTED_INSTALLATION: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
         run: |
-          python3 - <<'PY'
-          import os
-          from infra.aws_benchmark.common import require
-          from infra.aws_benchmark.production_trust import identifier
-          from infra.aws_benchmark.publication_identity import current_main
-          require(identifier(os.environ['EXPECTED_INSTALLATION']) == identifier(os.environ['ACTUAL_INSTALLATION']), 'Installation continuity differs')
-          current_main(os.environ['GITHUB_SHA'])
-          PY
-          python3 -m infra.aws_benchmark.history_canary writer \
-            --probe "$PROBE_ID" --trust-sha256 "$TRUST_SHA256" --revision "$GITHUB_SHA" \
-            --directory "$RUNNER_TEMP/canary.git" --evidence "$RUNNER_TEMP/canary.jsonl"
+          python3 -m infra.aws_benchmark.publication_identity installation
+          python3 -m infra.aws_benchmark.publication_identity canary-current-main
+          if test "$CANARY_MODE" = resume; then
+            python3 -m infra.aws_benchmark.history_canary resume \
+              --probe "$PROBE_ID" --trust-sha256 "$TRUST_SHA256" --revision "$GITHUB_SHA" \
+              --directory "$RUNNER_TEMP/canary.git" --evidence "$RUNNER_TEMP/canary.jsonl" \
+              --source-evidence "$RUNNER_TEMP/canary-source/canary.jsonl" --source-sha256 "$SOURCE_SHA256"
+          else
+            test "$CANARY_MODE" = bootstrap
+            python3 -m infra.aws_benchmark.history_canary writer \
+              --probe "$PROBE_ID" --trust-sha256 "$TRUST_SHA256" --revision "$GITHUB_SHA" \
+              --directory "$RUNNER_TEMP/canary.git" --evidence "$RUNNER_TEMP/canary.jsonl"
+          fi
       - name: Preserve bounded public canary evidence on success or hold
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aws-history-canary-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/canary.jsonl
-          retention-days: 7
+          path: |
+            ${{ runner.temp }}/canary.jsonl
+            ${{ runner.temp }}/canary-source-metadata.json
+            ${{ runner.temp }}/canary-source/canary.jsonl
+          retention-days: 90
           if-no-files-found: warn

@@ -29,6 +29,10 @@ class PublishTests(unittest.TestCase):
         self.db.get_item.side_effect = lambda **kw: {} if kw["Key"]["pk"]["S"] == "active" else {"Item": copy.deepcopy(self.item)}
         self.repository = self.root / "history.git"
         git(self.root, "init", "--bare", str(self.repository))
+        tree = git(self.repository, "mktree", input_text="").stdout.strip()
+        self.initial_history = git(self.repository, "commit-tree", tree, "-m", "Accepted empty-tree canary",
+            environment=publish.git_env()).stdout.strip()
+        git(self.repository, "update-ref", publish.HISTORY_REF, self.initial_history)
 
     def batch(self):
         downloaded, exported = self.root / "download", self.root / "export"
@@ -293,7 +297,7 @@ class PublishTests(unittest.TestCase):
         self.reader.discover = Mock(return_value=[])
         _, _, exported, bound = self.batch()
         self.assertEqual(publish.publish(exported, self.repository, REVISION, bound), "")
-        self.assertEqual(publish.history(self.repository), ({}, None))
+        self.assertEqual(publish.history(self.repository), ({}, self.initial_history))
 
     def test_conflicting_history_preserves_existing_ref(self):
         _, _, exported, bound = self.batch()
@@ -342,6 +346,22 @@ class PublishTests(unittest.TestCase):
         self.db.get_item.side_effect = [{"Item": owner}, {"Item": item}, {}]
         with self.assertRaisesRegex(ValueError, "changed during"):
             self.reader.active_observation()
+
+    def test_missing_accepted_history_holds_all_cli_phases_before_cloud_access(self):
+        _, _, exported, bound = self.batch()
+        git(self.repository, "update-ref", "-d", publish.HISTORY_REF)
+        with self.assertRaisesRegex(ValueError, "protected history missing"):
+            publish.publish(exported, self.repository, REVISION, bound)
+        common = ["--history", str(self.repository), "--reader-revision", REVISION]
+        with patch("infra.aws_benchmark.controller.oidc_session") as oidc:
+            for phase, extras in (("download", ["--region", "us-east-1", "--role", "arn:aws:iam::123456789012:role/reader"]),
+                    ("export", []), ("publish", [])):
+                with self.subTest(phase=phase), patch("sys.argv", ["publication", phase, *common,
+                        "--input", str(exported), "--output", str(self.root / ("missing-" + phase)),
+                        "--expected-sha256", bound, *extras]), self.assertRaisesRegex(ValueError, "protected history missing"):
+                    publish.main()
+            oidc.assert_not_called()
+        self.assertEqual(publish.history(self.repository), ({}, None))
 
 
 if __name__ == "__main__":

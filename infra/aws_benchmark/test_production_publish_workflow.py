@@ -1,6 +1,5 @@
 """Offline capability, provenance and Git reconciliation checks for publication."""
 
-import base64
 import json
 import os
 from pathlib import Path
@@ -127,15 +126,16 @@ class PublicationWorkflowTests(unittest.TestCase):
             source = "\n".join(item.get("run", "") for item in job["steps"])
             self.assertIn("git init --bare", source)
             self.assertIn(REF + ":" + REF, source)
-            for forbidden in ("git checkout", "git reset", "git clean", "--force", "--mirror", "git pull"):
+            for forbidden in ("git checkout", "git reset", "git clean", "--mirror", "git pull"):
                 self.assertNotIn(forbidden, source)
             self.assertEqual(job["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
             self.assertEqual(job["env"]["GIT_TERMINAL_PROMPT"], "0")
 
     def test_real_preparation_rejects_semantic_tampering_after_correct_inventory(self):
         step = next(item for item in self.jobs["publish"]["steps"] if item.get("id") == "prepare")
-        for malformed, empty, expected_success in ((False, False, True), (True, False, False), (False, True, True)):
-            with self.subTest(malformed=malformed, empty=empty), tempfile.TemporaryDirectory() as directory:
+        for malformed, empty, expected_success, config in ((False, False, True, {}), (True, False, False, {}), (False, True, True, {}),
+                (False, False, False, {"CLIENT_ID": "bad value"}), (False, False, False, {"INSTALLATION_ID": ""})):
+            with self.subTest(malformed=malformed, empty=empty, config=config), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 source = root / "public-records"
                 source.mkdir()
@@ -155,26 +155,34 @@ class PublicationWorkflowTests(unittest.TestCase):
                 bin_dir.mkdir()
                 git = bin_dir / "git"
                 real_git = __import__("shutil").which("git")
+                remote = root / "accepted.git"
+                subprocess.run([real_git, "init", "--bare", str(remote)], capture_output=True, check=True)
+                tree = subprocess.run([real_git, "--git-dir=" + str(remote), "mktree"], input="", capture_output=True,
+                    text=True, check=True).stdout.strip()
+                initial = subprocess.run([real_git, "--git-dir=" + str(remote), "commit-tree", tree, "-m", "Accepted canary"],
+                    capture_output=True, text=True, env=publish.git_env(), check=True).stdout.strip()
+                subprocess.run([real_git, "--git-dir=" + str(remote), "update-ref", REF, initial], capture_output=True, check=True)
                 git.write_text("#!" + sys.executable + "\n" +
                     "import os, sys\n" +
                     "if 'ls-remote' in sys.argv:\n" +
                     "    if sys.argv[-1] == 'refs/heads/main':\n" +
                     "        print('a' * 40 + '\\trefs/heads/main')\n" +
                     "        raise SystemExit(0)\n" +
-                    "    raise SystemExit(2)\n" +
+                    "sys.argv=[" + repr(str(remote)) + " if x=='https://github.com/wykurz/rcp.git' else x for x in sys.argv]\n" +
                     "if 'push' in sys.argv: raise SystemExit('preparation must never push')\n" +
                     "os.execv(" + repr(real_git) + ", [" + repr(real_git) + ", *sys.argv[1:]])\n")
                 git.chmod(0o700)
                 env = dict(trusted_environment(directory), EXPECTED_INVENTORY=publish.inventory(source),
                            PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], PYTHONOPTIMIZE="1")
+                env.update(config)
                 env.pop("GH_TOKEN", None)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
                     env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode == 0, expected_success, result.stdout + result.stderr)
                 if expected_success:
                     output = (root / "job-output").read_text()
-                    self.assertRegex(output, r"^commit=(?:[0-9a-f]{40})?\n")
-                    self.assertEqual(output == "commit=\nhistory_commit=\n", empty)
+                    self.assertRegex(output, r"^baseline=[0-9a-f]{40}\ncommit=(?:[0-9a-f]{40})?\n")
+                    self.assertEqual(output == "baseline=" + initial + "\ncommit=\nhistory_commit=" + initial + "\n", empty)
                 else:
                     self.assertFalse((root / "job-output").exists())
 
@@ -208,17 +216,8 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertNotIn("GIT_AUTHOR_NAME", self.jobs["publish"]["env"])
 
     def test_only_reviewed_publisher_and_canary_may_reference_writer_environment_or_key(self):
-        allowed = {contract.PUBLICATION_WORKFLOW, contract.CANARY_WORKFLOW}
-        found = set()
-        for path in (ROOT / ".github/workflows").glob("*.yml"):
-            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
-            for job in workflow.get("jobs", {}).values():
-                environment = job.get("environment")
-                name = environment.get("name") if isinstance(environment, dict) else environment
-                if name == contract.ENVIRONMENT or contract.WRITER_SECRET_NAME in str(job):
-                    self.assertIn(path.name, allowed)
-                    found.add(path.name)
-        self.assertIn(contract.PUBLICATION_WORKFLOW, found)
+        from .workflow_inventory import check_workflows
+        check_workflows(ROOT / ".github/workflows")
 
     def test_pages_reuses_reviewed_workflow_only_with_verified_history_commit(self):
         job = self.jobs["pages"]
@@ -235,167 +234,140 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertEqual(self.jobs["publish"]["outputs"], {"history_commit": "${{ steps.append.outputs.history_commit || steps.prepare.outputs.history_commit }}"})
 
     def test_every_embedded_shell_program_has_valid_syntax(self):
-        for name, job in self.phases.items():
+        jobs = {**self.phases, "canary": yaml.load((WORKFLOW.parent / contract.CANARY_WORKFLOW).read_text(), Loader=yaml.BaseLoader)["jobs"]["verify"]}
+        for name, job in jobs.items():
             for item in job["steps"]:
                 if "run" in item:
                     with self.subTest(job=name, step=item.get("name")):
                         result = subprocess.run(["bash", "-n"], input=item["run"], text=True, capture_output=True, timeout=5)
                         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def writer(self, directory, *, push_results="0", ls_status="0", no_change="0", malformed=False, shadow_only=False, main_fail_after="99"):
-        root = Path(directory)
-        bin_dir = root / "bin"
-        bin_dir.mkdir()
-        log = root / "commands.jsonl"
-        git = bin_dir / "git"
-        git.write_text("#!" + sys.executable + "\n" + r"""
-import json, os, pathlib, sys
-args = sys.argv[1:]
-with open(os.environ['COMMAND_LOG'], 'a') as stream:
-    stream.write(json.dumps(dict(args=args, header=os.environ.get('GIT_CONFIG_KEY_0') == 'http.https://github.com/.extraheader')) + '\n')
-if 'init' in args:
-    pathlib.Path(args[-1]).mkdir()
-    raise SystemExit(0)
-if 'ls-remote' in args:
-    if args[-1] == 'refs/heads/main':
-        counter = pathlib.Path(os.environ['RUNNER_TEMP']) / 'main-count'
-        index = int(counter.read_text()) if counter.exists() else 0
-        counter.write_text(str(index + 1))
-        print(('a' if index < int(os.environ['MAIN_FAIL_AFTER']) else 'b') * 40 + '\trefs/heads/main')
-        raise SystemExit(0)
-    if os.environ['LS_STATUS'] == '0':
-        print('c' * 40 + '\t' + ('refs/heads/shadow/refs/heads/aws-benchmark-history' if os.environ['SHADOW_ONLY'] == '1' else 'refs/heads/aws-benchmark-history'))
-    raise SystemExit(int(os.environ['LS_STATUS']))
-if 'fetch' in args:
-    raise SystemExit(0)
-if 'rev-parse' in args:
-    print('c' * 40)
-    raise SystemExit(0)
-if 'push' in args:
-    count = pathlib.Path(os.environ['RUNNER_TEMP']) / 'push-count'
-    index = int(count.read_text()) if count.exists() else 0
-    count.write_text(str(index + 1))
-    statuses = os.environ['PUSH_RESULTS'].split(',')
-    raise SystemExit(int(statuses[min(index, len(statuses)-1)]))
-raise SystemExit('unexpected git command')
-""")
-        git.chmod(0o700)
-        python = bin_dir / "python3"
-        python.write_text("#!" + sys.executable + "\n" + r"""
-import os, pathlib, sys
-if sys.argv[1:4] == ['-m', 'infra.aws_benchmark.production_publish', 'publish']:
-    count = pathlib.Path(os.environ['RUNNER_TEMP']) / 'publish-count'
-    attempt = (int(count.read_text()) if count.exists() else 0) + 1
-    count.write_text(str(attempt))
-    empty = int(os.environ['NO_CHANGE']) == attempt
-    receipt = 'unexpected=data\n' if os.environ['MALFORMED'] == '1' else 'commit=' + ('' if empty else 'a' * 40) + '\n'
-    pathlib.Path(os.environ['GITHUB_OUTPUT']).write_text(receipt)
-    raise SystemExit(0)
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-""")
-        python.chmod(0o700)
-        env = dict(trusted_environment(directory), PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
-                   COMMAND_LOG=str(log), PUSH_RESULTS=push_results, LS_STATUS=ls_status, NO_CHANGE=no_change,
-                   MALFORMED="1" if malformed else "0", SHADOW_ONLY="1" if shadow_only else "0", MAIN_FAIL_AFTER=main_fail_after)
-        steps = self.jobs["publish"]["steps"]
-        source = next(x["run"] for x in steps if x.get("id") == "prepare")
-        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", source], cwd=ROOT, env=env,
-                                text=True, capture_output=True, timeout=15)
-        if result.returncode == 0:
-            output = Path(env["GITHUB_OUTPUT"])
-            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-            output.write_text("")
-            if values["commit"]:
-                gate = next(x["run"] for x in steps if x.get("name") == "Require current main immediately before minting")
-                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", gate], cwd=ROOT, env=env,
-                    text=True, capture_output=True, timeout=15)
-                if result.returncode == 0:
-                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", steps[-1]["run"]], cwd=ROOT,
-                        env=dict(env, PREPARED_COMMIT=values["commit"], GH_TOKEN="synthetic-test-token"),
-                        text=True, capture_output=True, timeout=15)
-            else:
-                output.write_text("history_commit=" + values["history_commit"] + "\n")
-        commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-        return result, commands
+    def test_guards_run_before_any_cloud_call_and_match_flags_exactly(self):
+        for name in ("download", "export", "publish"):
+            steps = self.jobs[name]["steps"]
+            guard = steps[1]
+            self.assertIn("publication_identity identity", guard["run"])
+            self.assertIn("--flags", guard["run"])
+            for key, variable in (("PUBLICATION_ENABLED", contract.PUBLICATION_FLAG), ("TRUST_READY", contract.TRUST_FLAG)):
+                self.assertEqual(guard["env"][key], "${{ vars." + variable + " }}")
+                for value in ("false", "", "True", "true\n"):
+                    with self.subTest(job=name, key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", guard["run"]], cwd=ROOT,
+                            env={**trusted_environment(directory), key: value, "PYTHONOPTIMIZE": "2"},
+                            text=True, capture_output=True, timeout=10)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("readiness is closed", result.stderr)
 
-    def test_actual_shell_stops_if_main_moves_before_prepare_mint_or_any_push(self):
-        for allowed_reads, expected_pushes in (("0", 0), ("1", 0), ("2", 0), ("3", 1)):
-            with self.subTest(allowed_reads=allowed_reads), tempfile.TemporaryDirectory() as directory:
-                result, commands = self.writer(directory, main_fail_after=allowed_reads, push_results="1")
+    def test_all_workflow_key_and_identity_mappings_share_the_contract(self):
+        canary = yaml.load((WORKFLOW.parent / contract.CANARY_WORKFLOW).read_text(), Loader=yaml.BaseLoader)["jobs"]["verify"]
+        publish_steps = self.jobs["publish"]["steps"]
+        publish_mint = next(x for x in publish_steps if x.get("id") == "history-token")
+        canary_mint = next(x for x in canary["steps"] if x.get("id") == "writer")
+        self.assertEqual(canary_mint["with"], publish_mint["with"])
+        for mapping in (next(x for x in publish_steps if x.get("id") == "prepare")["env"], canary["env"]):
+            self.assertEqual(mapping["CLIENT_ID"], "${{ vars." + contract.CLIENT_VARIABLE + " }}")
+            self.assertEqual(mapping["INSTALLATION_ID"], "${{ vars." + contract.INSTALLATION_VARIABLE + " }}")
+        for steps in (publish_steps, canary["steps"]):
+            step = next(x for x in steps if "publication_identity installation" in x.get("run", ""))
+            self.assertEqual(step["env"]["EXPECTED_INSTALLATION"], "${{ vars." + contract.INSTALLATION_VARIABLE + " }}")
+        self.assertEqual(canary["env"]["CANARY_ENABLED"], "${{ vars." + contract.CANARY_FLAG + " }}")
+        self.assertEqual(canary["env"]["TRUST_READY"], "${{ vars." + contract.TRUST_FLAG + " }}")
+        self.assertEqual(canary["env"]["PUBLISH_ENABLED"], "${{ vars." + contract.PUBLICATION_FLAG + " }}")
+
+    def test_installation_shell_executes_before_token_use_under_optimized_python(self):
+        for path in (WORKFLOW, WORKFLOW.parent / contract.CANARY_WORKFLOW):
+            jobs = yaml.load(path.read_text(), Loader=yaml.BaseLoader)["jobs"]
+            steps = jobs["publish" if path == WORKFLOW else "verify"]["steps"]
+            step = next(x for x in steps if "publication_identity installation" in x.get("run", ""))
+            for actual in ("5678", "5679", "", "05678"):
+                with self.subTest(workflow=path.name, actual=actual), tempfile.TemporaryDirectory() as directory:
+                    binary = Path(directory) / "python3"
+                    log = Path(directory) / "commands"
+                    binary.write_text("#!" + sys.executable + "\nimport os,sys\n" +
+                        "with open(" + repr(str(log)) + ", 'a') as stream: stream.write(' '.join(sys.argv[1:])+'\\n')\n" +
+                        "if sys.argv[1:]==['-m','infra.aws_benchmark.publication_identity','installation']: os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n" +
+                        "raise SystemExit(0)\n")
+                    binary.chmod(0o700)
+                    env = dict(trusted_environment(directory), PATH=directory + os.pathsep + os.environ["PATH"],
+                        EXPECTED_INSTALLATION="5678", ACTUAL_INSTALLATION=actual, CANARY_MODE="bootstrap", PYTHONOPTIMIZE="2")
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
+                        env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, actual == "5678", result.stderr)
+                    commands = log.read_text() if log.exists() else ""
+                    self.assertIn("publication_identity installation", commands)
+                    if actual != "5678":
+                        self.assertNotIn("history_canary writer", commands)
+
+    def test_canary_preflight_and_resume_evidence_precede_every_mutation_and_mint(self):
+        job = yaml.load((WORKFLOW.parent / contract.CANARY_WORKFLOW).read_text(), Loader=yaml.BaseLoader)["jobs"]["verify"]
+        steps = job["steps"]
+        self.assertEqual(job["permissions"], {"contents": "write", "actions": "read"})
+        self.assertEqual(steps[1]["run"].strip(), "python3 -m infra.aws_benchmark.publication_identity canary-current-main")
+        metadata = next(i for i, x in enumerate(steps) if "canary_recovery" in x.get("run", ""))
+        download = next(i for i, x in enumerate(steps) if x.get("uses", "").startswith("actions/download-artifact@"))
+        check = next(i for i, x in enumerate(steps) if "history_canary resume-check" in x.get("run", ""))
+        ordinary = next(i for i, x in enumerate(steps) if "history_canary ordinary" in x.get("run", ""))
+        mint = next(i for i, x in enumerate(steps) if x.get("id") == "writer")
+        self.assertLess(metadata, download)
+        self.assertLess(download, check)
+        self.assertLess(check, mint)
+        self.assertLess(ordinary, mint)
+        for index in (metadata, download, check):
+            self.assertEqual(steps[index]["if"], "inputs.mode == 'resume'")
+        self.assertEqual(steps[ordinary]["if"], "inputs.mode == 'bootstrap'")
+        self.assertEqual(steps[download]["with"], {
+            "artifact-ids": "${{ inputs.source_artifact_id }}", "run-id": "${{ inputs.source_run_id }}",
+            "github-token": "${{ github.token }}", "path": "${{ runner.temp }}/canary-source",
+            "merge-multiple": "true", "digest-mismatch": "error"})
+        self.assertIn('--source-evidence "$RUNNER_TEMP/canary-source/canary.jsonl"', steps[check]["run"])
+        self.assertIn('--source-sha256 "$SOURCE_SHA256"', steps[check]["run"])
+        for index in (1, mint - 1):
+            self.assertIn("publication_identity canary-current-main", steps[index]["run"])
+        self.assertEqual(steps[-1]["with"]["retention-days"], "90")
+        self.assertIn("canary-source/canary.jsonl", steps[-1]["with"]["path"])
+        for key in ("CLIENT_ID", "INSTALLATION_ID", "CANARY_ENABLED", "TRUST_READY", "PUBLISH_ENABLED", "CANARY_MODE"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                env = dict(trusted_environment(directory), GITHUB_WORKFLOW_REF="wykurz/rcp/.github/workflows/" +
+                    contract.CANARY_WORKFLOW + "@refs/heads/main", CANARY_ENABLED="true", TRUST_READY="false",
+                    PUBLISH_ENABLED="false", CANARY_MODE="bootstrap", PYTHONOPTIMIZE="2")
+                env[key] = "invalid value"
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", steps[1]["run"]], cwd=ROOT,
+                    env=env, capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(sum("push" in item["args"] for item in commands), expected_pushes)
-                self.assertIn("identity check failed", result.stderr)
+                self.assertIn("Publication identity check failed:", result.stderr)
 
-    def test_actual_postapproval_guard_rejects_closed_or_missing_values_without_asserts(self):
-        guard = next(x for x in self.jobs["publish"]["steps"] if "publication_identity identity" in x.get("run", ""))
-        for key in ("PUBLICATION_ENABLED", "TRUST_READY"):
-            for value in ("false", "", "true\n"):
-                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
-                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", guard["run"]], cwd=ROOT,
-                        env={**trusted_environment(directory), key: value, "PYTHONOPTIMIZE": "2"},
-                        text=True, capture_output=True, timeout=10)
+    def test_each_main_publication_stage_holds_on_missing_or_shadow_only_history(self):
+        for name in ("download", "export", "publish"):
+            step = next(x for x in self.jobs[name]["steps"] if "ls-remote" in x.get("run", ""))
+            for shadow in (False, True):
+                with self.subTest(stage=name, shadow=shadow), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    binary = root / "git"
+                    log = root / "commands"
+                    binary.write_text("#!" + sys.executable + "\nimport os,sys,pathlib\n" +
+                        "a=sys.argv[1:]\n" +
+                        "with open(" + repr(str(log)) + ", 'a') as stream: stream.write(' '.join(a)+'\\n')\n" +
+                        "if 'ls-remote' in a:\n" +
+                        " if a[-1]=='refs/heads/main': print('a'*40+'\\trefs/heads/main'); raise SystemExit(0)\n" +
+                        " if " + repr(shadow) + ": print('b'*40+'\\trefs/heads/shadow/refs/heads/aws-benchmark-history'); raise SystemExit(0)\n" +
+                        " raise SystemExit(2)\n" +
+                        "if 'init' in a: pathlib.Path(a[-1]).mkdir(); raise SystemExit(0)\n" +
+                        "raise SystemExit('unexpected Git operation')\n")
+                    binary.chmod(0o700)
+                    env = dict(trusted_environment(directory), PATH=directory + os.pathsep + os.environ["PATH"], PYTHONOPTIMIZE="2")
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=ROOT,
+                        env=env, text=True, capture_output=True, timeout=10)
                     self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Protected history", result.stderr)
+                    self.assertNotIn("fetch", log.read_text())
+                    self.assertFalse((root / "job-output").exists())
 
-    def test_writer_reconciles_push_conflict_against_fresh_bare_history(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, push_results="1,0")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(sum("fetch" in item["args"] for item in commands), 2)
-            pushes = [item for item in commands if "push" in item["args"]]
-            self.assertEqual(len(pushes), 2)
-            for item in commands:
-                self.assertEqual(item["header"], "push" in item["args"])
-                self.assertFalse(any("synthetic-test-token" in arg for arg in item["args"]))
-                self.assertNotIn("--force", item["args"])
-            for item in pushes:
-                self.assertEqual(item["args"][-2:], [REMOTE, SHA + ":" + REF])
-            self.assertNotIn("synthetic-test-token", result.stdout + result.stderr)
-            self.assertNotIn(base64.b64encode(b"x-access-token:synthetic-test-token").decode(), result.stdout + result.stderr)
-
-    def test_writer_reconciles_lost_success_as_no_change_without_another_push(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, push_results="1", no_change="2")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(sum("fetch" in item["args"] for item in commands), 2)
-            self.assertEqual(sum("push" in item["args"] for item in commands), 1)
-            self.assertEqual((Path(directory) / "job-output").read_text(), "history_commit=" + "c" * 40 + "\n")
-
-    def test_suffix_ref_does_not_trigger_fetch_of_an_absent_exact_history_branch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, shadow_only=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(any("fetch" in item["args"] for item in commands))
-            self.assertEqual(sum("push" in item["args"] for item in commands), 1)
-        for name in ("download", "export"):
-            step = next(item for item in self.jobs[name]["steps"] if "ls-remote" in item.get("run", ""))
-            self.assertIn('$2 == "refs/heads/aws-benchmark-history"', step["run"])
-
-    def test_writer_caps_push_failures_at_three_and_never_forces(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, push_results="1")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(sum("push" in item["args"] for item in commands), 3)
-            self.assertEqual(sum("fetch" in item["args"] for item in commands), 3)
-            self.assertIn("reconciliation", result.stderr)
-
-    def test_no_change_with_no_remote_history_does_not_offer_a_pages_commit(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, ls_status="2", no_change="1")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(any("push" in item["args"] or "rev-parse" in item["args"] for item in commands))
-            self.assertEqual((Path(directory) / "job-output").read_text(), "history_commit=\n")
-
-    def test_only_confirmed_absent_branch_bootstraps_and_malformed_receipt_cannot_push(self):
-        for status, valid in (("2", True), ("128", False)):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
-                result, commands = self.writer(directory, ls_status=status)
-                self.assertEqual(result.returncode == 0, valid)
-                self.assertEqual(sum("fetch" in item["args"] for item in commands), 0)
-                self.assertEqual(sum("push" in item["args"] for item in commands), int(valid))
-        with tempfile.TemporaryDirectory() as directory:
-            result, commands = self.writer(directory, malformed=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(any("push" in item["args"] for item in commands))
+    def test_canary_environment_mode_matches_publication_and_main_reads_use_ordinary_token(self):
+        canary = yaml.load((WORKFLOW.parent / contract.CANARY_WORKFLOW).read_text(), Loader=yaml.BaseLoader)["jobs"]["verify"]
+        self.assertEqual(canary["environment"], self.jobs["publish"]["environment"])
+        for step in canary["steps"]:
+            if "publication_identity canary-current-main" in step.get("run", ""):
+                self.assertEqual(step["env"]["GH_TOKEN"], "${{ github.token }}")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 Each job checks a complete file-inventory digest supplied by its trusted predecessor,
 not an embedded claim or an artifact name. Only download imports an AWS client. The
 writer consumes public JSON, never raw archives or retained HTML; it prepares a commit
-without a checkout. The workflow pushes that exact commit without force and reconciles
-uncertain pushes by fetching again. No phase launches or retires a worker.
+without a checkout. The workflow pushes only that prepared child with an exact parent lease and
+reconciles uncertain pushes without adopting a foreign tip. No phase launches or retires a worker.
 """
 
 import argparse
@@ -24,6 +24,7 @@ from . import production_bundle as codec, production_collection as collection
 from . import production_export as public, production_publication as publication
 from .common import Budget, digest, require
 from .history_contract import REPOSITORY_ID, HISTORY_REF
+from .history_git import git_env
 
 DOWNLOAD_SCHEMA = "rcp-production-download-index-v1"
 PUBLIC_SCHEMA = "rcp-production-public-batch-v1"
@@ -41,16 +42,6 @@ def encoded(value):
 
 def read(path, limit):
     return collection.results.read_file(Path(path), limit, single_link=False)
-
-
-def git_env():
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
-        GIT_AUTHOR_NAME="RCP AWS benchmark history", GIT_AUTHOR_EMAIL="benchmark-history@users.noreply.github.com",
-        GIT_COMMITTER_NAME="RCP AWS benchmark history", GIT_COMMITTER_EMAIL="benchmark-history@users.noreply.github.com",
-        GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull,
-        GIT_CONFIG_KEY_1="commit.gpgsign", GIT_CONFIG_VALUE_1="false")
-    return env
 
 
 def git_bytes(repository, *args, limit):
@@ -319,9 +310,15 @@ def public_batch(source, revision, expected):
     return found, index
 
 
+def established_history(repository):
+    records, parent = history(repository)
+    require(parent is not None, "protected history missing; reconcile before publishing")
+    return records, parent
+
+
 def publish(source, repository, revision, expected):
     records, _ = public_batch(source, revision, expected)
-    prior, parent = history(repository)
+    prior, parent = established_history(repository)
     additions = {}
     for name, raw in records.items():
         if name in prior:
@@ -336,14 +333,14 @@ def publish(source, repository, revision, expected):
     env = git_env()
     with tempfile.TemporaryDirectory(prefix="aws-history-index-") as directory:
         env["GIT_INDEX_FILE"] = str(Path(directory) / "index")
-        git(repository, "read-tree", *([parent] if parent else ["--empty"]), environment=env)
+        git(repository, "read-tree", parent, environment=env)
         for name, raw in sorted(additions.items()):
             blob = git(repository, "hash-object", "-w", "--stdin", input_text=raw.decode(), environment=env).stdout.strip()
             require(re.fullmatch(r"[0-9a-f]{40}", blob), "invalid history blob ID")
             git(repository, "update-index", "--add", "--cacheinfo", "100644", blob,
                 "records/" + name + ".json", environment=env)
         tree = git(repository, "write-tree", environment=env).stdout.strip()
-        commit = git(repository, "commit-tree", tree, *(["-p", parent] if parent else []),
+        commit = git(repository, "commit-tree", tree, "-p", parent,
             "-m", "Record retired AWS benchmark results", environment=env).stdout.strip()
         require(re.fullmatch(r"[0-9a-f]{40}", commit), "invalid history commit ID")
         return commit
@@ -408,7 +405,7 @@ def main():
         require(args.output is not None and re.fullmatch(r"[a-z]{2}-[a-z]+-[1-9][0-9]?", args.region or "") and
                 re.fullmatch(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+", args.role or ""),
                 "invalid read-only AWS publication configuration")
-        prior, _ = history(args.history)
+        prior, _ = established_history(args.history)
         session, config = oidc_session(args.region, args.role, session_prefix="rcp-publication-", duration_seconds=900,
             budget=Budget(datetime.now(timezone.utc) + timedelta(seconds=60)), reserve=10)
         reader = publication.Reader(session.client("s3", config=config), session.client("dynamodb", config=config),
@@ -417,7 +414,7 @@ def main():
         index = index_at(args.output, DOWNLOAD_SCHEMA, args.reader_revision)
     elif args.phase == "export":
         require(args.input is not None and args.output is not None, "export directories required")
-        prior, _ = history(args.history)
+        prior, _ = established_history(args.history)
         value = export(args.input, prior, args.output, args.reader_revision, args.expected_sha256)
         index = index_at(args.output, PUBLIC_SCHEMA, args.reader_revision)
     else:

@@ -6,6 +6,7 @@ any proposal and testing live enforcement require separate approval.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from urllib.parse import quote
 from .common import ValidationError, require
 from .history_contract import (REPOSITORY, REPOSITORY_ID, OWNER_ID, ENVIRONMENT,
     HISTORY_REF, HISTORY_NAMESPACE, WRITER_SECRET_NAME, CLIENT_VARIABLE,
-    INSTALLATION_VARIABLE, REPOSITORY_FLAGS)
+    INSTALLATION_VARIABLE, REPOSITORY_FLAGS, PUBLICATION_FLAG, TRUST_FLAG, CANARY_FLAG, identifier)
 from .reader_identity import reader_resource_identity
 from .results import json_value, read_file
 
@@ -28,11 +29,7 @@ CLIENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 ROLE = re.compile(r"arn:aws:iam::([0-9]{12}):role/([A-Za-z0-9+=,.@_-]+(?:/[A-Za-z0-9+=,.@_-]+)*)")
 STACK = re.compile(r"arn:aws:cloudformation:([a-z]{2}-[a-z]+-[1-9][0-9]?):([0-9]{12}):stack/([A-Za-z][A-Za-z0-9-]{0,127})/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})")
 MAX_CAPTURE = 1024 * 1024
-
-
-def identifier(value):
-    require(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value), "a real numeric identifier is required")
-    return int(value)
+WRITER_CAPTURES = ("environment", "branches", "rulesets", "repository", "app", "inventory", "custom_rules")
 
 
 def writer_config(client_id, installation_id):
@@ -78,23 +75,24 @@ def capture(value, endpoint):
 
 
 def inventory_items(value, endpoint, key):
-    """Require raw, contiguous 100-item pages with typed, consistent totals."""
+    """Require contiguous pages using the endpoint's documented page size."""
+    page_size = 30 if key == "variables" else 100
     require(isinstance(value, dict) and set(value) == {"pages"} and
             isinstance(value["pages"], list) and 0 < len(value["pages"]) <= 100,
             "complete paginated inventory required")
     items, total = [], None
     for number, page in enumerate(value["pages"], 1):
-        response = capture(page, endpoint + "?per_page=100&page=" + str(number))
+        response = capture(page, endpoint + "?per_page=" + str(page_size) + "&page=" + str(number))
         count = response.get("total_count")
         require(type(count) is int and 0 <= count <= 10000 and (total is None or count == total),
                 "inventory counts must be bounded consistent integers")
         total = count
         chunk = response.get(key)
         require(isinstance(chunk, list) and all(isinstance(x, dict) for x in chunk), "inventory items missing")
-        expected = min(100, max(0, total - (number - 1) * 100))
+        expected = min(page_size, max(0, total - (number - 1) * page_size))
         require(len(chunk) == expected, "inventory page is incomplete")
         items.extend(chunk)
-    require(len(value["pages"]) == max(1, (total + 99) // 100) and len(items) == total,
+    require(len(value["pages"]) == max(1, (total + page_size - 1) // page_size) and len(items) == total,
             "inventory pagination is incomplete or duplicated")
     names = [x.get("name") for x in items]
     require(all(isinstance(x, str) and 0 < len(x) <= 255 for x in names) and len(set(names)) == len(names),
@@ -102,6 +100,9 @@ def inventory_items(value, endpoint, key):
     if key in {"secrets", "variables"}:
         require(all(re.fullmatch(r"[A-Z_][A-Z0-9_]{0,254}", name) for name in names),
                 "secret and variable metadata names must use canonical identifiers")
+    if key == "secrets":
+        require(all(set(x) <= {"name", "created_at", "updated_at"} for x in items),
+                "secret inventory must contain metadata only")
     return {x["name"]: x for x in items}
 
 
@@ -127,7 +128,7 @@ def writer_identity(plan, repository, app):
     same(metadata.get("events"), [], "App event subscriptions must be empty")
 
 
-def writer_inventory(plan, inventory, key_state):
+def writer_inventory(plan, inventory, key_state, phase):
     require(key_state in {"absent", "present"}, "invalid writer key metadata phase")
     require(isinstance(inventory, dict) and set(inventory) == {
         "environments", "repository_secrets", "dependabot_secrets", "environment_secrets",
@@ -136,17 +137,21 @@ def writer_inventory(plan, inventory, key_state):
     require(ENVIRONMENT in environments, "protected writer environment is absent")
     require(len({name.casefold() for name in environments}) == len(environments), "environment names collide")
     for name, item in environments.items():
-        require(item.get("url") == API_ROOT + "/environments/" + quote(name, safe=""),
+        require(item.get("url") == API_ROOT + "/environments/" + name,
                 "environment inventory identity differs")
     for key, suffix in (("repository_secrets", "/actions/secrets"), ("dependabot_secrets", "/dependabot/secrets")):
         entries = inventory_items(inventory[key], API_ROOT + suffix, "secrets")
         require(WRITER_SECRET_NAME not in entries, "writer secret name exists outside its environment")
-        require(all(set(x) <= {"name", "created_at", "updated_at"} for x in entries.values()),
-                "secret inventory must contain metadata only")
     variables = inventory_items(inventory["repository_variables"], API_ROOT + "/actions/variables", "variables")
     require(not {CLIENT_VARIABLE, INSTALLATION_VARIABLE} & variables.keys(), "App variables must be environment scoped")
-    same({name: variables.get(name, {}).get("value") for name in REPOSITORY_FLAGS}, plan["variables"]["repository"],
-         "repository readiness, publication and canary flags must be false")
+    expected_flags = dict(plan["variables"]["repository"])
+    if phase == "canary":
+        expected_flags[CANARY_FLAG] = "true"
+    elif phase == "publication":
+        expected_flags[TRUST_FLAG] = "true"
+        expected_flags[PUBLICATION_FLAG] = "true"
+    same({name: variables.get(name, {}).get("value") for name in REPOSITORY_FLAGS}, expected_flags,
+         "repository flags differ from the selected setup/canary/publication phase")
     for key, field, suffix in (("environment_secrets", "secrets", "/secrets"),
                                ("environment_variables", "variables", "/variables")):
         values = inventory[key]
@@ -154,8 +159,6 @@ def writer_inventory(plan, inventory, key_state):
         for name in environments:
             entries = inventory_items(values[name], API_ROOT + "/environments/" + quote(name, safe="") + suffix, field)
             if field == "secrets":
-                require(all(set(x) <= {"name", "created_at", "updated_at"} for x in entries.values()),
-                        "secret inventory must contain metadata only")
                 require((WRITER_SECRET_NAME in entries) == (name == ENVIRONMENT and key_state == "present"),
                         "writer secret name placement differs from the selected absent/present phase")
             else:
@@ -168,12 +171,40 @@ def writer_inventory(plan, inventory, key_state):
                             "writer App variables exist in another environment")
 
 
-def check_writer(plan, environment, branches, rulesets, repository, app, inventory, *, key_state="present"):
+def approved_plan(plan):
+    require(isinstance(plan, dict) and isinstance(plan.get("app"), dict), "approved writer plan required")
+    app = plan["app"]
+    require(type(app.get("id")) is int and type(app.get("installation_id")) is int,
+            "approved plan identifiers must be integers")
+    expected = writer_plan(str(app["id"]), app.get("client_id"), str(app["installation_id"]))
+    same(plan, expected, "writer plan differs from the supported reviewed contract")
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def conditions(value):
+    require(isinstance(value, dict) and set(value) == {"ref_name"} and
+            isinstance(value["ref_name"], dict) and set(value["ref_name"]) == {"include", "exclude"},
+            "ruleset ref conditions differ")
+    result = {}
+    for key, values in value["ref_name"].items():
+        require(isinstance(values, list) and all(isinstance(x, str) for x in values), "ruleset ref patterns missing")
+        result[key] = sorted(set(values))
+    return {"ref_name": result}
+
+
+def check_writer(plan, environment, branches, rulesets, repository, app, inventory, custom_rules, *, key_state="present", phase="setup"):
     """Check metadata snapshots, never claim installation scope or key custody."""
+    plan_hash = approved_plan(plan)
+    require(phase in {"setup", "canary", "publication"}, "invalid writer settings phase")
+    require(phase == "setup" or key_state == "present", "canary/publication requires present key metadata")
     writer_identity(plan, repository, app)
-    writer_inventory(plan, inventory, key_state)
+    writer_inventory(plan, inventory, key_state, phase)
     require(isinstance(environment, dict) and environment.get("name") == ENVIRONMENT, "environment identity differs")
     require(environment.get("url") == ENVIRONMENT_URL, "environment repository identity is unproven")
+    custom = capture(custom_rules, ENVIRONMENT_URL + "/deployment_protection_rules")
+    require(type(custom.get("total_count")) is int and custom["total_count"] == 0 and
+            custom.get("custom_deployment_protection_rules") == [],
+            "deployment:false requires an explicit empty custom protection-rule inventory")
     expected = plan["environment"]
     same(environment.get("deployment_branch_policy"), expected["settings"]["deployment_branch_policy"],
          "environment must select only explicitly configured branches")
@@ -189,7 +220,7 @@ def check_writer(plan, environment, branches, rulesets, repository, app, invento
     entries = reviewers[0].get("reviewers")
     require(isinstance(entries, list) and len(entries) == 1 and isinstance(entries[0], dict) and entries[0].get("type") == "User" and
             isinstance(entries[0].get("reviewer"), dict) and type(entries[0]["reviewer"].get("id")) is int and
-            entries[0]["reviewer"]["id"] == OWNER_ID, "environment reviewer must be the selected owner")
+            entries[0]["reviewer"]["id"] == expected["settings"]["reviewers"][0]["id"], "environment reviewer must be the selected owner")
     require(all(type(x.get("wait_timer")) is int and x["wait_timer"] == expected["settings"]["wait_timer"]
                 for x in protections if x.get("type") == "wait_timer"), "unexpected wait timer")
     branches = capture(branches, ENVIRONMENT_URL + "/deployment-branch-policies")
@@ -210,9 +241,11 @@ def check_writer(plan, environment, branches, rulesets, repository, app, invento
         require(actual.get("source") == REPOSITORY and actual.get("source_type") == "Repository",
                 "ruleset repository identity is unproven")
         require("bypass_actors" in actual, "privileged ruleset readback must expose bypass actors")
-        same({key: actual.get(key) for key in expected_rule if key != "rules"},
-             {key: value for key, value in expected_rule.items() if key != "rules"},
-             "ruleset differs from approved exact-branch proposal")
+        same(conditions(actual.get("conditions")), conditions(expected_rule["conditions"]),
+             "ruleset history namespace differs from approved proposal")
+        same({key: actual.get(key) for key in expected_rule if key not in {"rules", "conditions"}},
+             {key: value for key, value in expected_rule.items() if key not in {"rules", "conditions"}},
+             "ruleset differs from approved history namespace proposal")
         rules = actual.get("rules")
         require(isinstance(rules, list) and all(isinstance(x, dict) and isinstance(x.get("type"), str) for x in rules),
                 "ruleset rules missing")
@@ -227,7 +260,20 @@ def check_writer(plan, environment, branches, rulesets, repository, app, invento
              "ruleset rules differ from approved proposal")
     return dict(settings_match=True, live_enforcement_proven=False, key_custody_proven=False,
                 installation_scope_proven=False, configured_secret_name_placement_verified=True, key_metadata_state=key_state,
-                app_metadata_identity_verified=True, repository=REPOSITORY, ruleset_ids=ids, app_id=plan["app"]["id"])
+                app_metadata_identity_verified=True, repository=REPOSITORY, ruleset_ids=ids, app_id=plan["app"]["id"],
+                approved_plan_sha256=plan_hash, configured_installation_id=plan["app"]["installation_id"], phase=phase)
+
+
+def check_writer_blobs(blobs, *, key_state="present", phase="setup"):
+    """Validate and fingerprint the same bounded bytes supplied by the operator."""
+    require(isinstance(blobs, dict) and set(blobs) == {"plan", *WRITER_CAPTURES} and
+            all(isinstance(value, bytes) for value in blobs.values()), "complete raw trust captures required")
+    parsed = {key: json_value(value, MAX_CAPTURE) for key, value in blobs.items()}
+    result = check_writer(parsed["plan"], *(parsed[key] for key in WRITER_CAPTURES), key_state=key_state, phase=phase)
+    manifest = dict(schema="rcp-history-trust-captures-v1", phase=phase, key_state=key_state,
+                    capture_sha256={key: hashlib.sha256(value).hexdigest() for key, value in blobs.items()})
+    preimage = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return dict(result, trust_manifest=manifest, trust_sha256=hashlib.sha256(preimage).hexdigest())
 
 
 def reader_policy(resource_arn, admission_role, collector_role, recovery_role):
@@ -252,7 +298,7 @@ def reader_policy(resource_arn, admission_role, collector_role, recovery_role):
     ]}
 
 
-def reader_proposal(resource_arn, stack_id, stack_capture, recovery_role):
+def reader_proposal(resource_arn, stack_id, stack_capture, recovery_role, *, phase="bootstrap"):
     resource = reader_resource_identity(resource_arn)
     match = STACK.fullmatch(stack_id) if isinstance(stack_id, str) else None
     require(resource is not None and match and match.groups()[:2] == resource, "stack and secret account/region differ")
@@ -275,13 +321,21 @@ def reader_proposal(resource_arn, stack_id, stack_capture, recovery_role):
     parameters = pairs("Parameters", "ParameterKey", "ParameterValue")
     require(all(parameters.get(key) == "false" for key in ("RuntimeEnabled", "AdmissionEnabled", "PublicationEnabled")),
             "reader bootstrap and rebinding require disabled runtime, admission and publication")
+    require(phase in {"bootstrap", "rebind"}, "invalid reader policy phase")
+    config = {key: parameters.get(key) for key in ("GitHubAppClientId", "GitHubAppInstallationId", "GitHubAppSecretSuffix")}
+    if phase == "bootstrap":
+        require(all(value == "" for value in config.values()), "reader bootstrap requires empty App parameters before key import")
+    else:
+        writer_config(config["GitHubAppClientId"], config["GitHubAppInstallationId"])
+        require(config["GitHubAppSecretSuffix"] == resource_arn[-6:], "configured reader secret differs from policy attachment")
     outputs = pairs("Outputs", "OutputKey", "OutputValue")
+    require(recovery_role not in outputs.values(), "recovery role must not be a production stack role")
     require(all(key in outputs for key in ("AdmissionRoleArn", "CollectorRoleArn")), "reader role stack outputs missing")
     roles = [outputs["AdmissionRoleArn"], outputs["CollectorRoleArn"]]
     policy = reader_policy(resource_arn, *roles, recovery_role)
     return dict(schema="rcp-reader-secret-policy-v2", stack_id=stack_id,
                 attachment=dict(secret_id=resource_arn, block_public_policy=True), resource_policy=policy,
-                reader_roles=roles, recovery_role=recovery_role, live_acceptance_required=True)
+                reader_roles=roles, recovery_role=recovery_role, phase=phase, key_absence_proven=False, live_acceptance_required=True)
 
 
 def read(path):
@@ -312,7 +366,10 @@ def emit(value, output):
             raise ValidationError("output already exists; choose a new proposal path") from None
     finally:
         if temporary is not None:
-            temporary.unlink()
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def main():
@@ -320,11 +377,14 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("writer-plan", "writer-check"):
         command = commands.add_parser(name)
-        for field in ("app-id", "client-id", "installation-id"):
-            command.add_argument("--" + field, required=True)
-        if name == "writer-check":
-            for field in ("environment", "branches", "rulesets", "repository", "app", "inventory"):
-                command.add_argument("--" + field + "-readback", required=True, type=Path)
+        if name == "writer-plan":
+            for field in ("app-id", "client-id", "installation-id"):
+                command.add_argument("--" + field, required=True)
+        else:
+            command.add_argument("--plan", required=True, type=Path)
+            command.add_argument("--phase", choices=("setup", "canary", "publication"), default="setup")
+            for field in WRITER_CAPTURES:
+                command.add_argument("--" + field.replace("_", "-") + "-readback", required=True, type=Path)
             command.add_argument("--key-state", choices=("absent", "present"), default="present")
         command.add_argument("--output", type=Path)
     command = commands.add_parser("reader-policy")
@@ -332,15 +392,17 @@ def main():
     command.add_argument("--stack-id", required=True)
     command.add_argument("--stack-readback", type=Path, required=True)
     command.add_argument("--recovery-role", required=True)
+    command.add_argument("--phase", choices=("bootstrap", "rebind"), default="bootstrap")
     command.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.command == "reader-policy":
-        value = reader_proposal(args.resource_arn, args.stack_id, read(args.stack_readback), args.recovery_role)
-    else:
+        value = reader_proposal(args.resource_arn, args.stack_id, read(args.stack_readback), args.recovery_role, phase=args.phase)
+    elif args.command == "writer-plan":
         value = writer_plan(args.app_id, args.client_id, args.installation_id)
-        if args.command == "writer-check":
-            value = check_writer(value, *(read(getattr(args, field + "_readback"))
-                for field in ("environment", "branches", "rulesets", "repository", "app", "inventory")), key_state=args.key_state)
+    else:
+        paths = dict(plan=args.plan, **{field: getattr(args, field + "_readback") for field in WRITER_CAPTURES})
+        blobs = {field: read_file(path, MAX_CAPTURE) for field, path in paths.items()}
+        value = check_writer_blobs(blobs, key_state=args.key_state, phase=args.phase)
     emit(value, args.output)
 
 
