@@ -1,0 +1,93 @@
+name: Resolve release tag
+
+# source pinning and remaining protection requirements: docs/release-identity.md
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Existing v-prefixed release tag, not a branch, full ref or SHA.'
+        required: true
+        type: string
+    outputs:
+      tag:
+        description: 'Validated release tag name.'
+        value: ${{ jobs.resolve.outputs.tag }}
+      commit:
+        description: 'Exact commit used by every validation, build and publication job.'
+        value: ${{ jobs.resolve.outputs.commit }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_REF: ${{ github.ref }}
+      EVENT_SHA: ${{ github.sha }}
+    steps:
+      - name: Validate release tag input
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # support Cargo version tags, including prerelease and build metadata
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] ||
+             ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
+            echo "::error::Expected a v-prefixed release tag name"
+            exit 1
+          fi
+          case "$EVENT_NAME" in
+            push)
+              if [[ "$EVENT_REF" != "refs/tags/$RELEASE_TAG" ||
+                    ! "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::Release tag does not match the push event"
+                exit 1
+              fi
+              ;;
+            workflow_dispatch) ;;
+            *)
+              echo "::error::Unsupported release event"
+              exit 1
+              ;;
+          esac
+          printf 'tag=%s\nref=refs/tags/%s\n' "$RELEASE_TAG" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      # full refs/tags/ prevents checkout from preferring a same-named branch
+      - name: Fetch the exact release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin the release commit
+        id: resolve
+        shell: bash
+        env:
+          RELEASE_REF: ${{ steps.tag.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # do not execute any scripts from the release tag in this resolver
+          commit=$(git rev-parse --verify 'HEAD^{commit}')
+          tag_commit=$(git rev-parse --verify --end-of-options "${RELEASE_REF}^{commit}")
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ || "$commit" != "$tag_commit" ]]; then
+            echo "::error::Checkout does not match the exact release tag"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == push ]]; then
+            # a rerun must still match its original push, including annotated tags
+            event_commit=$(git rev-parse --verify --end-of-options "${EVENT_SHA}^{commit}")
+            if [[ "$commit" != "$event_commit" ]]; then
+              echo "::error::Release tag moved since the push event"
+              exit 1
+            fi
+          fi
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"

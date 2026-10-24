@@ -64,6 +64,7 @@ lint: _lint-build _lint-targets
     ./scripts/test-check-action-pins.sh
     @echo "🔍 Checking action pin consistency..."
     ./scripts/check-action-pins.py
+    just release-ref-test
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
     @echo "🔍 Checking walk-driver usage..."
@@ -95,6 +96,10 @@ fmt:
 # Run tests (debug mode, using nextest by default)
 test *ARGS:
     ./scripts/cargo-host.sh nextest run "$@"
+
+# exercise release-tag identity and workflow propagation without publishing anything
+release-ref-test:
+    python3 scripts/test-release-refs.py
 
 # Run tests in release mode
 test-release *ARGS:
