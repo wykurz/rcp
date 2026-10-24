@@ -221,10 +221,10 @@ window; if an approval is delayed or artifacts expire, reject the waiting run an
 one. A 30-day environment waiting limit does not preserve a one-day artifact. Main movement likewise
 requires a fresh run. Missing artifacts or a stale revision stop before minting.
 
-Only the mint step references the writer key. The official pinned action revokes its installation
-token on normal job cleanup. Abrupt runner loss can leave it valid until its one-hour expiry. There
-is no cross-job token handoff, token artifact or persistent credential helper. Never enable shell
-tracing or diagnostic header/key/token logging.
+Only the mint step references the writer key. The official pinned action attempts to revoke its
+installation token on normal job cleanup. Failed revocation or abrupt runner loss can leave it valid
+until its one-hour expiry. There is no cross-job token handoff, token artifact or persistent
+credential helper. Never enable shell tracing or diagnostic header/key/token logging.
 
 ## Separate writer acceptance lane
 
