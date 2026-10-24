@@ -20,6 +20,31 @@ def strings(value):
             yield from strings(item)
 
 
+def check_secret_expressions(value):
+    # this is a future-edit guard, not a proof that arbitrary trusted-main code is safe
+    # lex expressions so quoted text is inert and function/grouping spelling cannot hide a context
+    token_pattern = re.compile(r"\s+|'(?:[^']|'')*'|[A-Za-z_][A-Za-z0-9_-]*|.", re.DOTALL)
+    cursor = 0
+    while (start := value.find("${{", cursor)) >= 0:
+        cursor = start + 3
+        tokens = []
+        while cursor < len(value) and not value.startswith("}}", cursor):
+            token = token_pattern.match(value, cursor).group()
+            cursor += len(token)
+            if token.isspace():
+                continue
+            require(token != "'", "unterminated workflow expression string")
+            tokens.append(None if token.startswith("'") else token)
+        require(value.startswith("}}", cursor), "unterminated workflow expression")
+        cursor += 2
+        for index, token in enumerate(tokens):
+            if token is None or token.casefold() != "secrets" or index > 0 and tokens[index - 1] == ".":
+                continue
+            require(index + 2 < len(tokens) and tokens[index + 1] == "." and
+                    re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", tokens[index + 2] or ""),
+                    "only explicit named secret references are allowed")
+
+
 def check_workflows(directory):
     expected = {(PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")}
     environments, secrets = set(), set()
@@ -27,11 +52,10 @@ def check_workflows(directory):
         if path.suffix not in (".yaml", ".yml"):
             continue
         value = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
-        text = "\n".join(strings(value))
-        require(not re.search(r"tojson\s*\(\s*secrets\s*\)", text, re.IGNORECASE),
-                "whole-secret serialization is forbidden")
-        require(not re.search(r"\bsecrets\s*\[", text, re.IGNORECASE),
-                "indexed secret expressions require separate credential review")
+        values = list(strings(value))
+        for text in values:
+            check_secret_expressions(text)
+        text = "\n".join(values)
         key_count = text.casefold().count(WRITER_SECRET_NAME.casefold())
         require(key_count == (1 if path.name in (PUBLICATION_WORKFLOW, CANARY_WORKFLOW) else 0),
                 "history key references differ from reviewed mint steps")

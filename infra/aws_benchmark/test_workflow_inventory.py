@@ -63,7 +63,7 @@ class WorkflowInventoryTests(unittest.TestCase):
                 (root / name).write_text("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                     "\n    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
             (root / "rogue.yaml").write_text("jobs:\n  rogue:\n    steps:\n      - run: |\n          echo ${{ secrets[format('RCP_{0}', inputs.suffix)] }}\n")
-            with self.assertRaisesRegex(ValueError, "indexed secret"):
+            with self.assertRaisesRegex(ValueError, "explicit named secret"):
                 check_workflows(root)
 
     def test_multiline_expressions_are_checked_without_repr_escaping(self):
@@ -77,6 +77,45 @@ class WorkflowInventoryTests(unittest.TestCase):
                     expression.replace("\n", "\n          ") + " }}\n")
                 with self.assertRaisesRegex(ValueError, "secret"):
                     check_workflows(root)
+
+    def test_broad_secret_context_is_rejected_in_the_approved_job(self):
+        for expression in ("toJSON(secrets)", "toJSON((secrets))", "join(secrets.*)",
+                "toJSON(secrets.*)", "fromJSON(toJSON(secrets.*))", "(secrets).OTHER_TOKEN",
+                "secrets['OTHER_TOKEN']", "secrets[inputs.name]", "SECRETS . *",
+                "format('{0}', secrets)", "secrets", "toJSON(\nsecrets\n)"):
+            with self.subTest(expression=expression), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_consumers(root, "${{ " + expression + " }}")
+                with self.assertRaisesRegex(ValueError, "explicit named secret"):
+                    check_workflows(root)
+
+    def test_named_secrets_and_literal_text_remain_allowed(self):
+        for value in ("${{ secrets.OTHER_TOKEN }}", "${{ toJSON(secrets.OTHER_TOKEN) }}",
+                "${{ secrets . OTHER_TOKEN }}", "${{ SECRETS.other_token }}",
+                "${{ inputs.secrets }}", "${{ steps.secrets.outputs.value }}",
+                "${{ format('secrets.* and secrets[inputs.name]', secrets.OTHER_TOKEN) }}",
+                "${{ format('}} and ''secrets'' and ${{ secrets }}', secrets.OTHER_TOKEN) }}",
+                "${{ 'toJSON((secrets))' }}", "literal toJSON(secrets) and secrets[inputs.name]"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_consumers(root, value)
+                self.assertEqual(len(check_workflows(root)), 2)
+
+    def test_invalid_expression_boundaries_are_rejected(self):
+        for value in ("${{ secrets.OTHER_TOKEN", "${{ 'unterminated }}"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_consumers(root, value)
+                with self.assertRaisesRegex(ValueError, "unterminated workflow expression"):
+                    check_workflows(root)
+
+    def write_consumers(self, root, extra):
+        for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+            text = ("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
+                "\n    steps:\n      - with:\n          private-key: ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
+            if name == PUBLICATION_WORKFLOW:
+                text += "      - run: |\n          " + extra.replace("\n", "\n          ") + "\n"
+            (root / name).write_text(text)
 
 
 if __name__ == "__main__":
