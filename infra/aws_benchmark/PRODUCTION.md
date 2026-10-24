@@ -184,9 +184,14 @@ dropping data.
 The writer receives only public JSON. It reads fixed Git objects in a bare repository, preserves
 identical prior records and rejects conflicting records. It creates commits through Git plumbing and
 pushes to `aws-benchmark-history` without force, with three bounded fetch/reconcile attempts. The
-history branch remains separate from Depot's `benchmark-history`. The GitHub `contents: write` job
-token is repository-wide: the reviewed writer restricts its target, but GitHub does not scope that
-token to this one branch. Protect main and review changes to this workflow.
+history branch remains separate from Depot's `benchmark-history`. The job's default token is
+Contents read. A dedicated, repository-selected writer App supplies Contents write and Metadata read
+only after credential-free commit preparation finds new validated records, in the proposed main-only
+`aws-benchmark-history` environment. Its installation ID must match before use; this checks
+continuity, not drift in installation permissions or repository selection. The App token remains
+repository-scoped; protect main and review every workflow able to request the environment secret.
+See [TRUST.md](TRUST.md) for approval-delay cancellation, broader Contents-write reach, and live
+gates.
 
 ### Publication trust gate
 
@@ -199,27 +204,23 @@ repository variable defaults off and gates both publication and AWS history rend
 of `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`. Publication and Pages reject reruns; submit a fresh manual
 workflow after a hold instead of executing an old revision's write path.
 
-The proposed setup requires separate approval before implementation or live configuration:
+The offline integration and proposal renderer are implemented in [TRUST.md](TRUST.md); actual App,
+key, environment and ruleset setup remains separately approved work. The chosen AWS reader custody
+is tightened Secrets Manager, without a KMS implementation. Its deny-only policy renderer requires
+the exact two deployed reader roles and a recovery role selected by the user; it chooses no recovery
+principal and grants no access.
 
-- Create an owner-managed, repository-selected App named `rcp-benchmark-history-writer`, installed
-  only on `wykurz/rcp`, with Contents write and Metadata read. It must be separate from the
-  Actions-read proof App. Approve its key custody, secret location and short-lived token minting
-  workflow before generating or importing a key.
-- Add an active branch ruleset matching exactly `refs/heads/aws-benchmark-history`: restrict
-  creation, updates and deletion, and block force pushes. Give only that exact writer App the
-  required bypass. Do not add an all-Actions, collaborator, role-wide or unrelated-App bypass.
-  Preserve main protections; the App token itself is repository-scoped, not branch-scoped.
-- Replace the writer's repository-wide job token with the reviewed dedicated token path, keep the
-  exact refspec and credential-free export boundary, and verify denial with an ordinary workflow
-  token and success only through the dedicated writer. Protect the token-minting job/configuration
-  so arbitrary repository code cannot obtain the App key. Record resolved App/installation IDs,
-  ruleset ID and evidence before enabling the readiness and publication gates.
+History protection uses two exact-branch rulesets: an App-only creation/update restriction and a
+separate deletion/non-fast-forward prohibition with no bypass. The workflow's App key must be an
+environment secret, never shared with the AWS reader. An authorized operator must verify complete
+settings readbacks and live positive/negative canaries before setting the readiness flag. Other
+trusted main workflows can request that environment; this is not workflow-specific secret isolation.
+The initial environment policy requires owner approval, with no administrator bypass. A future
+unattended policy needs a separate decision.
 
-This PR does not create that App, secret, ruleset or bypass and does not claim the current job token
-satisfies this gate. Removing persisted checkout credentials from release jobs reduces exposure but
-is not a replacement for history protection. Anchoring public digests in DynamoDB is a possible
-additional integrity layer; it would still require a trusted verification path for standalone Pages
-and does not replace the publication authorization decision.
+No App, secret, policy, ruleset or environment is created by the code. Runtime tokens and repository
+flags cannot prove these settings exist. Anchoring public digests in DynamoDB remains a possible
+additional integrity layer; it does not replace this publication authorization boundary.
 
 Public pages distinguish consistency checks from measurement honesty. Candidate binaries share the
 harness UID and can forge measurement files; the displayed values are self-reported, unattested
@@ -568,8 +569,8 @@ References:
    its exact read-only role, enabling the separate `PublicationEnabled` gate, and setting
    `RCP_AWS_PRODUCTION_PUBLISH_ROLE`, `RCP_AWS_PRODUCTION_TABLE` and
    `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`; it shares the existing production region/bucket variables.
-   Keep `RCP_AWS_HISTORY_TRUST_READY` false until the separate history-writer/ruleset implementation
-   and live positive/negative trust canary above are approved and verified. Only then enable that
+   Keep `RCP_AWS_HISTORY_TRUST_READY` false until the separately approved history-writer/ruleset
+   setup and live positive/negative trust canary in TRUST.md are verified. Only then enable that
    readiness flag for both publication and AWS history rendering. Pages retains its independent
    `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in this change. Broader
    comparisons and a few-times-weekly schedule require their reviewed contracts, operating allowance

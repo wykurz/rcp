@@ -1,0 +1,258 @@
+{
+  "environment": {
+    "name": "aws-benchmark-history",
+    "url": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history",
+    "can_admins_bypass": false,
+    "deployment_branch_policy": {
+      "protected_branches": false,
+      "custom_branch_policies": true
+    },
+    "protection_rules": [
+      {
+        "type": "required_reviewers",
+        "prevent_self_review": false,
+        "reviewers": [
+          {
+            "type": "User",
+            "reviewer": {
+              "id": 483465
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "branches": {
+    "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/deployment-branch-policies",
+    "response": {
+      "total_count": 1,
+      "branch_policies": [
+        {
+          "id": 123,
+          "name": "main",
+          "type": "branch"
+        }
+      ]
+    }
+  },
+  "rulesets": [
+    {
+      "id": 100,
+      "name": "rcp-aws-history-writer",
+      "source": "wykurz/rcp",
+      "source_type": "Repository",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "refs/heads/aws-benchmark-history",
+            "refs/heads/aws-benchmark-history/**/*"
+          ],
+          "exclude": []
+        }
+      },
+      "bypass_actors": [
+        {
+          "actor_id": 1234,
+          "actor_type": "Integration",
+          "bypass_mode": "always"
+        }
+      ],
+      "rules": [
+        {
+          "type": "creation"
+        },
+        {
+          "type": "update"
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "name": "rcp-aws-history-preserve",
+      "source": "wykurz/rcp",
+      "source_type": "Repository",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "refs/heads/aws-benchmark-history",
+            "refs/heads/aws-benchmark-history/**/*"
+          ],
+          "exclude": []
+        }
+      },
+      "bypass_actors": [],
+      "rules": [
+        {
+          "type": "deletion"
+        },
+        {
+          "type": "non_fast_forward"
+        }
+      ]
+    }
+  ],
+  "repository": {
+    "endpoint": "https://api.github.com/repos/wykurz/rcp",
+    "response": {
+      "id": 655073755,
+      "full_name": "wykurz/rcp",
+      "fork": false,
+      "owner": {
+        "id": 483465,
+        "login": "wykurz",
+        "type": "User"
+      }
+    }
+  },
+  "app": {
+    "endpoint": "https://api.github.com/apps/rcp-test-writer",
+    "response": {
+      "id": 1234,
+      "client_id": "Iv23.test-client",
+      "slug": "rcp-test-writer",
+      "owner": {
+        "id": 483465,
+        "login": "wykurz",
+        "type": "User"
+      },
+      "permissions": {
+        "contents": "write",
+        "metadata": "read"
+      },
+      "events": []
+    }
+  },
+  "inventory": {
+    "environments": {
+      "pages": [
+        {
+          "endpoint": "https://api.github.com/repos/wykurz/rcp/environments?per_page=100&page=1",
+          "response": {
+            "total_count": 2,
+            "environments": [
+              {
+                "name": "aws-benchmark-history",
+                "url": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history"
+              },
+              {
+                "name": "other",
+                "url": "https://api.github.com/repos/wykurz/rcp/environments/other"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "repository_secrets": {
+      "pages": [
+        {
+          "endpoint": "https://api.github.com/repos/wykurz/rcp/actions/secrets?per_page=100&page=1",
+          "response": {
+            "total_count": 0,
+            "secrets": []
+          }
+        }
+      ]
+    },
+    "dependabot_secrets": {
+      "pages": [
+        {
+          "endpoint": "https://api.github.com/repos/wykurz/rcp/dependabot/secrets?per_page=100&page=1",
+          "response": {
+            "total_count": 0,
+            "secrets": []
+          }
+        }
+      ]
+    },
+    "repository_variables": {
+      "pages": [
+        {
+          "endpoint": "https://api.github.com/repos/wykurz/rcp/actions/variables?per_page=100&page=1",
+          "response": {
+            "total_count": 3,
+            "variables": [
+              {
+                "name": "RCP_AWS_HISTORY_TRUST_READY",
+                "value": "false"
+              },
+              {
+                "name": "RCP_AWS_PRODUCTION_PUBLISH_ENABLED",
+                "value": "false"
+              },
+              {
+                "name": "RCP_AWS_HISTORY_CANARY_ENABLED",
+                "value": "false"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "environment_secrets": {
+      "aws-benchmark-history": {
+        "pages": [
+          {
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/secrets?per_page=100&page=1",
+            "response": {
+              "total_count": 1,
+              "secrets": [
+                {
+                  "name": "RCP_AWS_HISTORY_APP_PRIVATE_KEY"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "other": {
+        "pages": [
+          {
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/other/secrets?per_page=100&page=1",
+            "response": {
+              "total_count": 0,
+              "secrets": []
+            }
+          }
+        ]
+      }
+    },
+    "environment_variables": {
+      "aws-benchmark-history": {
+        "pages": [
+          {
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/aws-benchmark-history/variables?per_page=100&page=1",
+            "response": {
+              "total_count": 2,
+              "variables": [
+                {
+                  "name": "RCP_AWS_HISTORY_APP_CLIENT_ID",
+                  "value": "Iv23.test-client"
+                },
+                {
+                  "name": "RCP_AWS_HISTORY_APP_INSTALLATION_ID",
+                  "value": "5678"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "other": {
+        "pages": [
+          {
+            "endpoint": "https://api.github.com/repos/wykurz/rcp/environments/other/variables?per_page=100&page=1",
+            "response": {
+              "total_count": 0,
+              "variables": []
+            }
+          }
+        ]
+      }
+    }
+  }
+}

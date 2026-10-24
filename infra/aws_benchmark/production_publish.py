@@ -23,9 +23,8 @@ from benchmarks.publish import git
 from . import production_bundle as codec, production_collection as collection
 from . import production_export as public, production_publication as publication
 from .common import Budget, digest, require
+from .history_contract import REPOSITORY_ID, HISTORY_REF
 
-REPOSITORY_ID = "655073755"
-HISTORY_REF = "refs/heads/aws-benchmark-history"
 DOWNLOAD_SCHEMA = "rcp-production-download-index-v1"
 PUBLIC_SCHEMA = "rcp-production-public-batch-v1"
 MAX_TOTAL = 512 * 1024 * 1024
@@ -395,7 +394,7 @@ def summary(index, records=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("download", "export", "publish"))
-    parser.add_argument("--history", required=True, type=Path)
+    parser.add_argument("--history", type=Path, required=True)
     parser.add_argument("--reader-revision", required=True)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
@@ -431,7 +430,10 @@ def main():
         records = [collection.results.json_value(read(args.output / (ref["run_key"] + ".json"), public.MAX_PUBLIC_RECORD))
                    for ref in index["records"]]
     summary(index, records)
-    outputs(inventory_sha256=value, reader_revision=args.reader_revision)
+    values = dict(inventory_sha256=value, reader_revision=args.reader_revision)
+    if args.phase == "export":
+        values["record_count"] = str(len(records))
+    outputs(**values)
 
 
 if __name__ == "__main__":
