@@ -13,17 +13,3 @@ permissions:
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
-
-  # run controller regression tests here, not in reusable validation of historical tags
-  release-identity:
-    name: Release source identity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Install test dependency
-        run: sudo apt-get update && sudo apt-get install -y python3-yaml
-      - name: Test release tag identity
-        run: /usr/bin/python3 scripts/test-release-refs.py

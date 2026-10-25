@@ -54,14 +54,11 @@ jobs:
         id: changelog
         run: |
           VERSION="${RELEASE_TAG#v}"
-          # extract section between ## [VERSION] and next ## [
-          # use awk to capture lines between the version header and next section
-          # escape dots in version for exact regex matching (1.2.3 -> 1\.2\.3)
+          # compare the heading literally so prerelease and build metadata need no regex escaping
           NOTES=$(awk -v ver="$VERSION" '
-            BEGIN { gsub(/\./, "\\.", ver) }
             /^## \[/ {
               if (found) exit
-              if ($0 ~ "\\[" ver "\\]") found=1
+              if (index($0, "## [" ver "]") == 1) found=1
               next
             }
             found { print }
@@ -73,15 +70,22 @@ jobs:
             exit 1
           fi
           # write to file for multi-line support
-          echo "$NOTES" > /tmp/release-notes.md
-          echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' "$NOTES" > "$NOTES_FILE"
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          # a hyphen in build metadata does not make the version a prerelease
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create Draft Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
           draft: true
+          prerelease: ${{ steps.changelog.outputs.prerelease }}
           generate_release_notes: false
           body_path: ${{ steps.changelog.outputs.notes_file }}
 
@@ -99,6 +103,16 @@ jobs:
         with:
           ref: ${{ needs.resolve-release.outputs.commit }}
           persist-credentials: false
+
+      - name: Restore release tag for build metadata
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+          # restore only the verified tag locally; keep the source pinned without another fetch
+          git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -129,11 +143,11 @@ jobs:
           ls -la rcp-deb-amd64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
-        if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
+          draft: true
           files: ./rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
 
   build-rpm-amd64:
@@ -150,6 +164,16 @@ jobs:
         with:
           ref: ${{ needs.resolve-release.outputs.commit }}
           persist-credentials: false
+
+      - name: Restore release tag for build metadata
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+          # restore only the verified tag locally; keep the source pinned without another fetch
+          git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -180,11 +204,11 @@ jobs:
           ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
-        if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
+          draft: true
           files: ./rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
 
   build-deb-arm64:
@@ -201,6 +225,16 @@ jobs:
         with:
           ref: ${{ needs.resolve-release.outputs.commit }}
           persist-credentials: false
+
+      - name: Restore release tag for build metadata
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+          # restore only the verified tag locally; keep the source pinned without another fetch
+          git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -231,11 +265,11 @@ jobs:
           ls -la rcp-deb-arm64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
-        if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
+          draft: true
           files: ./rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
 
   build-rpm-arm64:
@@ -252,6 +286,16 @@ jobs:
         with:
           ref: ${{ needs.resolve-release.outputs.commit }}
           persist-credentials: false
+
+      - name: Restore release tag for build metadata
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+          # restore only the verified tag locally; keep the source pinned without another fetch
+          git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -281,11 +325,11 @@ jobs:
           ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
-        if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
+          draft: true
           files: ./rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
 
   publish-crates:
@@ -293,7 +337,7 @@ jobs:
     needs: [resolve-release, build-deb-amd64, build-rpm-amd64, build-deb-arm64, build-rpm-arm64]
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
-    if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.build-deb-amd64.result == 'success' && needs.build-rpm-amd64.result == 'success' && needs.build-deb-arm64.result == 'success' && needs.build-rpm-arm64.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     permissions:
       contents: read
     steps:
@@ -355,13 +399,12 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs: [resolve-release, publish-crates]
-    if: ${{ needs.resolve-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.publish-crates.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     permissions:
       contents: write
     steps:
       - name: Publish Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
-          target_commitish: ${{ needs.resolve-release.outputs.commit }}
           draft: false

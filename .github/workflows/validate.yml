@@ -95,6 +95,9 @@ jobs:
         ./scripts/test-check-build-entrypoints.sh
         ./scripts/check-build-entrypoints.sh
 
+    - name: Test release source identity
+      run: just release-ref-test
+
     - name: Check action pins
       run: |
         ./scripts/test-check-action-pins.sh
