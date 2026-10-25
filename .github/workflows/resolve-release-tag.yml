@@ -60,7 +60,7 @@ jobs:
           esac
           printf 'tag=%s\nref=refs/tags/%s\n' "$RELEASE_TAG" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-      # full refs/tags/ prevents checkout from preferring a same-named branch
+      # verify the fetched object against the exact remote tag below
       - name: Fetch the exact release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,19 +73,33 @@ jobs:
         shell: bash
         env:
           RELEASE_REF: ${{ steps.tag.outputs.ref }}
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           set -euo pipefail
           # do not execute any scripts from the release tag in this resolver
+          object=$(git rev-parse --verify --end-of-options "$RELEASE_REF")
           commit=$(git rev-parse --verify 'HEAD^{commit}')
-          tag_commit=$(git rev-parse --verify --end-of-options "${RELEASE_REF}^{commit}")
-          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ || "$commit" != "$tag_commit" ]]; then
+          tag_commit=$(git rev-parse --verify --end-of-options "${object}^{commit}")
+          if [[ ! "$object" =~ ^[0-9a-f]{40}$ || ! "$commit" =~ ^[0-9a-f]{40}$ ||
+                "$commit" != "$tag_commit" ]]; then
             echo "::error::Checkout does not match the exact release tag"
+            exit 1
+          fi
+          # fetch can DWIM a missing tag to a shadow ref; ls-remote also tail-matches
+          # compare the exact remote name and unpeeled object, preserving annotated tags
+          # this public read is anonymous after checkout removes its credentials
+          if ! remote_object=$(git -c credential.helper= ls-remote --refs origin "$RELEASE_REF" |
+              awk -v ref="$RELEASE_REF" '$2 == ref {print $1}') ||
+             [[ ! "$remote_object" =~ ^[0-9a-f]{40}$ || "$remote_object" != "$object" ]]; then
+            echo "::error::Remote has no exact release tag matching the checkout"
             exit 1
           fi
           if [[ "$EVENT_NAME" == push ]]; then
             # a rerun must still match its original push, including annotated tags
-            event_commit=$(git rev-parse --verify --end-of-options "${EVENT_SHA}^{commit}")
-            if [[ "$commit" != "$event_commit" ]]; then
+            if ! event_commit=$(git rev-parse --verify --quiet --end-of-options "${EVENT_SHA}^{commit}") ||
+               [[ "$commit" != "$event_commit" ]]; then
               echo "::error::Release tag moved since the push event"
               exit 1
             fi

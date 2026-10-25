@@ -49,6 +49,8 @@ Runs on every push and pull request to `main`:
 
 - **format**: Checks code formatting with `cargo fmt`
 - **lint**: Runs Clippy linter
+- **release source identity**: Runs resolver, publication and failure-path regressions inside the
+  required lint job
 - **documentation**: Builds documentation with strict warnings
 - **test**: Runs the full test suite using cargo-nextest
 
@@ -59,7 +61,7 @@ Builds, publishes binary packages, and publishes to crates.io when a tag is push
 
 **Flow:**
 
-1. Runs validation (format, lint, tests) against the release tag
+1. Resolves the exact remote tag to one commit, then validates that commit (format, lint, tests)
 2. Creates a draft GitHub release
 3. Builds packages in parallel:
    - Debian packages (amd64 + arm64)
@@ -68,16 +70,23 @@ Builds, publishes binary packages, and publishes to crates.io when a tag is push
 5. Publishes all workspace crates to crates.io
 6. Publishes the GitHub release (removes draft status) only after crates.io succeeds
 
-All build and publish jobs check out the release tag, ensuring consistency even on manual
-workflow_dispatch reruns.
+All build and publish jobs check out the resolved commit SHA. Build jobs restore the validated tag
+locally for version metadata. Uploads preserve an existing draft; only the final step publishes that
+draft. Reruns against an already published mutable release update public assets without restoring
+draft state. Manual dispatch accepts a release tag, `dry_run` (build only) and `skip_validation`;
+skipping validation does not skip source resolution or downstream success gates. Prerelease versions
+are marked as prereleases, while hyphens inside build metadata alone do not mark a stable version as
+one. See [Release source identity](../../docs/release-identity.md) for exact source guarantees,
+historical-controller compatibility, partial reruns and credential boundaries.
 
 **Usage:**
 
 Run `just release`, which guides you through the whole process. Because direct pushes to `main` are
 disabled, the CHANGELOG and version-bump commits land via pull requests (you merge them with
 **Rebase and merge** — click **Update branch** first if GitHub reports the branch is out of date);
-the helper opens those PRs for you. Tag pushes are *not* branch-protected, so the helper still
-pushes the release tag directly to trigger this workflow:
+the helper opens those PRs for you. The separate release-tag ruleset controls tag creation, updates
+and deletion with an administrator bypass. An authorized operator can push the tag to trigger this
+workflow:
 
 ```bash
 git tag v0.24.0
@@ -87,7 +96,12 @@ git push origin v0.24.0
 ### publish.yml
 
 Manual-only workflow for re-publishing to crates.io (e.g., after a failed release). Requires an
-explicit release tag input (e.g., `v0.28.0`), validates and publishes from that exact tagged commit.
+explicit release tag input (e.g., `v0.28.0`), resolves it once, then validates and publishes from
+that commit SHA. The string-valued `dry-run` choice defaults to `true`. The selected controller must
+have build and validation commands compatible with the chosen source tag; older tags may lack
+required helpers. Use the current reviewed controller, and see the
+[old-ref credential boundary](../../docs/release-identity.md#separate-protection-requirements)
+before changing publication access.
 
 #### Setup Instructions
 
@@ -115,8 +129,8 @@ explicit release tag input (e.g., `v0.28.0`), validates and publishes from that 
    - Go to Actions → Publish to crates.io → Run workflow
    - Release tag: the tag to publish (e.g., `v0.28.0`)
    - Dry run: `false` to actually publish, `true` (default) to test
-   - The workflow checks out the specified tag, verifies the Cargo.toml version matches, validates,
-     and publishes from that exact commit
+   - The workflow resolves the specified tag, checks out its commit SHA, verifies the Cargo.toml
+     version matches, validates, and publishes from that commit
 
 #### How It Works
 

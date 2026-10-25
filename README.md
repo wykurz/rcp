@@ -72,6 +72,8 @@ API documentation for the command-line tools is available on docs.rs:
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
+- [Release source identity](docs/release-identity.md) - Pinned release sources, reruns and
+  protection boundaries
 - [Benchmarking](docs/benchmarking.md) - Copy performance measurements, CI and historical trends
 - [Reports](https://www.wykurz.org/rcp/reports/) ([repository index](docs/reports/README.md)) -
   Performance results and supporting measurement evidence
