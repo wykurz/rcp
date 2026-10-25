@@ -100,6 +100,7 @@ test *ARGS:
 # exercise release-tag identity and workflow propagation without publishing anything
 release-ref-test:
     python3 scripts/test-release-refs.py
+    python3 scripts/test-release-rpm-version.py
 
 # Run tests in release mode
 test-release *ARGS:

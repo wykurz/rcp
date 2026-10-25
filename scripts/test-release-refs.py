@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -15,6 +17,7 @@ RESOLVER = "resolve-release"
 COMMIT = "${{ needs.resolve-release.outputs.commit }}"
 TAG = "${{ needs.resolve-release.outputs.tag }}"
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+RELEASE_ACTION = "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64"
 BUILDS = {"build-deb-amd64", "build-rpm-amd64", "build-deb-arm64", "build-rpm-arm64"}
 spec = importlib.util.spec_from_file_location("check_yaml_duplicates", ROOT / "scripts/check-yaml-duplicates.py")
 DUPLICATES = importlib.util.module_from_spec(spec)
@@ -23,7 +26,7 @@ spec.loader.exec_module(DUPLICATES)
 
 def workflow(name):
     path = ROOT / ".github/workflows" / name
-    DUPLICATES.validate(path)
+    DUPLICATES.validate(path, case_insensitive=True)
     return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
 
 
@@ -74,8 +77,10 @@ class Condition:
             return {"cancelled": self.cancelled,
                     "success": not self.cancelled and all(x == "success" for x in self.needs),
                     "failure": any(x == "failure" for x in self.needs), "always": True}[token]
-        assert token in self.values, "unknown condition context: " + token
-        return self.values[token]
+        try:
+            return self.values[token]
+        except KeyError:
+            raise AssertionError("unknown condition context: " + token) from None
 
     @staticmethod
     def equal(left, right):
@@ -125,11 +130,83 @@ def expression(text, values):
     return text
 
 
-def context(event="workflow_dispatch", tag="v1.2.3", ref="refs/tags/v9.9.9", sha="", dry=False, skip=False):
-    return {"github.event_name": event, "github.ref": ref, "github.ref_name": ref.rsplit("/", 1)[-1],
-            "github.sha": sha, "inputs.release_tag": tag, "inputs.dry_run": dry,
-            "inputs.skip_validation": skip, "inputs.dry-run": str(dry).lower(),
-            "github.event.inputs.dry-run": str(dry).lower()}
+class WorkflowContext(dict):
+    # missing properties in modeled input/output contexts evaluate to an empty string on Actions
+    def __missing__(self, key):
+        if key.startswith(("inputs.", "github.event.inputs.")) or re.fullmatch(
+                r"(?:steps|jobs|needs)\.[^.]+\.outputs\.[^.]+", key):
+            return ""
+        raise KeyError(key)
+
+
+def rendered(value):
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def declared_inputs(flow, invocation, supplied):
+    declarations = flow.get("on", {}).get(invocation, {}).get("inputs", {})
+    assert set(supplied) <= set(declarations), "undeclared workflow inputs"
+    values = {}
+    for name, declaration in declarations.items():
+        kind = declaration.get("type", "string")
+        value = supplied.get(name, declaration.get("default", "false" if kind == "boolean" else ""))
+        if kind == "boolean":
+            assert value in (True, False, "true", "false"), "invalid boolean input"
+            value = value is True or value == "true"
+        else:
+            assert kind in ("string", "choice"), "unsupported workflow input type: " + kind
+            value = rendered(value)
+            if kind == "choice":
+                assert value in declaration["options"], "invalid workflow choice"
+        values["inputs." + name] = value
+    return values
+
+
+def context(flow, event="workflow_dispatch", tag="v1.2.3", ref="refs/tags/v9.9.9", sha="",
+            dry=None, skip=None, invocation=None, inputs=None):
+    values = WorkflowContext({"github.event_name": event, "github.ref": ref,
+                              "github.ref_name": ref.rsplit("/", 1)[-1], "github.sha": sha})
+    invocation = invocation or event
+    if invocation not in ("workflow_dispatch", "workflow_call"):
+        return values
+    declarations = flow.get("on", {}).get(invocation, {}).get("inputs", {})
+    supplied = dict(inputs or {})
+    controls = {"release_tag": tag, "dry_run": dry, "dry-run": dry, "skip_validation": skip}
+    supplied.update({k: v for k, v in controls.items() if k in declarations and v is not None and k not in supplied})
+    values.update(declared_inputs(flow, invocation, supplied))
+    if invocation == "workflow_dispatch":
+        values.update({"github.event." + k: rendered(v) for k, v in list(values.items()) if k.startswith("inputs.")})
+    return values
+
+
+def called_context(flow, caller, inputs):
+    values = WorkflowContext({k: v for k, v in caller.items() if not k.startswith("inputs.")})
+    values.update(declared_inputs(flow, "workflow_call", inputs))
+    return values
+
+
+def shell_command(flow, job, step):
+    # model Linux runner defaults, rejecting working directories and shells outside this adapter
+    assert "container" not in job, "container execution is not modeled"
+    settings = {}
+    for source in (flow, job):
+        defaults = source.get("defaults", {}).get("run", {})
+        assert set(defaults) <= {"shell", "working-directory"}, "unsupported run defaults"
+        settings.update(defaults)
+        assert "working-directory" not in defaults, "working-directory is not modeled"
+    assert "working-directory" not in step, "working-directory is not modeled"
+    shell = step.get("shell", settings.get("shell"))
+    assert shell in (None, "bash"), "unsupported workflow shell: " + str(shell)
+    return ["bash", "-e"] if shell is None else ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+
+
+def mapped_resolver_outputs(flow, step_outputs):
+    values = WorkflowContext({"steps." + step + ".outputs." + key: value
+                              for step, outputs in step_outputs.items() for key, value in outputs.items()})
+    job_outputs = {key: expression(value, values) for key, value in flow["jobs"]["resolve"]["outputs"].items()}
+    values = WorkflowContext({"jobs.resolve.outputs." + key: value for key, value in job_outputs.items()})
+    return {key: expression(output["value"], values)
+            for key, output in flow["on"]["workflow_call"]["outputs"].items()}
 
 
 def dependencies(job):
@@ -145,18 +222,21 @@ def ancestors(jobs, name, visiting=()):
     return result
 
 
-def runs(jobs, name, states, event="workflow_dispatch", dry=False, skip=False, cancelled=False):
-    values = context(event=event, dry=dry, skip=skip)
+def runs(flow, name, states, event="workflow_dispatch", dry=False, skip=False, cancelled=False):
+    jobs = flow["jobs"]
+    values = context(flow, event=event, dry=dry, skip=skip)
     values.update({"needs." + n + ".result": states[n] for n in dependencies(jobs[name])})
     return Condition(jobs[name].get("if", "true"), values,
                      [states[n] for n in ancestors(jobs, name)], cancelled).result()
 
 
-def consumer_checkouts(flows, values):
+def consumer_checkouts(flows, outputs, sha):
     for flow_name, flow in flows.items():
+        values = context(flow, sha=sha)
+        values.update({"needs.resolve-release.outputs." + key: value for key, value in outputs.items()})
         for job_name, job in flow["jobs"].items():
             if job.get("uses") == "./.github/workflows/validate.yml":
-                nested = dict(values, **{"inputs.ref": expression(job["with"]["ref"], values)})
+                nested = called_context(workflow("validate.yml"), values, {"ref": expression(job["with"]["ref"], values)})
                 for name, validation in workflow("validate.yml")["jobs"].items():
                     for step in validation.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
@@ -169,16 +249,17 @@ def consumer_checkouts(flows, values):
 class ExpressionTests(unittest.TestCase):
     def test_status_functions_include_skipped_and_failed_ancestors(self):
         jobs = {"validate": {}, "build": {"needs": "validate"}, "publish": {"needs": "build"}}
+        flow = {"jobs": jobs}
         states = {"validate": "skipped", "build": "success"}
-        self.assertFalse(runs(jobs, "publish", states))
+        self.assertFalse(runs(flow, "publish", states))
         jobs["publish"]["if"] = "success()"
-        self.assertFalse(runs(jobs, "publish", states))
+        self.assertFalse(runs(flow, "publish", states))
         jobs["publish"]["if"] = "failure()"
         states["validate"] = "failure"
-        self.assertTrue(runs(jobs, "publish", states))
+        self.assertTrue(runs(flow, "publish", states))
         jobs["publish"]["if"] = "!cancelled() && needs.build.result == 'success'"
-        self.assertTrue(runs(jobs, "publish", states))
-        self.assertFalse(runs(jobs, "publish", states, cancelled=True))
+        self.assertTrue(runs(flow, "publish", states))
+        self.assertFalse(runs(flow, "publish", states, cancelled=True))
 
     def test_strings_compare_without_case_and_boolean_operators_return_values(self):
         values = {"needs.validate.result": "failure"}
@@ -186,12 +267,76 @@ class ExpressionTests(unittest.TestCase):
         self.assertFalse(Condition("needs.validate.result != 'FAILURE'", values, []).result())
         self.assertEqual(expression("${{ false && 'wrong' || 'wanted' }}", {}), "wanted")
 
+    def test_dispatch_context_uses_only_declared_inputs_and_event_types(self):
+        release, publish = workflow("release.yml"), workflow("publish.yml")
+        release_values = context(release, dry=True, skip=True)
+        self.assertIs(release_values["inputs.dry_run"], True)
+        self.assertIs(release_values["inputs.skip_validation"], True)
+        self.assertEqual(release_values["github.event.inputs.dry_run"], "true")
+        self.assertEqual(release_values["inputs.dry-run"], "")
+        self.assertEqual(release_values["github.event.inputs.dry-run"], "")
+        publish_values = context(publish)
+        self.assertEqual(publish_values["inputs.dry-run"], "true")
+        self.assertEqual(publish_values["github.event.inputs.dry-run"], "true")
+        self.assertEqual(publish_values["inputs.dry_run"], "")
+        self.assertEqual(publish_values["inputs.skip_validation"], "")
+        self.assertIs(context(release)["inputs.dry_run"], False)
+        push = context(release, event="push", dry=True, skip=True)
+        self.assertFalse(any(k.startswith(("inputs.", "github.event.inputs.")) for k in push))
+        self.assertEqual(expression("${{ inputs.dry_run }}", push), "")
+
+    def test_undeclared_input_does_not_suppress_a_release_dry_run(self):
+        flow = workflow("release.yml")
+        states = {name: "success" for name in flow["jobs"]}
+        for name in ("create-release", "publish-crates", "publish-release"):
+            with self.subTest(job=name):
+                self.assertFalse(runs(flow, name, states, dry=True))
+                changed = copy.deepcopy(flow)
+                gate = changed["jobs"][name]["if"]
+                self.assertIn("inputs.dry_run", gate)
+                changed["jobs"][name]["if"] = gate.replace("inputs.dry_run", "inputs.dry-run == 'true'")
+                self.assertTrue(runs(changed, name, states, dry=True),
+                                "the misspelled input is empty on Actions, leaving this gate open")
+
+    def test_shell_defaults_use_step_then_job_then_workflow_precedence(self):
+        explicit = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        self.assertEqual(shell_command({}, {}, {}), ["bash", "-e"])
+        self.assertEqual(shell_command({"defaults": {"run": {"shell": "bash"}}}, {}, {}), explicit)
+        self.assertEqual(shell_command({"defaults": {"run": {"shell": "sh"}}},
+                                       {"defaults": {"run": {"shell": "bash"}}}, {}), explicit)
+        self.assertEqual(shell_command({}, {"defaults": {"run": {"shell": "sh"}}},
+                                       {"shell": "bash"}), explicit)
+        for flow, job, step in (
+                ({"defaults": {"run": {"shell": "sh"}}}, {}, {}),
+                ({}, {"defaults": {"run": {"shell": "sh"}}}, {}),
+                ({}, {}, {"shell": "sh"}),
+                ({"defaults": {"run": {"working-directory": "docs"}}}, {}, {}),
+                ({}, {"defaults": {"run": {"working-directory": "docs"}}}, {}),
+                ({}, {}, {"working-directory": "docs"}),
+                ({}, {"container": "example"}, {})):
+            with self.subTest(flow=flow, job=job, step=step), self.assertRaises(AssertionError):
+                shell_command(flow, job, step)
+
+    def test_missing_step_outputs_stay_empty_through_reusable_output_mappings(self):
+        flow = workflow("resolve-release-tag.yml")
+        steps = {"tag": {"tag": "v1.2.3"}, "resolve": {"sha": "a" * 40}}
+        self.assertEqual(mapped_resolver_outputs(flow, steps), {"tag": "v1.2.3", "commit": ""})
+        steps["resolve"] = {"commit": "b" * 40}
+        self.assertEqual(mapped_resolver_outputs(flow, steps), {"tag": "v1.2.3", "commit": "b" * 40})
+        changed = copy.deepcopy(flow)
+        changed["on"]["workflow_call"]["outputs"]["commit"]["value"] = "${{ jobs.resolve.outputs.sha }}"
+        self.assertEqual(mapped_resolver_outputs(changed, steps)["commit"], "")
+
     def test_duplicate_yaml_keys_are_rejected_before_loading(self):
         with tempfile.TemporaryDirectory(prefix="rcp-release-yaml-") as directory:
             path = Path(directory) / "duplicate.yml"
-            path.write_text("jobs:\n  build:\n    with:\n      ref: old\n      ref: new\n")
-            with self.assertRaises(DUPLICATES.DuplicateKeyError):
-                workflow(str(path))
+            for first in ("ref", "Ref"):
+                with self.subTest(first=first):
+                    path.write_text("jobs:\n  build:\n    with:\n      " + first + ": old\n      ref: new\n")
+                    with self.assertRaises(DUPLICATES.DuplicateKeyError):
+                        workflow(str(path))
+            path.write_text("Ref: old\nref: new\n")
+            DUPLICATES.validate(path)
 
 
 class ReleaseTagTests(unittest.TestCase):
@@ -235,18 +380,24 @@ class ReleaseTagTests(unittest.TestCase):
         self.git(self.source, "branch", name, self.other)
         return self.git(self.source, "rev-parse", "refs/tags/" + name).stdout.strip()
 
-    def run_step(self, flow, job, step, repo, values):
+    def run_step(self, flow, job, step, repo, values, resolver=False):
         self.output_number += 1
         output = self.root / ("output-" + str(self.output_number))
         environment = self.root / ("environment-" + str(self.output_number))
+        pathfile = self.root / ("path-" + str(self.output_number))
+        summary = self.root / ("summary-" + str(self.output_number))
         env = dict(self.env, GITHUB_OUTPUT=str(output), GITHUB_ENV=str(environment),
-                   RUNNER_TEMP=str(self.root))
+                   GITHUB_PATH=str(pathfile), GITHUB_STEP_SUMMARY=str(summary), RUNNER_TEMP=str(self.root))
         for source in (flow, job, step):
-            env.update({key: str(expression(value, values)) for key, value in source.get("env", {}).items()})
-        self.assertIn(step.get("shell", "bash"), ("bash",), "unsupported workflow shell")
-        script = re.sub(r"\$\{\{.*?\}\}", lambda match: str(expression(match[0], values)), step["run"])
-        result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+            env.update({key: rendered(expression(value, values)) for key, value in source.get("env", {}).items()})
+        script = re.sub(r"\$\{\{.*?\}\}", lambda match: rendered(expression(match[0], values)), step["run"])
+        scriptfile = self.root / ("step-" + str(self.output_number) + ".sh")
+        scriptfile.write_text(script)
+        result = subprocess.run([*shell_command(flow, job, step), str(scriptfile)],
                                 cwd=repo, env=env, text=True, capture_output=True)
+        if resolver:
+            self.assertFalse(environment.exists(), "resolver must not write GITHUB_ENV")
+            self.assertFalse(pathfile.exists(), "resolver must not write GITHUB_PATH")
         parsed = {}
         for line in output.read_text().splitlines() if output.exists() else []:
             key, separator, value = line.partition("=")
@@ -257,10 +408,10 @@ class ReleaseTagTests(unittest.TestCase):
 
     def step(self, name, repo, tag="v1.2.3", event="workflow_dispatch", event_ref="refs/heads/main",
              event_sha=None, release_ref=None):
-        values = context(event=event, tag=tag, ref=event_ref,
-                         sha=self.other if event_sha is None else event_sha)
+        values = context(self.resolver, event=event, ref=event_ref, invocation="workflow_call",
+                         inputs={"release_tag": tag}, sha=self.other if event_sha is None else event_sha)
         values["steps.tag.outputs.ref"] = "refs/tags/" + tag if release_ref is None else release_ref
-        return self.run_step(self.resolver, self.resolver["jobs"]["resolve"], self.steps[name], repo, values)
+        return self.run_step(self.resolver, self.resolver["jobs"]["resolve"], self.steps[name], repo, values, resolver=True)
 
     def checkout(self, step, values, name="checkout", check=True):
         # subset of the pinned checkout's input-helper/getRefSpec/getCheckoutInfo, with local git
@@ -307,7 +458,7 @@ class ReleaseTagTests(unittest.TestCase):
 
     def resolver_checkout(self, release_ref="refs/tags/v1.2.3", name="checkout", check=True):
         step = next(s for s in self.resolver["jobs"]["resolve"]["steps"] if "uses" in s)
-        values = context(sha=self.other)
+        values = context(self.resolver, invocation="workflow_call", sha=self.other)
         values["steps.tag.outputs.ref"] = release_ref
         values["steps.tag.outputs.tag"] = release_ref.removeprefix("refs/tags/")
         return self.checkout(step, values, name=name, check=check)
@@ -315,17 +466,17 @@ class ReleaseTagTests(unittest.TestCase):
     def resolve(self, annotated=False, event="workflow_dispatch", event_object=False):
         tag_object = self.make_tag(annotated=annotated)
         sha = tag_object if event_object else self.intended
-        tag_result, outputs = self.step("tag", self.source, event=event,
+        tag_result, tag_outputs = self.step("tag", self.source, event=event,
                                         event_ref="refs/tags/v1.2.3", event_sha=sha)
         self.assertEqual(tag_result.returncode, 0, tag_result.stderr)
-        self.assertEqual(outputs, {"tag": "v1.2.3", "ref": "refs/tags/v1.2.3"})
-        repo, _ = self.resolver_checkout(outputs["ref"])
+        self.assertEqual(tag_outputs, {"tag": "v1.2.3", "ref": "refs/tags/v1.2.3"})
+        repo, _ = self.resolver_checkout(tag_outputs["ref"])
         result, outputs = self.step("resolve", repo, event=event, event_ref="refs/tags/v1.2.3",
-                                    event_sha=sha, release_ref=outputs["ref"])
+                                    event_sha=sha, release_ref=tag_outputs["ref"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, {"commit": self.intended})
         self.assertEqual((repo / "payload").read_text(), "intended tag contents")
-        return repo, outputs["commit"]
+        return repo, mapped_resolver_outputs(self.resolver, {"tag": tag_outputs, "resolve": outputs})
 
     def test_lightweight_tag_wins_over_same_named_branch(self):
         self.resolve()
@@ -360,15 +511,18 @@ class ReleaseTagTests(unittest.TestCase):
     def test_non_commit_tag_cannot_emit_commit(self):
         blob = self.git(self.source, "rev-parse", self.intended + ":payload").stdout.strip()
         self.git(self.source, "update-ref", "refs/tags/v1.2.3", blob)
+        self.git(self.source, "remote", "add", "origin", self.source.as_uri())
         result, outputs = self.step("resolve", self.source)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs, {})
 
     def test_mismatched_checkout_cannot_emit_commit(self):
         self.make_tag()
+        self.git(self.source, "remote", "add", "origin", self.source.as_uri())
         result, outputs = self.step("resolve", self.source)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs, {})
+        self.assertIn("::error::Checkout does not match the exact release tag", result.stdout)
 
     def test_push_mismatch_or_missing_object_cannot_emit_commit(self):
         self.make_tag()
@@ -377,17 +531,14 @@ class ReleaseTagTests(unittest.TestCase):
         self.git(repo, "fetch", "--no-tags", "origin", self.other)
         for sha in (self.other, "f" * 40):
             with self.subTest(sha=sha):
-                result, outputs = self.step("resolve", repo, event="push", event_sha=sha)
+                result, outputs = self.step("resolve", repo, event="push", event_ref="refs/tags/v1.2.3", event_sha=sha)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(outputs, {})
                 self.assertIn("::error::Release tag moved since the push event", result.stdout)
 
-    def assert_consumers_keep_pin(self, flows):
-        values = context(sha=self.other)
-        values.update({"needs.resolve-release.outputs.commit": self.intended,
-                       "needs.resolve-release.outputs.tag": "v1.2.3"})
+    def assert_consumers_keep_pin(self, flows, outputs):
         count = 0
-        for label, step, checkout_values in consumer_checkouts(flows, values):
+        for label, step, checkout_values in consumer_checkouts(flows, outputs, self.other):
             with self.subTest(consumer=label):
                 consumer, result = self.checkout(step, checkout_values, name="consumer-" + str(count))
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -397,15 +548,16 @@ class ReleaseTagTests(unittest.TestCase):
         self.assertGreater(count, 9)
 
     def test_every_consumer_keeps_resolved_sha_after_remote_tag_moves(self):
-        self.resolve()
+        _, outputs = self.resolve()
+        self.git(self.source, "tag", "v9.9.9", self.other)
         self.git(self.source, "tag", "-f", "v1.2.3", self.other)
-        self.assert_consumers_keep_pin({name: workflow(name) for name in ("release.yml", "publish.yml")})
+        self.assert_consumers_keep_pin({name: workflow(name) for name in ("release.yml", "publish.yml")}, outputs)
 
     def test_moved_push_tag_fails_against_original_event(self):
         self.make_tag()
         self.git(self.source, "tag", "-f", "v1.2.3", self.other)
         repo, _ = self.resolver_checkout()
-        result, outputs = self.step("resolve", repo, event="push", event_sha=self.intended)
+        result, outputs = self.step("resolve", repo, event="push", event_ref="refs/tags/v1.2.3", event_sha=self.intended)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs, {})
         self.assertIn("::error::Release tag moved since the push event", result.stdout)
@@ -444,16 +596,18 @@ class ReleaseTagTests(unittest.TestCase):
         self.make_tag()
         self.git(self.source, "tag", "v9.9.9", self.other)
         for index, caller in enumerate(("release.yml", "publish.yml")):
-            values = context(ref="refs/tags/v9.9.9", sha=self.other)
-            values["inputs.release_tag"] = expression(workflow(caller)["jobs"][RESOLVER]["with"]["release_tag"], values)
+            flow = workflow(caller)
+            caller_values = context(flow, ref="refs/tags/v9.9.9", sha=self.other)
+            values = called_context(self.resolver, caller_values, {
+                "release_tag": expression(flow["jobs"][RESOLVER]["with"]["release_tag"], caller_values)})
             job = self.resolver["jobs"]["resolve"]
-            checked, tag_outputs = self.run_step(self.resolver, job, self.steps["tag"], self.source, values)
+            checked, tag_outputs = self.run_step(self.resolver, job, self.steps["tag"], self.source, values, resolver=True)
             self.assertEqual(checked.returncode, 0, checked.stderr)
             values.update({"steps.tag.outputs." + k: v for k, v in tag_outputs.items()})
             step = next(s for s in job["steps"] if "uses" in s)
             repo, fetched = self.checkout(step, values, name="dispatch-" + str(index))
             self.assertEqual(fetched.returncode, 0, fetched.stderr)
-            result, outputs = self.run_step(self.resolver, job, self.steps["resolve"], repo, values)
+            result, outputs = self.run_step(self.resolver, job, self.steps["resolve"], repo, values, resolver=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(outputs, {"commit": self.intended})
 
@@ -503,6 +657,54 @@ class ReleaseTagTests(unittest.TestCase):
                 self.git(self.source, "tag", "-d", "v1.2.3", check=False)
                 self.git(self.source, "branch", "-D", "v1.2.3")
 
+    def test_unavailable_origin_is_retryable_and_never_emits_true_or_shadow_commit(self):
+        for index, remote_ref in enumerate(("refs/tags/v1.2.3", "refs/remotes/refs/tags/v1.2.3")):
+            with self.subTest(remote_ref=remote_ref):
+                self.git(self.source, "update-ref", remote_ref, self.intended)
+                repo, fetched = self.resolver_checkout(name="outage-" + str(index))
+                self.assertEqual(fetched.returncode, 0, fetched.stderr)
+                self.git(repo, "remote", "set-url", "origin", (self.root / "unavailable-origin").as_uri())
+                result, outputs = self.step("resolve", repo)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(outputs, {})
+                self.assertIn("::error::Could not read the remote release tag; "
+                              "rerun resolution after GitHub reads recover", result.stdout)
+                self.assertNotIn("::error::Remote has no exact release tag matching the checkout", result.stdout)
+                self.git(self.source, "update-ref", "-d", remote_ref)
+
+    def test_command_files_are_isolated_and_resolver_writes_are_rejected(self):
+        outer_env, outer_path = self.root / "outer-environment", self.root / "outer-path"
+        self.env.update(GITHUB_ENV=str(outer_env), GITHUB_PATH=str(outer_path))
+        for command in ("GITHUB_ENV", "GITHUB_PATH"):
+            with self.subTest(command=command):
+                step = {"run": 'echo harmless >> "$' + command + '"'}
+                result, _ = self.run_step({}, {}, step, self.source, {})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(outer_env.exists())
+                self.assertFalse(outer_path.exists())
+                with self.assertRaisesRegex(AssertionError, "resolver must not write " + command):
+                    self.run_step({}, {}, step, self.source, {}, resolver=True)
+                self.assertFalse(outer_env.exists())
+                self.assertFalse(outer_path.exists())
+
+    def test_shell_runner_preserves_pipeline_and_boolean_rendering_semantics(self):
+        step = {"run": "false | true\nprintf 'value=%s\\n' '${{ true }}' >> \"$GITHUB_OUTPUT\""}
+        result, outputs = self.run_step({}, {}, step, self.source, {})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {"value": "true"})
+        result, outputs = self.run_step({}, {}, dict(step, shell="bash"), self.source, {})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outputs, {})
+        flow = workflow("publish.yml")
+        job = flow["jobs"]["publish"]
+        flags = copy.deepcopy(next(s for s in job["steps"] if s.get("name") == "Set publish flags"))
+        flags["env"]["DRY_RUN_INPUT"] = "${{ github.event.inputs.dry-run == 'true' }}"
+        for dry in (False, True):
+            result, _ = self.run_step(flow, job, flags, self.source, context(flow, dry=dry))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            envfile = self.root / ("environment-" + str(self.output_number))
+            self.assertEqual(envfile.read_text(), "DRY_RUN=" + ("--dry-run" if dry else "") + "\n")
+
     def test_resolver_ignores_executable_scripts_in_tag_tree(self):
         # probes known repository scripts and common guarded-call mutations; this is not a shell proof
         self.git(self.source, "checkout", "--detach", self.intended)
@@ -519,18 +721,25 @@ class ReleaseTagTests(unittest.TestCase):
         self.intended = self.git(self.source, "rev-parse", "HEAD").stdout.strip()
         self.make_tag()
         repo, _ = self.resolver_checkout()
-        result, outputs = self.step("resolve", repo)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(outputs, {"commit": self.intended})
-        self.assertFalse(marker.exists())
+        for event in ("workflow_dispatch", "push"):
+            with self.subTest(event=event):
+                result, outputs = self.step("resolve", repo, event=event,
+                                            event_ref="refs/tags/v1.2.3", event_sha=self.intended)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(outputs, {"commit": self.intended})
+                self.assertFalse(marker.exists())
 
     def test_every_build_restores_release_describe_from_the_pinned_commit(self):
-        self.resolve()
+        _, outputs = self.resolve()
         self.git(self.source, "tag", "-f", "v1.2.3", self.other)
         flow = workflow("release.yml")
-        values = context(sha=self.other)
-        values.update({"needs.resolve-release.outputs.commit": self.intended,
-                       "needs.resolve-release.outputs.tag": "v1.2.3"})
+        values = context(flow, sha=self.other)
+        values.update({"needs.resolve-release.outputs." + key: value for key, value in outputs.items()})
+        arrays = re.findall(r'\.args\(\[(.*?)\]\)', (ROOT / "common/build.rs").read_text(), re.DOTALL)
+        describe = [json.loads("[" + args + "]") for args in arrays if args.lstrip().startswith('"describe"')]
+        self.assertEqual(len(describe), 1, "expected one Git describe argv in common/build.rs")
+        self.assertIn("--tags", describe[0], "lightweight build tags require git describe --tags")
+        self.assertIn("--dirty", describe[0], "build metadata must expose dirty source trees")
         for name in sorted(BUILDS):
             with self.subTest(job=name):
                 job = flow["jobs"][name]
@@ -540,13 +749,15 @@ class ReleaseTagTests(unittest.TestCase):
                 self.assertEqual(stamp.get("shell"), "bash")
                 self.assertEqual(stamp.get("env"), {"RELEASE_COMMIT": COMMIT})
                 self.assertNotIn("if", stamp)
+                self.assertNotIn("continue-on-error", stamp)
                 consumer, _ = self.checkout(job["steps"][checkout], values, name=name)
                 self.assertEqual(self.git(consumer, "tag", "--list").stdout, "")
                 result, _ = self.run_step(flow, job, stamp, consumer, values)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertRegex(self.git(consumer, "describe", "--tags", "--long", "--always").stdout.strip(), r"^v1\.2\.3-0-g[0-9a-f]+$")
+                self.assertRegex(self.git(consumer, *describe[0]).stdout.strip(), r"^v1\.2\.3-0-g[0-9a-f]+$")
                 self.assertEqual(self.git(consumer, "rev-parse", "HEAD").stdout.strip(), self.intended)
                 self.git(consumer, "tag", "-d", "v1.2.3")
+                self.git(consumer, "fetch", "--no-tags", "--depth=1", "origin", self.other)
                 for bad in ("", self.other):
                     wrong = dict(values, **{"needs.resolve-release.outputs.commit": bad})
                     result, _ = self.run_step(flow, job, stamp, consumer, wrong)
@@ -559,7 +770,7 @@ class ReleaseTagTests(unittest.TestCase):
         step = next(s for s in job["steps"] if s.get("name") == "Set publish flags")
         for dry in (False, True):
             with self.subTest(dry=dry):
-                result, _ = self.run_step(flow, job, step, self.source, context(dry=dry))
+                result, _ = self.run_step(flow, job, step, self.source, context(flow, dry=dry))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 envfile = self.root / ("environment-" + str(self.output_number))
                 self.assertEqual(envfile.read_text(), "DRY_RUN=" + ("--dry-run" if dry else "") + "\n")
@@ -612,6 +823,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(flow["jobs"]["resolve"]["outputs"],
                          {"tag": "${{ steps.tag.outputs.tag }}", "commit": "${{ steps.resolve.outputs.commit }}"})
         job = flow["jobs"]["resolve"]
+        self.assertNotIn("container", job)
+        self.assertNotIn("continue-on-error", job)
         self.assertEqual(flow.get("env", {}), {})
         self.assertEqual(job["env"], {"RELEASE_TAG": "${{ inputs.release_tag }}",
                          "EVENT_NAME": "${{ github.event_name }}", "EVENT_REF": "${{ github.ref }}",
@@ -654,6 +867,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertEqual(step["with"]["persist-credentials"], "false", job_name)
                         if step.get("uses", "").startswith("softprops/action-gh-release@"):
                             releases += 1
+                            self.assertEqual(step["uses"], RELEASE_ACTION,
+                                             "review draft/target/prerelease handling in src/github.ts "
+                                             "release()/finalizeRelease() when upgrading the release action")
+                            if job_name in BUILDS:
+                                self.assertEqual(step["with"].get("fail_on_unmatched_files"), "true", job_name)
                             self.assertNotIn("target_commitish", step["with"], job_name)
                             self.assertEqual(step["with"]["draft"], "false" if job_name == "publish-release" else "true", job_name)
                             self.assertEqual(step["with"]["tag_name"], TAG, job_name)
@@ -700,10 +918,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=name, event=event, requested=requested, ref=ref):
                 actual = self.flows[name]["jobs"][RESOLVER]["with"]["release_tag"]
                 wanted = ref.removeprefix("refs/tags/") if event == "push" else requested
-                self.assertEqual(expression(actual, context(event=event, tag=requested, ref=ref)), wanted)
+                self.assertEqual(expression(actual, context(self.flows[name], event=event, tag=requested, ref=ref)), wanted)
 
     def test_publication_dependency_graph_cannot_drop_required_edges(self):
-        jobs = self.flows["release.yml"]["jobs"]
+        flow = self.flows["release.yml"]
+        jobs = flow["jobs"]
         expected = {RESOLVER: set(), "validate": {RESOLVER},
                     "create-release": {RESOLVER, "validate"},
                     "publish-crates": {RESOLVER, *BUILDS},
@@ -712,19 +931,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(set(jobs), set(expected))
         for name, needs in expected.items():
             self.assertEqual(set(dependencies(jobs[name])), needs, name)
+            self.assertNotIn("continue-on-error", jobs[name], name)
         for name in ("publish-crates", "publish-release"):
             self.assertLessEqual({"validate", *BUILDS}, ancestors(jobs, name))
-        jobs = self.flows["publish.yml"]["jobs"]
+        flow = self.flows["publish.yml"]
+        jobs = flow["jobs"]
+        for name, job in jobs.items():
+            self.assertNotIn("continue-on-error", job, name)
         self.assertEqual({name: set(dependencies(job)) for name, job in jobs.items()},
                          {RESOLVER: set(), "validate": {RESOLVER}, "publish": {RESOLVER, "validate"}})
 
     def test_release_regressions_run_in_required_lint_job(self):
-        steps = workflow("validate.yml")["jobs"]["lint-and-docs"]["steps"]
-        matches = [s for s in steps if "release-ref-test" in s.get("run", "")]
+        flow = workflow("validate.yml")
+        job = flow["jobs"]["lint-and-docs"]
+        self.assertNotIn("if", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertEqual(dependencies(job), [])
+        matches = [s for s in job["steps"] if "release-ref-test" in s.get("run", "")]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["run"], "just release-ref-test")
         self.assertNotIn("if", matches[0])
         self.assertNotIn("continue-on-error", matches[0])
+        self.assertIn(shell_command(flow, job, matches[0]),
+                      (["bash", "-e"], ["bash", "--noprofile", "--norc", "-eo", "pipefail"]))
+        recipe = re.search(r"^release-ref-test:\n((?:[ \t].*\n|\n)+)", (ROOT / "justfile").read_text(), re.MULTILINE)
+        self.assertIsNotNone(recipe, "release-ref-test recipe must exist")
+        self.assertEqual([line.strip() for line in recipe[1].splitlines() if line.strip()],
+                         ["python3 scripts/test-release-refs.py", "python3 scripts/test-release-rpm-version.py"])
 
     def test_reusable_validation_forwards_nonempty_pin_to_every_checkout(self):
         flow = workflow("validate.yml")
@@ -738,7 +971,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(set(checkouts), set(flow["jobs"]))
 
     def test_dry_run_holds_every_release_action(self):
-        jobs = self.flows["release.yml"]["jobs"]
+        flow = self.flows["release.yml"]
+        jobs = flow["jobs"]
         states = {name: "success" for name in jobs}
         uploads = 0
         for job_name, job in jobs.items():
@@ -748,30 +982,29 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 uploads += 1
                 # a release call is reachable only when both its job and step gates pass
                 for dry in (False, True):
-                    values = {"github.event_name": "workflow_dispatch", "inputs.dry_run": dry,
-                              "needs.resolve-release.result": "success"}
+                    values = {"github.event_name": "workflow_dispatch", "inputs.dry_run": dry}
                     step_runs = Condition(step.get("if", "true"), values, []).result()
-                    reached = runs(jobs, job_name, states, dry=dry) and step_runs
+                    reached = runs(flow, job_name, states, dry=dry) and step_runs
                     self.assertEqual(reached, not dry, (job_name, dry))
         self.assertEqual(uploads, 6)
 
     def test_no_consumer_runs_after_failed_skipped_or_cancelled_resolution(self):
         for flow_name, flow in self.flows.items():
             jobs = flow["jobs"]
-            for outcome in ("failure", "cancelled", "skipped"):
-                for skip in (False, True):
-                    for dry in (False, True):
-                        states = {name: "success" for name in jobs}
-                        states.update({RESOLVER: outcome, "validate": "skipped" if skip else "success"})
-                        for name, job in jobs.items():
-                            if name != RESOLVER:
-                                with self.subTest(workflow=flow_name, job=name, outcome=outcome, skip=skip, dry=dry):
-                                    self.assertFalse(runs(jobs, name, states, skip=skip, dry=dry))
+            for event in flow["on"]:
+                for outcome in ("failure", "cancelled", "skipped"):
+                    for skip in (False, True):
+                        for dry in (False, True):
+                            states = {name: "success" for name in jobs}
+                            states.update({RESOLVER: outcome, "validate": "skipped" if skip else "success"})
+                            for name, job in jobs.items():
+                                if name != RESOLVER:
+                                    with self.subTest(workflow=flow_name, event=event, job=name, outcome=outcome, skip=skip, dry=dry):
+                                        self.assertFalse(runs(flow, name, states, event=event, skip=skip, dry=dry))
 
     def test_release_preserves_tag_push_dry_run_and_skip_validation_gates(self):
-        jobs = self.flows["release.yml"]["jobs"]
-        builds = {name for name in jobs if name.startswith("build-")}
-        self.assertEqual(len(builds), 4)
+        flow = self.flows["release.yml"]
+        jobs = flow["jobs"]
         for event, dry, skip in (("push", False, False), ("workflow_dispatch", False, False),
                 ("workflow_dispatch", True, False), ("workflow_dispatch", False, True),
                 ("workflow_dispatch", True, True)):
@@ -780,49 +1013,52 @@ class ReleaseWorkflowTests(unittest.TestCase):
             states["create-release"] = "skipped" if dry else "success"
             expected = {"validate": not skip, "create-release": not dry,
                         "publish-crates": not dry, "publish-release": not dry}
-            expected.update({name: True for name in builds})
+            expected.update({name: True for name in BUILDS})
             for name, wanted in expected.items():
                 with self.subTest(event=event, dry=dry, skip=skip, job=name):
-                    self.assertEqual(runs(jobs, name, states, event=event, dry=dry, skip=skip), wanted)
+                    self.assertEqual(runs(flow, name, states, event=event, dry=dry, skip=skip), wanted)
 
     def test_validation_build_and_cancellation_failures_still_hold_publication(self):
         for flow in self.flows.values():
             jobs = flow["jobs"]
-            for name, job in jobs.items():
-                if name == RESOLVER:
-                    continue
-                states = {n: "success" for n in jobs}
-                self.assertFalse(runs(jobs, name, states, cancelled=True), name)
-                for dependency in dependencies(job):
-                    for state in ("failure", "cancelled"):
-                        bad = dict(states, **{dependency: state})
-                        with self.subTest(job=name, dependency=dependency, state=state):
-                            self.assertFalse(runs(jobs, name, bad), name)
+            for event in flow["on"]:
+                for name, job in jobs.items():
+                    if name == RESOLVER:
+                        continue
+                    states = {n: "success" for n in jobs}
+                    self.assertFalse(runs(flow, name, states, event=event, cancelled=True), name)
+                    for dependency in dependencies(job):
+                        for state in ("failure", "cancelled"):
+                            bad = dict(states, **{dependency: state})
+                            with self.subTest(event=event, job=name, dependency=dependency, state=state):
+                                self.assertFalse(runs(flow, name, bad, event=event), name)
 
     def test_upstream_failures_propagate_to_publication_through_the_graph(self):
         for flow_name, flow in self.flows.items():
             jobs = flow["jobs"]
-            for failed in ({RESOLVER, "validate", "create-release", *BUILDS} & set(jobs)):
-                states = {}
-                pending = set(jobs)
-                while pending:
-                    ready = [n for n in pending if set(dependencies(jobs[n])) <= set(states)]
-                    self.assertTrue(ready, "cyclic dependency graph")
-                    for name in ready:
-                        active = runs(jobs, name, states)
-                        states[name] = ("failure" if name == failed else "success") if active else "skipped"
-                        pending.remove(name)
-                with self.subTest(workflow=flow_name, failed=failed):
-                    for publication in ({"publish", "publish-crates", "publish-release"} & set(jobs)):
-                        self.assertEqual(states[publication], "skipped")
+            for event in flow["on"]:
+                for failed in ({RESOLVER, "validate", "create-release", *BUILDS} & set(jobs)):
+                    states = {}
+                    pending = set(jobs)
+                    while pending:
+                        ready = [n for n in pending if set(dependencies(jobs[n])) <= set(states)]
+                        self.assertTrue(ready, "cyclic dependency graph")
+                        for name in ready:
+                            active = runs(flow, name, states, event=event)
+                            states[name] = ("failure" if name == failed else "success") if active else "skipped"
+                            pending.remove(name)
+                    with self.subTest(workflow=flow_name, event=event, failed=failed):
+                        for publication in ({"publish", "publish-crates", "publish-release"} & set(jobs)):
+                            self.assertEqual(states[publication], "skipped")
 
     def test_standalone_publish_uses_validation_in_both_modes(self):
-        jobs = self.flows["publish.yml"]["jobs"]
+        flow = self.flows["publish.yml"]
+        jobs = flow["jobs"]
         states = {name: "success" for name in jobs}
         self.assertIn("validate", dependencies(jobs["publish"]))
         for dry in (False, True):
-            self.assertTrue(runs(jobs, "validate", states, dry=dry))
-            self.assertTrue(runs(jobs, "publish", states, dry=dry))
+            self.assertTrue(runs(flow, "validate", states, dry=dry))
+            self.assertTrue(runs(flow, "publish", states, dry=dry))
         self.assertEqual(jobs["publish"]["permissions"], {"contents": "read"})
 
 

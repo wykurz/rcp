@@ -148,6 +148,7 @@ jobs:
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
           draft: true
+          fail_on_unmatched_files: true
           files: ./rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
 
   build-rpm-amd64:
@@ -194,12 +195,13 @@ jobs:
           PKG_CONFIG_ALLOW_CROSS: "1"
           RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: |
+          RPM_VERSION=$(python3 scripts/release-rpm-version.py "$RELEASE_TAG")
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh build --release
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rlink
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rrm
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcmp
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p filegen
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rlink -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rrm -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcmp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p filegen -s "version = \"$RPM_VERSION\""
           zip rcp-rpm-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
@@ -209,6 +211,7 @@ jobs:
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
           draft: true
+          fail_on_unmatched_files: true
           files: ./rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
 
   build-deb-arm64:
@@ -270,6 +273,7 @@ jobs:
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
           draft: true
+          fail_on_unmatched_files: true
           files: ./rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
 
   build-rpm-arm64:
@@ -316,11 +320,12 @@ jobs:
 
       - name: Build RPM packages
         run: |
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcp
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rlink
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rrm
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcmp
-          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p filegen
+          RPM_VERSION=$(python3 scripts/release-rpm-version.py "$RELEASE_TAG")
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rlink -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rrm -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcmp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p filegen -s "version = \"$RPM_VERSION\""
           zip rcp-rpm-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 
@@ -330,6 +335,7 @@ jobs:
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
           draft: true
+          fail_on_unmatched_files: true
           files: ./rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
 
   publish-crates:

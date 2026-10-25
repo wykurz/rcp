@@ -29,6 +29,14 @@ permitted main workflows and repository administrators remain trusted. On compro
 server-enforced freeze and owner suspension procedure below, then audit those surfaces as well as
 history; restoring history alone does not contain the incident.
 
+Before provisioning the history writer App or its key, complete the
+[release credential prerequisite review](../../docs/release-identity.md#separate-protection-requirements).
+The repository-level `CRATES_IO_TOKEN` remains available to historical publication workflows,
+including old-ref dispatches and reruns with weaker source checks. Inventory those revisions as well
+as current consumers of ambiguous refs. Moving release credentials to a restricted environment or
+trusted-publishing policy requires separate approval, including old-ref rejection and recovery
+tests. This setup does not change credentials or settings.
+
 ## Writer environment and reserved history namespace
 
 Only the publication and explicit canary workflows currently reference `aws-benchmark-history` and
@@ -362,8 +370,12 @@ silently added by this template preparation.
 
 ## Approval and acceptance sequence
 
-1. Resolve and approve Apps/installations, custody/recovery identity, exact environment/rulesets,
-   empty-secret policy sequence and disabled deployment artifacts. Preserve unrelated resources.
+1. Complete the
+   [release credential prerequisite review](../../docs/release-identity.md#separate-protection-requirements)
+   before approving history writer App or key provisioning, including separate approval for any
+   restricted-environment or trusted-publishing change. Then resolve and approve Apps/installations,
+   custody/recovery identity, exact environment/rulesets, empty-secret policy sequence and disabled
+   deployment artifacts. Preserve unrelated resources.
 2. Pin the compatible AMI, package/source and numeric template; approve any necessary paid build
    separately. The template's service roles and live grants remain deployment approvals.
 3. Perform the exact reader-role, S3/DynamoDB and route-bound probes described in

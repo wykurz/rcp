@@ -20,7 +20,9 @@ def child_path(path: str, key: str) -> str:
     return f"{path}[{key!r}]"
 
 
-def reject_duplicate_keys(node: Node, path: str = "$", visited: set[int] | None = None) -> None:
+def reject_duplicate_keys(
+    node: Node, path: str = "$", visited: set[int] | None = None, *, case_insensitive: bool = False
+) -> None:
     if visited is None:
         visited = set()
     if id(node) in visited:
@@ -36,25 +38,26 @@ def reject_duplicate_keys(node: Node, path: str = "$", visited: set[int] | None 
                     f"(line {key_node.start_mark.line + 1})"
                 )
             key = key_node.value
-            if key in seen:
-                first = seen[key]
+            identity = key.upper() if case_insensitive else key
+            if identity in seen:
+                first = seen[identity]
                 raise DuplicateKeyError(
                     f"duplicate YAML mapping key {key!r} at {path} "
                     f"(line {key_node.start_mark.line + 1}, first declared on "
                     f"line {first.start_mark.line + 1})"
                 )
-            seen[key] = key_node
-            reject_duplicate_keys(value_node, child_path(path, key), visited)
+            seen[identity] = key_node
+            reject_duplicate_keys(value_node, child_path(path, key), visited, case_insensitive=case_insensitive)
     elif isinstance(node, SequenceNode):
         for index, child in enumerate(node.value):
-            reject_duplicate_keys(child, f"{path}[{index}]", visited)
+            reject_duplicate_keys(child, f"{path}[{index}]", visited, case_insensitive=case_insensitive)
 
 
-def validate(path: Path) -> None:
+def validate(path: Path, *, case_insensitive: bool = False) -> None:
     with path.open(encoding="utf-8") as stream:
         for document in yaml.compose_all(stream, Loader=yaml.BaseLoader):
             if document is not None:
-                reject_duplicate_keys(document)
+                reject_duplicate_keys(document, case_insensitive=case_insensitive)
 
 
 def main(arguments: list[str]) -> int:
@@ -66,7 +69,12 @@ def main(arguments: list[str]) -> int:
     for argument in arguments:
         path = Path(argument)
         try:
-            validate(path)
+            # GitHub mapping keys are case-insensitive; generic YAML keys are not
+            github_workflow = any(
+                path.parts[index:index + 2] == (".github", "workflows")
+                for index in range(len(path.parts) - 1)
+            )
+            validate(path, case_insensitive=github_workflow)
         except (OSError, ValueError, yaml.YAMLError) as error:
             print(f"{path}: {error}", file=sys.stderr)
             failed = True
