@@ -395,7 +395,7 @@ elif ! remote_tag_exists "$TAG"; then
     echo "This will trigger the release workflow which:"
     echo "  - Creates a draft GitHub release with notes from CHANGELOG"
     echo "  - Builds and attaches deb/rpm packages (amd64 + arm64)"
-    echo "  - Publishes the release (triggers crates.io publication)"
+    echo "  - Publishes all crates to crates.io, then publishes the draft release"
     echo ""
     read -p "Create and push tag ${TAG}? [Y/n] " -n 1 -r
     echo

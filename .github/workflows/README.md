@@ -79,6 +79,12 @@ are marked as prereleases, while hyphens inside build metadata alone do not mark
 one. See [Release source identity](../../docs/release-identity.md) for exact source guarantees,
 historical-controller compatibility, partial reruns and credential boundaries.
 
+A crates.io failure during a new release leaves its GitHub draft unpublished. After checking the tag
+and existing source provenance, prefer **Re-run failed jobs** on the original release run.
+`publish.yml` can recover crates.io publication only; it cannot publish that draft. Follow the
+[release recovery procedure](../../docs/release-identity.md#recovery) even after a successful
+crates-only run.
+
 **Usage:**
 
 Run `just release`, which guides you through the whole process. Because direct pushes to `main` are
@@ -95,7 +101,9 @@ git push origin v0.24.0
 
 ### publish.yml
 
-Manual-only workflow for re-publishing to crates.io (e.g., after a failed release). Requires an
+Manual-only workflow that publishes crates to crates.io; it does not publish a GitHub draft release.
+For a crates.io failure in `release.yml`, prefer **Re-run failed jobs** on that original run after
+the [recovery checks](../../docs/release-identity.md#recovery). This standalone workflow requires an
 explicit release tag input (e.g., `v0.28.0`), resolves it once, then validates and publishes from
 that commit SHA. The string-valued `dry-run` choice defaults to `true`. The selected controller must
 have build and validation commands compatible with the chosen source tag; older tags may lack
@@ -122,8 +130,12 @@ before changing publication access.
 
 3. **Usage**:
 
-   Crates.io publishing happens automatically as part of release.yml. This workflow is only needed
-   for manual recovery (e.g., if the crates.io step failed during a release).
+   Crates.io publishing happens automatically as part of `release.yml`. Prefer **Re-run failed
+   jobs** on the original release run for recovery. If this standalone workflow is used for
+   crates-only recovery, still rerun the failed jobs afterward to publish the GitHub draft. Beyond
+   GitHub's 30-day rerun window, manual draft publication requires separate user approval after
+   verifying all four expected assets, every crate and their source provenance, as described in
+   [Recovery](../../docs/release-identity.md#recovery).
 
    **Manual re-publish**:
    - Go to Actions → Publish to crates.io → Run workflow

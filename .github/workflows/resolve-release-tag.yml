@@ -90,9 +90,12 @@ jobs:
           # fetch can DWIM a missing tag to a shadow ref; ls-remote also tail-matches
           # compare the exact remote name and unpeeled object, preserving annotated tags
           # this public read is anonymous after checkout removes its credentials
-          if ! remote_object=$(git -c credential.helper= ls-remote --refs origin "$RELEASE_REF" |
-              awk -v ref="$RELEASE_REF" '$2 == ref {print $1}') ||
-             [[ ! "$remote_object" =~ ^[0-9a-f]{40}$ || "$remote_object" != "$object" ]]; then
+          if ! advertised=$(git -c credential.helper= ls-remote --refs origin "$RELEASE_REF"); then
+            echo "::error::Could not read the remote release tag; rerun resolution after GitHub reads recover"
+            exit 1
+          fi
+          remote_object=$(awk -v ref="$RELEASE_REF" '$2 == ref {print $1}' <<< "$advertised")
+          if [[ ! "$remote_object" =~ ^[0-9a-f]{40}$ || "$remote_object" != "$object" ]]; then
             echo "::error::Remote has no exact release tag matching the checkout"
             exit 1
           fi
