@@ -41,14 +41,17 @@ stored release target on updates: omission preserves an existing target, but can
 already incompatible target. Such a failure needs separate inspection, not broader token access.
 
 For a new or existing draft release, package uploads preserve draft state. Only the final release
-job publishes that draft, after every package build and crates.io publication succeeds. A crates.io
-failure leaves the release a draft; prefer **Re-run failed jobs** on the original release run after
-the [recovery checks](#recovery) below. Upload reruns against an already published mutable release
-do not restore draft state: those asset updates remain public and need the separately reviewed
-recovery policy below. `skip_validation` bypasses only the validation job; explicit dependency gates
-still require resolution and downstream work to succeed. `dry_run` builds without creating,
-uploading or publishing releases. Prerelease status comes from the version before any `+` metadata,
-and changelog headings are matched literally.
+job publishes that draft, after every package build, the isolated artifact upload job and crates.io
+publication succeed. Package builds are read-only; the upload job executes only controller-owned
+staging code, accepts bounded immutable artifacts, and never executes their contents. See the
+[artifact boundary](publishing-credentials.md#package-artifact-boundary) for identity and retention
+limits. A crates.io failure leaves the release a draft; prefer **Re-run failed jobs** on the
+original release run after the [recovery checks](#recovery) below. Upload reruns against an already
+published mutable release do not restore draft state: those asset updates remain public and need the
+separately reviewed recovery policy below. `skip_validation` bypasses only the validation job;
+explicit dependency gates still require resolution and downstream work to succeed. `dry_run` builds
+without creating, uploading or publishing releases. Prerelease status comes from the version before
+any `+` metadata, and changelog headings are matched literally.
 
 ## Pushes and reruns
 

@@ -66,7 +66,8 @@ Builds, publishes binary packages, and publishes to crates.io when a tag is push
 3. Builds packages in parallel:
    - Debian packages (amd64 + arm64)
    - RPM packages (amd64 + arm64)
-4. Each build job uploads its package to the draft release
+4. Read-only builds retain immutable package artifacts; a separate write job validates the bounded
+   artifact set and uploads it to the draft release without executing package contents
 5. Publishes all workspace crates to crates.io
 6. Publishes the GitHub release (removes draft status) only after crates.io succeeds
 
