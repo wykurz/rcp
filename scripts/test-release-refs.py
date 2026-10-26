@@ -242,7 +242,7 @@ def consumer_checkouts(flows, outputs, sha):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             yield flow_name + "/" + job_name + "/" + name, step, nested
             for step in job.get("steps", []):
-                if step.get("uses", "").startswith("actions/checkout@"):
+                if step.get("uses", "").startswith("actions/checkout@") and job_name != "upload-release":
                     yield flow_name + "/" + job_name, step, values
 
 
@@ -913,14 +913,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertEqual(env.get("RELEASE_TAG"), TAG, job_name)
                         if step.get("uses", "").startswith("actions/checkout@"):
                             checkouts += 1
-                            self.assertEqual(step["with"]["ref"], COMMIT, job_name)
+                            self.assertEqual(step["with"]["ref"], "${{ github.sha }}" if job_name == "upload-release" else COMMIT, job_name)
                             self.assertEqual(step["with"]["persist-credentials"], "false", job_name)
                         if step.get("uses", "").startswith("softprops/action-gh-release@"):
                             releases += 1
                             self.assertEqual(step["uses"], RELEASE_ACTION,
                                              "review draft/target/prerelease handling in src/github.ts "
                                              "release()/finalizeRelease() when upgrading the release action")
-                            if job_name in BUILDS:
+                            if job_name == "upload-release":
                                 self.assertEqual(step["with"].get("fail_on_unmatched_files"), "true", job_name)
                             self.assertNotIn("target_commitish", step["with"], job_name)
                             self.assertEqual(step["with"]["draft"], "false" if job_name == "publish-release" else "true", job_name)
@@ -932,8 +932,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertNotIn("make_latest", step["with"], job_name)
                         self.assertNotIn("inputs.release_tag", str(step))
                 self.assertEqual(validations, 1)
-                self.assertEqual(checkouts, 6 if name == "release.yml" else 2)
-                self.assertEqual(releases, 6 if name == "release.yml" else 0)
+                self.assertEqual(checkouts, 7 if name == "release.yml" else 2)
+                self.assertEqual(releases, 3 if name == "release.yml" else 0)
 
     def test_dispatch_input_schema_matches_the_typed_test_context(self):
         expected = {
@@ -975,7 +975,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         jobs = flow["jobs"]
         expected = {RESOLVER: set(), "validate": {RESOLVER},
                     "create-release": {RESOLVER, "validate"},
-                    "publish-crates": {RESOLVER, *BUILDS},
+                    "upload-release": {RESOLVER, "create-release", *BUILDS},
+                    "publish-crates": {RESOLVER, "upload-release"},
                     "publish-release": {RESOLVER, "publish-crates"}}
         expected.update({name: {RESOLVER, "validate", "create-release"} for name in BUILDS})
         self.assertEqual(set(jobs), set(expected))
@@ -1008,7 +1009,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         recipe = re.search(r"^release-ref-test:\n((?:[ \t].*\n|\n)+)", (ROOT / "justfile").read_text(), re.MULTILINE)
         self.assertIsNotNone(recipe, "release-ref-test recipe must exist")
         self.assertEqual([line.strip() for line in recipe[1].splitlines() if line.strip()],
-                         ["python3 scripts/test-release-refs.py", "python3 scripts/test-release-rpm-version.py"])
+                         ["python3 scripts/test-release-refs.py", "python3 scripts/test-release-rpm-version.py",
+                           "python3 scripts/test-stage-release-assets.py"])
 
     def test_reusable_validation_forwards_nonempty_pin_to_every_checkout(self):
         flow = workflow("validate.yml")
@@ -1037,7 +1039,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     step_runs = Condition(step.get("if", "true"), values, []).result()
                     reached = runs(flow, job_name, states, dry=dry) and step_runs
                     self.assertEqual(reached, not dry, (job_name, dry))
-        self.assertEqual(uploads, 6)
+        self.assertEqual(uploads, 3)
 
     def test_no_consumer_runs_after_failed_skipped_or_cancelled_resolution(self):
         for flow_name, flow in self.flows.items():
@@ -1063,7 +1065,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             states["validate"] = "skipped" if skip else "success"
             states["create-release"] = "skipped" if dry else "success"
             expected = {"validate": not skip, "create-release": not dry,
-                        "publish-crates": not dry, "publish-release": not dry}
+                        "upload-release": not dry, "publish-crates": not dry, "publish-release": not dry}
             expected.update({name: True for name in BUILDS})
             for name, wanted in expected.items():
                 with self.subTest(event=event, dry=dry, skip=skip, job=name):
@@ -1088,7 +1090,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for flow_name, flow in self.flows.items():
             jobs = flow["jobs"]
             for event in flow["on"]:
-                for failed in ({RESOLVER, "validate", "create-release", *BUILDS} & set(jobs)):
+                for failed in ({RESOLVER, "validate", "create-release", "upload-release", *BUILDS} & set(jobs)):
                     states = {}
                     pending = set(jobs)
                     while pending:
@@ -1101,6 +1103,51 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     with self.subTest(workflow=flow_name, event=event, failed=failed):
                         for publication in ({"publish", "publish-crates", "publish-release"} & set(jobs)):
                             self.assertEqual(states[publication], "skipped")
+
+    def test_source_builds_have_no_release_write_authority_even_in_dry_runs(self):
+        flow = self.flows["release.yml"]
+        jobs = flow["jobs"]
+        for name in BUILDS:
+            job = jobs[name]
+            self.assertEqual(job["permissions"], {"contents": "read"})
+            self.assertNotIn("environment", job)
+            self.assertEqual(job["outputs"], {"artifact-id": "${{ steps.package.outputs.artifact-id }}"})
+            self.assertFalse(any("softprops/" in step.get("uses", "") for step in job["steps"]))
+            artifact = next(step for step in job["steps"] if step.get("id") == "package")
+            self.assertEqual(artifact["uses"], "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+            kind = name.removeprefix("build-")
+            self.assertEqual(artifact["with"], {
+                "name": "release-" + kind + "-" + COMMIT + "-${{ github.run_attempt }}",
+                "path": "./rcp-" + kind + "-${{ env.RELEASE_TAG }}.zip",
+                "if-no-files-found": "error", "retention-days": "7", "compression-level": "0"})
+        states = {name: "success" for name in jobs}
+        for name, job in jobs.items():
+            if job.get("permissions", {}).get("contents") == "write":
+                self.assertFalse(runs(flow, name, states, dry=True), name)
+
+    def test_release_writer_executes_only_held_controller_code_and_fixed_artifact_paths(self):
+        job = self.flows["release.yml"]["jobs"]["upload-release"]
+        self.assertEqual(job["permissions"], {"contents": "write", "actions": "read"})
+        self.assertEqual(job["timeout-minutes"], "15")
+        self.assertEqual(len(job["steps"]), 3)
+        checkout, stage, upload = job["steps"]
+        self.assertEqual(checkout["uses"], CHECKOUT)
+        self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "path": "controller", "persist-credentials": "false"})
+        self.assertEqual(stage["run"], 'python3 -I "$GITHUB_WORKSPACE/controller/scripts/stage-release-assets.py"')
+        self.assertNotIn("if", stage)
+        self.assertNotIn("continue-on-error", stage)
+        self.assertEqual(stage["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertEqual(stage["env"]["RELEASE_COMMIT"], COMMIT)
+        self.assertEqual(stage["env"]["RELEASE_TAG"], TAG)
+        for kind in ("deb-amd64", "rpm-amd64", "deb-arm64", "rpm-arm64"):
+            self.assertEqual(stage["env"][kind.replace("-", "_").upper() + "_ID"],
+                             "${{ needs.build-" + kind + ".outputs.artifact-id }}")
+        self.assertEqual(upload["uses"], RELEASE_ACTION)
+        self.assertEqual(upload["with"]["files"].splitlines(), [
+            "${{ steps.assets.outputs.directory }}/rcp-" + kind + "-" + TAG + ".zip"
+            for kind in ("deb-amd64", "rpm-amd64", "deb-arm64", "rpm-arm64")])
+        self.assertNotIn("if", upload)
+        self.assertNotIn("continue-on-error", upload)
 
     def test_standalone_publish_uses_validation_in_both_modes(self):
         flow = self.flows["publish.yml"]

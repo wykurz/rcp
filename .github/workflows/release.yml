@@ -99,7 +99,9 @@ jobs:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
     if: ${{ !cancelled() && needs.resolve-release.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -145,14 +147,16 @@ jobs:
           zip rcp-deb-amd64-${RELEASE_TAG}.zip target/debian/*.deb
           ls -la rcp-deb-amd64-${RELEASE_TAG}.zip
 
-      - name: Upload to GitHub Release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Retain package bundle
+        id: package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ needs.resolve-release.outputs.tag }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: ./rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
+          name: release-deb-amd64-${{ needs.resolve-release.outputs.commit }}-${{ github.run_attempt }}
+          path: ./rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
 
   build-rpm-amd64:
     runs-on: ubuntu-latest
@@ -161,7 +165,9 @@ jobs:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
     if: ${{ !cancelled() && needs.resolve-release.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -208,14 +214,16 @@ jobs:
           zip rcp-rpm-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
-      - name: Upload to GitHub Release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Retain package bundle
+        id: package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ needs.resolve-release.outputs.tag }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: ./rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
+          name: release-rpm-amd64-${{ needs.resolve-release.outputs.commit }}-${{ github.run_attempt }}
+          path: ./rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
 
   build-deb-arm64:
     runs-on: ubuntu-latest
@@ -224,7 +232,9 @@ jobs:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
     if: ${{ !cancelled() && needs.resolve-release.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -270,14 +280,16 @@ jobs:
           zip rcp-deb-arm64-${RELEASE_TAG}.zip target/debian/*.deb
           ls -la rcp-deb-arm64-${RELEASE_TAG}.zip
 
-      - name: Upload to GitHub Release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Retain package bundle
+        id: package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ needs.resolve-release.outputs.tag }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: ./rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
+          name: release-deb-arm64-${{ needs.resolve-release.outputs.commit }}-${{ github.run_attempt }}
+          path: ./rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
 
   build-rpm-arm64:
     runs-on: ubuntu-latest
@@ -286,7 +298,9 @@ jobs:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
     if: ${{ !cancelled() && needs.resolve-release.result == 'success' && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.package.outputs.artifact-id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -332,24 +346,66 @@ jobs:
           zip rcp-rpm-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 
-      - name: Upload to GitHub Release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+      - name: Retain package bundle
+        id: package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-rpm-arm64-${{ needs.resolve-release.outputs.commit }}-${{ github.run_attempt }}
+          path: ./rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+
+  upload-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [resolve-release, create-release, build-deb-amd64, build-rpm-amd64, build-deb-arm64, build-rpm-arm64]
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.create-release.result == 'success' && needs.build-deb-amd64.result == 'success' && needs.build-rpm-amd64.result == 'success' && needs.build-deb-arm64.result == 'success' && needs.build-rpm-arm64.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout the trusted workflow controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Stage the bounded package artifact set
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve-release.outputs.commit }}
+          DEB_AMD64_ID: ${{ needs.build-deb-amd64.outputs.artifact-id }}
+          RPM_AMD64_ID: ${{ needs.build-rpm-amd64.outputs.artifact-id }}
+          DEB_ARM64_ID: ${{ needs.build-deb-arm64.outputs.artifact-id }}
+          RPM_ARM64_ID: ${{ needs.build-rpm-arm64.outputs.artifact-id }}
+        run: python3 -I "$GITHUB_WORKSPACE/controller/scripts/stage-release-assets.py"
+
+      - name: Upload validated bundles without executing their contents
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.resolve-release.outputs.tag }}
           draft: true
           fail_on_unmatched_files: true
-          files: ./rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
+          files: |
+            ${{ steps.assets.outputs.directory }}/rcp-deb-amd64-${{ needs.resolve-release.outputs.tag }}.zip
+            ${{ steps.assets.outputs.directory }}/rcp-rpm-amd64-${{ needs.resolve-release.outputs.tag }}.zip
+            ${{ steps.assets.outputs.directory }}/rcp-deb-arm64-${{ needs.resolve-release.outputs.tag }}.zip
+            ${{ steps.assets.outputs.directory }}/rcp-rpm-arm64-${{ needs.resolve-release.outputs.tag }}.zip
 
   publish-crates:
     runs-on: ubuntu-latest
     environment:
       name: crates-io
       url: https://github.com/wykurz/rcp/commit/${{ needs.resolve-release.outputs.commit }}
-    needs: [resolve-release, build-deb-amd64, build-rpm-amd64, build-deb-arm64, build-rpm-arm64]
+    needs: [resolve-release, upload-release]
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
-    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.build-deb-amd64.result == 'success' && needs.build-rpm-amd64.result == 'success' && needs.build-deb-arm64.result == 'success' && needs.build-rpm-arm64.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.upload-release.result == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     permissions:
       contents: read
     steps:

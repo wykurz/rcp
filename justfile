@@ -101,6 +101,7 @@ test *ARGS:
 release-ref-test:
     python3 scripts/test-release-refs.py
     python3 scripts/test-release-rpm-version.py
+    python3 scripts/test-stage-release-assets.py
 
 # Run tests in release mode
 test-release *ARGS:

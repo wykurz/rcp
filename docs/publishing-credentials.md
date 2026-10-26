@@ -18,11 +18,12 @@ where a value came from.
 The standalone `publish.yml` dry run is a separate job with no environment, publishing-secret
 reference or OIDC permission. It still validates the held source and runs the fixed `--dry-run`
 command. It has the ordinary read-only workflow token; "credential-free" here means no publishing
-credential. `release.yml` dry runs continue to skip publishing jobs and release writes. Neither dry
-run is evidence that a real publishing token is authorized for every workspace crate.
-`cargo-workspaces` 0.4.2 can skip versions already present in the index and report per-crate
-packaging errors as warnings. A successful dry-run command is not proof that every crate packaged
-successfully. The source validation jobs remain required.
+credential. `release.yml` package builds have only Contents read permission; dry runs skip all jobs
+with repository write authority as well as crates.io publishing. Neither dry run is evidence that a
+real publishing token is authorized for every workspace crate. `cargo-workspaces` 0.4.2 can skip
+versions already present in the index and report per-crate packaging errors as warnings. A
+successful dry-run command is not proof that every crate packaged successfully. The source
+validation jobs remain required.
 
 Both caller workflows set `cache-mode: none`, which limits the runner's scoped cache token and
 propagates into reusable validation. Selected release source cannot restore or save shared Actions
@@ -37,6 +38,41 @@ controller dispatched on `main` can select an older tag, provided its source sup
 build helpers. No new helper script is required in that older source by this credential change.
 Tag-push release controllers are preserved. Rerunning an old workflow does not upgrade it to current
 code; recovery should dispatch the reviewed controller instead.
+
+## Package artifact boundary
+
+The four package builds retain one ZIP bundle each as a seven-day Actions artifact. Their tokens
+have Contents read permission, no publishing environment, and no cloud OIDC grant. They cannot
+upload release assets. Artifact storage remains an ordinary capability of the build runner; this is
+not a sandbox for malicious approved source.
+
+A fresh `upload-release` job has Contents write and Actions read permissions. It checks out the
+**workflow controller** at `github.sha`, never the separately selected release source, and runs its
+staging helper with isolated Python. Existing release-note creation stays in its separate job: it
+parses the selected changelog as data using inline commands, without executing source scripts.
+
+The staging helper accepts exactly four immutable artifact IDs from the completed builds. It checks
+GitHub metadata for repository, run, controller SHA, expected source-qualified name, non-expiry,
+size and SHA256 digest. An earlier attempt's artifact can be reused during a failed-job rerun; the
+name's attempt is only a naming check, not server attestation of a producing job. The digest binds
+transfer bytes, not benign package contents or source provenance.
+
+Each download is bounded to 513 MiB, and each artifact must contain exactly one expected regular ZIP
+asset of at most 512 MiB. Traversal, symlinks, extra members, duplicate IDs, malformed metadata,
+truncation and digest mismatches fail before release upload. Four assets bound staged payload to 2
+GiB. The helper checks a ten-minute staging deadline between reads, with 30-second socket waits; the
+job's 15-minute timeout is the outer bound, including uploads. API redirects never forward the
+repository credential to storage, and failure messages do not expose signed download URLs.
+
+Only four explicit staged paths reach the pinned release action. The inner package ZIPs remain
+opaque data: they are not extracted or executed, and their package safety is not certified. Build
+output cannot select a shell command, executable helper, upload glob or release tag. No source-owned
+helper is newly required in an older release tree. Controller and source review remain necessary.
+
+If an upload fails, retain its artifacts and existing draft. Retry with the same IDs while they are
+available. After seven-day expiry, rebuild packages only after reconciling the original source pin
+and existing assets; never substitute a name lookup or a different run's artifact. If upload already
+succeeded, a crates-only failure does not require re-downloading the package artifacts.
 
 ## Proposed live configuration — separate approval required
 
@@ -90,9 +126,12 @@ keep the proposed history writer App out of their bypass lists.
 ## Acceptance and recovery
 
 Offline regression tests read the actual workflow YAML and execute its publishing/check scripts
-against a local command stub. They verify source/dependency gates, dry-run selection, fixed dry-run
-arguments, missing-credential failure, environment/secret inventory, and command failure handling.
-They do not simulate GitHub environment enforcement or crates.io authorization.
+against a local command stub. They verify source/dependency gates, read-only package builds and
+skipped write jobs, dry-run selection, fixed dry-run arguments, missing-credential failure,
+environment/secret inventory, and command failure handling. Artifact tests exercise HTTP response
+shapes, credential stripping on redirects, immutable identity, byte limits, unsafe ZIP members and
+complete-or-no-output CLI behavior without network access. They do not simulate GitHub environment
+enforcement or crates.io authorization.
 
 Live acceptance requires an approved harmless probe, not dispatching historical release workflows:
 those can create GitHub releases/upload assets independently of crates.io authentication. Verify:
