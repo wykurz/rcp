@@ -37,6 +37,25 @@ as current consumers of ambiguous refs. Moving release credentials to a restrict
 trusted-publishing policy requires separate approval, including old-ref rejection and recovery
 tests. This setup does not change credentials or settings.
 
+## AWS publication reader trust
+
+The separately disabled `GitHubPublicationRole` keeps its existing provider, `sts.amazonaws.com`
+audience and `repo:wykurz/rcp:ref:refs/heads/main` subject. It requires repository `wykurz/rcp`,
+repository ID `655073755`, owner ID `483465`, actor ID `483465`, ref `refs/heads/main` and workflow
+name `Publish retired AWS benchmark history` through exact `StringEquals` conditions. Its existing
+read-only resource scope and `PublicationEnabled=false` default are unchanged; paid runtime and
+admission remain separately disabled. See
+[Storage and privileges](PRODUCTION.md#storage-and-privileges).
+
+GitHub's
+[OIDC claim reference](https://docs.github.com/en/actions/reference/security/oidc#custom-claims-provided-by-github)
+defines `workflow` as a name; this does not pin a workflow file or commit. Another owner-run main
+workflow with the same name can match. `job_workflow_ref` describes a called reusable workflow and
+is not used for this ordinary workflow. Keep trusted main review/protection. Offline tests exercise
+missing/wrong claims and disabled grants, but do not prove deployed AWS enforcement. Live
+role-assumption and branch/environment rejection checks still require separate approval before
+activation.
+
 ## Writer environment and reserved history namespace
 
 Only the publication and explicit canary workflows currently reference `aws-benchmark-history` and

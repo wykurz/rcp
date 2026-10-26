@@ -340,6 +340,9 @@ jobs:
 
   publish-crates:
     runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://github.com/wykurz/rcp/commit/${{ needs.resolve-release.outputs.commit }}
     needs: [resolve-release, build-deb-amd64, build-rpm-amd64, build-deb-arm64, build-rpm-arm64]
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
@@ -351,6 +354,15 @@ jobs:
         with:
           ref: ${{ needs.resolve-release.outputs.commit }}
           persist-credentials: false
+
+      - name: Require the environment publishing credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_PUBLISH_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo '::error::Configure and approve the crates-io environment before publishing.' >&2
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -377,7 +389,7 @@ jobs:
         # source of truth.
         continue-on-error: true
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_PUBLISH_TOKEN }}
         run: |
           # --no-verify skips the verification build step which would fail because
           # .cargo/config.toml sets musl as the default target and the musl linker

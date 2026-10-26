@@ -98,6 +98,9 @@ enough.
 
 ## Separate protection requirements
 
+See [Publishing credential boundary](publishing-credentials.md) for the proposed environment-only
+credential cutover, historical-controller limitations and separately approved live acceptance.
+
 Pinning checkouts does not make tags or published release assets immutable. Repository policy is
 separate from this code. At the October 25, 2026 read-only check, the active `release-tags` ruleset
 restricted creation, update and deletion of `refs/tags/v*`, with an administrator bypass. The active

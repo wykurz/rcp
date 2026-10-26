@@ -258,11 +258,18 @@ long-lived access key or remote shell is created.
 The separately disabled publication reader has exact-table `GetItem` for `active` and this
 repository's run records, exact-prefix `ListBucket` with `MaxKeys=500`, manifest `GetObject`, and
 `GetObjectVersion` for the seven fixed collection files. It has no write, launch, scan, collector
-invocation or `PassRole` authority. Its default main subject admits matching jobs from other main
-workflows when enabled; IAM does not bind the actor, workflow path or immutable repository/owner IDs
-for this read role. Listing exposes key names under the repository's run prefix. IAM also cannot
-enforce numeric run IDs, retirement state or manifest-selected versions; the reader validates those
-properties. These limits must remain explicit in the deployment approval.
+invocation or `PassRole` authority. Its trust retains the configured GitHub OIDC provider, audience
+`sts.amazonaws.com` and subject `repo:wykurz/rcp:ref:refs/heads/main`. It additionally requires
+exact `StringEquals` claims for repository `wykurz/rcp`, repository ID `655073755`, repository owner
+ID `483465`, actor ID `483465`, ref `refs/heads/main` and workflow
+`Publish retired AWS benchmark history`. The native claims are documented in the
+[AWS GitHub condition-key reference](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif).
+The workflow claim is a display name, not an immutable path or revision; another owner-run main
+workflow using that name can still match. `job_workflow_ref` applies to reusable workflows and is
+not used here. Preserve main review/protection and separately verify real role-assumption positives
+and negatives before enabling this role. Listing exposes key names under the repository's run
+prefix. IAM also cannot enforce numeric run IDs, retirement state or manifest-selected versions; the
+reader validates those properties. These limits must remain explicit in the deployment approval.
 
 DynamoDB condition checks retain exact table/item fences without relying on an undocumented
 `EnclosingOperation` context key. Put/Update/Delete remain transaction-only with their attribute

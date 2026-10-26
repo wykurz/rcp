@@ -35,10 +35,10 @@ jobs:
     with:
       ref: ${{ needs.resolve-release.outputs.commit }}
 
-  publish:
+  dry-run:
     runs-on: ubuntu-latest
     needs: [resolve-release, validate]
-    if: ${{ needs.resolve-release.result == 'success' }}
+    if: ${{ needs.resolve-release.result == 'success' && inputs.dry-run == 'true' }}
     permissions:
       contents: read
     steps:
@@ -66,52 +66,73 @@ jobs:
       - name: Install cargo-workspaces
         run: ./scripts/cargo-install-host.sh cargo-workspaces --version 0.4.2 --locked
 
-      - name: Set publish flags
-        env:
-          DRY_RUN_INPUT: ${{ github.event.inputs.dry-run }}
+      - name: Check publishing without a credential
         run: |
-          if [ "$DRY_RUN_INPUT" = "true" ]; then
-            echo "DRY_RUN=--dry-run" >> $GITHUB_ENV
-            echo "Running in DRY-RUN mode"
-          else
-            echo "DRY_RUN=" >> $GITHUB_ENV
-            echo "Running in PUBLISH mode"
+          # this separate job has no environment, publishing secret or OIDC permission
+          cargo workspaces publish --publish-as-is --yes --no-verify --dry-run
+
+      - name: Summary
+        run: |
+          echo 'Dry run completed; no packages were published to crates.io.' >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://github.com/wykurz/rcp/commit/${{ needs.resolve-release.outputs.commit }}
+    needs: [resolve-release, validate]
+    if: ${{ needs.resolve-release.result == 'success' && inputs.dry-run == 'false' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve-release.outputs.commit }}
+          persist-credentials: false
+
+      - name: Require the environment publishing credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_PUBLISH_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo '::error::Configure and approve the crates-io environment before publishing.' >&2
+            exit 1
           fi
+
+      - name: Verify version matches release tag
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: |
+          TAG_VERSION="${RELEASE_TAG#v}"
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Install cargo-workspaces
+        run: ./scripts/cargo-install-host.sh cargo-workspaces --version 0.4.2 --locked
 
       - name: Publish to crates.io
         id: publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_PUBLISH_TOKEN }}
         run: |
-          # --no-verify skips the verification build step which would fail because
-          # .cargo/config.toml sets musl as the default target and the musl linker
-          # isn't available in this environment. The validate job already verified
-          # the build, so this is safe.
-          cargo workspaces publish \
-            --publish-as-is \
-            --yes \
-            --no-verify \
-            ${{ env.DRY_RUN }}
+          # validation built the held source; skip the registry verification build with its musl default
+          cargo workspaces publish --publish-as-is --yes --no-verify
 
       - name: Summary
         if: always()
+        env:
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         run: |
-          echo "## Publication Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.publish.outcome }}" != "success" ]; then
-            echo "❌ crates.io publication failed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ env.DRY_RUN }}" = "--dry-run" ]; then
-            echo "✅ Dry-run completed successfully" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No packages were actually published to crates.io" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The following packages would have been published:" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ All workspace packages published to crates.io" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Published packages:" >> $GITHUB_STEP_SUMMARY
+          if [ "$PUBLISH_OUTCOME" != 'success' ]; then
+            echo '::error::Publication did not complete; inspect the publish step before retrying.' >&2
+            exit 1
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          cargo workspaces list --all >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo 'Workspace packages published to crates.io.' >> "$GITHUB_STEP_SUMMARY"

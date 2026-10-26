@@ -695,15 +695,6 @@ class ReleaseTagTests(unittest.TestCase):
         result, outputs = self.run_step({}, {}, dict(step, shell="bash"), self.source, {})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outputs, {})
-        flow = workflow("publish.yml")
-        job = flow["jobs"]["publish"]
-        flags = copy.deepcopy(next(s for s in job["steps"] if s.get("name") == "Set publish flags"))
-        flags["env"]["DRY_RUN_INPUT"] = "${{ github.event.inputs.dry-run == 'true' }}"
-        for dry in (False, True):
-            result, _ = self.run_step(flow, job, flags, self.source, context(flow, dry=dry))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            envfile = self.root / ("environment-" + str(self.output_number))
-            self.assertEqual(envfile.read_text(), "DRY_RUN=" + ("--dry-run" if dry else "") + "\n")
 
     def test_resolver_ignores_executable_scripts_in_tag_tree(self):
         # probes known repository scripts and common guarded-call mutations; this is not a shell proof
@@ -764,16 +755,56 @@ class ReleaseTagTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(self.git(consumer, "tag", "--list").stdout, "")
 
-    def test_standalone_dry_run_flag_comes_from_real_choice_input(self):
-        flow = workflow("publish.yml")
-        job = flow["jobs"]["publish"]
-        step = next(s for s in job["steps"] if s.get("name") == "Set publish flags")
-        for dry in (False, True):
-            with self.subTest(dry=dry):
-                result, _ = self.run_step(flow, job, step, self.source, context(flow, dry=dry))
+    def test_real_publishing_steps_require_a_credential_and_dry_run_never_gets_one(self):
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        capture = self.root / "cargo-call.json"
+        cargo = bindir / "cargo"
+        cargo.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                         "from pathlib import Path\n"
+                         "Path(os.environ['CAPTURE']).write_text(json.dumps({"
+                         "'args': sys.argv[1:], 'token': bool(os.environ.get('CARGO_REGISTRY_TOKEN'))}))\n"
+                         "sys.exit(int(os.environ.get('CARGO_EXIT', '0')))\n")
+        cargo.chmod(0o755)
+        scripts = self.source / "scripts"
+        scripts.mkdir()
+        host = scripts / "cargo-host.sh"
+        host.write_text('#!/bin/sh\nexec cargo "$@"\n')
+        host.chmod(0o755)
+        self.env.pop("CARGO_REGISTRY_TOKEN", None)
+        self.env.update(PATH=str(bindir) + os.pathsep + self.env["PATH"], CAPTURE=str(capture))
+        for filename, jobname in (("release.yml", "publish-crates"), ("publish.yml", "publish")):
+            flow = workflow(filename)
+            job = flow["jobs"][jobname]
+            preflight = next(s for s in job["steps"] if s.get("name") == "Require the environment publishing credential")
+            publish = next(s for s in job["steps"] if s.get("name") == "Publish to crates.io")
+            for token in ("", "fixture-publish-credential"):
+                values = context(flow)
+                values.update({"needs.resolve-release.outputs.tag": "v1.2.3",
+                               "secrets.CRATES_IO_PUBLISH_TOKEN": token})
+                capture.unlink(missing_ok=True)
+                checked, _ = self.run_step(flow, job, preflight, self.source, values)
+                self.assertNotIn("fixture-publish-credential", checked.stdout + checked.stderr)
+                if not token:
+                    self.assertNotEqual(checked.returncode, 0)
+                    self.assertFalse(capture.exists())
+                    continue
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+                result, _ = self.run_step(flow, job, publish, self.source, values)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                envfile = self.root / ("environment-" + str(self.output_number))
-                self.assertEqual(envfile.read_text(), "DRY_RUN=" + ("--dry-run" if dry else "") + "\n")
+                self.assertEqual(json.loads(capture.read_text()),
+                                 {"args": ["workspaces", "publish", "--publish-as-is", "--yes", "--no-verify"],
+                                  "token": True})
+        flow = workflow("publish.yml")
+        job = flow["jobs"]["dry-run"]
+        step = next(s for s in job["steps"] if s.get("name") == "Check publishing without a credential")
+        for status in (0, 73):
+            self.env["CARGO_EXIT"] = str(status)
+            result, _ = self.run_step(flow, job, step, self.source, context(flow, dry=True))
+            self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual(json.loads(capture.read_text()),
+                             {"args": ["workspaces", "publish", "--publish-as-is", "--yes", "--no-verify", "--dry-run"],
+                              "token": False})
 
     def test_release_notes_match_literal_versions_and_classify_prereleases(self):
         flow = workflow("release.yml")
@@ -882,7 +913,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertNotIn("make_latest", step["with"], job_name)
                         self.assertNotIn("inputs.release_tag", str(step))
                 self.assertEqual(validations, 1)
-                self.assertEqual(checkouts, 6 if name == "release.yml" else 1)
+                self.assertEqual(checkouts, 6 if name == "release.yml" else 2)
                 self.assertEqual(releases, 6 if name == "release.yml" else 0)
 
     def test_dispatch_input_schema_matches_the_typed_test_context(self):
@@ -939,7 +970,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for name, job in jobs.items():
             self.assertNotIn("continue-on-error", job, name)
         self.assertEqual({name: set(dependencies(job)) for name, job in jobs.items()},
-                         {RESOLVER: set(), "validate": {RESOLVER}, "publish": {RESOLVER, "validate"}})
+                         {RESOLVER: set(), "validate": {RESOLVER}, "publish": {RESOLVER, "validate"},
+                           "dry-run": {RESOLVER, "validate"}})
 
     def test_release_regressions_run_in_required_lint_job(self):
         flow = workflow("validate.yml")
@@ -1058,8 +1090,46 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("validate", dependencies(jobs["publish"]))
         for dry in (False, True):
             self.assertTrue(runs(flow, "validate", states, dry=dry))
-            self.assertTrue(runs(flow, "publish", states, dry=dry))
+            self.assertEqual(runs(flow, "publish", states, dry=dry), not dry)
+            self.assertEqual(runs(flow, "dry-run", states, dry=dry), dry)
         self.assertEqual(jobs["publish"]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["dry-run"]["permissions"], {"contents": "read"})
+
+
+    def test_only_actual_publishing_jobs_request_environment_credentials(self):
+        expected = {("release.yml", "publish-crates"), ("publish.yml", "publish")}
+        found = set()
+        for filename, flow in self.flows.items():
+            self.assertNotIn("secrets.", json.dumps(flow.get("env", {})))
+            for jobname, job in flow["jobs"].items():
+                identity = filename, jobname
+                self.assertNotIn("CRATES_IO_TOKEN", json.dumps(job))
+                self.assertNotIn("id-token", job.get("permissions", {}))
+                if identity not in expected:
+                    self.assertNotIn("environment", job)
+                    self.assertNotIn("secrets", json.dumps(job))
+                    continue
+                found.add(identity)
+                self.assertEqual(job["environment"], {"name": "crates-io",
+                    "url": "https://github.com/wykurz/rcp/commit/" + COMMIT})
+                self.assertEqual(job["permissions"], {"contents": "read"})
+                self.assertNotIn("secrets", json.dumps(job.get("env", {})))
+                references = [step for step in job["steps"] if "secrets" in json.dumps(step)]
+                self.assertEqual([step["name"] for step in references],
+                                 ["Require the environment publishing credential", "Publish to crates.io"])
+                for step in references:
+                    self.assertEqual(step["env"]["CARGO_REGISTRY_TOKEN"], "${{ secrets.CRATES_IO_PUBLISH_TOKEN }}")
+                gate = references[0]
+                self.assertNotIn("if", gate)
+                self.assertNotIn("continue-on-error", gate)
+                # missing credentials stop before any selected-source shell step can run
+                self.assertIs(next(step for step in job["steps"] if "run" in step), gate)
+        self.assertEqual(found, expected)
+        for flow in self.flows.values():
+            states = {name: "success" for name in flow["jobs"]}
+            for jobname in ("publish", "publish-crates"):
+                if jobname in states:
+                    self.assertFalse(runs(flow, jobname, states, dry=True))
 
 
 if __name__ == "__main__":
