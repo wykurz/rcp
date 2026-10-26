@@ -691,15 +691,19 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-        # only supported default-subject claims; every OIDC job with this main subject can read
-        # this does not bind an actor, workflow path or immutable repository/owner ID
+        # bind native GitHub identity claims as well as the existing main subject
+        # workflow is a display name, not an immutable workflow path or revision
         - Effect: {'Fn::If': [Publishing, Allow, Deny]}
           Principal:
             Federated: {Ref: GitHubOidcProviderArn}
           Action: sts:AssumeRoleWithWebIdentity
           Condition:
             StringEquals: {'token.actions.githubusercontent.com:aud': sts.amazonaws.com,
-              'token.actions.githubusercontent.com:sub': 'repo:wykurz/rcp:ref:refs/heads/main'}
+              'token.actions.githubusercontent.com:sub': 'repo:wykurz/rcp:ref:refs/heads/main',
+              'token.actions.githubusercontent.com:repository': wykurz/rcp, 'token.actions.githubusercontent.com:repository_id': '655073755',
+              'token.actions.githubusercontent.com:repository_owner_id': '483465', 'token.actions.githubusercontent.com:actor_id': '483465',
+              'token.actions.githubusercontent.com:ref': refs/heads/main,
+              'token.actions.githubusercontent.com:workflow': Publish retired AWS benchmark history}
       Policies:
       - PolicyName: ReadProductionRetainedEvidenceOnly
         PolicyDocument:

@@ -102,40 +102,40 @@ git push origin v0.24.0
 ### publish.yml
 
 Manual-only workflow that publishes crates to crates.io; it does not publish a GitHub draft release.
-For a crates.io failure in `release.yml`, prefer **Re-run failed jobs** on that original run after
-the [recovery checks](../../docs/release-identity.md#recovery). This standalone workflow requires an
-explicit release tag input (e.g., `v0.28.0`), resolves it once, then validates and publishes from
-that commit SHA. The string-valued `dry-run` choice defaults to `true`. The selected controller must
-have build and validation commands compatible with the chosen source tag; older tags may lack
-required helpers. Use the current reviewed controller, and see the
+For a crates.io failure in an environment-enabled `release.yml`, prefer **Re-run failed jobs** on
+that original run after the [recovery checks](../../docs/release-identity.md#recovery). Historical
+controllers without the environment lose credential access after cutover; use a reviewed modern
+controller for those runs. This standalone workflow requires an explicit release tag input (e.g.,
+`v0.28.0`), resolves it once, then validates and publishes from that commit SHA. The string-valued
+`dry-run` choice defaults to `true`. The selected controller must have build and validation commands
+compatible with the chosen source tag; older tags may lack required helpers. Use the current
+reviewed controller, and see the
 [old-ref credential boundary](../../docs/release-identity.md#separate-protection-requirements)
 before changing publication access.
 
 #### Setup Instructions
 
-1. **Create a crates.io API token**:
-   - Go to https://crates.io/settings/tokens
-   - Click "New Token"
-   - Give it a descriptive name (e.g., "GitHub Actions - RCP Tools")
-   - Grant it the `publish-update` scope
-   - Copy the generated token
+1. **Review and approve the credential cutover separately**: Follow
+   [Publishing credential boundary](../../docs/publishing-credentials.md). This code does not
+   create/configure `crates-io`, transfer a token, or revoke the old repository credential.
+   Configure its owner approval, disabled administrator bypass and typed branch `main` / tag `v*`
+   policies before storing a credential or dispatching a publishing job.
 
-2. **Add the token to GitHub Secrets**:
-   - Go to your repository on GitHub
-   - Navigate to Settings → Secrets and variables → Actions
-   - Click "New repository secret"
-   - Name: `CRATES_IO_TOKEN`
-   - Value: Paste the token from step 1
-   - Click "Add secret"
+2. **Use an environment-only credential**: After explicit setup approval, store a fresh scoped token
+   as `CRATES_IO_PUBLISH_TOKEN` in the `crates-io` environment, never as a repository/organization
+   secret. Drain affected queued/running jobs, remove repository `CRATES_IO_TOKEN` and revoke its
+   old value at crates.io under the exact cutover plan. Preserve unrelated credentials. Do not copy
+   token values into chat or logs.
 
 3. **Usage**:
 
-   Crates.io publishing happens automatically as part of `release.yml`. Prefer **Re-run failed
-   jobs** on the original release run for recovery. If this standalone workflow is used for
-   crates-only recovery, still rerun the failed jobs afterward to publish the GitHub draft. Beyond
-   GitHub's 30-day rerun window, manual draft publication requires separate user approval after
-   verifying all four expected assets, every crate and their source provenance, as described in
-   [Recovery](../../docs/release-identity.md#recovery).
+   Crates.io publishing is part of `release.yml` but requires environment approval. Prefer **Re-run
+   failed jobs** on an environment-enabled original release run for recovery; old controllers need
+   the modern-controller recovery path after credential cutover. If this standalone workflow is used
+   for crates-only recovery, still rerun the failed jobs afterward to publish the GitHub draft.
+   Beyond GitHub's 30-day rerun window, manual draft publication requires separate user approval
+   after verifying all four expected assets, every crate and their source provenance, as described
+   in [Recovery](../../docs/release-identity.md#recovery).
 
    **Manual re-publish**:
    - Go to Actions → Publish to crates.io → Run workflow
@@ -177,9 +177,10 @@ workflow when adding or removing workspace members.
 
 **Permission denied**:
 
-- Verify CRATES_IO_TOKEN secret is set correctly
-- Ensure the token has `publish-update` scope
-- Check token hasn't expired
+- Verify the approved `crates-io` environment policy and environment-only `CRATES_IO_PUBLISH_TOKEN`
+  metadata. Do not restore the old repository secret to recover an old run.
+- Verify the actual token scope covers the intended crates and that it has not expired.
+- Dry runs deliberately have no publishing credential and cannot prove real publishing permission.
 
 **Crates.io index delays**:
 

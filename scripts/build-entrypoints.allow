@@ -1,8 +1,8 @@
 # Exact active source lines approved by scripts/check-build-entrypoints.sh.
 .github/workflows/cargo-update.yml	--title "Update cargo dependencies" \
 .github/workflows/cargo-update.yml	git commit -m "Update cargo dependencies" \
-.github/workflows/publish.yml	cargo workspaces list --all >> $GITHUB_STEP_SUMMARY
-.github/workflows/publish.yml	cargo workspaces publish \
+.github/workflows/publish.yml	cargo workspaces publish --publish-as-is --yes --no-verify
+.github/workflows/publish.yml	cargo workspaces publish --publish-as-is --yes --no-verify --dry-run
 .github/workflows/release.yml	- name: Build with cross
 .github/workflows/release.yml	- name: Build with cross
 .github/workflows/release.yml	- name: Install cross

@@ -839,16 +839,24 @@ class PublicationRoleTests(unittest.TestCase):
                                         for entry in statements(self.role, **flags)))
                     self.assertEqual(permits(self.role, "dynamodb:GetItem", TABLE,
                         db_context("active", transaction=False), **flags), publication)
+                    self.assertEqual(permits(self.role, "s3:ListBucket", BUCKET_ARN,
+                        {"s3:prefix": "production/runs/repo-655073755-run-", "s3:max-keys": 500}, **flags), publication)
                     self.assertEqual(permits(self.role, "s3:GetObject", self.collection + "manifest.json", **flags),
+                                     publication)
+                    self.assertEqual(permits(self.role, "s3:GetObjectVersion", self.collection + "results.zip", **flags),
                                      publication)
         self.assertEqual(TEMPLATE["Outputs"]["GitHubPublicationRoleArn"]["Value"],
                          {"Fn::GetAtt": [self.role, "Arn"]})
 
-    def test_publication_trust_uses_only_supported_exact_audience_and_main_subject(self):
+    def test_publication_trust_binds_owner_repository_main_and_workflow_name(self):
         props = TEMPLATE["Resources"][self.role]["Properties"]
         trust = resolve(props["AssumeRolePolicyDocument"])["Statement"]
-        context = {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-                   "token.actions.githubusercontent.com:sub": "repo:wykurz/rcp:ref:refs/heads/main"}
+        expected = {"aud": "sts.amazonaws.com", "sub": "repo:wykurz/rcp:ref:refs/heads/main",
+                    "repository": "wykurz/rcp", "repository_id": "655073755", "repository_owner_id": "483465",
+                    "actor_id": "483465", "ref": "refs/heads/main", "workflow": "Publish retired AWS benchmark history"}
+        context = {"token.actions.githubusercontent.com:" + key: value for key, value in expected.items()}
+        workflow = yaml.safe_load((ROOT.parents[1] / ".github/workflows/aws-benchmark-publish.yml").read_text())
+        self.assertEqual(workflow["name"], expected["workflow"])
         self.assertEqual(trust, [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
             "Principal": {"Federated": VALUES["GitHubOidcProviderArn"]}, "Condition": {"StringEquals": context}}])
         self.assertEqual(props["MaxSessionDuration"], 3600)
@@ -861,10 +869,20 @@ class PublicationRoleTests(unittest.TestCase):
             self.assertFalse(conditions_match(trust[0]["Condition"],
                 context | {"token.actions.githubusercontent.com:sub": subject}), subject)
         for key in context:
-            missing = dict(context)
-            del missing[key]
-            self.assertFalse(conditions_match(trust[0]["Condition"], missing))
-            self.assertFalse(conditions_match(trust[0]["Condition"], context | {key: "different"}))
+            with self.subTest(claim=key):
+                missing = dict(context)
+                del missing[key]
+                self.assertFalse(conditions_match(trust[0]["Condition"], missing))
+                for wrong in ("different", "", "*"):
+                    self.assertFalse(conditions_match(trust[0]["Condition"], context | {key: wrong}), wrong)
+        original_context = {key: value for key, value in context.items() if key.rsplit(":", 1)[1] in {"aud", "sub"}}
+        self.assertFalse(conditions_match(trust[0]["Condition"], original_context))
+        for ref in ("refs/heads/debug", "refs/pull/1/merge", "refs/tags/main"):
+            self.assertFalse(conditions_match(trust[0]["Condition"],
+                context | {"token.actions.githubusercontent.com:ref": ref}), ref)
+        for workflow_name in ("AWS production benchmark", ".github/workflows/aws-benchmark-publish.yml"):
+            self.assertFalse(conditions_match(trust[0]["Condition"],
+                context | {"token.actions.githubusercontent.com:workflow": workflow_name}), workflow_name)
 
     def test_publication_reads_only_exact_active_and_repository_run_records(self):
         for key in ("active", RUN_PK, "run#repo-655073755-run-999999"):
