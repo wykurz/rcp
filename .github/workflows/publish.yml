@@ -22,6 +22,9 @@ env:
 permissions:
   contents: read
 
+# selected release source must neither consume nor poison shared Actions caches
+cache-mode: none
+
 jobs:
   resolve-release:
     uses: ./.github/workflows/resolve-release-tag.yml
