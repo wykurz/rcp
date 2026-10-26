@@ -24,6 +24,14 @@ run is evidence that a real publishing token is authorized for every workspace c
 packaging errors as warnings. A successful dry-run command is not proof that every crate packaged
 successfully. The source validation jobs remain required.
 
+Both caller workflows set `cache-mode: none`, which limits the runner's scoped cache token and
+propagates into reusable validation. Selected release source cannot restore or save shared Actions
+caches, even during a dry run dispatched on `main`. Read-only `GITHUB_TOKEN` permissions or simply
+turning off a cache action would not enforce that boundary. This may make release validation slower;
+ordinary CI keeps its existing cache policy. Offline tests assert the caller limit and reject
+conflicting job/callee overrides; they do not emulate GitHub's cache service. Historical controllers
+retain their original cache access until retired.
+
 Both publishing paths preserve the [resolved release identity](release-identity.md). A modern
 controller dispatched on `main` can select an older tag, provided its source supports the required
 build helpers. No new helper script is required in that older source by this credential change.
@@ -115,5 +123,6 @@ separate [writer setup review](../infra/aws_benchmark/TRUST.md).
 References:
 [GitHub environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
 [secret timing](https://docs.github.com/en/actions/reference/security/secrets),
+[cache token controls](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode),
 [rerun identity](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
 [crates.io trusted publishing](https://crates.io/docs/trusted-publishing).

@@ -837,6 +837,25 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def setUpClass(cls):
         cls.flows = {name: workflow(name) for name in ("release.yml", "publish.yml")}
 
+    def test_release_source_jobs_and_reusable_callees_cannot_request_cache_access(self):
+        # cache-mode scopes the runtime token; GITHUB_TOKEN permissions or disabling a cache action do not
+        for filename, flow in self.flows.items():
+            with self.subTest(workflow=filename):
+                self.assertEqual(flow.get("cache-mode"), "none")
+                pending = [flow]
+                visited = set()
+                while pending:
+                    caller = pending.pop()
+                    self.assertIn(caller.get("cache-mode", "none"), ("none",))
+                    for name, job in caller["jobs"].items():
+                        self.assertEqual(job.get("cache-mode", "none"), "none", name)
+                        reusable = job.get("uses", "")
+                        if reusable:
+                            self.assertTrue(reusable.startswith("./.github/workflows/"), reusable)
+                            if reusable not in visited:
+                                visited.add(reusable)
+                                pending.append(workflow(Path(reusable).name))
+
     def test_resolver_has_only_read_permission_and_trusted_inline_steps(self):
         flow = workflow("resolve-release-tag.yml")
         self.assertEqual(set(flow["on"]), {"workflow_call"})
