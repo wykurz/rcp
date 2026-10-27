@@ -24,7 +24,7 @@ API = "https://api.github.com"
 
 
 class Rejected(ValueError):
-    pass
+    """A fixed, credential-free diagnostic authored by this module."""
 
 
 def require(condition, message):
@@ -76,8 +76,8 @@ class Client:
             raise Rejected("unexpected artifact response")
         return response
 
-    def copy(self, source, destination, limit):
-        digest, size = hashlib.sha256(), 0
+    def copy(self, source, destination, limit, digest=None):
+        size = 0
         while True:
             self.remaining()
             block = source.read(min(1024 * 1024, limit + 1 - size))
@@ -85,9 +85,10 @@ class Client:
                 break
             size += len(block)
             require(size <= limit, "artifact exceeds byte limit")
-            digest.update(block)
+            if digest is not None:
+                digest.update(block)
             destination.write(block)
-        return size, digest.hexdigest()
+        return size
 
     def metadata(self, url):
         with self.open(url, authenticated=True) as response:
@@ -126,7 +127,7 @@ def unpack(client, archive, destination, filename):
         require(not info.flag_bits & 1 and info.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED), "unsupported asset encoding")
         require(0 < info.file_size <= MAX_ASSET, "invalid asset size")
         with bundle.open(info) as source, destination.open("xb") as target:
-            size, _ = client.copy(source, target, MAX_ASSET)
+            size = client.copy(source, target, MAX_ASSET)
         require(size == info.file_size, "asset size mismatch")
     # the inner package ZIP is uploaded as data; never extract or execute packages
     require(zipfile.is_zipfile(destination), "asset is not a ZIP bundle")
@@ -151,8 +152,9 @@ def stage(env, client):
                                              run_id, attempt, controller, source)
             with tempfile.TemporaryFile(dir=root) as archive:
                 with client.open(endpoint + "/zip", authenticated=True, redirect=True) as response:
-                    actual_size, actual_digest = client.copy(response, archive, MAX_ARCHIVE)
-                require((actual_size, actual_digest) == (size, digest), "artifact archive size or SHA256 mismatch")
+                    actual_digest = hashlib.sha256()
+                    actual_size = client.copy(response, archive, MAX_ARCHIVE, digest=actual_digest)
+                require((actual_size, actual_digest.hexdigest()) == (size, digest), "artifact archive size or SHA256 mismatch")
                 archive.seek(0)
                 filename = f"rcp-{kind}-{tag}.zip"
                 unpack(client, archive, directory / filename, filename)
@@ -166,17 +168,24 @@ def stage(env, client):
 def main():
     token = os.environ.get("GH_TOKEN", "")
     require(token and not any(c in token for c in "\r\n"), "missing artifact read credential")
+    require(os.environ.get("RUNNER_TEMP"), "missing runner temporary directory")
+    require(os.environ.get("GITHUB_OUTPUT"), "missing workflow output path")
     directory = stage(os.environ, Client(token))
-    # no partial output is emitted; the next release step runs only after all four succeed
-    with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-        require(not any(c in str(directory) for c in "\r\n"), "invalid staging directory")
-        output.write("directory=" + str(directory) + "\n")
+    try:
+        # the next release step runs only after all four assets and output publication succeed
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            require(not any(c in str(directory) for c in "\r\n"), "invalid staging directory")
+            output.write("directory=" + str(directory) + "\n")
+    except BaseException:
+        shutil.rmtree(directory)
+        raise
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (Rejected, OSError, ValueError, zipfile.BadZipFile, RuntimeError):
-        # exception URLs/headers can contain signed download credentials; never print them
-        print("::error::Release artifact staging failed; no release upload authorized", file=sys.stderr)
+    except Exception as error:
+        # only our authored validation messages are safe; other errors may contain signed URLs
+        reason = str(error) if isinstance(error, Rejected) else "unexpected staging error"
+        print("::error::Release artifact staging failed: " + reason + "; no release upload authorized", file=sys.stderr)
         sys.exit(1)

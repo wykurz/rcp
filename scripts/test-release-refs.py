@@ -806,6 +806,33 @@ class ReleaseTagTests(unittest.TestCase):
                              {"args": ["workspaces", "publish", "--publish-as-is", "--yes", "--no-verify", "--dry-run"],
                               "token": False})
 
+    def test_publication_summary_reports_actual_stage_without_adding_a_failure(self):
+        flow = workflow("publish.yml")
+        job = flow["jobs"]["publish"]
+        gate = next(step for step in job["steps"] if step.get("id") == "credential")
+        summary = next(step for step in job["steps"] if step.get("name") == "Summary")
+        self.assertEqual(summary["if"], "always()")
+        missing_credential = dict(context(flow), **{"secrets.CRATES_IO_PUBLISH_TOKEN": ""})
+        failed, _ = self.run_step(flow, job, gate, self.source, missing_credential)
+        self.assertNotEqual(failed.returncode, 0)
+        for credential, publish, message in (("failure", "skipped", "credential gate"),
+                                             ("skipped", "skipped", "preceding checkout"),
+                                             ("success", "skipped", "version check and setup"),
+                                             ("success", "failure", "Publication failed"),
+                                             ("success", "cancelled", "Publication was cancelled"),
+                                             ("success", "success", "Workspace packages published"),
+                                             ("success", "", "outcome is unavailable")):
+            with self.subTest(credential=credential, publish=publish):
+                values = context(flow)
+                values.update({"steps.credential.outcome": credential, "steps.publish.outcome": publish})
+                result, _ = self.run_step(flow, job, summary, self.source, values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = (self.root / ("summary-" + str(self.output_number))).read_text()
+                self.assertIn(message, report)
+                if publish != "success":
+                    self.assertNotIn("packages published", report)
+                self.assertNotIn("::error::", result.stdout + result.stderr)
+
     def test_release_notes_match_literal_versions_and_classify_prereleases(self):
         flow = workflow("release.yml")
         job = flow["jobs"]["create-release"]
