@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import copy
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import runpy
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,7 @@ import unittest
 from unittest import mock
 import urllib.error
 import zipfile
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +132,91 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn(self.env["GH_TOKEN"], stderr.getvalue())
         self.assertFalse((self.root / "output").exists())
         self.assertEqual(list(self.root.glob("release-assets-*")), [])
+
+    def cli_failure(self, reason, env=None):
+        stderr, transport = io.StringIO(), Transport(self.responses)
+        with mock.patch.dict(os.environ, env or self.env, clear=True), mock.patch("urllib.request.build_opener", return_value=transport), mock.patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as result:
+                runpy.run_path(str(SCRIPT), run_name="__main__")
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn(reason, stderr.getvalue())
+        self.assertIn("no release upload authorized", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn("signed-secret", stderr.getvalue())
+        self.assertNotIn(self.env["GH_TOKEN"], stderr.getvalue())
+        self.assertFalse((self.root / "output").exists())
+        self.assertEqual(list(self.root.glob("release-assets-*")), [])
+        return transport
+
+    def test_cli_preserves_authored_rejection_reasons_without_external_details(self):
+        original = copy.deepcopy(self.metadata[4])
+        for key, value, reason in (("expired", True, "artifact expired or unavailable"),
+                                   ("id", 99, "artifact ID mismatch"),
+                                   ("digest", "sha256:" + "0" * 64, "artifact archive size or SHA256 mismatch")):
+            with self.subTest(reason=reason):
+                self.metadata[4] = dict(original, **{key: value})
+                self.sync_metadata()
+                self.cli_failure(reason)
+        self.metadata[4] = original
+        self.sync_metadata()
+        self.responses[self.endpoint(4)] = urllib.error.HTTPError("https://storage.example/?signed-secret", 410, self.env["GH_TOKEN"], {}, None)
+        self.cli_failure("artifact HTTP request failed: 410")
+
+    def test_cli_redacts_unexpected_transport_decoder_and_environment_exceptions(self):
+        secret = "https://storage.example/?signed-secret=" + self.env["GH_TOKEN"]
+        errors = [zlib.error(secret), EOFError(secret), http.client.IncompleteRead(secret.encode(), 1000),
+                  http.client.HTTPException(secret), KeyError(secret), RuntimeError(secret)]
+        for error in errors:
+            with self.subTest(kind=type(error).__name__):
+                self.responses[self.endpoint(4)] = error
+                self.cli_failure("unexpected staging error")
+
+    def test_cli_redacts_actual_corrupt_deflate_member_failure(self):
+        filename = self.filename(M.KINDS[0])
+        blob = bytearray(archive([(filename, self.payloads[M.KINDS[0]])], zipfile.ZIP_DEFLATED))
+        name_size, extra_size = struct.unpack_from("<HH", blob, 26)
+        blob[30 + name_size + extra_size] = 7  # reserved deflate block type
+        with zipfile.ZipFile(io.BytesIO(blob)) as bundle, self.assertRaises(zlib.error):
+            bundle.read(filename)
+        self.replace_blob(bytes(blob))  # valid outer digest, failure in inner decompression
+        self.cli_failure("unexpected staging error")
+
+    def test_cli_validates_runner_paths_before_network_and_cleans_output_failure(self):
+        for key, reason in (("RUNNER_TEMP", "missing runner temporary directory"),
+                            ("GITHUB_OUTPUT", "missing workflow output path")):
+            with self.subTest(key=key):
+                env = dict(self.env)
+                del env[key]
+                transport = self.cli_failure(reason, env)
+                self.assertEqual(transport.calls, [])
+        self.cli_failure("unexpected staging error", dict(self.env, GITHUB_OUTPUT=str(self.root)))
+
+    def test_cli_preserves_interruption_and_cleans_partial_staging(self):
+        transport = Transport(self.responses)
+        original_open = transport.open
+        def interrupted(request, timeout):
+            if request.full_url == self.endpoint(4):
+                raise KeyboardInterrupt()
+            return original_open(request, timeout)
+        transport.open = interrupted
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch("urllib.request.build_opener", return_value=transport):
+            with self.assertRaises(KeyboardInterrupt):
+                runpy.run_path(str(SCRIPT), run_name="__main__")
+        self.assertFalse((self.root / "output").exists())
+        self.assertEqual(list(self.root.glob("release-assets-*")), [])
+
+    def test_inner_asset_copy_does_not_hash_but_keeps_size_crc_and_type_validation(self):
+        filename = self.filename(M.KINDS[0])
+        blob = self.responses[self.endpoint(1) + "/zip"]
+        with mock.patch.object(M.hashlib, "sha256", side_effect=AssertionError("unneeded inner digest")):
+            destination = self.root / filename
+            M.unpack(self.client(), io.BytesIO(blob), destination, filename)
+        self.assertEqual(destination.read_bytes(), self.payloads[M.KINDS[0]])
+        corrupt = bytearray(blob)
+        name_size, extra_size = struct.unpack_from("<HH", corrupt, 26)
+        corrupt[30 + name_size + extra_size] ^= 1
+        with self.assertRaises(zipfile.BadZipFile):
+            M.unpack(self.client(), io.BytesIO(corrupt), self.root / "corrupt.zip", filename)
 
     def test_rejects_foreign_missing_expired_future_or_unbound_metadata(self):
         original = copy.deepcopy(self.metadata[1])

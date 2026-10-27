@@ -94,6 +94,7 @@ jobs:
           persist-credentials: false
 
       - name: Require the environment publishing credential
+        id: credential
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_PUBLISH_TOKEN }}
         run: |
@@ -132,10 +133,23 @@ jobs:
       - name: Summary
         if: always()
         env:
+          CREDENTIAL_OUTCOME: ${{ steps.credential.outcome }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         run: |
-          if [ "$PUBLISH_OUTCOME" != 'success' ]; then
-            echo '::error::Publication did not complete; inspect the publish step before retrying.' >&2
-            exit 1
-          fi
-          echo 'Workspace packages published to crates.io.' >> "$GITHUB_STEP_SUMMARY"
+          case "$PUBLISH_OUTCOME" in
+            success)
+              message='Workspace packages published to crates.io.' ;;
+            failure)
+              message='Publication failed; inspect the publish step and reconcile registry state before retrying.' ;;
+            cancelled)
+              message='Publication was cancelled; reconcile registry state before retrying.' ;;
+            skipped)
+              if [ "$CREDENTIAL_OUTCOME" != 'success' ]; then
+                message='Publication did not start; inspect the credential gate and preceding checkout.'
+              else
+                message='Publication did not start; inspect the earlier version check and setup steps.'
+              fi ;;
+            *)
+              message='Publication outcome is unavailable; inspect the job before retrying.' ;;
+          esac
+          echo "$message" >> "$GITHUB_STEP_SUMMARY"

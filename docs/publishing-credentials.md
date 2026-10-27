@@ -69,10 +69,15 @@ opaque data: they are not extracted or executed, and their package safety is not
 output cannot select a shell command, executable helper, upload glob or release tag. No source-owned
 helper is newly required in an older release tree. Controller and source review remain necessary.
 
-If an upload fails, retain its artifacts and existing draft. Retry with the same IDs while they are
-available. After seven-day expiry, rebuild packages only after reconciling the original source pin
-and existing assets; never substitute a name lookup or a different run's artifact. If upload already
-succeeded, a crates-only failure does not require re-downloading the package artifacts.
+If a package build or upload fails, retain the successful artifacts and existing draft. **Re-run
+failed jobs** can reuse the same IDs only while every required artifact is still available. The
+seven-day artifact retention is shorter than GitHub's 30-day workflow rerun window; a day-eight
+retry cannot recover expired successful-build artifacts by rerunning only failed jobs. After expiry,
+reconcile the original source pin, current tag and existing draft/assets before deciding whether to
+**Re-run all jobs**. That rebuild also reruns draft creation and all downstream jobs: do not use it
+blindly on an already published or inconsistent release. Never substitute a name lookup or another
+run's artifact. If upload already succeeded, a crates-only failed-job rerun does not re-download
+package artifacts and remains eligible within the workflow rerun window.
 
 ## Proposed live configuration — separate approval required
 

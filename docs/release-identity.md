@@ -91,11 +91,15 @@ crates.io publication, checks every crate version, and then publishes the draft.
 for crates-only recovery, rerun the failed jobs on the original release run to complete draft
 publication.
 
-GitHub permits [reruns for 30 days after the initial run][rerun-window]. Beyond that window,
-manually publishing the draft requires separate user approval after confirming all four expected
-assets and every crate are present and their source provenance matches the intended commit and
-current tag. Missing or inconsistent evidence holds publication; a successful crates-only run is not
-enough.
+GitHub permits [reruns for 30 days after the initial run][rerun-window]. This is a workflow
+eligibility window, not an artifact-retention guarantee: failed package/upload jobs can reuse
+artifacts for only seven days. See
+[artifact recovery](publishing-credentials.md#package-artifact-boundary) before rerunning those jobs
+after expiry. Successful uploads are not repeated by a crates-only failed-job rerun. Beyond the
+30-day workflow window, manually publishing the draft requires separate user approval after
+confirming all four expected assets and every crate are present and their source provenance matches
+the intended commit and current tag. Missing or inconsistent evidence holds publication; a
+successful crates-only run is not enough.
 
 [rerun-window]: https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs
 
