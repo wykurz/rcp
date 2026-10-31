@@ -311,6 +311,13 @@ check_realized_linux_shell() { # $1 = shell name, $2 = expected target
             fail "AR_FOR_TARGET resolves to mismatched $resolved_ar"
         python3 -c '"'"'import yaml, markdown_it'"'"' ||
             fail "Python cannot import PyYAML and markdown-it-py"
+
+        # keep the probe local and read-only if a future build accidentally enables self-update
+        nextest_status=0
+        timeout 10s cargo nextest self update --check \
+            --releases-url http://127.0.0.1:9/ >/dev/null 2>&1 || nextest_status=$?
+        [[ "$nextest_status" == 93 ]] || \
+            fail "Nextest self-update should be unavailable (exit 93), got $nextest_status"
     ' bash "$shell_name" "$expected_target"
 }
 
