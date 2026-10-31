@@ -1,9 +1,10 @@
 # Full dependency closure; SHA-256 hashes of the universal wheels published on PyPI.
+# botocore 1.43.117 removes the AAA root that cross-signed compromised eMudhra intermediates
 --only-binary=:all:
-boto3==1.43.114 \
-    --hash=sha256:d9cac2eb921ce674970cef1c9ad750f85ee3a846aedcf188d18368fb9eb6da23
-botocore==1.43.114 \
-    --hash=sha256:d1c441a22e93e158de5b1e026205f5d6d67a4545d10540c5090c62dccb3a9eca
+boto3==1.43.117 \
+    --hash=sha256:a5b6cd7e67653987fcf0e212187c16f7b58af2ae192e368f7212ddab7c05b25d
+botocore==1.43.117 \
+    --hash=sha256:5920ef9b3002e1361846549078549d9154a6e0004c22853c01ce7b279d05d495
 jmespath==1.1.0 \
     --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64
 python-dateutil==2.9.0.post0 \

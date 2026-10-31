@@ -1,6 +1,7 @@
 let
   rust_overlay = import (builtins.fetchTarball https://github.com/oxalica/rust-overlay/archive/master.tar.gz);
   nixpkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
+  cargoNextest = nixpkgs.callPackage ./nix/cargo-nextest.nix { };
   targetPlatform = import ./nix/target-platform.nix {
     pkgs = nixpkgs;
     system = nixpkgs.stdenv.hostPlatform.system;
@@ -59,7 +60,7 @@ in
             cargo-expand
             cargo-flamegraph
             cargo-generate
-            cargo-nextest
+            cargoNextest
             inferno
             just
             cargo-outdated

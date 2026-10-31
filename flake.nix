@@ -40,6 +40,7 @@
           targets = platform.rustTargets;
         };
         rustToolchain = mkRustToolchain targetPlatform;
+        cargoNextest = pkgs.callPackage ./nix/cargo-nextest.nix { };
         # build package hooks from the target stdenv itself. Setting CARGO_BUILD_TARGET on a
         # native-GNU buildRustPackage is insufficient because the hooks append their own
         # --target from stdenv.hostPlatform.
@@ -357,7 +358,7 @@
                 pkgs.cargo-flamegraph
                 pkgs.cargo-generate
                 pkgs.inferno
-                pkgs.cargo-nextest
+                cargoNextest
                 pkgs.cargo-outdated
                 pkgs.cargo-udeps
                 pkgs.dprint
