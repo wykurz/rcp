@@ -65,7 +65,7 @@ jobs:
             --region "$REGION" --role "$ROLE" --bucket "$BUCKET" --table "$TABLE" \
             --history "$RUNNER_TEMP/download-history.git" \
             --output "$RUNNER_TEMP/retired-evidence" --reader-revision "$GITHUB_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: raw
         with:
           name: aws-retired-evidence-${{ github.run_id }}-${{ github.run_attempt }}
@@ -104,7 +104,7 @@ jobs:
           TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
         run: |
           python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.download.outputs.artifact_id }}
           path: ${{ runner.temp }}/retired-evidence
@@ -133,7 +133,7 @@ jobs:
             --input "$RUNNER_TEMP/retired-evidence" --history "$RUNNER_TEMP/export-history.git" \
             --output "$RUNNER_TEMP/public-records" --reader-revision "$GITHUB_SHA" \
             --expected-sha256 "$EXPECTED_INVENTORY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: public
         with:
           name: aws-public-records-${{ github.run_id }}-${{ github.run_attempt }}
@@ -176,7 +176,7 @@ jobs:
           TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
         run: |
           python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.export.outputs.artifact_id }}
           path: ${{ runner.temp }}/public-records
@@ -235,7 +235,7 @@ jobs:
       - name: Mint the repository-selected history writer token
         if: steps.prepare.outputs.commit != ''
         id: history-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
           private-key: ${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}

@@ -163,7 +163,7 @@ jobs:
         run: >-
           tar --dereference --hard-dereference --directory _site
           -cvf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.current_main.outputs.current == 'true'
         with:
           name: github-pages
@@ -173,7 +173,7 @@ jobs:
       - name: Deploy project site
         if: steps.current_main.outputs.current == 'true'
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
       - name: Summarize historical changes
         if: always() && steps.render.outcome == 'success'
         env:

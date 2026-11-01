@@ -82,7 +82,7 @@ jobs:
         run: python3 -m infra.aws_benchmark.canary_recovery
       - name: Download only the approved source artifact
         if: inputs.mode == 'resume'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ inputs.source_artifact_id }}
           run-id: ${{ inputs.source_run_id }}
@@ -111,7 +111,7 @@ jobs:
         run: python3 -m infra.aws_benchmark.publication_identity canary-current-main
       - name: Mint only after ordinary controls pass
         id: writer
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
           private-key: ${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}
@@ -142,7 +142,7 @@ jobs:
           fi
       - name: Preserve bounded public canary evidence on success or hold
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aws-history-canary-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
