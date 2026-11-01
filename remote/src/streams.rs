@@ -40,7 +40,7 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
         obj: &T,
     ) -> anyhow::Result<()> {
         self.send_batch_message(obj).await?;
-        self.framed.flush().await?;
+        SinkExt::<bytes::Bytes>::flush(&mut self.framed).await?;
         Ok(())
     }
 
@@ -53,7 +53,7 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
             let bytes = bitcode::serialize(object).map_err(anyhow::Error::from)?;
             self.framed.feed(bytes::Bytes::from(bytes)).await?;
         }
-        self.framed.flush().await?;
+        SinkExt::<bytes::Bytes>::flush(&mut self.framed).await?;
         Ok(())
     }
 
@@ -122,7 +122,7 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
     }
 
     pub async fn close(&mut self) -> anyhow::Result<()> {
-        self.framed.close().await?;
+        SinkExt::<bytes::Bytes>::close(&mut self.framed).await?;
         Ok(())
     }
 }

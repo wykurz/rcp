@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 struct Written {
     bytes: Vec<u8>,
     flushes: usize,
+    events: Vec<&'static str>,
     max_write: usize,
     blocked: bool,
     wake: Option<std::task::Waker>,
@@ -31,13 +32,16 @@ impl AsyncWrite for Writer {
         self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.0.lock().unwrap().flushes += 1;
+        let mut state = self.0.lock().unwrap();
+        state.flushes += 1;
+        state.events.push("flush");
         std::task::Poll::Ready(Ok(()))
     }
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.lock().unwrap().events.push("shutdown");
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -117,6 +121,34 @@ async fn grouped_control_frames_retain_writer_backpressure() -> anyhow::Result<(
     let mut recv = RecvStream::new(bytes.as_slice());
     for message in messages {
         assert_eq!(recv.recv_object::<String>().await?, Some(message));
+    }
+    assert!(recv.recv_object::<String>().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn close_flushes_buffered_frames_before_shutdown() -> anyhow::Result<()> {
+    let messages = ["first", "second"];
+    let state = Arc::new(Mutex::new(Written::default()));
+    let mut sender = SendStream::new(Writer(state.clone()));
+    for message in &messages {
+        let bytes = bitcode::serialize(message)?;
+        sender.framed.feed(bytes::Bytes::from(bytes)).await?;
+    }
+    {
+        let written = state.lock().unwrap();
+        assert!(written.bytes.is_empty());
+        assert!(written.events.is_empty());
+    }
+    sender.close().await?;
+    let bytes = {
+        let written = state.lock().unwrap();
+        assert_eq!(written.events, ["flush", "shutdown"]);
+        written.bytes.clone()
+    };
+    let mut recv = RecvStream::new(bytes.as_slice());
+    for expected in messages {
+        assert_eq!(recv.recv_object::<String>().await?, Some(expected.into()));
     }
     assert!(recv.recv_object::<String>().await?.is_none());
     Ok(())
