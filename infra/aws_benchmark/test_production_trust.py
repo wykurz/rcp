@@ -224,6 +224,18 @@ class TrustTests(unittest.TestCase):
         self.assertTrue(all(s["Resource"] == "*" for s in policy["Statement"]))
         self.assertFalse(rendered_deny(policy, RESOURCE, "other", action="secretsmanager:DescribeSecret"))
 
+    def test_root_and_unselected_admin_reads_denied_without_claiming_policy_admin_allow(self):
+        policy = trust.reader_policy(RESOURCE, *ROLES)
+        for principal in ("arn:aws:iam::123456789012:root",
+                          "arn:aws:iam::123456789012:role/unselected-human-admin"):
+            for stage in (None, "AWSCURRENT", "AWSPREVIOUS"):
+                self.assertTrue(rendered_deny(policy, RESOURCE, principal, stage))
+            for action in ("secretsmanager:PutResourcePolicy", "secretsmanager:DeleteResourcePolicy"):
+                # This fragment does not deny the action; it does not establish an effective allow.
+                self.assertFalse(rendered_deny(policy, RESOURCE, principal, action=action))
+        with self.assertRaises(ValueError):
+            trust.reader_policy(RESOURCE, ROLES[0], ROLES[1], "arn:aws:iam::123456789012:root")
+
     def test_reader_resource_grammar_matches_runtime_and_roles_do_not_broaden(self):
         variants = [RESOURCE + "*", RESOURCE.replace("github-read-app", "other"),
             RESOURCE.replace("arn:aws:", "arn:aws-us-gov:").replace("us-east-1", "us-gov-east-1"),
