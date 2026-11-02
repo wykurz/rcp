@@ -320,13 +320,34 @@ relaxation is part of recovery.
 
 ## Explicit Secrets Manager reader boundary
 
-The user must select an existing same-account recovery IAM role outside the production stack. No
-production service/job role, administrator, root, user or session ARN is substituted. The setup CLI
+The user must explicitly select an existing same-account, human-operated recovery IAM role outside
+the production stack. An existing administrator role is eligible only after its trust and access are
+reviewed and its exact role ARN is selected; administrator status is not an automatic exemption. No
+production service/job role, root, user or assumed-role session ARN is substituted. The setup CLI
 derives the reader roles from the exact captured disabled stack's `AdmissionRoleArn` and
 `CollectorRoleArn` outputs; independently verify stack identity, template provenance and role trust.
 The checker excludes recovery identities present in stack outputs; the operator must also verify
 that the selected recovery role is not another production service/job role absent from those
 outputs. Stack output text alone is not live effective-permission proof.
+
+This deny fragment governs `GetSecretValue` only. Root and unselected administrator roles are denied
+direct reads, including `AWSCURRENT`; their existing authority to amend resource policies is not
+removed by this fragment. This is not a grant of policy-management access or a guarantee that
+another IAM, SCP or RCP deny permits recovery. A selected recovery role still needs an identity
+allow on the exact secret ARN. Do not infer an exemption from an account-root `Principal`: that
+delegates to the account, whereas an exact root ARN in an `aws:PrincipalArn` condition identifies
+actual root credentials. This tooling deliberately continues to accept role ARNs only.
+
+Use the selected human role for routine emergency access, with short sessions and existing MFA
+controls. Root is a last-resort policy-repair path, never a source of automation keys. An authorized
+policy administrator can propose restoring the selected role's access or replacing the exact secret
+policy after separately approved review. Preserve unrelated statements and use `BlockPublicPolicy`;
+deleting the whole policy is not the recovery procedure. Capture policy and role trust before repair
+and re-run the reader acceptance cases afterward. AWS documents
+[principal ARN semantics](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-principalarn),
+[resource-policy management](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html)
+and
+[root-account precautions](https://docs.aws.amazon.com/IAM/latest/UserGuide/root-user-best-practices.html).
 
 The stack capture is
 `{ "operation": "DescribeStacks", "region": "<region>", "parameters":
@@ -398,9 +419,9 @@ silently added by this template preparation.
 2. Pin the compatible AMI, package/source and numeric template; approve any necessary paid build
    separately. The template's service roles and live grants remain deployment approvals.
 3. Perform the exact reader-role, S3/DynamoDB and route-bound probes described in
-   [PRODUCTION.md](PRODUCTION.md). Those probes are not an implemented OIDC canary: separately
-   verify real GitHub OIDC claim shapes, role assumption positives/negatives and branch/environment
-   rejection.
+   [PRODUCTION.md](PRODUCTION.md). The positive OIDC adapter in [ACCEPTANCE.md](ACCEPTANCE.md) does
+   not close the negative-ref or role-policy gates: separately verify real GitHub OIDC claim shapes,
+   role assumption positives/negatives and branch/environment rejection.
 4. Approve the bounded writer lane and approval-delay test above, with flags otherwise off. Review
    all evidence and holds, including installation scope and broader Contents-write reach.
 5. After live checks and production qualification, separately approve readiness/publication. Verify

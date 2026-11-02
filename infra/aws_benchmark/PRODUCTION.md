@@ -307,8 +307,10 @@ permissions. They are separate conditional `AWS::IAM::RolePolicy` resources with
 removes these grants even when `CollectorRole` is retained for recovery; verify actual removal if
 CloudFormation cleanup fails. This does not revoke an already-minted token or erase an exposed key.
 Never delete the stack to close admission during active reconciliation. Worker, coordinator,
-watchdog, publication and GitHub job roles receive no secret access; existing account administrators
-retain their existing powers.
+watchdog, publication and GitHub job roles receive no secret access. The external resource policy
+also denies direct reads by root and unselected administrators. Existing policy-management powers
+are separate; see
+[the explicit reader boundary and recovery procedure](TRUST.md#explicit-secrets-manager-reader-boundary).
 
 | Template parameter        | Non-secret Lambda configuration             |
 | ------------------------- | ------------------------------------------- |
@@ -445,6 +447,10 @@ execution from launching, but state changes and service charges are still possib
 execution, active pointer, run/accounting mutation or worker exists afterward. An unexpected change
 holds activation until reconciled; do not release ownership merely to clean up a probe. Delete only
 the two approved temporary functions after invocation reconciliation and retain sanitized evidence.
+
+The fixed-binding adapters and offline package/template commands are documented in
+[ACCEPTANCE.md](ACCEPTANCE.md). They prepare reviewable probes, not deployment authorization or an
+automatic acceptance decision.
 
 This disabled-state canary verifies reader access, not an operating watchdog. Independent watchdog
 health is a later, separately approved runtime-with-admission-closed check before any paid request.
