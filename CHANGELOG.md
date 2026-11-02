@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-11-01
+
 ### Added
 
 - Add fresh, unchanged and partial benchmark scenarios with owned loopback latency, verified source
@@ -25,6 +27,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   including files copied during `rlink --update`. The default `auto` keeps existing behavior;
   `never` uses sparse-aware read/write copying for benchmarking. An `always` mode is deferred until
   there is a clear need.
+- Add experimental `--local-copy-handoff=never|fresh` to `rcp` and `rlink`. The default `never`
+  keeps separate blocking jobs; `fresh` reuses the worker after a fresh file's create, saving one
+  submission per file at the cost of a queue boundary.
+- Add a project website and a reproducible performance report comparing rcp with dcp, GNU cp, and
+  rsync on Lustre, Weka, NFS, XFS, and ZFS, between hosts, and on a Linux source tree.
+- Add copy benchmarks with performance history, a browsable dashboard, and paired local
+  measurements, plus a manually armed AWS benchmark pipeline with verified history publication. This
+  pipeline replaces the Depot benchmark jobs.
 
 ### Changed
 
@@ -79,6 +89,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   target on supported Linux, and make Docker, Nix, CI, and release jobs select their x86_64 or
   AArch64 targets explicitly. Supported builds and Nix outputs are Linux-only; musl remains the
   primary target, with an additional x86_64 GNU/glibc build in CI.
+- Make `--remote-copy-buffer-size` the maximum transfer buffer and file I/O request size on both
+  endpoints, capped per file to its size. Source reads were previously limited to Tokio's 2 MiB
+  default, so the datacenter default now issues requests up to 16 MiB and allows more working memory
+  per active transfer.
+- Reuse already-open files for source ACL reads and remote receiver metadata instead of reopening or
+  duplicating descriptors, and keep destination file ownership through metadata finalization.
+- Harden release publishing: pin workflows to one resolved tag commit, separate package builds from
+  uploads, isolate publishing credentials, and improve staging diagnostics and recovery.
 
 ### Fixed
 
@@ -100,6 +118,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Keep local sparse copies progressing when extent probes stop advancing or become unsupported,
   report the reconciled logical byte count after a partial kernel copy or a mid-copy fallback, and
   retry interrupted kernel copies, reads, and writes.
+- Reject impossible kernel-copy counts, propagate permission errors after a partial kernel copy, and
+  stop padding destinations past the observed EOF when a source reports a larger size than it reads.
+- Hold destination directories open during `--dry-run --delete` previews so they stay bound across
+  renames, and stop before descending when a destination directory cannot be opened.
+- Drain pending `rlink` workers and finalize the directory after a directory read error in
+  keep-going mode; `--fail-early` cancels those workers.
+- Remove empty traversal-only directories from filtered `rlink --update` delegated copies, excluding
+  them from dry-run counts, while keeping directly included and reused directories.
+- Reject duplicate remote root entries before registering a competing file, symlink, or directory.
 
 ## [0.40.0] - 2026-09-01
 
@@ -1258,7 +1285,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.40.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/wykurz/rcp/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/wykurz/rcp/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/wykurz/rcp/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/wykurz/rcp/compare/v0.37.0...v0.38.0
