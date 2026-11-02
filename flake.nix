@@ -315,7 +315,7 @@
         mkRcpPackage = { packageName, binaryName, description }:
           packageRustPlatform.buildRustPackage {
             pname = binaryName;
-            version = "0.41.0";
+            version = "0.42.0";
             src = ./.;
 
             cargoLock = {
@@ -455,7 +455,7 @@
           # All tools in one package
           rcp-all = packageRustPlatform.buildRustPackage {
             pname = "rcp-all";
-            version = "0.41.0";
+            version = "0.42.0";
             src = ./.;
 
             cargoLock = {
