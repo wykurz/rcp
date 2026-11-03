@@ -4,6 +4,18 @@ name: AWS production benchmark
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Benchmark submission or separately approved identity-only acceptance
+        type: choice
+        options:
+          - benchmark
+          - identity-test
+        default: benchmark
+        required: true
+      identity_approval:
+        description: Nonsecret finite approval JSON for identity-test only; see PRODUCTION.md
+        type: string
+        required: false
       revision:
         description: Full source SHA for the initial four-copy A/A qualification (blank uses main)
         type: string
@@ -14,7 +26,7 @@ permissions:
 
 jobs:
   validate:
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && vars.RCP_AWS_PRODUCTION_ENABLED == 'true'
+    if: inputs.mode == 'benchmark' && github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && vars.RCP_AWS_PRODUCTION_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -36,6 +48,7 @@ jobs:
           PY
 
   build:
+    if: inputs.mode == 'benchmark'
     needs: validate
     runs-on: ubuntu-24.04
     cache-mode: none
@@ -79,6 +92,7 @@ jobs:
           if-no-files-found: error
 
   submit:
+    if: inputs.mode == 'benchmark'
     needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -120,4 +134,40 @@ jobs:
           name: production-admission-${{ github.run_attempt }}
           path: ${{ runner.temp }}/production-admission.json
           retention-days: 90
+          if-no-files-found: warn
+
+  identity-test:
+    if: inputs.mode == 'identity-test' && github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == 1 && (vars.RCP_AWS_PRODUCTION_ENABLED == '' || vars.RCP_AWS_PRODUCTION_ENABLED == 'false')
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    # no environment: the existing trust tests the main-ref subject, not an environment subject
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned identity verification dependencies before requesting tokens
+        run: |
+          python3 -m pip install --only-binary=:all: --require-hashes -r infra/aws_benchmark/production-requirements.txt
+      - name: Observe only signed identity and a deny-all STS session
+        env:
+          RCP_ACCEPTANCE_MODE: ${{ inputs.mode }}
+          RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
+          RCP_REQUESTED_REVISION: ${{ inputs.revision }}
+          RCP_IDENTITY_APPROVAL: ${{ inputs.identity_approval }}
+        run: |
+          python3 -B -m infra.aws_benchmark.acceptance_oidc_workflow > "$RUNNER_TEMP/oidc-observation.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: production-oidc-observation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-observation.json
+          retention-days: 30
           if-no-files-found: warn
