@@ -596,6 +596,77 @@ References:
    operating allowance and activation decisions. Do not call this initial acceptance foundation a
    complete production cutover.
 
+### Manual identity-only workflow acceptance
+
+The existing **AWS production benchmark** workflow has an explicit `identity-test` manual mode. It
+excludes validation, candidate building and submission, even if production is accidentally enabled.
+The identity job itself requires production's repository variable to be absent or exactly `false`;
+it never changes that variable or any AWS setting. Ordinary `benchmark` mode retains the existing
+enabled-variable gate. Unknown or missing modes run neither path.
+
+Merging this code does not approve dispatch. Before an explicitly approved single live run, verify
+the deployed submit role's immutable ID and trust, production disabled/idle state, the exact
+reviewed merged controller SHA, and a recovery window. Use only owner `wykurz` (ID `483465`), branch
+`main`, attempt 1. The role is pinned in `acceptance_oidc_workflow.py` to
+`arn:aws:iam::381183037896:role/rcp-production-benchmark-GitHubSubmitRole-hg2kGsuS3Qa1`, immutable
+ID `AROAVRQCHSHEKT2CRHFFR`, account `381183037896`, region `us-east-1`. A role replacement requires
+another reviewed pin update; no role/trust is created or widened by this workflow.
+
+Select `mode=identity-test`, leave `revision` blank, and supply `identity_approval` as a JSON object
+with exactly these five fields:
+
+| Field                     | Required value                                                                      |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `schema`                  | `rcp-oidc-workflow-approval-v1`                                                     |
+| `source_commit`           | Actual reviewed merged 40-character SHA for this run, never a branch name           |
+| `not_before`              | Approved Unix timestamp, integer                                                    |
+| `expires_at`              | Approved Unix timestamp, integer; after now and at most one hour after `not_before` |
+| `approval_capture_sha256` | SHA256 of the separately retained approval/preflight record                         |
+
+There must be more than 45 seconds remaining after the checkout and dependency installation. No
+runnable sample with synthetic times or IDs is provided. The hash is an audit reference, not a
+signature, bearer capability or proof of approval. Only the separately approved operator dispatch
+authorizes live use. Attempt 1 prevents job reruns; it does not prevent the owner from manually
+creating a different run, so reconcile an uncertain run before any new dispatch. Actual run ID is
+taken from the runner and compared with both signed tokens.
+
+The five-minute job uses a fresh GitHub-hosted Ubuntu runner, `cache-mode: none`, read-only checkout
+without persisted credentials, and hash-pinned Python dependencies installed before token
+acquisition. The approved SHA must equal `GITHUB_SHA`, `GITHUB_WORKFLOW_SHA` and clean checkout
+HEAD. No environment is attached: an environment would change the subject away from the existing
+main-ref trust. The job has only `contents: read` and `id-token: write`, and no repository secret,
+App key, candidate artifact, binary execution, release permission or production client invocation.
+
+One process obtains at most two OIDC JWTs, one for the deployed admission audience
+`rcp-production-benchmark-admission` and one for `sts.amazonaws.com`. The runner-provided token
+endpoint must be HTTPS beneath `actions.githubusercontent.com`; userinfo, fragments, other ports,
+redirects, proxies, duplicate audience selection, oversized or incomplete responses fail closed. A
+future GitHub endpoint-domain change requires review, not a permissive fallback. Tokens are passed
+directly in memory to `acceptance_oidc.run_probe`; they never become command arguments, exported
+environment values, files or logs. The runner's built-in request bearer necessarily exists in its
+environment, but is not forwarded to the checkout-verification subprocess. Memory erasure is not
+guaranteed.
+
+The 45-second process timer covers token retrieval, JWKS verification, the single STS exchange and
+`GetCallerIdentity`; cancellation and errors produce only the sanitized hold observation. There are
+no request retries. STS requests a 900-second session with an explicit deny-all session policy.
+`GetCallerIdentity` still works under that deny and verifies the exact immutable role. Cancellation,
+deleting the run or completing the job does not revoke an already issued session; retain its
+possible 15-minute validity as part of incident reconciliation.
+
+Only `oidc-observation.json` is uploaded, with 30-day retention. A success records authenticated
+matching main/run/source identity; `live_accepted` remains `false`. It does not prove underlying
+resource-policy denials, because the deny-all session masks any resource grants. It does not prove
+production admission, paid-run controls, publication-role access or signed negative actor/ref cases.
+The publication role stays disabled. Genuine signed negative fixtures require separate reviewed
+execution contexts; the verifier's early rejection of an unsigned wrong-ref payload is not live
+negative evidence.
+
+References:
+[GitHub OIDC claims and token requests](https://docs.github.com/en/actions/reference/security/oidc),
+[AWS web identity sessions](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html),
+[GetCallerIdentity permission behavior](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html).
+
 ## Maintenance and unresolved production prerequisites
 
 Close the separate admission gate and wait for ownership retirement before rotating policy version,
