@@ -163,14 +163,14 @@ class WorkflowAdapterTests(unittest.TestCase):
             def runner(cfg, reader, **kwargs):
                 return reader()
             result = lane.run(environment(), source=lambda: SHA, clock=lambda: NOW, fetch=fetch, runner=runner)
-            self.assertEqual(result, probe._hold())
+            self.assertEqual(result, probe._hold(probe.Progress(stage=probe.Stage.TOKEN_REQUEST)))
             self.assertEqual(fetch.call_count, failing)
         fetch = Mock(return_value="a.b.c")
         def repeated(cfg, reader, **kwargs):
             reader()
             return reader()
         self.assertEqual(lane.run(environment(), source=lambda: SHA, clock=lambda: NOW,
-            fetch=fetch, runner=repeated), probe._hold())
+            fetch=fetch, runner=repeated), probe._hold(probe.Progress(stage=probe.Stage.TOKEN_REQUEST)))
         self.assertEqual(fetch.call_count, 2)
 
     def test_expiration_between_fetches_stops_before_second_request(self):
@@ -182,7 +182,7 @@ class WorkflowAdapterTests(unittest.TestCase):
         def runner(cfg, reader, **kwargs):
             return reader()
         self.assertEqual(lane.run(environment(), source=lambda: SHA, clock=lambda: now[0],
-            fetch=fetch, runner=runner), probe._hold())
+            fetch=fetch, runner=runner), probe._hold(probe.Progress(stage=probe.Stage.TOKEN_REQUEST)))
         fetch.assert_called_once()
 
     def test_endpoint_and_bearer_validation_precedes_any_connection(self):
@@ -259,13 +259,25 @@ class WorkflowAdapterTests(unittest.TestCase):
         def adapter(cfg, reader, **kwargs):
             reader()
             return sts()
-        def runner(env):
-            return lane.run(env, source=lambda: SHA, clock=lambda: NOW, fetch=fetch, runner=adapter)
+        def runner(env, **kwargs):
+            return lane.run(env, source=lambda: SHA, clock=lambda: NOW, fetch=fetch, runner=adapter, **kwargs)
         output = io.StringIO()
         self.assertEqual(lane.main([], env=environment(), output=output, runner=runner), 1)
-        self.assertEqual(json.loads(output.getvalue()), probe._hold())
+        self.assertEqual(json.loads(output.getvalue()), probe._hold(probe.Progress(stage=probe.Stage.TOKEN_REQUEST)))
         fetch.assert_called_once()
         sts.assert_not_called()
+
+    def test_outer_cancellation_retains_only_fixed_inner_stage_and_provider_labels(self):
+        def runner(env, *, progress):
+            progress.stage = probe.Stage.STS_RESPONSE_IDENTITY
+            progress.provider = probe.ProviderForm.EXPECTED_PROVIDER_ARN
+            raise lane.Interrupted(SECRET)
+        output = io.StringIO()
+        self.assertEqual(lane.main([], env=environment(), output=output, runner=runner), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result, probe._hold(probe.Progress(
+            stage=probe.Stage.STS_RESPONSE_IDENTITY, provider=probe.ProviderForm.EXPECTED_PROVIDER_ARN)))
+        self.assertNotIn(SECRET, output.getvalue())
 
     def test_cli_and_process_alarm_or_cancellation_emit_only_sanitized_hold(self):
         result = subprocess.run([sys.executable, "-B", "-m", "infra.aws_benchmark.acceptance_oidc_workflow"],
@@ -277,7 +289,7 @@ class WorkflowAdapterTests(unittest.TestCase):
             program = """import time
 from infra.aws_benchmark import acceptance_oidc_workflow as lane
 lane.probe.SECONDS = 0.2 if not CANCEL else 5
-def blocked(env):
+def blocked(env, **kwargs):
     print('ready', flush=True)
     time.sleep(10)
 original = lane.main

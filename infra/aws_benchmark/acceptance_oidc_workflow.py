@@ -145,13 +145,15 @@ def request_token(audience, env, *, connection_factory=http.client.HTTPSConnecti
                     pass
 
 
-def run(env, *, source=checkout_commit, clock=time.time, fetch=request_token, runner=probe.run_probe):
+def run(env, *, source=checkout_commit, clock=time.time, fetch=request_token, runner=probe.run_probe, progress=None):
     """Validate first, fetch each audience once, then reuse the identity-only adapter."""
+    progress = probe.Progress() if progress is None else progress
     try:
         config = configuration(env, source=source, clock=clock)
         used = False
         def tokens():
             nonlocal used
+            progress.stage = probe.Stage.TOKEN_REQUEST
             require(not used)
             used = True
             result = {}
@@ -159,18 +161,19 @@ def run(env, *, source=checkout_commit, clock=time.time, fetch=request_token, ru
                 require(config["not_before"] <= clock() < config["expires_at"])
                 result[name] = fetch(audience, env)
             return result
-        return runner(config, tokens, clock=clock)
+        return runner(config, tokens, clock=clock, progress=progress)
     except Exception:
-        return probe._hold()
+        return probe._hold(progress)
 
 
 def main(argv=None, *, env=None, output=None, runner=run):
     output = sys.stdout if output is None else output
+    progress = probe.Progress()
     try:
         require(not (sys.argv[1:] if argv is None else argv))
-        result = runner(os.environ if env is None else env)
+        result = runner(os.environ if env is None else env, progress=progress)
     except (Exception, Interrupted):
-        result = probe._hold()
+        result = probe._hold(progress)
     output.write(json.dumps(result, sort_keys=True, allow_nan=False) + "\n")
     return 0 if result["ok"] else 1
 

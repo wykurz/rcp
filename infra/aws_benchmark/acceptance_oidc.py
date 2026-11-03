@@ -13,7 +13,9 @@ not a hard deadline. Failures, including AccessDenied, establish no negative
 acceptance. Real signed negative-ref and role fixtures remain separate live gates.
 """
 
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 import hashlib
 import json
 import math
@@ -44,6 +46,51 @@ UNPROVEN = ["signed-negative-ref-rejection", "negative-role-policy-cases", "whol
 # needs no permission even under explicit deny (see the AWS API reference)
 SESSION_POLICY = '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}'
 
+
+
+class Stage(Enum):
+    CONFIGURATION = "configuration"
+    TOKEN_REQUEST = "token-request"
+    SIGNED_ADMISSION = "signed-admission"
+    STS_EXCHANGE = "sts-exchange"
+    STS_RESPONSE_IDENTITY = "sts-response-identity"
+    SIGNED_STS_CLAIMS = "signed-sts-claims"
+    ASSUMED_ROLE_IDENTITY = "assumed-role-identity"
+    CREDENTIAL_METADATA = "credential-metadata"
+    CALLER_IDENTITY = "caller-identity"
+    COMPLETE = "complete"
+
+
+class ProviderForm(Enum):
+    NOT_OBSERVED = "not-observed"
+    DOCUMENTED_ISSUER = "documented-issuer"
+    EXPECTED_PROVIDER_ARN = "expected-provider-arn"
+    OTHER = "other"
+    ABSENT = "absent"
+
+
+@dataclass
+class Progress:
+    """Share only fixed labels with the outer cancellation handler, never response data."""
+    stage: Stage = Stage.CONFIGURATION
+    provider: ProviderForm = ProviderForm.NOT_OBSERVED
+
+    def snapshot(self):
+        # fail closed even if a future caller assigns an unclassified value
+        return dict(stage=self.stage.value if type(self.stage) is Stage else "unknown",
+                    provider=self.provider.value if type(self.provider) is ProviderForm else "unknown")
+
+
+def provider_form(value, account):
+    """Recognize only the issuer or the exact account-bound GitHub provider, never a suffix."""
+    if value is None:
+        return ProviderForm.ABSENT
+    if type(value) is str:
+        if value == auth.ISSUER:
+            return ProviderForm.DOCUMENTED_ISSUER
+        if value == "arn:aws:iam::" + account + ":oidc-provider/token.actions.githubusercontent.com":
+            return ProviderForm.EXPECTED_PROVIDER_ARN
+    return ProviderForm.OTHER
 
 def _matches(pattern, value):
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
@@ -112,14 +159,18 @@ def _authenticated_claims(token):
     return auth._json(auth._segment(parts[1]))
 
 
-def _hold():
+def _hold(progress=None):
     return dict(schema=OBSERVATION, ok=False, live_accepted=False, unproven=list(UNPROVEN),
-                hold="OIDC probe incomplete; retain evidence and reconcile before retry")
+                hold="OIDC probe incomplete; retain evidence and reconcile before retry",
+                diagnostics=(Progress() if progress is None else progress).snapshot())
 
 
 def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
-              clock=time.time, monotonic=time.monotonic):
+              clock=time.time, monotonic=time.monotonic, progress=None):
     """Call only JWKS, AssumeRoleWithWebIdentity and GetCallerIdentity, without retries."""
+    progress = Progress() if progress is None else progress
+    progress.stage = Stage.CONFIGURATION
+    progress.provider = ProviderForm.NOT_OBSERVED
     clients = []
     try:
         start = _clock(monotonic)
@@ -130,12 +181,14 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
             require(0 <= _clock(monotonic) - start < SECONDS)
             return now
         require(check() + SECONDS < config["expires_at"])
+        progress.stage = Stage.TOKEN_REQUEST
         tokens = token_reader()
         require(type(tokens) is dict and set(tokens) == {"admission_token", "sts_token"})
         for token in tokens.values():
             require(isinstance(token, str) and 0 < len(token) <= auth.MAX_TOKEN_BYTES and token.isascii())
         require(tokens["admission_token"] != tokens["sts_token"])
         check()
+        progress.stage = Stage.SIGNED_ADMISSION
         identity = _verifier(config, clock, jwks_fetcher).verify(tokens["admission_token"])
         expected = {name: getattr(identity, name) for name in IDENTITY_FIELDS}
         for name in ("workflow_ref", "run_id", "run_attempt", "actor", "actor_id", "event_name"):
@@ -144,6 +197,7 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
         subject = "repo:wykurz/rcp:ref:refs/heads/main"
         require(_authenticated_claims(tokens["admission_token"])["sub"] == subject)
         require(check() < identity.expires_at)
+        progress.stage = Stage.STS_EXCHANGE
         unsigned = factory()
         clients.append(unsigned)
         session_name = "rcp-acceptance-" + config["run_id"] + "-1"
@@ -152,10 +206,13 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
             RoleSessionName=session_name, WebIdentityToken=tokens["sts_token"],
             DurationSeconds=900, Policy=SESSION_POLICY)
         now = check()
-        require(response.get("Provider") == auth.ISSUER
+        progress.stage = Stage.STS_RESPONSE_IDENTITY
+        progress.provider = provider_form(response.get("Provider"), config["account"])
+        require(progress.provider in (ProviderForm.DOCUMENTED_ISSUER, ProviderForm.EXPECTED_PROVIDER_ARN)
                 and response.get("Audience") == "sts.amazonaws.com"
                 and response.get("SubjectFromWebIdentityToken") == subject)
         # STS success authenticates this exact token. Parsing alone is never identity evidence.
+        progress.stage = Stage.SIGNED_STS_CLAIMS
         claims = _authenticated_claims(tokens["sts_token"])
         require(claims.get("iss") == auth.ISSUER and claims.get("aud") == "sts.amazonaws.com"
                 and claims.get("sub") == subject)
@@ -167,17 +224,20 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
                 and now - claims["iat"] < auth.MAX_TOKEN_AGE_SECONDS
                 and 0 < claims["exp"] - claims["iat"] <= auth.MAX_TOKEN_LIFETIME_SECONDS
                 and now < min(claims["exp"], identity.expires_at))
+        progress.stage = Stage.ASSUMED_ROLE_IDENTITY
         role_name = config["role_arn"].rsplit("/", 1)[1]
         arn = "arn:aws:sts::" + config["account"] + ":assumed-role/" + role_name + "/" + session_name
         user_id = config["role_id"] + ":" + session_name
         assumed = response.get("AssumedRoleUser", {})
         require(assumed.get("Arn") == arn and assumed.get("AssumedRoleId") == user_id)
+        progress.stage = Stage.CREDENTIAL_METADATA
         credentials = response["Credentials"]
         require(all(isinstance(credentials.get(name), str) and credentials[name]
                     for name in ("AccessKeyId", "SecretAccessKey", "SessionToken")))
         expiration = credentials.get("Expiration")
         require(isinstance(expiration, datetime) and expiration.tzinfo is not None
                 and now < expiration.timestamp() <= now + 960)
+        progress.stage = Stage.CALLER_IDENTITY
         signed = factory(credentials=credentials)
         clients.append(signed)
         require(check() < min(claims["exp"], identity.expires_at, expiration.timestamp()))
@@ -185,15 +245,16 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
         require(caller.get("Account") == config["account"] and caller.get("Arn") == arn
                 and caller.get("UserId") == user_id)
         require(check() < min(claims["exp"], identity.expires_at, expiration.timestamp()))
+        progress.stage = Stage.COMPLETE
         digest = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return dict(schema=OBSERVATION, ok=True, live_accepted=False, unproven=list(UNPROVEN),
-            bindings_sha256=digest, source_commit=config["source_commit"],
+            diagnostics=progress.snapshot(), bindings_sha256=digest, source_commit=config["source_commit"],
             account=config["account"], region=config["region"], role_arn=config["role_arn"],
             role_id=config["role_id"], identity=expected,
             cases={"signed_admission_main": True, "sts_same_run_main": True, "exact_role_identity": True})
     except Exception:
         # token, credential, SDK error and response bytes never enter output or exception text
-        return _hold()
+        return _hold(progress)
     finally:
         for client in clients:
             try:
@@ -205,6 +266,7 @@ def run_probe(config, token_reader, *, factory=sdk_sts, jwks_fetcher=None,
 def main(argv=None, *, stream=None, output=None, runner=run_probe):
     """Read one ephemeral runner pipe; reject arguments and interactive terminals."""
     output = sys.stdout if output is None else output
+    progress = Progress()
     try:
         require(not (sys.argv[1:] if argv is None else argv))
         if stream is None:
@@ -216,9 +278,9 @@ def main(argv=None, *, stream=None, output=None, runner=run_probe):
         envelope = parse_json(raw.decode("utf-8"))
         require(type(envelope) is dict and set(envelope) == {"config", "admission_token", "sts_token"})
         result = runner(envelope["config"], lambda: {name: envelope[name]
-            for name in ("admission_token", "sts_token")})
+            for name in ("admission_token", "sts_token")}, progress=progress)
     except Exception:
-        result = _hold()
+        result = _hold(progress)
     output.write(json.dumps(result, sort_keys=True, allow_nan=False) + "\n")
     return 0 if result["ok"] else 1
 

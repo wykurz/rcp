@@ -654,6 +654,25 @@ no request retries. STS requests a 900-second session with an explicit deny-all 
 deleting the run or completing the job does not revoke an already issued session; retain its
 possible 15-minute validity as part of incident reconciliation.
 
+The observation adds only fixed `diagnostics.stage` and `diagnostics.provider` labels. The stage is
+the operation being checked when an error or cancellation occurs, not proof of that operation's
+completion or a negative IAM test. Provider labels distinguish the documented issuer URL, the exact
+account-bound GitHub provider ARN, another value, an absent value, and a provider not yet
+classified. Raw provider values, response objects, tokens, credentials and exception messages never
+enter these diagnostics. Cancellation retains the last label while still returning a failed hold. In
+particular, `not-observed` can follow a successful STS exchange if the deadline check or
+cancellation interrupts before provider classification; it does not prove that no session was
+issued.
+
+STS provider identity accepts only `https://token.actions.githubusercontent.com` or
+`arn:aws:iam::381183037896:oidc-provider/token.actions.githubusercontent.com`. JWT issuer, audience,
+subject, exact role/session and all existing identity checks are unchanged. The
+[STS API reference](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html)
+describes the issuer form; a [raw SDK response report](https://github.com/boto/botocore/issues/2139)
+also demonstrates the ARN form. A CloudTrail provider ARN alone does not establish the raw SDK
+response or the precise cause of an earlier generic hold. Offline tests cover both response forms; a
+separately approved live observation is still required.
+
 Only `oidc-observation.json` is uploaded, with 30-day retention. A success records authenticated
 matching main/run/source identity; `live_accepted` remains `false`. It does not prove underlying
 resource-policy denials, because the deny-all session masks any resource grants. It does not prove
