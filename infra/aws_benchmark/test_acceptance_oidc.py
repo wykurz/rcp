@@ -98,7 +98,10 @@ class AcceptanceOidcTests(unittest.TestCase):
     def assert_hold(self, result):
         self.assertFalse(result["ok"])
         self.assertFalse(result["live_accepted"])
-        self.assertEqual(result, probe._hold())
+        self.assertEqual({k: v for k, v in result.items() if k != "diagnostics"},
+                         {k: v for k, v in probe._hold().items() if k != "diagnostics"})
+        self.assertIn(result["diagnostics"]["stage"], {stage.value for stage in probe.Stage})
+        self.assertIn(result["diagnostics"]["provider"], {form.value for form in probe.ProviderForm})
         encoded = json.dumps(result)
         for secret in [SENTINEL, *self.tokens.values(), CREDENTIALS["AccessKeyId"]]:
             self.assertNotIn(secret, encoded)
@@ -106,6 +109,7 @@ class AcceptanceOidcTests(unittest.TestCase):
     def test_verified_main_identity_is_bound_to_two_distinct_audiences_and_exact_role(self):
         result = self.run_probe()
         self.assertTrue(result["ok"])
+        self.assertEqual(result["diagnostics"], dict(stage="complete", provider="documented-issuer"))
         self.assertFalse(result["live_accepted"])
         self.assertEqual(result["unproven"], probe.UNPROVEN)
         self.assertEqual(result["identity"], {name: claims()[name] for name in probe.IDENTITY_FIELDS})
@@ -217,7 +221,10 @@ class AcceptanceOidcTests(unittest.TestCase):
             self.elapsed = 45
             return sts_response()
         self.unsigned.assume_role_with_web_identity.side_effect = late_sts
-        self.assert_hold(self.run_probe())
+        result = self.run_probe()
+        self.assert_hold(result)
+        # a returned response can remain unclassified: labels do not prove no session was issued
+        self.assertEqual(result["diagnostics"], dict(stage="sts-exchange", provider="not-observed"))
         self.assertEqual(self.factory.call_count, 1)
         self.unsigned.close.assert_called_once_with()
         self.signed.get_caller_identity.assert_not_called()
@@ -243,7 +250,7 @@ class AcceptanceOidcTests(unittest.TestCase):
 
     def test_bounded_stdin_accepts_only_an_ephemeral_envelope_and_no_arguments(self):
         envelope = dict(config=config(), **self.tokens)
-        def runner(configuration, token_reader):
+        def runner(configuration, token_reader, **kwargs):
             self.assertEqual(configuration, config())
             self.assertEqual(token_reader(), self.tokens)
             return dict(ok=True, live_accepted=False)
@@ -304,7 +311,7 @@ class AcceptanceOidcTests(unittest.TestCase):
             self.assertEqual(client.meta.config.connect_timeout, 1)
             self.assertEqual(client.meta.config.read_timeout, 3)
 
-    def test_real_sdk_wire_round_trip_is_unsigned_then_session_signed_and_redacted(self):
+    def wire_round_trip(self, provider, *, accepted):
         sent = []
         def response(action, fields):
             body = f'<{action}Response xmlns="https://sts.amazonaws.com/doc/2011-06-15/">'
@@ -327,7 +334,8 @@ class AcceptanceOidcTests(unittest.TestCase):
                 # the simulated provider verifies this locally signed fixture before success
                 jwt.decode(token, self.signer.public_key(), algorithms=["RS256"], issuer=auth.ISSUER,
                     audience="sts.amazonaws.com", options={"verify_exp": False, "verify_iat": False, "verify_nbf": False})
-                fields = '<Provider>' + auth.ISSUER + '</Provider><Audience>sts.amazonaws.com</Audience>'
+                fields = '' if provider is None else '<Provider>' + escape(provider) + '</Provider>'
+                fields += '<Audience>sts.amazonaws.com</Audience>'
                 fields += '<SubjectFromWebIdentityToken>' + SUBJECT + '</SubjectFromWebIdentityToken>'
                 fields += '<AssumedRoleUser><Arn>' + ARN + '</Arn><AssumedRoleId>' + USER_ID + '</AssumedRoleId></AssumedRoleUser>'
                 fields += '<Credentials>' + ''.join('<' + key + '>' + escape(value) + '</' + key + '>'
@@ -355,8 +363,11 @@ class AcceptanceOidcTests(unittest.TestCase):
         finally:
             logger.removeHandler(handler)
             logger.setLevel(old_level)
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(result["ok"], accepted, result)
+        self.assertEqual(len(sent), 2 if accepted else 1)
+        if not accepted:
+            self.assert_hold(result)
+            self.assertEqual(result["diagnostics"]["stage"], "sts-response-identity")
         captured = logs.getvalue() + json.dumps(result)
         for secret in (SENTINEL, *self.tokens.values(), CREDENTIALS["AccessKeyId"]):
             self.assertNotIn(secret, captured)
@@ -395,6 +406,62 @@ class AcceptanceOidcTests(unittest.TestCase):
             self.assertEqual(len(sends), 1)
             for secret in (SENTINEL, *self.tokens.values()):
                 self.assertNotIn(secret, logs.getvalue())
+
+
+    def test_real_sdk_wire_accepts_exact_provider_url_and_account_bound_arn(self):
+        for provider in (auth.ISSUER, "arn:aws:iam::381183037896:oidc-provider/token.actions.githubusercontent.com"):
+            with self.subTest(provider=provider):
+                self.wire_round_trip(provider, accepted=True)
+
+    def test_real_sdk_wire_rejects_other_accounts_paths_partitions_suffixes_and_missing_provider(self):
+        expected = "arn:aws:iam::381183037896:oidc-provider/token.actions.githubusercontent.com"
+        for provider in (None, "", "token.actions.githubusercontent.com",
+                         expected.replace("381183037896", "000000000000"),
+                         expected.replace("arn:aws:", "arn:aws-us-gov:"),
+                         expected.replace("oidc-provider/", "oidc-provider/path/"),
+                         expected + "/", expected + ".evil.invalid", auth.ISSUER + "/",
+                         auth.ISSUER + ".evil.invalid", SENTINEL):
+            with self.subTest(provider=provider):
+                self.wire_round_trip(provider, accepted=False)
+
+    def test_failure_stage_labels_do_not_echo_provider_response_or_exception_data(self):
+        def check(result, stage, provider="not-observed"):
+            self.assert_hold(result)
+            self.assertEqual(result["diagnostics"], dict(stage=stage, provider=provider))
+        check(self.run_probe(config(account=SENTINEL)), "configuration")
+        self.reader.side_effect = ValueError(SENTINEL)
+        check(self.run_probe(), "token-request")
+        self.reader.side_effect = lambda: dict(self.tokens)
+        with patch.object(probe, "_verifier", side_effect=ValueError(SENTINEL)):
+            check(self.run_probe(), "configuration")
+        with patch.object(auth.GitHubIdentityVerifier, "verify", side_effect=ValueError(SENTINEL)):
+            check(self.run_probe(), "signed-admission")
+        self.unsigned.assume_role_with_web_identity.side_effect = ValueError(SENTINEL)
+        self.factory = Mock(return_value=self.unsigned)
+        check(self.run_probe(), "sts-exchange")
+        self.unsigned.assume_role_with_web_identity.side_effect = None
+        for value, label in ((SENTINEL, "other"), (None, "absent"), ({SENTINEL: SENTINEL}, "other")):
+            self.unsigned.assume_role_with_web_identity.return_value = dict(sts_response(), Provider=value)
+            check(self.run_probe(), "sts-response-identity", label)
+        self.unsigned.assume_role_with_web_identity.return_value = sts_response()
+        self.tokens["sts_token"] = self.token(aud="sts.amazonaws.com", iss=SENTINEL)
+        check(self.run_probe(), "signed-sts-claims", "documented-issuer")
+        self.tokens["sts_token"] = self.token(aud="sts.amazonaws.com")
+        for field, value, stage in (
+            ("AssumedRoleUser", dict(Arn=SENTINEL), "assumed-role-identity"),
+            ("Credentials", dict(SecretAccessKey=SENTINEL), "credential-metadata")):
+            self.unsigned.assume_role_with_web_identity.return_value = dict(sts_response(), **{field: value})
+            check(self.run_probe(), stage, "documented-issuer")
+        self.unsigned.assume_role_with_web_identity.return_value = sts_response()
+        self.factory = Mock(side_effect=[self.unsigned, self.signed])
+        self.signed.get_caller_identity.side_effect = ValueError(SENTINEL)
+        check(self.run_probe(), "caller-identity", "documented-issuer")
+
+    def test_diagnostic_serialization_never_accepts_unclassified_values(self):
+        for value in (SENTINEL, {SENTINEL: SENTINEL}, None):
+            result = probe._hold(probe.Progress(stage=value, provider=value))
+            self.assertEqual(result["diagnostics"], dict(stage="unknown", provider="unknown"))
+            self.assertNotIn(SENTINEL, json.dumps(result))
 
 
 if __name__ == "__main__":
