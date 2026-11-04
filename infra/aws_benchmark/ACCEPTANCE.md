@@ -8,6 +8,10 @@ identity, policy and resource state; a locally editable receipt is not remote at
 The first supported account/region is `381183037896` / `us-east-1`. The existing production
 [acceptance gates](PRODUCTION.md) and [reader/writer trust procedure](TRUST.md) still apply.
 
+The [isolated admission wrapper](ADMISSION-ACCEPTANCE.md) separately exercises real
+Admission/RunStore limits and races. It has its own schema, durable phase claims and fixture-only
+role; the storage canary below does not establish that integration proof.
+
 ## Offline preparation
 
 The modules separate case logic, fixed Lambda bindings, runtime adapters, package construction and
