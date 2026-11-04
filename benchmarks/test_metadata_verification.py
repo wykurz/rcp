@@ -7,12 +7,11 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from benchmarks import capacity, report, run, streaming
-from benchmarks.harness_test_support import run_fixture
+from benchmarks.harness_test_support import fake_stat, run_fixture
 
 
 class MetadataVerificationTests(unittest.TestCase):
@@ -66,9 +65,20 @@ class MetadataVerificationTests(unittest.TestCase):
         file.write_bytes(b"damaged-content")
         os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertEqual(file.stat().st_ino, before.st_ino)
-        self.assertNotEqual(file.stat().st_ctime_ns, before.st_ctime_ns)
-        self.assertTrue(streaming.validate_tree(self.source, expected)["ok"])
-        proof = streaming.validate_tree(self.source, expected, source=True)
+        self.assertEqual(file.stat().st_mtime_ns, before.st_mtime_ns)
+        content_proof = streaming.validate_tree(self.source, full)
+        self.assertFalse(content_proof["ok"])
+        self.assertFalse(content_proof["digest_match"])
+        original = os.fstat
+        def changed_ctime(fd):
+            value = original(fd)
+            if (value.st_dev, value.st_ino) == (before.st_dev, before.st_ino):
+                return fake_stat(value, st_ctime_ns=before.st_ctime_ns + 1)
+            return value
+        # rapid writes can share a ctime tick; control only that observation, not the verifier
+        with mock.patch.object(streaming.os, "fstat", side_effect=changed_ctime):
+            self.assertTrue(streaming.validate_tree(self.source, expected)["ok"])
+            proof = streaming.validate_tree(self.source, expected, source=True)
         self.assertFalse(proof["ok"])
         self.assertEqual(proof["error"], "source metadata changed")
         self.assertTrue(proof["digest_match"])
@@ -191,8 +201,7 @@ class MetadataVerificationTests(unittest.TestCase):
             calls += 1
             value = original(fd)
             if calls == 2:
-                fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
-                return SimpleNamespace(**dict(fields, st_mtime_ns=value.st_mtime_ns + 1))
+                return fake_stat(value, st_mtime_ns=value.st_mtime_ns + 1)
             return value
         parent = os.open(self.source / "directory", os.O_RDONLY | os.O_DIRECTORY)
         try:

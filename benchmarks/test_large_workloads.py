@@ -14,7 +14,7 @@ from unittest import mock
 
 from benchmarks import capacity, report, run, streaming
 from benchmarks.test_pair_boundaries import paired_record
-from benchmarks.harness_test_support import run_fixture
+from benchmarks.harness_test_support import fake_stat, run_fixture
 
 
 class CapacityTests(unittest.TestCase):
@@ -189,8 +189,7 @@ class StreamingTests(unittest.TestCase):
             calls += 1
             value = original(fd)
             if calls == 2:
-                fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
-                return SimpleNamespace(**dict(fields, st_mtime_ns=value.st_mtime_ns + 1))
+                return fake_stat(value, st_mtime_ns=value.st_mtime_ns + 1)
             return value
         parent = os.open(self.source / "a", os.O_RDONLY | os.O_DIRECTORY)
         try:
