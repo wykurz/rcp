@@ -57,21 +57,23 @@ class NegativeWorkflowTests(unittest.TestCase):
     def test_existing_and_symlink_journal_hold_without_fetch_and_preserve_target(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / adapter.JOURNAL_NAME
-            path.write_text(SECRET)
+            # Public binary fixture tests preservation; leak markers belong only in leak checks.
+            sentinel = b"public existing-file fixture\x00preserve exact bytes\n"
+            path.write_bytes(sentinel)
             fetch = Mock()
             result = adapter.run(environment(directory), fetch=fetch,
                 source=lambda: SHA, clock=lambda: NOW)
             self.assertFalse(result["ok"])
             fetch.assert_not_called()
-            self.assertEqual(path.read_text(), SECRET)
+            self.assertEqual(path.read_bytes(), sentinel)
             path.unlink()
             target = Path(directory) / "target"
-            target.write_text(SECRET)
+            target.write_bytes(sentinel)
             path.symlink_to(target)
             self.assertFalse(adapter.run(environment(directory), fetch=fetch,
                 source=lambda: SHA, clock=lambda: NOW)["ok"])
             fetch.assert_not_called()
-            self.assertEqual(target.read_text(), SECRET)
+            self.assertEqual(target.read_bytes(), sentinel)
 
     def test_journal_rejects_extra_fields_or_labels(self):
         with tempfile.TemporaryDirectory() as directory:
