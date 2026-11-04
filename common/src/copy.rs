@@ -1273,10 +1273,10 @@ impl WalkVisitor for CopyVisitor {
             .with_context(|| format!("cannot open directory {:?} for reading", src_path))
             .map_err(|err| Error::new(err, Default::default()))?;
         let src_dir = Arc::new(src_dir);
-        // the directory metadata applied to the destination comes from the SAME fd whose contents we
-        // enumerate (read-side fidelity, docs/tocttou.md), not the classify `Handle`: a swap of the
-        // dir entry between classify and `open_dir` is caught by O_NOFOLLOW (fail-closed), and on a
-        // same-name dir swap the applied metadata pairs with the contents actually copied.
+        // the directory metadata applied to the destination comes from the held directory we
+        // enumerate (read-side fidelity, docs/tocttou.md). on ESPIPE, reopening "." relative to
+        // the held fd preserves that inode. the classify `Handle` may predate a directory swap;
+        // O_NOFOLLOW rejects a swapped-in symlink, and metadata pairs with the directory copied
         let src_meta = src_dir
             .meta()
             .await

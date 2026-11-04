@@ -2328,8 +2328,9 @@ async fn link_dir_contents(
     // directory itself was created/opened above. skipped in dry-run (no directory exists). prefer
     // the update directory's metadata when an update tree is present at this level (it is the
     // materialized version, matching the old `update_metadata_opt` preference), else the source
-    // directory's. The metadata is read from the SAME fd whose contents were enumerated (read-side
-    // fidelity, docs/tocttou.md), not the classify handles.
+    // directory's. the metadata comes from the held directory whose contents were enumerated
+    // (read-side fidelity, docs/tocttou.md), not the classify handles. an ESPIPE fallback opens "."
+    // relative to that held fd, so enumeration still uses the same directory inode
     tracing::debug!("set 'dst' directory metadata");
     let metadata_result = match dst_dir {
         Some(dst_dir) => {
@@ -8186,20 +8187,39 @@ mod link_tests {
     mod race_tests {
         use super::*;
 
-        // Repeatedly swap `dir/entry_name` between a real regular file (content `REAL_CONTENT`) and
+        struct SwapperGuard {
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for SwapperGuard {
+            fn drop(&mut self) {
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(thread) = self.thread.take() {
+                    let result = thread.join();
+                    // preserve the original test panic if the swapper also panicked
+                    if !std::thread::panicking() {
+                        result.expect("swapper thread panicked");
+                    }
+                }
+            }
+        }
+
+        // repeatedly swap `dir/entry_name` between a real regular file (content `REAL_CONTENT`) and
         // a symlink pointing at `sentinel`, using rename so each individual state is atomic. Runs on
         // a dedicated OS thread so it makes progress regardless of the tokio runtime's scheduling.
         fn spawn_file_symlink_swapper(
             dir: std::path::PathBuf,
             entry_name: &'static str,
             sentinel: std::path::PathBuf,
-            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        ) -> std::thread::JoinHandle<()> {
-            std::thread::spawn(move || {
+        ) -> SwapperGuard {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
                 let entry = dir.join(entry_name);
                 let staged_real = dir.join("__staged_real");
                 let staged_link = dir.join("__staged_link");
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = std::fs::remove_file(&staged_real);
                     if std::fs::write(&staged_real, b"REAL_CONTENT").is_err() {
                         continue;
@@ -8209,7 +8229,11 @@ mod link_tests {
                     let _ = std::os::unix::fs::symlink(&sentinel, &staged_link);
                     let _ = std::fs::rename(&staged_link, &entry);
                 }
-            })
+            });
+            SwapperGuard {
+                stop,
+                thread: Some(thread),
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8230,17 +8254,22 @@ mod link_tests {
             tokio::fs::create_dir(&src).await?;
             tokio::fs::create_dir(&sub).await?;
             tokio::fs::write(sub.join("entry"), "REAL_CONTENT").await?;
-
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let swapper =
-                spawn_file_symlink_swapper(sub.clone(), "entry", sentinel.clone(), stop.clone());
-
+            let mut swapper = None;
             // overwrite=true so each iteration's destination need not be empty; no update tree, so
             // `src/sub/entry` takes the hard-link path (or copy-as-symlink when caught mid-swap).
             let settings = common_settings(false, true);
             let mut caught_swaps = 0usize;
             let mut linked_real = 0usize;
+            let mut linked_symlinks = 0usize;
             for i in 0..200 {
+                // establish a real-file control before the 199 concurrent swap attempts
+                if i == 1 {
+                    swapper = Some(spawn_file_symlink_swapper(
+                        sub.clone(),
+                        "entry",
+                        sentinel.clone(),
+                    ));
+                }
                 let dst = test_path.join(format!("dst_{i}"));
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
@@ -8248,6 +8277,20 @@ mod link_tests {
                 )
                 .await
                 .expect("link must not hang under concurrent swapping");
+                let entry_dst = dst.join("sub").join("entry");
+                let metadata = tokio::fs::symlink_metadata(&entry_dst).await;
+                if i == 0 {
+                    result
+                        .as_ref()
+                        .expect("the stable regular-file control must succeed");
+                    assert!(
+                        metadata
+                            .as_ref()
+                            .expect("the stable regular-file control must create the entry")
+                            .is_file(),
+                        "the stable regular-file control must create a regular file"
+                    );
+                }
                 match result {
                     Ok(_) => {}
                     Err(_) => caught_swaps += 1, // a swap was caught mid-link (failed closed)
@@ -8257,27 +8300,33 @@ mod link_tests {
                 // (linkat made a hard link to the symlink inode, or copy reproduced the symlink) or
                 // be absent. A symlink that resolves to the sentinel is fine: it is a link, not a
                 // copy of the secret bytes, and it did not give the sentinel a new hard link.
-                let entry_dst = dst.join("sub").join("entry");
-                if let Ok(md) = tokio::fs::symlink_metadata(&entry_dst).await
-                    && md.file_type().is_file()
-                {
-                    let content = tokio::fs::read_to_string(&entry_dst).await?;
-                    assert_ne!(
-                        content, "SENTINEL_SECRET_CONTENT",
-                        "iteration {i}: sentinel content leaked into the destination as a regular file"
-                    );
-                    assert_eq!(
-                        content, "REAL_CONTENT",
-                        "iteration {i}: a regular destination file must hold the real content"
-                    );
-                    linked_real += 1;
+                if let Ok(md) = metadata {
+                    if md.file_type().is_file() {
+                        let content = tokio::fs::read_to_string(&entry_dst).await?;
+                        assert_ne!(
+                            content, "SENTINEL_SECRET_CONTENT",
+                            "iteration {i}: sentinel content leaked into the destination as a regular file"
+                        );
+                        assert_eq!(
+                            content, "REAL_CONTENT",
+                            "iteration {i}: a regular destination file must hold the real content"
+                        );
+                        // count concurrent outcomes separately from the stable control
+                        if i > 0 {
+                            linked_real += 1;
+                        }
+                    } else if md.file_type().is_symlink() {
+                        assert_eq!(
+                            tokio::fs::read_link(&entry_dst).await?,
+                            sentinel,
+                            "iteration {i}: a destination symlink must preserve the literal target"
+                        );
+                        linked_symlinks += 1;
+                    }
                 }
                 let _ = tokio::fs::remove_dir_all(&dst).await;
             }
-
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            swapper.join().expect("swapper thread panicked");
-
+            drop(swapper);
             // the sentinel must never have gained a hard link from a `linkat` that followed the
             // swapped-in symlink (flags=0 links the symlink inode itself, not its target).
             let sentinel_links_after = {
@@ -8288,14 +8337,14 @@ mod link_tests {
                 sentinel_links_after, sentinel_links_before,
                 "the sentinel file must never gain a hard link (linkat must not follow the symlink)"
             );
-            // sanity: the run did observable work (this is not the safety assertion — the safety
-            // assertions above hold on every iteration regardless of timing).
+            // sanity: the concurrent iterations did observable work, excluding the stable control.
+            // the safety assertions above hold on every iteration regardless of timing
             tracing::info!(
-                "link file/symlink swap: caught_swaps={caught_swaps}, linked_real={linked_real}"
+                "link file/symlink swap: caught_swaps={caught_swaps}, linked_real={linked_real}, linked_symlinks={linked_symlinks}"
             );
             assert!(
-                caught_swaps + linked_real > 0,
-                "expected at least one observable outcome across 200 iterations"
+                caught_swaps + linked_real + linked_symlinks > 0,
+                "expected at least one observable outcome across 199 concurrent iterations"
             );
             Ok(())
         }

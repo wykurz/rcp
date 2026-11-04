@@ -504,20 +504,23 @@ Specific invariants enforced:
   for a removal already in progress.
 - Directory names passed to any `*at()` call are validated to be single path components (no `/`,
   `.`, `..`).
-- **Source payload and metadata come from the same fd (read-side fidelity).** For each copied or
-  sent source object, the data and the metadata applied/sent for it are read from one open file
+- **Source payload and metadata stay bound to the same inode (read-side fidelity).** For each copied
+  or sent regular file or symlink, its data and applied/sent metadata are read from one open file
   description, so a same-name swap cannot pair one inode's bytes/target with another inode's
   mode/owner/timestamps — or, under `acl`, with another inode's ACL, which is read from that same fd
   (`read_acls_owned` transfers the local file's data-fd owner and returns it with the ACLs; the
-  remote source still uses `read_acls_fd` on its held data fd; `Dir::read_acls` uses the enumerated
-  directory fd): a regular file via `open_file_read` → `(File, FileMeta)`; a symlink via the
-  `O_PATH` handle's `read_symlink` (target + metadata off the one fd); a directory via its held,
-  enumerated `Dir` fd. Remote source discovery uses one fd-relative cursor per directory in bounded
-  batches; each discovered name is classified once for filtering and dispatch. A subsequently opened
-  file data fd is checked again and supplies the wire header's metadata and ACLs for the bytes it
-  sends. The remote *destination* is fidelity-safe by construction — it writes the received bytes
-  and applies the received metadata to its single created fd, so there are no two source fds to
-  mismatch. `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
+  remote source still uses `read_acls_fd` on its held data fd): a regular file via `open_file_read`
+  → `(File, FileMeta)`; a symlink via the `O_PATH` handle's `read_symlink` (target + metadata off
+  the one fd). Directory metadata and ACLs come from the held `Dir` fd. Full and capped listings
+  seek its description before duplicating it; the `ESPIPE` fallback and independent cursors instead
+  open `.` relative to that held fd, creating a new description for the same directory inode without
+  re-resolving its name. Enumeration and metadata therefore remain bound to the same held directory.
+  Remote source discovery uses one fd-relative cursor per directory in bounded batches; each
+  discovered name is classified once for filtering and dispatch. A subsequently opened file data fd
+  is checked again and supplies the wire header's metadata and ACLs for the bytes it sends. The
+  remote *destination* is fidelity-safe by construction — it writes the received bytes and applies
+  the received metadata to its single created fd, so there are no two source fds to mismatch.
+  `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
   source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
   `-L`/`--dereference` path.
 

@@ -136,6 +136,32 @@ Local file operation tests in each tool's `tests/` directory:
 - **rlink**: Hard-linking operations
 - **rcmp**: File comparison
 
+**Directory listing tests** should also run with `TMPDIR` on Btrfs when changing held-directory
+enumeration. Btrfs records a directory-entry cutoff when a descriptor is opened, and duplicating the
+descriptor retains it. Full and capped listings must refresh that view before reading, including the
+first listing after creating children through a held directory. The exhausted-offset tests also
+catch a missing initial seek on filesystems such as ext4; Btrfs exercises the entry-cutoff behavior
+after creation. These tests require no sandbox exemption:
+
+```bash
+TMPDIR=/path/on/btrfs just test -p rcp-tools-common --lib \
+  -E 'test(read_entries_) | test(capped_entries_) |
+      test(make_dir_creates_and_returns_usable_dir) |
+      test(hard_link_entry_swap_never_leaks_sentinel)'
+```
+
+The hard-link race regression covers the walker above the directory-listing API. When running the
+entire `rcp-tools-common` library test suite, keep the `TMPDIR` path shorter than roughly 75
+characters so temporary Unix socket paths fit the kernel's path-length limit.
+
+Nonseekable FUSE directories need a fresh, fd-relative open of `.` when the seek returns `ESPIPE`.
+The committed tests inject the seek result through a closure on an ordinary filesystem, exercising
+fallback control flow without validating actual kernel/FUSE behavior. No real FUSE fixture is
+committed. When changing it, manually verify repeated full and capped listings with a FUSE server
+that sets `FOPEN_NONSEEKABLE` or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Expect
+an extra open/close per fallback listing, and `EACCES` if reopening `.` requires search permission
+the caller lacks, including on an empty directory with mode `0444`.
+
 **POSIX ACL tests** (`rcp/tests/acls.rs`, `rlink/tests/acls.rs`, and unit tests in
 `common/src/safedir.rs`) need a temp filesystem that can hold `system.posix_acl_*` extended
 attributes. Per the repo's convention they **fail rather than skip** when it cannot, so a lost
