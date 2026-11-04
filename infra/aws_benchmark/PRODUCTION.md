@@ -733,3 +733,75 @@ References:
 [transaction IAM](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html),
 [CopyObject API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html),
 [conditional-write policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html).
+
+## Signed different-workflow denial test
+
+The separate **AWS benchmark identity denial** workflow is manual, main-only and owner-only, with no
+environment attached. Keeping the existing main-ref subject makes its different signed workflow
+display name the negative dimension. It never edits trust, invokes admission, starts a worker or
+enables production. Code review and merge do not approve live dispatch.
+
+After separate approval, bind the reviewed merged SHA, exact deployed submit-role ARN/immutable ID
+and unchanged trust, a finite token-eligibility interval, and a separately enforced recovery cutoff.
+Only attempt 1 is eligible. The actual role trust compares the workflow display name; it does not
+bind an immutable workflow path or source hash. A same-named workflow could meet that AWS condition.
+Production admission has its own exact workflow_ref validation.
+
+The nonsecret identity_approval object requires exactly:
+
+| Field                   | Required value                                                           |
+| ----------------------- | ------------------------------------------------------------------------ |
+| schema                  | rcp-oidc-negative-workflow-approval-v1                                   |
+| source_commit           | Reviewed merged SHA, matching workflow SHA, event SHA and clean checkout |
+| not_before              | Approved positive Unix timestamp                                         |
+| expires_at              | After now, at most 900 seconds after not_before                          |
+| recovery_cutoff         | At least expires_at + 1860, at most not_before + 7200                    |
+| approval_capture_sha256 | Hash of separately retained actual approval/preflight evidence           |
+
+The 1,860-second reserve covers the maximum 600-second token lifetime, AWS's 300-second OIDC
+acceptance skew, a requested 900-second session and 60 seconds for reconciliation. Check actual
+operator coverage against that bound before dispatch; successful authentication is not credential
+expiry proof. Never generate runnable approvals with synthetic timestamps.
+
+One five-minute job and a 45-second process obtain one STS-audience JWT under the reviewed code. The
+job-level OIDC capability also exists in other trusted steps; GitHub does not enforce a one-token
+quota. Checkout is read-only at the workflow SHA, dependencies are hash-pinned wheels, caches are
+disabled, and no candidate artifact or repository secret is executed or read.
+
+The exact JWT must pass independent GitHub JWKS/RS256 verification and fixed signed
+repository/owner/actor/main/run/source/workflow-name checks before a single regional
+AssumeRoleWithWebIdentity request. Production's public verifier still rejects the STS audience; the
+separate private test verifier shares only the bounded signature/claim implementation. The STS
+request always includes a 900-second duration and explicit deny-all session policy.
+
+Only operation AssumeRoleWithWebIdentity, code AccessDenied, HTTP 403 and a canonical request UUID
+count as a successful denial. Expired or invalid tokens, provider rejection, throttling, transport
+failure, missing evidence and unexpected issuance are holds. There are no SDK retries. A denied
+token is never authenticated merely because AWS rejected it.
+
+A checked metadata-only runner journal is fsynced before the possible STS send and after its known
+response. The artifact contains only oidc-negative-observation.json and oidc-negative-journal.jsonl,
+retained for 30 days. No JWT, credential value, service body, raw exception or token-request
+capability enters those files. Tokens and any returned credentials stay in process memory; memory
+erasure is not guaranteed.
+
+If a session is unexpectedly issued, preserve only validated expiration/expected-identity metadata
+and fail. The horizon is at least token expiry plus AWS skew, session duration and margin. A longer
+valid observed expiration extends it instead of being discarded; coverage_exceeded requires renewed
+operator recovery coverage and never permits silent closeout. Cancellation may interrupt before
+metadata capture, so uncertainty is armed before the send. Completing/cancelling a run does not
+revoke a session. The signed session is never used for resource operations.
+
+Runner-local fsync is not external durability. Artifact upload can fail or be cancelled. Keep a
+separate operator dispatch intent, exact run ID and approved worst-case recovery cutoff. Missing or
+partial artifacts never establish no issuance and never authorize a rerun. Reconcile the exact
+request/run and possible-session horizon, then verify production remains disabled and idle.
+
+A passing observation proves this signed different-name context was rejected, not negative
+actor/ref/audience cases, same-name path isolation, or whole-system acceptance. The live_accepted
+field remains false. The separate image, instance-origin IAM and end-to-end gates still apply.
+
+References:
+[AWS GitHub claim mapping](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html),
+[AWS OIDC skew](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc.html),
+[STS sessions](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html).

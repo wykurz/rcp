@@ -162,7 +162,7 @@ def _fetch_official_jwks() -> bytes:
         connection.close()
 
 
-class GitHubIdentityVerifier:
+class _GitHubTokenVerifier:
     """Verify tokens against fixed trust settings with a bounded in-memory key cache.
 
     The injected clock returns Unix seconds. The optional zero-argument JWKS fetcher
@@ -179,7 +179,7 @@ class GitHubIdentityVerifier:
         _require(_matches(_ID, repository_id) and _matches(_ID, repository_owner_id))
         _require(isinstance(audience, str) and 0 < len(audience) <= 512
                  and audience.isascii() and not any(char.isspace() for char in audience)
-                 and audience != "sts.amazonaws.com")
+                 )
         _require(not isinstance(workflow_refs, str))
         refs = frozenset(workflow_refs)
         _require(0 < len(refs) <= 8)
@@ -312,3 +312,13 @@ class GitHubIdentityVerifier:
                      and key.public_numbers().e == 65537)
             keys[entry["kid"]] = key
         return keys
+
+
+class GitHubIdentityVerifier(_GitHubTokenVerifier):
+    """Preserve production admission's rejection of the STS audience."""
+    def __init__(self, *, repository, repository_id, repository_owner_id,
+                 audience, workflow_refs, clock=time.time, jwks_fetcher=None):
+        _require(audience != "sts.amazonaws.com")
+        super().__init__(repository=repository, repository_id=repository_id,
+            repository_owner_id=repository_owner_id, audience=audience,
+            workflow_refs=workflow_refs, clock=clock, jwks_fetcher=jwks_fetcher)

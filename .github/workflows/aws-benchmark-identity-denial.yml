@@ -1,0 +1,48 @@
+
+name: AWS benchmark identity denial
+on:
+  workflow_dispatch:
+    inputs:
+      identity_approval:
+        description: Nonsecret finite approval binding, actual reviewed merged SHA and window
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: aws-benchmark-identity-denial
+  cancel-in-progress: false
+jobs:
+  deny-wrong-workflow:
+    if: github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == 1 && (vars.RCP_AWS_PRODUCTION_ENABLED == '' || vars.RCP_AWS_PRODUCTION_ENABLED == 'false')
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    # No environment: preserve main-ref subject so workflow-name is the negative dimension.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install hash-pinned wheels before the token-reading process
+        run: |
+          python3 -m pip install --only-binary=:all: --require-hashes -r infra/aws_benchmark/production-requirements.txt
+      - name: Verify signed negative context and require exact STS AccessDenied
+        env:
+          RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
+          RCP_IDENTITY_APPROVAL: ${{ inputs.identity_approval }}
+        run: python3 -B -m infra.aws_benchmark.acceptance_oidc_negative_workflow > "$RUNNER_TEMP/oidc-negative-observation.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: production-oidc-negative-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/oidc-negative-observation.json
+            ${{ runner.temp }}/oidc-negative-journal.jsonl
+          retention-days: 30
+          if-no-files-found: warn
