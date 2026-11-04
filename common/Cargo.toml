@@ -40,7 +40,7 @@ hdrhistogram = { version = "7.6", default-features = false, features = ["seriali
 humantime = "2.4"
 indicatif = "0.18"
 libc = "0.2"
-nix = { version = "0.31", features = ["dir", "fs", "hostname", "user", "zerocopy"] }
+nix = { version = "0.31", features = ["fs", "hostname", "user", "zerocopy"] }
 pin-project-lite = "0.2"
 procfs = "0.18"
 rand = "0.10"

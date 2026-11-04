@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, openat, readlinkat};
 use nix::sys::stat::{FileStat, Mode, fchmod, fstat, fstatat, futimens, mkdirat};
@@ -448,6 +448,35 @@ struct DirectoryDescriptor {
     credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
+impl DirectoryDescriptor {
+    fn reopen(&self) -> std::io::Result<OwnedFd> {
+        openat(
+            self.as_fd(),
+            c".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(nix_to_io)
+    }
+
+    fn listing_fd_with_seek(
+        &self,
+        seek: impl FnOnce(BorrowedFd<'_>) -> nix::Result<libc::off_t>,
+    ) -> std::io::Result<OwnedFd> {
+        match seek(self.as_fd()) {
+            Ok(_) => self.fd.try_clone(),
+            Err(nix::errno::Errno::ESPIPE) => {
+                // nonseekable FUSE directories need a fresh description for each listing.
+                // opening "." stays on the held inode, but requires search permission too:
+                // an otherwise readable directory (even empty) can fail with EACCES.
+                // each fallback also adds an open/close pair
+                self.reopen()
+            }
+            Err(error) => Err(nix_to_io(error)),
+        }
+    }
+}
+
 impl AsFd for DirectoryDescriptor {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
@@ -460,7 +489,7 @@ impl AsRawFd for DirectoryDescriptor {
     }
 }
 
-/// A directory entry returned by a streaming cursor.
+/// A directory entry read by a listing or streaming cursor.
 ///
 /// The type hint comes from `d_type` and must be checked before acting on the entry.
 #[derive(Debug)]
@@ -566,7 +595,7 @@ impl DirectoryCursor {
     }
 }
 
-/// Owns one `DIR*` and its fd for the entire lifetime of a movable cursor.
+/// Owns one `DIR*` and its fd for a listing or a movable cursor.
 #[derive(Debug)]
 struct OwnedDirectoryStream {
     dir: std::ptr::NonNull<libc::DIR>,
@@ -574,7 +603,7 @@ struct OwnedDirectoryStream {
     _credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
 }
 
-// SAFETY: ownership is exclusive; the cursor moves into one blocking job at a time, and no
+// SAFETY: ownership is exclusive; the stream moves into one blocking job at a time, and no
 // `readdir` call or entry reference can overlap a move to another thread.
 unsafe impl Send for OwnedDirectoryStream {}
 
@@ -611,17 +640,20 @@ impl OwnedDirectoryStream {
         // SAFETY: readdir returned a valid dirent with a NUL-terminated d_name.
         let entry = unsafe { &*raw };
         let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
-        let kind_hint = match entry.d_type {
-            libc::DT_UNKNOWN => None,
-            libc::DT_DIR => Some(EntryKind::Dir),
-            libc::DT_LNK => Some(EntryKind::Symlink),
-            libc::DT_REG => Some(EntryKind::File),
-            _ => Some(EntryKind::Special),
-        };
         Ok(Some(DirectoryEntry {
             name: OsStr::from_bytes(name.to_bytes()).to_owned(),
-            kind_hint,
+            kind_hint: kind_hint_from_dtype(entry.d_type),
         }))
+    }
+}
+
+fn kind_hint_from_dtype(dtype: libc::c_uchar) -> Option<EntryKind> {
+    match dtype {
+        libc::DT_DIR => Some(EntryKind::Dir),
+        libc::DT_LNK => Some(EntryKind::Symlink),
+        libc::DT_REG => Some(EntryKind::File),
+        libc::DT_FIFO | libc::DT_CHR | libc::DT_BLK | libc::DT_SOCK => Some(EntryKind::Special),
+        _ => None,
     }
 }
 
@@ -875,10 +907,11 @@ impl Dir {
 
     /// `fstat` this directory's own held fd, returning its metadata snapshot.
     ///
-    /// Lets a caller apply/send a directory's metadata from the SAME fd whose `read_entries`
-    /// produced its contents (read-side fidelity, see docs/tocttou.md), rather than from a
-    /// separately-opened classify [`Handle`] that a concurrent swap could desync from the
-    /// enumerated contents. Gated as `Stat`.
+    /// Lets a caller apply/send metadata from the held directory whose `read_entries` produced
+    /// its contents (read-side fidelity, see docs/tocttou.md). A nonseekable listing reopens `.`
+    /// relative to this fd, which still names the same directory inode. A separately opened
+    /// classify [`Handle`] could instead refer to an inode swapped out before enumeration.
+    /// Gated as `Stat`.
     pub async fn meta(&self) -> std::io::Result<FileMeta> {
         let dir = self.fd.clone();
         let side = self.side;
@@ -892,9 +925,10 @@ impl Dir {
     /// Read this directory's own access and default POSIX ACLs from its held fd.
     ///
     /// The directory counterpart of [`Self::meta`], and paired with it for the same reason: the
-    /// ACLs a caller applies to the destination come from the SAME fd whose `read_entries` produced
-    /// the contents being copied. Callers gate this on `d:acl` — see [`read_acls_fd`] for what the
-    /// probe costs.
+    /// ACLs a caller applies to the destination come from the held directory inode whose
+    /// `read_entries` produced the contents being copied, including when a nonseekable listing
+    /// reopens `.` relative to that fd. Callers gate this on `d:acl` — see [`read_acls_fd`] for
+    /// what the probe costs.
     pub async fn read_acls(&self) -> std::io::Result<Acls> {
         read_acls_owned(self.fd.clone(), self.side, true)
             .await
@@ -1253,14 +1287,7 @@ impl Dir {
     pub async fn entries(&self) -> std::io::Result<DirectoryCursor> {
         let dir = Arc::clone(&self.fd);
         let iterator = run_fd_admitted_blocking(move || {
-            let fd = openat(
-                dir.as_fd(),
-                c".",
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(nix_to_io)?;
-            OwnedDirectoryStream::from_fd(fd, dir.credit.clone())
+            OwnedDirectoryStream::from_fd(dir.reopen()?, dir.credit.clone())
         })
         .await?;
         Ok(DirectoryCursor {
@@ -1273,7 +1300,7 @@ impl Dir {
     /// Enumerate the directory's entries (excluding `.` and `..`).
     ///
     /// Returns each entry's name and its `getdents` `d_type` as a best-effort
-    /// `EntryKind` hint (`None` when the filesystem reports `DT_UNKNOWN`). The
+    /// `EntryKind` hint (`None` for `DT_UNKNOWN` or unrecognized values). The
     /// hint is advisory only — callers MUST confirm type via `child`/`fstat`
     /// before acting (TOCTOU safety).
     ///
@@ -1285,64 +1312,17 @@ impl Dir {
     pub async fn read_entries(
         &self,
     ) -> std::io::Result<Vec<(std::ffi::OsString, Option<EntryKind>)>> {
-        throttle::get_ops_token().await;
-        let dir = self.fd.clone();
-        run_fd_admitted_blocking(move || {
-            // Dup the fd with FD_CLOEXEC so nix::dir::Dir can consume (and close)
-            // it on drop without touching self's shared descriptor owner. A bare dup(2)
-            // would clear FD_CLOEXEC; F_DUPFD_CLOEXEC atomically sets it.
-            //
-            // Re-entrancy: the dup shares the original's open file description,
-            // and therefore its directory read offset. Reading to EOF advances
-            // that shared offset, so a naive `fdopendir` loop would leave self's
-            // fd at EOF and make a *second* read_entries() on the same Dir
-            // return an empty listing. nix's borrowing `Iter` (from
-            // `nix_dir.iter()`) rewinds the shared description in its `Drop`
-            // (rewinddir(3) → offset 0), and that `Drop` runs on BOTH normal
-            // completion AND the early `?`-return taken on a mid-iteration error
-            // — so the dup is always rewound before it is closed, leaving self's
-            // fd at offset 0 either way. This preserves repeatable full listings
-            // for local callers. Streaming remote enumeration instead uses
-            // `entries`, whose independent open description keeps its own offset.
-            let dup_raw: RawFd =
-                nix::fcntl::fcntl(dir.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))
-                    .map_err(nix_to_io)?;
-            // SAFETY: dup_raw is a freshly-dup'd fd that we own exclusively; no
-            // other reference to it exists.
-            let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_raw) };
-            let mut nix_dir = nix::dir::Dir::from_fd(dup_owned).map_err(nix_to_io)?;
-
-            let mut entries = Vec::new();
-            for entry_result in nix_dir.iter() {
-                let entry = entry_result.map_err(nix_to_io)?;
-                let name_cstr = entry.file_name();
-                // skip "." and ".."
-                if name_cstr == c"." || name_cstr == c".." {
-                    continue;
-                }
-                let name = std::ffi::OsStr::from_bytes(name_cstr.to_bytes()).to_owned();
-                let kind = entry.file_type().map(|t| match t {
-                    nix::dir::Type::Directory => EntryKind::Dir,
-                    nix::dir::Type::Symlink => EntryKind::Symlink,
-                    nix::dir::Type::File => EntryKind::File,
-                    _ => EntryKind::Special,
-                });
-                entries.push((name, kind));
-            }
-            // nix_dir drops here, closing the dup'd fd; self's fd is unaffected
-            Ok(entries)
-        })
-        .await
+        Ok(self
+            .read_entries_capped(usize::MAX)
+            .await?
+            .expect("an unbounded listing cannot exceed usize::MAX entries"))
     }
 
     /// Enumerate at most `cap` entries (excluding `.` and `..`), or report the directory as
-    /// over-cap. Returns `Ok(None)` as soon as a `cap + 1`-th entry is seen — the whole point:
-    /// a caller that will DISCARD an over-cap listing (the overwrite-manifest build against its
-    /// `--overwrite-manifest-max-entries` bound) must not pay for, or sit uncancellably in, a
-    /// full enumeration of a directory arbitrarily larger than its bound. The early break leaves
-    /// the shared read offset mid-directory; the borrowing iterator's `Drop` rewinds it exactly
-    /// as on the full-read and error paths of [`Self::read_entries`], so re-enumeration on the
-    /// same `Dir` stays sound.
+    /// over-cap. Returns `Ok(None)` as soon as a `cap + 1`-th entry is seen, so callers that
+    /// discard an over-cap listing do not pay for a full enumeration. Each call refreshes its
+    /// position before reading, including after an earlier error or over-cap return.
+    /// Calls on the same `Dir` or its clones must not overlap: seekable listings share an offset.
     pub async fn read_entries_capped(
         &self,
         cap: usize,
@@ -1350,32 +1330,22 @@ impl Dir {
         throttle::get_ops_token().await;
         let dir = self.fd.clone();
         run_fd_admitted_blocking(move || {
-            // dup + rewind contract: see read_entries
-            let dup_raw: RawFd =
-                nix::fcntl::fcntl(dir.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))
-                    .map_err(nix_to_io)?;
-            // SAFETY: dup_raw is a freshly-dup'd fd that we own exclusively; no
-            // other reference to it exists.
-            let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_raw) };
-            let mut nix_dir = nix::dir::Dir::from_fd(dup_owned).map_err(nix_to_io)?;
+            // refresh the held description's offset and btrfs entry cutoff before duplicating.
+            // this includes the first listing after creating children through the held directory
+            let fd = dir.listing_fd_with_seek(|fd| {
+                nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)
+            })?;
+            // this owner closes the descriptor even if fdopendir fails and never rewinds on drop
+            let mut stream = OwnedDirectoryStream::from_fd(fd, dir.credit.clone())?;
             let mut entries = Vec::new();
-            for entry_result in nix_dir.iter() {
-                let entry = entry_result.map_err(nix_to_io)?;
-                let name_cstr = entry.file_name();
-                if name_cstr == c"." || name_cstr == c".." {
+            while let Some(entry) = stream.next_raw_entry()? {
+                if entry.name == "." || entry.name == ".." {
                     continue;
                 }
                 if entries.len() >= cap {
                     return Ok(None);
                 }
-                let name = std::ffi::OsStr::from_bytes(name_cstr.to_bytes()).to_owned();
-                let kind = entry.file_type().map(|t| match t {
-                    nix::dir::Type::Directory => EntryKind::Dir,
-                    nix::dir::Type::Symlink => EntryKind::Symlink,
-                    nix::dir::Type::File => EntryKind::File,
-                    _ => EntryKind::Special,
-                });
-                entries.push((name, kind));
+                entries.push((entry.name, entry.kind_hint));
             }
             Ok(Some(entries))
         })
@@ -5467,7 +5437,27 @@ mod tests {
         Ok(())
     }
 
-    // read_entries: returns all entries with correct d_type hints.
+    #[test]
+    fn dtype_hints_only_classify_named_types() {
+        let named = [
+            (libc::DT_DIR, EntryKind::Dir),
+            (libc::DT_LNK, EntryKind::Symlink),
+            (libc::DT_REG, EntryKind::File),
+            (libc::DT_FIFO, EntryKind::Special),
+            (libc::DT_CHR, EntryKind::Special),
+            (libc::DT_BLK, EntryKind::Special),
+            (libc::DT_SOCK, EntryKind::Special),
+        ];
+        for dtype in libc::c_uchar::MIN..=libc::c_uchar::MAX {
+            let expected = named
+                .iter()
+                .find(|(value, _)| *value == dtype)
+                .map(|(_, kind)| *kind);
+            assert_eq!(kind_hint_from_dtype(dtype), expected, "d_type={dtype}");
+        }
+    }
+
+    // read_entries: returns all entries with correct d_type hints
     #[tokio::test]
     async fn read_entries_lists_children_with_dtype_hints() -> anyhow::Result<()> {
         use std::collections::HashMap;
@@ -5506,7 +5496,191 @@ mod tests {
         Ok(())
     }
 
-    // read_entries: calling it twice on the same Dir must succeed (fd not consumed).
+    #[tokio::test]
+    async fn read_entries_sees_children_created_after_open_and_between_reads() -> anyhow::Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        for name in ["first", "second"] {
+            std::fs::write(tmp.path().join(name), b"content")?;
+            let names = sorted_names(root.read_entries().await?);
+            let expected = if name == "first" {
+                vec!["first"]
+            } else {
+                vec!["first", "second"]
+            };
+            assert_eq!(names, expected);
+        }
+        Ok(())
+    }
+
+    fn exhaust_shared_directory_offset(root: &Dir) -> anyhow::Result<()> {
+        let mut stream = OwnedDirectoryStream::from_fd(root.fd.fd.try_clone()?, None)?;
+        while stream.next_raw_entry()?.is_some() {}
+        // independently check that closing the stream leaves a seekable description at EOF.
+        // nonseekable FUSE descriptions reject SEEK_CUR too
+        let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur);
+        if let Ok(offset) = end {
+            assert_ne!(
+                offset, 0,
+                "exhausting the stream did not advance its offset"
+            );
+        } else {
+            assert_eq!(end, Err(nix::errno::Errno::ESPIPE));
+        }
+        drop(stream);
+        assert_eq!(
+            nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur),
+            end,
+            "closing the stream changed the shared offset"
+        );
+        Ok(())
+    }
+
+    fn sorted_names(
+        entries: Vec<(std::ffi::OsString, Option<EntryKind>)>,
+    ) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = entries.into_iter().map(|(name, _)| name).collect();
+        names.sort();
+        names
+    }
+
+    fn stream_names(fd: OwnedFd) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        let mut stream = OwnedDirectoryStream::from_fd(fd, None)?;
+        let mut names = Vec::new();
+        while let Some(entry) = stream.next_raw_entry()? {
+            if entry.name != "." && entry.name != ".." {
+                names.push(entry.name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    #[tokio::test]
+    async fn listing_fd_shares_the_refreshed_description_on_seek_success() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        std::fs::write(tmp.path().join("entry"), b"content")?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        exhaust_shared_directory_offset(&root)?;
+        let fd = root.fd.listing_fd_with_seek(|fd| {
+            assert_eq!(fd.as_raw_fd(), root.fd.as_raw_fd());
+            nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)
+        })?;
+        assert_eq!(
+            nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
+            0
+        );
+        assert_eq!(stream_names(fd)?, ["entry"]);
+        assert_ne!(
+            nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listing_fd_reopens_the_held_directory_on_espipe() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join("entry"), b"content")?;
+        let root = Dir::open_root_dir(&source, false, congestion::Side::Source).await?;
+        exhaust_shared_directory_offset(&root)?;
+        let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?;
+        // a replacement at the old path must not redirect the reopened listing
+        std::fs::rename(&source, tmp.path().join("moved"))?;
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join("replacement"), b"other")?;
+        for _ in 0..2 {
+            let fd = root.fd.listing_fd_with_seek(|fd| {
+                assert_eq!(fd.as_raw_fd(), root.fd.as_raw_fd());
+                Err(nix::errno::Errno::ESPIPE)
+            })?;
+            assert_eq!(stream_names(fd)?, ["entry"]);
+            assert_eq!(
+                nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
+                end
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listing_fd_propagates_other_seek_errors() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        for error in [
+            nix::errno::Errno::EIO,
+            nix::errno::Errno::EACCES,
+            nix::errno::Errno::EINVAL,
+        ] {
+            let result = root.fd.listing_fd_with_seek(|_| Err(error));
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(error as i32));
+        }
+        assert!(root.read_entries().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_entries_refreshes_an_exhausted_shared_offset() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for name in ["first", "second"] {
+            std::fs::write(tmp.path().join(name), b"content")?;
+        }
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        exhaust_shared_directory_offset(&root)?;
+        let names = sorted_names(root.read_entries().await?);
+        assert_eq!(names, ["first", "second"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capped_entries_refreshes_an_exhausted_shared_offset() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for name in ["first", "second", "third"] {
+            std::fs::write(tmp.path().join(name), b"content")?;
+        }
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        exhaust_shared_directory_offset(&root)?;
+        assert!(root.read_entries_capped(2).await?.is_none());
+        let names = sorted_names(
+            root.read_entries_capped(3)
+                .await?
+                .expect("three entries fit the cap"),
+        );
+        assert_eq!(names, ["first", "second", "third"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capped_entries_refresh_after_creation_and_over_cap_reads() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        assert_eq!(root.read_entries_capped(0).await?, Some(Vec::new()));
+        std::fs::write(tmp.path().join("first"), b"content")?;
+        let first = root
+            .read_entries_capped(1)
+            .await?
+            .expect("one entry fits the cap");
+        assert_eq!(
+            first.into_iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["first"]
+        );
+        std::fs::write(tmp.path().join("second"), b"content")?;
+        assert!(root.read_entries_capped(1).await?.is_none());
+        std::fs::write(tmp.path().join("third"), b"content")?;
+        let names = sorted_names(
+            root.read_entries_capped(3)
+                .await?
+                .expect("three entries fit the cap"),
+        );
+        assert_eq!(names, ["first", "second", "third"]);
+        assert!(root.read_entries_capped(0).await?.is_none());
+        Ok(())
+    }
+
+    // read_entries: calling it twice on the same Dir must succeed (fd not consumed)
     #[tokio::test]
     async fn read_entries_does_not_close_self_fd() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5514,10 +5688,8 @@ mod tests {
         // first call
         let first = root.read_entries().await?;
         assert!(!first.is_empty(), "first read_entries returned empty");
-        // second call on the SAME Dir must yield the identical entry set, not
-        // just an equal count. read_entries dups a fd that shares the directory
-        // read offset, so absent nix's rewinddir-on-completion this second call
-        // would see an empty (or partial) listing.
+        // the first stream leaves the shared description at EOF without rewinding.
+        // the second call must refresh it and return the same complete entry set
         let second = root.read_entries().await?;
         let mut first_names: Vec<_> = first.iter().map(|(name, _)| name.clone()).collect();
         let mut second_names: Vec<_> = second.iter().map(|(name, _)| name.clone()).collect();
