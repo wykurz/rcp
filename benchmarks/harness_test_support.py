@@ -5,10 +5,16 @@ import io
 import json
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 from unittest import mock
 
 from benchmarks import report, run, streaming
 from benchmarks.test_timings import TimingTests
+
+
+def fake_stat(value, **changes):
+    fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+    return SimpleNamespace(**(fields | changes))
 
 
 def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=None,
