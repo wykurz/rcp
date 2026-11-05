@@ -1938,6 +1938,16 @@ mod tests {
     // every iteration is the safety assertion. Also confirms the run terminates (timeout).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn entry_symlink_swap_never_changes_sentinel_mode() -> anyhow::Result<()> {
+        check_entry_swap_sentinel_mode(true).await
+    }
+
+    // exercise the valid no-change outcome without depending on swapper scheduling
+    #[tokio::test]
+    async fn symlink_only_chmod_is_an_observable_race_outcome() -> anyhow::Result<()> {
+        check_entry_swap_sentinel_mode(false).await
+    }
+
+    async fn check_entry_swap_sentinel_mode(swap_entries: bool) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let tmp = crate::testutils::create_temp_dir().await?;
         let root = tmp.as_path();
@@ -1955,14 +1965,25 @@ mod tests {
         std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644))?;
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let swapper =
-            spawn_file_symlink_swapper(target_dir.clone(), "entry", sentinel.clone(), stop.clone());
+        let swapper = if swap_entries {
+            Some(spawn_file_symlink_swapper(
+                target_dir.clone(),
+                "entry",
+                sentinel.clone(),
+                stop.clone(),
+            ))
+        } else {
+            tokio::fs::remove_file(&entry_path).await?;
+            tokio::fs::symlink(&sentinel, &entry_path).await?;
+            None
+        };
 
         // g+w on a file would turn the sentinel 0600 -> 0620 if the link were ever followed.
         let settings = settings_with("g+w", None, None);
         let mut caught = 0usize;
         let mut changed_real = 0usize;
-        for i in 0..300 {
+        let mut unchanged_symlinks = 0usize;
+        for i in 0..if swap_entries { 300 } else { 1 } {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 chmod(&RACE_PROGRESS, &target_dir, &settings),
@@ -1970,7 +1991,10 @@ mod tests {
             .await
             .expect("rchm must not hang under concurrent swapping");
             match result {
-                Ok(summary) => changed_real += summary.files_changed,
+                Ok(summary) => {
+                    changed_real += summary.files_changed;
+                    unchanged_symlinks += summary.symlinks_unchanged;
+                }
                 Err(_) => caught += 1, // a swap was caught mid-run (failed closed for that entry)
             }
             // CORE SAFETY ASSERTION (holds on every iteration regardless of timing): the
@@ -1989,12 +2013,23 @@ mod tests {
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.join().expect("swapper thread panicked");
+        if let Some(swapper) = swapper {
+            swapper.join().expect("swapper thread panicked");
+        }
+        if !swap_entries {
+            assert_eq!(
+                caught, 0,
+                "the stable symlink must be inspected successfully"
+            );
+            assert_eq!(unchanged_symlinks, 1);
+        }
         // sanity (not the safety assertion): the run did observable work across the iterations.
-        tracing::info!("entry swap: caught={caught}, changed_real={changed_real}");
+        tracing::info!(
+            "entry swap: caught={caught}, changed_real={changed_real}, unchanged_symlinks={unchanged_symlinks}"
+        );
         assert!(
-            caught + changed_real > 0,
-            "expected at least one observable outcome across the iterations"
+            caught + changed_real + unchanged_symlinks > 0,
+            "expected at least one observable outcome: caught={caught}, changed_real={changed_real}, unchanged_symlinks={unchanged_symlinks}"
         );
         Ok(())
     }
