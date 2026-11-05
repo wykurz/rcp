@@ -15,6 +15,7 @@ from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
 MAX_PRICE_AGE_SECONDS = 31 * 86400
+SCHEDULE_MAIN_AA = "triggering-main-aa"
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 PRODUCER_FIELDS = ("repository", "repository_id", "repository_owner_id", "ref", "workflow_ref",
@@ -68,8 +69,13 @@ class Policy:
             integer(slot[1], 0, 23, "invalid schedule hour")
             integer(slot[2], 0, 59, "invalid schedule minute")
         require(len(set(self.schedule_slots)) == len(self.schedule_slots), "duplicate schedule slots")
-        require(not self.schedule_slots or isinstance(self.scheduled_baseline, str)
-                and SHA.fullmatch(self.scheduled_baseline), "scheduled runs need an approved baseline SHA")
+        # this server-only tagged value explicitly opts into a main A/A trend series.
+        # a stored SHA retains its old pin; missing/empty policy never follows main.
+        require(isinstance(self.scheduled_baseline, str) and (self.scheduled_baseline == ""
+                or self.scheduled_baseline == SCHEDULE_MAIN_AA or SHA.fullmatch(self.scheduled_baseline)),
+                "invalid scheduled baseline policy")
+        require(not self.schedule_slots or self.scheduled_baseline != "",
+                "scheduled runs need an approved baseline policy")
         for field in ("total_cap_microusd", "monthly_cap_microusd", "hourly_microusd", "ancillary_microusd"):
             integer(getattr(self, field), 0, 10**12, "invalid server money limit")
         integer(self.daily_run_limit, 0, 10, "invalid daily admission limit")
@@ -188,7 +194,9 @@ def authorize(policy, identity, run, value, now):
         require(identity.actor_id in (policy.owner_id, *policy.manual_actor_ids), "manual requester is not approved")
     elif identity.event_name == "schedule":
         slot = schedule_slot(policy, run.created_at, now)
-        require(checked["baseline"] == policy.scheduled_baseline and checked["candidate"] == identity.sha,
+        require(identity.actor_id == policy.owner_id, "scheduled requester is not the approved owner")
+        baseline = identity.sha if policy.scheduled_baseline == SCHEDULE_MAIN_AA else policy.scheduled_baseline
+        require(checked["baseline"] == baseline and checked["candidate"] == identity.sha,
                 "scheduled revisions differ from approved baseline and main")
     else:
         raise ValueError("only approved manual and scheduled requests may enter admission")

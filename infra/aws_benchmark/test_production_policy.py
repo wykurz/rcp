@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 from .common import BINARIES, MAX_BINARY
-from .production_policy import Policy, WorkflowRun, authorize, manifest, schedule_slot
+from .production_policy import Policy, WorkflowRun, authorize, manifest, schedule_slot, SCHEDULE_MAIN_AA
 
 NOW = datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc)
 SHA = "a" * 40
@@ -158,6 +158,31 @@ class ProductionPolicyTests(unittest.TestCase):
         for slots in (((3, 19, 31),), ((3, 18, 0),), ((3, 19, 0), (3, 19, 30))):
             with self.subTest(slots=slots), self.assertRaises(ValueError):
                 self.authorize(policy(schedule_slots=slots, scheduled_baseline=SHA), identity(event_name="schedule"))
+
+    def test_main_aa_schedule_is_explicit_and_tracks_each_signed_trigger_sha(self):
+        configured = policy(schedule_slots=((3, 19, 30),), scheduled_baseline=SCHEDULE_MAIN_AA)
+        for sha in (SHA, "b" * 40):
+            who = identity(event_name="schedule", sha=sha, workflow_sha=sha)
+            observed = WorkflowRun.verify(run_json(who), who, NOW)
+            result = self.authorize(configured, who, inputs(baseline=sha, candidate=sha), observed)
+            self.assertEqual(result["schedule_slot"], "2026-10-22T19:30Z")
+            self.assertEqual(result["reserve_microusd"], configured.reservation(NOW))
+            self.assertEqual(result["producer"]["sha"], sha)
+        with self.assertRaises(ValueError):
+            self.authorize(configured, identity(event_name="schedule", sha="b" * 40), inputs())
+
+    def test_schedule_cannot_inherit_manual_maintainer_authority(self):
+        configured = policy(manual_actor_ids=("55",), schedule_slots=((3, 19, 30),),
+                            scheduled_baseline=SCHEDULE_MAIN_AA)
+        with self.assertRaisesRegex(ValueError, "scheduled requester"):
+            self.authorize(configured, identity(event_name="schedule", actor_id="55"))
+
+    def test_unknown_schedule_modes_and_unapproved_slots_fail_closed(self):
+        for baseline in ("main", "", None, True):
+            with self.subTest(baseline=baseline), self.assertRaises(ValueError):
+                policy(schedule_slots=((3, 19, 30),), scheduled_baseline=baseline)
+        with self.assertRaisesRegex(ValueError, "schedule slot"):
+            self.authorize(policy(scheduled_baseline=SCHEDULE_MAIN_AA), identity(event_name="schedule"))
 
     def test_schedule_handles_week_boundary_without_caller_slot(self):
         created = datetime(2026, 10, 26, 0, 10, tzinfo=timezone.utc)

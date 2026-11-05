@@ -17,6 +17,7 @@ import time
 
 from . import durable
 from .ami_image import launch_template_data
+from .guard_observation import GUARD_READ_ATTEMPTS, GuardStatus, classify_guard
 from .common import (BINARIES, MAX_BINARY, REQUEST_KEY, STATUS_KEY, WINDOW_KEY,
                      get_json, put_json, error_code, retryable_io, INSTANCE_TYPE, require, timestamp, utc,
                      durable_plan_contract, RevisionConflict)
@@ -25,6 +26,9 @@ REQUEST = "control/durable-request.json"
 RECEIPT = "output/durable-receipt.json"
 MAX_RECEIPT = 100_000
 LIVE = {"pending", "running", "stopping", "stopped", "shutting-down"}
+# fixed call and wait bounds also hold when injected clocks or sleepers do not advance
+GUARD_RETRY_SECONDS = 1
+GUARD_RETRY_DELAY = 0.25
 
 
 @dataclass(frozen=True)
@@ -63,7 +67,7 @@ def clients(region=None):
 
 
 class AllocationDeferred(Exception):
-    """A missing or stale heartbeat blocks allocation without failing the execution."""
+    """A missing, future or stale scan blocks allocation without failing the execution."""
 
 
 def transient(error):
@@ -173,19 +177,31 @@ class Service:
         """Read mode-specific policy before useful binding; physical observations still follow."""
 
     def fresh_guard(self):
-        response = self.api["dynamodb"].get_item(TableName=self.config.table,
-            Key={"pk": {"S": "guard"}}, ConsistentRead=True)
-        item = response.get("Item")
-        if item is None:
-            raise AllocationDeferred("independent janitor has no successful scan")
-        proof = json.loads(item["payload"]["S"])
-        require(proof.get("namespace") == self.config.namespace and proof.get("healthy") is True,
-                "independent janitor scan is invalid")
-        age = (self.now() - utc(proof["observed_at"])).total_seconds()
-        require(age >= 0, "independent janitor scan is in the future")
-        if age > durable.GUARD_GAP_SECONDS:
-            raise AllocationDeferred("independent janitor scan is stale")
-        return proof["observed_at"]
+        # the monotonic retry budget leaves one SDK call in reserve; SDK timeouts bound each read
+        retry_until = min(self.monotonic() + GUARD_RETRY_SECONDS, self.retry_until - 16)
+        for attempt in range(GUARD_READ_ATTEMPTS):
+            response = self.api["dynamodb"].get_item(TableName=self.config.table,
+                Key={"pk": {"S": "guard"}}, ConsistentRead=True)
+            checked_at = self.now()
+            observation = classify_guard(response, namespace=self.config.namespace, now=checked_at)
+            if observation.status is GuardStatus.FRESH:
+                return observation.observed_at
+            metadata = response.get("ResponseMetadata") if isinstance(response, dict) else None
+            request_id = metadata.get("RequestId") if isinstance(metadata, dict) else None
+            print(json.dumps(observation.diagnostic(checked_at=checked_at, attempt=attempt + 1,
+                                                    request_id=request_id), sort_keys=True, allow_nan=False))
+            require(observation.status is not GuardStatus.INVALID, "independent janitor scan is invalid")
+            if observation.status is GuardStatus.MISSING:
+                raise AllocationDeferred("independent janitor has no successful scan")
+            if observation.status is GuardStatus.STALE:
+                raise AllocationDeferred("independent janitor scan is stale")
+            if (attempt + 1 == GUARD_READ_ATTEMPTS or
+                    retry_until - self.monotonic() <= GUARD_RETRY_DELAY):
+                break
+            self.sleep(GUARD_RETRY_DELAY)
+            if self.monotonic() >= retry_until:
+                break
+        raise AllocationDeferred("independent janitor scan is in the future")
 
     def inventory(self, request=None):
         values, token = [], None
@@ -373,9 +389,10 @@ class Service:
         self.reconcile_launch(run, allocation, mutate, not_sent=not_sent)
 
     def launch_allowed(self, request, observed, allocation=None):
-        return (self.now() < utc(request["capacity_deadline"]) and
-                0 <= (self.now() - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS and
-                (allocation is None or self.now() < utc(allocation["close_at"])))
+        now = self.now()
+        return (now < utc(request["capacity_deadline"]) and
+                0 <= (now - utc(observed)).total_seconds() <= durable.GUARD_GAP_SECONDS and
+                (allocation is None or now < utc(allocation["close_at"])))
 
     def launch_recovery_open(self, state):
         # the legacy controller never replays persisted unknown outcomes

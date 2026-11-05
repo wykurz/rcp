@@ -61,7 +61,9 @@ activation.
 Only the publication and explicit canary workflows currently reference `aws-benchmark-history` and
 its key; tests check the complete workflow inventory. Any future trusted main workflow could request
 this environment, so preserve main review/protection. The owner-only approval gate is the initial
-policy; removing it requires a separate decision. Neither workflow is scheduled.
+policy; removing it requires a separate decision. The canary remains manual-only. The publication
+workflow's proposed daily poll has a separate exact-true schedule gate, closed by default; it
+retains the same owner approval environment and cannot make writer access unattended.
 
 Configure and read back the environment **before storing a key or running either lane**. GitHub can
 automatically create a missing environment without protection. Require:
@@ -209,15 +211,17 @@ signing key.
 
 ## Approval wait and publication
 
-Publication rejects reruns. It exports a record count, skips the protected writer job for an empty
-batch, and prepares a validated commit against fresh anonymous history **before** minting a token.
-Every publication phase requires the established canary-created root; absence holds for
-reconciliation and never silently starts a new lineage. An already-published replay also needs no
-token, though a replay-only batch still requests owner approval before preparation discovers the
-no-op. An empty batch skips publication and Pages. To recover a failed or stale Pages deployment
-without new records, dispatch `benchmark-pages.yml` directly on current main under its existing
-gates; do not rerun an old publication. Semantic validation is tested with recomputed valid
-inventories so a schema check cannot be accidentally replaced by a checksum-only test.
+Publication rejects reruns. A separately approved schedule can create a fresh run, but never reruns
+an old write path; missing schedule/readiness/publication gates keep the declared cron inert. It
+exports a record count, skips the protected writer job for an empty batch, and prepares a validated
+commit against fresh anonymous history **before** minting a token. Every publication phase requires
+the established canary-created root; absence holds for reconciliation and never silently starts a
+new lineage. An already-published replay also needs no token, though a replay-only batch still
+requests owner approval before preparation discovers the no-op. An empty batch skips publication and
+Pages. To recover a failed or stale Pages deployment without new records, dispatch
+`benchmark-pages.yml` directly on current main under its existing gates; do not rerun an old
+publication. Semantic validation is tested with recomputed valid inventories so a schema check
+cannot be accidentally replaced by a checksum-only test.
 
 After environment approval, explicit checks validate identity, supplied flags and current main. The
 exact main ref is rechecked immediately before mint and each push, so an approval for a superseded

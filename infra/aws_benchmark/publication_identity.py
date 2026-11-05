@@ -17,11 +17,15 @@ REMOTE = "https://github.com/" + REPOSITORY + ".git"
 def check_identity(environment, *, workflow=PUBLICATION_WORKFLOW, artifact=False, flags=False):
     revision = environment.get("GITHUB_SHA", "")
     expected = dict(GITHUB_REPOSITORY=REPOSITORY, GITHUB_REF=MAIN,
-        GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_ACTOR_ID=str(OWNER_ID), GITHUB_RUN_ATTEMPT="1",
+        GITHUB_ACTOR_ID=str(OWNER_ID), GITHUB_RUN_ATTEMPT="1",
         GITHUB_WORKFLOW_REF=REPOSITORY + "/.github/workflows/" + workflow + "@" + MAIN,
         GITHUB_WORKFLOW_SHA=revision)
     require(re.fullmatch(r"[0-9a-f]{40}", revision) and
             all(environment.get(key) == value for key, value in expected.items()), "publication workflow identity differs")
+    event = environment.get("GITHUB_EVENT_NAME")
+    require(event == "workflow_dispatch" or (workflow == PUBLICATION_WORKFLOW and event == "schedule"
+            and environment.get("PUBLISH_SCHEDULE_ENABLED") == "true"),
+            "publication event or separate schedule gate differs")
     if artifact:
         require(environment.get("EXPECTED_READER") == revision and
                 re.fullmatch(r"[0-9a-f]{64}", environment.get("EXPECTED_INVENTORY", "")) and
