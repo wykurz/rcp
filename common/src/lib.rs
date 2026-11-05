@@ -73,7 +73,8 @@
 //! };
 //! let preserve = common::preserve::preserve_none();
 //!
-//! let summary = common::copy(src, dst, &settings, &preserve).await?;
+//! let session = common::copy::CopySession::default();
+//! let summary = common::copy(&session, src, dst, &settings, &preserve).await?;
 //! println!("Copied {} files", summary.files_copied);
 //! # Ok(())
 //! # }
@@ -549,12 +550,15 @@ pub async fn cmp(
 }
 
 pub async fn copy(
+    session: &copy::CopySession,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &copy::Settings,
     preserve: &preserve::Settings,
 ) -> Result<copy::Summary, copy::Error> {
-    copy::copy(&PROGRESS, src, dst, settings, preserve, false).await
+    session
+        .copy(&PROGRESS, src, dst, settings, preserve, false)
+        .await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<rm::Summary, rm::Error> {

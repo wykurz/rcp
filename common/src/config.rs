@@ -443,7 +443,7 @@ impl DryRunWarnings {
         }
         if has_overwrite {
             warnings.push(
-                "dry-run: --overwrite was ignored; dry-run does not check destination state"
+                "dry-run: --overwrite was ignored; dry-run does not evaluate overwrite decisions"
                     .to_string(),
             );
         }

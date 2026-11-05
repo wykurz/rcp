@@ -1,3 +1,8 @@
+pub(crate) mod destination;
+pub(crate) use destination::{
+    DestinationContext, PreparedDestination, PreviewParent, SourceSnapshot,
+};
+
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -308,10 +313,9 @@ impl std::fmt::Display for Summary {
 /// their parent directories and payload operations use file-descriptor-relative syscalls
 /// (see [`crate::safedir`]). Held parents prevent full-path redirection and contain each by-name
 /// operation to its intended directory. `--dereference` still resolves symlinks by path
-/// (`canonicalize`) and is not hardened. Read-only `--dry-run --ignore-existing` destination
+/// (`canonicalize`) and is not hardened. Read-only leaf `--dry-run --ignore-existing` destination
 /// probes also re-resolve paths: default mode may observe a redirected preview, while strict mode
 /// rejects intermediate symlinks via `openat2` and a no-follow final-component probe.
-#[instrument(skip(prog_track, settings, preserve))]
 pub async fn copy(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -320,18 +324,43 @@ pub async fn copy(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
-    crate::timing_scope!("local.copy")
-        .measure(copy_root_admitted(
-            prog_track,
-            src,
-            dst,
-            settings,
-            preserve,
-            is_fresh,
-            DeleteScanAnchor::new(dst, std::path::Path::new("")),
-            None,
-        ))
+    CopySession::default()
+        .copy(prog_track, src, dst, settings, preserve, is_fresh)
         .await
+}
+
+/// Shared input/output identities for all source operands of one local copy invocation.
+/// Clones retain the same registry, including when strict-mode roots run sequentially.
+#[derive(Clone, Default)]
+pub struct CopySession {
+    overlap: Arc<safedir::overlap::DirectoryOverlap>,
+}
+
+impl CopySession {
+    /// Copy one operand while retaining the other operands' directory identities.
+    #[instrument(name = "copy", skip(self, prog_track, settings, preserve))]
+    pub async fn copy(
+        &self,
+        prog_track: &'static progress::Progress,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        settings: &Settings,
+        preserve: &preserve::Settings,
+        is_fresh: bool,
+    ) -> Result<Summary, Error> {
+        crate::timing_scope!("local.copy")
+            .measure(copy_root_admitted(
+                prog_track,
+                src,
+                dst,
+                settings,
+                preserve,
+                is_fresh,
+                DestinationContext::with_registry(src, dst, Arc::clone(&self.overlap)),
+                None,
+            ))
+            .await
+    }
 }
 
 /// Path-based root setup with transferable leaf admission.
@@ -349,9 +378,15 @@ async fn copy_root_admitted(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    delete_scan_anchor: DeleteScanAnchor,
+    destination: DestinationContext,
     open_file_guard: Option<throttle::OpenFileGuard>,
 ) -> Result<Summary, Error> {
+    if settings.dereference && safedir::strict_operand_resolution() {
+        return Err(Error::new(
+            anyhow!("--dereference cannot be combined with strict operand resolution"),
+            Default::default(),
+        ));
+    }
     let open_file_guard = match open_file_guard {
         Some(guard) => guard,
         None => throttle::open_file_permit().await,
@@ -362,6 +397,7 @@ async fn copy_root_admitted(
             src_operand: crate::walk::RootOperand,
             src_parent: Arc<Dir>,
             dst_parent: Option<Arc<Dir>>,
+            preview_parent: Option<destination::PreviewParent>,
         },
     }
     let setup_admission = open_file_guard.admission();
@@ -388,8 +424,8 @@ async fn copy_root_admitted(
         };
         // Under strict operand resolution (--require-toctou-safe), resolve BOTH operand parents UP
         // FRONT — before the source root-filter early-return, unconditionally, in every mode (real and
-        // dry-run) — via `open_parent_dir` (openat2 RESOLVE_NO_SYMLINKS). This single open per operand
-        // IS the strict validation: a symlink in any directory component of the source OR destination
+        // dry-run) — with openat2 RESOLVE_NO_SYMLINKS (O_PATH for the preview destination parent).
+        // this single open per operand is the strict validation: a symlink in any directory component of the source OR destination
         // path fails closed with ELOOP here, so no filter/dry-run/overwrite branch downstream can let a
         // symlinked prefix through. The held fds are reused below (source classify + walk; destination
         // walk). On the DEFAULT path this is skipped: the filter check runs first over a path stat, so
@@ -408,32 +444,48 @@ async fn copy_root_admitted(
         } else {
             None
         };
-        let strict_dst_parent: Option<Arc<Dir>> = match (strict, dst_parent_path_opt) {
-            (true, Some(dst_parent_path)) => {
-                match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
-                    Ok(parent) => Some(Arc::new(parent.into_tree())),
-                    // an absent destination parent (dry-run previewing into a not-yet-created tree, or
-                    // a filtered-out root) is not a symlink violation — leave it to the walk's
-                    // functional handling below. Only a symlinked prefix component (ELOOP) fails here.
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::NotFound
-                            || err.raw_os_error() == Some(libc::ENOTDIR) =>
+        let preview_parent = if strict && settings.dry_run.is_some() {
+            match dst_parent_path_opt {
+                Some(path) => Some(
+                    destination::PreviewParent::open(path)
+                        .await
+                        .with_context(|| {
+                            format!("cannot open destination parent directory {path:?}")
+                        })
+                        .map_err(|err| Error::new(err, Default::default()))?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let strict_dst_parent: Option<Arc<Dir>> =
+            match (strict && settings.dry_run.is_none(), dst_parent_path_opt) {
+                (true, Some(dst_parent_path)) => {
+                    match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await
                     {
-                        None
-                    }
-                    Err(err) => {
-                        return Err(Error::new(
-                            anyhow::Error::new(err).context(format!(
-                                "cannot open destination parent directory {dst_parent_path:?}"
-                            )),
-                            Default::default(),
-                        ));
+                        Ok(parent) => Some(Arc::new(parent.into_tree())),
+                        // a missing or invalid parent can still belong to a filtered-out root.
+                        // defer its functional error until after filtering; reject symlinks here.
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::NotFound
+                                || err.raw_os_error() == Some(libc::ENOTDIR) =>
+                        {
+                            None
+                        }
+                        Err(err) => {
+                            return Err(Error::new(
+                                anyhow::Error::new(err).context(format!(
+                                    "cannot open destination parent directory {dst_parent_path:?}"
+                                )),
+                                Default::default(),
+                            ));
+                        }
                     }
                 }
-            }
-            // default mode, or a degenerate destination (rejected by the authoritative split below)
-            _ => None,
-        };
+                // default mode, or a degenerate destination (rejected by the authoritative split below)
+                _ => None,
+            };
         // check filter for top-level source (files, directories, and symlinks)
         if let Some(ref filter) = settings.filter {
             let (kind, is_dir) = match &strict_src_parent {
@@ -542,16 +594,18 @@ async fn copy_root_admitted(
             src_operand,
             src_parent,
             dst_parent,
+            preview_parent,
         })
     })
     .await?;
-    let (src_operand, src_parent, dst_parent) = match setup {
+    let (src_operand, src_parent, dst_parent, preview_parent) = match setup {
         CopyRootSetup::Complete(summary) => return Ok(summary),
         CopyRootSetup::Ready {
             src_operand,
             src_parent,
             dst_parent,
-        } => (src_operand, src_parent, dst_parent),
+            preview_parent,
+        } => (src_operand, src_parent, dst_parent, preview_parent),
     };
     run_copy_root(
         prog_track,
@@ -563,7 +617,7 @@ async fn copy_root_admitted(
         settings,
         preserve,
         is_fresh,
-        delete_scan_anchor,
+        destination.with_preview_parent(preview_parent),
         EntryAdmission::Held(LeafPermit::OpenFile(open_file_guard)).into(),
     )
     .await
@@ -609,7 +663,7 @@ impl From<EntryAdmission> for CopyEntryAdmission {
 /// A nonempty base must end in `name`; an empty base uses `dst_root`'s basename for the destination.
 /// This entry point always seeds that coordinate and bypasses root filtering. Its descendants use
 /// the same coordinate for destination reconstruction, filtering, and deletion.
-/// `delete_scan_anchor` independently carries the held preview parent or its known absence, so
+/// `destination` independently carries the held preview parent or its known absence, so
 /// preview authority never comes from a display or filter path. `dst_parent` is absent only in dry-run.
 #[instrument(skip(prog_track, src_parent, dst_parent, settings, preserve, admission))]
 #[allow(clippy::too_many_arguments)]
@@ -624,7 +678,7 @@ pub(crate) async fn copy_child(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    delete_scan_anchor: DeleteScanAnchor,
+    destination: DestinationContext,
     admission: AdmittedEntry,
 ) -> Result<Summary, Error> {
     // nonempty delegated paths name an entry within the original destination root
@@ -639,58 +693,13 @@ pub(crate) async fn copy_child(
         settings,
         preserve,
         is_fresh,
-        delete_scan_anchor,
+        destination,
         CopyEntryAdmission::Filtered {
             entry: admission,
             filter_base: filter_base.to_path_buf(),
         },
     )
     .await
-}
-
-/// Authority for opening the next destination directory in a deletion preview.
-/// Root/delegated entry setup retains the original named operand and physical base. After one
-/// pre-order open, children inherit a held parent or absorbing absence, never a reconstructed path.
-#[derive(Clone, Debug)]
-pub(crate) enum DeleteScanAnchor {
-    Operand { named_root: PathBuf, base: PathBuf },
-    Parent(Option<Arc<Dir>>),
-}
-
-impl DeleteScanAnchor {
-    /// Retain the original named operand and independently supplied physical subtree base.
-    #[must_use]
-    pub(crate) fn new(named_root: &std::path::Path, base: &std::path::Path) -> Self {
-        Self::Operand {
-            named_root: named_root.to_path_buf(),
-            base: base.to_path_buf(),
-        }
-    }
-
-    /// Descendants inherit this held preview parent; absence cannot trigger a later path reopen.
-    pub(crate) fn parent(dir: Option<Arc<Dir>>) -> Self {
-        Self::Parent(dir)
-    }
-
-    /// Open the entry once before descent. Only operand setup may resolve a path; nested entries
-    /// open `name` through their held parent and never follow a final-component symlink.
-    pub(crate) async fn open(&self, name: &OsStr) -> std::io::Result<Option<Arc<Dir>>> {
-        let dir = match self {
-            Self::Operand { named_root, base } => {
-                safedir::open_existing_dir_beneath_operand(
-                    named_root,
-                    base,
-                    congestion::Side::Destination,
-                )
-                .await?
-            }
-            Self::Parent(Some(parent)) => {
-                safedir::open_existing_preview_child(parent, name).await?
-            }
-            Self::Parent(None) => None,
-        };
-        Ok(dir.map(Arc::new))
-    }
 }
 
 /// The copy walk's [`WalkVisitor`]: holds the run-constant state shared by every entry and maps
@@ -711,7 +720,7 @@ struct CopyVisitor {
     dst_root: PathBuf,
     /// The root's preview authority: the original destination operand for a public copy, or an
     /// inherited held parent/absence for a delegated copy. Independent of filter coordinates.
-    delete_scan_anchor: DeleteScanAnchor,
+    destination: DestinationContext,
     settings: Settings,
     preserve: preserve::Settings,
     /// The opened top-level destination parent directory (`None` in dry-run). Seeds the
@@ -723,12 +732,12 @@ struct CopyVisitor {
 
 /// Inherited per-directory context: the destination parent directory for one level plus its
 /// freshness. `dst_dir == None` is the dry-run signal threaded throughout the walk (no destination
-/// mutation). `delete_scan_parent` independently carries read-only preview authority. Each child
+/// mutation). `destination` independently carries read-only preview authority. Each child
 /// reads its destination parents from here rather than the driver knowing a second tree exists.
 #[derive(Clone)]
 struct CopyDirContext {
     dst_dir: Option<Arc<Dir>>,
-    delete_scan_parent: DeleteScanAnchor,
+    destination: DestinationContext,
     is_fresh: bool,
 }
 
@@ -751,12 +760,8 @@ struct CopyDirState {
     /// What the strict-mode lockdown must put back at finalize (original owner + original ACLs),
     /// `Some` iff this reused directory was locked down. See [`DirSlot::reused_lock`].
     reused_lock: Option<safedir::ReusedDirLock>,
-    /// The source directory's metadata, applied to the destination post-order.
-    src_meta: FileMeta,
-    /// The source directory's access + default ACLs, read from the same fd as `src_meta` and
-    /// applied post-order alongside it. `None` when `d:acl` was not requested (so nothing was read)
-    /// or in dry-run (nothing is applied).
-    src_acls: Option<safedir::Acls>,
+    /// Preservation state captured together before walking this held input.
+    snapshot: SourceSnapshot,
     /// The `directories_created`/`directories_unchanged` contribution from resolving this
     /// directory's destination, folded into the final summary.
     base: Summary,
@@ -1022,13 +1027,13 @@ async fn run_copy_root(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    delete_scan_anchor: DeleteScanAnchor,
+    destination: DestinationContext,
     admission: CopyEntryAdmission,
 ) -> Result<Summary, Error> {
     let visitor = Arc::new(CopyVisitor {
         prog_track,
         dst_root: dst_root.to_path_buf(),
-        delete_scan_anchor,
+        destination,
         settings: settings.clone(),
         preserve: *preserve,
         dst_parent,
@@ -1096,7 +1101,7 @@ impl WalkVisitor for CopyVisitor {
     fn root_dir_context(&self) -> CopyDirContext {
         CopyDirContext {
             dst_dir: self.dst_parent.clone(),
-            delete_scan_parent: self.delete_scan_anchor.clone(),
+            destination: self.destination.clone(),
             is_fresh: self.root_is_fresh,
         }
     }
@@ -1189,7 +1194,7 @@ impl WalkVisitor for CopyVisitor {
                 &self.settings,
                 &self.preserve,
                 is_fresh,
-                parent_ctx.delete_scan_parent.clone(),
+                parent_ctx.destination.clone(),
                 Some(open_file_guard),
             )
             .await;
@@ -1271,173 +1276,90 @@ impl WalkVisitor for CopyVisitor {
         let dst_name = self.dst_name_for(cx)?.to_owned();
         let is_fresh = parent_ctx.is_fresh;
         // open the source directory's contents (O_NOFOLLOW) — this is the `dir` the driver walks.
-        let src_dir = src_parent
-            .open_dir(name)
+        let (src_dir, src_meta) = src_parent
+            .open_dir_with_meta(name)
             .await
             .with_context(|| format!("cannot open directory {:?} for reading", src_path))
             .map_err(|err| Error::new(err, Default::default()))?;
         let src_dir = Arc::new(src_dir);
-        // the directory metadata applied to the destination comes from the held directory we
-        // enumerate (read-side fidelity, docs/tocttou.md). on ESPIPE, reopening "." relative to
-        // the held fd preserves that inode. the classify `Handle` may predate a directory swap;
-        // O_NOFOLLOW rejects a swapped-in symlink, and metadata pairs with the directory copied
-        let src_meta = src_dir
-            .meta()
-            .await
-            .with_context(|| format!("cannot read directory metadata from {:?}", src_path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        if self.settings.dry_run.is_some() {
-            // dry-run: if --ignore-existing and a non-directory already exists at the destination,
-            // the whole subtree would be skipped. otherwise report the directory and traverse its
-            // contents (with no destination directory).
-            let dst_nondir_exists = if !self.settings.ignore_existing || is_fresh {
-                false
-            } else if crate::safedir::strict_operand_resolution() {
-                // strict: fd-relative probe so a symlinked destination prefix fails closed
-                matches!(strict_dry_run_dst_kind(&dst_path).await?, Some(kind) if kind != EntryKind::Dir)
-            } else {
-                match crate::walk::run_metadata_probed(
-                    congestion::Side::Destination,
-                    congestion::MetadataOp::Stat,
-                    tokio::fs::symlink_metadata(&dst_path),
-                )
-                .await
-                {
-                    // Decide from the metadata already in hand rather than asking again with
-                    // `Path::is_dir()`. That call FOLLOWED symlinks, so a destination symlink — even
-                    // one pointing at a directory — read as "a directory is there, recurse", while the
-                    // real `--ignore-existing` run classifies the same entry through the parent's fd
-                    // (`O_NOFOLLOW`) as a non-directory and skips the whole subtree. The dry run
-                    // predicted a copy the real run does not perform. It was also a second,
-                    // un-throttled syscall re-resolving a path we had just probed.
-                    Ok(meta) => !meta.is_dir(),
-                    // `NotFound` is the ONE error that means the slot is empty — the same rule
-                    // [`dry_run_dst_exists`] and [`preflight_dst_file`] follow. Every other failure
-                    // (`EACCES` on a destination parent, `ELOOP`, `ENOTDIR`, `EIO`) says we could not
-                    // look, and reporting those as "nothing there" made `--dry-run` announce
-                    // "would copy" and exit 0 for a subtree the real run cannot even reach.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => {
-                        return Err(Error::new(
-                            anyhow::Error::new(error)
-                                .context(format!("cannot probe destination {dst_path:?}")),
-                            Default::default(),
-                        ));
-                    }
-                }
-            };
-            if dst_nondir_exists {
-                match self.settings.dry_run {
-                    Some(DryRunMode::Brief) | None => {}
-                    Some(DryRunMode::All) => println!("skip dir {:?}", dst_path),
-                    Some(DryRunMode::Explain) => {
-                        println!(
-                            "skip dir {:?} (destination exists, not a directory)",
-                            dst_path
-                        );
-                    }
-                }
-                return Ok(DirAction::Skip(Summary {
-                    directories_unchanged: 1,
-                    ..Default::default()
-                }));
-            }
-            let preview_dir = if self.settings.delete.is_some() {
-                parent_ctx
-                    .delete_scan_parent
-                    .open(&dst_name)
-                    .await
-                    .with_context(|| {
-                        format!("cannot open destination {dst_path:?} for delete scan")
-                    })
-                    .map_err(|error| Error::new(error, Default::default()))?
-            } else {
-                None
-            };
-            crate::dry_run::report_action("copy", src_path, Some(&dst_path), "dir");
-            let base = Summary {
-                directories_created: 1, // report as would-be-created
-                ..Default::default()
-            };
-            return Ok(DirAction::Descend {
-                dir: Arc::clone(&src_dir),
-                child_ctx: CopyDirContext {
-                    dst_dir: None, // dry-run: no destination parent (no destination mutation)
-                    delete_scan_parent: DeleteScanAnchor::parent(preview_dir.clone()),
-                    is_fresh,
+        let admission = parent_ctx
+            .destination
+            .enter(
+                self.prog_track,
+                &[&src_meta],
+                destination::PreservationSource {
+                    dir: &src_dir,
+                    meta: &src_meta,
+                    path: src_path,
+                    acl: self.preserve.dir.acl,
                 },
-                state: CopyDirState {
-                    src_dir,
-                    preview_dir,
-                    dst_dir: None,
-                    dst_parent: None,
-                    dst_name,
-                    // treat as "created" so empty-dir cleanup can suppress the dry-run count.
-                    we_created: true,
-                    // preview handles never lock or mutate the destination, so nothing to restore.
-                    reused_lock: None,
-                    src_meta,
-                    // dry-run applies no metadata at all, so it never reads ACLs either.
-                    src_acls: None,
-                    base,
-                },
-            });
-        }
-        // the directory's ACLs come from the same fd as `src_meta`, for the same read-side fidelity
-        // reason. Both ACLs: a directory's DEFAULT ACL is what its children inherit, so dropping it
-        // would silently change the destination tree's inheritance policy. Only when `d:acl` was
-        // requested — the probe is a per-entry syscall an ordinary copy must not pay for.
-        let src_acls = if self.preserve.dir.acl {
-            Some(
-                src_dir
-                    .read_acls()
-                    .await
-                    .with_context(|| format!("cannot read ACLs from directory {:?}", src_path))
-                    .map_err(|err| Error::new(err, Default::default()))?,
+                parent_ctx.dst_dir.as_ref(),
+                &dst_name,
+                &dst_path,
+                &self.settings,
+                self.settings.dry_run,
             )
-        } else {
-            None
+            .await
+            .map_err(|error| {
+                Error::new(
+                    error.source.context(format!(
+                        "cannot copy directory {src_path:?} to {dst_path:?}"
+                    )),
+                    error.summary,
+                )
+            })?;
+        let destination::Admission::Entered {
+            destination,
+            slot,
+            preview,
+            snapshot,
+        } = admission
+        else {
+            let destination::Admission::Skip(summary) = admission else {
+                unreachable!()
+            };
+            return Ok(DirAction::Skip(summary));
         };
-        // real copy: the destination parent is Some (None only in dry-run, handled above).
-        let dst_parent = parent_ctx
-            .dst_dir
-            .as_ref()
-            .expect("destination parent must be open for a real copy");
-        let DirSlot {
-            dir: dst_dir,
-            summary: base,
-            is_fresh: child_is_fresh,
-            we_created,
-            reused_lock,
-        } = match resolve_dst_dir(
-            self.prog_track,
-            dst_parent,
-            &dst_name,
-            &dst_path,
-            &self.settings,
-        )
-        .await?
-        {
-            DirResolution::Skip(summary) => return Ok(DirAction::Skip(summary)),
-            DirResolution::Proceed(slot) => slot,
+        let (dst_dir, dst_parent, base, child_is_fresh, we_created, reused_lock) = match slot {
+            Some(slot) => (
+                Some(slot.dir),
+                parent_ctx.dst_dir.clone(),
+                slot.summary,
+                slot.is_fresh,
+                slot.we_created,
+                slot.reused_lock,
+            ),
+            None => {
+                crate::dry_run::report_action("copy", src_path, Some(&dst_path), "dir");
+                (
+                    None,
+                    None,
+                    Summary {
+                        directories_created: 1,
+                        ..Default::default()
+                    },
+                    is_fresh,
+                    true,
+                    None,
+                )
+            }
         };
         Ok(DirAction::Descend {
             dir: Arc::clone(&src_dir),
             child_ctx: CopyDirContext {
-                dst_dir: Some(Arc::clone(&dst_dir)),
-                delete_scan_parent: DeleteScanAnchor::parent(None),
+                dst_dir: dst_dir.clone(),
+                destination: destination.child(),
                 is_fresh: child_is_fresh,
             },
             state: CopyDirState {
                 src_dir,
-                preview_dir: None,
-                dst_dir: Some(dst_dir),
-                dst_parent: Some(Arc::clone(dst_parent)),
+                preview_dir: preview,
+                dst_dir,
+                dst_parent,
                 dst_name,
                 we_created,
                 reused_lock,
-                src_meta,
-                src_acls,
+                snapshot,
                 base,
             },
         })
@@ -1457,8 +1379,7 @@ impl WalkVisitor for CopyVisitor {
             dst_name,
             we_created,
             reused_lock,
-            src_meta,
-            src_acls,
+            snapshot,
             base,
         } = state;
         // whether any child failed (non-fail-early: the driver still calls dir_post on error so we
@@ -1513,8 +1434,8 @@ impl WalkVisitor for CopyVisitor {
                 dst_dir,
                 dst_parent,
                 dst_name,
-                src_meta,
-                src_acls,
+                src_meta: snapshot.meta,
+                src_acls: snapshot.acls,
                 we_created,
                 reused_lock,
             },
@@ -2358,9 +2279,15 @@ pub(crate) async fn resolve_dst_dir(
     name: &OsStr,
     dst_path: &std::path::Path,
     settings: &Settings,
+    reservation: &safedir::overlap::Reservation,
 ) -> Result<DirResolution, Error> {
+    let output = reservation.clone();
     match dst_parent
-        .make_dir(name, safedir::DST_DIR_CREATE_MODE)
+        .make_dir_checked(name, safedir::DST_DIR_CREATE_MODE, move |meta| {
+            output.output(meta)?;
+            output.commit();
+            Ok(())
+        })
         .await
     {
         Ok(dir) => {
@@ -2400,21 +2327,28 @@ pub(crate) async fn resolve_dst_dir(
                 // and restrict it to 0o700 for the copy's duration, restoring the original owner and
                 // source mode at finalize (see `finalize_dir`) so the final state is unchanged.
                 tracing::debug!("'dst' is a directory, reusing it");
-                let dir = dst_parent
-                    .open_dir(name)
+                let (dir, meta) = dst_parent
+                    .open_dir_with_meta(name)
                     .await
                     .with_context(|| format!("cannot open existing directory {:?}", dst_path))
                     .map_err(|err| Error::new(err, Default::default()))?;
+                reservation
+                    .output(&meta)
+                    .with_context(|| format!("cannot use destination directory {dst_path:?}"))
+                    .map_err(|error| Error::new(error, Default::default()))?;
                 // strict-only lockdown: take over the reused directory and restrict it to 0o700 for
                 // the copy's duration (no-op / None in the default path). A recheck or EPERM failure
                 // surfaces as this directory's error, honoring --fail-early; `dir_pre` returning Err
                 // skips descent, so no child is ever written into an unsecured directory.
-                let reused_lock = safedir::lockdown_reused_dir(&dir, &dst_handle)
-                    .await
-                    .with_context(|| {
-                        format!("cannot secure reused destination directory {:?}", dst_path)
-                    })
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let mutation = reservation.clone();
+                let reused_lock = safedir::lockdown_reused_dir_with(&dir, &dst_handle, move || {
+                    mutation.commit();
+                })
+                .await
+                .with_context(|| {
+                    format!("cannot secure reused destination directory {:?}", dst_path)
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
                 prog_track.directories_unchanged.inc();
                 Ok(DirResolution::Proceed(DirSlot {
                     dir: Arc::new(dir),
@@ -2441,17 +2375,25 @@ pub(crate) async fn resolve_dst_dir(
             } else if settings.overwrite {
                 // a non-directory exists and --overwrite was set: remove it and create the dir.
                 tracing::info!("'dst' is not a directory, removing and creating a new one");
-                let rm_summary = remove_existing(
+                // only a successful unlink commits history. its blocking job owns the reservation
+                // until it finishes, including when the awaiting directory admission is cancelled
+                let mutation = reservation.clone();
+                let rm_summary = remove_existing_non_directory(
                     prog_track,
                     dst_parent,
                     name,
                     dst_path,
                     dst_handle.into_removal_snapshot(),
-                    settings,
+                    move || mutation.commit(),
                 )
                 .await?;
+                let output = reservation.clone();
                 let dir = dst_parent
-                    .make_dir(name, safedir::DST_DIR_CREATE_MODE)
+                    .make_dir_checked(name, safedir::DST_DIR_CREATE_MODE, move |meta| {
+                        output.output(meta)?;
+                        output.commit();
+                        Ok(())
+                    })
                     .await
                     .with_context(|| format!("cannot create directory {:?}", dst_path))
                     .map_err(|err| {
@@ -2496,6 +2438,39 @@ pub(crate) async fn resolve_dst_dir(
     }
 }
 
+async fn remove_existing_non_directory(
+    prog_track: &'static progress::Progress,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    dst_snapshot: RemovalSnapshot,
+    after_unlink: impl FnOnce() + Send + 'static,
+) -> Result<RmSummary, Error> {
+    let removed_size = dst_snapshot.size();
+    // single-entry, fd-relative removal contained to dst_parent; never follows a symlink.
+    dst_parent
+        .unlink_at_with(dst_name, after_unlink)
+        .await
+        .with_context(|| format!("failed removing existing destination {:?}", dst_path))
+        .map_err(|err| Error::new(err, Default::default()))?;
+    let is_symlink = dst_snapshot.kind() == EntryKind::Symlink;
+    if is_symlink {
+        prog_track.symlinks_removed.inc();
+    } else {
+        prog_track.files_removed.inc();
+        prog_track.bytes_removed.add(removed_size);
+    }
+    Ok(RmSummary {
+        // the summary must carry the same bytes the progress counter just took, or the
+        // end-of-run totals and the error payloads disagree with the live display. a
+        // symlink contributes none, matching `rm::rm_file`'s accounting.
+        bytes_removed: if is_symlink { 0 } else { removed_size },
+        files_removed: usize::from(!is_symlink),
+        symlinks_removed: usize::from(is_symlink),
+        ..Default::default()
+    })
+}
+
 /// Remove an existing destination entry (file, symlink, directory, or special) so a fresh copy can
 /// take its place. The returned summary is folded into the caller's copy summary.
 ///
@@ -2526,29 +2501,15 @@ pub async fn remove_existing(
 ) -> Result<RmSummary, Error> {
     match dst_snapshot.kind() {
         EntryKind::File | EntryKind::Symlink | EntryKind::Special => {
-            let removed_size = dst_snapshot.size();
-            // single-entry, fd-relative removal contained to dst_parent; never follows a symlink.
-            dst_parent
-                .unlink_at(dst_name)
-                .await
-                .with_context(|| format!("failed removing existing destination {:?}", dst_path))
-                .map_err(|err| Error::new(err, Default::default()))?;
-            let is_symlink = dst_snapshot.kind() == EntryKind::Symlink;
-            if is_symlink {
-                prog_track.symlinks_removed.inc();
-            } else {
-                prog_track.files_removed.inc();
-                prog_track.bytes_removed.add(removed_size);
-            }
-            Ok(RmSummary {
-                // the summary must carry the same bytes the progress counter just took, or the
-                // end-of-run totals and the error payloads disagree with the live display. a
-                // symlink contributes none, matching `rm::rm_file`'s accounting.
-                bytes_removed: if is_symlink { 0 } else { removed_size },
-                files_removed: usize::from(!is_symlink),
-                symlinks_removed: usize::from(is_symlink),
-                ..Default::default()
-            })
+            remove_existing_non_directory(
+                prog_track,
+                dst_parent,
+                dst_name,
+                dst_path,
+                dst_snapshot,
+                || {},
+            )
+            .await
         }
         EntryKind::Dir => {
             // try the fd-relative fast path first: an empty directory removes cleanly via rmdir_at.
@@ -2643,6 +2604,321 @@ mod copy_tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_overwrite_removal_releases_input_history() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let src = root.path().join("source");
+        let next = root.path().join("next");
+        let dst = root.path().join("occupied");
+        for path in [&src, &next] {
+            std::fs::create_dir(path)?;
+            let mut config = crate::filegen::FileGenConfig::new(path.clone(), vec![], 1, 16);
+            config.leaf_files = true;
+            crate::filegen::filegen(&PROGRESS, &config).await?;
+        }
+        std::fs::write(&dst, b"keep")?;
+        let mut settings = settings_with_delete(None);
+        settings.overwrite = true;
+        let session = CopySession::default();
+        let task_session = session.clone();
+        let task_src = src.clone();
+        let task_dst = dst.clone();
+        let task_settings = settings.clone();
+        let mut gate = testutils::BlockingPathGate::install(dst.join(".rcp-unlink"));
+        let task = tokio::spawn(async move {
+            task_session
+                .copy(
+                    &PROGRESS,
+                    &task_src,
+                    &task_dst,
+                    &task_settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await
+        });
+        let timeout = std::time::Duration::from_secs(5);
+        tokio::time::timeout(timeout, gate.wait_started()).await??;
+        // a planned non-directory may become a directory; unlink must fail without recursing
+        let retained = root.path().join("retained");
+        std::fs::rename(&dst, &retained)?;
+        std::fs::create_dir(&dst)?;
+        std::fs::write(dst.join("sentinel"), b"retain directory")?;
+        gate.release_all();
+        let error = tokio::time::timeout(timeout, task).await??.unwrap_err();
+        assert_eq!(gate.hit_count(), 1);
+        assert_eq!(
+            error
+                .source
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EISDIR)
+        );
+        assert_eq!(error.summary.rm_summary.files_removed, 0);
+        assert_eq!(error.summary.rm_summary.symlinks_removed, 0);
+        assert_eq!(error.summary.rm_summary.directories_removed, 0);
+        assert_eq!(error.summary.rm_summary.bytes_removed, 0);
+        assert_eq!(std::fs::read(&retained)?, b"keep");
+        assert_eq!(std::fs::read(dst.join("sentinel"))?, b"retain directory");
+        session
+            .copy(
+                &PROGRESS,
+                &next,
+                &src.join("out"),
+                &settings,
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await
+            .map_err(|error| error.source)?;
+        assert_eq!(std::fs::metadata(src.join("out/file0"))?.len(), 16);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_overwrite_removal_keeps_input_history_after_success() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let src = root.path().join("source");
+        let dst = root.path().join("occupied");
+        std::fs::create_dir(&src)?;
+        std::fs::write(&dst, b"remove")?;
+        let source_meta = std::fs::metadata(&src)?;
+        let mut settings = settings_with_delete(None);
+        settings.overwrite = true;
+        let session = CopySession::default();
+        let task_session = session.clone();
+        let task_src = src.clone();
+        let task_dst = dst.clone();
+        let mut gate = testutils::BlockingPathGate::install(dst.join(".rcp-unlink"));
+        let task = tokio::spawn(async move {
+            task_session
+                .copy(
+                    &PROGRESS,
+                    &task_src,
+                    &task_dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await
+        });
+        let timeout = std::time::Duration::from_secs(5);
+        tokio::time::timeout(timeout, gate.wait_started()).await??;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let conflicts = || {
+            session
+                .overlap
+                .reserve(
+                    &[],
+                    &safedir::overlap::Evidence::from([(source_meta.dev(), source_meta.ino())]),
+                    Arc::new(safedir::overlap::Operand {
+                        source: root.path().join("next"),
+                        update: None,
+                        destination: src.join("out"),
+                        destination_ancestors: Default::default(),
+                    }),
+                )
+                .is_err()
+        };
+        let retained_while_running = conflicts();
+        gate.release_all();
+        tokio::time::timeout(timeout, gate.wait_completed()).await??;
+        assert!(
+            retained_while_running,
+            "started removal must retain its input"
+        );
+        assert!(
+            !dst.exists(),
+            "the started unlink must finish after cancellation"
+        );
+        assert!(
+            conflicts(),
+            "successful removal must commit its input history"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignored_non_directory_still_skips_when_source_acl_read_fails() -> anyhow::Result<()> {
+        for use_link in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("source");
+            let dst = root.path().join("destination");
+            std::fs::create_dir(&src)?;
+            std::fs::write(&dst, b"keep")?;
+            let fault =
+                testutils::BlockingPathGate::fail_once(src.join(".rcp-directory-acl"), libc::EIO);
+            let mut settings = settings_with_delete(None);
+            settings.ignore_existing = true;
+            let preserve = preserve::preserve_all_with_acls();
+            let summary = if use_link {
+                crate::link::link(
+                    &PROGRESS,
+                    root.path(),
+                    &src,
+                    &dst,
+                    &None,
+                    &crate::link::Settings {
+                        copy_settings: settings,
+                        update_compare: Default::default(),
+                        update_exclusive: false,
+                        filter: None,
+                        dry_run: None,
+                        preserve,
+                    },
+                    false,
+                )
+                .await
+                .map_err(|error| error.source)?
+                .copy_summary
+            } else {
+                copy(&PROGRESS, &src, &dst, &settings, &preserve, false)
+                    .await
+                    .map_err(|error| error.source)?
+            };
+            assert_eq!(
+                fault.hit_count(),
+                1,
+                "fixture must reach the failing source ACL read"
+            );
+            assert_eq!(summary.directories_unchanged, 1);
+            assert_eq!(std::fs::read(&dst)?, b"keep");
+        }
+        Ok(())
+    }
+
+    async fn root_acl_capture_after_ancestry(
+        use_link: bool,
+        with_update: bool,
+    ) -> anyhow::Result<()> {
+        use crate::testutils::acl::*;
+        for (before, after) in [(0o2770, 0o750), (0o750, 0o700)] {
+            let root = tempfile::tempdir()?;
+            let root_path = root.path().canonicalize()?;
+            let src = root_path.join("source");
+            let update = root_path.join("update");
+            let ancestor = root_path.join("ancestor");
+            let dst = ancestor.join("parent/destination");
+            for path in [&src, &update, &dst] {
+                std::fs::create_dir_all(path)?;
+            }
+            std::fs::write(src.join("file"), b"source payload")?;
+            std::fs::write(update.join("file"), b"update payload")?;
+            let chosen = if with_update { &update } else { &src };
+            let acl = encode_acl(&[
+                (ACL_USER_OBJ, 7, ACL_UNDEFINED_ID),
+                (ACL_USER, 0, nix::unistd::geteuid().as_raw()),
+                (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+                (ACL_MASK, 5, ACL_UNDEFINED_ID),
+                (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+            ]);
+            set_xattr_at(chosen, c"system.posix_acl_access", &acl);
+            std::fs::set_permissions(chosen, std::fs::Permissions::from_mode(before))?;
+            // ancestry opens this intermediate parent after sampling the input's initial metadata
+            let mut gate = testutils::BlockingPathGate::install(&ancestor);
+            let task_src = src.clone();
+            let task_dst = dst.clone();
+            let task_update = with_update.then_some(update.clone());
+            let task = tokio::spawn(async move {
+                let mut settings = settings_with_delete(None);
+                settings.overwrite = true;
+                let preserve = preserve::preserve_all_with_acls();
+                if use_link {
+                    crate::link::link(
+                        &PROGRESS,
+                        &root_path,
+                        &task_src,
+                        &task_dst,
+                        &task_update,
+                        &crate::link::Settings {
+                            copy_settings: settings,
+                            update_compare: Default::default(),
+                            update_exclusive: false,
+                            filter: None,
+                            dry_run: None,
+                            preserve,
+                        },
+                        false,
+                    )
+                    .await
+                    .map(|summary| summary.copy_summary)
+                    .map_err(|error| error.source)
+                } else {
+                    copy(&PROGRESS, &task_src, &task_dst, &settings, &preserve, false)
+                        .await
+                        .map_err(|error| error.source)
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started()).await??;
+            std::fs::set_permissions(chosen, std::fs::Permissions::from_mode(after))?;
+            let expected_acl = get_xattr_at(chosen, c"system.posix_acl_access");
+            gate.release_all();
+            task.await?.with_context(|| {
+                format!(
+                    "root mode {before:#o} -> {after:#o}, link={use_link}, update={with_update}"
+                )
+            })?;
+            assert!(dst.join("file").is_file());
+            assert_eq!(
+                std::fs::metadata(&dst)?.permissions().mode() & 0o7777,
+                after
+            );
+            assert_eq!(get_xattr_at(&dst, c"system.posix_acl_access"), expected_acl);
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn copy_root_acl_snapshot_refreshes_after_ancestry() -> anyhow::Result<()> {
+        root_acl_capture_after_ancestry(false, false).await
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn link_root_acl_snapshot_refreshes_after_ancestry() -> anyhow::Result<()> {
+        root_acl_capture_after_ancestry(true, false).await
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn link_update_root_acl_snapshot_refreshes_after_ancestry() -> anyhow::Result<()> {
+        root_acl_capture_after_ancestry(true, true).await
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[test]
+    fn strict_root_acl_snapshot_refreshes_after_ancestry() -> anyhow::Result<()> {
+        const CHILD: &str = "RCP_TEST_STRICT_ROOT_ACL_SNAPSHOT";
+        if std::env::var_os(CHILD).is_some() {
+            // strict mode is process-global, so it must not leak into other libtest tests
+            safedir::enable_strict_operand_resolution();
+            return tokio::runtime::Runtime::new()?.block_on(async {
+                for (use_link, with_update) in [(false, false), (true, false), (true, true)] {
+                    root_acl_capture_after_ancestry(use_link, with_update).await?;
+                }
+                Ok(())
+            });
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "copy::copy_tests::strict_root_acl_snapshot_refreshes_after_ancestry",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "strict root ACL test did not pass: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
     fn delete_on() -> Option<DeleteSettings> {
         Some(DeleteSettings {
             delete_excluded: false,
@@ -2714,7 +2990,7 @@ mod copy_tests {
         let visitor = CopyVisitor {
             prog_track: &PROGRESS,
             dst_root: PathBuf::from("destination//./renamed"),
-            delete_scan_anchor: DeleteScanAnchor::parent(None),
+            destination: DestinationContext::parent(None),
             settings: settings_with_delete(None),
             preserve: *NO_PRESERVE_SETTINGS,
             dst_parent: None,
@@ -2984,6 +3260,97 @@ mod copy_tests {
             "extraneous symlink must be removed"
         );
         assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_destination_inside_source_before_creating_it() -> anyhow::Result<()> {
+        for preview in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let dst = src.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            let mut config = crate::filegen::FileGenConfig::new(&src, vec![], 1, 32);
+            config.leaf_files = true;
+            crate::filegen::filegen(&PROGRESS, &config).await?;
+            let original = tokio::fs::read(src.join("file0")).await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            // keep the old implementation finite without hiding the invalid destination
+            filter.add_exclude("dst/")?;
+            let mut settings = settings_with_delete(None);
+            settings.filter = Some(filter);
+            settings.dry_run = preview.then_some(crate::config::DryRunMode::Brief);
+            let error = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &settings,
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await
+            .expect_err("a destination inside its source must be rejected");
+            assert!(format!("{:#}", error.source).contains("overlap"));
+            assert_eq!(error.summary.directories_created, 0);
+            assert!(!dst.exists());
+            assert_eq!(tokio::fs::read(src.join("file0")).await?, original);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_overlapping_destination_without_changing_existing_contents()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "nested/dst"] {
+            for preview in [false, true] {
+                let root = tempfile::tempdir()?;
+                let src = root.path().join("src");
+                let physical_dst = src.join(suffix);
+                tokio::fs::create_dir_all(&physical_dst).await?;
+                let mut config = crate::filegen::FileGenConfig::new(&src, vec![], 1, 32);
+                config.leaf_files = true;
+                crate::filegen::filegen(&PROGRESS, &config).await?;
+                let original = tokio::fs::read(src.join("file0")).await?;
+                tokio::fs::write(physical_dst.join("sentinel"), b"keep").await?;
+                tokio::fs::set_permissions(&physical_dst, std::fs::Permissions::from_mode(0o751))
+                    .await?;
+                // resolve the destination through a symlinked parent, not a lexical source prefix
+                let alias = root.path().join("alias");
+                tokio::fs::symlink(root.path(), &alias).await?;
+                let dst = alias.join("src").join(suffix);
+                let mut settings = settings_with_delete(delete_on());
+                settings.dry_run = preview.then_some(crate::config::DryRunMode::Brief);
+                let mut filter = crate::filter::FilterSettings::new();
+                filter.add_exclude("nested/")?;
+                settings.filter = Some(filter);
+                let error = copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await
+                .expect_err("overlapping directories must be rejected");
+                assert!(format!("{:#}", error.source).contains("overlap"));
+                assert_eq!(error.summary.directories_created, 0);
+                assert_eq!(tokio::fs::read(src.join("file0")).await?, original);
+                assert_eq!(
+                    tokio::fs::read(physical_dst.join("sentinel")).await?,
+                    b"keep"
+                );
+                assert_eq!(
+                    tokio::fs::metadata(&physical_dst)
+                        .await?
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o751
+                );
+            }
+        }
         Ok(())
     }
 
@@ -3466,13 +3833,11 @@ mod copy_tests {
                 filter.add_include("*.rs")?;
                 settings.filter = Some(filter);
                 // an invalid scan anchor fails with EINVAL regardless of process privileges
+                let destination = DestinationContext::new(std::path::Path::new("/"));
                 let visitor = Arc::new(CopyVisitor {
                     prog_track: &PROGRESS,
                     dst_root: dst.clone(),
-                    delete_scan_anchor: DeleteScanAnchor::new(
-                        std::path::Path::new("/"),
-                        std::path::Path::new(""),
-                    ),
+                    destination,
                     settings,
                     preserve: *NO_PRESERVE_SETTINGS,
                     dst_parent: None,
@@ -3499,7 +3864,7 @@ mod copy_tests {
                 assert_eq!(error.summary.directories_created, 0);
                 assert_eq!(error.summary.files_skipped, 0);
                 let message = format!("{:#}", error.source);
-                assert!(message.contains("for delete scan"), "{message}");
+                assert!(message.contains("for preview"), "{message}");
                 assert!(
                     message.contains(&format!(
                         "{:?}",
@@ -5728,7 +6093,7 @@ mod copy_tests {
                     &settings,
                     &NO_PRESERVE_SETTINGS,
                     false,
-                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    DestinationContext::new(&dst),
                     CopyEntryAdmission::Admitted(entry),
                 ),
             )
@@ -5784,7 +6149,7 @@ mod copy_tests {
                 let visitor = Arc::new(CopyVisitor {
                     prog_track: &PROGRESS,
                     dst_root: dst.clone(),
-                    delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    destination: DestinationContext::new(&dst),
                     settings: {
                         let mut settings = settings_with_delete(delete);
                         settings.filter = Some(filter.clone());
@@ -5801,7 +6166,7 @@ mod copy_tests {
                     &PROGRESS,
                 );
                 let child_ctx = CopyDirContext {
-                    delete_scan_parent: DeleteScanAnchor::parent(None),
+                    destination: DestinationContext::parent(None),
                     dst_dir: Some(Arc::clone(&dst_dir)),
                     is_fresh: true,
                 };
@@ -5867,7 +6232,7 @@ mod copy_tests {
             let visitor = Arc::new(CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst.clone(),
-                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                destination: DestinationContext::new(&dst),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -5880,7 +6245,7 @@ mod copy_tests {
                 &PROGRESS,
             );
             let child_ctx = CopyDirContext {
-                delete_scan_parent: DeleteScanAnchor::parent(None),
+                destination: DestinationContext::parent(None),
                 dst_dir: Some(Arc::clone(&dst_dir)),
                 is_fresh: false,
             };
@@ -5960,7 +6325,7 @@ mod copy_tests {
             let visitor = Arc::new(CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst.clone(),
-                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                destination: DestinationContext::new(&dst),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -5979,7 +6344,7 @@ mod copy_tests {
                     src_dir,
                     &root_cx,
                     &CopyDirContext {
-                        delete_scan_parent: DeleteScanAnchor::parent(None),
+                        destination: DestinationContext::parent(None),
                         dst_dir: None,
                         is_fresh: false,
                     },
@@ -6881,10 +7246,7 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: PathBuf::new(),
-                delete_scan_anchor: DeleteScanAnchor::new(
-                    std::path::Path::new("dst"),
-                    std::path::Path::new(""),
-                ),
+                destination: DestinationContext::new(std::path::Path::new("dst")),
                 settings: settings_with_delete(None),
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -6929,7 +7291,7 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst_root.clone(),
-                delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
+                destination: DestinationContext::new(&dst_root),
                 settings: settings_with_delete(None),
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: Some(Arc::clone(&dst_parent)),
@@ -6942,7 +7304,7 @@ mod copy_tests {
                 &PROGRESS,
             );
             let parent_ctx = CopyDirContext {
-                delete_scan_parent: DeleteScanAnchor::parent(None),
+                destination: DestinationContext::parent(None),
                 dst_dir: Some(dst_parent),
                 is_fresh: true,
             };
@@ -7007,7 +7369,7 @@ mod copy_tests {
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
                 dst_root: dst_root.clone(),
-                delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
+                destination: DestinationContext::new(&dst_root),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -7020,7 +7382,7 @@ mod copy_tests {
                 &PROGRESS,
             );
             let parent_ctx = CopyDirContext {
-                delete_scan_parent: DeleteScanAnchor::parent(None),
+                destination: DestinationContext::parent(None),
                 dst_dir: None,
                 is_fresh: false,
             };
@@ -7897,7 +8259,7 @@ mod copy_tests {
                     &settings,
                     &NO_PRESERVE_SETTINGS,
                     false,
-                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    DestinationContext::new(&dst),
                     entry,
                 ),
             )
@@ -7971,7 +8333,7 @@ mod copy_tests {
                     &settings,
                     &NO_PRESERVE_SETTINGS,
                     false,
-                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    DestinationContext::new(&dst),
                     entry,
                 ),
             )
@@ -8114,7 +8476,7 @@ mod copy_tests {
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
-                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                DestinationContext::new(&dst),
                 entry,
             ),
         )
@@ -8171,7 +8533,7 @@ mod copy_tests {
                 &settings_with_delete(None),
                 &NO_PRESERVE_SETTINGS,
                 false,
-                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                DestinationContext::new(&dst),
                 entry,
             ),
         )
@@ -8235,7 +8597,7 @@ mod copy_tests {
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
-                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                DestinationContext::new(&dst),
                 entry,
             ),
         )
@@ -8383,7 +8745,7 @@ mod copy_tests {
                 &toctou_settings(),
                 &NO_PRESERVE_SETTINGS,
                 false,
-                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                DestinationContext::new(&dst),
                 entry,
             ),
         )

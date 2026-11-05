@@ -240,7 +240,8 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     // directory just like `rrm .`/`rchm .` already work. (`/` is rejected there.) Use a shell glob
     // (`dir/*`) if you want to expand a directory's contents instead.
     let dst = resolve_dst_root(&args.src, &args.dst)?;
-    if !(args.dst.ends_with('/') || args.overwrite || args.delete) {
+    // previews report attempted work; only real links need this existing-destination preflight
+    if args.dry_run.is_none() && !(args.dst.ends_with('/') || args.overwrite || args.delete) {
         // Under strict operand resolution, probe the destination fd-relative (parent opened
         // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead of
         // being followed by a path-based `exists()`. The engine also validates the prefix up front;

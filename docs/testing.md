@@ -162,6 +162,36 @@ that sets `FOPEN_NONSEEKABLE` or `FOPEN_STREAM`; a seekable FUSE mount does not 
 an extra open/close per fallback listing, and `EACCES` if reopening `.` requires search permission
 the caller lacks, including on an empty directory with mode `0444`.
 
+**Directory overlap tests** cover local copy/link destinations inside source and update roots,
+including deletion, dry runs, held parents after rename, and descriptor ownership on cancellation.
+Shared admission tests also cover missing or unreadable preview counterparts, failed reservations,
+operation provenance, and metadata/ACL capture before traversal. Probe tests pin directory costs and
+ancestry-cache reuse independently of per-entry accounting. Run them on Btrfs as well when changing
+enumeration or destination setup:
+
+```bash
+TMPDIR=/path/on/btrfs just test -p rcp-tools-common \
+  -E 'test(rejects_destination_inside) | test(rejects_overlapping_destination) |
+      test(safedir::overlap) | test(copy::destination) |
+      test(directory_acl_snapshot_precedes_child_traversal) | binary(directory_overlap)'
+```
+
+The committed bind-mount regressions use Linux user/mount namespaces and `unshare`. They are opt-in
+locally and explicitly enabled in debug CI. Each starts its own private mount namespace before
+creating mounts and fails if isolation is unavailable. They cover source/output aliases, parallel
+cross-branch and multi-source feedback, and both update-only and type-mismatch delegated copies. The
+bind cases distinguish a direct-child bind detected before creation from a general `X` onto `X`
+self-bind discovered later during traversal, and retain a valid same-device nonrecursive bind:
+
+```bash
+just test -p rcp-tools-common -p rcp-tools-rcp --test directory_overlap --run-ignored only
+```
+
+The fixtures remain ignored in ordinary local test runs and the Nix sandbox. The musl debug CI step
+for sudo-required tests also selects the ignored `directory_overlap` fixtures with
+`test(~sudo) or binary(=directory_overlap)`. CI sets `RCP_TEST_MOUNT_SUDO=1` to use its passwordless
+sudo for private mount namespaces; local runs default to unprivileged user/mount namespaces.
+
 **POSIX ACL tests** (`rcp/tests/acls.rs`, `rlink/tests/acls.rs`, and unit tests in
 `common/src/safedir.rs`) need a temp filesystem that can hold `system.posix_acl_*` extended
 attributes. Per the repo's convention they **fail rather than skip** when it cannot, so a lost
@@ -455,11 +485,13 @@ release + doctest + Docker checks CI does, plus full Nix target checks when Nix 
 the one command to run before pushing. It's a close proxy for the CI matrix rather than a
 byte-for-byte match; a few CI steps live outside it:
 
-- **Sudo-gated tests** (`test(~sudo)`, which need passwordless sudo). CI runs these in a separate
-  step, in both debug and release. Run them yourself when a change touches sudo-only behavior:
+- **Sudo-gated and isolated mount tests.** CI runs `test(~sudo)` in a separate step in both debug
+  and release. The debug step also selects ignored `binary(=directory_overlap)` fixtures and sets
+  `RCP_TEST_MOUNT_SUDO=1` for private mount namespaces. To reproduce that combined step with
+  passwordless sudo:
 
   ```bash
-  ./scripts/cargo-host.sh nextest run --run-ignored only -E 'test(~sudo)'
+  RCP_TEST_MOUNT_SUDO=1 just test --run-ignored only -E 'test(~sudo) or binary(=directory_overlap)'
   ```
 
 - **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`. On supported

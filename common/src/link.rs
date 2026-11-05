@@ -332,12 +332,15 @@ async fn link_inner(
     // reserve root admission before any strict probe or operand-parent open, then transfer it into
     // link_internal. an authoritative directory releases it before dual-tree descent.
     let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+    // setup is immediately unpacked; keep its held authority and admission allocation-free.
+    #[allow(clippy::large_enum_variant)]
     enum LinkRootSetup {
         Complete(Summary),
         Ready {
             src_operand: crate::walk::RootOperand,
             src_parent: Arc<Dir>,
             dst_parent: Option<Arc<Dir>>,
+            preview_parent: Option<copy::PreviewParent>,
             update_parent: Option<(Arc<Dir>, std::ffi::OsString)>,
             admission: LinkEntryAdmission,
         },
@@ -450,8 +453,24 @@ async fn link_inner(
         // every mode regardless of filters/flags (see copy::copy for the same pattern). An absent parent
         // (dry-run previewing into a not-yet-created tree, or a filtered-out root) is not a symlink
         // violation; only a symlinked prefix component (ELOOP) fails closed here.
+        let preview_parent =
+            if crate::safedir::strict_operand_resolution() && settings.dry_run.is_some() {
+                match dst_parent_path_opt {
+                    Some(path) => Some(
+                        copy::PreviewParent::open(path)
+                            .await
+                            .with_context(|| {
+                                format!("cannot open destination parent directory {path:?}")
+                            })
+                            .map_err(|err| Error::new(err, Default::default()))?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
         let strict_dst_parent: Option<Arc<Dir>> = match (
-            crate::safedir::strict_operand_resolution(),
+            crate::safedir::strict_operand_resolution() && settings.dry_run.is_none(),
             dst_parent_path_opt,
         ) {
             (true, Some(dst_parent_path)) => {
@@ -759,27 +778,31 @@ async fn link_inner(
             src_operand,
             src_parent,
             dst_parent,
+            preview_parent,
             update_parent,
             admission,
         })
     })
     .await?;
-    let (src_operand, src_parent, dst_parent, update_parent, admission) = match setup {
-        LinkRootSetup::Complete(summary) => return Ok(summary),
-        LinkRootSetup::Ready {
-            src_operand,
-            src_parent,
-            dst_parent,
-            update_parent,
-            admission,
-        } => (
-            src_operand,
-            src_parent,
-            dst_parent,
-            update_parent,
-            admission,
-        ),
-    };
+    let (src_operand, src_parent, dst_parent, preview_parent, update_parent, admission) =
+        match setup {
+            LinkRootSetup::Complete(summary) => return Ok(summary),
+            LinkRootSetup::Ready {
+                src_operand,
+                src_parent,
+                dst_parent,
+                preview_parent,
+                update_parent,
+                admission,
+            } => (
+                src_operand,
+                src_parent,
+                dst_parent,
+                preview_parent,
+                update_parent,
+                admission,
+            ),
+        };
     let src = src_operand.display.as_path();
     let src_name = src_operand.name.as_os_str();
     let update_ref = update_parent
@@ -799,7 +822,8 @@ async fn link_inner(
         settings,
         is_fresh,
         admission,
-        copy::DeleteScanAnchor::new(dst, std::path::Path::new("")),
+        copy::DestinationContext::for_operand(src, update.as_deref(), dst)
+            .with_preview_parent(preview_parent),
     )
     .await
     .map(|result| result.summary)
@@ -1076,7 +1100,7 @@ async fn link_internal(
     settings: &Settings,
     is_fresh: bool,
     admission: LinkEntryAdmission,
-    delete_scan_parent: copy::DeleteScanAnchor,
+    destination: copy::DestinationContext,
 ) -> Result<LinkEntryResult, Error> {
     let _prog_guard = prog_track.ops.guard();
     // reconstruct diagnostic paths and the deliberately path-based dereference fallback.
@@ -1261,7 +1285,7 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    delete_scan_parent.clone(),
+                    destination.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1321,7 +1345,7 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    delete_scan_parent.clone(),
+                    destination.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1342,7 +1366,7 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    delete_scan_parent.clone(),
+                    destination.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1394,7 +1418,7 @@ async fn link_internal(
                     &src_path,
                     dst_root,
                     rel_path,
-                    delete_scan_parent.clone(),
+                    destination.clone(),
                     settings,
                     is_fresh,
                     admission,
@@ -1482,7 +1506,7 @@ async fn link_internal(
         update_path_for_dir,
         settings,
         is_fresh,
-        delete_scan_parent,
+        destination,
     )
     .await
     .map(LinkEntryResult::selected)
@@ -1492,7 +1516,7 @@ async fn link_internal(
 /// directory handles plus the entry `name` for payload authority. Copy's documented dereference
 /// and read-only preview exceptions still apply. `dst_root` retains the original destination
 /// anchor; `filter_base` is the entry's logical relative path (so pruning inside the subtree
-/// matches include/exclude patterns at the entry's true path). `delete_scan_anchor` independently
+/// matches include/exclude patterns at the entry's true path). `destination` independently
 /// carries the held preview parent or its known absence. The returned copy
 /// summary is folded into a link `Summary`.
 #[allow(clippy::too_many_arguments)]
@@ -1504,7 +1528,7 @@ async fn delegate_copy(
     src_path: &std::path::Path,
     dst_root: &std::path::Path,
     filter_base: &std::path::Path,
-    delete_scan_anchor: copy::DeleteScanAnchor,
+    destination: copy::DestinationContext,
     settings: &Settings,
     is_fresh: bool,
     admission: AdmittedEntry,
@@ -1532,7 +1556,7 @@ async fn delegate_copy(
         copy_settings,
         &settings.preserve,
         is_fresh,
-        delete_scan_anchor,
+        destination,
         admission,
     )
     .await
@@ -1552,9 +1576,9 @@ async fn delegate_copy(
     })
 }
 
-/// Resolve (create / reuse / overwrite) the destination directory fd-relative, open the source
-/// (and update) directories, then recurse via [`link_dir_contents`]. Mirrors copy's
-/// [`copy::resolve_dst_dir`] for the overwrite branches (fd-relative, parent-contained removal).
+/// Open the source and optional update directory, then admit the destination through the shared
+/// copy/link path before traversing their contents. Admission captures preservation metadata and
+/// ACLs from the selected input and retains held destination authority for the child traversal.
 #[allow(clippy::too_many_arguments)]
 async fn link_dir_entry(
     prog_track: &'static progress::Progress,
@@ -1572,110 +1596,111 @@ async fn link_dir_entry(
     update_path: Option<&std::path::Path>,
     settings: &Settings,
     is_fresh: bool,
-    delete_scan_parent: copy::DeleteScanAnchor,
+    destination: copy::DestinationContext,
 ) -> Result<Summary, Error> {
-    let src_dir = src_parent
-        .open_dir(name)
+    let (src_dir, src_meta) = src_parent
+        .open_dir_with_meta(name)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src_path))
         .map_err(|err| Error::new(err, Default::default()))?;
     let src_dir = Arc::new(src_dir);
     // open the update directory too (it has the same file type as src here — both are dirs).
-    let update_dir = match update {
+    let (update_dir, update_meta) = match update {
         Some((update_parent, update_name)) => {
-            let dir = update_parent
-                .open_dir(update_name)
+            let update_path = update_path.expect("an update directory has a display path");
+            let (dir, meta) = update_parent
+                .open_dir_with_meta(update_name)
                 .await
                 .with_context(|| {
                     format!("cannot open update directory {:?} for reading", update_path)
                 })
                 .map_err(|err| Error::new(err, Default::default()))?;
-            Some(Arc::new(dir))
+            (Some(Arc::new(dir)), Some((meta, update_path)))
         }
-        None => None,
+        None => (None, None),
     };
-    // dry-run: report the directory and traverse its contents, but never create a destination dir.
-    if settings.dry_run.is_some() {
-        let preview_dir = if settings.copy_settings.delete.is_some() {
-            delete_scan_parent
-                .open(dst_name)
-                .await
-                .with_context(|| format!("cannot open destination {dst_path:?} for delete scan"))
-                .map_err(|error| Error::new(error, Default::default()))?
-        } else {
-            None
-        };
-        crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
-        let base = Summary {
-            copy_summary: CopySummary {
-                directories_created: 1, // report as would-be-created
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        return link_dir_contents(
+    let (meta_dir, meta, meta_path) = match &update_meta {
+        Some((meta, path)) => (
+            update_dir.as_ref().expect("update directory is open"),
+            meta,
+            *path,
+        ),
+        None => (&src_dir, &src_meta, src_path),
+    };
+    let inputs = [&src_meta, meta];
+    let inputs = &inputs[..if update_dir.is_some() { 2 } else { 1 }];
+    let admission = destination
+        .enter(
             prog_track,
-            &src_dir,
-            update_dir.as_ref(),
-            None, // dry-run: no destination dir
-            None, // dry-run: no destination parent
-            dst_name,
-            src_root,
-            dst_root,
-            update_root,
-            rel_path,
-            src_path,
-            dst_path,
-            true, // treat as "created" so empty-dir cleanup can suppress the dry-run count
-            is_fresh,
-            None, // preview handles never lock the destination, so nothing to restore
-            settings,
-            base,
-            SourceEntries::Live,
-            UpdateEntries::Live,
-            preview_dir.as_ref(),
-        )
-        .await;
-    }
-    // real link: dst_parent is Some.
-    let dst_parent = dst_parent.expect("destination parent must be open for a real link");
-    let copy::DirSlot {
-        dir: dst_dir,
-        summary: base,
-        is_fresh: child_is_fresh,
-        we_created,
-        reused_lock,
-    } = match copy::resolve_dst_dir(
-        prog_track,
-        dst_parent,
-        dst_name,
-        dst_path,
-        &settings.copy_settings,
-    )
-    .await
-    .map_err(|err| {
-        Error::new(
-            err.source,
-            Summary {
-                copy_summary: err.summary,
-                ..Default::default()
+            inputs,
+            copy::destination::PreservationSource {
+                dir: meta_dir,
+                meta,
+                path: meta_path,
+                acl: settings.preserve.dir.acl,
             },
+            dst_parent,
+            dst_name,
+            dst_path,
+            &settings.copy_settings,
+            settings.dry_run,
         )
-    })? {
-        copy::DirResolution::Skip(summary) => {
-            return Ok(Summary {
-                copy_summary: summary,
-                ..Default::default()
-            });
-        }
-        copy::DirResolution::Proceed(slot) => slot,
+        .await
+        .map_err(|error| {
+            Error::new(
+                error.source.context(format!(
+                    "cannot link directory {src_path:?} to {dst_path:?}"
+                )),
+                Summary {
+                    copy_summary: error.summary,
+                    ..Default::default()
+                },
+            )
+        })?;
+    let copy::destination::Admission::Entered {
+        destination,
+        slot,
+        preview,
+        snapshot,
+    } = admission
+    else {
+        let copy::destination::Admission::Skip(copy_summary) = admission else {
+            unreachable!()
+        };
+        return Ok(Summary {
+            copy_summary,
+            ..Default::default()
+        });
     };
-    link_dir_contents(
+    let (dst_dir, base, child_is_fresh, we_created, reused_lock) = match slot {
+        Some(slot) => (
+            Some(slot.dir),
+            slot.summary,
+            slot.is_fresh,
+            slot.we_created,
+            slot.reused_lock,
+        ),
+        None => {
+            crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
+            (
+                None,
+                CopySummary {
+                    directories_created: 1,
+                    ..Default::default()
+                },
+                is_fresh,
+                true,
+                None,
+            )
+        }
+    };
+    link_dir_contents_prepared(
         prog_track,
         &src_dir,
+        snapshot,
         update_dir.as_ref(),
-        Some(&dst_dir),
-        Some(dst_parent),
+        dst_dir.as_ref(),
+        dst_parent,
         dst_name,
         src_root,
         dst_root,
@@ -1693,7 +1718,8 @@ async fn link_dir_entry(
         },
         SourceEntries::Live,
         UpdateEntries::Live,
-        None,
+        preview.as_ref(),
+        destination,
     )
     .await
 }
@@ -1839,7 +1865,7 @@ async fn process_update_only_entry(
     update_entry_path: std::path::PathBuf,
     dst_root: std::path::PathBuf,
     entry_rel: std::path::PathBuf,
-    delete_scan_anchor: copy::DeleteScanAnchor,
+    destination: copy::DestinationContext,
     settings: Settings,
     is_fresh: bool,
     admission: EntryAdmission,
@@ -1907,7 +1933,7 @@ async fn process_update_only_entry(
         &update_entry_path,
         &dst_root,
         &entry_rel,
-        delete_scan_anchor,
+        destination,
         &settings,
         is_fresh,
         entry,
@@ -2010,9 +2036,10 @@ enum UpdateEntries {
 /// is independently held from pre-order for dry-run deletion scans only. `base` carries
 /// the `directories_created`/`directories_unchanged` contribution from resolving this directory.
 #[allow(clippy::too_many_arguments)]
-async fn link_dir_contents(
+async fn link_dir_contents_prepared(
     prog_track: &'static progress::Progress,
     src_dir: &Arc<Dir>,
+    snapshot: copy::SourceSnapshot,
     update_dir: Option<&Arc<Dir>>,
     dst_dir: Option<&Arc<Dir>>,
     dst_parent: Option<&Arc<Dir>>,
@@ -2031,6 +2058,7 @@ async fn link_dir_contents(
     source_entries: SourceEntries,
     update_entries: UpdateEntries,
     preview_dir: Option<&Arc<Dir>>,
+    destination: copy::PreparedDestination,
 ) -> Result<Summary, Error> {
     tracing::debug!("process contents of 'src' directory");
     let mut link_summary = base;
@@ -2093,7 +2121,7 @@ async fn link_dir_contents(
             let src_root = src_root.to_owned();
             let dst_root = dst_root.to_owned();
             let update_root = update_root.map(std::path::Path::to_path_buf);
-            let delete_scan_parent = copy::DeleteScanAnchor::parent(preview_dir.cloned());
+            let destination = destination.child();
             let do_link = move || async move {
                 let update_ref = update_parent
                     .as_ref()
@@ -2112,7 +2140,7 @@ async fn link_dir_contents(
                     &settings,
                     is_fresh,
                     admission.into(),
-                    delete_scan_parent,
+                    destination,
                 )
                 .await
                 .map(|result| LinkTaskResult::from_link(entry_name, result))
@@ -2179,7 +2207,7 @@ async fn link_dir_contents(
                 let update_parent = Arc::clone(update_dir);
                 let dst_parent = dst_dir.map(Arc::clone);
                 let settings = settings.clone();
-                let delete_scan_anchor = copy::DeleteScanAnchor::parent(preview_dir.cloned());
+                let destination = destination.child();
                 let source_for_delete = (settings.copy_settings.delete.is_some()
                     && !settings.update_exclusive)
                     .then(|| {
@@ -2210,7 +2238,7 @@ async fn link_dir_contents(
                                     &settings,
                                     is_fresh,
                                     admission.into(),
-                                    delete_scan_anchor,
+                                    destination,
                                 )
                                 .await
                                 .map(|result| LinkTaskResult::from_link(entry_name, result));
@@ -2238,7 +2266,7 @@ async fn link_dir_contents(
                         update_entry_path,
                         dst_root,
                         entry_rel,
-                        delete_scan_anchor,
+                        destination,
                         settings,
                         is_fresh,
                         admission,
@@ -2389,30 +2417,13 @@ async fn link_dir_contents(
     tracing::debug!("set 'dst' directory metadata");
     let metadata_result = match dst_dir {
         Some(dst_dir) => {
-            let meta_dir = update_dir.unwrap_or(src_dir);
-            // for a reused directory locked down under strict mode, put back the ACLs the
-            // lockdown stripped and restore the original owner component-wise, then apply source
-            // metadata (see set_reused_dir_metadata_fd — no transient window hands the directory to
-            // a hostile prior owner); None for fresh dirs.
-            async {
-                let preserve_meta = meta_dir.meta().await?;
-                // the ACLs come from the same fd as the metadata, and only when `d:acl` was asked
-                // for — rlink creates its directories fresh, so unlike files there is no shared
-                // inode and applying them is ordinary destination work.
-                let preserve_acls = if settings.preserve.dir.acl {
-                    Some(meta_dir.read_acls().await?)
-                } else {
-                    None
-                };
-                crate::safedir::set_reused_dir_metadata_fd(
-                    &settings.preserve,
-                    &preserve_meta,
-                    preserve_acls.as_ref(),
-                    reused_lock,
-                    dst_dir,
-                )
-                .await
-            }
+            crate::safedir::set_reused_dir_metadata_fd(
+                &settings.preserve,
+                &snapshot.meta,
+                snapshot.acls.as_ref(),
+                reused_lock,
+                dst_dir,
+            )
             .await
         }
         None => Ok(()),
@@ -2435,6 +2446,69 @@ async fn link_dir_contents(
         .with_context(|| format!("failed setting directory metadata on {:?}", dst_path))
         .map_err(|err| Error::new(err, link_summary))?;
     Ok(link_summary)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn link_dir_contents(
+    prog_track: &'static progress::Progress,
+    src_dir: &Arc<Dir>,
+    preserve_meta: crate::safedir::FileMeta,
+    update_dir: Option<&Arc<Dir>>,
+    dst_dir: Option<&Arc<Dir>>,
+    dst_parent: Option<&Arc<Dir>>,
+    dst_name: &std::ffi::OsStr,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    update_root: Option<&std::path::Path>,
+    rel_path: &std::path::Path,
+    src_path: &std::path::Path,
+    dst_path: &std::path::Path,
+    we_created_this_dir: bool,
+    is_fresh: bool,
+    reused_lock: Option<crate::safedir::ReusedDirLock>,
+    settings: &Settings,
+    base: Summary,
+    source_entries: SourceEntries,
+    update_entries: UpdateEntries,
+    preview_dir: Option<&Arc<Dir>>,
+    destination: copy::DestinationContext,
+) -> Result<Summary, Error> {
+    let snapshot = copy::SourceSnapshot::capture(
+        update_dir.unwrap_or(src_dir),
+        preserve_meta,
+        settings.dry_run.is_none() && settings.preserve.dir.acl,
+    )
+    .await
+    .map_err(|error| Error::new(error.into(), base))?;
+    let destination = copy::destination::test_prepared(destination, dst_dir, preview_dir)
+        .await
+        .map_err(|error| Error::new(error, base))?;
+    link_dir_contents_prepared(
+        prog_track,
+        src_dir,
+        snapshot,
+        update_dir,
+        dst_dir,
+        dst_parent,
+        dst_name,
+        src_root,
+        dst_root,
+        update_root,
+        rel_path,
+        src_path,
+        dst_path,
+        we_created_this_dir,
+        is_fresh,
+        reused_lock,
+        settings,
+        base,
+        source_entries,
+        update_entries,
+        preview_dir,
+        destination,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2568,6 +2642,65 @@ mod link_tests {
         }
     }
 
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn directory_acl_snapshot_precedes_child_traversal() -> anyhow::Result<()> {
+        use crate::testutils::acl::*;
+        for with_update in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let update = root.path().join("update");
+            let dst = root.path().join("dst");
+            std::fs::create_dir_all(src.join("child"))?;
+            std::fs::create_dir_all(update.join("child"))?;
+            let chosen = if with_update { &update } else { &src };
+            let acl = |permission| {
+                encode_acl(&[
+                    (ACL_USER_OBJ, 7, ACL_UNDEFINED_ID),
+                    (ACL_USER, permission, nix::unistd::geteuid().as_raw()),
+                    (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+                    (ACL_MASK, 5, ACL_UNDEFINED_ID),
+                    (ACL_OTHER, 5, ACL_UNDEFINED_ID),
+                ])
+            };
+            let original = acl(0);
+            set_xattr_at(chosen, c"system.posix_acl_access", &original);
+            let mut gate = testutils::BlockingPathGate::install(src.join("child"));
+            let task_src = src.clone();
+            let task_dst = dst.clone();
+            let task_root = root.path().to_owned();
+            let task_update = with_update.then_some(update.clone());
+            let task = tokio::spawn(async move {
+                let mut settings = common_settings(false, false);
+                settings.preserve = preserve::preserve_all_with_acls();
+                link(
+                    &PROGRESS,
+                    &task_root,
+                    &task_src,
+                    &task_dst,
+                    &task_update,
+                    &settings,
+                    false,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started()).await??;
+            set_xattr_at(chosen, c"system.posix_acl_access", &acl(7));
+            std::fs::set_permissions(chosen, std::fs::Permissions::from_mode(0o700))?;
+            gate.release_all();
+            task.await?.map_err(|error| error.source)?;
+            assert_eq!(
+                get_xattr_at(&dst, c"system.posix_acl_access"),
+                Some(original)
+            );
+            assert_eq!(
+                std::fs::metadata(&dst)?.permissions().mode() & 0o7777,
+                0o755
+            );
+        }
+        Ok(())
+    }
+
     mod delete_source_presence_tests {
         use super::*;
 
@@ -2597,6 +2730,7 @@ mod link_tests {
             crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                update_dir.as_ref().unwrap_or(&src_dir).meta().await?,
                 update_dir.as_ref(),
                 (!preview).then_some(&dst_dir),
                 (!preview).then_some(&parent),
@@ -2615,6 +2749,7 @@ mod link_tests {
                 SourceEntries::Injected(Vec::new()),
                 UpdateEntries::Injected(update_entries),
                 preview.then_some(&dst_dir),
+                copy::DestinationContext::new(&dst),
             ))
             .await
             .map_err(|error| error.source)
@@ -2806,6 +2941,63 @@ mod link_tests {
             dry_run: None,
             preserve: preserve::preserve_all(),
         }
+    }
+
+    async fn check_rejected_input_destination(
+        in_update: bool,
+        exclusive: bool,
+    ) -> anyhow::Result<()> {
+        for preview in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let update = root.path().join("update");
+            for input in [&src, &update] {
+                tokio::fs::create_dir(input).await?;
+                let mut config = crate::filegen::FileGenConfig::new(input, vec![], 1, 32);
+                config.leaf_files = true;
+                crate::filegen::filegen(&PROGRESS, &config).await?;
+            }
+            let dst = if in_update { &update } else { &src }.join("dst");
+            let mut filter = crate::filter::FilterSettings::new();
+            // keep the old implementation finite without hiding the invalid destination
+            filter.add_exclude("dst/")?;
+            let mut settings = common_settings(false, true);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            settings.update_exclusive = exclusive;
+            settings.dry_run = preview.then_some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = settings.dry_run;
+            let error = link(
+                &PROGRESS,
+                root.path(),
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await
+            .expect_err("a destination inside a source or update root must be rejected");
+            assert!(format!("{:#}", error.source).contains("overlap"));
+            assert_eq!(error.summary.copy_summary.directories_created, 0);
+            assert!(!dst.exists());
+            assert_eq!(tokio::fs::metadata(src.join("file0")).await?.len(), 32);
+            assert_eq!(tokio::fs::metadata(update.join("file0")).await?.len(), 32);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_destination_inside_link_source_before_creating_it() -> anyhow::Result<()> {
+        check_rejected_input_destination(false, false).await
+    }
+
+    #[tokio::test]
+    async fn rejects_destination_inside_update_before_creating_it() -> anyhow::Result<()> {
+        for exclusive in [false, true] {
+            check_rejected_input_destination(true, exclusive).await?;
+        }
+        Ok(())
     }
 
     struct RestoreRenamedUpdateRoot {
@@ -3032,7 +3224,7 @@ mod link_tests {
             &common_settings(false, false),
             false,
             EntryAdmission::RootOrDelegated.into(),
-            copy::DeleteScanAnchor::new(destination, std::path::Path::new("")),
+            copy::DestinationContext::new(destination),
         )
         .await;
         let error = match result {
@@ -4286,7 +4478,7 @@ mod link_tests {
                     &settings,
                     false,
                     LinkEntryAdmission::Filtered(entry),
-                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    copy::DestinationContext::new(&dst),
                 ),
             )
             .await?;
@@ -4370,7 +4562,7 @@ mod link_tests {
                     &settings,
                     false,
                     LinkEntryAdmission::Filtered(entry),
-                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    copy::DestinationContext::new(&dst),
                 ),
             )
             .await??;
@@ -4434,7 +4626,7 @@ mod link_tests {
                     &common_settings(false, false),
                     false,
                     LinkEntryAdmission::Filtered(entry),
-                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    copy::DestinationContext::new(&dst),
                 ),
             )
             .await??;
@@ -4499,7 +4691,7 @@ mod link_tests {
                     &entry_path,
                     &dst,
                     std::path::Path::new("node"),
-                    copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                    copy::DestinationContext::parent(Some(Arc::clone(&dst_parent))),
                     &settings,
                     false,
                     entry,
@@ -4575,7 +4767,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::RootOrDelegated.into(),
-                copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                copy::DestinationContext::parent(Some(Arc::clone(&dst_parent))),
             ))
             .await?;
             let mut summary = Summary::default();
@@ -4659,7 +4851,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
-                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                        copy::DestinationContext::parent(Some(Arc::clone(&dst_dir))),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -4738,7 +4930,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
-                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                        copy::DestinationContext::parent(None),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -4806,7 +4998,7 @@ mod link_tests {
                         &settings,
                         false,
                         admission.into(),
-                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                        copy::DestinationContext::parent(Some(Arc::clone(&dst_dir))),
                     ))
                     .await?;
                     LinkTaskResult::from_link(std::ffi::OsString::from("node"), result)
@@ -4887,7 +5079,7 @@ mod link_tests {
                         &update.join("node"),
                         &dst,
                         std::path::Path::new("node"),
-                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                        copy::DestinationContext::parent(Some(Arc::clone(&dst_dir))),
                         &settings,
                         false,
                         entry,
@@ -4965,7 +5157,7 @@ mod link_tests {
                         &update.join("node"),
                         &dst,
                         std::path::Path::new("node"),
-                        copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
+                        copy::DestinationContext::parent(None),
                         &settings,
                         false,
                         entry,
@@ -6716,6 +6908,7 @@ mod link_tests {
             let operation = link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                src_dir.meta().await?,
                 None,
                 None,
                 None,
@@ -6734,6 +6927,7 @@ mod link_tests {
                 SourceEntries::Live,
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             );
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6777,6 +6971,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                update_dir.meta().await?,
                 Some(&update_dir),
                 None,
                 None,
@@ -6795,6 +6990,7 @@ mod link_tests {
                 SourceEntries::Live,
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6855,7 +7051,7 @@ mod link_tests {
                         &settings,
                         false,
                         walk::EntryAdmission::HintedDirectory.into(),
-                        copy::DeleteScanAnchor::new(&dst_path, std::path::Path::new("")),
+                        copy::DestinationContext::new(&dst_path),
                     ),
                 )
                 .await;
@@ -6907,7 +7103,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::HintedDirectory.into(),
-                copy::DeleteScanAnchor::new(&dst_root, std::path::Path::new("entry")),
+                copy::DestinationContext::parent(None),
             );
             tokio::pin!(operation);
             assert!(
@@ -6955,6 +7151,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                update_dir.meta().await?,
                 Some(&update_dir),
                 None,
                 None,
@@ -6973,6 +7170,7 @@ mod link_tests {
                 SourceEntries::Live,
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -7065,7 +7263,7 @@ mod link_tests {
                 &settings,
                 false,
                 EntryAdmission::RootOrDelegated.into(),
-                copy::DeleteScanAnchor::new(&dst_path, std::path::Path::new("")),
+                copy::DestinationContext::new(&dst_path),
             );
             tokio::pin!(operation);
             let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
@@ -7134,7 +7332,7 @@ mod link_tests {
                     &common_settings(false, false),
                     true,
                     EntryAdmission::from(permit).into(),
-                    copy::DeleteScanAnchor::new(&task_dst_entry, std::path::Path::new("")),
+                    copy::DestinationContext::new(&task_dst_entry),
                 )
                 .await
             });
@@ -7395,6 +7593,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 progress,
                 &src_dir,
+                update_dir.meta().await?,
                 Some(&update_dir),
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -7426,6 +7625,7 @@ mod link_tests {
                 ]),
                 UpdateEntries::InjectedReadError(read_error),
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             tokio::pin!(operation);
             // the read error is held until real source workers have started and retain both
@@ -7576,6 +7776,9 @@ mod link_tests {
                     let error = crate::task_scope::scope_tasks(link_dir_contents(
                         &PROGRESS,
                         &src_dir,
+                        (if with_update { &update_dir } else { &src_dir })
+                            .meta()
+                            .await?,
                         with_update.then_some(&update_dir),
                         Some(&dst_dir),
                         Some(&dst_parent),
@@ -7602,6 +7805,7 @@ mod link_tests {
                         )),
                         UpdateEntries::Live,
                         None,
+                        copy::DestinationContext::new(&dst),
                     ))
                     .await
                     .expect_err("source enumeration must fail");
@@ -7672,6 +7876,7 @@ mod link_tests {
                 let error = crate::task_scope::scope_tasks(link_dir_contents(
                     &PROGRESS,
                     &src_dir,
+                    src_dir.meta().await?,
                     None,
                     dst_dir.as_ref(),
                     (!dry_run).then_some(&dst_parent),
@@ -7696,6 +7901,7 @@ mod link_tests {
                     SourceEntries::InjectedReadError(std::io::Error::from_raw_os_error(libc::EIO)),
                     UpdateEntries::Live,
                     None,
+                    copy::DestinationContext::new(&dst),
                 ))
                 .await
                 .expect_err("cleanup must preserve the read error");
@@ -7742,6 +7948,7 @@ mod link_tests {
                 Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
             let dst_parent =
                 Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let preserve_meta = src_dir.meta().await?;
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let mut held_readlink = Some(throttle::ops_in_flight_permit(readlink_resource).await);
             let mut filter = crate::filter::FilterSettings::new();
@@ -7753,6 +7960,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                preserve_meta,
                 None,
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -7782,6 +7990,7 @@ mod link_tests {
                 ]),
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             tokio::pin!(operation);
             let mut completed_while_gated = None;
@@ -7875,6 +8084,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                src_dir.meta().await?,
                 None,
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -7897,6 +8107,7 @@ mod link_tests {
                 ]),
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(20), operation)
@@ -7943,6 +8154,7 @@ mod link_tests {
             let summary = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                src_dir.meta().await?,
                 None,
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -7961,6 +8173,7 @@ mod link_tests {
                 SourceEntries::Injected(vec![(std::ffi::OsString::from("node"), None)]),
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ))
             .await?;
             assert_eq!(summary.copy_summary.directories_skipped, 1);
@@ -7993,6 +8206,7 @@ mod link_tests {
                 Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
             let dst_parent =
                 Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let preserve_meta = src_dir.meta().await?;
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("never/")?;
@@ -8002,6 +8216,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                preserve_meta,
                 None,
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -8023,6 +8238,7 @@ mod link_tests {
                 ]),
                 UpdateEntries::Live,
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             tokio::pin!(operation);
             let mut completed_while_gated = None;
@@ -8086,6 +8302,7 @@ mod link_tests {
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
+            let preserve_meta = update_dir.meta().await?;
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("never/")?;
@@ -8095,6 +8312,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                preserve_meta,
                 Some(&update_dir),
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -8116,6 +8334,7 @@ mod link_tests {
                     (std::ffi::OsString::from("second"), Some(EntryKind::File)),
                 ]),
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             tokio::pin!(operation);
             let available_while_classifying = loop {
@@ -8181,6 +8400,7 @@ mod link_tests {
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
+            let preserve_meta = update_dir.meta().await?;
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let vanished = std::ffi::OsString::from("middle");
             let successful = [
@@ -8191,6 +8411,7 @@ mod link_tests {
             let operation = crate::task_scope::scope_tasks(link_dir_contents(
                 &PROGRESS,
                 &src_dir,
+                preserve_meta,
                 Some(&update_dir),
                 Some(&dst_dir),
                 Some(&dst_parent),
@@ -8213,6 +8434,7 @@ mod link_tests {
                     (std::ffi::OsString::from("last"), Some(EntryKind::File)),
                 ]),
                 None,
+                copy::DestinationContext::new(&dst),
             ));
             tokio::pin!(operation);
             loop {

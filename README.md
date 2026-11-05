@@ -89,6 +89,17 @@ Basic local copy with progress-bar and summary at the end:
 > rcp <foo> <bar> --progress --summary
 ```
 
+Local directory copies check for a destination equal to or inside the source, including paths
+reached through a symlinked parent. `rlink` also checks its participating `--update` tree. Filters
+and `--update-exclusive` do not exempt a participating root from this check. This prevents commands
+such as `rcp src src/backup` or `rlink src --update old old/backup` from repeatedly copying their
+own output. Real traversals and accessible dry-run counterparts also check existing directory
+aliases, such as bind mounts; earlier output may remain when an alias is discovered later. Admitted
+directories remain recorded across the invocation, including sequential source operands; errors
+identify the conflicting operation. The
+[overlap checks](docs/tocttou.md#local-inputoutput-directory-overlap) inspect held directory
+identities and available ancestry, with limits at mount boundaries and unsearchable ancestors.
+
 Copy while preserving metadata, overwrite/update destination if it already exists:
 
 ```fish
@@ -685,8 +696,13 @@ Preview what would happen without making changes:
 ```
 
 **Note:** Dry-run mode is primarily useful for previewing `--include`/`--exclude` filtering. It
-bypasses `--overwrite` checks and does not check whether files already exist at the destination.
-`--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see summary output).
+bypasses `--overwrite` checks. With `--ignore-existing`, it still probes destination leaf paths to
+decide what to skip, and lookup errors are reported. Plain previews can target a tree that does not
+exist yet and do not require reading destination directories. They check directory overlap where
+identities can be inspected; missing or inaccessible parts leave that check incomplete. With
+`--delete`, a preview also needs read access to existing destination directories to report
+deletions. `--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see
+summary output).
 
 ### Age-based filtering (`rrm`, `rchm`)
 
@@ -712,6 +728,11 @@ unreadable there) — use `--modified-before` or a glibc build.
 ## Overwrite
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
+
+**Known limitation:** destination removal does not protect source trees contained within it,
+including directory aliases. `--overwrite` or `--delete` can destroy the source in this arrangement;
+for example, `rcp --delete src/a/b src` can delete `src/a/b`. Avoid destinations containing a source
+or participating update tree.
 
 ## Delete (mirror)
 
