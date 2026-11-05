@@ -270,6 +270,15 @@ By-name actions through pinned parents guarantee containment and syscall type, n
 compatible replacement may be affected. Point-in-time observations may still drive filtering,
 planning, dispatch, and accounting when documented as snapshots.
 
+`--delete` uses a no-follow, fd-relative source lookup before pruning a name omitted from the
+completed traversal's selected-name collection. A currently selected source counterpart protects the
+destination; lookup errors leave that candidate untouched and are reported. These checks use the
+held source directories, including rlink's selected source/update trees, so replacing a source
+pathname does not redirect the lookup. They are still snapshots: a source name can appear after the
+lookup, and no syscall makes source absence atomic with destination removal. The destination action
+remains contained through its pinned parent; this check does not strengthen the two TOCTOU
+guarantees into snapshot consistency.
+
 ### Out of scope — what we deliberately do not promise
 
 **Freezing the tree, or pinning *which* object is operated on.** The tree may change concurrently;

@@ -742,9 +742,18 @@ type — e.g. a directory that is now a file in the source — removing the old 
 part of that overwrite, not an exclude-filtered deletion.
 
 Pruning happens incrementally as the parallel copy proceeds, and a directory's extraneous entries
-are removed only once that directory's subtree has been processed without error — so deletions never
-act on an incomplete source listing. Unlike rsync, rcp/rlink do not cancel *all* deletions when a
-single error occurs elsewhere: subtrees that were processed cleanly are still mirrored.
+are considered only once that directory's observed subtree has been processed without error. Before
+removing a name missing from the collected source names, rcp/rlink look it up through the held
+source directory and apply the source filter to its current type. A selected counterpart protects
+the destination even when enumeration omitted it; lookup errors leave that candidate untouched and
+are reported. Normal `rlink --update` checks both source and update directories;
+`--update-exclusive` checks only the update directory when one is present.
+
+Directory enumeration is not a snapshot: concurrent rename replacements can be omitted even when
+enumeration succeeds, and a source name can appear after the final absence check. A changing source
+can therefore still produce an incomplete mirror. Unlike rsync, rcp/rlink do not cancel *all*
+deletions when a single error occurs elsewhere: subtrees that were processed cleanly are still
+mirrored.
 
 ## Permissions and ownership (`rchm`)
 

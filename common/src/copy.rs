@@ -736,6 +736,8 @@ struct CopyDirContext {
 /// everything `dir_post` needs to run empty-dir cleanup, `--delete` prune, and apply directory
 /// metadata.
 struct CopyDirState {
+    /// The directory actually enumerated, retained for live source checks during deletion.
+    src_dir: Arc<Dir>,
     /// Read-only destination held from pre-order in dry-run deletion previews.
     preview_dir: Option<Arc<Dir>>,
     /// The destination directory just created/reused (`None` in dry-run).
@@ -790,7 +792,7 @@ impl CopyVisitor {
     }
 
     /// rsync-style `--delete` prune for one finished directory: remove destination entries with no
-    /// source counterpart. Runs only when `--delete` was requested AND every child of this directory
+    /// source counterpart. Runs only when `--delete` was requested AND every observed child
     /// succeeded — skipping the prune on any error (deleting based on a run that did not fully
     /// succeed could remove data unexpectedly). Prune enumerates and removes through the
     /// destination's own pinned directory fd, so a concurrent symlink swap cannot redirect it outside
@@ -804,6 +806,7 @@ impl CopyVisitor {
         &self,
         copy_summary: &mut Summary,
         keep_set: &crate::delete::DeleteKeepSet<&[OsString]>,
+        src_dir: &Arc<Dir>,
         prune_dir: &Arc<Dir>,
         filter_path: &std::path::Path,
     ) -> Result<(), anyhow::Error> {
@@ -811,6 +814,7 @@ impl CopyVisitor {
         crate::delete::prune_and_fold(
             self.prog_track,
             prune_dir,
+            crate::delete::DeleteSources::Single(src_dir),
             filter_path,
             &keep_set,
             self.settings.filter.as_ref(),
@@ -1356,13 +1360,14 @@ impl WalkVisitor for CopyVisitor {
                 ..Default::default()
             };
             return Ok(DirAction::Descend {
-                dir: src_dir,
+                dir: Arc::clone(&src_dir),
                 child_ctx: CopyDirContext {
                     dst_dir: None, // dry-run: no destination parent (no destination mutation)
                     delete_scan_parent: DeleteScanAnchor::parent(preview_dir.clone()),
                     is_fresh,
                 },
                 state: CopyDirState {
+                    src_dir,
                     preview_dir,
                     dst_dir: None,
                     dst_parent: None,
@@ -1417,13 +1422,14 @@ impl WalkVisitor for CopyVisitor {
             DirResolution::Proceed(slot) => slot,
         };
         Ok(DirAction::Descend {
-            dir: src_dir,
+            dir: Arc::clone(&src_dir),
             child_ctx: CopyDirContext {
                 dst_dir: Some(Arc::clone(&dst_dir)),
                 delete_scan_parent: DeleteScanAnchor::parent(None),
                 is_fresh: child_is_fresh,
             },
             state: CopyDirState {
+                src_dir,
                 preview_dir: None,
                 dst_dir: Some(dst_dir),
                 dst_parent: Some(Arc::clone(dst_parent)),
@@ -1444,6 +1450,7 @@ impl WalkVisitor for CopyVisitor {
         child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
         let CopyDirState {
+            src_dir,
             preview_dir,
             dst_dir,
             dst_parent,
@@ -1476,7 +1483,13 @@ impl WalkVisitor for CopyVisitor {
                     )
                 {
                     match self
-                        .prune_finished_dir(&mut summary, &keep_set, prune_dir, &cx.rel_path)
+                        .prune_finished_dir(
+                            &mut summary,
+                            &keep_set,
+                            &src_dir,
+                            prune_dir,
+                            &cx.rel_path,
+                        )
                         .await
                     {
                         Ok(()) => {}
@@ -2971,6 +2984,158 @@ mod copy_tests {
             "extraneous symlink must be removed"
         );
         assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_preserves_live_names_omitted_from_listing() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        for rename_source in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let dst = root.path().join("dst");
+            let held = root.path().join("held-source");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            let mut config = crate::filegen::FileGenConfig::new(&src, vec![], 1, 32);
+            config.leaf_files = true;
+            crate::filegen::filegen(&PROGRESS, &config).await?;
+            let raw_name = std::ffi::OsStr::from_bytes(b"non-utf8-\xff");
+            for name in [
+                std::ffi::OsStr::new("file"),
+                std::ffi::OsStr::new("dangling"),
+                raw_name,
+            ] {
+                tokio::fs::write(dst.join(name), b"retained destination").await?;
+            }
+            tokio::fs::create_dir(dst.join("directory")).await?;
+            tokio::fs::write(dst.join("directory/child"), b"retained child").await?;
+            tokio::fs::write(dst.join("extra"), b"remove me").await?;
+            let mut gate = testutils::BlockingPathGate::install(dst.join("file0"));
+            let task_src = src.clone();
+            let task_dst = dst.clone();
+            let task = tokio::spawn(async move {
+                copy(
+                    &PROGRESS,
+                    &task_src,
+                    &task_dst,
+                    &settings_with_delete(delete_on()),
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await
+            });
+            let timeout = std::time::Duration::from_secs(20);
+            let started = tokio::time::timeout(timeout, gate.wait_started()).await;
+            // the real walker already collected its names before this payload worker started
+            let mutation = async {
+                let live_source = if rename_source {
+                    tokio::fs::rename(&src, &held).await?;
+                    tokio::fs::create_dir(&src).await?;
+                    &held
+                } else {
+                    &src
+                };
+                tokio::fs::write(live_source.join("file"), b"new source").await?;
+                tokio::fs::write(live_source.join(raw_name), b"new source").await?;
+                tokio::fs::symlink("missing-target", live_source.join("dangling")).await?;
+                tokio::fs::create_dir(live_source.join("directory")).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            gate.release_all();
+            let result = tokio::time::timeout(timeout, task).await;
+            started??;
+            mutation?;
+            let summary = result???;
+            for name in [
+                std::ffi::OsStr::new("file"),
+                std::ffi::OsStr::new("dangling"),
+                raw_name,
+            ] {
+                assert!(
+                    dst.join(name).exists(),
+                    "pruned {name:?} despite its live source counterpart; renamed={rename_source}"
+                );
+                assert_eq!(
+                    tokio::fs::read(dst.join(name)).await?,
+                    b"retained destination",
+                    "live source {name:?} was omitted from enumeration; renamed={rename_source}"
+                );
+            }
+            assert_eq!(
+                tokio::fs::read(dst.join("directory/child")).await?,
+                b"retained child"
+            );
+            assert!(!dst.join("extra").exists());
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.rm_summary.files_removed, 1);
+            assert_eq!(summary.rm_summary.directories_removed, 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_reports_source_lookup_errors_without_pruning() -> anyhow::Result<()> {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping permission-denial case: root bypasses directory permissions");
+            return Ok(());
+        }
+        for fail_early in [false, true] {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let dst = root.path().join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            let mut config = crate::filegen::FileGenConfig::new(&src, vec![], 1, 32);
+            config.leaf_files = true;
+            crate::filegen::filegen(&PROGRESS, &config).await?;
+            for name in ["first", "second"] {
+                tokio::fs::write(dst.join(name), b"retain on lookup error").await?;
+            }
+            let mut gate = testutils::BlockingPathGate::install(dst.join("file0"));
+            let task_src = src.clone();
+            let task_dst = dst.clone();
+            let task = tokio::spawn(async move {
+                let mut settings = settings_with_delete(delete_on());
+                settings.fail_early = fail_early;
+                copy(
+                    &PROGRESS,
+                    &task_src,
+                    &task_dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
+                .await
+            });
+            let timeout = std::time::Duration::from_secs(20);
+            let started = tokio::time::timeout(timeout, gate.wait_started()).await;
+            let permissions =
+                tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).await;
+            gate.release_all();
+            let result = tokio::time::timeout(timeout, task).await;
+            tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o700)).await?;
+            started??;
+            permissions?;
+            let error =
+                result??.expect_err("an unavailable source lookup cannot authorize pruning");
+            assert_eq!(
+                error
+                    .source
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            assert_eq!(error.summary.rm_summary.files_removed, 0);
+            for name in ["first", "second"] {
+                assert_eq!(
+                    tokio::fs::read(dst.join(name)).await?,
+                    b"retain on lookup error"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5726,7 +5891,7 @@ mod copy_tests {
                 let (mut summary, processed) =
                     crate::task_scope::scope_tasks(crate::walk_driver::walk_dir_entries(
                         Arc::clone(&visitor),
-                        src_dir,
+                        Arc::clone(&src_dir),
                         &root_cx,
                         &child_ctx,
                         vec![(std::ffi::OsString::from("node"), Some(EntryKind::Dir))],
@@ -5742,6 +5907,7 @@ mod copy_tests {
                         )
                         .into_ready(&dst)
                         .expect("delete traversal completed"),
+                        &src_dir,
                         &dst_dir,
                         &root_cx.rel_path,
                     )
