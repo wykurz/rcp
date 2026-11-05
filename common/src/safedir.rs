@@ -23,6 +23,8 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, 
 use crate::timing::metadata::{Phase as MetadataTimingPhase, scope as metadata_timing_scope};
 use crate::walk::EntryKind;
 
+pub(crate) mod overlap;
+
 #[cfg(test)]
 mod resource_tests;
 #[cfg(test)]
@@ -413,6 +415,8 @@ impl Handle {
 /// shape.
 #[derive(Debug)]
 pub struct Dir {
+    // immutable identity sampled from this exact held fd; mutable metadata is never cached
+    captured_identity: Option<(u64, u64)>,
     fd: Arc<DirectoryDescriptor>,
     /// Which filesystem side this directory lives on, for congestion gating.
     side: congestion::Side,
@@ -684,6 +688,7 @@ impl Dir {
         credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
     ) -> Dir {
         Dir {
+            captured_identity: None,
             fd: Arc::new(DirectoryDescriptor { fd, credit }),
             side,
             children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -815,7 +820,19 @@ impl Dir {
     /// refers to a non-directory entry. The returned `Dir` carries the same
     /// congestion side as `self`.
     pub async fn open_dir(&self, name: &OsStr) -> std::io::Result<Dir> {
-        self.open_dir_with_credit(name, None).await
+        self.open_dir_with_credit(name, None, Ok).await
+    }
+
+    /// Open a child and read its held metadata in the same blocking job.
+    ///
+    /// The snapshot describes the returned directory even if its name is replaced. Later metadata
+    /// changes remain observable through [`Self::meta`]. Ordinary opens do not pay for this stat.
+    pub(crate) async fn open_dir_with_meta(
+        &self,
+        name: &OsStr,
+    ) -> std::io::Result<(Dir, FileMeta)> {
+        self.open_dir_with_credit(name, None, Self::with_metadata_snapshot)
+            .await
     }
 
     /// Open a child directory while retaining its caller's shared descriptor credit.
@@ -827,14 +844,19 @@ impl Dir {
         name: &OsStr,
         credit: Arc<dyn std::fmt::Debug + Send + Sync>,
     ) -> std::io::Result<Dir> {
-        self.open_dir_with_credit(name, Some(credit)).await
+        self.open_dir_with_credit(name, Some(credit), Ok).await
     }
 
-    async fn open_dir_with_credit(
+    async fn open_dir_with_credit<T, F>(
         &self,
         name: &OsStr,
         credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
-    ) -> std::io::Result<Dir> {
+        finish: F,
+    ) -> std::io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Dir) -> std::io::Result<T> + Send + 'static,
+    {
         // `O_NOFOLLOW`/`O_PATH` only guard the final path component, so a `name`
         // containing `/` could let openat traverse an intermediate symlink. Reject
         // multi-component names at runtime (debug_assert is compiled out in release).
@@ -855,9 +877,15 @@ impl Dir {
             let opened = Dir::opened_with_credit(fd, side, credit);
             #[cfg(test)]
             let _visit = resource_tests::gate_opened_descriptor(opened.fd.as_raw_fd())?;
-            Ok(opened)
+            finish(opened)
         })
         .await
+    }
+
+    fn with_metadata_snapshot(mut self) -> std::io::Result<(Dir, FileMeta)> {
+        let meta = snapshot_directory_meta(self.fd.as_fd())?;
+        self.captured_identity = Some((meta.dev(), meta.ino()));
+        Ok((self, meta))
     }
 
     /// Open a child regular file for reading, refusing to follow symlinks and never
@@ -930,6 +958,8 @@ impl Dir {
     /// reopens `.` relative to that fd. Callers gate this on `d:acl` — see [`read_acls_fd`] for
     /// what the probe costs.
     pub async fn read_acls(&self) -> std::io::Result<Acls> {
+        #[cfg(test)]
+        let _visit = resource_tests::gate_directory_acl(self.fd.as_raw_fd())?;
         read_acls_owned(self.fd.clone(), self.side, true)
             .await
             .map(|(_, acls)| acls)
@@ -983,6 +1013,8 @@ impl Dir {
             let dev = st.st_dev;
             let ino = st.st_ino;
             let meta = FileMeta::from_stat(&st);
+            #[cfg(test)]
+            let _gate = resource_tests::gate_classified_entry(fd.as_raw_fd())?;
             Ok(Handle {
                 fd,
                 kind,
@@ -997,15 +1029,22 @@ impl Dir {
     /// Confirm this directory's own held fd still refers to the same inode as
     /// `handle` (same `dev` + `ino`), returning `ESTALE` on mismatch.
     ///
-    /// This stats this [`Dir`]'s already-pinned fd (via [`Self::meta`]) against a classification
-    /// [`Handle`] taken for the same entry. It closes the classify-to-`open_dir` window in the
+    /// This compares the identity captured when this exact held directory was opened, or samples
+    /// it through [`Self::meta`] when no identity was captured, against a classification [`Handle`].
+    /// It closes the classify-to-`open_dir` window in the
     /// reused-destination-directory lockdown: `open_dir` re-resolves the name, so a concurrent
     /// rename could substitute a different directory between classification and the open.
     /// Comparing the opened fd's identity to the pinned classification handle catches that swap.
     /// The handle keeps the classified inode number from being recycled during the comparison.
     pub async fn verify_same_inode(&self, handle: &Handle) -> std::io::Result<()> {
-        let meta = self.meta().await?;
-        if meta.dev() == handle.dev() && meta.ino() == handle.ino() {
+        let identity = match self.captured_identity {
+            Some(identity) => identity,
+            None => {
+                let meta = self.meta().await?;
+                (meta.dev(), meta.ino())
+            }
+        };
+        if identity == (handle.dev(), handle.ino()) {
             Ok(())
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ESTALE))
@@ -1054,13 +1093,29 @@ impl Dir {
         orig_uid: u32,
         orig_gid: u32,
     ) -> std::io::Result<()> {
+        self.secure_as_copier_with(mode, orig_uid, orig_gid, || {})
+            .await
+    }
+
+    async fn secure_as_copier_with(
+        &self,
+        mode: u32,
+        orig_uid: u32,
+        orig_gid: u32,
+        on_mutation: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
         let fd = self.fd.clone();
         let euid = nix::unistd::geteuid().as_raw();
         run_metadata_probed_blocking(self.side, congestion::MetadataOp::Chmod, move || {
             let raw = fd.as_fd();
+            #[cfg(test)]
+            let _gate = resource_tests::gate_directory_lockdown(raw.as_raw_fd())?;
             // Take uid ownership — this locks the prior owner out of any further chown/chmod. If it
             // fails the directory is left untouched (transparent), which is fail-safe.
             fchown(raw, Some(Uid::from_raw(euid)), None).map_err(nix_to_io)?;
+            // the closure owns tentative admission through queued/started work. Only a successful
+            // mutation makes history permanent, including if the async waiter was cancelled.
+            on_mutation();
             // Restrict to owner-only IMMEDIATELY, so EVERY later failure leaves the directory no wider
             // than a successful copy would. Drop to a plain 0o700 first — there is no special bit to
             // lose yet; the setgid bit (if wanted) is re-added below, once the gid is correct. If the
@@ -1219,7 +1274,25 @@ impl Dir {
     /// who wants the destination tree's inheritance policy honored should not be using this flag on
     /// that tree.
     pub async fn make_dir(&self, name: &OsStr, mode: u32) -> std::io::Result<Dir> {
-        self.make_dir_with_credit(name, mode, None).await
+        self.make_dir_with_credit(name, mode, None, |_| Ok(()))
+            .await
+    }
+
+    /// Create a child and check its held metadata in the same blocking job.
+    ///
+    /// The check runs before strict-mode ACL sanitation. A metadata or check failure triggers the
+    /// same best-effort empty-directory cleanup as an open or ACL failure. Existing creation APIs
+    /// perform no extra metadata read.
+    pub(crate) async fn make_dir_checked(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        check: impl FnOnce(&FileMeta) -> std::io::Result<()> + Send + 'static,
+    ) -> std::io::Result<Dir> {
+        self.make_dir_with_credit(name, mode, None, move |dir| {
+            check(&snapshot_directory_meta(dir.fd.as_fd())?)
+        })
+        .await
     }
 
     /// Create a child while retaining its descriptor lifetime guard through blocking work.
@@ -1229,7 +1302,8 @@ impl Dir {
         mode: u32,
         credit: Arc<dyn std::fmt::Debug + Send + Sync>,
     ) -> std::io::Result<Dir> {
-        self.make_dir_with_credit(name, mode, Some(credit)).await
+        self.make_dir_with_credit(name, mode, Some(credit), |_| Ok(()))
+            .await
     }
 
     async fn make_dir_with_credit(
@@ -1237,6 +1311,7 @@ impl Dir {
         name: &OsStr,
         mode: u32,
         credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
+        check: impl FnOnce(&Dir) -> std::io::Result<()> + Send + 'static,
     ) -> std::io::Result<Dir> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -1252,49 +1327,41 @@ impl Dir {
                 Mode::from_bits_truncate(mode),
             )
             .map_err(nix_to_io)?;
-            let open_flags =
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-            let fd = match openat(
-                dir.as_fd(),
-                name_owned.as_bytes(),
-                open_flags,
-                Mode::empty(),
-            )
-            .map_err(nix_to_io)
-            {
-                Ok(fd) => fd,
-                Err(err) => {
-                    // could not open what was just created: remove it best-effort. No fd
-                    // exists to anchor an inode recheck on, but the exposure is bounded —
-                    // `RemoveDir` refuses anything but an empty directory, so a swapped-in
-                    // file or symlink fails it and a swapped-in populated directory survives
-                    let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
-                    return Err(err);
+            let result = (|| {
+                let open_flags =
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+                let fd = openat(
+                    dir.as_fd(),
+                    name_owned.as_bytes(),
+                    open_flags,
+                    Mode::empty(),
+                )
+                .map_err(nix_to_io)?;
+                // own the descriptor before any fallible ACL/stat action or task handoff can
+                // outlive the awaiting caller; failure closes it before releasing its credit
+                let created = Dir {
+                    captured_identity: None,
+                    fd: Arc::new(DirectoryDescriptor { fd, credit }),
+                    side,
+                    children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
+                };
+                #[cfg(test)]
+                let _visit = resource_tests::gate_opened_descriptor(created.fd.as_raw_fd())?;
+                check(&created)?;
+                if strict {
+                    // strip the inheritance-carrying default ACL before the access ACL
+                    apply_one_acl(created.fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)?;
+                    apply_one_acl(created.fd.as_raw_fd(), ACL_ACCESS_XATTR, None)?;
                 }
-            };
-            // construct the descriptor owner inside started work, before any fallible ACL
-            // action or completed-task handoff can outlive the awaiting caller.
-            let created = Dir {
-                fd: Arc::new(DirectoryDescriptor { fd, credit }),
-                side,
-                children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
-            };
-            #[cfg(test)]
-            let _visit = resource_tests::gate_opened_descriptor(created.fd.as_raw_fd())?;
-            if strict {
-                // both ACLs, the default (inheritance-carrying) one first — see the doc
-                // comment for why this must happen inside the creation closure
-                if let Err(err) = apply_one_acl(created.fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)
-                    .and_then(|()| apply_one_acl(created.fd.as_raw_fd(), ACL_ACCESS_XATTR, None))
-                {
-                    // clean up the destination slot rather than leave inherited ACLs behind.
-                    // rmdir can remove only an empty directory and never follows a symlink; a
-                    // prior identity observation would not bind this by-name removal
-                    let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
-                    return Err(err);
-                }
+                Ok(created)
+            })();
+            if result.is_err() {
+                // open, sanitation, or metadata failure: remove the slot best-effort. rmdir
+                // cannot follow a symlink or remove a populated replacement; an earlier identity
+                // observation would not bind this by-name removal
+                let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
             }
-            Ok(created)
+            result
         })
         .await
     }
@@ -1381,6 +1448,18 @@ impl Dir {
         self.unlink_at_on(name, self.side).await
     }
 
+    /// Remove a non-directory child and record success in the same blocking job.
+    ///
+    /// The callback is not invoked on error. Once the job starts it retains the callback's owners
+    /// through the syscall and callback, even when the awaiting future is cancelled.
+    pub(crate) async fn unlink_at_with(
+        &self,
+        name: &OsStr,
+        after_unlink: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        self.unlink_at_on_with(name, self.side, after_unlink).await
+    }
+
     /// Like [`Self::unlink_at`], but gates the `unlinkat` on an explicitly chosen congestion
     /// `side` rather than the directory's own side.
     ///
@@ -1393,13 +1472,27 @@ impl Dir {
         name: &OsStr,
         side: congestion::Side,
     ) -> std::io::Result<()> {
+        self.unlink_at_on_with(name, side, || {}).await
+    }
+
+    async fn unlink_at_on_with(
+        &self,
+        name: &OsStr,
+        side: congestion::Side,
+        after_unlink: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         let dir = self.fd.clone();
         let name = name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Unlink, move || {
-            unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir).map_err(nix_to_io)
+            #[cfg(test)]
+            let _visit = tests::gate_unlink(dir.as_raw_fd(), &name)?;
+            unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir)
+                .map_err(nix_to_io)?;
+            after_unlink();
+            Ok(())
         })
         .await
     }
@@ -1750,7 +1843,7 @@ impl TrustedDir {
 /// enforced it), so a plain `parent()`/`file_name()` split is correct. Returns
 /// `None` when the path has no distinct parent+name (e.g. `/`), where there is
 /// nothing to probe fd-relative.
-fn split_parent_and_name(path: &Path) -> Option<(&Path, &OsStr)> {
+pub(crate) fn split_parent_and_name(path: &Path) -> Option<(&Path, &OsStr)> {
     let name = path.file_name()?;
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -1765,7 +1858,10 @@ fn split_parent_and_name(path: &Path) -> Option<(&Path, &OsStr)> {
 /// `O_PATH` is load-bearing in default mode: a searchable-but-unreadable parent may contain an
 /// operand that is itself readable, and preview containment must not add a parent read-permission
 /// requirement. Strict mode applies the same flag through `openat2(RESOLVE_NO_SYMLINKS)`.
-async fn open_preview_operand_parent(path: &Path, side: congestion::Side) -> std::io::Result<Dir> {
+pub(crate) async fn open_preview_operand_parent(
+    path: &Path,
+    side: congestion::Side,
+) -> std::io::Result<Dir> {
     let path = path.to_owned();
     run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
         let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
@@ -1782,83 +1878,113 @@ async fn open_preview_operand_parent(path: &Path, side: congestion::Side) -> std
     .await
 }
 
-fn preview_scan_absence(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::NotFound
-        || error.kind() == std::io::ErrorKind::NotADirectory
-        || matches!(
-            error.raw_os_error(),
-            Some(libc::ENOTDIR) | Some(libc::ELOOP)
-        )
+fn snapshot_directory_meta(fd: BorrowedFd<'_>) -> std::io::Result<FileMeta> {
+    let result = (|| {
+        #[cfg(test)]
+        let _visit = resource_tests::gate_directory_stat(fd.as_raw_fd())?;
+        let stat = fstat(fd).map_err(nix_to_io)?;
+        Ok(FileMeta::from_stat(&stat))
+    })();
+    result.map_err(|error: std::io::Error| {
+        std::io::Error::new(error.kind(), DirectoryStatError(error))
+    })
 }
 
-/// Open one preview child through its held parent without following a final symlink.
-/// Missing, non-directory, and symlink children have no directory to scan; other errors propagate.
-pub(crate) async fn open_existing_preview_child(
+#[derive(Debug)]
+struct DirectoryStatError(std::io::Error);
+
+impl std::fmt::Display for DirectoryStatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot fstat opened directory")
+    }
+}
+
+impl std::error::Error for DirectoryStatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// A preview's held identity, with optional enumeration authority acquired at the same open.
+#[derive(Debug)]
+pub(crate) struct PreviewDirectory {
+    dir: Arc<Dir>,
+    pub(crate) meta: FileMeta,
+    readable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreviewEntry {
+    Directory(Arc<PreviewDirectory>),
+    Missing,
+    NonDirectory,
+    Unavailable,
+}
+
+impl PreviewDirectory {
+    pub(crate) fn readable(&self) -> Option<Arc<Dir>> {
+        self.readable.then(|| Arc::clone(&self.dir))
+    }
+
+    pub(crate) async fn child(
+        &self,
+        name: &OsStr,
+        readable: bool,
+    ) -> std::io::Result<PreviewEntry> {
+        open_preview_entry(&self.dir, name, readable).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn preview_from_readable(dir: Arc<Dir>) -> std::io::Result<PreviewEntry> {
+    let meta = dir.meta().await?;
+    Ok(PreviewEntry::Directory(Arc::new(PreviewDirectory {
+        dir,
+        meta,
+        readable: true,
+    })))
+}
+
+/// Resolve identity without read access; delete previews open readably through the same parent.
+/// Only opening can yield unavailable evidence. A failed fstat is always an error.
+pub(crate) async fn open_preview_entry(
     parent: &Dir,
     name: &OsStr,
-) -> std::io::Result<Option<Dir>> {
-    match parent.open_dir(name).await {
-        Ok(dir) => Ok(Some(dir)),
-        Err(error) if preview_scan_absence(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn preview_relative_components(relative: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
-    if relative.as_os_str().is_empty() {
-        return Ok(Vec::new());
-    }
-    relative
-        .as_os_str()
-        .as_bytes()
-        .split(|byte| *byte == b'/')
-        .map(|component| {
-            let component = OsStr::from_bytes(component);
-            is_single_component(component)
-                .then(|| component.to_owned())
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
-        })
-        .collect()
-}
-
-/// Open an existing directory below the exact destination operand named by the user.
-///
-/// The operand's trusted parent is resolved with the normal strict/default policy, but the named
-/// root itself and every `relative` component are opened one at a time with `O_NOFOLLOW`. This keeps
-/// dry-run delete scans beneath the operand even when that final operand component is a symlink.
-/// Missing, non-directory, and symlink components mean there is no real directory to preview and
-/// return `None`; every other error remains observable to the caller.
-pub(crate) async fn open_existing_dir_beneath_operand(
-    named_root: &Path,
-    relative: &Path,
-    side: congestion::Side,
-) -> std::io::Result<Option<Dir>> {
-    let relative = preview_relative_components(relative)?;
-    let Some((parent_path, root_name)) = split_parent_and_name(named_root) else {
-        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-    };
-    if !is_single_component(root_name) {
+    readable: bool,
+) -> std::io::Result<PreviewEntry> {
+    if !is_single_component(name) {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let parent = match open_preview_operand_parent(parent_path, side).await {
-        Ok(parent) => parent,
-        Err(error) if preview_scan_absence(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut current = match parent.open_dir(root_name).await {
-        Ok(dir) => dir,
-        Err(error) if preview_scan_absence(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    drop(parent);
-    for component in relative {
-        current = match current.open_dir(&component).await {
-            Ok(dir) => dir,
-            Err(error) if preview_scan_absence(&error) => return Ok(None),
-            Err(error) => return Err(error),
+    let parent_fd = Arc::clone(&parent.fd);
+    let side = parent.side;
+    let name = name.to_owned();
+    run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+        let access = if readable {
+            OFlag::O_RDONLY
+        } else {
+            OFlag::O_PATH
         };
-    }
-    Ok(Some(current))
+        let flags = access | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let fd = match openat(parent_fd.as_fd(), name.as_bytes(), flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::ENOENT) => return Ok(PreviewEntry::Missing),
+            Err(nix::errno::Errno::ENOTDIR | nix::errno::Errno::ELOOP) => {
+                return Ok(PreviewEntry::NonDirectory);
+            }
+            Err(nix::errno::Errno::EACCES) if !readable => return Ok(PreviewEntry::Unavailable),
+            Err(error) => return Err(nix_to_io(error)),
+        };
+        let dir = Dir::opened_with_credit(fd, side, parent_fd.credit.clone());
+        #[cfg(test)]
+        let _visit = resource_tests::gate_opened_descriptor(dir.fd.as_raw_fd())?;
+        let (dir, meta) = dir.with_metadata_snapshot()?;
+        Ok(PreviewEntry::Directory(Arc::new(PreviewDirectory {
+            dir: Arc::new(dir),
+            meta,
+            readable,
+        })))
+    })
+    .await
 }
 
 /// Probe an operand's existence and kind fd-relative under strict operand
@@ -2210,6 +2336,17 @@ pub async fn lockdown_reused_dir(
     dir: &Dir,
     handle: &Handle,
 ) -> std::io::Result<Option<ReusedDirLock>> {
+    lockdown_reused_dir_with(dir, handle, || {}).await
+}
+
+/// Keep admission ownership tentative through verification and queued work, then notify after the
+/// first successful mutation. The blocking closure owns the callback if its waiter is cancelled.
+/// Outside strict mode no mutation occurs and the callback is dropped without being invoked.
+pub(crate) async fn lockdown_reused_dir_with(
+    dir: &Dir,
+    handle: &Handle,
+    on_mutation: impl FnOnce() + Send + 'static,
+) -> std::io::Result<Option<ReusedDirLock>> {
     if !strict_operand_resolution() {
         return Ok(None);
     }
@@ -2229,7 +2366,7 @@ pub async fn lockdown_reused_dir(
     // did not honor the takeover at all. Root has `CAP_FSETID`, keeps the bit, and never trips this.
     let want_setgid = orig_meta.permissions().mode() & 0o2000 != 0;
     let interim_mode = if want_setgid { 0o2700 } else { 0o700 };
-    dir.secure_as_copier(interim_mode, orig_meta.uid(), orig_meta.gid())
+    dir.secure_as_copier_with(interim_mode, orig_meta.uid(), orig_meta.gid(), on_mutation)
         .await?;
     // snapshot the default ACL, now that the directory is ours and the prior owner can no longer
     // race the read (step 4). Mode-neutral. `read_acls_fd` also reads the access ACL when one is
@@ -3456,12 +3593,12 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     // `--preserve` of a setgid directory (the kernel strips setgid when the copier is not in the
     // group and lacks CAP_FSETID) — matching the best-effort behavior of a non-strict copy.
     //
-    // `want_mode` stays `masked_mode` even when an access ACL was applied, because the two agree by
-    // construction: the destination's rwx bits come from the source's ACL (`fsetxattr` sets them
-    // from USER_OBJ/MASK/OTHER) and the source's own mode's rwx bits were derived from that same
-    // ACL by the kernel. The special bits come from the chmod either way. So for a setgid source
-    // directory with an ACL, `want_mode`'s S_ISGID is checked against the chmod's result and its
-    // rwx against the ACL's, with no double-counting.
+    // `want_mode` stays `masked_mode` even when an access ACL was applied. The kernel derives the
+    // source's rwx bits from its ACL, so these agree when source permissions stay stable during
+    // capture. Metadata and ACL reads use the same held inode but are separately gated, not atomic;
+    // concurrent changes during capture can still make this verification fail. The destination's
+    // rwx bits come from the applied ACL (USER_OBJ/MASK/OTHER), and its special bits from chmod,
+    // so both are checked against the captured mode without double-counting
     use crate::preserve::Metadata as _;
     use std::os::unix::fs::PermissionsExt as _;
     let want_uid = if ut.uid { meta.uid() } else { orig_uid };
@@ -4142,63 +4279,22 @@ mod tests {
         EntryKind::Special,
     ];
 
-    #[tokio::test]
-    async fn preview_operand_descent_rejects_a_symlink_in_the_relative_prefix() -> anyhow::Result<()>
-    {
-        let fixture = testutils::create_temp_dir().await?;
-        let named_root = fixture.join("named-root");
-        let outside = fixture.join("outside");
-        tokio::fs::create_dir_all(&named_root).await?;
-        tokio::fs::create_dir_all(outside.join("level-two")).await?;
-        tokio::fs::symlink(&outside, named_root.join("level-one")).await?;
-
-        let opened = open_existing_dir_beneath_operand(
-            &named_root,
-            Path::new("level-one/level-two"),
-            congestion::Side::Destination,
-        )
-        .await?;
-
-        assert!(opened.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preview_operand_relative_path_accepts_empty_and_rejects_non_normal_components()
-    -> anyhow::Result<()> {
-        let fixture = testutils::create_temp_dir().await?;
-        let named_root = fixture.join("named-root");
-        tokio::fs::create_dir(&named_root).await?;
-
-        assert!(
-            open_existing_dir_beneath_operand(
-                &named_root,
-                Path::new(""),
-                congestion::Side::Destination,
-            )
-            .await?
-            .is_some(),
-            "an empty relative path must open the named root"
-        );
-        for invalid in ["/absolute", ".", "..", "one/./two", "one/../two"] {
-            let error = open_existing_dir_beneath_operand(
-                &named_root,
-                Path::new(invalid),
-                congestion::Side::Destination,
-            )
-            .await
-            .expect_err("a non-normal relative path must be rejected");
-            assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{invalid:?}");
-        }
-        Ok(())
-    }
-
     pub(super) fn gate_file_create_stage(
         fd: RawFd,
         stage: &str,
     ) -> Option<testutils::BlockingPathGateVisit> {
         let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
         testutils::wait_on_blocking_path_gate(&path.join(stage), fd)
+    }
+
+    pub(super) fn gate_unlink(
+        fd: RawFd,
+        name: &OsStr,
+    ) -> std::io::Result<Option<testutils::BlockingPathGateVisit>> {
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+        testutils::wait_on_blocking_path_gate(&path.join(name).join(".rcp-unlink"), fd)
+            .map(testutils::BlockingPathGateVisit::into_result)
+            .transpose()
     }
 
     mod max_files_in_flight_tests {
@@ -5188,6 +5284,74 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn directory_metadata_snapshot_uses_the_opened_inode_after_a_name_swap()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        for create in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("child");
+            let moved = tmp.path().join("moved");
+            if !create {
+                std::fs::create_dir(&path)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+            let mut gate = testutils::BlockingPathGate::install(&path);
+            let task = tokio::spawn(async move {
+                if create {
+                    let (sender, snapshot) = tokio::sync::oneshot::channel();
+                    let dir = root
+                        .make_dir_checked(OsStr::new("child"), 0o700, move |meta| {
+                            let _ = sender.send(meta.clone());
+                            Ok(())
+                        })
+                        .await?;
+                    Ok((dir, snapshot.await.map_err(std::io::Error::other)?))
+                } else {
+                    root.open_dir_with_meta(OsStr::new("child")).await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started()).await??;
+            let before = std::fs::metadata(&path)?;
+            std::fs::rename(&path, &moved)?;
+            std::fs::create_dir(&path)?;
+            let replacement = std::fs::metadata(&path)?;
+            gate.release_all();
+            let (dir, snapshot) = task.await??;
+            assert_eq!(
+                (snapshot.dev(), snapshot.ino()),
+                (before.dev(), before.ino())
+            );
+            assert_ne!(
+                (snapshot.dev(), snapshot.ino()),
+                (replacement.dev(), replacement.ino())
+            );
+            assert_eq!(snapshot.permissions().mode() & 0o7777, 0o700);
+            std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o500))?;
+            let live = dir.meta().await?;
+            assert_eq!((live.dev(), live.ino()), (snapshot.dev(), snapshot.ino()));
+            assert_eq!(live.permissions().mode() & 0o7777, 0o500);
+            assert_eq!(snapshot.permissions().mode() & 0o7777, 0o700);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_created_directory_removes_the_empty_slot() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+        let error = root
+            .make_dir_checked(OsStr::new("child"), 0o700, |_meta| {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(!tmp.path().join("child").exists());
+        Ok(())
+    }
+
     #[cfg_attr(
         rcp_nix_sandbox,
         ignore = "Nix sandbox cannot change ownership or set-id modes"
@@ -5313,6 +5477,7 @@ mod tests {
         let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
         // clone the underlying Arc-held fd into a second Dir, then drop the original
         let shared = Dir {
+            captured_identity: root.captured_identity,
             fd: root.fd.clone(),
             side: root.side,
             children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(true)),

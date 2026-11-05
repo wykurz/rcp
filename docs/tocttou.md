@@ -511,8 +511,10 @@ Specific invariants enforced:
   directory (an include traversal, time-filter skip, or expected `ENOTEMPTY` while filtering).
   Operation errors, cancellation, and unexpected `rmdir` failures do not attempt metadata rollback
   for a removal already in progress.
-- Directory names passed to any `*at()` call are validated to be single path components (no `/`,
-  `.`, `..`).
+- Tree-entry child names passed through `Dir`'s fd-relative lookup and mutation APIs are validated
+  to be single path components (no `/`, `.`, `..`). Internal read-only opens of `.` for
+  held-directory listings and `..` for ancestry identity checks are intentional exceptions, not
+  caller-supplied child names.
 - **Source payload and metadata stay bound to the same inode (read-side fidelity).** For each copied
   or sent regular file or symlink, its data and applied/sent metadata are read from one open file
   description, so a same-name swap cannot pair one inode's bytes/target with another inode's
@@ -520,18 +522,100 @@ Specific invariants enforced:
   (`read_acls_owned` transfers the local file's data-fd owner and returns it with the ACLs; the
   remote source still uses `read_acls_fd` on its held data fd): a regular file via `open_file_read`
   → `(File, FileMeta)`; a symlink via the `O_PATH` handle's `read_symlink` (target + metadata off
-  the one fd). Directory metadata and ACLs come from the held `Dir` fd. Full and capped listings
-  seek its description before duplicating it; the `ESPIPE` fallback and independent cursors instead
-  open `.` relative to that held fd, creating a new description for the same directory inode without
-  re-resolving its name. Enumeration and metadata therefore remain bound to the same held directory.
-  Remote source discovery uses one fd-relative cursor per directory in bounded batches; each
-  discovered name is classified once for filtering and dispatch. A subsequently opened file data fd
-  is checked again and supplies the wire header's metadata and ACLs for the bytes it sends. The
-  remote *destination* is fidelity-safe by construction — it writes the received bytes and applies
-  the received metadata to its single created fd, so there are no two source fds to mismatch.
+  the one fd). Directory metadata and ACLs come from the held `Dir` fd. Local copy and link capture
+  their preservation metadata and ACLs before descending, from the selected source or update
+  directory, and carry that pair through finalization. With ACL preservation enabled, metadata is
+  refreshed immediately before the ACL reads, after the destination ancestry check, rather than
+  reusing the earlier directory-open snapshot. These separately gated reads are not an atomic
+  snapshot; consistency assumes the source metadata stays stable during capture. Mutations after
+  capture do not update the preserved snapshot. Full and capped listings seek its description before
+  duplicating it; the `ESPIPE` fallback and independent cursors instead open `.` relative to that
+  held fd, creating a new description for the same directory inode without re-resolving its name.
+  Enumeration and metadata therefore remain bound to the same held directory. Remote source
+  discovery uses one fd-relative cursor per directory in bounded batches; each discovered name is
+  classified once for filtering and dispatch. A subsequently opened file data fd is checked again
+  and supplies the wire header's metadata and ACLs for the bytes it sends. The remote *destination*
+  is fidelity-safe by construction — it writes the received bytes and applies the received metadata
+  to its single created fd, so there are no two source fds to mismatch.
   `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
   source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
   `-L`/`--dereference` path.
+
+### Local input/output directory overlap
+
+Local `rcp` and `rlink` share directory admission: prepare destination authority, reserve the
+participating input identities, resolve the output or skip, then admit traversal. Source and update
+directories register together. Only a prepared destination can provide a child's lookup authority;
+children inherit held descriptors or an explicit preview state, never a reconstructed display or
+filter path. Root preparation retains the actual resolved authority rather than a boolean saying a
+check ran.
+
+The held destination parent's available ancestors are checked before creating the corresponding
+output. Encountering a source or participating update directory in that set rejects the subtree.
+Excluded roots and `--ignore-existing` skips of non-directory destinations do not commit input
+history. Once a root participates, descendant filters and `--update-exclusive` do not exempt a
+destination beneath it from this ancestry check.
+
+Parent opens use `O_PATH`, requiring search permission but no ancestor read permission. The ancestry
+snapshot stops at an unsearchable ancestor (`EACCES` from opening its parent) or a mount boundary.
+An equal `(dev, ino)` pair across different mount IDs permits continuing that particular parent
+transition; this handles a directory bound onto its direct child. It does not identify every
+self-bind layout: binding `X` onto `X` can cross to a different parent identity and stop the scan.
+Such aliases may instead be discovered during traversal, after earlier output or deletions. Crossing
+all same-device mount boundaries would also reject legitimate nonrecursive bind arrangements. Equal
+identities within one mount terminate at its root. Mount IDs come from `statx`, with
+`/proc/self/fdinfo` as a fallback; unavailable mount identity and other ancestry errors are
+reported. These limits can leave ancestry above the stopping point unchecked.
+
+One registry shared across local operands, parallel branches, and delegated update copies records
+input and output `(dev, ino)` identities with the operation responsible for them. Admission reserves
+identities atomically, so concurrent opposite uses cannot both pass. An unsuccessful admission
+releases its own tentative reservations; it does not erase another admission's reservation or
+committed history. Once traversal or destination mutation commits participation, the history remains
+for the invocation, including strict-mode sequential operands. An error names the conflicting
+operation even when that operation has already completed. This conservative policy also prevents
+later operands from consuming earlier output.
+
+Existing output identity is checked through its held descriptor before strict-mode lockdown or
+metadata changes. Fresh creation retains registration ownership through the blocking job that can
+outlive a cancelled waiter. Replacing a non-directory commits its input reservation only after
+`unlinkat` succeeds, inside that same blocking job; a failed removal releases its tentative history.
+An overlap error inhibits that directory's `--delete` pruning through the ordinary child-error path.
+Work completed earlier can leave partial output; discovering an alias later does not roll it back.
+This registry does not provide transactional rollback.
+
+The registry and ancestry cache retain identities rather than descriptors, with memory proportional
+to encountered directories and prepared destination containers. Ancestry evidence is reused for the
+same observed directory and mount position; the current mount identity is carried between parent
+steps. It remains a snapshot: a later rename can change ancestry. Temporary ancestry descriptors and
+cancelled blocking jobs retain their normal ownership and admission lifetime; the cache does not
+keep file-admission credits alive.
+
+Plain dry runs use identity-only directory handles and never require directory read permission for
+overlap checks. The separate `--ignore-existing` leaf check still probes the destination by path;
+strict mode reopens its parent with `openat2(RESOLVE_NO_SYMLINKS)` and read access for that probe.
+Lookup errors are reported rather than treated as absence. A missing destination parent permits a
+hypothetical preview, and an inaccessible counterpart leaves its identity unavailable; neither means
+the entire planned destination has been verified. Descendants retain that unavailable or absent
+state without reopening a path or walking upward lexically. Strict prefix symlink rejection remains
+in force. A delete preview instead opens existing destination directories readably through their
+held parents so it can enumerate them; read failures stop that subtree before its children are
+reported. Opening readably at that point avoids adding a search-permission requirement merely to
+reopen an empty, readable directory.
+
+**Destination removal is not covered by this registry.** A destination containing a source or
+participating update tree can destroy that input through `--delete` or directory replacement under
+`--overwrite`; `rcp --delete src/a/b src` can remove `src/a/b`. The same problem applies to
+directory aliases and operands whose source traversal has not started. Do not use these
+arrangements. Errors elsewhere in a copy do not cancel every independent removal already in
+progress.
+
+These are recursion checks, not a new security boundary or an atomic topology snapshot. Concurrent
+renames can change ancestry after observation, and inode reuse after deletion can cause a
+conservative rejection. Identity comparison assumes distinct live directories have distinct
+`(dev, ino)` pairs; a filesystem that reports duplicate pairs can cause false overlap errors. The
+existing held-descriptor and contained-by-name action guarantees remain the security contract.
+Remote copy uses separate endpoints and does not perform this local overlap check.
 
 ### Strict operand resolution (`--require-toctou-safe`)
 
@@ -550,8 +634,8 @@ The operand paths themselves — the one place the fd-based walk still consults 
   closes the race between a wrapper's `realpath`+policy check and the tool's open. Requires Linux
   5.6+; on older kernels `--require-toctou-safe` refuses to run rather than degrade. The named entry
   itself keeps the tools' non-`-L` semantics: classified `O_NOFOLLOW`, a symlink operand is operated
-  on as the link object and never followed (`ELOOP` where the open requires a directory, e.g. the
-  `--delete` preview open).
+  on as the link object and never followed. A destination preview, including `--delete`, represents
+  a final symlink as a non-directory counterpart; it does not traverse or enumerate its target.
 - **Resolved up front, then threaded.** Every operand prefix is validated at the entry of the
   operation, **before any filter / dry-run / overwrite / `--update` branching**. A symlinked prefix
   therefore fails closed before any downstream branch (a filtered-out source root, a trailing-slash
@@ -561,20 +645,21 @@ The operand paths themselves — the one place the fd-based walk still consults 
   implementation exception: it performs one up-front strict prefix/existence probe and later opens
   the update parent again for its fd-relative walk. Both operations independently use
   `openat2(RESOLVE_NO_SYMLINKS)`, so the second open cannot weaken containment; consolidating them
-  into one retained parent would reduce duplication but is not a security dependency. Where a dry
-  run holds no persistent destination fd, the existence probes re-resolve with a decomposed
-  `openat2` (parent open + `O_NOFOLLOW` child), which is atomic and distinguishes an
-  intermediate-prefix symlink (fail closed) from a final component that is merely a symlink or
-  non-directory (a replaceable operand, accepted). Local `--dry-run --delete` opens a separate
-  read-only destination directory before visiting its children. The named operand is opened through
-  its trusted parent using the active default/strict policy; each nested directory is opened with
-  `O_NOFOLLOW` through its held preview parent. Copy, rlink, delegated update copies, and library
-  dereference handoffs retain that physical authority independently of their display/filter paths.
-  Missing, non-directory, or symlink counterparts mean no directory exists to scan, and descendants
-  inherit that absence without reopening a path. Other open failures, including permission errors,
-  stop that subtree before its children are reported. Successful previews prune through the held
-  directory after their children finish, without modifying it or restoring metadata. The operand
-  prefix *above* the named root is still validated up front in strict mode (fatal).
+  into one retained parent would reduce duplication but is not a security dependency. A strict dry
+  run opens its destination parent with `O_PATH` during this up-front step and retains that
+  authority for directory admission. Missing or inaccessible preview-parent evidence is retained
+  too, without retrying the pathname or claiming complete validation of unavailable ancestry. The
+  parent open uses `openat2(RESOLVE_NO_SYMLINKS)`; subsequent child opens use `O_NOFOLLOW`, so a
+  reported prefix symlink fails closed while a final symlink or non-directory can be represented as
+  a replaceable counterpart. Plain overlap previews need only identity access; the separate
+  `--ignore-existing` leaf probe retains the path-based exception described above. A `--delete`
+  preview opens each existing counterpart readably before visiting its children and scans through
+  that held directory after they finish. Copy, rlink, delegated update copies, and library
+  dereference handoffs retain this authority independently of their display/filter paths. Missing or
+  non-directory counterparts propagate without reopening paths. Inaccessible plain-preview
+  counterparts propagate unavailable identity evidence; delete previews instead report the read
+  failure. No preview modifies or restores destination metadata. Strict prefix resolution is
+  attempted up front, including for previews that never admit a directory.
 - **Remote operands.** The master lints the remote path parts (which must be absolute as written;
   `host:~/x` forms are rejected) and mirrors the flag onto each spawned `rcpd`, which arms the same
   strict resolution for its root opens on the remote host. The source `rcpd` opens the source parent
@@ -591,12 +676,13 @@ The operand paths themselves — the one place the fd-based walk still consults 
   master nor the source can open a path on the destination host.
 
 The switch is process-global, armed once by the linter before any filesystem work. Without the flag,
-operand prefixes use ordinary symlink-following resolution. Because strict mode opens operand
-parents for read up front, an excluded root under an execute-only (`0111`) parent — which the
+operand prefixes use ordinary symlink-following resolution. Because strict mode opens source operand
+parents for read up front, an excluded source root under an execute-only (`0111`) parent — which the
 default path skips via a path stat — instead fails with `EACCES`; this is consistent with the real
-copy (which already requires parent read) and with `rrm`/`rchm`. One consequence worth knowing:
-systems whose legitimate paths cross symlinks (`/home → /var/home`, automounts) must pass the
-resolved form — that is the point, and it is why this is opt-in rather than the default.
+copy (which already requires parent read) and with `rrm`/`rchm`. Preview destination parents use
+identity-only access instead. One consequence worth knowing: systems whose legitimate paths cross
+symlinks (`/home → /var/home`, automounts) must pass the resolved form — that is the point, and it
+is why this is opt-in rather than the default.
 
 ### One shared traversal driver
 

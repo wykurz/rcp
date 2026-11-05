@@ -1707,8 +1707,11 @@ async fn async_main(
                 ));
             }
         };
-        // check for existing destination only when not using trailing slash (single source case)
-        if src_strings.len() == 1 && !dst_string.ends_with('/') && !(args.overwrite || args.delete)
+        // previews report attempted work; only real copies need this existing-destination preflight
+        if args.dry_run.is_none()
+            && src_strings.len() == 1
+            && !dst_string.ends_with('/')
+            && !(args.overwrite || args.delete)
         {
             // under strict operand resolution, probe the destination fd-relative (parent opened
             // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead
@@ -1790,13 +1793,14 @@ async fn async_main(
     let fail_early = settings.fail_early;
     let error_collector = common::error_collector::ErrorCollector::default();
     let mut copy_summary = common::copy::Summary::default();
+    let session = common::copy::CopySession::default();
     // under --require-toctou-safe, run multi-source copies SEQUENTIALLY instead of concurrently, so
     // two sources that alias to the same destination directory (see the duplicate check above)
     // cannot run overlapping reused-directory lockdown/restore lifecycles against it. Strict
     // multi-source is the paranoid, uncommon path, so the sequential cost is acceptable.
     if common::safedir::strict_operand_resolution() && src_dst.len() > 1 {
         for (src_path, dst_path) in src_dst {
-            let result = common::copy(&src_path, &dst_path, &settings, &preserve).await;
+            let result = common::copy(&session, &src_path, &dst_path, &settings, &preserve).await;
             if let Some(err) = fold_copy_result(
                 result,
                 &mut copy_summary,
@@ -1811,8 +1815,10 @@ async fn async_main(
         let mut join_set = tokio::task::JoinSet::new();
         for (src_path, dst_path) in src_dst {
             let settings = settings.clone();
-            let do_copy =
-                || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
+            let session = session.clone();
+            let do_copy = || async move {
+                common::copy(&session, &src_path, &dst_path, &settings, &preserve).await
+            };
             join_set.spawn(do_copy());
         }
         while let Some(res) = join_set.join_next().await {

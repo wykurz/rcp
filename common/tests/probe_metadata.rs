@@ -94,6 +94,28 @@ fn default_copy_settings() -> copy::Settings {
     }
 }
 
+async fn empty_directory_destination_samples(parent: &std::path::Path) -> usize {
+    // measure root setup under this same parent instead of deriving ancestry from its pathname.
+    // mount boundaries and namespace layout change the setup cost, but not per-entry probing
+    let src = parent.join("empty-source");
+    tokio::fs::create_dir(&src)
+        .await
+        .expect("create empty source");
+    let sink = install_sink();
+    copy::copy(
+        &PROGRESS,
+        &src,
+        &parent.join("empty-destination"),
+        &default_copy_settings(),
+        &preserve::preserve_all(),
+        true,
+    )
+    .await
+    .expect("empty baseline copy succeeds");
+    congestion::clear_sample_sink();
+    sink.metadata_count_for(congestion::Side::Destination)
+}
+
 #[tokio::test]
 async fn rm_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
@@ -136,8 +158,9 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
 async fn copy_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
     spend_root_acl_probe().await;
-    let sink = install_sink();
     let tmp = make_tempdir("copy_samples").await;
+    let destination_baseline = empty_directory_destination_samples(&tmp).await;
+    let sink = install_sink();
     let src = tmp.join("src");
     let dst = tmp.join("dst");
     make_small_tree(&src).await.expect("create src tree");
@@ -152,38 +175,29 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("copy succeeds");
     congestion::clear_sample_sink();
-    // the local copy walk is fd-based (`common::safedir`), so the probe counts reflect
-    // fd-relative `openat`/`fstatat`/`mkdirat` syscalls rather than the old path-based
-    // `symlink_metadata`/`create_dir`/`File::open`. The data copy (`copy_file_range`) stays
-    // unprobed, like the `tokio::fs::copy` it replaced.
-    //
-    // source-side metadata (16 total):
-    //   - 1 open_root_dir(src parent)                                          = 1
-    //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)                = 3
-    //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat)    × 2         = 6
-    //   - 3 files:   child(classify) + open_file_read × 3                       = 6
-    //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
-    //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
-    //
-    // the source-root ACL probe is deliberately NOT in this number: `spend_root_acl_probe` above
-    // burns it first, so this counts the walk alone. Its cost is owned by `root_acl_probe_cost.rs`.
+    // source-side metadata: one parent open, three directories with classify + open/snapshot,
+    // and three files with classify + open/read = 1 + 3 * 2 + 3 * 2 = 13.
+    // each snapshot still uses the opened directory fd; fstat shares the open job's probe.
+    // listings and data transfers are unprobed. The root ACL probe was spent above
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        16,
-        "expected 16 src metadata probes for the fd-based walk",
+        13,
+        "expected 13 src metadata probes for the fd-based walk",
     );
-    // destination-side metadata (25 total):
+    // destination-side: 25 payload/metadata jobs plus ancestry. The empty baseline includes
+    // root setup and its four jobs, leaving 20 jobs for two subdirs and three files:
     //   - 1 open_root_dir(dst parent)                                          = 1
     //   - 3 dirs:  make_dir + 3 preserve (chown/chmod/utimens)                 = 4 each = 12
     //   - 3 files: create_file + 3 preserve (chown/chmod/utimens)              = 4 each = 12
     //   (make_dir is ONE probed op: its mkdirat + re-open — and, under strict mode, the
     //    inherited-ACL strip — share one blocking closure so no cancellation point can abandon a
     //    created-but-unsanitized directory; the controller sees one slightly longer MkDir sample
-    //    instead of a MkDir + a Stat. copy_file_range is the data path, unprobed)
+    //    instead of a MkDir + a Stat. The overlap identity check shares that creation job too.
+    //    copy_file_range is the data path, unprobed)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        25,
-        "expected 25 dst metadata probes for the fd-based walk",
+        destination_baseline + 20,
+        "expected two subdirectories and three copied files beyond root setup",
     );
 }
 
@@ -412,8 +426,9 @@ async fn link_update_path_emits_probes_for_update_tree() {
     // count would drop by the per-file `symlink_metadata` (× 3 = 3).
     let _guard = SINK_GUARD.lock().await;
     spend_root_acl_probe().await;
-    let sink = install_sink();
     let tmp = make_tempdir("link_update_samples").await;
+    let destination_baseline = empty_directory_destination_samples(&tmp).await;
+    let sink = install_sink();
     let src = tmp.join("src");
     let update = tmp.join("update");
     let dst = tmp.join("dst");
@@ -447,28 +462,17 @@ async fn link_update_path_emits_probes_for_update_tree() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // the link walk is fd-based, and update-only entries are delegated to the fd-based
-    // `copy::copy_child` using the HELD update/destination parent `Dir`s (so the delegation opens
-    // no root dir of its own). read_entries/getdents is unprobed; failed (NotFound) probes are
-    // discarded by `run_metadata_probed`.
-    //
-    // source-side (22 total):
-    //   - open_root_dir(src parent) + open_root_dir(update parent)               = 2
-    //   - root dir: src child + src open_dir + update child + update open_dir
-    //               + meta(fstat, from the update dir)                            = 5
-    //   - a/, b/:   src child + src open_dir + meta(fstat, from src dir) (× 2); the update
-    //               lookups are NotFound and discarded                            = 6
-    //   - 3 src .txt files: src child only (hard link reads src via linkat)       = 3
-    //   - 3 update-only files via copy_child: child(classify) + open_file_read (× 3) = 6
-    //   2 + 5 + 6 + 3 + 6 = 22. (Drops if the update-walk path stops spawning copies for u*.txt.)
-    //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`.)
+    // source-side metadata: two parent opens; source/update roots and two source subdirectories
+    // each classify + open/snapshot; three source files classify for linking; three update-only
+    // files classify + open/read = 2 + 4 * 2 + 3 + 3 * 2 = 19.
+    // directory finalization reuses its held directory's entry snapshot
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        22,
-        "expected 22 src metadata probes — drops if the update-walk path stops spawning copies \
+        19,
+        "expected 19 src metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
-    // destination-side (28 total):
+    // destination-side: 28 payload/metadata jobs plus ancestry; 23 beyond the empty baseline:
     //   - open_root_dir(dst parent)                                              = 1
     //   - 3 dirs (root + a + b): make_dir (one probed op, see the copy test)
     //     + 3 preserve                                                           = 4 each = 12
@@ -477,8 +481,8 @@ async fn link_update_path_emits_probes_for_update_tree() {
     //   1 + 12 + 3 + 12 = 28. (Drops if the update-walk path stops spawning copies for u*.txt.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        28,
-        "expected 28 dst metadata probes — drops if the update-walk path stops spawning copies \
+        destination_baseline + 23,
+        "expected payload and overlap probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
 }
@@ -487,8 +491,9 @@ async fn link_update_path_emits_probes_for_update_tree() {
 async fn link_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
     spend_root_acl_probe().await;
-    let sink = install_sink();
     let tmp = make_tempdir("link_samples").await;
+    let destination_baseline = empty_directory_destination_samples(&tmp).await;
+    let sink = install_sink();
     let src = tmp.join("src");
     let dst = tmp.join("dst");
     make_small_tree(&src).await.expect("create src tree");
@@ -511,34 +516,112 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // The link walk is now fd-based (`common::safedir`), so the probe counts reflect fd-relative
-    // `openat`/`fstatat`/`mkdirat`/`linkat` syscalls rather than the old path-based
-    // `symlink_metadata`/`create_dir`/`hard_link`. read_entries/getdents is deliberately unprobed.
-    //
-    // Source-side metadata (13 total):
-    //   - 1 open_root_dir(src parent)                                  = 1
-    //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)        = 3
-    //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat) × 2    = 6
-    //   - 3 files:   child(stat) only — a hard link reads the src via `linkat` (no open_file_read)
-    //                                                  × 3             = 3
-    //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`)
-    //
-    // The source-root ACL probe is burned by `spend_root_acl_probe` above, so it is not counted
-    // here. rlink asks about DIRECTORY roots only: a hard-linked destination file IS the source
-    // inode, so its ACL cannot be dropped.
+    // source-side metadata: one parent open, three directories with classify + open/snapshot,
+    // and three files classified for hard linking = 1 + 3 * 2 + 3 = 10.
+    // directory finalization reuses the opened directory's snapshot; listings remain unprobed.
+    // the source-root ACL probe was spent above
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        13,
-        "expected 13 src metadata probes for the fd-based link walk",
+        10,
+        "expected 10 src metadata probes for the fd-based link walk",
     );
-    // Destination-side metadata (16 total):
+    // destination-side: 16 payload/metadata jobs plus ancestry; 11 beyond the empty baseline:
     //   - 1 open_root_dir(dst parent)                                            = 1
     //   - 3 dirs:  make_dir (one probed op, see the copy test) + 3 preserve
     //     (chown/chmod/utimens)                                                  = 4 each = 12
     //   - 3 files: hard_link_at (linkat) only — a hard link copies no metadata   = 1 each = 3
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        16,
-        "expected 16 dst metadata probes for the fd-based link walk",
+        destination_baseline + 11,
+        "expected two subdirectories and three hard links beyond root setup",
     );
+}
+
+#[tokio::test]
+async fn repeated_container_setup_has_a_fixed_cost() {
+    let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
+    for (preview, existing, expected) in [(false, false, 4), (false, true, 5), (true, true, 3)] {
+        let root = tempfile::tempdir().expect("create fixture");
+        for name in ["source-a", "source-b"] {
+            std::fs::create_dir(root.path().join(name)).expect("create source");
+        }
+        if existing {
+            for name in ["output-a", "output-b"] {
+                std::fs::create_dir(root.path().join(name)).expect("create output");
+            }
+        }
+        let mut settings = default_copy_settings();
+        settings.dry_run = preview.then_some(common::config::DryRunMode::Brief);
+        settings.ignore_existing = existing;
+        let session = copy::CopySession::default();
+        session
+            .copy(
+                &PROGRESS,
+                &root.path().join("source-a"),
+                &root.path().join("output-a"),
+                &settings,
+                &preserve::preserve_none(),
+                false,
+            )
+            .await
+            .expect("first operand");
+        let sink = install_sink();
+        session
+            .copy(
+                &PROGRESS,
+                &root.path().join("source-b"),
+                &root.path().join("output-b"),
+                &settings,
+                &preserve::preserve_none(),
+                false,
+            )
+            .await
+            .expect("second operand");
+        congestion::clear_sample_sink();
+        // parent open + one held-position sample, then either one preview open, or real
+        // mkdir + final chmod. Ignored existing directories classify + open/snapshot after the
+        // failed mkdir, and skip final metadata application.
+        assert_eq!(
+            sink.metadata_count_for(congestion::Side::Destination),
+            expected,
+            "preview={preview}, existing={existing}: setup must not repeat ancestor or root resolution"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ignore_existing_adds_no_probe_for_directory_counterparts() {
+    let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
+    for preview in [false, true] {
+        let root = tempfile::tempdir().expect("create fixture");
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("nested/deep")).expect("create source");
+        let mut counts = Vec::new();
+        for ignore in [false, true] {
+            let destination = root.path().join(format!("destination-{ignore}"));
+            std::fs::create_dir_all(destination.join("nested/deep")).expect("create destination");
+            let mut settings = default_copy_settings();
+            settings.ignore_existing = ignore;
+            settings.dry_run = preview.then_some(common::config::DryRunMode::Brief);
+            let sink = install_sink();
+            copy::copy(
+                &PROGRESS,
+                &source,
+                &destination,
+                &settings,
+                &preserve::preserve_none(),
+                false,
+            )
+            .await
+            .expect("directory copy");
+            congestion::clear_sample_sink();
+            counts.push(sink.metadata_count_for(congestion::Side::Destination));
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "ignore-existing must reuse directory resolution, preview={preview}"
+        );
+    }
 }

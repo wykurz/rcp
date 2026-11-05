@@ -17,6 +17,170 @@ fn rcpd() -> Command {
     Command::cargo_bin("rcpd").unwrap()
 }
 
+async fn plain_preview_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    common::filegen::filegen(
+        common::get_progress(),
+        &common::filegen::FileGenConfig::new(&source, vec![], 1, 16),
+    )
+    .await
+    .unwrap();
+    temp
+}
+
+#[tokio::test]
+async fn plain_preview_reports_existing_destination_without_overwrite() {
+    let temp = plain_preview_fixture().await;
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let source_bytes = std::fs::read(source.join("file0")).unwrap();
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("file0"), b"existing destination").unwrap();
+    for strict in [false, true] {
+        if strict && !common::safedir::openat2_available() {
+            continue;
+        }
+        let mut command = rcp();
+        if strict {
+            command.arg("--require-toctou-safe");
+        }
+        command
+            .arg("--dry-run=brief")
+            .args([&source, &destination])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(format!(
+                "would copy dir {source:?} -> {destination:?}"
+            )))
+            .stdout(predicates::str::contains(format!(
+                "would copy file {:?} -> {:?}",
+                source.join("file0"),
+                destination.join("file0")
+            )));
+        assert_eq!(std::fs::read(source.join("file0")).unwrap(), source_bytes);
+        assert_eq!(
+            std::fs::read(destination.join("file0")).unwrap(),
+            b"existing destination"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn strict_plain_preview_accepts_unreadable_destination_parents() {
+    use std::os::unix::fs::PermissionsExt;
+    if !common::safedir::openat2_available() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = plain_preview_fixture().await;
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let source_bytes = std::fs::read(source.join("file0")).unwrap();
+    let parent = root.join("parent");
+    let destination = parent.join("destination");
+    std::fs::create_dir(&parent).unwrap();
+    for mode in [0o111, 0o000] {
+        for overwrite in [false, true] {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            let mut command = rcp();
+            command.args(["--require-toctou-safe", "--dry-run=brief"]);
+            if overwrite {
+                command.arg("--overwrite");
+            }
+            let assert = command.args([&source, &destination]).assert();
+            let actual_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert
+                .success()
+                .stdout(predicates::str::contains(format!(
+                    "would copy dir {source:?} -> {destination:?}"
+                )))
+                .stdout(predicates::str::contains(format!(
+                    "would copy file {:?} -> {:?}",
+                    source.join("file0"),
+                    destination.join("file0")
+                )));
+            assert_eq!(actual_mode, mode);
+            assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+            assert_eq!(std::fs::read(source.join("file0")).unwrap(), source_bytes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn strict_plain_preview_rejects_symlinked_destination_prefix() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let temp = plain_preview_fixture().await;
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let target = root.join("target");
+    let prefix = root.join("prefix");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("sentinel"), b"keep target").unwrap();
+    std::os::unix::fs::symlink(&target, &prefix).unwrap();
+    for overwrite in [false, true] {
+        for filtered in [false, true] {
+            let mut command = rcp();
+            command.args(["--require-toctou-safe", "--dry-run=brief"]);
+            if overwrite {
+                command.arg("--overwrite");
+            }
+            if filtered {
+                command.arg("--exclude=source");
+            }
+            command
+                .arg(&source)
+                .arg(prefix.join("destination"))
+                .assert()
+                .failure()
+                .stdout(predicates::str::contains("os error 40"))
+                .stdout(predicates::str::contains("would ").not());
+            assert_eq!(std::fs::read_link(&prefix).unwrap(), target);
+            assert_eq!(
+                std::fs::read(target.join("sentinel")).unwrap(),
+                b"keep target"
+            );
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_run_refuses_existing_destination_without_overwrite() {
+    let temp = plain_preview_fixture().await;
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let source_bytes = std::fs::read(source.join("file0")).unwrap();
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("file0"), b"existing destination").unwrap();
+    for strict in [false, true] {
+        if strict && !common::safedir::openat2_available() {
+            continue;
+        }
+        let mut command = rcp();
+        if strict {
+            command.arg("--require-toctou-safe");
+        }
+        command
+            .args([&source, &destination])
+            .assert()
+            .failure()
+            .stdout(predicates::str::contains("already exists"));
+        assert_eq!(std::fs::read(source.join("file0")).unwrap(), source_bytes);
+        assert_eq!(
+            std::fs::read(destination.join("file0")).unwrap(),
+            b"existing destination"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+    }
+}
+
 #[test]
 fn local_copy_writes_scoped_timings_without_verbose_logging() {
     let temp = tempfile::tempdir().unwrap();

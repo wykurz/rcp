@@ -247,15 +247,16 @@ jobs:
         # Run tests with nextest for better output
         ./scripts/cargo-host.sh nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
 
-    - name: Test sudo-required tests (musl debug)
+    - name: Test sudo-required and isolated mount tests (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
+        RCP_TEST_MOUNT_SUDO: "1"
         # root SSH is provisioned above, so a missing precondition is a CI bug, not a skip
         RCP_REQUIRE_ROOT_SSH: "1"
       run: |
         set -o pipefail
-        # Run tests that require passwordless sudo (available in CI)
-        ./scripts/cargo-host.sh nextest run --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_debug.log
+        # Run passwordless-sudo tests and the fixtures that create private mount namespaces.
+        ./scripts/cargo-host.sh nextest run --no-capture --run-ignored only -E 'test(~sudo) or binary(=directory_overlap)' 2>&1 | tee -a test_output_musl_debug.log
 
     - name: Doctests (musl debug)
       env:

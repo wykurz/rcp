@@ -1,15 +1,73 @@
 use super::*;
 use anyhow::Context as _;
 
-pub(super) fn gate_opened_descriptor(
+fn gate_descriptor_stage(
     fd: RawFd,
+    stage: Option<&str>,
 ) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
-    let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{fd}")) else {
+    let Ok(mut path) = std::fs::read_link(format!("/proc/self/fd/{fd}")) else {
         return Ok(None);
     };
+    if let Some(stage) = stage {
+        path.push(stage);
+    }
     crate::testutils::wait_on_blocking_path_gate(&path, fd)
         .map(crate::testutils::BlockingPathGateVisit::into_result)
         .transpose()
+}
+
+pub(super) fn gate_opened_descriptor(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, None)
+}
+
+pub(super) fn gate_classified_entry(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-classified-entry"))
+}
+
+pub(super) fn gate_directory_lockdown(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-lockdown"))
+}
+
+pub(super) fn gate_directory_acl(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-acl"))
+}
+
+pub(super) fn gate_directory_stat(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-stat"))
+}
+
+#[tokio::test]
+async fn preview_metadata_failure_is_not_unavailable_open_evidence() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let child = root.path().join("child");
+    std::fs::create_dir(&child)?;
+    let parent = Dir::open_root_dir(root.path(), false, congestion::Side::Destination).await?;
+    let _failure = crate::testutils::BlockingPathGate::fail_once(
+        child.join(".rcp-directory-stat"),
+        libc::EACCES,
+    );
+    let error = open_preview_entry(&parent, OsStr::new("child"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("cannot fstat opened directory"));
+    let open_error = parent
+        .open_dir_with_meta(OsStr::new("missing"))
+        .await
+        .unwrap_err();
+    assert_eq!(open_error.kind(), std::io::ErrorKind::NotFound);
+    assert!(!open_error.to_string().contains("fstat"));
+    Ok(())
 }
 
 async fn credit(gate: &Arc<tokio::sync::Semaphore>) -> Arc<tokio::sync::OwnedSemaphorePermit> {

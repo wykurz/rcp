@@ -195,6 +195,43 @@ fn overwrite_copy_settings() -> common::copy::Settings {
     }
 }
 
+#[tokio::test]
+async fn strict_copy_rejects_dereference_before_traversal() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root_path = root.path().canonicalize()?;
+    let source = root_path.join("source");
+    let referent = root_path.join("referent");
+    let destination = root_path.join("destination");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&referent)?;
+    let config = common::filegen::FileGenConfig::new(referent.clone(), vec![], 1, 16);
+    common::filegen::filegen(common::get_progress(), &config).await?;
+    std::os::unix::fs::symlink(&referent, source.join("link"))?;
+    common::safedir::enable_strict_operand_resolution();
+    for preview in [Some(common::config::DryRunMode::Brief), None] {
+        let mut settings = overwrite_copy_settings();
+        settings.dereference = true;
+        settings.dry_run = preview;
+        let error = common::copy::copy(
+            common::get_progress(),
+            &source,
+            &destination,
+            &settings,
+            &common::preserve::preserve_none(),
+            false,
+        )
+        .await
+        .expect_err("strict copies must reject dereferencing without entering the tree");
+        let message = format!("{:#}", error.source);
+        assert!(message.contains("--dereference"), "{message}");
+        assert!(message.contains("strict operand resolution"), "{message}");
+        assert_eq!(error.summary.directories_created, 0);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_link(source.join("link"))?, referent);
+    }
+    Ok(())
+}
+
 /// The current process's effective uid/gid (the copier's identity), read via libc
 /// as the rest of this binary already does for raw errnos.
 fn effective_owner() -> (u32, u32) {
@@ -960,5 +997,58 @@ async fn strict_make_dir_under_default_acl_parent_strips_both_inherited_acls() -
         None,
         "a file beneath a sanitized directory must carry no inherited ACL"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_plain_preview_needs_only_destination_parent_search_access() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() || effective_owner().0 == 0 {
+        return Ok(());
+    }
+    common::safedir::enable_strict_operand_resolution();
+    let root = tempfile::tempdir()?;
+    let path = root.path().canonicalize()?;
+    let source = path.join("source");
+    std::fs::create_dir(&source)?;
+    let mut config = common::filegen::FileGenConfig::new(&source, vec![], 1, 32);
+    config.leaf_files = true;
+    common::filegen::filegen(common::get_progress(), &config).await?;
+    let container = path.join("container");
+    std::fs::create_dir(&container)?;
+    for mode in [0o111, 0o000] {
+        std::fs::set_permissions(&container, std::fs::Permissions::from_mode(mode))?;
+        let mut settings = overwrite_copy_settings();
+        settings.dry_run = Some(common::config::DryRunMode::Brief);
+        let copied = common::copy::copy(
+            common::get_progress(),
+            &source,
+            &container.join("copy"),
+            &settings,
+            &common::preserve::preserve_none(),
+            false,
+        )
+        .await;
+        let linked = common::link::link(
+            common::get_progress(),
+            &path,
+            &source,
+            &container.join("link"),
+            &None,
+            &common::link::Settings {
+                copy_settings: settings,
+                update_compare: Default::default(),
+                update_exclusive: false,
+                filter: None,
+                dry_run: Some(common::config::DryRunMode::Brief),
+                preserve: common::preserve::preserve_none(),
+            },
+            false,
+        )
+        .await;
+        std::fs::set_permissions(&container, std::fs::Permissions::from_mode(0o700))?;
+        copied.map_err(|e| e.source)?;
+        linked.map_err(|e| e.source)?;
+        assert_eq!(std::fs::read_dir(&container)?.count(), 0);
+    }
     Ok(())
 }
