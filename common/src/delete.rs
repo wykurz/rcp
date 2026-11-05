@@ -21,15 +21,56 @@ pub struct DeleteSettings {
     pub delete_excluded: bool,
 }
 
-/// Complete exact child-name evidence, sealed with the settings that consume it.
+/// Exact selected child names from a successful traversal, sealed with their settings.
 ///
 /// Rlink captures settings when collection starts; copy binds its own settings at completion.
 /// The storage can be ordered names from copy or a hashed set from rlink; pruning requires the
 /// hashed form. Once sealed, the private fields keep those settings and names together.
+/// A successful enumeration can omit concurrently replaced names; candidates still need a live
+/// source lookup before pruning.
 #[derive(Debug)]
 pub(crate) struct DeleteKeepSet<N> {
     settings: DeleteSettings,
     names: N,
+}
+
+/// The held directories whose selected children belong in this destination directory.
+///
+/// Normal rlink updates use the union; exclusive updates use only the update directory.
+#[derive(Clone, Copy)]
+pub(crate) enum DeleteSources<'a> {
+    Single(&'a Arc<Dir>),
+    Union(&'a Arc<Dir>, &'a Arc<Dir>),
+}
+
+impl DeleteSources<'_> {
+    async fn contains_selected(
+        self,
+        name: &std::ffi::OsStr,
+        relative_path: &std::path::Path,
+        filter: Option<&crate::filter::FilterSettings>,
+    ) -> std::io::Result<bool> {
+        let (first, second) = match self {
+            Self::Single(dir) => (dir, None),
+            Self::Union(first, second) => (first, Some(second)),
+        };
+        for dir in std::iter::once(first).chain(second) {
+            let kind = match dir.child_kind(name).await {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if filter.is_none_or(|filter| {
+                matches!(
+                    filter.should_include(relative_path, kind == crate::walk::EntryKind::Dir),
+                    crate::filter::FilterResult::Included
+                )
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl<N> DeleteKeepSet<N> {
@@ -174,9 +215,14 @@ impl LinkChildOutcomes {
 /// entries against `filter` for exclude-protection. Excluded destination entries are protected
 /// (kept) unless the keep-set's `delete_excluded` setting is set. Honors `dry_run` (reports without
 /// removing, via `rm::rm_child`).
+/// Candidates absent from `keep` are checked against `sources` using their current type and the
+/// source filter. A lookup error leaves that candidate untouched and is reported. This narrows
+/// enumeration races; it is not atomic with deletion or a snapshot of a concurrently changing tree.
+#[allow(clippy::too_many_arguments)]
 async fn prune_extraneous<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
+    sources: DeleteSources<'_>,
     relative_dir: &std::path::Path,
     keep: &DeleteKeepSet<std::collections::HashSet<K>>,
     filter: Option<&crate::filter::FilterSettings>,
@@ -202,6 +248,7 @@ where
     prune_entries(
         prog_track,
         dst_dir,
+        sources,
         relative_dir,
         keep,
         filter,
@@ -235,6 +282,7 @@ pub(crate) fn select_scan_dir<'a>(
 pub(crate) async fn prune_and_fold<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
+    sources: DeleteSources<'_>,
     relative_dir: &std::path::Path,
     keep: &DeleteKeepSet<std::collections::HashSet<K>>,
     filter: Option<&crate::filter::FilterSettings>,
@@ -248,6 +296,7 @@ where
     match prune_extraneous(
         prog_track,
         dst_dir,
+        sources,
         relative_dir,
         keep,
         filter,
@@ -275,6 +324,7 @@ where
 async fn prune_entries<K>(
     prog_track: &'static progress::Progress,
     dst_dir: &Arc<Dir>,
+    sources: DeleteSources<'_>,
     relative_dir: &std::path::Path,
     keep: &std::collections::HashSet<K>,
     filter: Option<&crate::filter::FilterSettings>,
@@ -328,6 +378,23 @@ where
                 )
             {
                 tracing::debug!("protecting excluded destination entry {:?}", rel);
+                return Ok(Default::default());
+            }
+            // enumeration can omit a live name (notably after rename replacement on btrfs).
+            // this stat-only snapshot creates no fd or second admission while a destination
+            // classification may be held. dangling source symlinks count as present too
+            if sources
+                .contains_selected(&name, &rel, filter)
+                .await
+                .with_context(|| {
+                    format!("failed checking source counterpart for deletion at {rel:?}")
+                })
+                .map_err(|error| crate::rm::Error::new(error, Default::default()))?
+            {
+                tracing::debug!(
+                    "keeping destination entry with a live source counterpart {:?}",
+                    rel
+                );
                 return Ok(Default::default());
             }
             // Protect excluded descendants when removing an extraneous directory: rm::rm_child
@@ -482,6 +549,7 @@ mod tests {
                 tokio::fs::write(dst.join(child).join("file"), b"abc").await?;
             }
             let dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             if block_parent_removal {
                 tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
             }
@@ -496,6 +564,7 @@ mod tests {
             let result = prune_and_fold(
                 &PROGRESS,
                 &dir,
+                DeleteSources::Single(&source_dir),
                 std::path::Path::new(""),
                 &keep,
                 None,
@@ -549,6 +618,14 @@ mod tests {
         ))
     }
 
+    async fn open_empty_source(dst: &std::path::Path) -> anyhow::Result<Arc<Dir>> {
+        let source = dst.with_extension("source");
+        tokio::fs::create_dir_all(&source).await?;
+        Ok(Arc::new(
+            Dir::open_root_dir(&source, false, congestion::Side::Source).await?,
+        ))
+    }
+
     mod max_files_in_flight_tests {
         use super::*;
 
@@ -562,6 +639,7 @@ mod tests {
             let admission = crate::testutils::AdmissionLimit::new().await;
             admission.set_files_in_flight(1);
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("cache/")?;
             let result = admission
@@ -570,6 +648,7 @@ mod tests {
                     prune_entries(
                         &PROGRESS,
                         &dst_dir,
+                        DeleteSources::Single(&source_dir),
                         std::path::Path::new(""),
                         &HashSet::<OsString>::new(),
                         Some(&filter),
@@ -601,6 +680,7 @@ mod tests {
             let admission = crate::testutils::AdmissionLimit::new().await;
             admission.set_files_in_flight(1);
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -612,6 +692,7 @@ mod tests {
             let prune = prune_entries(
                 &PROGRESS,
                 &dst_dir,
+                DeleteSources::Single(&source_dir),
                 std::path::Path::new(""),
                 &keep,
                 Some(&filter),
@@ -659,6 +740,7 @@ mod tests {
             tokio::fs::write(dst.join("protected"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("protected")?;
             let keep: HashSet<OsString> = HashSet::new();
@@ -671,6 +753,7 @@ mod tests {
             let prune = prune_entries(
                 &PROGRESS,
                 &dst_dir,
+                DeleteSources::Single(&source_dir),
                 std::path::Path::new(""),
                 &keep,
                 Some(&filter),
@@ -716,6 +799,7 @@ mod tests {
             tokio::fs::write(dst.join("after"), b"a").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let filter = crate::filter::FilterSettings::new();
             let mut keep = HashSet::new();
             keep.insert(std::ffi::OsString::from("kept"));
@@ -725,6 +809,7 @@ mod tests {
                     prune_entries(
                         &PROGRESS,
                         &dst_dir,
+                        DeleteSources::Single(&source_dir),
                         std::path::Path::new(""),
                         &keep,
                         Some(&filter),
@@ -770,6 +855,7 @@ mod tests {
             tokio::fs::write(dst.join("after"), b"a").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let filter = crate::filter::FilterSettings::new();
             let mut keep = HashSet::new();
             keep.insert(std::ffi::OsString::from("kept"));
@@ -779,6 +865,7 @@ mod tests {
                     prune_entries(
                         &PROGRESS,
                         &dst_dir,
+                        DeleteSources::Single(&source_dir),
                         std::path::Path::new(""),
                         &keep,
                         Some(&filter),
@@ -829,9 +916,11 @@ mod tests {
         keep.insert(std::ffi::OsString::from("keep.txt"));
 
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             None,
@@ -864,9 +953,11 @@ mod tests {
 
         // default: *.log is protected, data.bin is removed
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
@@ -884,9 +975,11 @@ mod tests {
 
         // with delete_excluded: note.log is also removed
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
@@ -917,9 +1010,11 @@ mod tests {
 
         // default --delete: the excluded descendant is protected, so the dir survives non-empty
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
@@ -937,9 +1032,11 @@ mod tests {
 
         // --delete-excluded: the whole extraneous directory is removed
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
@@ -969,9 +1066,11 @@ mod tests {
         let keep: HashSet<OsString> = HashSet::new();
 
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_extraneous(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
@@ -1010,9 +1109,11 @@ mod tests {
         let keep: HashSet<OsString> = HashSet::new(); // both `cache/` and `unrelated.txt` are extraneous
 
         let dst_dir = open_dst(&dst).await?;
+        let source_dir = open_empty_source(&dst).await?;
         let summary = prune_entries(
             &PROGRESS,
             &dst_dir,
+            DeleteSources::Single(&source_dir),
             std::path::Path::new(""),
             &keep,
             Some(&filter),
@@ -1138,11 +1239,13 @@ mod tests {
             }
             // open the destination O_NOFOLLOW (as the real call sites do) and prune it.
             let dst_dir = open_dst(&dst).await?;
+            let source_dir = open_empty_source(&dst).await?;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 prune_extraneous(
                     &PROGRESS,
                     &dst_dir,
+                    DeleteSources::Single(&source_dir),
                     std::path::Path::new(""),
                     &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
                     None,

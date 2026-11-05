@@ -935,6 +935,25 @@ impl Dir {
             .map(|(_, acls)| acls)
     }
 
+    /// Read a child's current kind without opening it or following symlinks.
+    ///
+    /// This is a snapshot through the held parent, not a handle binding a later action to the
+    /// entry. In particular, a missing name may appear immediately after this lookup.
+    pub(crate) async fn child_kind(&self, name: &OsStr) -> std::io::Result<EntryKind> {
+        if !is_single_component(name) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let dir = self.fd.clone();
+        let side = self.side;
+        let name = name.to_owned();
+        run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            let st = fstatat(dir.as_fd(), name.as_bytes(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map_err(nix_to_io)?;
+            Ok(kind_from_stat(&st))
+        })
+        .await
+    }
+
     /// Open a child entry by name, classifying it without following symlinks.
     ///
     /// Uses `O_PATH|O_NOFOLLOW`, which yields a valid fd even for symlinks. The

@@ -2180,7 +2180,53 @@ async fn link_dir_contents(
                 let dst_parent = dst_dir.map(Arc::clone);
                 let settings = settings.clone();
                 let delete_scan_anchor = copy::DeleteScanAnchor::parent(preview_dir.cloned());
-                let do_copy = move || {
+                let source_for_delete = (settings.copy_settings.delete.is_some()
+                    && !settings.update_exclusive)
+                    .then(|| {
+                        (
+                            Arc::clone(src_dir),
+                            src_root.to_owned(),
+                            update_root.to_owned(),
+                        )
+                    });
+                let do_copy = move || async move {
+                    if let Some((src_parent, src_root, update_root)) = source_for_delete {
+                        // a source name omitted from enumeration is not necessarily update-only.
+                        // joint dispatch preserves source-only descendants of a live directory;
+                        // link_internal performs its own held-handle selection after this snapshot
+                        match src_parent.child_kind(&entry_name).await {
+                            Ok(_) => {
+                                return link_internal(
+                                    prog_track,
+                                    &src_parent,
+                                    Some((&update_parent, entry_name.as_os_str())),
+                                    dst_parent.as_ref(),
+                                    &entry_name,
+                                    &src_root,
+                                    &dst_root,
+                                    Some(&update_root),
+                                    &entry_rel,
+                                    UpdateRootRequirement::Optional,
+                                    &settings,
+                                    is_fresh,
+                                    admission.into(),
+                                    delete_scan_anchor,
+                                )
+                                .await
+                                .map(|result| LinkTaskResult::from_link(entry_name, result));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(Error::new(
+                                    anyhow::Error::new(error).context(format!(
+                                        "failed checking source counterpart for update entry {:?}",
+                                        walk::join_rel(&src_root, &entry_rel)
+                                    )),
+                                    Default::default(),
+                                ));
+                            }
+                        }
+                    }
                     // filter-base for the delegated copy: this update entry's path relative to the
                     // source root, so any --delete pruning inside it matches the include/exclude filter
                     // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
@@ -2197,6 +2243,7 @@ async fn link_dir_contents(
                         is_fresh,
                         admission,
                     )
+                    .await
                 };
                 crate::task_scope::spawn_tracked(&mut join_set, do_copy());
             }
@@ -2229,11 +2276,19 @@ async fn link_dir_contents(
     // names under --update-exclusive; deliberately skipped specials retain their historical
     // protection even though no new entry is materialized.
     let (decision, errors) = outcomes.finish();
+    let delete_sources = match update_dir {
+        Some(update_dir) if settings.update_exclusive => {
+            crate::delete::DeleteSources::Single(update_dir)
+        }
+        Some(update_dir) => crate::delete::DeleteSources::Union(src_dir, update_dir),
+        None => crate::delete::DeleteSources::Single(src_dir),
+    };
     if let Some(keep_set) = decision.into_ready(dst_path)
         && let Some(prune_dir) = crate::delete::select_scan_dir(dst_dir, preview_dir, dst_path)
         && let Err(error) = crate::delete::prune_and_fold(
             prog_track,
             prune_dir,
+            delete_sources,
             rel_path,
             &keep_set,
             settings.filter.as_ref(),
@@ -2510,6 +2565,212 @@ mod link_tests {
                     .map(OsString::from)
                     .collect();
             assert_eq!(set, expected);
+        }
+    }
+
+    mod delete_source_presence_tests {
+        use super::*;
+
+        async fn link_with_omitted_source_names(
+            root: &std::path::Path,
+            settings: &Settings,
+            with_update: bool,
+            update_entries: Vec<(std::ffi::OsString, Option<EntryKind>)>,
+        ) -> anyhow::Result<Summary> {
+            let src = root.join("src");
+            let update = root.join("update");
+            let dst = root.join("dst");
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let update_dir = if with_update {
+                Some(Arc::new(
+                    Dir::open_root_dir(&update, false, congestion::Side::Source).await?,
+                ))
+            } else {
+                None
+            };
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let parent =
+                Arc::new(Dir::open_root_dir(root, false, congestion::Side::Destination).await?);
+            let preview = settings.dry_run.is_some();
+            crate::task_scope::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                update_dir.as_ref(),
+                (!preview).then_some(&dst_dir),
+                (!preview).then_some(&parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                with_update.then_some(update.as_path()),
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                settings,
+                Summary::default(),
+                SourceEntries::Injected(Vec::new()),
+                UpdateEntries::Injected(update_entries),
+                preview.then_some(&dst_dir),
+            ))
+            .await
+            .map_err(|error| error.source)
+        }
+
+        #[tokio::test]
+        async fn delete_preserves_unlisted_names_from_the_selected_trees() -> anyhow::Result<()> {
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            for (with_update, exclusive) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                for preview in [false, true] {
+                    let root = tempfile::tempdir()?;
+                    for name in ["src", "update", "dst"] {
+                        tokio::fs::create_dir(root.path().join(name)).await?;
+                    }
+                    tokio::fs::write(root.path().join("src/source-only"), b"source").await?;
+                    tokio::fs::write(root.path().join("update/update-only"), b"update").await?;
+                    for name in ["source-only", "update-only", "extra"] {
+                        tokio::fs::write(root.path().join("dst").join(name), b"old").await?;
+                    }
+                    let mut settings = common_settings(false, true);
+                    settings.copy_settings.delete = Some(copy::DeleteSettings {
+                        delete_excluded: false,
+                    });
+                    settings.update_exclusive = exclusive;
+                    settings.filter = Some(crate::filter::FilterSettings::new());
+                    settings.copy_settings.filter = settings.filter.clone();
+                    settings.dry_run = preview.then_some(crate::config::DryRunMode::Brief);
+                    settings.copy_settings.dry_run = settings.dry_run;
+                    let summary = limits
+                        .run_with_timeout(
+                            std::time::Duration::from_secs(20),
+                            link_with_omitted_source_names(
+                                root.path(),
+                                &settings,
+                                with_update,
+                                Vec::new(),
+                            ),
+                        )
+                        .await??;
+                    let keep_source = !with_update || !exclusive;
+                    assert_eq!(
+                        root.path().join("dst/source-only").exists(),
+                        preview || keep_source,
+                        "with_update={with_update}, exclusive={exclusive}, preview={preview}"
+                    );
+                    assert_eq!(
+                        root.path().join("dst/update-only").exists(),
+                        preview || with_update
+                    );
+                    assert_eq!(root.path().join("dst/extra").exists(), preview);
+                    assert_eq!(
+                        summary.copy_summary.rm_summary.files_removed,
+                        1 + usize::from(!keep_source) + usize::from(!with_update)
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn delete_filters_unlisted_source_and_update_names_by_their_own_kinds()
+        -> anyhow::Result<()> {
+            for (source_is_dir, update_is_dir, exclusive, kept) in [
+                (false, true, false, true),
+                (false, true, true, false),
+                (true, false, false, true),
+                (true, false, true, true),
+                (true, true, false, false),
+            ] {
+                let root = tempfile::tempdir()?;
+                for (name, is_dir) in [("src", source_is_dir), ("update", update_is_dir)] {
+                    let parent = root.path().join(name);
+                    tokio::fs::create_dir(&parent).await?;
+                    if is_dir {
+                        tokio::fs::create_dir(parent.join("node")).await?;
+                    } else {
+                        tokio::fs::write(parent.join("node"), b"source").await?;
+                    }
+                }
+                tokio::fs::create_dir(root.path().join("dst")).await?;
+                tokio::fs::write(root.path().join("dst/node"), b"old").await?;
+                let mut filter = crate::filter::FilterSettings::new();
+                filter.add_exclude("node/")?;
+                let mut settings = common_settings(false, true);
+                settings.copy_settings.delete = Some(copy::DeleteSettings {
+                    delete_excluded: true,
+                });
+                settings.filter = Some(filter.clone());
+                settings.copy_settings.filter = Some(filter);
+                settings.update_exclusive = exclusive;
+                let summary =
+                    link_with_omitted_source_names(root.path(), &settings, true, Vec::new())
+                        .await?;
+                assert_eq!(
+                    root.path().join("dst/node").exists(),
+                    kept,
+                    "source_dir={source_is_dir}, update_dir={update_is_dir}, exclusive={exclusive}"
+                );
+                assert_eq!(
+                    summary.copy_summary.rm_summary.files_removed,
+                    usize::from(!kept)
+                );
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn delete_merges_an_unlisted_source_directory_with_update() -> anyhow::Result<()> {
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            for exclusive in [false, true] {
+                let root = tempfile::tempdir()?;
+                for name in ["src/node", "update/node", "dst/node"] {
+                    tokio::fs::create_dir_all(root.path().join(name)).await?;
+                }
+                tokio::fs::write(root.path().join("src/node/source-only"), b"source").await?;
+                tokio::fs::write(root.path().join("update/node/update-only"), b"update").await?;
+                tokio::fs::write(root.path().join("dst/node/source-only"), b"old").await?;
+                tokio::fs::write(root.path().join("dst/node/extra"), b"remove").await?;
+                let mut settings = common_settings(false, true);
+                settings.copy_settings.delete = Some(copy::DeleteSettings {
+                    delete_excluded: false,
+                });
+                settings.update_exclusive = exclusive;
+                limits
+                    .run_with_timeout(
+                        std::time::Duration::from_secs(20),
+                        link_with_omitted_source_names(
+                            root.path(),
+                            &settings,
+                            true,
+                            vec![(std::ffi::OsString::from("node"), Some(EntryKind::Dir))],
+                        ),
+                    )
+                    .await??;
+                assert_eq!(
+                    root.path().join("dst/node/source-only").exists(),
+                    !exclusive,
+                    "the source listing omitted node; exclusive={exclusive}"
+                );
+                if !exclusive {
+                    assert_eq!(
+                        tokio::fs::read(root.path().join("dst/node/source-only")).await?,
+                        b"source"
+                    );
+                }
+                assert_eq!(
+                    tokio::fs::read(root.path().join("dst/node/update-only")).await?,
+                    b"update"
+                );
+                assert!(!root.path().join("dst/node/extra").exists());
+            }
+            Ok(())
         }
     }
 
@@ -4323,6 +4584,7 @@ mod link_tests {
             crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_parent,
+                crate::delete::DeleteSources::Single(&src_parent),
                 std::path::Path::new(""),
                 &outcomes.expect_ready(),
                 settings.filter.as_ref(),
@@ -4407,6 +4669,7 @@ mod link_tests {
             crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
+                crate::delete::DeleteSources::Single(&src_dir),
                 std::path::Path::new(""),
                 &outcomes.expect_ready(),
                 settings.filter.as_ref(),
@@ -4553,6 +4816,7 @@ mod link_tests {
             crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
+                crate::delete::DeleteSources::Single(&src_dir),
                 std::path::Path::new(""),
                 &outcomes.expect_ready(),
                 None,
@@ -4639,6 +4903,7 @@ mod link_tests {
             crate::delete::prune_and_fold(
                 &PROGRESS,
                 &dst_dir,
+                crate::delete::DeleteSources::Single(&update_dir),
                 std::path::Path::new(""),
                 &outcomes.expect_ready(),
                 settings.filter.as_ref(),
