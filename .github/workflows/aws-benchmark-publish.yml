@@ -2,14 +2,33 @@ name: Publish retired AWS benchmark history
 
 # publishing is separate from paid execution and remains inert until explicitly enabled
 on:
+  schedule:
+    # candidate reporting cadence; the separate schedule gate defaults closed
+    - cron: '43 9 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Publish retired history or separately approved bounded reader acceptance
+        type: choice
+        options:
+          - publish
+          - reader-test
+        default: publish
+        required: true
+      reader_approval:
+        description: Nonsecret finite reader-test approval JSON; see ACCEPTANCE.md
+        type: string
+        required: false
 
 permissions:
   contents: read
 
+env:
+  PUBLISH_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED }}
+
 jobs:
   download:
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -75,7 +94,7 @@ jobs:
 
   export:
     needs: download
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -143,7 +162,7 @@ jobs:
 
   publish:
     needs: export
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && needs.export.outputs.record_count != '' && needs.export.outputs.record_count != '0'
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && needs.export.outputs.record_count != '' && needs.export.outputs.record_count != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # configure the main-only owner approval gate separately before activation
@@ -261,7 +280,7 @@ jobs:
 
   pages:
     needs: publish
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
+    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
     permissions:
       contents: read
       pages: write
@@ -269,3 +288,41 @@ jobs:
     uses: ./.github/workflows/benchmark-pages.yml
     with:
       aws_history_commit: ${{ needs.publish.outputs.history_commit }}
+
+  reader-test:
+    if: inputs.mode == 'reader-test' && github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && (vars.RCP_AWS_PRODUCTION_ENABLED == '' || vars.RCP_AWS_PRODUCTION_ENABLED == 'false') && (vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == '' || vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'false') && (vars.RCP_AWS_HISTORY_TRUST_READY == '' || vars.RCP_AWS_HISTORY_TRUST_READY == 'false')
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    # no environment: the existing main-ref AWS subject must remain unchanged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned dependencies before requesting a token
+        run: |
+          python3 -m pip install --only-binary=:all: --require-hashes -r infra/aws_benchmark/production-requirements.txt
+      - name: Observe only the exact publication identity and bounded read controls
+        env:
+          RCP_PUBLICATION_MODE: ${{ inputs.mode }}
+          RCP_PUBLICATION_APPROVAL: ${{ inputs.reader_approval }}
+          RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
+          RCP_PUBLISH_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+          RCP_TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          python3 -B -m infra.aws_benchmark.acceptance_publication_workflow > "$RUNNER_TEMP/publication-reader-observation.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: publication-reader-observation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication-reader-observation.json
+          retention-days: 30
+          if-no-files-found: warn

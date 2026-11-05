@@ -1,7 +1,10 @@
 name: AWS production benchmark
 
-# Initially inert. Schedule activation and the production IAM trust are separate approvals.
+# Initially inert. Proposed cadence is not authority: both repository gates and server slots/budgets must be approved.
 on:
+  schedule:
+    # proposed two-slot UTC cadence; no job runs until the separate schedule gate is true
+    - cron: '17 8 * * 2,5'
   workflow_dispatch:
     inputs:
       mode:
@@ -26,29 +29,26 @@ permissions:
 
 jobs:
   validate:
-    if: inputs.mode == 'benchmark' && github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && vars.RCP_AWS_PRODUCTION_ENABLED == 'true'
+    if: github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'benchmark') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       revision: ${{ steps.source.outputs.revision }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - id: source
         env:
-          REVISION: ${{ inputs.revision || github.sha }}
-          REQUESTER_ID: ${{ github.actor_id }}
-        run: |
-          python3 - <<'PY'
-          import os, re
-          # early UI guard only; signed server identity and central policy authorize the cost
-          assert os.environ['REQUESTER_ID'] == '483465', 'Only the repository owner may request acceptance'
-          revision = os.environ['REVISION']
-          assert re.fullmatch(r'[0-9a-f]{40}', revision), 'A full commit SHA is required'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
-              stream.write('revision=' + revision + '\n')
-          PY
+          RCP_MODE: ${{ inputs.mode || 'benchmark' }}
+          RCP_REQUESTED_REVISION: ${{ inputs.revision }}
+          RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
+          RCP_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED }}
+        run: python3 -m infra.aws_benchmark.production_workflow
 
   build:
-    if: inputs.mode == 'benchmark'
+    if: github.event_name == 'schedule' || inputs.mode == 'benchmark'
     needs: validate
     runs-on: ubuntu-24.04
     cache-mode: none
@@ -92,7 +92,7 @@ jobs:
           if-no-files-found: error
 
   submit:
-    if: inputs.mode == 'benchmark'
+    if: github.event_name == 'schedule' || inputs.mode == 'benchmark'
     needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15

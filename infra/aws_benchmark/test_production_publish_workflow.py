@@ -37,10 +37,13 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.jobs = self.workflow["jobs"]
         self.phases = {name: self.jobs[name] for name in ("download", "export", "publish")}
 
-    def test_manual_disabled_main_only_pipeline_has_exact_separated_capabilities(self):
-        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
-        self.assertIn(self.workflow["on"]["workflow_dispatch"], (None, ""))
-        self.assertEqual(set(self.jobs), {"download", "export", "publish", "pages"})
+    def test_manual_or_separately_gated_schedule_keeps_exact_separated_capabilities(self):
+        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "43 9 * * *"}])
+        self.assertEqual(self.workflow["env"], {"PUBLISH_SCHEDULE_ENABLED":
+                         "${{ vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED }}"})
+        self.assertEqual(self.workflow["on"]["workflow_dispatch"]["inputs"]["mode"]["default"], "publish")
+        self.assertEqual(set(self.jobs), {"download", "export", "publish", "pages", "reader-test"})
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         expected = {"download": {"contents": "read", "id-token": "write"},
                     "export": {"contents": "read"}, "publish": {"contents": "read"}}
@@ -55,7 +58,8 @@ class PublicationWorkflowTests(unittest.TestCase):
             for guard in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                           "github.event_name == 'workflow_dispatch'", "github.actor_id == '483465'",
                           "vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'", "github.run_attempt == '1'",
-                          "vars.RCP_AWS_HISTORY_TRUST_READY == 'true'"):
+                          "vars.RCP_AWS_HISTORY_TRUST_READY == 'true'",
+                          "vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true'"):
                 self.assertIn(guard, job["if"])
         self.assertEqual(self.jobs["export"]["needs"], "download")
         self.assertEqual(self.jobs["publish"]["needs"], "export")
@@ -76,6 +80,25 @@ class PublicationWorkflowTests(unittest.TestCase):
                     env = {**trusted_environment(directory), **change}
                     result = subprocess.run(["bash", "-e", "-c", source], cwd=ROOT, env={**env, "PYTHONOPTIMIZE": "1"}, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode == 0, not change)
+
+    def test_real_scheduled_guards_reject_closed_gate_and_foreign_events(self):
+        for name, job in self.phases.items():
+            script = next(step["run"] for step in job["steps"]
+                          if "publication_identity identity" in step.get("run", ""))
+            for flag, event, valid in (("true", "schedule", True), ("false", "schedule", False),
+                                       ("True", "schedule", False), ("true", "push", False)):
+                with self.subTest(job=name, flag=flag, event=event), tempfile.TemporaryDirectory() as directory:
+                    env = trusted_environment(directory) | {"GITHUB_EVENT_NAME": event,
+                                                            "PUBLISH_SCHEDULE_ENABLED": flag}
+                    result = subprocess.run(["bash", "-e", "-c", script], cwd=ROOT, env=env,
+                                            capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+        self.assertEqual(self.phases["publish"]["environment"],
+                         {"name": contract.ENVIRONMENT, "deployment": "false"})
+        reader = self.jobs["reader-test"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", reader["if"])
+        self.assertNotIn("github.event_name == 'schedule'", reader["if"])
+        self.assertNotIn("actions: write", str(self.workflow))
 
     def test_actions_are_immutable_and_controller_checkout_is_always_current_sha(self):
         for job in self.phases.values():

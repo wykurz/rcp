@@ -322,7 +322,8 @@ class WorkflowModeTests(unittest.TestCase):
         values = {"inputs.mode": mode, "github.repository": "wykurz/rcp",
             "github.repository_id": "655073755", "github.ref": "refs/heads/main",
             "github.event_name": "workflow_dispatch", "github.actor_id": "483465",
-            "github.run_attempt": 1, "vars.RCP_AWS_PRODUCTION_ENABLED": enabled}
+            "github.run_attempt": 1, "vars.RCP_AWS_PRODUCTION_ENABLED": enabled,
+            "vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED": "false"}
         values.update(updates)
         selected = set()
         for name, job in self.workflow["jobs"].items():
@@ -370,8 +371,22 @@ class WorkflowModeTests(unittest.TestCase):
                              ("github.event_name", "schedule"), ("github.run_attempt", 2),
                              ("github.repository_id", "1"), ("github.repository", "fork/rcp")):
             self.assertEqual(self.enabled_jobs("identity-test", **{field: value}), set())
-        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
         self.assertEqual(self.workflow["on"]["workflow_dispatch"]["inputs"]["mode"]["default"], "benchmark")
+
+    def test_schedule_dependency_graph_requires_both_gates_and_cannot_run_identity(self):
+        for enabled in ("", "false", "true"):
+            for scheduled in ("", "false", "true"):
+                selected = self.enabled_jobs("", enabled=enabled, **{
+                    "github.event_name": "schedule", "vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED": scheduled})
+                expected = {"validate", "build", "submit"} if enabled == scheduled == "true" else set()
+                self.assertEqual(selected, expected)
+                self.assertNotIn("identity-test", selected)
+        for field, value in (("github.actor_id", "1"), ("github.ref", "refs/heads/debug"),
+                             ("github.repository_id", "1"), ("github.run_attempt", "2")):
+            self.assertEqual(self.enabled_jobs("", enabled="true", **{
+                "github.event_name": "schedule", "vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED": "true",
+                field: value}), set())
 
     def test_identity_job_has_only_pinned_controller_dependencies_probe_and_safe_artifact(self):
         job = self.workflow["jobs"]["identity-test"]

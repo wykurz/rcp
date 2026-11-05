@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 # package only the handler import closure, never arbitrary local Python configuration
 SOURCES = ("infra/aws_benchmark/__init__.py",
            "infra/aws_benchmark/common.py", "infra/aws_benchmark/durable.py",
-           "infra/aws_benchmark/durable_aws.py", "infra/aws_benchmark/ami_image.py",
+           "infra/aws_benchmark/durable_aws.py", "infra/aws_benchmark/guard_observation.py",
+           "infra/aws_benchmark/ami_image.py",
            "benchmarks/__init__.py",
            "benchmarks/verification.py", "benchmarks/signals.py")
 

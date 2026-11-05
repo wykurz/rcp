@@ -160,3 +160,111 @@ loosen trust, add secrets or broaden workflow access just to obtain a positive r
 No-worker acceptance also does not prove independent worker shutdown, ownership retirement,
 production budgets/rate controls, durable publication or the new AMI. Those retain their separate
 disabled-deployment, image, one-run qualification and protected-history/Pages acceptance stages.
+
+## Bounded publication reader observation
+
+The separate `reader-test` mode in `.github/workflows/aws-benchmark-publish.yml` tests the
+publication role. The submission adapters above are not publication acceptance. The workflow
+defaults to `publish`, whose original publication/readiness flags and protected writer environment
+still apply. `reader-test` is manual, owner-only, main-only, first-attempt-only and requires all
+three repository flags (`RCP_AWS_PRODUCTION_ENABLED`, `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and
+`RCP_AWS_HISTORY_TRUST_READY`) to be empty or exactly `false` inside the adapter. A GitHub job
+expression is only an early guard; the Python checks reject case variants before requesting a token.
+The reader job has no dependency on the publishing jobs and no writer environment or App key.
+
+All live reader executions remain **HOLD**. The current `GitHubPublicationRole` trust and read
+statements are `Deny`. A later, separate approval may enable the AWS `PublicationEnabled` reader
+gate while keeping `RuntimeEnabled=false`, `AdmissionEnabled=false` and all three repository flags
+closed. This adapter changes no trust, IAM policy, template, stack, live flag, schedule or fixture.
+Keep the existing native owner/repository/main/workflow conditions intact. Independently capture the
+disabled runtime and admission state, the exact role ID and effective policies before approving a
+reader run; the adapter does not perform administrative state readbacks.
+
+`python3 -B -m infra.aws_benchmark.acceptance_publication_workflow` accepts no arguments, token
+files or operator credentials. The runner supplies the built-in OIDC request capability in memory.
+Its nonsecret `reader_approval` input is strict JSON with schema `rcp-publication-read-approval-v1`;
+`acceptance_publication.FIELDS` and `CALL_PLAN` are authoritative. Every field is mandatory,
+unknown/duplicate fields hold, and the encoded input is limited to 8192 bytes. Bind all of the
+following before dispatch:
+
+- The reviewed full `source_commit`, a new 32-hex `approval_nonce`, integer `not_before` and
+  `expires_at` with a maximum one-hour window and more than 45 seconds remaining, plus the
+  `approval_capture_sha256` of the explicit one-run approval.
+- `role_arn` equal to
+  `arn:aws:iam::381183037896:role/rcp-production-benchmark-GitHubPublicationRole-34PMVuYgLR5R` and
+  immutable `role_id` equal to `AROAVRQCHSHEHGOUK7XQR`.
+- `bucket` equal to `rcp-production-benchmark-artifactbucket-augcame1lsq0`, `table` equal to
+  `rcp-production-benchmark-LeaseTable-137SHCUGC8HHU`, and `manifest_key` equal to
+  `production/runs/repo-655073755-run-41973977673/collection/manifest.json`.
+- `manifest_version` equal to `oXca.tk9xmd6NXHo9uji.RHBM8ru6Bcp`, `manifest_bytes` equal to 3536,
+  and `manifest_sha256` equal to `0e56b863e2b66186875a7155d5c9806f545ac8e49f12f0cb40f25148ee8f8895`.
+- `negative_key` equal to `production/runs/repo-655073755-run-41973977673/durable-receipt.json`, its
+  exact non-null `negative_version`, and `fixture_capture_sha256` of independently reviewed evidence
+  that both this exact object version and the table's `policy` item exist. Revalidate fixture
+  existence for the approved window; historical existence or a syntactically valid capture hash is
+  insufficient. Captures must be nonsecret. This adapter does not create fixtures or read their
+  content to prove existence. Approval/capture hashes are audit bindings, not remote attestation.
+- `call_plan` equal to the complete fixed ordered list in `acceptance_publication.CALL_PLAN`, with
+  no extra operations, attempts, handlers or endpoints.
+
+The nonce correlates the approval with the run; it is **not service-enforced global single use**.
+GitHub assigns the run ID after dispatch, so the approval does not contain a guessed future run ID.
+Before the one approved manual dispatch, the owner must record durable one-shot intent keyed by
+nonce, source, window and call plan. Record the assigned run ID/attempt and reconcile any ambiguous
+dispatch before considering a new approval. Do not redispatch the approval or rerun the job. Job
+concurrency and attempt-1 checks cannot prevent a second dispatch with the same nonce. No
+state-write permission has been added to claim otherwise. The adapter incorporates the assigned run
+ID and attempt into the effective binding digest and requires the authenticated token to match that
+exact run, source, workflow, owner and repository.
+
+The fixed maximum call sequence is:
+
+| Call                            | Fixed target and result                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| One runner OIDC request         | `sts.amazonaws.com`; no admission audience or second token.                                                 |
+| One `AssumeRoleWithWebIdentity` | The exact publication role; 900-second session, fixed inline policy and run-bound session name.             |
+| One `GetCallerIdentity`         | Exact account, assumed-role ARN and immutable role ID, matching the STS response.                           |
+| One positive `GetItem`          | Only `pk` from `run#repo-655073755-run-41973977673`, consistent read from the exact table; item must exist. |
+| One positive `GetObjectVersion` | Exact retained collection manifest version, owner, byte count and SHA256 above.                             |
+| One negative `GetItem`          | Only `pk` from `policy` in the same table; require `AccessDeniedException` / HTTP 400.                      |
+| One negative `GetObjectVersion` | Exact existing durable receipt version; require `AccessDenied` / HTTP 403.                                  |
+
+STS authenticates the token before its decoded claims become identity evidence. Claims must match
+the publication workflow path and display name, main source/workflow SHA, owner/repository IDs,
+actor, event, hosted runner, run ID and attempt. The checkout must be clean and exactly match the
+approved source. A malformed/expired/mismatched local approval holds before any token request or
+service client exists. No local token decoding is presented as independent signature proof.
+
+The inline session policy explicitly denies every action except `dynamodb:GetItem` and
+`s3:GetObjectVersion`, then allows those two actions on `*`. Session policies cannot add identity
+permissions. The two negative resource reads therefore remain eligible in the session policy; their
+observed denials are not manufactured by an inline resource restriction. The observations cover
+effective access under this session, including applicable role/resource/organization policy; they do
+not identify which base policy caused a denial. The explicit deny constrains writes, launches,
+invocations and secret reads, so this lane **does not prove base-policy denials for those actions**.
+It never attempts them. `GetCallerIdentity` requires no grant even under explicit deny, as
+documented in the AWS reference linked above.
+
+These positives cover only the tested `GetItem` and versioned manifest scopes. They do not establish
+the role's separate `ListBucket`, current-version `GetObject`, other collection-file access, or
+durable publication/Pages behavior. The exact ordered negative calls need independently proven
+existing fixtures; missing fixtures, unexpected allows, redirects, transient errors or uncertain
+responses produce HOLD. A failed trust exchange is HOLD, not positive negative-role acceptance. The
+SDK uses fixed regional HTTPS endpoints, no proxy/config/credential fallback, one attempt and guards
+against implicit S3 redirect/`HeadBucket` requests or repeat sends before transport. No anonymous
+retry exists.
+
+The process has a 45-second deadline, with a five-minute outer job timeout. JWTs, credentials,
+fixture bytes and raw service errors never enter the JSON output; only fixed diagnostic stages,
+approved identity/binding hashes and booleans are retained. Unexpected allowed object bodies are
+closed without reading them. Closing clients and dropping references does not erase memory or revoke
+a minted 15-minute STS session. Preserve the sanitized observation and independent journal even
+after timeout/cancellation, and reconcile before any new approval. Every result keeps
+`live_accepted: false`.
+
+A genuine wrong-workflow rejection remains a separate live gate. This lane's early local workflow
+rejection is not AWS trust evidence, and the native `workflow` condition is a display name rather
+than an immutable path. Do not rename a trusted workflow, loosen trust, add a reusable caller or
+broaden another workflow's access to fabricate that proof. The same applies to the other signed
+native-claim negatives and base write/launch/invoke/secret-policy gates. Existing no-worker,
+retirement, qualification, publication and production activation gates remain separate.

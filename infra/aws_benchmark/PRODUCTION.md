@@ -9,12 +9,14 @@ Ordinary build and test workflows are independent.
 
 ## Request boundary
 
-`aws-benchmark-production.yml` is manual-only and inert unless `RCP_AWS_PRODUCTION_ENABLED` is
-`true` on `main`. A source build runs without OIDC credentials; the separate submission job treats
-its binaries as bounded data. It uses reviewed controller code from the triggering main commit and
-never executes the uploaded binaries with cloud credentials. The build creates one artifact reused
-for both A/A sides. Admission checks that each baseline/candidate binary pair has matching size and
-SHA-256 digest. These are executable-artifact hashes, not fixture or copied-content scans.
+`aws-benchmark-production.yml` is inert unless `RCP_AWS_PRODUCTION_ENABLED` is `true` on `main`.
+Owner-requested manual runs and the separately gated proposed schedule share the same submission
+path; a missing `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED` never enables scheduled builds. A source build
+runs without OIDC credentials; the separate submission job treats its binaries as bounded data. It
+uses reviewed controller code from the triggering main commit and never executes the uploaded
+binaries with cloud credentials. The build creates one artifact reused for both A/A sides. Admission
+checks that each baseline/candidate binary pair has matching size and SHA-256 digest. These are
+executable-artifact hashes, not fixture or copied-content scans.
 
 The GitHub role can invoke only the admission function. Admission verifies a second original, signed
 GitHub OIDC token against official keys: exact audience, repository/owner IDs, main ref, workflow
@@ -76,10 +78,17 @@ not release ownership or choose a new token from an empty Describe response or e
 
 The 180-minute allocation envelope starts at the allocation attempt, covering boot, fixture
 generation, copies, validation, packaging and upload. A healthy independent expiry scan must precede
-launch. Immutable deadline tags accompany instance creation, and an exact-instance shutdown schedule
-supplies a second termination path once the ID is known. Guest and GitHub roles cannot change the
-guards, deadlines or termination protection. Control-plane failures and asynchronous termination can
-still exceed the planning allowance; this is not a strict monetary cap.
+launch. Scan freshness remains exactly `0 <= age <= GUARD_GAP_SECONDS` (120 seconds). A future scan
+is never accepted early: at most three consistent reads, with two 0.25-second waits, can observe
+local time catching up. The one-second monotonic retry budget bounds retry scheduling and waits;
+existing SDK timeouts bound each read separately. The clock is sampled after each read and before
+launch. Persistent future, missing or stale scans defer without allocation; malformed, foreign or
+unhealthy proofs fail closed. Sanitized nonfresh observations distinguish clock holds without
+retaining raw guard payloads. No retry refreshes an allocation or producer deadline. Immutable
+deadline tags accompany instance creation, and an exact-instance shutdown schedule supplies a second
+termination path once the ID is known. Guest and GitHub roles cannot change the guards, deadlines or
+termination protection. Control-plane failures and asynchronous termination can still exceed the
+planning allowance; this is not a strict monetary cap.
 
 Disabling policy blocks new launch intents transactionally and makes the watchdog close a readable
 active run. An EC2 call following an already committed intent can still be in flight; DynamoDB and
@@ -166,12 +175,13 @@ processing. The public exporter renders escaped allowlisted fields and never pub
 HTML. Failed qualifications retain diagnostics without performance measurements. Exact source replay
 preserves historical output without today's measurement parser. The history repository is trusted
 prior exporter storage: the retirement digest binds source evidence, not arbitrary edited
-measurement bytes. An embedded checksum would not replace that trust. The manual-only
-`aws-benchmark-publish.yml` workflow separates three jobs: read-only AWS download, credential-free
-export, and a GitHub history writer. Each transfer uses the exact current-run artifact ID and a
-complete inventory digest passed through trusted job outputs. The embedded reader revision is an
-additional binding, not independent authentication. Raw handoff artifacts have one-day retention and
-the repository's normal Actions artifact access; they are never committed to history.
+measurement bytes. An embedded checksum would not replace that trust. The manual and separately
+schedule-gated `aws-benchmark-publish.yml` workflow separates three jobs: read-only AWS download,
+credential-free export, and a GitHub history writer. Each transfer uses the exact current-run
+artifact ID and a complete inventory digest passed through trusted job outputs. The embedded reader
+revision is an additional binding, not independent authentication. Raw handoff artifacts have
+one-day retention and the repository's normal Actions artifact access; they are never committed to
+history.
 
 Discovery is complete within its page/count bounds. Processing uses a 512 MiB aggregate byte budget
 and a ten-minute budget checked between runs, within a fifteen-minute job timeout. Completed subsets
@@ -277,8 +287,9 @@ fences. The service authorization reference and transaction guide disagree about
 `ConditionCheckItem`; offline tests do not replace the no-worker live canary.
 
 All Lambda reserved concurrencies are zero initially; watchdog and collector rules are disabled.
-Admission has a separate gate. There is no recurring benchmark trigger in this change. The
-five-minute collector timer only reconciles existing ownership and never submits work.
+Admission has a separate gate. Recurring trigger declarations remain inert without their separate
+exact-true repository gates and approved server policy. The five-minute collector timer only
+reconciles existing ownership and never submits work.
 
 ## Authenticated GitHub proof reads
 
@@ -591,10 +602,53 @@ References:
    TRUST.md's present-key readback and writer canary. After those live gates pass, separately
    approve the `PublicationEnabled` deployment gate and enable publication/readiness together, with
    canary disabled. Verify the publication-phase readback before the first publication. Pages
-   retains its independent `RCP_BENCHMARK_PAGES` flag. Publication has no recurring trigger in this
-   change. Broader comparisons and a few-times-weekly schedule require their reviewed contracts,
-   operating allowance and activation decisions. Do not call this initial acceptance foundation a
-   complete production cutover.
+   retains its independent `RCP_BENCHMARK_PAGES` flag. The declared recurring paths below remain
+   gated; broader comparisons, operating allowances and actual activation are separate decisions. Do
+   not call this initial acceptance foundation a complete production cutover.
+
+### Disabled recurring orchestration
+
+The proposed benchmark cron is Tuesday and Friday at 08:17 UTC. It does not select approved
+operating slots or authorize spending by being present in YAML. Scheduled builds need both
+`RCP_AWS_PRODUCTION_ENABLED=true` and `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED=true`, owner actor ID
+`483465`, main and attempt 1. The early credential-free CLI rejects other events, actors, refs, runs
+and caller-selected scheduled revisions. A scheduled build uses the triggering main SHA once for
+both A/A sides; it receives no OIDC, environment secret or shared candidate cache. Submission still
+passes the original signed identity, authenticated GitHub run metadata and transactional admission
+checks. No PR, push, fork, comment or `workflow_run` event is a paid trigger.
+
+The server policy is independently required. `scheduled_baseline` accepts either its existing
+40-character approved SHA, or the explicit server-only tagged value `triggering-main-aa`. Existing
+SHA policies retain their old semantics and never follow a changed main. The tagged value means both
+baseline and candidate must equal the signed triggering SHA, with identical binary digests; it is an
+A/A trend series, not A/B coverage. An empty baseline, empty slots, unknown tag, nonowner scheduled
+actor or out-of-slot run rejects admission. This choice introduces no new policy field, implicit
+default or migration of retained payloads. Changing it requires a new reviewed policy version;
+nothing in this workflow writes policy, prices, counters or allowances.
+
+Approve exact UTC server slots, initial/total/monthly reservation limits and a daily run limit
+before activating either gate. Successful collection still does not refund full reservations.
+Preserve the seeded cumulative ledger, slot tombstones and one active owner; do not zero accounting
+for a new month or to make an attempt fit. The development ceiling does not establish an ongoing
+monthly operating allowance. Price evidence still expires after 31 days. No controller or workflow
+gets automatic policy-edit or credential-refresh authority.
+
+The separate publication workflow proposes a daily 09:43 UTC poll. It requires the existing
+publication/readiness flags plus `RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED=true`; its manual
+`reader-test` and the history canary cannot run on a schedule. It downloads only retired evidence,
+never launches work, and keeps the same current-main, exact artifact/inventory, exact-tip lease and
+protected writer environment checks. The owner approval requirement stays in place: this code does
+not make history publishing unattended or change any environment, App, secret or ruleset. Empty
+batches do not request a writer token or owner approval. A batch with new records can wait for the
+owner, and its one-day handoff retention still applies. Fully unattended publication requires an
+explicit later protection-policy decision, not merely setting a repository flag.
+
+A scheduled submission job can finish many hours before the cloud collector retires ownership. The
+daily reporting scan revisits retained runs rather than treating the submit job conclusion as
+workload completion. Runtime/watchdog/collector recovery remains independent of desktop sessions;
+local operator restart, an assumed provider expiry or another dispatch cannot replace missing
+retirement proof. Both repository schedule gates are absent/off by default. This PR dispatches
+nothing, grants no live permission and does not initialize or alter the current closed ledger.
 
 ### Manual identity-only workflow acceptance
 

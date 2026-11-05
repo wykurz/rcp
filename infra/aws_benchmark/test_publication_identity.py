@@ -38,6 +38,27 @@ class PublicationIdentityTests(unittest.TestCase):
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     identity.check_identity({**environment(), key: value}, flags=True)
 
+    def test_scheduled_publication_needs_its_own_gate_and_never_applies_to_canary(self):
+        scheduled = environment() | {"GITHUB_EVENT_NAME": "schedule"}
+        for flag in ("", "false", "True", "1"):
+            with self.subTest(flag=flag), self.assertRaises(ValueError):
+                identity.check_identity(scheduled | {"PUBLISH_SCHEDULE_ENABLED": flag}, flags=True)
+        self.assertEqual(identity.check_identity(scheduled | {"PUBLISH_SCHEDULE_ENABLED": "true"}, flags=True), SHA)
+        for field in ("PUBLICATION_ENABLED", "TRUST_READY"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                identity.check_identity(scheduled | {"PUBLISH_SCHEDULE_ENABLED": "true", field: "false"}, flags=True)
+        with self.assertRaises(ValueError):
+            identity.check_identity(environment(CANARY_WORKFLOW) |
+                {"GITHUB_EVENT_NAME": "schedule", "PUBLISH_SCHEDULE_ENABLED": "true"}, workflow=CANARY_WORKFLOW)
+
+    def test_scheduled_identity_cli_is_gated_even_under_optimization(self):
+        for flag, valid in (("false", False), ("true", True)):
+            env = {**os.environ, **environment(), "GITHUB_EVENT_NAME": "schedule",
+                   "PUBLISH_SCHEDULE_ENABLED": flag, "PYTHONOPTIMIZE": "2"}
+            result = subprocess.run([sys.executable, "-m", "infra.aws_benchmark.publication_identity",
+                                     "identity", "--flags"], cwd=ROOT, env=env, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode == 0, valid, result.stderr)
+
     def test_main_requires_one_exact_successful_ref_and_no_token_for_read(self):
         good = SHA + "\trefs/heads/main\n"
         for status, raw in ((0, good), (0, good + "b" * 40 + "\trefs/heads/x/refs/heads/main\n"), (0, "b" * 40 + "\trefs/heads/main\n"), (0, good + good),

@@ -1,0 +1,59 @@
+"""Credential-free early workflow guard; server admission remains authoritative.
+
+No prices, budgets or schedule slots are accepted from workflow inputs. Selected
+source builds never receive OIDC or service credentials. A scheduled run always
+builds the signed triggering main revision once for both A/A sides.
+"""
+
+import os
+from pathlib import Path
+import re
+
+from .common import require
+
+OWNER = "483465"
+REPOSITORY = "wykurz/rcp"
+REPOSITORY_ID = "655073755"
+WORKFLOW = "wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads/main"
+
+
+def source(environment):
+    require(environment.get("GITHUB_REPOSITORY") == REPOSITORY
+            and environment.get("GITHUB_REPOSITORY_ID") == REPOSITORY_ID
+            and environment.get("GITHUB_REF") == "refs/heads/main"
+            and environment.get("GITHUB_WORKFLOW_REF") == WORKFLOW
+            and environment.get("GITHUB_ACTOR_ID") == OWNER
+            and environment.get("GITHUB_RUN_ATTEMPT") == "1",
+            "only the owner may request the current main benchmark workflow")
+    require(environment.get("RCP_PRODUCTION_ENABLED") == "true", "production workflow is disabled")
+    require(environment.get("RCP_MODE") == "benchmark", "not a benchmark request")
+    current = environment.get("GITHUB_SHA", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", current)
+            and environment.get("GITHUB_WORKFLOW_SHA") == current,
+            "triggering source and controller SHA differ")
+    requested = environment.get("RCP_REQUESTED_REVISION", "")
+    if environment.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        revision = requested or current
+    elif environment.get("GITHUB_EVENT_NAME") == "schedule":
+        require(environment.get("RCP_SCHEDULE_ENABLED") == "true", "scheduled admission is disabled")
+        require(requested == "", "scheduled requests cannot select another revision")
+        revision = current
+    else:
+        raise ValueError("only owner manual and approved scheduled requests are supported")
+    require(re.fullmatch(r"[0-9a-f]{40}", revision), "a full source SHA is required")
+    return revision
+
+
+def main():
+    revision = source(os.environ)
+    destination = os.environ.get("GITHUB_OUTPUT", "")
+    require(destination != "", "workflow output destination is missing")
+    with Path(destination).open("a", encoding="utf-8") as stream:
+        stream.write("revision=" + revision + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        raise SystemExit("Benchmark request rejected (" + type(error).__name__ + ").") from None

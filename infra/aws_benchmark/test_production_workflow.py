@@ -13,27 +13,42 @@ class ProductionWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = yaml.load((ROOT / ".github/workflows/aws-benchmark-production.yml").read_text(), Loader=yaml.BaseLoader)
 
-    def test_initial_workflow_has_only_manual_trigger_and_disabled_variable_gate(self):
-        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
+    def test_only_owner_manual_or_explicitly_enabled_schedule_can_build(self):
+        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "17 8 * * 2,5"}])
         guard = self.workflow["jobs"]["validate"]["if"]
         for check in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
-                      "github.event_name == 'workflow_dispatch'", "vars.RCP_AWS_PRODUCTION_ENABLED == 'true'"):
+                      "github.event_name == 'workflow_dispatch'", "vars.RCP_AWS_PRODUCTION_ENABLED == 'true'",
+                      "vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED == 'true'", "github.actor_id == '483465'",
+                      "github.run_attempt == '1'"):
             self.assertIn(check, guard)
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
 
     def test_real_early_guard_rejects_other_requesters_and_unpinned_sources(self):
-        source = self.workflow["jobs"]["validate"]["steps"][0]["run"]
+        from .test_production_workflow_request import environment
+        step = next(step for step in self.workflow["jobs"]["validate"]["steps"] if step.get("id") == "source")
         for actor, revision, valid in (("483465", "a" * 40, True), ("1", "a" * 40, False),
                                        ("483465", "main", False), ("483465", "a" * 39, False)):
             with self.subTest(actor=actor, revision=revision), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "output"
-                env = dict(os.environ, REQUESTER_ID=actor, REVISION=revision, GITHUB_OUTPUT=str(output))
-                result = subprocess.run(["bash", "-e", "-c", source], env=env, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode == 0, valid)
+                env = dict(os.environ, **environment(GITHUB_ACTOR_ID=actor, RCP_REQUESTED_REVISION=revision),
+                           GITHUB_OUTPUT=str(output))
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env,
+                                        cwd=ROOT, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
                 if valid:
                     self.assertEqual(output.read_text(), "revision=" + revision + "\n")
                 else:
                     self.assertFalse(output.exists())
+
+    def test_schedule_has_no_privileged_dispatch_or_unreviewed_credentials(self):
+        validate = self.workflow["jobs"]["validate"]
+        self.assertEqual(validate["steps"][0]["with"]["ref"], "${{ github.sha }}")
+        self.assertNotIn("actions: write", str(self.workflow))
+        for job in ("build", "submit"):
+            self.assertIn("github.event_name == 'schedule'", self.workflow["jobs"][job]["if"])
+        self.assertEqual(self.workflow["jobs"]["build"]["needs"], "validate")
+        self.assertNotIn("environment", validate)
 
     def test_candidate_builds_without_cloud_credentials_or_shared_cache(self):
         job = self.workflow["jobs"]["build"]
