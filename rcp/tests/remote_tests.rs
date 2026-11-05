@@ -542,6 +542,29 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     output
 }
 
+fn run_rcp_and_capture_daemon_logs(args: &[&str]) -> (std::process::Output, String) {
+    // synchronous daemon files remain available when forwarded tracing is dropped
+    let logs = tempfile::tempdir().unwrap();
+    let log_arg = format!(
+        "--rcpd-debug-log-prefix={}",
+        logs.path().join("rcpd").display()
+    );
+    let mut with_logs = vec![log_arg.as_str()];
+    with_logs.extend_from_slice(args);
+    let output = run_rcp_and_expect_success(&with_logs);
+    let mut contents = String::new();
+    for entry in std::fs::read_dir(logs.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let content = std::fs::read_to_string(&path).unwrap();
+        contents.push_str(&format!("{}:\n{content}\n", path.display()));
+    }
+    assert!(
+        rcpd_role_hellos_received(logs.path()),
+        "both daemon logs must be present before checking their contents: {contents}"
+    );
+    (output, contents)
+}
+
 fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
@@ -7758,19 +7781,14 @@ fn remote_capacity_one_manifests_and_rejected_subtree_complete() {
             if dereference {
                 args.insert(0, "-L");
             }
-            let output = run_rcp_and_expect_success(&args);
+            let (output, logs) = run_rcp_and_capture_daemon_logs(&args);
             let summary = parse_summary_from_output(&output).unwrap();
             assert_eq!(summary.files_copied, 6);
             assert_eq!(summary.files_unchanged, 6);
             assert_eq!(summary.bytes_copied, 18);
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
             assert!(
-                combined.contains("skipping transfer (manifest)"),
-                "source manifest skips must execute: {combined}"
+                logs.contains("skipping transfer (manifest)"),
+                "source manifest skips must execute in the daemon logs: {logs}"
             );
             let mut relative = std::path::PathBuf::new();
             for _ in 0..6 {
@@ -8662,18 +8680,15 @@ fn test_remote_overwrite_skips_identical_files_in_directory() {
     }
     let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
-    let output =
-        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let (output, logs) =
+        run_rcp_and_capture_daemon_logs(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0, "no file should be copied");
     assert_eq!(summary.files_unchanged, 3, "all 3 files unchanged");
     assert_eq!(summary.bytes_copied, 0, "no bytes written");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("skipping transfer (manifest)"),
-        "source-skip marker should appear (proving data was not sent), got:\n{combined}"
+        logs.contains("skipping transfer (manifest)"),
+        "source-skip marker should appear (proving data was not sent) in the daemon logs: {logs}"
     );
 }
 
@@ -8762,8 +8777,12 @@ fn test_remote_ignore_existing_skips_colliding_files_in_directory() {
     create_test_file(&src_sub.join("fresh.txt"), "fresh", 0o644);
     let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
-    let output =
-        run_rcp_and_expect_success(&["--ignore-existing", "--summary", &src_remote, &dst_remote]);
+    let (output, logs) = run_rcp_and_capture_daemon_logs(&[
+        "--ignore-existing",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
     assert_eq!(
         get_file_content(&dst_sub.join("keep.txt")),
         "destination version"
@@ -8772,12 +8791,9 @@ fn test_remote_ignore_existing_skips_colliding_files_in_directory() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_unchanged, 1);
     assert_eq!(summary.files_copied, 1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("skipping transfer (manifest)"),
-        "source-skip marker should appear for the colliding file, got:\n{combined}"
+        logs.contains("skipping transfer (manifest)"),
+        "source-skip marker should appear for the colliding file in the daemon logs: {logs}"
     );
 }
 
@@ -8830,7 +8846,7 @@ fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
     }
     let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
-    let output = run_rcp_and_expect_success(&[
+    let (output, logs) = run_rcp_and_capture_daemon_logs(&[
         "--overwrite",
         "--overwrite-manifest-max-entries=1",
         "--max-connections=1",
@@ -8843,12 +8859,9 @@ fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
     // still correct: identical files are unchanged (destination drains them), no bytes written
     assert_eq!(summary.files_unchanged, 2);
     assert_eq!(summary.bytes_copied, 0);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
     assert!(
-        !combined.contains("skipping transfer (manifest)"),
-        "above the cap the manifest is omitted, so the source must NOT skip-by-manifest"
+        !logs.contains("skipping transfer (manifest)"),
+        "above the cap the manifest is omitted, so the source must NOT skip-by-manifest: {logs}"
     );
 }
 
@@ -8874,20 +8887,17 @@ fn test_remote_overwrite_nested_mixed_fresh_and_reused_dirs() {
     create_test_file(&src_sub.join("fresh/g.txt"), "new file", 0o644);
     let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
-    let output =
-        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let (output, logs) =
+        run_rcp_and_capture_daemon_logs(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     // reused/f.txt skipped (manifest), fresh/g.txt copied into the freshly-created subdir
     assert_eq!(summary.files_unchanged, 1, "reused/f.txt unchanged");
     assert_eq!(summary.files_copied, 1, "fresh/g.txt copied");
     assert_eq!(get_file_content(&dst_sub.join("reused/f.txt")), "shared");
     assert_eq!(get_file_content(&dst_sub.join("fresh/g.txt")), "new file");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("skipping transfer (manifest)"),
-        "the reused subdir's identical file should be skipped via the manifest, got:\n{combined}"
+        logs.contains("skipping transfer (manifest)"),
+        "the reused subdir's identical file should be skipped via the manifest in the daemon logs: {logs}"
     );
 }
 
@@ -8938,7 +8948,7 @@ fn test_remote_overwrite_filter_newer_in_directory() {
     .unwrap();
     let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
-    let output = run_rcp_and_expect_success(&[
+    let (output, logs) = run_rcp_and_capture_daemon_logs(&[
         "--overwrite",
         "--overwrite-filter=newer",
         "--summary",
@@ -8957,12 +8967,9 @@ fn test_remote_overwrite_filter_newer_in_directory() {
         get_file_content(&dst_sub.join("update_dest.txt")),
         "fresh source bytes"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("skipping transfer (manifest)"),
-        "the dest-newer file should be skipped via the manifest, got:\n{combined}"
+        logs.contains("skipping transfer (manifest)"),
+        "the dest-newer file should be skipped via the manifest in the daemon logs: {logs}"
     );
 }
 
