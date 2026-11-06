@@ -182,7 +182,7 @@ reader run; the adapter does not perform administrative state readbacks.
 
 `python3 -B -m infra.aws_benchmark.acceptance_publication_workflow` accepts no arguments, token
 files or operator credentials. The runner supplies the built-in OIDC request capability in memory.
-Its nonsecret `reader_approval` input is strict JSON with schema `rcp-publication-read-approval-v1`;
+Its nonsecret `reader_approval` input is strict JSON with schema `rcp-publication-read-approval-v2`;
 `acceptance_publication.FIELDS` and `CALL_PLAN` are authoritative. Every field is mandatory,
 unknown/duplicate fields hold, and the encoded input is limited to 8192 bytes. Bind all of the
 following before dispatch:
@@ -194,8 +194,9 @@ following before dispatch:
   `arn:aws:iam::381183037896:role/rcp-production-benchmark-GitHubPublicationRole-34PMVuYgLR5R` and
   immutable `role_id` equal to `AROAVRQCHSHEHGOUK7XQR`.
 - `bucket` equal to `rcp-production-benchmark-artifactbucket-augcame1lsq0`, `table` equal to
-  `rcp-production-benchmark-LeaseTable-137SHCUGC8HHU`, and `manifest_key` equal to
-  `production/runs/repo-655073755-run-41973977673/collection/manifest.json`.
+  `rcp-production-benchmark-LeaseTable-137SHCUGC8HHU`, `table_key_arn` equal to
+  `arn:aws:kms:us-east-1:381183037896:key/fda6ab01-08d2-49d9-9866-f75012f06ed6`, and `manifest_key`
+  equal to `production/runs/repo-655073755-run-41973977673/collection/manifest.json`.
 - `manifest_version` equal to `oXca.tk9xmd6NXHo9uji.RHBM8ru6Bcp`, `manifest_bytes` equal to 3536,
   and `manifest_sha256` equal to `0e56b863e2b66186875a7155d5c9806f545ac8e49f12f0cb40f25148ee8f8895`.
 - `negative_key` equal to `production/runs/repo-655073755-run-41973977673/durable-receipt.json`, its
@@ -235,15 +236,53 @@ actor, event, hosted runner, run ID and attempt. The checkout must be clean and 
 approved source. A malformed/expired/mismatched local approval holds before any token request or
 service client exists. No local token decoding is presented as independent signature proof.
 
-The inline session policy explicitly denies every action except `dynamodb:GetItem` and
-`s3:GetObjectVersion`, then allows those two actions on `*`. Session policies cannot add identity
-permissions. The two negative resource reads therefore remain eligible in the session policy; their
-observed denials are not manufactured by an inline resource restriction. The observations cover
-effective access under this session, including applicable role/resource/organization policy; they do
-not identify which base policy caused a denial. The explicit deny constrains writes, launches,
-invocations and secret reads, so this lane **does not prove base-policy denials for those actions**.
-It never attempts them. `GetCallerIdentity` requires no grant even under explicit deny, as
-documented in the AWS reference linked above.
+The inline session policy leaves `dynamodb:GetItem` and `s3:GetObjectVersion` eligible on `*`. The
+two negative resource reads therefore remain eligible in this session policy; their observed denials
+are not manufactured by an inline resource restriction. The observations cover effective access
+under this session, including applicable role/resource/organization policy; they do not identify
+which base policy caused a denial. Session policies do not independently grant access.
+
+The table uses an AWS-managed DynamoDB KMS key. A blanket session deny of KMS actions also denies
+DynamoDB's delegated decryption, preventing an otherwise eligible `GetItem`. The v2 session adds
+only `kms:Decrypt` on the exact `table_key_arn`, with all four exact conditions:
+
+- `kms:ViaService`: `dynamodb.us-east-1.amazonaws.com`.
+- `kms:CallerAccount`: `381183037896`.
+- `kms:EncryptionContext:aws:dynamodb:tableName`:
+  `rcp-production-benchmark-LeaseTable-137SHCUGC8HHU`.
+- `kms:EncryptionContext:aws:dynamodb:subscriberId`: `381183037896`.
+
+An explicit deny covers every other key. Four separate `StringNotEqualsIfExists` deny statements
+reject each absent or mismatched condition, including direct KMS calls without `kms:ViaService`.
+Combining those mismatches in one statement would AND them and leave single-condition failures
+without that explicit deny. The compact session policy must remain within STS's 2048-character
+plaintext limit; STS packed-policy limits may still reject it and must produce HOLD without retry.
+The SDK factory still rejects KMS clients and makes no direct KMS API calls. DynamoDB can make
+additional service-side KMS calls, so the fixed client call sequence is not a total service-call
+cap. Table encryption context does not authorize particular items; native DynamoDB item restrictions
+remain necessary. Table-key caching also means a successful read does not prove a fresh KMS call.
+
+Before any new live approval, independently revalidate the exact table's enabled encryption/key
+binding, the AWS-managed key's service/account delegation and effective role policies, alongside the
+existing state and fixture checks. Record the readbacks in the nonsecret fixture capture. A changed
+key, table, region or account needs reviewed bindings and a fresh approval, not a caller policy
+override. v1 approvals are rejected before requesting a token. Successful v2 observations include
+the exact key ARN and SHA256 of the serialized session policy; the effective binding digest also
+covers the mandatory key binding. Neither these hashes nor offline policy tests are live KMS
+authorization evidence. This correction changes no role/key/table policy or encryption setting.
+
+The explicit deny still constrains writes, launches, invocations, secret reads and every other KMS
+action. This lane **does not prove base-policy denials for those actions** and never attempts them.
+`GetCallerIdentity` requires no grant even under explicit deny, as documented in the AWS reference
+linked above. Direct/wrong-context KMS denials also remain unproven live; this adapter must not
+broaden its call plan to test them.
+
+References:
+[DynamoDB encryption context and delegated decryption](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html),
+[KMS conditions](https://docs.aws.amazon.com/kms/latest/developerguide/conditions-kms.html),
+[negated IfExists in Deny statements](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html#Conditions_IfExists),
+and
+[STS session policy limits](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html).
 
 These positives cover only the tested `GetItem` and versioned manifest scopes. They do not establish
 the role's separate `ListBucket`, current-version `GetObject`, other collection-file access, or

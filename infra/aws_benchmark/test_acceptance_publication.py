@@ -32,7 +32,7 @@ SIGNER = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 def approval(**updates):
     value = dict(schema=probe.SCHEMA, source_commit=SHA, approval_nonce="d" * 32,
-        role_arn=probe.ROLE, role_id=probe.ROLE_ID, bucket=probe.BUCKET, table=probe.TABLE,
+        role_arn=probe.ROLE, role_id=probe.ROLE_ID, bucket=probe.BUCKET, table=probe.TABLE, table_key_arn=probe.TABLE_KEY_ARN,
         manifest_key=probe.MANIFEST, manifest_version=probe.VERSION, manifest_bytes=probe.MANIFEST_BYTES,
         manifest_sha256=probe.MANIFEST_SHA256, negative_key=probe.FORBIDDEN, negative_version="TEST-ONLY-version",
         fixture_capture_sha256="e" * 64, not_before=NOW - 10, expires_at=NOW + 300,
@@ -112,6 +112,8 @@ class PublicationProbeTests(unittest.TestCase):
         self.assertFalse(result["live_accepted"])
         self.assertEqual(result["diagnostics"], {"stage": "complete"})
         self.assertEqual(result["run_id"], "10001")
+        self.assertEqual(result["table_key_arn"], probe.TABLE_KEY_ARN)
+        self.assertEqual(result["session_policy_sha256"], hashlib.sha256(probe.SESSION_POLICY.encode("ascii")).hexdigest())
         self.reader.assert_called_once_with()
         self.unsigned.assume_role_with_web_identity.assert_called_once_with(RoleArn=probe.ROLE,
             RoleSessionName=self.name, WebIdentityToken=token(), DurationSeconds=900, Policy=probe.SESSION_POLICY)
@@ -138,12 +140,27 @@ class PublicationProbeTests(unittest.TestCase):
         changes += [dict(not_before=NOW + 1), dict(expires_at=NOW + probe.SECONDS),
             dict(expires_at=NOW + 3601), dict(not_before=True), dict(manifest_bytes=True),
             dict(call_plan=probe.CALL_PLAN + ["lambda:InvokeFunction"]), dict(extra="unknown"),
-            dict(negative_version="null"), dict(negative_version="bad?"), dict(negative_version="x" * 1025)]
+            dict(schema="rcp-publication-read-approval-v1"), dict(negative_version="null"), dict(negative_version="bad?"), dict(negative_version="x" * 1025)]
         for change in changes:
             with self.subTest(change=change):
                 self.assert_hold(self.run_probe({**bindings(), **change}), "configuration")
         self.reader.assert_not_called()
         self.factory.assert_not_called()
+
+    def test_missing_key_binding_rejects_both_approval_versions_before_credentials(self):
+        for schema in (probe.SCHEMA, "rcp-publication-read-approval-v1"):
+            with self.subTest(schema=schema):
+                config = bindings(schema=schema)
+                del config["table_key_arn"]
+                self.assert_hold(self.run_probe(config), "configuration")
+        self.reader.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_direct_kms_client_is_rejected_before_sdk_or_credential_construction(self):
+        with patch("botocore.session.Session", side_effect=AssertionError("must not construct SDK")) as sdk:
+            with self.assertRaises(Exception):
+                probe.sdk_client("kms", credentials=self.credentials)
+            sdk.assert_not_called()
 
     def test_sts_denial_transient_or_malformed_result_holds_without_signed_calls(self):
         for failure in (error("AccessDenied", 403), error("ServiceUnavailable", 503), ValueError(SECRET)):
@@ -246,7 +263,7 @@ class PublicationProbeTests(unittest.TestCase):
     def test_inline_policy_does_not_synthesize_tested_resource_denials(self):
         policy = json.loads(probe.SESSION_POLICY)
         reads = ["dynamodb:GetItem", "s3:GetObjectVersion"]
-        self.assertEqual(policy["Statement"], [dict(Effect="Deny", NotAction=reads, Resource="*"),
+        self.assertEqual(policy["Statement"][:2], [dict(Effect="Deny", NotAction=reads + ["kms:Decrypt"], Resource="*"),
             dict(Effect="Allow", Action=reads, Resource="*")])
         self.assertIn("base-policy-write-launch-invoke-and-secret-denials", probe.UNPROVEN)
 

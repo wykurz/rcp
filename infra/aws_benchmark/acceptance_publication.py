@@ -1,9 +1,10 @@
 """Bounded publication-role read observation; never publish or invoke a handler.
 
 STS authenticates the single token before any claims are decoded as evidence.
-The inline policy denies every action except the two tested read actions, and
-allows those actions on all resources. It therefore cannot manufacture the
-same-action negative resource denials. It does not prove base write/launch denial.
+The inline policy leaves the two tested read actions eligible on all resources,
+so it cannot manufacture their same-action negative resource denials. It permits
+only exact-table DynamoDB-mediated KMS decryption and denies other actions. It
+does not prove base write/launch denial or live KMS negative cases.
 All token, credential and returned fixture bytes remain in memory.
 """
 
@@ -21,8 +22,8 @@ import urllib.parse
 from . import acceptance_oidc as oidc
 from .acceptance_cases import require
 
-SCHEMA = "rcp-publication-read-approval-v1"
-OBSERVATION = "rcp-publication-read-observation-v1"
+SCHEMA = "rcp-publication-read-approval-v2"
+OBSERVATION = "rcp-publication-read-observation-v2"
 SECONDS = 45
 ACCOUNT = "381183037896"
 REGION = "us-east-1"
@@ -32,6 +33,7 @@ ROLE = "arn:aws:iam::381183037896:role/rcp-production-benchmark-GitHubPublicatio
 ROLE_ID = "AROAVRQCHSHEHGOUK7XQR"
 BUCKET = "rcp-production-benchmark-artifactbucket-augcame1lsq0"
 TABLE = "rcp-production-benchmark-LeaseTable-137SHCUGC8HHU"
+TABLE_KEY_ARN = "arn:aws:kms:us-east-1:381183037896:key/fda6ab01-08d2-49d9-9866-f75012f06ed6"
 RUN = "repo-655073755-run-41973977673"
 MANIFEST = "production/runs/" + RUN + "/collection/manifest.json"
 VERSION = "oXca.tk9xmd6NXHo9uji.RHBM8ru6Bcp"
@@ -43,16 +45,31 @@ CALL_PLAN = ["github:oidc:sts.amazonaws.com", "sts:AssumeRoleWithWebIdentity:900
              "sts:GetCallerIdentity", "dynamodb:GetItem:run:pk-only",
              "s3:GetObjectVersion:collection-manifest", "dynamodb:GetItem:policy:pk-only:AccessDeniedException",
              "s3:GetObjectVersion:durable-receipt:AccessDenied"]
-FIELDS = {"schema", "source_commit", "approval_nonce", "role_arn", "role_id", "bucket", "table",
+FIELDS = {"schema", "source_commit", "approval_nonce", "role_arn", "role_id", "bucket", "table", "table_key_arn",
           "manifest_key", "manifest_version", "manifest_bytes", "manifest_sha256",
           "negative_key", "negative_version", "fixture_capture_sha256", "not_before", "expires_at",
           "approval_capture_sha256", "call_plan"}
+# These single-valued conditions bind service delegation, not individual DynamoDB items.
+# Each mismatch needs its own deny: different condition keys in one statement are ANDed.
+KMS_CONTEXT = {
+    "kms:ViaService": "dynamodb." + REGION + ".amazonaws.com",
+    "kms:CallerAccount": ACCOUNT,
+    "kms:EncryptionContext:aws:dynamodb:tableName": TABLE,
+    "kms:EncryptionContext:aws:dynamodb:subscriberId": ACCOUNT,
+}
 SESSION_POLICY = json.dumps({"Version": "2012-10-17", "Statement": [
-    {"Effect": "Deny", "NotAction": ["dynamodb:GetItem", "s3:GetObjectVersion"], "Resource": "*"},
-    {"Effect": "Allow", "Action": ["dynamodb:GetItem", "s3:GetObjectVersion"], "Resource": "*"}]},
+    {"Effect": "Deny", "NotAction": ["dynamodb:GetItem", "s3:GetObjectVersion", "kms:Decrypt"], "Resource": "*"},
+    {"Effect": "Allow", "Action": ["dynamodb:GetItem", "s3:GetObjectVersion"], "Resource": "*"},
+    {"Effect": "Allow", "Action": "kms:Decrypt", "Resource": TABLE_KEY_ARN,
+        "Condition": {"StringEquals": KMS_CONTEXT}},
+    {"Effect": "Deny", "Action": "kms:Decrypt", "NotResource": TABLE_KEY_ARN},
+    *[{"Effect": "Deny", "Action": "kms:Decrypt", "Resource": "*",
+        "Condition": {"StringNotEqualsIfExists": {key: value}}} for key, value in KMS_CONTEXT.items()]]},
     separators=(",", ":"))
+SESSION_POLICY_SHA256 = hashlib.sha256(SESSION_POLICY.encode("ascii")).hexdigest()
 UNPROVEN = ["signed-wrong-workflow-and-other-native-trust-negatives", "other-publication-read-scopes",
-            "base-policy-write-launch-invoke-and-secret-denials", "durable-publication", "whole-system-acceptance"]
+            "base-policy-write-launch-invoke-and-secret-denials", "live-kms-direct-and-context-denials",
+            "durable-publication", "whole-system-acceptance"]
 
 
 class Stage(Enum):
@@ -90,7 +107,7 @@ def timestamp(clock):
 def validate_approval(value):
     """Validate exact nonsecret bindings; capture hashes do not authenticate external evidence."""
     require(type(value) is dict and set(value) == FIELDS)
-    fixed = dict(schema=SCHEMA, role_arn=ROLE, role_id=ROLE_ID, bucket=BUCKET, table=TABLE,
+    fixed = dict(schema=SCHEMA, role_arn=ROLE, role_id=ROLE_ID, bucket=BUCKET, table=TABLE, table_key_arn=TABLE_KEY_ARN,
         manifest_key=MANIFEST, manifest_version=VERSION, manifest_bytes=MANIFEST_BYTES,
         manifest_sha256=MANIFEST_SHA256, negative_key=FORBIDDEN, call_plan=CALL_PLAN)
     require(all(value.get(key) == expected for key, expected in fixed.items()))
@@ -274,7 +291,8 @@ def run_probe(approval, token_reader, *, factory=sdk_client, clock=time.time,
         return dict(schema=OBSERVATION, ok=True, live_accepted=False, unproven=list(UNPROVEN),
             diagnostics={"stage": progress.stage.value}, bindings_sha256=binding,
             source_commit=approval["source_commit"], run_id=approval["run_id"], run_attempt="1",
-            role_arn=ROLE, role_id=ROLE_ID, fixture_capture_sha256=approval["fixture_capture_sha256"],
+            role_arn=ROLE, role_id=ROLE_ID, table_key_arn=TABLE_KEY_ARN,
+            session_policy_sha256=SESSION_POLICY_SHA256, fixture_capture_sha256=approval["fixture_capture_sha256"],
             cases={"sts_same_run_main_publication": True, "exact_role_identity": True,
                 "retained_run_pk_read": True, "versioned_collection_manifest_read": True,
                 "policy_pk_denied": True, "versioned_durable_receipt_denied": True})
