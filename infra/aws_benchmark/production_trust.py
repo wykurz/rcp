@@ -118,7 +118,10 @@ def writer_identity(plan, repository, app):
     require(isinstance(app, dict) and isinstance(app.get("response"), dict), "App metadata capture required")
     slug = app["response"].get("slug")
     require(isinstance(slug, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug), "App slug is invalid")
-    metadata = capture(app, "https://api.github.com/apps/" + slug)
+    endpoint = app.get("endpoint")
+    require(endpoint in ("https://api.github.com/app", "https://api.github.com/apps/" + slug),
+            "App metadata endpoint differs")
+    metadata = capture(app, endpoint)
     require(type(metadata.get("id")) is int and metadata["id"] == plan["app"]["id"] and
             metadata.get("client_id") == plan["app"]["client_id"], "App numeric and client identities differ")
     app_owner = metadata.get("owner")
