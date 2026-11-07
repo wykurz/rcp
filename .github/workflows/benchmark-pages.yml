@@ -3,8 +3,16 @@ name: Benchmark history and reports
 on:
   workflow_call:
     inputs:
-      aws_history_commit:
-        description: Exact public history commit returned by the successful history writer
+      aws_records_artifact:
+        description: Exact immutable public-record artifact ID from this run
+        type: string
+        required: true
+      aws_inventory_sha256:
+        description: Inventory digest from the trusted read-only predecessor
+        type: string
+        required: true
+      aws_reader_revision:
+        description: Exact main source SHA that read and validated the frozen records
         type: string
         required: true
   workflow_dispatch:
@@ -18,12 +26,105 @@ concurrency:
   group: benchmark-pages-publish
   cancel-in-progress: false
 
+env:
+  PAGES_ENABLED: ${{ vars.RCP_BENCHMARK_PAGES }}
+  PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
+  PUBLISH_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED }}
+  EXPECTED_ARTIFACT: ${{ inputs.aws_records_artifact }}
+  EXPECTED_INVENTORY: ${{ inputs.aws_inventory_sha256 }}
+  EXPECTED_READER: ${{ inputs.aws_reader_revision }}
+  GIT_CONFIG_NOSYSTEM: '1'
+  GIT_CONFIG_GLOBAL: /dev/null
+  GIT_TERMINAL_PROMPT: '0'
+
 jobs:
-  # report tests and link validation run on every PR through the required lint job
-  publish:
-    # enable after selecting GitHub Actions as the repository's Pages source
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && vars.RCP_BENCHMARK_PAGES == 'true'
-    runs-on: ubuntu-latest
+  render:
+    # while AWS reporting is enabled, docs-only pushes must preserve the AWS dashboard
+    if: github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && vars.RCP_BENCHMARK_PAGES == 'true' && ((inputs.aws_records_artifact != '' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true') || (inputs.aws_records_artifact == '' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED != 'true'))
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      current: ${{ steps.current.outputs.current }}
+      artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Bind site mode and current main before reading artifacts
+        id: source
+        run: python3 -B -m infra.aws_benchmark.production_reports site-gate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.source.outputs.current == 'true'
+        with:
+          ref: benchmark-history
+          path: benchmark-history-data
+          persist-credentials: false
+      - uses: ./.depot/actions/setup-report-python
+        if: steps.source.outputs.current == 'true'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.source.outputs.current == 'true' && inputs.aws_records_artifact != ''
+        with:
+          artifact-ids: ${{ inputs.aws_records_artifact }}
+          path: ${{ runner.temp }}/public-records
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Verify the exact predecessor and complete retained view without cloud credentials
+        if: steps.source.outputs.current == 'true' && inputs.aws_records_artifact != ''
+        run: |
+          python3 -B -m infra.aws_benchmark.production_reports inspect \
+            --input "$RUNNER_TEMP/public-records" --reader-revision "$EXPECTED_READER" \
+            --expected-sha256 "$EXPECTED_INVENTORY" --require-complete
+      - name: Render history using trusted main-branch code
+        if: steps.source.outputs.current == 'true'
+        id: render
+        run: python3 -m benchmarks.report benchmark-history-data --output _site/ci-benchmarks --reports-url ../reports/index.html
+      - name: Render project landing page and maintained reports
+        if: steps.source.outputs.current == 'true'
+        run: |
+          args=()
+          if test -n "$EXPECTED_ARTIFACT"; then
+            args+=(--aws-records "$RUNNER_TEMP/public-records" --aws-reader-revision "$EXPECTED_READER" --aws-inventory-sha256 "$EXPECTED_INVENTORY")
+          fi
+          python3 scripts/report_site.py --output _site --with-benchmark-history "${args[@]}"
+      - name: Summarize historical changes
+        if: always() && steps.render.outcome == 'success'
+        run: |
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          from benchmarks import changes
+          evidence = json.loads(Path("_site/ci-benchmarks/changes.json").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(changes.markdown(evidence, link_base=None))
+          PYCODE
+      - name: Check current main again before packaging
+        if: steps.source.outputs.current == 'true'
+        id: current
+        run: python3 -B -m infra.aws_benchmark.production_reports site-gate
+      # the job owns _site and executes no retained HTML or source from the data artifact
+      - name: Package project site for Pages
+        id: package
+        if: steps.current.outputs.current == 'true'
+        run: >-
+          tar --dereference --hard-dereference --directory _site
+          -cvf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.current.outputs.current == 'true'
+        with:
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    needs: render
+    if: needs.render.outputs.current == 'true'
+    runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 10
     permissions:
       contents: read
@@ -33,161 +134,17 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Pin current main for this site
-        id: source
-        timeout-minutes: 1
-        env:
-          GIT_CONFIG_NOSYSTEM: '1'
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_TERMINAL_PROMPT: '0'
-        run: |
-          git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/main > "$RUNNER_TEMP/pages-source-ref"
-          python3 - "$RUNNER_TEMP/pages-source-ref" <<'PY'
-          import os, re, sys
-          from pathlib import Path
-          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
-          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/main']
-          assert len(commits) == 1 and re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact main reference'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('commit=' + commits[0] + '\n')
-          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.source.outputs.commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: benchmark-history
-          path: benchmark-history-data
-          persist-credentials: false
-      - uses: ./.depot/actions/setup-report-python
-      - name: Read the pinned AWS public history without checking out data
-        if: vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
-        id: aws_history
-        timeout-minutes: 2
-        env:
-          AWS_HISTORY_COMMIT: ${{ inputs.aws_history_commit }}
-          GIT_CONFIG_NOSYSTEM: '1'
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_TERMINAL_PROMPT: '0'
-        run: |
-          history="$RUNNER_TEMP/aws-pages-history.git"
-          git init --bare "$history"
-          commit="$AWS_HISTORY_COMMIT"
-          if test -z "$commit"; then
-            if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/aws-pages-ref"; then
-              commit=$(python3 - "$RUNNER_TEMP/aws-pages-ref" <<'PY'
-          import re, sys
-          from pathlib import Path
-          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
-          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/aws-benchmark-history']
-          assert len(commits) <= 1, 'Ambiguous exact AWS history reference'
-          if commits:
-              assert re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact AWS history reference'
-              print(commits[0])
-          PY
-              )
-            else
-              code=$?
-              test "$code" -eq 2
-            fi
-          fi
-          if test -n "$commit"; then
-            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git "$commit"
-            test "$(git --git-dir="$history" rev-parse --verify 'FETCH_HEAD^{commit}')" = "$commit"
-            git --git-dir="$history" update-ref refs/heads/aws-benchmark-history "$commit"
-          fi
-          printf 'path=%s\ncommit=%s\n' "$history" "$commit" >> "$GITHUB_OUTPUT"
-      - name: Render history using trusted main-branch code
-        id: render
-        run: python3 -m benchmarks.report benchmark-history-data --output _site/ci-benchmarks --reports-url ../reports/index.html
-      - name: Render project landing page and maintained reports
-        env:
-          AWS_HISTORY: ${{ steps.aws_history.outputs.path }}
-        run: |
-          args=()
-          if test -n "$AWS_HISTORY"; then args+=(--aws-history "$AWS_HISTORY"); fi
-          python3 scripts/report_site.py --output _site --with-benchmark-history "${args[@]}"
-      # serialize deployments and recheck the pinned render source immediately before publishing
-      # stale source or history is a visible green skip; a fresh dispatch renders current tips
-      - name: Check that this site still belongs to current main
-        id: current_main
-        timeout-minutes: 1
-        env:
-          PAGES_SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
-          PAGES_AWS_HISTORY: ${{ steps.aws_history.outputs.path }}
-          PAGES_HISTORY_COMMIT: ${{ steps.aws_history.outputs.commit }}
-          GIT_CONFIG_NOSYSTEM: '1'
-          GIT_CONFIG_GLOBAL: /dev/null
-          GIT_TERMINAL_PROMPT: '0'
-        run: |
-          git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/main > "$RUNNER_TEMP/pages-main-ref"
-          if test -n "$PAGES_AWS_HISTORY"; then
-            if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/pages-history-ref"; then
-              :
-            else
-              code=$?
-              test "$code" -eq 2
-            fi
-          fi
-          python3 - "$RUNNER_TEMP/pages-main-ref" <<'PY'
-          import os, re, sys
-          from pathlib import Path
-          refs = [line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines()]
-          commits = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/main']
-          assert len(commits) == 1 and re.fullmatch(r'[0-9a-f]{40}', commits[0]), 'Invalid exact main reference'
-          source = os.environ['PAGES_SOURCE_COMMIT']
-          assert re.fullmatch(r'[0-9a-f]{40}', source), 'Invalid pinned Pages source'
-          current = commits[0] == source
-          if os.environ.get('PAGES_AWS_HISTORY'):
-              history = os.environ.get('PAGES_HISTORY_COMMIT', '')
-              assert not history or re.fullmatch(r'[0-9a-f]{40}', history), 'Invalid pinned history source'
-              refs = [line.split('\t') for line in (Path(os.environ['RUNNER_TEMP']) / 'pages-history-ref').read_text().splitlines()]
-              tips = [fields[0] for fields in refs if len(fields) == 2 and fields[1] == 'refs/heads/aws-benchmark-history']
-              assert len(tips) <= 1 and all(re.fullmatch(r'[0-9a-f]{40}', tip) for tip in tips), 'Invalid exact history reference'
-              current = current and (tips[0] if tips else '') == history
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('current=' + str(current).lower() + '\n')
-          if not current:
-              message = (f'Pages deployment skipped: rendered main {source} or AWS history is no longer current '
-                         f'(current main {commits[0]}). A newer queued run may publish it; otherwise start a fresh workflow dispatch.')
-              print('::warning::' + message)
-              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                  summary.write(message + '\n')
-          PY
-      # package directly because upload-pages-artifact pins its nested action to a tag
-      - name: Package project site for Pages
-        id: package
-        if: steps.current_main.outputs.current == 'true'
-        run: >-
-          tar --dereference --hard-dereference --directory _site
-          -cvf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.current_main.outputs.current == 'true'
-        with:
-          name: github-pages
-          path: ${{ runner.temp }}/artifact.tar
-          retention-days: 1
-          if-no-files-found: error
+      - name: Require current main and the same publication mode after the deployment gate
+        id: current
+        run: python3 -B -m infra.aws_benchmark.production_reports site-gate
+      # deploy-pages selects by unique immutable name in this workflow run; it has no artifact-id input
       - name: Deploy project site
-        if: steps.current_main.outputs.current == 'true'
+        if: steps.current.outputs.current == 'true'
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
-      - name: Summarize historical changes
-        if: always() && steps.render.outcome == 'success'
-        env:
-          REPORT_URL: ${{ steps.deployment.outputs.page_url }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          from benchmarks import changes
-          evidence = json.loads(Path("_site/ci-benchmarks/changes.json").read_text(encoding="utf-8"))
-          site_url = os.environ.get("REPORT_URL")
-          history_url = site_url.rstrip("/") + "/ci-benchmarks/" if site_url else None
-          report = changes.markdown(evidence, link_base=history_url)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write(report)
-          PY
+        with:
+          artifact_name: ${{ needs.render.outputs.artifact_name }}

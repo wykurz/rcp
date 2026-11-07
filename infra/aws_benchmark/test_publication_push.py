@@ -126,11 +126,19 @@ class FixedAppendTests(unittest.TestCase):
 
 
 class PublicationShellTests(unittest.TestCase):
-    def test_actual_prepare_installation_and_push_cli_emit_exact_output(self):
-        steps = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)["jobs"]["publish"]["steps"]
-        prepare = next(x for x in steps if x.get("id") == "prepare")
-        continuity = next(x for x in steps if "publication_identity installation" in x.get("run", ""))
-        append = next(x for x in steps if x.get("id") == "append")
+    def test_dormant_local_append_installation_and_push_clis_emit_exact_output(self):
+        # The keyless workflow no longer calls this legacy local tool. Preserve its
+        # real CLI/retry regression for deliberate future recovery use only.
+        prepare = {"run": """
+          history="$RUNNER_TEMP/publish-history-1.git"
+          git init --bare "$history"
+          git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
+          baseline=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
+          printf 'baseline=%s\n' "$baseline" >> "$GITHUB_OUTPUT"
+          python3 -m infra.aws_benchmark.production_publish publish --input "$RUNNER_TEMP/public-records" --history "$history" --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
+        """}
+        continuity = {"run": "python3 -m infra.aws_benchmark.publication_identity installation"}
+        append = {"run": "python3 -m infra.aws_benchmark.publication_push"}
         for fail_first in (False, True):
             with self.subTest(fail_first=fail_first), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

@@ -262,8 +262,8 @@ class CanaryTests(unittest.TestCase):
         self.assertLess(ordinary, mint)
         self.assertLess(mint, writer)
         self.assertFalse(steps[mint]["with"]["skip-token-revoke"])
-        publish = yaml.safe_load((ROOT / ".github/workflows" / PUBLICATION_WORKFLOW).read_text())["jobs"]["publish"]
-        self.assertEqual(job["concurrency"], publish["concurrency"])
+        self.assertEqual(job["concurrency"], {"group": "aws-production-history-publish", "cancel-in-progress": False})
+        self.assertNotIn("publish", yaml.safe_load((ROOT / ".github/workflows" / PUBLICATION_WORKFLOW).read_text())["jobs"])
         self.assertEqual(steps[-1]["if"], "always()")
         self.assertNotIn("id-token", str(value))
 

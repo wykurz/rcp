@@ -1,14 +1,16 @@
 name: Publish retired AWS benchmark history
 
-# publishing is separate from paid execution and remains inert until explicitly enabled
+# keyless read-only reporting; this never starts a benchmark
 on:
+  push:
+    branches: [main]
   schedule:
-    # candidate reporting cadence; the separate schedule gate defaults closed
+    # reporting cadence only; the separate gate defaults closed
     - cron: '43 9 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: Publish retired history or separately approved bounded reader acceptance
+        description: Render retained AWS reports or run separately approved reader acceptance
         type: choice
         options:
           - publish
@@ -25,21 +27,20 @@ permissions:
 
 env:
   PUBLISH_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED }}
+  PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
 
 jobs:
   download:
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
+    if: github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || github.event_name == 'push' || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 15
+    # no environment: preserve the existing main-ref AWS trust subject
     permissions:
       contents: read
       id-token: write
-    env:
-      GIT_CONFIG_NOSYSTEM: '1'
-      GIT_CONFIG_GLOBAL: /dev/null
-      GIT_TERMINAL_PROMPT: '0'
     outputs:
-      artifact_id: ${{ steps.raw.outputs.artifact-id }}
+      artifact_id: ${{ steps.public.outputs.artifact-id }}
       inventory_sha256: ${{ steps.download.outputs.inventory_sha256 }}
       reader_revision: ${{ steps.download.outputs.reader_revision }}
     steps:
@@ -47,31 +48,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require the exact main publication workflow
-        env:
-          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
-          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
-        run: |
-          python3 -m infra.aws_benchmark.publication_identity identity --flags
-      - name: Read published identities before downloading raw evidence
-        run: |
-          history="$RUNNER_TEMP/download-history.git"
-          git init --bare "$history"
-          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/download-history-ref"; then
-            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/download-history-ref"; then
-              echo 'Protected history missing; reconcile before publishing.' >&2
-              exit 1
-            fi
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-          else
-            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
-            exit 1
-          fi
-      - name: Install the pinned read-only SDK
+      - name: Require the exact owner and main reporting workflow
+        run: python3 -B -m infra.aws_benchmark.production_reports identity
+      - name: Install the pinned read-only SDK before requesting a token
         run: |
           python3 -m venv "$RUNNER_TEMP/publication-sdk"
-          "$RUNNER_TEMP/publication-sdk/bin/pip" install --require-hashes -r infra/aws_benchmark/requirements.txt
-      - name: Download retired evidence with read-only AWS access
+          "$RUNNER_TEMP/publication-sdk/bin/pip" install --only-binary=:all: --require-hashes -r infra/aws_benchmark/requirements.txt
+      - name: Read the frozen retired public reports
         id: download
         env:
           REGION: ${{ vars.RCP_AWS_PRODUCTION_REGION }}
@@ -80,78 +63,9 @@ jobs:
           TABLE: ${{ vars.RCP_AWS_PRODUCTION_TABLE }}
           AWS_EC2_METADATA_DISABLED: 'true'
         run: |
-          "$RUNNER_TEMP/publication-sdk/bin/python" -m infra.aws_benchmark.production_publish download \
+          "$RUNNER_TEMP/publication-sdk/bin/python" -B -m infra.aws_benchmark.production_reports download \
             --region "$REGION" --role "$ROLE" --bucket "$BUCKET" --table "$TABLE" \
-            --history "$RUNNER_TEMP/download-history.git" \
-            --output "$RUNNER_TEMP/retired-evidence" --reader-revision "$GITHUB_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        id: raw
-        with:
-          name: aws-retired-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/retired-evidence/
-          retention-days: 1
-          if-no-files-found: error
-
-  export:
-    needs: download
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    outputs:
-      artifact_id: ${{ steps.public.outputs.artifact-id }}
-      inventory_sha256: ${{ steps.export.outputs.inventory_sha256 }}
-      reader_revision: ${{ steps.export.outputs.reader_revision }}
-      record_count: ${{ steps.export.outputs.record_count }}
-    env:
-      GIT_CONFIG_NOSYSTEM: '1'
-      GIT_CONFIG_GLOBAL: /dev/null
-      GIT_TERMINAL_PROMPT: '0'
-      AWS_EC2_METADATA_DISABLED: 'true'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Bind download provenance to this workflow revision
-        env:
-          EXPECTED_READER: ${{ needs.download.outputs.reader_revision }}
-          EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
-          EXPECTED_ARTIFACT: ${{ needs.download.outputs.artifact_id }}
-          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
-          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
-        run: |
-          python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          artifact-ids: ${{ needs.download.outputs.artifact_id }}
-          path: ${{ runner.temp }}/retired-evidence
-          merge-multiple: true
-          digest-mismatch: error
-      - name: Read existing public history without checking out its files
-        run: |
-          history="$RUNNER_TEMP/export-history.git"
-          git init --bare "$history"
-          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/history-ref"; then
-            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/history-ref"; then
-              echo 'Protected history missing; reconcile before publishing.' >&2
-              exit 1
-            fi
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-          else
-            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
-            exit 1
-          fi
-      - name: Validate and export without cloud or write credentials
-        id: export
-        env:
-          EXPECTED_INVENTORY: ${{ needs.download.outputs.inventory_sha256 }}
-        run: |
-          python3 -m infra.aws_benchmark.production_publish export \
-            --input "$RUNNER_TEMP/retired-evidence" --history "$RUNNER_TEMP/export-history.git" \
-            --output "$RUNNER_TEMP/public-records" --reader-revision "$GITHUB_SHA" \
-            --expected-sha256 "$EXPECTED_INVENTORY"
+            --output "$RUNNER_TEMP/public-records" --reader-revision "$GITHUB_SHA" --require-complete
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: public
         with:
@@ -160,134 +74,18 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  publish:
-    needs: export
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && needs.export.outputs.record_count != '' && needs.export.outputs.record_count != '0'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    # configure the main-only owner approval gate separately before activation
-    environment:
-      name: aws-benchmark-history
-      deployment: false
-    permissions:
-      contents: read
-    outputs:
-      history_commit: ${{ steps.append.outputs.history_commit || steps.prepare.outputs.history_commit }}
-    concurrency:
-      group: aws-production-history-publish
-      cancel-in-progress: false
-    env:
-      GIT_CONFIG_NOSYSTEM: '1'
-      GIT_CONFIG_GLOBAL: /dev/null
-      GIT_TERMINAL_PROMPT: '0'
-      AWS_EC2_METADATA_DISABLED: 'true'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Bind public provenance and recheck publication gates after approval
-        env:
-          EXPECTED_READER: ${{ needs.export.outputs.reader_revision }}
-          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
-          EXPECTED_ARTIFACT: ${{ needs.export.outputs.artifact_id }}
-          PUBLICATION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED }}
-          TRUST_READY: ${{ vars.RCP_AWS_HISTORY_TRUST_READY }}
-        run: |
-          python3 -m infra.aws_benchmark.publication_identity identity --artifact --flags
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          artifact-ids: ${{ needs.export.outputs.artifact_id }}
-          path: ${{ runner.temp }}/public-records
-          merge-multiple: true
-          digest-mismatch: error
-      - name: Prepare a verified append without writer credentials
-        id: prepare
-        env:
-          EXPECTED_INVENTORY: ${{ needs.export.outputs.inventory_sha256 }}
-          CLIENT_ID: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
-          INSTALLATION_ID: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
-        run: |
-          python3 -m infra.aws_benchmark.publication_identity current-main
-          python3 - <<'PY'
-          import os
-          from infra.aws_benchmark.production_trust import writer_config
-          writer_config(os.environ['CLIENT_ID'], os.environ['INSTALLATION_ID'])
-          PY
-          history="$RUNNER_TEMP/publish-history-1.git"
-          receipt="$RUNNER_TEMP/publish-commit-1.txt"
-          git init --bare "$history"
-          if git -c credential.helper= ls-remote --exit-code --heads https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history > "$RUNNER_TEMP/publish-ref-1"; then
-            if ! awk -F '\t' '$2 == "refs/heads/aws-benchmark-history" { found=1 } END { exit !found }' "$RUNNER_TEMP/publish-ref-1"; then
-              echo 'Protected history missing; reconcile before publishing.' >&2
-              exit 1
-            fi
-            git -c credential.helper= --git-dir="$history" fetch --no-tags --depth=1 https://github.com/wykurz/rcp.git refs/heads/aws-benchmark-history:refs/heads/aws-benchmark-history
-          else
-            echo 'Protected history absent or unavailable; reconcile before publishing.' >&2
-            exit 1
-          fi
-          baseline=$(git --git-dir="$history" rev-parse --verify 'refs/heads/aws-benchmark-history^{commit}')
-          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
-          GITHUB_OUTPUT="$receipt" python3 -m infra.aws_benchmark.production_publish publish \
-            --input "$RUNNER_TEMP/public-records" --history "$history" \
-            --reader-revision "$GITHUB_SHA" --expected-sha256 "$EXPECTED_INVENTORY"
-          commit=$(python3 - "$receipt" <<'PY'
-          import re, sys
-          from pathlib import Path
-          from infra.aws_benchmark.common import require
-          value = Path(sys.argv[1]).read_text()
-          require(re.fullmatch(r'commit=([0-9a-f]{40})?\n', value), 'invalid append receipt')
-          print(value.removeprefix('commit=').strip())
-          PY
-          )
-          printf 'baseline=%s\n' "$baseline" >> "$GITHUB_OUTPUT"
-          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-          if test -z "$commit"; then
-            commit="$baseline"
-            printf 'history_commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-            echo 'History already contains all verified records; no writer token is needed.' >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Require current main immediately before minting
-        if: steps.prepare.outputs.commit != ''
-        run: python3 -m infra.aws_benchmark.publication_identity current-main
-      - name: Mint the repository-selected history writer token
-        if: steps.prepare.outputs.commit != ''
-        id: history-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RCP_AWS_HISTORY_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RCP_AWS_HISTORY_APP_PRIVATE_KEY }}
-          owner: wykurz
-          repositories: rcp
-          permission-contents: write
-          permission-metadata: read
-          skip-token-revoke: false
-      - name: Require installation continuity before using its token
-        if: steps.prepare.outputs.commit != ''
-        env:
-          EXPECTED_INSTALLATION: ${{ vars.RCP_AWS_HISTORY_APP_INSTALLATION_ID }}
-          ACTUAL_INSTALLATION: ${{ steps.history-token.outputs.installation-id }}
-        run: python3 -m infra.aws_benchmark.publication_identity installation
-      - name: Append only the prepared commit with exact-baseline reconciliation
-        if: steps.prepare.outputs.commit != ''
-        id: append
-        env:
-          PREPARED_COMMIT: ${{ steps.prepare.outputs.commit }}
-          PREPARED_BASELINE: ${{ steps.prepare.outputs.baseline }}
-          GH_TOKEN: ${{ steps.history-token.outputs.token }}
-        run: python3 -m infra.aws_benchmark.publication_push
-
   pages:
-    needs: publish
-    if: github.repository == 'wykurz/rcp' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_AWS_HISTORY_TRUST_READY == 'true' && vars.RCP_BENCHMARK_PAGES == 'true' && needs.publish.outputs.history_commit != ''
+    needs: download
+    if: github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.mode == 'publish') || github.event_name == 'push' || (github.event_name == 'schedule' && vars.RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED == 'true')) && github.actor_id == '483465' && github.run_attempt == '1' && vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true' && vars.RCP_BENCHMARK_PAGES == 'true'
     permissions:
       contents: read
       pages: write
       id-token: write
     uses: ./.github/workflows/benchmark-pages.yml
     with:
-      aws_history_commit: ${{ needs.publish.outputs.history_commit }}
+      aws_records_artifact: ${{ needs.download.outputs.artifact_id }}
+      aws_inventory_sha256: ${{ needs.download.outputs.inventory_sha256 }}
+      aws_reader_revision: ${{ needs.download.outputs.reader_revision }}
 
   reader-test:
     if: inputs.mode == 'reader-test' && github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == '1' && (vars.RCP_AWS_PRODUCTION_ENABLED == '' || vars.RCP_AWS_PRODUCTION_ENABLED == 'false') && (vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == '' || vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'false') && (vars.RCP_AWS_HISTORY_TRUST_READY == '' || vars.RCP_AWS_HISTORY_TRUST_READY == 'false')

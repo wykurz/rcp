@@ -46,7 +46,7 @@ def check_secret_expressions(value):
 
 
 def check_workflows(directory):
-    expected = {(PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")}
+    expected = {(CANARY_WORKFLOW, "verify")}
     environments, secrets = set(), set()
     for path in sorted(directory.iterdir()):
         if path.suffix not in (".yaml", ".yml"):
@@ -57,7 +57,7 @@ def check_workflows(directory):
             check_secret_expressions(text)
         text = "\n".join(values)
         key_count = text.casefold().count(WRITER_SECRET_NAME.casefold())
-        require(key_count == (1 if path.name in (PUBLICATION_WORKFLOW, CANARY_WORKFLOW) else 0),
+        require(key_count == (1 if path.name == CANARY_WORKFLOW else 0),
                 "history key references differ from reviewed mint steps")
         for name, job in value.get("jobs", {}).items():
             location = (path.name, name)

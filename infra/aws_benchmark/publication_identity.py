@@ -37,8 +37,7 @@ def check_identity(environment, *, workflow=PUBLICATION_WORKFLOW, artifact=False
     return revision
 
 
-def current_main(revision, *, token=None):
-    require(isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision), "invalid publication revision")
+def observed_main(*, token=None):
     clean = git_env()
     for key in ("GH_TOKEN", "GITHUB_TOKEN"):
         clean.pop(key, None)
@@ -49,8 +48,12 @@ def current_main(revision, *, token=None):
     result = subprocess.run(["git", "-c", "credential.helper=", "ls-remote", "--exit-code", "--heads", REMOTE, MAIN],
         env=clean, capture_output=True, text=True, timeout=30, check=False)
     require(result.returncode == 0, "current main observation failed")
-    require(exact_ref(result.stdout, MAIN) == revision,
-            "publication revision is no longer the exact current main")
+    return exact_ref(result.stdout, MAIN)
+
+
+def current_main(revision, *, token=None):
+    require(isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision), "invalid publication revision")
+    require(observed_main(token=token) == revision, "publication revision is no longer the exact current main")
 
 
 def canary_identity(environment):
