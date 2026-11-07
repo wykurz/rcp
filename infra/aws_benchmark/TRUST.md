@@ -119,17 +119,19 @@ The plan separates repository variables from environment variables. It is not an
 API payload. Obtain approval for exact resolved targets and baseline diffs, preserve unrelated
 settings and stop on drift. Typed installation IDs are not installation-scope verification.
 
-With an already-authorized operator, capture repository metadata, owner-authenticated `/apps/{slug}`
-metadata, environment detail, both ruleset detail objects, deployment branch policy, custom
-deployment rules, complete secret-name inventories and variable names/values. Do not give either
-runtime App Administration permission for this check. The repository capture must prove ID
-`655073755`, owner `483465`, `wykurz/rcp`, and `fork: false`. App metadata must bind App ID, client
-ID, owner, exact permissions and empty events. Ruleset detail must include `bypass_actors`; omission
-does not prove an empty list. As additional operator evidence, capture effective rules for
-`rules/branches/aws-benchmark-history` and one named descendant and compare the reported ruleset IDs
-with the approved pair. GH013 alone names violated rules, not their source ruleset. This optional
-effective-rules capture is separate manual evidence; the local settings checker does not claim to
-validate it.
+With an already-authorized operator, capture repository metadata and genuine App metadata from
+`https://api.github.com/apps/{slug}` or the App-JWT-authenticated `https://api.github.com/app`
+endpoint. The authenticated route supports a private App without changing its visibility or
+broadening another credential. Capture environment detail, both ruleset detail objects, deployment
+branch policy, custom deployment rules, complete secret-name inventories and variable names/values.
+Do not give either runtime App Administration permission for this check. The repository capture must
+prove ID `655073755`, owner `483465`, `wykurz/rcp`, and `fork: false`. App metadata must bind App
+ID, client ID, owner, exact permissions and empty events. Ruleset detail must include
+`bypass_actors`; omission does not prove an empty list. As additional operator evidence, capture
+effective rules for `rules/branches/aws-benchmark-history` and one named descendant and compare the
+reported ruleset IDs with the approved pair. GH013 alone names violated rules, not their source
+ruleset. This optional effective-rules capture is separate manual evidence; the local settings
+checker does not claim to validate it.
 
 The repository and App captures use `{ "endpoint": "<exact API URL>", "response": {...} }`.
 Environment and rulesets retain raw detail responses. Branch policies use an endpoint/response
@@ -158,6 +160,17 @@ python -m infra.aws_benchmark.production_trust writer-check \
   --custom-rules-readback custom-rules.json \
   --key-state absent --output writer-readback-before-import.json
 ```
+
+Here `--key-state absent` means the environment secret is absent, not that the App has no registered
+key. If metadata verification requires an App JWT, obtain the applicable approval for one
+owner-generated key and a bounded owner-operated metadata read. Keep the PEM and JWT local to that
+process, except for sending the JWT to the exact GitHub API endpoint; never put either in chat,
+arguments, environment dumps, logs or Git. Verify the public fingerprint and actual App/installation
+metadata before importing the key. A metadata read does not mint an installation token or prove the
+complete selected-repository list. Preserve separate owner UI/attestation evidence for that list,
+private installability and registered-key inventory. A 404, copied identifier or owner assertion
+must not be relabeled as an API response. All exact identity, permissions and event checks still
+apply.
 
 Run the absent-key phase before storing the key, then capture fresh inventories and repeat with
 `--key-state present` and a new output path after the separately approved import. Record the writer
@@ -469,6 +482,7 @@ References: [rulesets](https://docs.github.com/en/rest/repos/rules),
 [variables and timing](https://docs.github.com/en/actions/reference/workflows-and-actions/variables),
 [branch rename](https://docs.github.com/en/rest/branches/branches#rename-a-branch),
 [App metadata](https://docs.github.com/en/rest/apps/apps),
+[authenticated App metadata](https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app),
 [private-key management](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps),
 [custom protection rules](https://docs.github.com/en/rest/deployments/protection-rules#get-all-deployment-protection-rules-for-an-environment),
 [temporary anonymous Git restrictions](https://github.blog/changelog/2026-10-19-some-git-over-https-may-temporarily-require-authentication/),

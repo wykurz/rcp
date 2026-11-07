@@ -170,6 +170,60 @@ class TrustTests(unittest.TestCase):
             data = readbacks(); mutate(data)
             with self.subTest(mutation=mutate), self.assertRaises(ValueError): self.check(data)
 
+    def test_authenticated_app_metadata_preserves_full_absent_secret_check(self):
+        data = readbacks()
+        data["app"]["endpoint"] = "https://api.github.com/app"
+        page_response(data["inventory"]["environment_secrets"][trust.ENVIRONMENT]).update(total_count=0, secrets=[])
+        result = trust.check_writer(self.plan, *(data[key] for key in FIELDS), key_state="absent")
+        self.assertTrue(result["app_metadata_identity_verified"])
+        self.assertEqual(result["key_metadata_state"], "absent")
+        for key in ("live_enforcement_proven", "key_custody_proven", "installation_scope_proven"):
+            self.assertFalse(result[key])
+        page_response(data["inventory"]["environment_secrets"][trust.ENVIRONMENT]).update(
+            total_count=1, secrets=[{"name": trust.WRITER_SECRET_NAME}])
+        with self.assertRaises(ValueError):
+            trust.check_writer(self.plan, *(data[key] for key in FIELDS), key_state="absent")
+
+    def test_authenticated_app_does_not_relax_identity_owner_permission_or_event_checks(self):
+        variants = [
+            lambda d: d["app"]["response"].update(id=True),
+            lambda d: d["app"]["response"].update(id=4321),
+            lambda d: d["app"]["response"].update(client_id="Iv23.other"),
+            lambda d: d["app"]["response"].update(slug="../other"),
+            lambda d: d["app"]["response"]["owner"].update(id=123),
+            lambda d: d["app"]["response"]["owner"].update(login="other"),
+            lambda d: d["app"]["response"]["owner"].update(type="Organization"),
+            lambda d: d["app"]["response"]["permissions"].update(actions="write"),
+            lambda d: d["app"]["response"]["permissions"].pop("metadata"),
+            lambda d: d["app"]["response"].update(events=["push"]),
+            lambda d: d["app"].update(owner_attestation=True),
+            lambda d: d["app"].pop("response"),
+        ]
+        for mutate in variants:
+            data = readbacks(); data["app"]["endpoint"] = "https://api.github.com/app"; mutate(data)
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError): self.check(data)
+
+    def test_only_exact_documented_app_metadata_endpoints_are_accepted(self):
+        for endpoint in ("http://api.github.com/app", "https://other.example/app",
+                         "https://api.github.com:443/app", "https://api.github.com/app/",
+                         "https://api.github.com/app?ignored=true", "https://api.github.com/app#ignored",
+                         "https://api.github.com/apps", "https://api.github.com/apps/wrong",
+                         "https://api.github.com/app/installations/5678", None, [], {}):
+            data = readbacks(); data["app"]["endpoint"] = endpoint
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError): self.check(data)
+
+    def test_app_metadata_route_change_invalidates_existing_capture_fingerprint(self):
+        data = readbacks()
+        blobs = {"plan": json.dumps(self.plan).encode(),
+                 **{key: json.dumps(data[key]).encode() for key in FIELDS}}
+        before = trust.check_writer_blobs(blobs)
+        data["app"]["endpoint"] = "https://api.github.com/app"
+        blobs["app"] = json.dumps(data["app"]).encode()
+        after = trust.check_writer_blobs(blobs)
+        self.assertNotEqual(before["trust_sha256"], after["trust_sha256"])
+        self.assertNotEqual(before["trust_manifest"]["capture_sha256"],
+                            after["trust_manifest"]["capture_sha256"])
+
     def test_complete_inventory_prevents_secret_scope_and_variable_shadowing_mistakes(self):
         variants = [
             lambda i: i["environment_secrets"].pop("other"),
