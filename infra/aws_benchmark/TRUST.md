@@ -4,6 +4,21 @@ This is an offline setup proposal. It creates no App, key, secret, environment, 
 AWS resource. Publication and production remain disabled. The selected reader custody is **Secrets
 Manager**; no KMS implementation is included. Merging these files is not live setup approval.
 
+## Current reporting mode: no history-writer credential
+
+The keyless route in [PRODUCTION.md](PRODUCTION.md#keyless-retained-reporting) reads frozen reports
+from AWS through the existing read-only OIDC role and passes public JSON directly to Pages. It uses
+the current 90-day lifecycle, not a permanent Git history archive. It does not use the writer App,
+key, environment, branch or canary described below. Do not generate/import a writer key or turn on
+legacy readiness/canary flags for this route. Existing live Apps, environments and rulesets are
+preserved; this code does not revoke or delete them.
+
+Only the dormant explicit canary workflow still references the writer environment/key. The complete
+workflow inventory enforces that the normal publisher is keyless. The remaining writer procedures
+are an optional permanent-history design and recovery reference, **not a checklist to execute for
+the 90-day mode**. The AWS admission/collector reader App is separate and remains required for
+producer proof; it is not the GitHub-to-AWS publication OIDC identity.
+
 ## Two separate credentials
 
 | Consumer                     | Dedicated App permissions     | Key custody                                                                          | Installation      |
@@ -31,11 +46,11 @@ history; restoring history alone does not contain the incident.
 
 Before provisioning the history writer App or its key, complete the
 [release credential prerequisite review](../../docs/release-identity.md#separate-protection-requirements).
-The repository-level `CRATES_IO_TOKEN` remains available to historical publication workflows,
-including old-ref dispatches and reruns with weaker source checks. Inventory those revisions as well
-as current consumers of ambiguous refs. Moving release credentials to a restricted environment or
-trusted-publishing policy requires separate approval, including old-ref rejection and recovery
-tests. This setup does not change credentials or settings.
+A repository-level `CRATES_IO_TOKEN`, if still present, is available to historical publication
+workflows, including old-ref dispatches and reruns with weaker source checks. Inventory its current
+metadata and those revisions as well as current consumers of ambiguous refs. Moving release
+credentials to a restricted environment or trusted-publishing policy requires separate approval,
+including old-ref rejection and recovery tests. This setup does not change credentials or settings.
 
 ## AWS publication reader trust
 
@@ -58,12 +73,13 @@ activation.
 
 ## Writer environment and reserved history namespace
 
-Only the publication and explicit canary workflows currently reference `aws-benchmark-history` and
-its key; tests check the complete workflow inventory. Any future trusted main workflow could request
-this environment, so preserve main review/protection. The owner-only approval gate is the initial
-policy; removing it requires a separate decision. The canary remains manual-only. The publication
-workflow's proposed daily poll has a separate exact-true schedule gate, closed by default; it
-retains the same owner approval environment and cannot make writer access unattended.
+Only the dormant explicit canary workflow currently references `aws-benchmark-history` and its key;
+tests check the complete workflow inventory. The legacy publisher is no longer wired into the normal
+workflow. Any future trusted main workflow could request this environment, so preserve main
+review/protection. The owner-only approval gate is the initial policy; removing it requires a
+separate decision. The canary remains manual-only. The publication workflow's proposed daily poll
+has a separate exact-true schedule gate, closed by default; it retains the same owner approval
+environment and cannot make writer access unattended.
 
 Configure and read back the environment **before storing a key or running either lane**. GitHub can
 automatically create a missing environment without protection. Require:

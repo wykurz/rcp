@@ -226,10 +226,10 @@ class PublicationReaderWorkflowTests(unittest.TestCase):
             self.assertIn("(vars." + flag + " == '' || vars." + flag + " == 'false')", self.job["if"])
         self.assertNotIn("needs", self.job)
         self.assertNotIn("environment", self.job)
-        for name in ("download", "export", "publish", "pages"):
+        for name in ("download", "pages"):
             self.assertIn("inputs.mode == 'publish'", self.workflow["jobs"][name]["if"])
             self.assertIn("vars.RCP_AWS_PRODUCTION_PUBLISH_ENABLED == 'true'", self.workflow["jobs"][name]["if"])
-            self.assertIn("vars.RCP_AWS_HISTORY_TRUST_READY == 'true'", self.workflow["jobs"][name]["if"])
+            self.assertNotIn("RCP_AWS_HISTORY_TRUST_READY", self.workflow["jobs"][name]["if"])
 
     def test_reader_job_has_only_reviewed_dependencies_probe_and_sanitized_artifact(self):
         self.assertEqual(self.job["permissions"], {"contents": "read", "id-token": "write"})

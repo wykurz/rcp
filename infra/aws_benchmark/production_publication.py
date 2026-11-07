@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import re
 import time
 
-from . import production_collection as collection
+from . import production_collection as collection, production_projection as projection
 from .common import MAX_RESULT, digest, require
 from .production_store import PHASES, RunStore
 
@@ -21,6 +21,113 @@ MAX_BUNDLE_BYTES = MAX_RESULT + 8 * 1024 * 1024
 LIMITS = {"durable.json": collection.MAX_RECEIPT, "status.json": collection.MAX_DOCUMENT,
           "results.zip": MAX_RESULT, "controller.json": collection.MAX_DOCUMENT,
           "report.json": collection.MAX_REPORT, "summary.html": collection.MAX_REPORT}
+
+
+def _reference(ref, key, limit):
+    require(isinstance(ref, dict) and set(ref) == {"key", "version", "sha256", "bytes"} and
+            ref["key"] == key and isinstance(ref["version"], str) and
+            0 < len(ref["version"]) <= 1024 and ref["version"] != "null" and
+            all(32 < ord(char) < 127 for char in ref["version"]) and
+            isinstance(ref["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) and
+            type(ref["bytes"]) is int and 0 < ref["bytes"] <= limit, "retained reference differs")
+
+
+def _public_manifest(record, manifest):
+    """Validate the retirement-anchored envelope without downloading raw evidence."""
+    binding = dict(schema=collection.SCHEMA, run_key=record.run_key, epoch=record.epoch,
+        state_sha256=digest(collection.encoded(record.state)),
+        admission_sha256=digest(collection.encoded(record.admission)), identity=collection.identity(record))
+    require(isinstance(manifest, dict) and set(manifest) == set(binding) | {
+        "execution", "producer_conclusion", "sources", "retained", "benchmark_valid"} and
+        all(manifest.get(key) == value for key, value in binding.items()) and
+        type(manifest["benchmark_valid"]) is bool and manifest["producer_conclusion"] in collection.CONCLUSIONS and
+        isinstance(manifest["execution"], dict) and
+        manifest["execution"].get("status") in collection.TERMINAL | {"NEVER_SUBMITTED", "NEVER_STARTED"},
+        "retained manifest belongs to different evidence")
+    refs, sources = manifest["retained"], manifest["sources"]
+    require(isinstance(refs, dict) and {"durable.json", "controller.json", "report.json", "summary.html"}
+            <= set(refs) <= set(LIMITS), "retained file set differs")
+    prefix = "production/runs/" + record.run_key + "/collection/"
+    for name, ref in refs.items():
+        _reference(ref, prefix + name, LIMITS[name])
+    require(isinstance(sources, dict) and set(sources) == set(refs) - {
+        "controller.json", "report.json", "summary.html"}, "source references differ")
+    keys = {"durable.json": "production/runs/" + record.run_key + "/durable-receipt.json"}
+    if record.state.get("binding") is not None:
+        pins = record.state["request"]["pins"]
+        paths = collection.MailboxPaths.for_instance(pins["account"], pins["region"],
+                                                     record.state["binding"]["instance_id"])
+        keys.update({"status.json": paths.status, "results.zip": paths.results})
+    for name, ref in sources.items():
+        require(name in keys, "source has no bound worker")
+        _reference(ref, keys[name], LIMITS[name])
+        require(all(ref[field] == refs[name][field] for field in ("sha256", "bytes")), "source binding differs")
+        field = {"status.json": "status", "results.zip": "results"}.get(name)
+        committed = (record.state.get("worker_output") or {}).get(field) if field else None
+        require(committed is None or committed == ref, "retained source differs from committed worker version")
+    return binding
+
+
+def _frozen_public(record, manifest, report, controller):
+    """Authenticate the collector's projection, not a fresh qualification of raw data."""
+    expected, refs = manifest["identity"], manifest["retained"]
+    require(isinstance(controller, dict) and controller.get("schema_version") == 1 and
+            controller.get("identity") == expected and controller.get("cleanup") == "verified" and
+            controller.get("outcome") in {"success", "failure"}, "retained controller provenance differs")
+    bound, request = record.state.get("binding"), record.state["request"]
+    if bound is None:
+        require(all(controller.get(key) is None for key in ("instance", "window", "request")),
+                "retained unallocated controller differs")
+    else:
+        require(controller.get("instance") == dict(instance_id=bound["instance_id"],
+            image_id=request["pins"]["ami"], instance_type="c5d.24xlarge"), "retained instance differs")
+        window, command = controller.get("window", {}), controller.get("request", {})
+        require(isinstance(window, dict) and
+                all(window.get(key) == request[key] for key in
+                    ("protocol", "run", "baseline", "candidate", "suite", "runtime_seconds", "plan", "outer_deadline")) and
+                all(window.get(key) == bound[key] for key in
+                    ("instance_id", "launch_at", "deadline", "attempt_id", "attempt_started_at")) and
+                window.get("opens") == bound["attempt_started_at"] and
+                window.get("request_expires") == request["capacity_deadline"], "retained worker window differs")
+        require(isinstance(command, dict) and
+                all(command.get(key) == request[key] for key in ("run", "baseline", "candidate", "suite", "sha256")) and
+                command.get("deadline") == bound["deadline"], "retained worker request differs")
+    for field, name in (("status_sha256", "status.json"), ("archive_sha256", "results.zip")):
+        require(controller.get(field) == (refs[name]["sha256"] if name in refs else None),
+                "retained controller digest differs")
+    evidence = report.get("evidence", {}) if isinstance(report, dict) else {}
+    require(isinstance(report, dict) and report.get("schema") == manifest["schema"] and
+            report.get("identity") == expected and type(report.get("benchmark_valid")) is bool and
+            report["benchmark_valid"] == manifest["benchmark_valid"] and report.get("cleanup_verified") is True and
+            report.get("execution_proof") == manifest["execution"] and isinstance(evidence, dict) and
+            evidence.get("identity") == expected and evidence.get("producer_conclusion") == manifest["producer_conclusion"] and
+            evidence.get("controller") == controller and evidence.get("files") == {
+                name: refs[name]["sha256"] for name in ("controller.json", "status.json", "results.zip") if name in refs},
+            "retained report provenance differs")
+    outcome = report.get("qualification_outcome")
+    require(outcome in {"passed", "failed", "evidence-unavailable"} and
+            (outcome == "passed") == manifest["benchmark_valid"] and
+            (outcome == "evidence-unavailable") == (report.get("evidence_availability") is not None),
+            "retained qualification outcome differs")
+    value = projection.bind(report["public_projection"], record.retirement_sha256)
+    require(value["run_key"] == record.run_key and value["benchmark_valid"] == manifest["benchmark_valid"] and
+            value["identity"] == {key: expected[key] for key in
+                ("run", "run_url", "suite", "baseline", "candidate", "controller")} and
+            value["comparison"] == projection.comparison_label(expected, controller) and
+            projection.qualification_outcome(value) == outcome and
+            (not value["benchmark_valid"] or value["verification"] == evidence.get("expected_verification")),
+            "retained public projection provenance differs")
+    if "collection_checkpoint" in report:
+        binding = {key: manifest[key] for key in ("schema", "run_key", "epoch", "state_sha256",
+            "admission_sha256", "identity", "execution", "producer_conclusion")}
+        require(report["collection_checkpoint"] == dict(schema=collection.CHECKPOINT_SCHEMA, binding=binding,
+            sources=manifest["sources"], derived={name: {field: refs[name][field] for field in ("sha256", "bytes")}
+                for name in ("controller.json", "summary.html")}), "retained collection checkpoint differs")
+        collected_at = value.get("collected_at")
+        require(collected_at is not None and collection.timestamp(collection.utc(collected_at)) == collected_at and
+                collection.utc(collected_at) >= collection.utc(record.state["cleanup"]["verified_at"]),
+                "retained collection time differs")
+    return value
 
 
 @dataclass(frozen=True)
@@ -138,7 +245,7 @@ class Reader:
         return dict(state="pending", retired=False, run_key=run_key, phase=phase,
                     reason="ownership remains held until collection and retirement")
 
-    def download(self, key):
+    def _retired_manifest(self, key):
         run_key = self.run_key(key)
         record, item = self.record(run_key)
         require(record.closed and record.terminal, "manifest is not retired; publication remains pending")
@@ -147,6 +254,11 @@ class Reader:
         # bind the discovery read to an immutable object version before accepting payload references
         require(self.objects.read(key, collection.MAX_DOCUMENT, version=ref["version"]) == (raw, ref),
                 "manifest version changed")
+        return record, item, raw, ref
+
+    def download(self, key):
+        run_key = self.run_key(key)
+        record, item, raw, ref = self._retired_manifest(key)
         manifest = collection.results.json_value(raw)
         refs = manifest.get("retained") if isinstance(manifest, dict) else None
         require(isinstance(refs, dict) and {"durable.json", "controller.json", "report.json", "summary.html"}
@@ -157,6 +269,36 @@ class Reader:
         bundle.validate()
         require(self.record(run_key) == (record, item), "retirement record changed during download")
         return bundle
+
+    def public_record(self, key):
+        """Read only the retirement-bound frozen projection and its controller context.
+
+        This authenticates collector-produced public bytes. It deliberately does not
+        download or requalify raw worker output, durable receipts or retained HTML.
+        """
+        record, item, raw, _ = self._retired_manifest(key)
+        manifest = collection.results.json_value(raw)
+        _public_manifest(record, manifest)
+        prefix = "production/runs/" + record.run_key + "/collection/"
+        payloads = {name: self.objects.referenced(manifest["retained"][name], prefix + name, LIMITS[name])
+                    for name in ("report.json", "controller.json")}
+        value = _frozen_public(record, manifest,
+            collection.results.json_value(payloads["report.json"], collection.MAX_REPORT),
+            collection.results.json_value(payloads["controller.json"], collection.MAX_DOCUMENT))
+        require(self.record(record.run_key) == (record, item), "retirement record changed during download")
+        return value
+
+    def observe_public(self, key):
+        """Observe the frozen public path with the same pending/held semantics as raw evidence."""
+        retired = False
+        try:
+            record, _ = self.record(self.run_key(key))
+            retired = record.closed
+            if not retired:
+                return dict(state="pending", retired=False, reason="manifest exists but ownership is not retired")
+            return dict(state="ready", retired=True, record=self.public_record(key))
+        except Exception as error:
+            return dict(state="held", retired=retired, reason=collection.results.diagnostic(error))
 
     def observe(self, key):
         """Describe an individual failure without losing known retirement or exposing SDK secrets."""

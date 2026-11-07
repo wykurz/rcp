@@ -25,10 +25,10 @@ class WorkflowInventoryTests(unittest.TestCase):
                 ("yaml", "other", "secrets[format(\"RCP_AWS_{0}\", \"HISTORY_APP_PRIVATE_KEY\")]")):
             with self.subTest(suffix=suffix, environment=environment), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+                for name, job in ((CANARY_WORKFLOW, "verify"),):
                     (root / name).write_text("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                         "\n    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
-                self.assertEqual(len(check_workflows(root)), 2)
+                self.assertEqual(len(check_workflows(root)), 1)
                 (root / ("rogue." + suffix)).write_text("jobs:\n  rogue:\n    environment: '" + environment +
                     "'\n    steps:\n      - run: echo ${{ " + expression + " }}\n")
                 with self.assertRaises(ValueError):
@@ -38,7 +38,7 @@ class WorkflowInventoryTests(unittest.TestCase):
         for missing in ("environment", "key"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+                for name, job in ((CANARY_WORKFLOW, "verify"),):
                     (root / name).write_text("jobs:\n  " + job + ":\n" +
                         ("    environment: " + ENVIRONMENT + "\n" if missing != "environment" else "") +
                         ("    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n" if missing != "key" else "    steps: []\n"))
@@ -49,7 +49,7 @@ class WorkflowInventoryTests(unittest.TestCase):
         for expression in ("secrets." + PUBLIC_REFERENCE_NAME, "toJSON(secrets)"):
             with self.subTest(expression=expression), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+                for name, job in ((CANARY_WORKFLOW, "verify"),):
                     (root / name).write_text("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                         "\n    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
                 (root / "rogue.yaml").write_text("env:\n  VALUE: ${{ " + expression + " }}\njobs: {}\n")
@@ -59,7 +59,7 @@ class WorkflowInventoryTests(unittest.TestCase):
     def test_dynamic_secret_lookup_holds_even_without_literal_key_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+            for name, job in ((CANARY_WORKFLOW, "verify"),):
                 (root / name).write_text("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                     "\n    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
             (root / "rogue.yaml").write_text("jobs:\n  rogue:\n    steps:\n      - run: |\n          echo ${{ secrets[format('RCP_{0}', inputs.suffix)] }}\n")
@@ -70,7 +70,7 @@ class WorkflowInventoryTests(unittest.TestCase):
         for expression in ("secrets\n[format('RCP_{0}', inputs.suffix)]", "toJSON(\nsecrets)"):
             with self.subTest(expression=expression), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+                for name, job in ((CANARY_WORKFLOW, "verify"),):
                     (root / name).write_text("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                         "\n    steps:\n      - run: echo ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
                 (root / "rogue.yaml").write_text("jobs:\n  rogue:\n    steps:\n      - run: |\n          echo ${{ " +
@@ -99,7 +99,7 @@ class WorkflowInventoryTests(unittest.TestCase):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 self.write_consumers(root, value)
-                self.assertEqual(len(check_workflows(root)), 2)
+                self.assertEqual(len(check_workflows(root)), 1)
 
     def test_invalid_expression_boundaries_are_rejected(self):
         for value in ("${{ secrets.OTHER_TOKEN", "${{ 'unterminated }}"):
@@ -110,10 +110,10 @@ class WorkflowInventoryTests(unittest.TestCase):
                     check_workflows(root)
 
     def write_consumers(self, root, extra):
-        for name, job in ((PUBLICATION_WORKFLOW, "publish"), (CANARY_WORKFLOW, "verify")):
+        for name, job in ((CANARY_WORKFLOW, "verify"),):
             text = ("jobs:\n  " + job + ":\n    environment: " + ENVIRONMENT +
                 "\n    steps:\n      - with:\n          private-key: ${{ secrets." + PUBLIC_REFERENCE_NAME + " }}\n")
-            if name == PUBLICATION_WORKFLOW:
+            if name == CANARY_WORKFLOW:
                 text += "      - run: |\n          " + extra.replace("\n", "\n          ") + "\n"
             (root / name).write_text(text)
 

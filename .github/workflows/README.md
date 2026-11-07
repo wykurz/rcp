@@ -25,16 +25,29 @@ security-sensitive change:
 
 ### benchmark-pages.yml
 
-Publishes the project landing page, a trend dashboard under `ci-benchmarks/` from the dedicated
-`benchmark-history` branch, and the Markdown-based [reports](../../docs/reports/README.md) under
-`reports/`. Every push to `main` and manual requests rebuild the combined site. The push trigger
-covers changes to linked documentation as well as report sources. Pull requests validate the report
-build and original measurement checksums without deploying. Published rendering code and report
-sources come from `main`; historical records are data. The deployment is enabled with the repository
-variable `RCP_BENCHMARK_PAGES=true` after configuring Pages to use GitHub Actions. See
-[Benchmark dashboard and run results](../../docs/benchmarking.md#view-results) for viewing
-instructions, and [Pages setup](../../docs/benchmarking.md#enable-the-historical-site) to enable
-publication.
+Publishes the project landing page, the separate historical Depot dashboard under `ci-benchmarks/`,
+and maintained [reports](../../docs/reports/README.md). Pull requests validate rendering without
+publishing. Pages is enabled independently by `RCP_BENCHMARK_PAGES=true` with GitHub Actions as its
+source. Rendering is Contents read only; a separate gated job deploys the unique current-run Pages
+artifact and rechecks current main.
+
+When keyless AWS reporting is disabled, main pushes/manual requests build the ordinary site. When it
+is enabled, docs-only runs skip deployment to preserve the AWS dashboard. The owner/main-only
+`aws-benchmark-publish.yml` builds the combined site on main push, manual `publish`, or a separately
+gated daily read-only poll. It assumes the existing read-only AWS role, reads frozen retired public
+records and passes the exact artifact ID, trusted inventory digest and source SHA to the renderer.
+There is no writer key, Git data commit or per-report owner approval. Pending ownership remains
+visible; held, deferred or incomplete reads preserve the last deployed site rather than silently
+publishing a subset. Valid empty scans produce an explicit empty AWS view.
+
+The AWS view contains still-retained objects under the existing 90-day lifecycle, not permanent
+history or an exact deletion clock. Pages displays when it observed the records; a held/disabled
+publisher leaves an older static site online. No workflow here starts a worker. The publication and
+separate schedule flags default off; live reader/deployment acceptance and activation need their own
+approval. See
+[production reporting](../../infra/aws_benchmark/PRODUCTION.md#keyless-retained-reporting). Existing
+dormant writer protections remain untouched. Quiesce pending runs before changing site mode flags;
+preserve paid-run and canary gates.
 
 Depot benchmark definitions are removed from refs containing the retirement commit, including PR,
 push, schedule and manual benchmark triggers. Old refs and reruns can retain those definitions;

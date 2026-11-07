@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from string import Template
 import sys
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -256,21 +257,62 @@ def render(source, root, route, routes, *, has_aws_history=False):
 
 
 def aws_benchmark_pages(repository):
-    """Render only validated public records; Git history is data, never checked-out code."""
-    from infra.aws_benchmark import production_export, production_publish
+    """Read legacy Git history as data, never checked-out code."""
+    from infra.aws_benchmark import production_publish
     records, commit = production_publish.history(repository)
     if not records:
         return {}
+    return render_aws_benchmarks(records, footer=(
+        '<p>Legacy read-only history. History commit: <code>' + html.escape(commit) + '</code></p>'))
+
+
+def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
+    """Consume a bounded, proof-bound directory without consulting Git history."""
+    from infra.aws_benchmark import production_reports
+    records, index = production_reports.public_batch(directory, reader_revision, inventory_sha256)
+    rows = []
+    for observation in [index['active'], *index['observations']]:
+        fields = (observation.get('run_key', '—'), observation['state'],
+                  observation.get('phase', '—'), observation.get('reason', '—'),
+                  'yes' if observation['retired'] else 'no')
+        rows.append('<tr>' + ''.join('<td>' + html.escape(value) + '</td>' for value in fields) + '</tr>')
+    processing = 'complete' if index['processing_complete'] else 'incomplete; some records are deferred'
+    status = (
+        '<section aria-labelledby="collection-status"><h2 id="collection-status">Snapshot status</h2>'
+        '<p>Observed at: <time>' + html.escape(index['observed_at']) + '</time>. '
+        'Discovery: complete. Record processing: ' + processing + '.</p>'
+        '<p>The first row is the lease observation at that time; it is not a fresh physical teardown check. '
+        'Retirement and cleanup verification belong to individual retained records. '
+        'Pending, held and deferred entries are not successful measurements.</p>'
+        '<div class="table-scroll"><table><thead><tr><th>Run</th><th>State</th><th>Phase</th>'
+        '<th>Details</th><th>Retirement recorded</th></tr></thead><tbody>' + ''.join(rows) +
+        '</tbody></table></div></section>')
+    if not records:
+        empty = ('Discovery and processing completed; no retained public records were found.'
+                 if index['processing_complete'] and not index['observations'] and index['active']['state'] == 'idle'
+                 else 'No public records are available to display in this snapshot. See the observations below.')
+        status = '<p>' + empty + '</p>' + status
+    return render_aws_benchmarks(records, retained=True, status=status, footer=(
+        '<p>Reader revision: <code>' + html.escape(reader_revision) + '</code><br>'
+        'Snapshot inventory SHA256: <code>' + html.escape(inventory_sha256) + '</code></p>'))
+
+
+def render_aws_benchmarks(records, *, retained=False, status='', footer=''):
+    """Render frozen public JSON only; retained HTML and binaries are never inputs."""
+    from infra.aws_benchmark import production_export
+    title = 'AWS benchmarks · retained records' if retained else 'AWS benchmark history'
+    retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
+                 'This view is not permanent history.</p>' if retained else '')
     pages, rows = {}, []
     for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
-        value = production_export.validate_public(production_publish.collection.results.json_value(
+        value = production_export.validate_public(production_export.results.json_value(
             raw, production_export.MAX_PUBLIC_RECORD))
         identity = value['identity']
         report = Path('aws-benchmarks/runs') / (run_key + '.html')
         record = Path('aws-benchmarks/records') / (run_key + '.json')
         pages[record] = raw.decode('utf-8')
-        pages[report] = production_export.render(value) + (
-            '<p><a href="../index.html">AWS benchmark history</a> · '
+        pages[report] = production_export.render(value) + retention + (
+            '<p><a href="../index.html">' + html.escape(title) + '</a> · '
             f'<a href="../records/{run_key}.json">Public JSON record</a> · '
             '<a href="../../index.html#top">RCP Tools</a></p>')
         qualification = production_export.projection.outcome_label(value)
@@ -278,13 +320,13 @@ def aws_benchmark_pages(repository):
         cells = '<td><a href="runs/' + run_key + '.html">' + html.escape(fields[0]) + '</a></td>'
         cells += ''.join('<td>' + html.escape(field) + '</td>' for field in fields[1:])
         rows.append('<tr>' + cells + '</tr>')
-    pages[Path('aws-benchmarks/index.html')] = f'''<!doctype html>
+    pages[Path('aws-benchmarks/index.html')] = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AWS benchmark history · RCP Tools</title>{read_theme()}
+<title>{html.escape(title)} · RCP Tools</title>{read_theme()}
 <link rel="stylesheet" href="../assets/site.css"><link rel="stylesheet" href="../assets/report.css"></head>
 <body><a class="skip-link" href="#report-content">Skip to report</a>
 {site_header(Path('aws-benchmarks/index.html'), has_aws_history=True)}
-<main id="report-content"><h1>AWS benchmark history</h1>
+<main id="report-content"><h1>{html.escape(title)}</h1>{retention}
 <p>Retired AWS runs with verified resource termination. Failed consistency checks and unavailable evidence remain
 visible and are excluded from performance history. These records are separate from historical Depot measurements.</p>
 <p>{html.escape(production_export.projection.MEASUREMENT_CAVEAT)}</p>
@@ -292,13 +334,45 @@ visible and are excluded from performance history. These records are separate fr
 establish broad variance. Compare only matching workload and measurement contracts.</p>
 <div class="table-scroll"><table><thead><tr><th>Run</th><th>Collected at</th><th>Suite</th>
 <th>Comparison</th><th>Qualification</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
-<p>History commit: <code>{html.escape(commit)}</code></p></main></body></html>
-'''
+{status}{footer}</main></body></html>
+"""
     return pages
 
 
-def build(root, output, *, has_dashboard=False, aws_history=None):
+def refresh_aws_output(directory):
+    """Refresh only generated AWS pages in a job-owned output without concurrent writers.
+
+    Observed symlinks and special files are rejected before deletion. These pathname
+    checks do not provide a general atomic filesystem snapshot against hostile races.
+    """
+    if not directory.exists() and not directory.is_symlink():
+        return
+    if not stat.S_ISDIR(directory.lstat().st_mode):
+        raise ValueError('Generated AWS output must be a real directory')
+    pending = [directory]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISDIR(mode):
+                    pending.append(Path(entry.path))
+                elif not stat.S_ISREG(mode):
+                    raise ValueError('Generated AWS output contains a symlink or special file')
+    shutil.rmtree(directory)
+
+
+def build(root, output, *, has_dashboard=False, aws_history=None, aws_records=None,
+          aws_reader_revision=None, aws_inventory_sha256=None):
     """Build the public project pages while preserving history under ci-benchmarks/."""
+    proof = (aws_records, aws_reader_revision, aws_inventory_sha256)
+    if any(value is not None for value in proof) and not all(value is not None for value in proof):
+        raise ValueError('--aws-records, --aws-reader-revision and --aws-inventory-sha256 are required together')
+    if aws_history is not None and aws_records is not None:
+        raise ValueError('Choose retained AWS records or legacy AWS history, not both')
+    if aws_records is not None:
+        source, destination = Path(aws_records).resolve(), output.resolve()
+        if source.is_relative_to(destination) or destination.is_relative_to(source):
+            raise ValueError('Retained AWS input and generated output directories must not overlap')
     root = root.resolve()
     sources = sorted((root / 'docs/reports').glob('*.md'))
     if root / 'docs/reports/README.md' not in sources:
@@ -308,7 +382,8 @@ def build(root, output, *, has_dashboard=False, aws_history=None):
     dashboard = output / 'ci-benchmarks/index.html'
     if has_dashboard and not dashboard.is_file():
         raise ValueError(f'Missing benchmark dashboard: {dashboard}')
-    pages = aws_benchmark_pages(aws_history) if aws_history is not None else {}
+    pages = (retained_aws_benchmark_pages(aws_records, aws_reader_revision, aws_inventory_sha256)
+             if aws_records is not None else aws_benchmark_pages(aws_history) if aws_history is not None else {})
     has_aws_history = bool(pages)
     assets, headings, sections = {}, {}, {}
     for source, route in routes.items():
@@ -343,6 +418,8 @@ def build(root, output, *, has_dashboard=False, aws_history=None):
     for destination, source in assets.items():
         if not source.is_file():
             raise ValueError(f'Missing report asset: {source}')
+    if aws_records is not None:
+        refresh_aws_output(output / 'aws-benchmarks')
     for route, text in pages.items():
         target = output / route
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -361,10 +438,15 @@ def main():
     parser.add_argument('--with-benchmark-history', action='store_true',
                         help='require an existing dashboard under the output directory\'s ci-benchmarks/')
     parser.add_argument('--aws-history', type=Path,
-                        help='optional bare Git repository with the fixed aws-benchmark-history ref')
+                        help='legacy read-only bare Git repository with the fixed aws-benchmark-history ref')
+    parser.add_argument('--aws-records', type=Path, help='proof-bound directory of retained AWS public records')
+    parser.add_argument('--aws-reader-revision', help='exact trusted reader revision for --aws-records')
+    parser.add_argument('--aws-inventory-sha256', help='trusted predecessor inventory digest for --aws-records')
     args = parser.parse_args()
     try:
-        count = build(args.root, args.output, has_dashboard=args.with_benchmark_history, aws_history=args.aws_history)
+        count = build(args.root, args.output, has_dashboard=args.with_benchmark_history, aws_history=args.aws_history,
+                      aws_records=args.aws_records, aws_reader_revision=args.aws_reader_revision,
+                      aws_inventory_sha256=args.aws_inventory_sha256)
     except (OSError, ValueError) as error:
         parser.exit(1, f'report site: {error}\n')
     print(f'Wrote {count} project pages to {args.output}')

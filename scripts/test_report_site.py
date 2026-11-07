@@ -59,11 +59,11 @@ class ReportSiteTests(unittest.TestCase):
             '| Scope | Recipe | Wall time (s) |\n| --- | --- | --- |\n'
             '| Local | rcp auto | 2.484 |\n| Local | cp | 2.497 |\n')
 
-    def build(self, *flags):
+    def build(self, *flags, env=None):
         return subprocess.run(
-            [sys.executable, str(Path(__file__).with_name('report_site.py')),
+            [sys.executable, '-B', str(Path(__file__).with_name('report_site.py')),
              '--root', str(self.repo), '--output', str(self.output), *flags],
-            text=True, capture_output=True,
+            text=True, capture_output=True, env=env,
         )
 
     def aws_record(self, run='123', *, passed=True):
@@ -102,6 +102,261 @@ class ReportSiteTests(unittest.TestCase):
         commit = git('commit-tree', outer, '-m', 'Offline public history')
         git('update-ref', 'refs/heads/aws-benchmark-history', commit)
         return repository
+
+    def retained_batch(self, records=(), **updates):
+        from infra.aws_benchmark.production_publish import inventory
+        directory = Path(tempfile.mkdtemp(prefix='retained-', dir=self.root))
+        entries = []
+        for value in records:
+            raw = json.dumps(value, separators=(',', ':')).encode()
+            (directory / (value['run_key'] + '.json')).write_bytes(raw)
+            entries.append(dict(run_key=value['run_key'], sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw)))
+        index = dict(schema='rcp-production-retained-reports-v1', repository_id='655073755',
+            reader_revision='c' * 40, observed_at='2026-11-07T12:00:00+00:00', retention_days=90,
+            discovery_complete=True, processing_complete=True, active=dict(state='idle', retired=False),
+            observations=[dict(state='ready', retired=True, run_key=item['run_key']) for item in entries], records=entries)
+        index.update(updates)
+        (directory / 'index.json').write_text(json.dumps(index))
+        return directory, index['reader_revision'], inventory(directory)
+
+    def build_retained(self, batch, *flags, **kwargs):
+        directory, revision, digest = batch
+        return self.build('--aws-records', str(directory), '--aws-reader-revision', revision,
+                          '--aws-inventory-sha256', digest, *flags, **kwargs)
+
+    def assert_site_links_resolve(self):
+        for page in self.output.rglob('*.html'):
+            for tag, attrs in Elements(page.read_text()).tags:
+                value = attrs.get('href') if tag in {'a', 'link'} else attrs.get('src')
+                if not value:
+                    continue
+                url = urlsplit(value)
+                if url.scheme or url.netloc:
+                    continue
+                self.assertFalse(url.path.startswith('/'), value)
+                target = (page.parent / unquote(url.path)).resolve() if url.path else page
+                if target.is_dir():
+                    target /= 'index.html'
+                self.assertTrue(target.is_file(), (page, value))
+                if url.fragment and target.suffix == '.html':
+                    self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
+
+    def test_retained_directory_cli_uses_no_git_and_preserves_frozen_json_and_links(self):
+        value = self.aws_record()
+        value.update(schema='rcp-production-public-report-v3', qualification_outcome='passed',
+                     collected_at='2026-11-06T18:00:00+00:00', timestamp='1999-01-01T00:00:00Z')
+        batch = self.retained_batch([value])
+        result = self.build_retained(batch, env=dict(os.environ, PATH=''))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('Still-retained records under the 90-day AWS lifecycle; deletion timing can vary.', index)
+        self.assertNotIn('Rolling 90-day', index)
+        self.assertIn('not permanent history', index)
+        self.assertIn('Reader revision', index)
+        self.assertIn(batch[2], index)
+        self.assertNotIn('History commit', index)
+        self.assertIn('2026-11-06T18:00:00+00:00', index)
+        self.assertNotIn('1999-01-01', index)
+        self.assertIn('not independently attested', index)
+        self.assertIn('does not prove content integrity', index)
+        self.assertIn('href="aws-benchmarks/index.html">AWS benchmarks', (self.output / 'index.html').read_text())
+        copied = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
+        self.assertEqual(copied.read_bytes(), (batch[0] / copied.name).read_bytes())
+        detail = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
+        self.assertIn('Collected at', detail)
+        self.assertIn(value['collected_at'], detail)
+        self.assertNotIn('1999-01-01', detail)
+        self.assert_site_links_resolve()
+
+    def test_complete_empty_retained_snapshot_is_visible_and_honest(self):
+        result = self.build_retained(self.retained_batch())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('Discovery and processing completed; no retained public records were found.', page)
+        self.assertIn('Discovery: complete. Record processing: complete.', page)
+        self.assertIn('<td>idle</td>', page)
+        self.assertNotIn('History commit', page)
+        self.assertIn('AWS benchmarks', (self.output / 'reports/index.html').read_text())
+        self.assert_site_links_resolve()
+
+    def test_held_pending_and_deferred_snapshot_is_not_empty_success_and_escapes_data(self):
+        active = dict(state='pending', retired=False, run_key='repo-655073755-run-123',
+                      phase='<script>phase</script>', reason='Waiting & watching "lease"')
+        observations = [dict(state='held', retired=False, run_key='repo-655073755-run-124',
+                             reason='<img src=x onerror=alert(1)>'),
+                        dict(state='deferred', retired=False, run_key='repo-655073755-run-125',
+                             reason='Remaining records need a later snapshot')]
+        result = self.build_retained(self.retained_batch(active=active, observations=observations, processing_complete=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('No public records are available to display', page)
+        self.assertNotIn('no retained public records were found', page)
+        self.assertIn('Record processing: incomplete', page)
+        self.assertIn('not a fresh physical teardown check', page)
+        for state in ('pending', 'held', 'deferred'):
+            self.assertIn('<td>' + state + '</td>', page)
+        self.assertIn('&lt;script&gt;phase&lt;/script&gt;', page)
+        self.assertIn('&lt;img src=x onerror=alert(1)&gt;', page)
+        self.assertIn('Waiting &amp; watching &quot;lease&quot;', page)
+        self.assertNotIn('<script>phase', page)
+        self.assertFalse(any('onerror' in attrs for _, attrs in Elements(page).tags))
+        self.assert_site_links_resolve()
+
+    def test_retained_directory_requires_all_proofs_and_rejects_legacy_ambiguity(self):
+        batch = self.retained_batch()
+        choices = [('--aws-records', str(batch[0])), ('--aws-reader-revision', batch[1]),
+                   ('--aws-inventory-sha256', batch[2])]
+        for omitted in range(3):
+            flags = [item for index, pair in enumerate(choices) if index != omitted for item in pair]
+            with self.subTest(omitted=omitted):
+                result = self.build(*flags)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('required together', result.stderr)
+                self.assertFalse(self.output.exists())
+        result = self.build_retained(batch, '--aws-history', str(self.root / 'absent.git'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not both', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_retained_directory_rejects_proof_or_public_record_mismatch_before_output(self):
+        from infra.aws_benchmark.production_publish import inventory
+        batch = self.retained_batch([self.aws_record()])
+        for revision, digest in (('d' * 40, batch[2]), (batch[1], '0' * 64), ('invalid', batch[2]), (batch[1], 'invalid')):
+            with self.subTest(revision=revision, digest=digest):
+                result = self.build_retained((batch[0], revision, digest))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
+        path = batch[0] / (self.aws_record()['run_key'] + '.json')
+        value = json.loads(path.read_text())
+        value['private'] = '<script>private retained data</script>'
+        path.write_text(json.dumps(value))
+        index_path = batch[0] / 'index.json'
+        index = json.loads(index_path.read_text())
+        index['records'][0].update(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+        index_path.write_text(json.dumps(index))
+        result = self.build_retained((batch[0], batch[1], inventory(batch[0])))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_retained_directory_rejects_unavailable_discovery_and_unbounded_observations(self):
+        for changes in (dict(discovery_complete=False),
+                        dict(active=dict(state='held', retired=False, reason='x' * 513))):
+            with self.subTest(changes=changes):
+                result = self.build_retained(self.retained_batch(**changes))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
+
+    def test_retained_directory_rejects_symlinks_extra_html_and_oversized_record(self):
+        from infra.aws_benchmark.production_export import MAX_PUBLIC_RECORD
+        from infra.aws_benchmark.production_publish import inventory
+        batch = self.retained_batch()
+        alias = self.root / 'retained-link'
+        alias.symlink_to(batch[0], target_is_directory=True)
+        result = self.build_retained((alias, batch[1], batch[2]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+        extra = batch[0] / 'retained.html'
+        extra.write_text('<script>never execute or publish</script>')
+        result = self.build_retained((batch[0], batch[1], inventory(batch[0])))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+        extra.unlink()
+        value = self.aws_record()
+        batch = self.retained_batch([value])
+        path = batch[0] / (value['run_key'] + '.json')
+        outside = self.root / 'outside-record.json'
+        outside.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(outside)
+        result = self.build_retained(batch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+        path.unlink()
+        path.write_bytes(b' ' * (MAX_PUBLIC_RECORD + 1))
+        result = self.build_retained((batch[0], batch[1], inventory(batch[0])))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_retained_public_values_are_escaped_and_unavailable_outcomes_keep_their_meaning(self):
+        value = self.aws_record('125', passed=False)
+        value.update(schema='rcp-production-public-report-v3', qualification_outcome='evidence-unavailable',
+                     collected_at='2026-11-06T18:00:00+00:00')
+        value['identity']['suite'] = '<script>suite</script>'
+        value['comparison'] = '<img src=x onerror=alert(1)>'
+        result = self.build_retained(self.retained_batch([value]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for relative in ('aws-benchmarks/index.html', 'aws-benchmarks/runs/' + value['run_key'] + '.html'):
+            text = (self.output / relative).read_text()
+            self.assertIn('&lt;script&gt;suite&lt;/script&gt;', text)
+            self.assertNotIn('<script>suite', text)
+            self.assertNotIn('<img src=x', text)
+            self.assertIn('unavailable; workload outcome unknown', text)
+            self.assertNotIn('failed; excluded from performance history', text)
+
+    def test_retained_refresh_removes_expired_records_but_preserves_depot_and_docs(self):
+        self.test_preserves_existing_benchmark_dashboard()
+        depot = {p.name: p.read_bytes() for p in (self.output / 'ci-benchmarks').iterdir()}
+        value = self.aws_record()
+        first = self.build_retained(self.retained_batch([value]), '--with-benchmark-history')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        old = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
+        old_page = self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')
+        self.assertTrue(old.exists())
+        report = (self.output / 'reports/performance/index.html').read_bytes()
+        second = self.build_retained(self.retained_batch(), '--with-benchmark-history')
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(old.exists())
+        self.assertFalse(old_page.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in (self.output / 'ci-benchmarks').iterdir()}, depot)
+        self.assertEqual((self.output / 'reports/performance/index.html').read_bytes(), report)
+        self.assert_site_links_resolve()
+
+    def test_invalid_retained_input_preserves_existing_generated_site(self):
+        batch = self.retained_batch([self.aws_record()])
+        result = self.build_retained(batch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before = {p.relative_to(self.output): p.read_bytes() for p in self.output.rglob('*') if p.is_file()}
+        result = self.build_retained((batch[0], batch[1], '0' * 64))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual({p.relative_to(self.output): p.read_bytes() for p in self.output.rglob('*') if p.is_file()}, before)
+
+    def test_retained_input_and_output_overlap_is_rejected_without_changing_evidence(self):
+        batch = self.retained_batch([self.aws_record()])
+        before = {p.name: p.read_bytes() for p in batch[0].iterdir()}
+        for output in (batch[0], batch[0] / 'site', batch[0].parent):
+            with self.subTest(output=output):
+                result = self.build_retained(batch, '--output', str(output))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('must not overlap', result.stderr)
+                self.assertEqual({p.name: p.read_bytes() for p in batch[0].iterdir()}, before)
+        self.assertFalse((batch[0] / 'site').exists())
+
+    def test_retained_refresh_rejects_output_symlinks_and_special_files_without_deleting_targets(self):
+        batch = self.retained_batch()
+        self.output.mkdir()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        sentinel = outside / 'keep.txt'
+        sentinel.write_text('preserve')
+        target = self.output / 'aws-benchmarks'
+        target.symlink_to(outside, target_is_directory=True)
+        result = self.build_retained(batch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sentinel.read_text(), 'preserve')
+        target.unlink()
+        target.mkdir()
+        child = target / 'unsafe'
+        child.symlink_to(sentinel)
+        result = self.build_retained(batch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sentinel.read_text(), 'preserve')
+        child.unlink()
+        if hasattr(os, 'mkfifo'):
+            os.mkfifo(child)
+            result = self.build_retained(batch)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(child.exists())
+        self.assertFalse((self.output / 'index.html').exists())
 
     def test_aws_history_navigation_requires_actual_records(self):
         for records in (None, {}):

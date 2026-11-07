@@ -159,91 +159,72 @@ verdict. Partial sets from an older collector without a checkpoint also require 
 they are never silently omitted or adopted. Completed older manifests remain readable. A missing
 derived object whose renderer has changed requires compatible code to reproduce its committed bytes.
 
-Already-published history is never rewritten. Public v1 success/failure records and v2's distinct
-evidence-unavailable outcome remain readable. New v3 records carry a canonical collector-recorded
-`collected_at`; old records display no trusted collection time instead of presenting the
-candidate-controlled harness timestamp as trusted. A bounded diagnostic report can describe a failed
-archive while preserving its exact raw bytes. The local publication helpers discover only retired
-manifests, bind each to a consistent closed tombstone, and download exact retained versions through
-read-only clients. Discovery traverses the full retained prefix within page/count/time bounds; it is
-not an atomic snapshot, and later scans must revisit the prefix. A separate consistent
-active-pointer observation describes pending ownership before a manifest exists, without claiming
-physical teardown or a cross-service snapshot.
+### Keyless retained reporting
 
-A separate bounded bundle format binds the downloader revision and repository for credential-free
-processing. The public exporter renders escaped allowlisted fields and never publishes retained
-HTML. Failed qualifications retain diagnostics without performance measurements. Exact source replay
-preserves historical output without today's measurement parser. The history repository is trusted
-prior exporter storage: the retirement digest binds source evidence, not arbitrary edited
-measurement bytes. An embedded checksum would not replace that trust. The manual and separately
-schedule-gated `aws-benchmark-publish.yml` workflow separates three jobs: read-only AWS download,
-credential-free export, and a GitHub history writer. Each transfer uses the exact current-run
-artifact ID and a complete inventory digest passed through trusted job outputs. The embedded reader
-revision is an additional binding, not independent authentication. Raw handoff artifacts have
-one-day retention and the repository's normal Actions artifact access; they are never committed to
-history.
+Public v1 success/failure records, v2's distinct evidence-unavailable outcome and v3's canonical
+collector-recorded `collected_at` remain readable. Older records show no trusted collection time;
+they never promote the candidate-controlled harness timestamp. Measurements remain self-reported and
+unattested: candidate binaries share the harness UID and can forge their output. Verified cleanup
+describes independent teardown evidence only. Metadata validation does not establish content
+integrity.
 
-Discovery is complete within its page/count bounds. Processing uses a 512 MiB aggregate byte budget
-and a ten-minute budget checked between runs, within a fifteen-minute job timeout. Completed subsets
-can publish while remaining runs are explicitly deferred. Subsequent scans skip already-published
-retirement digests without downloading raw archives again. Pending, held and deferred observations
-appear in workflow summaries and do not enter performance history. History has a separate
-2,000-record, 64 MiB bound; reaching a bound requires deliberate maintenance rather than silently
-dropping data.
+The initial dashboard uses objects still retained under the existing **90-day AWS lifecycle**.
+Lifecycle expiration makes objects eligible for deletion; it is not an exact deletion time or a
+strict timestamp filter. This is not permanent history. A later complete scan removes expired
+records from the site; if reporting is stopped or held, the previously deployed static site remains
+available and can be older. Every page shows the snapshot observation time. Extending retention or
+publishing a permanent archive requires a separate decision.
 
-The writer receives only public JSON. It reads fixed Git objects in a bare repository, preserves
-identical prior records and rejects conflicting records. It creates commits through Git plumbing and
-pushes one fixed prepared commit to `aws-benchmark-history` with an exact expected-tip lease and
-three bounded attempts. The prepared commit must be a fast-forward from its recorded baseline;
-reconciliation accepts only that baseline or the exact prepared tip, never a foreign fast-forward.
-The history branch remains separate from Depot's `benchmark-history`. The job's default token is
-Contents read. A dedicated, repository-selected writer App supplies Contents write and Metadata read
-only after credential-free commit preparation finds new validated records, in the proposed main-only
-`aws-benchmark-history` environment. Its installation ID must match before use; this checks
-continuity, not drift in installation permissions or repository selection. The App token remains
-repository-scoped; protect main and review every workflow able to request the environment secret.
-See [TRUST.md](TRUST.md) for approval-delay cancellation, broader Contents-write reach, and live
-gates.
+`aws-benchmark-publish.yml` reads each frozen public projection directly. A consistent closed
+DynamoDB tombstone anchors the retirement manifest digest; an immutable-version reread binds the
+manifest, exact report/controller versions bind the projection and context, and a final consistent
+tombstone reread checks stability. This authenticates the collector's frozen bytes, not the honesty
+of the measured candidate. It does **not** download raw archives, reparse measurements, render
+retained worker HTML, recollect, retire ownership or write Git.
 
-### Publication trust gate
+The read-only download job has Contents read and OIDC request permission, with no environment so the
+existing main-ref AWS subject is preserved. It installs hash-pinned dependencies before requesting
+one 15-minute AWS reader session. It reads only through the existing publication role. No writer
+App, signing key, environment approval or `aws-benchmark-history` branch is needed by this path.
+Existing writer protections and the separately disabled legacy canary remain untouched; their
+procedures in [TRUST.md](TRUST.md) are not activation prerequisites for keyless reporting.
 
-Publication remains disabled pending the separate history-writer decision and live acceptance (F55).
-A schema-valid Git record and a retirement digest are not independent authentication of its
-measurement bytes. Another repository Contents-write credential can alter an unprotected history
-branch, including through a fast-forward commit. Do not enable publication or AWS history rendering
-by treating `RCP_AWS_HISTORY_TRUST_READY=true` alone as evidence of a protected branch. That
-repository variable defaults off and gates both publication and AWS history rendering, independently
-of `RCP_AWS_PRODUCTION_PUBLISH_ENABLED`. Publication and Pages reject reruns; submit a fresh manual
-workflow after a hold instead of executing an old revision's write path.
+A small public-JSON artifact crosses jobs by exact current-run artifact ID and a complete inventory
+digest from trusted predecessor outputs. The embedded reader revision is only a consistency check.
+The directory renderer repeats inventory, schema and identity checks with no AWS credential, secret
+or Git write token. It renders escaped allowlisted fields alongside project docs and separate Depot
+history. The handoff artifact expires after one day; AWS source retention remains 90 days.
 
-The offline integration and proposal renderer are implemented in [TRUST.md](TRUST.md); actual App,
-key, environment and ruleset setup remains separately approved work. The chosen AWS reader custody
-is tightened Secrets Manager, without a KMS implementation. Its deny-only policy renderer requires
-the exact two deployed reader roles and a recovery role selected by the user; it chooses no recovery
-principal and grants no access.
+Discovery must complete within its page/count bounds. Processing has a 512 MiB source allowance, 64
+MiB public-output bound and ten-minute budget checked between runs, within a fifteen-minute job
+timeout. Each public-record attempt reserves the maximum of two manifest reads, a controller and a
+report. Pending ownership is displayed without claiming teardown. Any held, deferred or incomplete
+scan prevents deployment and preserves the previous site; a valid empty scan publishes an explicit
+empty AWS view. There is no partial-success fallback that silently erases failed records.
 
-History protection reserves the root and all descendant names with two rulesets: an App-only
-creation/update restriction and a separate deletion/non-fast-forward prohibition with no bypass. The
-workflow's App key must be an environment secret, never shared with the AWS reader. An authorized
-operator must verify complete settings readbacks and live positive/negative canaries before setting
-the readiness flag. Other trusted main workflows can request that environment; this is not
-workflow-specific secret isolation. The initial environment policy requires owner approval, with no
-administrator bypass. A future unattended policy needs a separate decision.
+### Publication activation and deployment boundary
 
-No App, secret, policy, ruleset or environment is created by the code. Runtime tokens and repository
-flags cannot prove these settings exist. Anchoring public digests in DynamoDB remains a possible
-additional integrity layer; it does not replace this publication authorization boundary.
+This code does not enable access or publication. Keep `RCP_AWS_PRODUCTION_PUBLISH_ENABLED=false` and
+the stack's separate `PublicationEnabled=false` until an exact live read/deploy acceptance is
+approved. The latter still controls the existing role's trust and read grants. There is no new IAM
+scope, bucket, secret or App in this change. Runtime, admission, policy counters and paid execution
+remain independent. `RCP_AWS_HISTORY_TRUST_READY` is exclusively a dormant legacy writer/canary
+control and stays false; it is not a prerequisite or substitute proof for the keyless reader.
 
-Public pages distinguish consistency checks from measurement honesty. Candidate binaries share the
-harness UID and can forge measurement files; the displayed values are self-reported, unattested
-performance measurements. Verified cleanup describes independent teardown evidence only. Metadata
-validation does not establish content integrity. Do not turn these labels into an accuracy or
-performance claim without reviewing the candidate and measurement methodology.
+The owner-only main workflow can render on push, manual dispatch, or a separately gated daily poll.
+It and Pages reject reruns and stale main. A credential-free job renders and packages the full site;
+a separate `github-pages` job has Pages write/OIDC only for deployment, never AWS reads or artifact
+execution. It selects the unique immutable Pages artifact name within that same workflow run. Source
+freshness is rechecked after any deployment wait. This is a fresh observation before a network
+action, not an atomic main lock.
 
-Pages renders the public JSON with trusted main code, never retained worker HTML. AWS navigation
-appears only when valid AWS history exists. Neither publication nor Pages launches a benchmark. The
-publication feature flag defaults off. Its read-only AWS role has a separate `PublicationEnabled`
-gate, also false by default; enabling it requires specific deployment approval.
+`RCP_BENCHMARK_PAGES` stays an independent gate. While keyless publication is enabled, direct
+docs-only Pages runs skip deployment so they cannot replace the dashboard with a site lacking AWS
+records. The keyless workflow builds the whole site instead. Non-owner pushes cannot assume the
+owner-bound AWS role, so they leave the old site until the next authorized owner manual/scheduled
+refresh. Quiesce pending Pages/reporting runs before changing mode flags: job-context variable reads
+are defense in depth, not an atomic live settings lock. Do not enable the legacy writer lane
+alongside this mode. Neither reporting path launches a benchmark.
 
 ## Storage and privileges
 
@@ -597,14 +578,13 @@ References:
 7. Verify one complete A/A acceptance through retained collection and ownership retirement,
    including cancelled/failed producer recovery. Prepare the exact read-only reporting role and
    non-secret `RCP_AWS_PRODUCTION_PUBLISH_ROLE` / `RCP_AWS_PRODUCTION_TABLE` variables under
-   separate approval; reporting shares the production region/bucket variables. Keep both
-   `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and `RCP_AWS_HISTORY_TRUST_READY` explicitly false through
-   TRUST.md's present-key readback and writer canary. After those live gates pass, separately
-   approve the `PublicationEnabled` deployment gate and enable publication/readiness together, with
-   canary disabled. Verify the publication-phase readback before the first publication. Pages
-   retains its independent `RCP_BENCHMARK_PAGES` flag. The declared recurring paths below remain
-   gated; broader comparisons, operating allowances and actual activation are separate decisions. Do
-   not call this initial acceptance foundation a complete production cutover.
+   separate approval; reporting shares the production region/bucket variables. Approve the
+   `PublicationEnabled` deployment gate and a single keyless reporting acceptance separately. Reuse
+   a retained qualification: verify exact frozen records, allowed/denied reads, no AWS writes or
+   workers, complete directory rendering and the expected Pages deployment. Restore disabled gates
+   after acceptance unless recurring read-only reporting is explicitly authorized. Preserve the
+   legacy writer/canary flags false. Broader comparisons, operating allowances and recurring paid
+   activation are separate decisions; a reporting success is not paid-run acceptance.
 
 ### Disabled recurring orchestration
 
@@ -633,15 +613,13 @@ for a new month or to make an attempt fit. The development ceiling does not esta
 monthly operating allowance. Price evidence still expires after 31 days. No controller or workflow
 gets automatic policy-edit or credential-refresh authority.
 
-The separate publication workflow proposes a daily 09:43 UTC poll. It requires the existing
-publication/readiness flags plus `RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED=true`; its manual
-`reader-test` and the history canary cannot run on a schedule. It downloads only retired evidence,
-never launches work, and keeps the same current-main, exact artifact/inventory, exact-tip lease and
-protected writer environment checks. The owner approval requirement stays in place: this code does
-not make history publishing unattended or change any environment, App, secret or ruleset. Empty
-batches do not request a writer token or owner approval. A batch with new records can wait for the
-owner, and its one-day handoff retention still applies. Fully unattended publication requires an
-explicit later protection-policy decision, not merely setting a repository flag.
+The separate keyless reporting workflow declares a daily 09:43 UTC poll behind
+`RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and the independent
+`RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED=true`. It reads retained frozen reports and never
+launches work. Main-only owner identity, exact artifact/inventory bindings and complete-scan
+requirements still apply. Its `reader-test` remains manual-only. Read-only schedule activation and
+its operating allowance still require approval; this code neither changes live flags nor enables
+recurring benchmarks. No history writer key or per-report environment approval is needed.
 
 A scheduled submission job can finish many hours before the cloud collector retires ownership. The
 daily reporting scan revisits retained runs rather than treating the submit job conclusion as
@@ -758,10 +736,11 @@ accepted across invocations. Admission failures and collector holds emit bounded
 diagnostics without tokens, upload URLs or SDK response bodies. An operator alarm/notification
 destination remains an activation decision.
 
-The dormant scheduled policy requires its fixed baseline to equal main for this initial A/A
-contract; it is not a working recurring comparison policy as main advances. Keep schedule slots
-empty. A future scheduled contract, baseline selection and operating budget need their own tests and
-approval before adding a timer.
+The disabled scheduled `triggering-main-aa` policy binds both sides to the authenticated triggering
+main commit. A frozen fixed baseline is still valid only for its exact manual A/A commit; A/B
+comparisons are not supported. Server slots remain empty until exact cadence, counter limits,
+notification and operating-budget decisions pass their acceptance gates. No timer or budget is
+changed by this reporting work.
 
 Rollback closes admission and preserves the independent watchdog/collector while active work
 reconciles. Restore an older compatible package only after checking its state schema and immutable
