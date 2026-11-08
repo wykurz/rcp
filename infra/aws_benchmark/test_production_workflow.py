@@ -15,7 +15,7 @@ class ProductionWorkflowTests(unittest.TestCase):
 
     def test_only_owner_manual_or_explicitly_enabled_schedule_can_build(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
-        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "17 8 * * 2,5"}])
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "17 8 * * 1,5"}])
         guard = self.workflow["jobs"]["validate"]["if"]
         for check in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                       "github.event_name == 'workflow_dispatch'", "vars.RCP_AWS_PRODUCTION_ENABLED == 'true'",

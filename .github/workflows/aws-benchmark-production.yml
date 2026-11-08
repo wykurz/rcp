@@ -4,7 +4,7 @@ name: AWS production benchmark
 on:
   schedule:
     # proposed two-slot UTC cadence; no job runs until the separate schedule gate is true
-    - cron: '17 8 * * 2,5'
+    - cron: '17 8 * * 1,5'
   workflow_dispatch:
     inputs:
       mode:
