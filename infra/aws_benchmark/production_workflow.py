@@ -5,7 +5,6 @@ source builds never receive OIDC or service credentials. A scheduled run always
 builds the signed triggering main revision once for both A/A sides.
 """
 
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -19,12 +18,9 @@ WORKFLOW = "wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads
 
 
 REGULAR_CRON = "17 8 * * 1,5"
-COMMISSIONING_CRON = "17 7 8 11 *"
-COMMISSIONING_START = datetime(2026, 11, 8, 7, 17, tzinfo=timezone.utc)
-COMMISSIONING_END = datetime(2026, 11, 8, 7, 47, tzinfo=timezone.utc)
 
 
-def source(environment, now=None):
+def source(environment):
     require(environment.get("GITHUB_REPOSITORY") == REPOSITORY
             and environment.get("GITHUB_REPOSITORY_ID") == REPOSITORY_ID
             and environment.get("GITHUB_REF") == "refs/heads/main"
@@ -45,12 +41,8 @@ def source(environment, now=None):
         require(environment.get("RCP_SCHEDULE_ENABLED") == "true", "scheduled admission is disabled")
         require(requested == "", "scheduled requests cannot select another revision")
         event_schedule = environment.get("RCP_EVENT_SCHEDULE")
-        require(event_schedule in (REGULAR_CRON, COMMISSIONING_CRON),
+        require(event_schedule == REGULAR_CRON,
                 "unknown or missing scheduled event context")
-        if event_schedule == COMMISSIONING_CRON:
-            current_time = datetime.now(timezone.utc) if now is None else now
-            require(COMMISSIONING_START <= current_time <= COMMISSIONING_END,
-                    "temporary commissioning schedule is outside its approved window")
         revision = current
     else:
         raise ValueError("only owner manual and approved scheduled requests are supported")

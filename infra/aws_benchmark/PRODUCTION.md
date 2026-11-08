@@ -586,23 +586,16 @@ References:
    legacy writer/canary flags false. Broader comparisons, operating allowances and recurring paid
    activation are separate decisions; a reporting success is not paid-run acceptance.
 
-### Disabled recurring orchestration
+### Recurring orchestration
 
-The proposed benchmark cron is Monday and Friday at 08:17 UTC. It does not select approved operating
-slots or authorize spending by being present in YAML. Scheduled builds need both
+The benchmark cron is Monday and Friday at 08:17 UTC. It does not select approved operating slots or
+authorize spending by being present in YAML. Scheduled builds need both
 `RCP_AWS_PRODUCTION_ENABLED=true` and `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED=true`, owner actor ID
 `483465`, main and attempt 1. The early credential-free CLI rejects other events, actors, refs, runs
 and caller-selected scheduled revisions. A scheduled build uses the triggering main SHA once for
 both A/A sides; it receives no OIDC, environment secret or shared candidate cache. Submission still
 passes the original signed identity, authenticated GitHub run metadata and transactional admission
 checks. No PR, push, fork, comment or `workflow_run` event is a paid trigger.
-
-A temporary commissioning cron also targets November 8 at 07:17 UTC. It exercises the real
-`schedule` event after a separately approved activation, not a manual dispatch. Its early guard
-accepts only November 8, 2026 through the 30-minute scheduling-delay window. Central admission still
-requires the matching third UTC slot, owner/main identity, an unused slot and the normal daily,
-budget and single-worker limits. Missed or delayed-outside-window events do not authorize another
-run. Remove this temporary cron and server slot after the test retires; retain Monday/Friday.
 
 The server policy is independently required. `scheduled_baseline` accepts either its existing
 40-character approved SHA, or the explicit server-only tagged value `triggering-main-aa`. Existing
