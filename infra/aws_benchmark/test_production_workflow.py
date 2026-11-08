@@ -16,7 +16,7 @@ class ProductionWorkflowTests(unittest.TestCase):
     def test_only_owner_manual_or_explicitly_enabled_schedule_can_build(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
         self.assertEqual(self.workflow["on"]["schedule"],
-                         [{"cron": "17 8 * * 1,5"}, {"cron": "17 5 8 11 *"}])
+                         [{"cron": "17 8 * * 1,5"}, {"cron": "17 7 8 11 *"}])
         guard = self.workflow["jobs"]["validate"]["if"]
         for check in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                       "github.event_name == 'workflow_dispatch'", "vars.RCP_AWS_PRODUCTION_ENABLED == 'true'",
@@ -54,7 +54,7 @@ class ProductionWorkflowTests(unittest.TestCase):
             self.assertEqual(source(env, at), env["GITHUB_SHA"])
         for at in (COMMISSIONING_START - timedelta(seconds=1),
                    COMMISSIONING_END + timedelta(seconds=1),
-                   datetime(2027, 11, 8, 5, 17, tzinfo=timezone.utc)):
+                   datetime(2027, 11, 8, 7, 17, tzinfo=timezone.utc)):
             with self.subTest(at=at), self.assertRaisesRegex(ValueError, "commissioning schedule"):
                 source(env, at)
         env["RCP_EVENT_SCHEDULE"] = "17 8 * * 1,5"
