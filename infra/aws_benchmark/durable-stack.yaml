@@ -14,7 +14,7 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['false', 'true']
-    Description: Permit new submissions; disabling admission leaves an activated watchdog running.
+    Description: Retained compatibility parameter; the retired GitHub role stays denied for either value.
   WorkerSubnetId:
     Type: AWS::EC2::Subnet::Id
   WorkerSecurityGroupId:
@@ -466,6 +466,7 @@ Resources:
             Type: Fail
             Error: DurableLeaseIncomplete
             Cause: Inspect the lease receipt and independent cleanup; do not resubmit blindly.
+  # retired GitHub lane; preserve the role and cleanup services without a reactivation switch
   GitHubSubmitRole:
     Type: AWS::IAM::Role
     Properties:
@@ -473,7 +474,7 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
+          - Effect: Deny
             Principal: {Federated: {Ref: GitHubOidcProviderArn}}
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
@@ -485,20 +486,20 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: {Fn::If: [Admitting, Allow, Deny]}
+              - Effect: Deny
                 Action: states:StartExecution
                 Resource: {Ref: CoordinatorStateMachine}
-              - Effect: Allow
+              - Effect: Deny
                 Action: states:DescribeExecution
                 Resource: {Fn::Sub: 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${CoordinatorStateMachine.Name}:*'}
-              - Effect: Allow
+              - Effect: Deny
                 Action: s3:GetObject
                 Resource:
                   - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/control/durable-request.json'}
                   - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/durable-receipt.json'}
                   - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/status.json'}
                   - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/output/results.zip'}
-              - Effect: Allow
+              - Effect: Deny
                 Action: s3:PutObject
                 Resource:
                   - {Fn::Sub: 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/input/baseline/rcp'}

@@ -1,9 +1,22 @@
 # Durable capacity acquisition
 
+This is the historical direct-launch path. Its GitHub submit/collect role is retired: the template
+now denies session issuance and every former submission, staging and result action even when the
+runtime and admission flags are enabled. Use [production orchestration](PRODUCTION.md) for new runs.
+The procedures below remain as historical protocol and recovery documentation; they do not
+reactivate the GitHub lane.
+
+This source change does not revoke access on an existing deployment. Before a separately approved
+live retirement, reconcile its producers, lease, instances, roots and cutoff delivery. Inspect the
+actual deployed template and require a role-only, non-replacing change; deployed environment
+subjects may differ from this source. Preserve retained evidence, service roles and independent
+cleanup protection. An authorized AWS operator can still inspect old evidence without this GitHub
+role.
+
 The optional direct-launch protocol waits up to **12 hours for capacity** and gives an allocated
 worker at most **180 minutes from the start of its launch attempt**, including boot. It is manual
 and disabled by default. Deploying the default template starts no worker and schedules no benchmark.
-The existing ASG operator-window workflow and historical result formats remain supported.
+Historical result formats and existing AWS recovery paths remain available.
 
 This path replaces ASG acquisition for the durable request. It does not raise the existing ASG's
 maximum or give GitHub EC2 permissions. A dedicated coordinator gains restricted EC2 launch
@@ -25,11 +38,11 @@ hashing are disabled. Path, type, count, size and required metadata checks, copy
 timeouts still apply; these checks do not prove content integrity or detect same-size corruption.
 The existing 1,200-second per-copy timeout is unchanged.
 
-A short GitHub job uploads the prebuilt binaries and starts one Standard Step Functions execution.
-Its name binds the original workflow run ID and attempt. GitHub does not hold credentials or a
-hosted runner open during the capacity wait. A separate manual collection workflow fetches partial
-or terminal evidence. Submission is not successful qualification, and collection does not publish
-performance history. No recurring benchmark schedule is introduced.
+Historically, a short GitHub job uploaded the prebuilt binaries and started one Standard Step
+Functions execution. Its name binds the original workflow run ID and attempt. GitHub does not hold
+credentials or a hosted runner open during the capacity wait. A separate manual collection workflow
+fetches partial or terminal evidence. Submission is not successful qualification, and collection
+does not publish performance history. No recurring benchmark schedule is introduced.
 
 The coordinator persists the exact launch parameters, idempotency token, attempt ID, start time and
 deadline before calling `RunInstances`. Region, subnet and all parameters stay fixed for that
@@ -204,13 +217,13 @@ in chat, the repository or GitHub settings.
    deployed IAM behavior. Review encrypted-AMI launch prerequisites without expanding key policy or
    changing account defaults to work around an incompatible image.
 
-`AdmissionEnabled=false` blocks new submissions while `RuntimeEnabled=true` keeps both the guard and
-existing executions active, including requests still waiting for capacity. Lambda service retries
-retain the same execution and persisted allocation identity; they do not create new leases. Do not
-disable runtime supervision, update guard code/roles, change the image/template/network, delete
-schedule groups or retire the lease while an attempt is unresolved. Service-role credentials
-continue independently of the operator's SSO expiry, but deployment and subsequent manual recovery
-still require a usable operator identity.
+The retained `AdmissionEnabled` parameter no longer re-enables GitHub access for either value.
+`RuntimeEnabled=true` keeps both the guard and existing executions active, including requests still
+waiting for capacity. Lambda service retries retain the same execution and persisted allocation
+identity; they do not create new leases. Do not disable runtime supervision, update guard
+code/roles, change the image/template/network, delete schedule groups or retire the lease while an
+attempt is unresolved. Service-role credentials continue independently of the operator's SSO expiry,
+but deployment and subsequent manual recovery still require a usable operator identity.
 
 To stop an existing capacity wait, first close admission and record the exact execution ARN and
 retained request/attempt identities. An operator who already has separately authorized
@@ -265,9 +278,10 @@ receipt path. It first claims the shared mailbox, then writes an exclusive lease
 objects; it is an AWS mutation and must not run before deployment and admission approval. It does
 not itself request an instance.
 
-Approve the short durable submission job only after arming. Collect partial or final evidence later
-using `aws-benchmark-durable-collect.yml` and the original run ID-attempt. The credentialed job
-fetches bounded opaque archives; a separate job parses and qualifies them without cloud credentials.
+Historically, arming preceded approval of the short submission job, and
+`aws-benchmark-durable-collect.yml` fetched evidence for the original run ID-attempt. The retired
+GitHub role can no longer submit or fetch those archives. Recover retained objects through an
+already authorized AWS operator, then parse and qualify the bounded data without cloud credentials.
 An in-progress collection is labeled pending, not failed qualification. Cleanup evidence is retained
 even if qualification failed. Historical recorded plans remain readable; new qualification requires
 the current exact plan. Both paths use the same immutable per-version workload bounds, paired binary

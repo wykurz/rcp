@@ -588,8 +588,8 @@ References:
 
 ### Disabled recurring orchestration
 
-The proposed benchmark cron is Tuesday and Friday at 08:17 UTC. It does not select approved
-operating slots or authorize spending by being present in YAML. Scheduled builds need both
+The proposed benchmark cron is Monday and Friday at 08:17 UTC. It does not select approved operating
+slots or authorize spending by being present in YAML. Scheduled builds need both
 `RCP_AWS_PRODUCTION_ENABLED=true` and `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED=true`, owner actor ID
 `483465`, main and attempt 1. The early credential-free CLI rejects other events, actors, refs, runs
 and caller-selected scheduled revisions. A scheduled build uses the triggering main SHA once for

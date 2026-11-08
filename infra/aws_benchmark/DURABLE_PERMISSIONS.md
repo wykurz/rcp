@@ -1,17 +1,22 @@
 # Durable benchmark deployment permissions
 
-`durable-stack.yaml` is a disabled proposal for the `rcp-direct-v1` protocol. It reuses the short
-coordinator ticks, Standard state machine, lease table and independent watchdog, but replaces ASG
-runtime mutations with direct EC2 allocation and termination. It creates no instance, ASG, network,
-NAT gateway, worker profile or recurring benchmark. Deployment, activation, a new image, paid
-qualification and recurring submissions require their own explicit approval. Code changes grant no
-AWS access.
+`durable-stack.yaml` retains the historical `rcp-direct-v1` protocol and its recovery services. Its
+GitHub submit/collect role is permanently denied in this template, independently of runtime and
+admission flags. Existing deployed access changes only after a separate role-only deployment; keep
+cleanup protection active until all old work has reconciled. New GitHub runs use
+[production orchestration](PRODUCTION.md).
+
+The retained direct protocol reuses the short coordinator ticks, Standard state machine, lease table
+and independent watchdog, but replaces ASG runtime mutations with direct EC2 allocation and
+termination. It creates no instance, ASG, network, NAT gateway, worker profile or recurring
+benchmark. Deployment, activation, a new image, paid qualification and recurring submissions require
+their own explicit approval. Code changes grant no AWS access.
 
 ## Service boundaries
 
 | Principal                  | Allowed actions and scope                                                                                                                                                                                                                  | Excluded authority                                                                                                   |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| GitHub submit/collect role | Start this state machine; describe its executions; write six fixed binary objects; read the operator request and three outputs                                                                                                             | No EC2, Scheduler, DynamoDB, IAM, shell, request-manifest or result writes                                           |
+| Retired GitHub role        | None: session issuance and all former state-machine and mailbox actions are explicitly denied                                                                                                                                              | No EC2, Scheduler, DynamoDB, IAM, shell, request-manifest or result writes                                           |
 | Coordinator Lambda         | RunInstances with pinned resource/type/profile constraints; creation-only instance/volume tags; pass the exact worker role to EC2; read instances, numeric launch template and input binaries; read lease/guard freshness and update lease | No termination, tag changes after creation, guard-heartbeat writes, schedules, IAM changes or launch-template writes |
 | Watchdog Lambda            | Independently scan namespace instances and terminate them; read root volumes, lease and worker status; update lease and publish guard freshness; create/read direct-ID runtime schedules; write three fixed control/receipt objects        | No launch, instance/profile/configuration changes, tag changes, cutoff updates/deletion or worker shell              |
 | Scheduler termination role | TerminateInstances on instances carrying this deployment's exact namespace tag                                                                                                                                                             | No launch, tags, instance changes, IAM or schedules                                                                  |
@@ -24,11 +29,11 @@ keys and can update only `lease`. The watchdog can read/update `lease` and put o
 coordinator cannot forge a healthy guard heartbeat. There is no TTL or runtime DeleteItem: expiry
 must not release ownership or erase cleanup evidence.
 
-GitHub trusts only the existing OIDC provider, audience `sts.amazonaws.com`, repository `wykurz/rcp`
-and protected environment `aws-benchmark-durable`, with maximum session duration one hour. The
-trusted workflow requires its exact reviewed branch before credentials. Builds and untrusted result
-parsing remain separate jobs without cloud credentials. Short-lived submission credentials and
-operator SSO expiry do not stop the AWS service roles.
+The denied GitHub trust statement retains its existing OIDC provider, audience and protected
+environment condition for scope continuity; it does not permit any matching session. Its former
+action/resource scopes remain present as explicit denies, including for already-issued sessions. Do
+not re-enable them to collect old evidence. Operator SSO expiry and GitHub retirement do not stop
+the retained AWS service roles.
 
 ## Launch permission and its limits
 

@@ -137,7 +137,7 @@ class DurableStackTests(unittest.TestCase):
             else:
                 self.assertNotIn("RCP_DURABLE_ENABLED", function["Environment"]["Variables"])
         self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE, enabled=False))
-        self.assertTrue(permits("GitHubSubmitRole", "states:StartExecution", MACHINE, enabled=True))
+        self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE, enabled=True))
 
     def test_closing_admission_keeps_existing_execution_and_watchdog_running(self):
         self.assertEqual(TEMPLATE["Parameters"]["AdmissionEnabled"]["Default"], "false")
@@ -266,14 +266,19 @@ class DurableStackTests(unittest.TestCase):
         self.assertEqual(table["Properties"]["BillingMode"], "PAY_PER_REQUEST")
         self.assertEqual(table["DeletionPolicy"], "Retain")
 
-    def test_github_cannot_self_certify_request_or_result(self):
+    def test_retired_github_cannot_read_or_write_its_former_mailbox(self):
         prefix = "arn:aws:s3:::rcp-artifacts/"
         for role in ("baseline", "candidate"):
             for binary in ("rcp", "rcpd", "filegen"):
-                self.assertTrue(permits("GitHubSubmitRole", "s3:PutObject", prefix + "input/" + role + "/" + binary))
+                self.assertFalse(permits("GitHubSubmitRole", "s3:PutObject", prefix + "input/" + role + "/" + binary))
         for key in ("control/window.json", "control/durable-request.json", "input/request.json",
                     "output/status.json", "output/results.zip", "output/durable-receipt.json", "input/candidate/shell"):
             self.assertFalse(permits("GitHubSubmitRole", "s3:PutObject", prefix + key), key)
+        for key in ("control/durable-request.json", "output/durable-receipt.json",
+                    "output/status.json", "output/results.zip"):
+            self.assertFalse(permits("GitHubSubmitRole", "s3:GetObject", prefix + key), key)
+        self.assertFalse(permits("GitHubSubmitRole", "states:DescribeExecution", MACHINE.replace(
+            ":stateMachine:", ":execution:") + ":123-1"))
         for action in ("ec2:RunInstances", "ec2:TerminateInstances", "states:StopExecution"):
             self.assertFalse(permits("GitHubSubmitRole", action, ASG))
         self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE + "-other"))
@@ -285,13 +290,30 @@ class DurableStackTests(unittest.TestCase):
         for key in ("control/window.json", "input/request.json", "output/durable-receipt.json"):
             self.assertTrue(permits("WatchdogRole", "s3:PutObject", "arn:aws:s3:::rcp-artifacts/" + key))
 
-    def test_github_trust_has_exact_protected_environment(self):
+    def test_retired_github_trust_preserves_scope_but_cannot_issue_sessions(self):
         trust = TEMPLATE["Resources"]["GitHubSubmitRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"]
         self.assertEqual(len(trust), 1)
+        self.assertEqual(trust[0]["Effect"], "Deny")
         self.assertEqual(trust[0]["Condition"]["StringEquals"], {
             "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
             "token.actions.githubusercontent.com:sub": "repo:wykurz/rcp:environment:aws-benchmark-durable"})
         self.assertEqual(TEMPLATE["Resources"]["GitHubSubmitRole"]["Properties"]["MaxSessionDuration"], 3600)
+
+    def test_runtime_and_admission_flags_cannot_reactivate_retired_github_access(self):
+        for enabled in (False, True):
+            for admission in (False, True):
+                with self.subTest(enabled=enabled, admission=admission):
+                    policies = statements("GitHubSubmitRole", enabled, admission)
+                    self.assertEqual(len(policies), 4)
+                    self.assertTrue(all(statement["Effect"] == "Deny" for statement in policies))
+                    self.assertFalse(permits("GitHubSubmitRole", "states:StartExecution", MACHINE,
+                                            enabled=enabled, admission=admission))
+                    self.assertFalse(permits("GitHubSubmitRole", "s3:PutObject",
+                                            "arn:aws:s3:::rcp-artifacts/input/candidate/rcp",
+                                            enabled=enabled, admission=admission))
+                    self.assertFalse(permits("GitHubSubmitRole", "s3:GetObject",
+                                            "arn:aws:s3:::rcp-artifacts/output/results.zip",
+                                            enabled=enabled, admission=admission))
 
     def test_only_service_reads_have_unscoped_resources(self):
         expected = {"ec2:DescribeInstances", "ec2:DescribeVolumes", "ec2:DescribeLaunchTemplateVersions"}
