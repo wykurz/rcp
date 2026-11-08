@@ -647,13 +647,30 @@ impl OwnedDirectoryStream {
                 Err(std::io::Error::from_raw_os_error(errno))
             };
         }
-        // SAFETY: readdir returned a valid dirent with a NUL-terminated d_name.
-        let entry = unsafe { &*raw };
-        let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
-        Ok(Some(DirectoryEntry {
-            name: OsStr::from_bytes(name.to_bytes()).to_owned(),
-            kind_hint: kind_hint_from_dtype(entry.d_type),
-        }))
+        // keep all record field access in the helper exercised by the focused Miri tests
+        // SAFETY: readdir returns an aligned record in one live allocation, with initialized
+        // d_type and a NUL-terminated d_name. Exclusive stream ownership keeps the record
+        // unchanged until the helper has copied the fields
+        Ok(Some(unsafe { directory_entry_from_raw(raw) }))
+    }
+}
+
+/// Copy the name and advisory type from a directory record.
+///
+/// # Safety
+///
+/// `raw` must be non-null, aligned for `libc::dirent`, and point to the start of a directory record
+/// with an initialized `d_type` and a NUL-terminated name at `d_name`'s offset. The entire byte range
+/// from `raw` through the name's NUL must lie within one live allocation. The type and name bytes
+/// must remain readable and unchanged until this returns.
+unsafe fn directory_entry_from_raw(raw: *const libc::dirent) -> DirectoryEntry {
+    // SAFETY: the caller guarantees the readable type field and NUL-terminated name. libc records
+    // can be smaller or larger than dirent, so borrow neither the struct nor its d_name array
+    let name = unsafe { CStr::from_ptr((&raw const (*raw).d_name).cast()) };
+    let dtype = unsafe { (*raw).d_type };
+    DirectoryEntry {
+        name: OsStr::from_bytes(name.to_bytes()).to_owned(),
+        kind_hint: kind_hint_from_dtype(dtype),
     }
 }
 
@@ -4040,6 +4057,46 @@ mod tests {
     use crate::testutils;
     use std::io::Read;
     use std::num::NonZeroUsize;
+
+    fn read_directory_record(name: &[u8], dtype: libc::c_uchar) -> (DirectoryEntry, usize) {
+        let name_offset = std::mem::offset_of!(libc::dirent, d_name);
+        let words = (name_offset + name.len() + 1).div_ceil(std::mem::size_of::<u64>());
+        let mut storage = vec![0_u64; words].into_boxed_slice();
+        let allocation_len = std::mem::size_of_val(storage.as_ref());
+        const { assert!(std::mem::align_of::<u64>() >= std::mem::align_of::<libc::dirent>()) };
+        let raw = storage.as_mut_ptr().cast::<libc::dirent>();
+        // SAFETY: aligned, zeroed storage covers the record through the name's NUL. The field
+        // accesses do not borrow the nominal struct or fixed-size name array
+        let entry = unsafe {
+            (*raw).d_type = dtype;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (&raw mut (*raw).d_name).cast::<u8>(),
+                name.len(),
+            );
+            directory_entry_from_raw(raw)
+        };
+        // storage drops before the caller inspects the owned name
+        (entry, allocation_len)
+    }
+
+    #[test]
+    fn raw_directory_entry_accepts_short_records() {
+        let (entry, allocation_len) = read_directory_record(b"f\xff", libc::DT_REG);
+        assert!(allocation_len < std::mem::size_of::<libc::dirent>());
+        assert_eq!(entry.name.as_bytes(), b"f\xff");
+        assert_eq!(entry.kind_hint, Some(EntryKind::File));
+    }
+
+    #[test]
+    fn raw_directory_entry_accepts_names_beyond_declared_array() {
+        let mut name = vec![b'x'; 300];
+        name[7] = 0xff;
+        let (entry, allocation_len) = read_directory_record(&name, libc::DT_DIR);
+        assert!(allocation_len > std::mem::size_of::<libc::dirent>());
+        assert_eq!(entry.name.as_bytes(), name);
+        assert_eq!(entry.kind_hint, Some(EntryKind::Dir));
+    }
 
     #[test]
     fn failed_stream_construction_closes_the_owned_fd() -> anyhow::Result<()> {
