@@ -19,9 +19,9 @@ WORKFLOW = "wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads
 
 
 REGULAR_CRON = "17 8 * * 1,5"
-COMMISSIONING_CRON = "17 5 8 11 *"
-COMMISSIONING_START = datetime(2026, 11, 8, 5, 17, tzinfo=timezone.utc)
-COMMISSIONING_END = datetime(2026, 11, 8, 5, 47, tzinfo=timezone.utc)
+COMMISSIONING_CRON = "17 7 8 11 *"
+COMMISSIONING_START = datetime(2026, 11, 8, 7, 17, tzinfo=timezone.utc)
+COMMISSIONING_END = datetime(2026, 11, 8, 7, 47, tzinfo=timezone.utc)
 
 
 def source(environment, now=None):
