@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from .production_workflow import source, WORKFLOW
+from .production_workflow import source, WORKFLOW, REGULAR_CRON
 
 ROOT = Path(__file__).resolve().parents[2]
 SHA = "a" * 40
@@ -18,7 +18,7 @@ def environment(**updates):
         GITHUB_REF="refs/heads/main", GITHUB_WORKFLOW_REF=WORKFLOW, GITHUB_ACTOR_ID="483465",
         GITHUB_RUN_ATTEMPT="1", GITHUB_SHA=SHA, GITHUB_WORKFLOW_SHA=SHA, GITHUB_EVENT_NAME="workflow_dispatch",
         RCP_PRODUCTION_ENABLED="true", RCP_MODE="benchmark", RCP_REQUESTED_REVISION="",
-        RCP_SCHEDULE_ENABLED="false") | updates
+        RCP_SCHEDULE_ENABLED="false", RCP_EVENT_SCHEDULE=REGULAR_CRON) | updates
 
 
 class RequestTests(unittest.TestCase):
@@ -34,6 +34,22 @@ class RequestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             source(environment(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true",
                                RCP_REQUESTED_REVISION="b" * 40))
+
+    def test_missing_or_unknown_schedule_context_never_emits_cli_revision(self):
+        for event_schedule in (None, "", "* * * * *", "17 8 * * 2,5"):
+            with self.subTest(event_schedule=event_schedule), tempfile.TemporaryDirectory() as directory:
+                env = dict(os.environ, **environment(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true"))
+                if event_schedule is None:
+                    env.pop("RCP_EVENT_SCHEDULE", None)
+                else:
+                    env["RCP_EVENT_SCHEDULE"] = event_schedule
+                output = Path(directory) / "output"
+                env["GITHUB_OUTPUT"] = str(output)
+                result = subprocess.run([sys.executable, "-B", "-m", "infra.aws_benchmark.production_workflow"],
+                    cwd=ROOT, env=env, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+                self.assertFalse(output.exists())
 
     def test_other_events_reruns_actors_refs_and_missing_flags_are_rejected(self):
         cases = [dict(GITHUB_EVENT_NAME=event) for event in ("push", "pull_request", "pull_request_target",

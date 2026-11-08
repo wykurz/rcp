@@ -597,6 +597,13 @@ both A/A sides; it receives no OIDC, environment secret or shared candidate cach
 passes the original signed identity, authenticated GitHub run metadata and transactional admission
 checks. No PR, push, fork, comment or `workflow_run` event is a paid trigger.
 
+A temporary commissioning cron also targets November 8 at 05:17 UTC. It exercises the real
+`schedule` event after a separately approved activation, not a manual dispatch. Its early guard
+accepts only November 8, 2026 through the 30-minute scheduling-delay window. Central admission still
+requires the matching third UTC slot, owner/main identity, an unused slot and the normal daily,
+budget and single-worker limits. Missed or delayed-outside-window events do not authorize another
+run. Remove this temporary cron and server slot after the test retires; retain Monday/Friday.
+
 The server policy is independently required. `scheduled_baseline` accepts either its existing
 40-character approved SHA, or the explicit server-only tagged value `triggering-main-aa`. Existing
 SHA policies retain their old semantics and never follow a changed main. The tagged value means both
