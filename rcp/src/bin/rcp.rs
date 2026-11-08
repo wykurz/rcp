@@ -1794,13 +1794,23 @@ async fn async_main(
     let error_collector = common::error_collector::ErrorCollector::default();
     let mut copy_summary = common::copy::Summary::default();
     let session = common::copy::CopySession::default();
+    // only explicit roots are inspected here: no directory listing or recursive input inventory
+    // retain each tentative claim until that operand finishes admission or fails
+    let mut prepared = Vec::with_capacity(src_dst.len());
+    for (src, dst) in &src_dst {
+        prepared.push(session.prepare(src, dst, &settings).await);
+    }
+
     // under --require-toctou-safe, run multi-source copies SEQUENTIALLY instead of concurrently, so
     // two sources that alias to the same destination directory (see the duplicate check above)
     // cannot run overlapping reused-directory lockdown/restore lifecycles against it. Strict
     // multi-source is the paranoid, uncommon path, so the sequential cost is acceptable.
     if common::safedir::strict_operand_resolution() && src_dst.len() > 1 {
-        for (src_path, dst_path) in src_dst {
-            let result = common::copy(&session, &src_path, &dst_path, &settings, &preserve).await;
+        for operand in prepared {
+            let result = match operand {
+                Ok(operand) => common::copy_prepared(operand, &preserve).await,
+                Err(error) => Err(error),
+            };
             if let Some(err) = fold_copy_result(
                 result,
                 &mut copy_summary,
@@ -1813,11 +1823,12 @@ async fn async_main(
         }
     } else {
         let mut join_set = tokio::task::JoinSet::new();
-        for (src_path, dst_path) in src_dst {
-            let settings = settings.clone();
-            let session = session.clone();
+        for operand in prepared {
             let do_copy = || async move {
-                common::copy(&session, &src_path, &dst_path, &settings, &preserve).await
+                match operand {
+                    Ok(operand) => common::copy_prepared(operand, &preserve).await,
+                    Err(error) => Err(error),
+                }
             };
             join_set.spawn(do_copy());
         }

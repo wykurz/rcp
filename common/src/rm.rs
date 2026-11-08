@@ -257,6 +257,7 @@ pub async fn rm(
     // the root is processed like a nested child via `process_admitted_entry`, transferring
     // classification and admission acquired during setup
     let visitor = Arc::new(RmVisitor {
+        protection: None,
         prog_track,
         settings: settings.clone(),
     });
@@ -306,6 +307,7 @@ pub async fn rm_child(
         rel_path,
         settings,
         EntryAdmission::RootOrDelegated,
+        None,
     )
     .await
 }
@@ -322,6 +324,7 @@ pub(crate) async fn rm_child_admitted(
     rel_path: &std::path::Path,
     settings: &Settings,
     admission: EntryAdmission,
+    protection: Option<Arc<crate::input_protection::InputProtection>>,
 ) -> Result<Summary, Error> {
     rm_child_with_source(
         prog_track,
@@ -330,6 +333,7 @@ pub(crate) async fn rm_child_admitted(
         rel_path,
         settings,
         RmChildSource::Unclassified(admission),
+        protection,
     )
     .await
 }
@@ -342,6 +346,7 @@ pub(crate) async fn rm_child_admitted_entry(
     rel_path: &std::path::Path,
     settings: &Settings,
     entry: AdmittedEntry,
+    protection: Option<Arc<crate::input_protection::InputProtection>>,
 ) -> Result<Summary, Error> {
     rm_child_with_source(
         prog_track,
@@ -350,6 +355,7 @@ pub(crate) async fn rm_child_admitted_entry(
         rel_path,
         settings,
         RmChildSource::Admitted(entry),
+        protection,
     )
     .await
 }
@@ -367,10 +373,12 @@ async fn rm_child_with_source(
     rel_path: &std::path::Path,
     settings: &Settings,
     source: RmChildSource,
+    protection: Option<Arc<crate::input_protection::InputProtection>>,
 ) -> Result<Summary, Error> {
     // pruning passes a mirror-relative seed; unfiltered overwrite passes a full display path
     // both coordinates start from this one seed and are never used to open a removal target
     let visitor = Arc::new(RmVisitor {
+        protection,
         prog_track,
         settings: settings.clone(),
     });
@@ -393,6 +401,7 @@ async fn rm_child_with_source(
 /// snapshot in [`WalkVisitor::dir_pre`], and the post-order `rmdir` decision in
 /// [`WalkVisitor::dir_post`]). rm has no second tree, so [`Self::DirContext`] is `()`.
 struct RmVisitor {
+    protection: Option<Arc<crate::input_protection::InputProtection>>,
     prog_track: &'static progress::Progress,
     settings: Settings,
 }
@@ -565,6 +574,12 @@ impl WalkVisitor for RmVisitor {
                 }
             }
         }
+        if let Some(protection) = &self.protection {
+            protection
+                .check_child(parent, name, path)
+                .await
+                .map_err(|error| Error::new(error.into(), Default::default()))?;
+        }
         // handle dry-run mode for files/symlinks
         if settings.dry_run.is_some() {
             let entry_type = if is_symlink { "symlink" } else { "file" };
@@ -613,6 +628,14 @@ impl WalkVisitor for RmVisitor {
         let settings = &self.settings;
         let path = cx.real_path.as_path();
         tracing::debug!("remove contents of the directory first");
+        if let Some(protection) = &self.protection {
+            protection
+                .check_child(&cx.parent, &cx.name, path)
+                .await
+                .and_then(|()| protection.check_directory(handle.meta(), path))
+                .map_err(|error| Error::new(error.into(), Default::default()))?;
+        }
+
         // Snapshot the directory's full metadata NOW, before relaxing its mode or removing any
         // child. The directory's own time filter (evaluated in `dir_post`, after its children are
         // processed) must use these pristine timestamps: removing children bumps the directory's
@@ -679,9 +702,9 @@ impl WalkVisitor for RmVisitor {
         // open the directory's real fd via the parent fd with O_NOFOLLOW|O_DIRECTORY: a directory
         // entry swapped to a symlink mid-walk fails closed here (ELOOP/ENOTDIR) — descent never
         // follows it outside the tree. this is the core rm -rf race closure.
-        let dir = cx
+        let (dir, _) = cx
             .parent
-            .open_dir(&cx.name)
+            .open_dir_with_meta(&cx.name)
             .await
             .with_context(|| format!("failed reading directory {path:?}"))
             .map_err(|err| Error::new(err, Default::default()))?;
@@ -1475,6 +1498,7 @@ mod tests {
             let target_dir =
                 Arc::new(Dir::open_root_dir(&target, false, congestion::Side::Source).await?);
             let visitor = Arc::new(RmVisitor {
+                protection: None,
                 prog_track: &PROGRESS,
                 settings,
             });
@@ -2267,6 +2291,7 @@ mod tests {
                 time_filter: None,
             };
             let visitor = Arc::new(RmVisitor {
+                protection: None,
                 prog_track: &PROGRESS,
                 settings: settings.clone(),
             });
@@ -2328,6 +2353,7 @@ mod tests {
             tokio::fs::create_dir(&entry).await?;
             tokio::fs::write(entry.join("replacement-child"), b"replacement").await?;
             let visitor = RmVisitor {
+                protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
                     fail_early: true,
@@ -2373,6 +2399,7 @@ mod tests {
             tokio::fs::create_dir(&entry).await?;
             tokio::fs::write(entry.join("replacement-child"), b"replacement").await?;
             let visitor = RmVisitor {
+                protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
                     fail_early: true,
@@ -2414,6 +2441,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
                     fail_early: true,
@@ -2461,6 +2489,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
                     fail_early: true,
@@ -2552,6 +2581,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
                     fail_early: true,

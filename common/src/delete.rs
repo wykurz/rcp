@@ -228,6 +228,7 @@ async fn prune_extraneous<K>(
     filter: Option<&crate::filter::FilterSettings>,
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
+    protection: Option<&std::sync::Arc<crate::input_protection::InputProtection>>,
 ) -> Result<crate::rm::Summary, crate::rm::Error>
 where
     K: std::borrow::Borrow<std::ffi::OsStr> + Eq + std::hash::Hash + Sync,
@@ -256,6 +257,7 @@ where
         fail_early,
         dry_run,
         entries,
+        protection,
     )
     .await
 }
@@ -289,6 +291,7 @@ pub(crate) async fn prune_and_fold<K>(
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
     summary: &mut crate::rm::Summary,
+    protection: Option<&std::sync::Arc<crate::input_protection::InputProtection>>,
 ) -> Result<(), anyhow::Error>
 where
     K: std::borrow::Borrow<std::ffi::OsStr> + Eq + std::hash::Hash + Sync,
@@ -302,6 +305,7 @@ where
         filter,
         fail_early,
         dry_run,
+        protection,
     )
     .await
     {
@@ -332,6 +336,7 @@ async fn prune_entries<K>(
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
     entries: Vec<(OsString, Option<crate::walk::EntryKind>)>,
+    protection: Option<&std::sync::Arc<crate::input_protection::InputProtection>>,
 ) -> Result<crate::rm::Summary, crate::rm::Error>
 where
     K: std::borrow::Borrow<std::ffi::OsStr> + Eq + std::hash::Hash + Sync,
@@ -424,6 +429,7 @@ where
                         &rel,
                         &rm_settings,
                         entry,
+                        protection.cloned(),
                     )
                     .await
                 }
@@ -440,6 +446,7 @@ where
                         &rel,
                         &rm_settings,
                         admission,
+                        protection.cloned(),
                     )
                     .await
                 }
@@ -571,6 +578,7 @@ mod tests {
                 fail_early,
                 None,
                 &mut summary,
+                None,
             )
             .await;
             tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
@@ -659,6 +667,7 @@ mod tests {
                             std::ffi::OsString::from("cache"),
                             Some(crate::walk::EntryKind::File),
                         )],
+                        None,
                     ),
                 )
                 .await
@@ -703,6 +712,7 @@ mod tests {
                     std::ffi::OsString::from("protected"),
                     Some(crate::walk::EntryKind::File),
                 )],
+                None,
             );
             tokio::pin!(prune);
             let stopped_at_stat_gate = futures::poll!(prune.as_mut()).is_pending();
@@ -761,6 +771,7 @@ mod tests {
                 false,
                 None,
                 vec![(std::ffi::OsString::from("protected"), None)],
+                None,
             );
             tokio::pin!(prune);
             let stopped_at_stat_gate = futures::poll!(prune.as_mut()).is_pending();
@@ -822,6 +833,7 @@ mod tests {
                             (std::ffi::OsString::from("kept"), None),
                             (std::ffi::OsString::from("after"), None),
                         ],
+                        None,
                     ),
                 )
                 .await
@@ -878,6 +890,7 @@ mod tests {
                             (std::ffi::OsString::from("kept"), None),
                             (std::ffi::OsString::from("after"), None),
                         ],
+                        None,
                     ),
                 )
                 .await
@@ -926,6 +939,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .map_err(|e| e.source)?;
@@ -963,6 +977,7 @@ mod tests {
             Some(&filter),
             false,
             None,
+            None,
         )
         .await
         .map_err(|e| e.source)?;
@@ -984,6 +999,7 @@ mod tests {
             &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
             false,
+            None,
             None,
         )
         .await
@@ -1020,6 +1036,7 @@ mod tests {
             Some(&filter),
             false,
             None,
+            None,
         )
         .await
         .map_err(|e| e.source)?;
@@ -1041,6 +1058,7 @@ mod tests {
             &DeleteKeepSet::from_complete(delete_settings(true), (keep).clone()),
             Some(&filter),
             false,
+            None,
             None,
         )
         .await
@@ -1075,6 +1093,7 @@ mod tests {
             &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
             Some(&filter),
             false,
+            None,
             None,
         )
         .await
@@ -1127,6 +1146,7 @@ mod tests {
                     Some(crate::walk::EntryKind::File),
                 ),
             ],
+            None,
         )
         .await
         .map_err(|e| e.source)?;
@@ -1250,6 +1270,7 @@ mod tests {
                     &DeleteKeepSet::from_complete(delete_settings(false), (keep).clone()),
                     None,
                     false,
+                    None,
                     None,
                 ),
             )

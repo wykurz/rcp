@@ -294,15 +294,16 @@ pub struct Handle {
     meta: FileMeta,
 }
 
-/// The classification and size needed to remove an occupied destination slot.
+/// The classification, identity, and size needed to remove an occupied destination slot.
 ///
 /// Unlike [`Handle`], this snapshot does not keep an inode pinned. Overwrite removal operates by
 /// name through a pinned parent directory, so retaining the entry fd cannot bind the later by-name
 /// removal to that inode. Converting to this snapshot closes the classification fd while preserving
-/// the accounting data the removal path needs.
+/// the input-overlap and accounting data the removal path needs.
 #[derive(Clone, Copy, Debug)]
 pub struct RemovalSnapshot {
     kind: EntryKind,
+    identity: (u64, u64),
     size: u64,
 }
 
@@ -311,6 +312,10 @@ impl RemovalSnapshot {
     #[must_use]
     pub fn kind(self) -> EntryKind {
         self.kind
+    }
+
+    pub(crate) fn identity(self) -> (u64, u64) {
+        self.identity
     }
 
     /// The entry size captured during overwrite planning.
@@ -350,6 +355,7 @@ impl Handle {
     pub fn into_removal_snapshot(self) -> RemovalSnapshot {
         RemovalSnapshot {
             kind: self.kind,
+            identity: (self.dev, self.ino),
             size: self.meta.size,
         }
     }
@@ -1037,18 +1043,23 @@ impl Dir {
     /// Comparing the opened fd's identity to the pinned classification handle catches that swap.
     /// The handle keeps the classified inode number from being recycled during the comparison.
     pub async fn verify_same_inode(&self, handle: &Handle) -> std::io::Result<()> {
-        let identity = match self.captured_identity {
-            Some(identity) => identity,
-            None => {
-                let meta = self.meta().await?;
-                (meta.dev(), meta.ino())
-            }
-        };
+        let identity = self.identity().await?;
         if identity == (handle.dev(), handle.ino()) {
             Ok(())
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ESTALE))
         }
+    }
+
+    /// Reuse immutable identity captured from this fd, or read it when none was captured.
+    pub(crate) async fn identity(&self) -> std::io::Result<(u64, u64)> {
+        Ok(match self.captured_identity {
+            Some(identity) => identity,
+            None => {
+                let meta = self.meta().await?;
+                (meta.dev(), meta.ino())
+            }
+        })
     }
 
     /// Take uid ownership of this directory as the copier and restrict it to `mode`,
@@ -1290,7 +1301,9 @@ impl Dir {
         check: impl FnOnce(&FileMeta) -> std::io::Result<()> + Send + 'static,
     ) -> std::io::Result<Dir> {
         self.make_dir_with_credit(name, mode, None, move |dir| {
-            check(&snapshot_directory_meta(dir.fd.as_fd())?)
+            let meta = snapshot_directory_meta(dir.fd.as_fd())?;
+            dir.captured_identity = Some((meta.dev(), meta.ino()));
+            check(&meta)
         })
         .await
     }
@@ -1311,7 +1324,7 @@ impl Dir {
         name: &OsStr,
         mode: u32,
         credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
-        check: impl FnOnce(&Dir) -> std::io::Result<()> + Send + 'static,
+        check: impl FnOnce(&mut Dir) -> std::io::Result<()> + Send + 'static,
     ) -> std::io::Result<Dir> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -1339,7 +1352,7 @@ impl Dir {
                 .map_err(nix_to_io)?;
                 // own the descriptor before any fallible ACL/stat action or task handoff can
                 // outlive the awaiting caller; failure closes it before releasing its credit
-                let created = Dir {
+                let mut created = Dir {
                     captured_identity: None,
                     fd: Arc::new(DirectoryDescriptor { fd, credit }),
                     side,
@@ -1347,7 +1360,7 @@ impl Dir {
                 };
                 #[cfg(test)]
                 let _visit = resource_tests::gate_opened_descriptor(created.fd.as_raw_fd())?;
-                check(&created)?;
+                check(&mut created)?;
                 if strict {
                     // strip the inheritance-carrying default ACL before the access ACL
                     apply_one_acl(created.fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)?;

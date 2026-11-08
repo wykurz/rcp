@@ -1,6 +1,7 @@
 //! Physical destination authority shared by local copy and link directory admission.
 
 use super::{DirResolution, DirSlot, Error, Settings, Summary};
+use crate::input_protection::InputProtection;
 use crate::safedir::overlap::{DirectoryOverlap, Evidence, Operand};
 use crate::safedir::{self, Dir, FileMeta, PreviewEntry};
 use anyhow::Context as _;
@@ -12,7 +13,10 @@ use std::sync::Arc;
 pub(crate) struct DestinationContext {
     origin: Origin,
     registry: Arc<DirectoryOverlap>,
+    protection: Arc<InputProtection>,
     operand: Arc<Operand>,
+    // explicit root participation stays tentative until ordinary admission/mutation commits it
+    _root_claim: Option<safedir::overlap::Reservation>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,15 +62,22 @@ impl PreviewParent {
 pub(crate) struct PreparedDestination {
     parent: PreparedParent,
     registry: Arc<DirectoryOverlap>,
+    protection: Arc<InputProtection>,
     operand: Arc<Operand>,
 }
 
 impl PreparedDestination {
+    pub(crate) fn protection(&self) -> &Arc<InputProtection> {
+        &self.protection
+    }
+
     pub(crate) fn child(&self) -> DestinationContext {
         DestinationContext {
             origin: Origin::Prepared(self.parent.clone()),
             registry: Arc::clone(&self.registry),
+            protection: Arc::clone(&self.protection),
             operand: Arc::clone(&self.operand),
+            _root_claim: None,
         }
     }
 }
@@ -114,11 +125,13 @@ impl SourceSnapshot {
 impl DestinationContext {
     #[cfg(test)]
     pub(crate) fn new(named_root: &Path) -> Self {
-        Self::with_registry(named_root, named_root, Arc::default())
+        Self::for_operand(named_root, None, named_root)
     }
 
     pub(crate) fn for_operand(source: &Path, update: Option<&Path>, destination: &Path) -> Self {
-        let mut context = Self::with_registry(source, destination, Arc::default());
+        let registry = Arc::new(DirectoryOverlap::default());
+        let protection = Arc::new(InputProtection::new(Arc::clone(&registry)));
+        let mut context = Self::with_registry(source, destination, registry, protection);
         Arc::get_mut(&mut context.operand)
             .expect("a new operand is unshared")
             .update = update.map(Path::to_owned);
@@ -129,6 +142,7 @@ impl DestinationContext {
         source: &Path,
         named_root: &Path,
         registry: Arc<DirectoryOverlap>,
+        protection: Arc<InputProtection>,
     ) -> Self {
         Self {
             origin: Origin::Root {
@@ -136,13 +150,55 @@ impl DestinationContext {
                 preview_parent: None,
             },
             registry,
+            protection,
             operand: Arc::new(Operand {
                 source: source.to_owned(),
                 update: None,
                 destination: named_root.to_owned(),
                 destination_ancestors: Default::default(),
             }),
+            _root_claim: None,
         }
+    }
+
+    pub(crate) fn protection(&self) -> &Arc<InputProtection> {
+        &self.protection
+    }
+
+    pub(crate) async fn record_root(
+        &self,
+        parent: &Dir,
+        name: &OsStr,
+        entry: &safedir::Handle,
+        path: &Path,
+    ) -> std::io::Result<()> {
+        if entry.kind() != crate::walk::EntryKind::Dir {
+            self.protection
+                .record_leaf(parent.identity().await?, name, path);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_roots(&mut self, inputs: &[&FileMeta]) -> std::io::Result<()> {
+        if !inputs.is_empty() {
+            self._root_claim = Some(self.registry.reserve(
+                inputs,
+                &Evidence::new(),
+                Arc::clone(&self.operand),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_leaf_replacement_parent(
+        &self,
+        parent: &Dir,
+        path: &Path,
+    ) -> std::io::Result<()> {
+        if matches!(self.origin, Origin::Root { .. }) {
+            self.protection.check_root_parent(parent, path).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn with_preview_parent(mut self, parent: Option<PreviewParent>) -> Self {
@@ -315,8 +371,16 @@ impl DestinationContext {
             (PreparedParent::Preview(entry), None, preview_dir)
         } else {
             let parent = parent.expect("real admission retains its parent");
-            match super::resolve_dst_dir(prog_track, &parent, name, path, settings, &reservation)
-                .await?
+            match super::resolve_dst_dir(
+                prog_track,
+                &parent,
+                name,
+                path,
+                settings,
+                &reservation,
+                &self.protection,
+            )
+            .await?
             {
                 DirResolution::Skip(summary) => return Ok(Admission::Skip(summary)),
                 DirResolution::Proceed(slot) => (
@@ -331,6 +395,7 @@ impl DestinationContext {
             destination: PreparedDestination {
                 parent,
                 registry: Arc::clone(&self.registry),
+                protection: Arc::clone(&self.protection),
                 operand: Arc::clone(&self.operand),
             },
             slot,
@@ -346,9 +411,11 @@ impl DestinationContext {
             PreparedParent::Preview(PreviewEntry::Missing),
             PreparedParent::Real,
         );
+        let registry = Arc::new(DirectoryOverlap::default());
         PreparedDestination {
             parent,
-            registry: Arc::default(),
+            protection: Arc::new(InputProtection::new(Arc::clone(&registry))),
+            registry,
             operand: Arc::new(Operand {
                 source: "test source".into(),
                 update: None,
@@ -414,6 +481,7 @@ pub(crate) async fn test_prepared(
     Ok(PreparedDestination {
         parent,
         registry: context.registry,
+        protection: context.protection,
         operand: context.operand,
     })
 }
