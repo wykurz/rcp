@@ -331,14 +331,119 @@ pub async fn copy(
 
 /// Shared input/output identities for all source operands of one local copy invocation.
 /// Clones retain the same registry, including when strict-mode roots run sequentially.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CopySession {
     overlap: Arc<safedir::overlap::DirectoryOverlap>,
+    protection: Arc<crate::input_protection::InputProtection>,
+}
+
+impl Default for CopySession {
+    fn default() -> Self {
+        let overlap = Arc::new(safedir::overlap::DirectoryOverlap::default());
+        Self {
+            protection: Arc::new(crate::input_protection::InputProtection::new(Arc::clone(
+                &overlap,
+            ))),
+            overlap,
+        }
+    }
+}
+
+/// One explicit operand prepared without retaining descriptors or scanning its descendants.
+/// Keep every prepared operand alive until dispatch to protect inputs that have not started yet.
+pub struct PreparedCopy {
+    src: PathBuf,
+    dst: PathBuf,
+    settings: Settings,
+    destination: DestinationContext,
+}
+
+fn root_is_selected(settings: &Settings, name: &OsStr, kind: EntryKind) -> bool {
+    settings.filter.as_ref().is_none_or(|filter| {
+        matches!(
+            filter.should_include_root_item(std::path::Path::new(name), kind == EntryKind::Dir),
+            crate::filter::FilterResult::Included,
+        )
+    })
 }
 
 impl CopySession {
+    /// Register an explicit input root before any operand can mutate the destination.
+    /// This performs only root lookups, and is needed only for destructive local operations.
+    pub async fn prepare(
+        &self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        settings: &Settings,
+    ) -> Result<PreparedCopy, Error> {
+        if settings.dereference && safedir::strict_operand_resolution() {
+            return Err(Error::new(
+                anyhow!("--dereference cannot be combined with strict operand resolution"),
+                Default::default(),
+            ));
+        }
+        let mut destination = DestinationContext::with_registry(
+            src,
+            dst,
+            Arc::clone(&self.overlap),
+            Arc::clone(&self.protection),
+        );
+        if settings.overwrite || settings.delete.is_some() {
+            let permit = throttle::open_file_permit().await;
+            safedir::with_fd_admission(permit.admission(), async {
+                let operand = crate::walk::split_root_operand(src).await?;
+                let parent =
+                    safedir::open_preview_operand_parent(&operand.parent, congestion::Side::Source)
+                        .await?;
+                let entry = parent.child(&operand.name).await?;
+                if !root_is_selected(settings, &operand.name, entry.kind()) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                destination
+                    .record_root(&parent, &operand.name, &entry, src)
+                    .await?;
+                if settings.dereference && entry.kind() == EntryKind::Symlink {
+                    let target = crate::walk::run_metadata_probed(
+                        congestion::Side::Source,
+                        congestion::MetadataOp::Stat,
+                        tokio::fs::canonicalize(src),
+                    )
+                    .await?;
+                    let target = crate::walk::split_root_operand(&target).await?;
+                    let parent = safedir::open_preview_operand_parent(
+                        &target.parent,
+                        congestion::Side::Source,
+                    )
+                    .await?;
+                    let entry = parent.child(&target.name).await?;
+                    // dereference re-enters root filtering under the referent's own basename
+                    if !root_is_selected(settings, &target.name, entry.kind()) {
+                        return Ok(());
+                    }
+                    destination
+                        .record_root(&parent, &target.name, &entry, &target.display)
+                        .await?;
+                    if entry.kind() == EntryKind::Dir {
+                        destination.reserve_roots(&[entry.meta()])?;
+                    }
+                } else if entry.kind() == EntryKind::Dir {
+                    destination.reserve_roots(&[entry.meta()])?;
+                }
+                Ok(())
+            })
+            .await
+            .with_context(|| format!("cannot prepare input {src:?}"))
+            .map_err(|error| Error::new(error, Default::default()))?;
+        }
+        Ok(PreparedCopy {
+            src: src.to_owned(),
+            dst: dst.to_owned(),
+            settings: settings.clone(),
+            destination,
+        })
+    }
+
     /// Copy one operand while retaining the other operands' directory identities.
-    #[instrument(name = "copy", skip(self, prog_track, settings, preserve))]
     pub async fn copy(
         &self,
         prog_track: &'static progress::Progress,
@@ -348,15 +453,31 @@ impl CopySession {
         preserve: &preserve::Settings,
         is_fresh: bool,
     ) -> Result<Summary, Error> {
+        self.prepare(src, dst, settings)
+            .await?
+            .copy(prog_track, preserve, is_fresh)
+            .await
+    }
+}
+
+impl PreparedCopy {
+    /// Execute a prepared operand, retaining its tentative root claim until admission or failure.
+    #[instrument(name = "copy", skip(self, prog_track, preserve), fields(src = ?self.src, dst = ?self.dst))]
+    pub async fn copy(
+        self,
+        prog_track: &'static progress::Progress,
+        preserve: &preserve::Settings,
+        is_fresh: bool,
+    ) -> Result<Summary, Error> {
         crate::timing_scope!("local.copy")
             .measure(copy_root_admitted(
                 prog_track,
-                src,
-                dst,
-                settings,
+                &self.src,
+                &self.dst,
+                &self.settings,
                 preserve,
                 is_fresh,
-                DestinationContext::with_registry(src, dst, Arc::clone(&self.overlap)),
+                self.destination,
                 None,
             ))
             .await
@@ -826,6 +947,7 @@ impl CopyVisitor {
             self.settings.fail_early,
             self.settings.dry_run,
             &mut copy_summary.rm_summary,
+            Some(self.destination.protection()),
         )
         .await
     }
@@ -892,6 +1014,13 @@ impl CopyVisitor {
                 // cannot be redirected. our still-open fd to the directory itself simply detaches.
                 // `dst_parent` is always Some here: it is None only in dry-run, where this arm is
                 // unreachable (`check_empty_dir_cleanup` returns `DryRunSkip`, not `Remove`).
+                if let Some(parent) = &dst_parent {
+                    self.destination
+                        .protection()
+                        .check_child(parent, &dst_name, &dst_path)
+                        .await
+                        .map_err(|error| Error::new(error.into(), copy_summary))?;
+                }
                 let rmdir_result = match &dst_parent {
                     Some(dst_parent) => dst_parent.rmdir_at(&dst_name).await,
                     None => {
@@ -1213,6 +1342,7 @@ impl WalkVisitor for CopyVisitor {
                     &self.settings,
                     &self.preserve,
                     is_fresh,
+                    &parent_ctx.destination,
                 )
                 .await
             }
@@ -1228,6 +1358,7 @@ impl WalkVisitor for CopyVisitor {
                     &self.settings,
                     &self.preserve,
                     is_fresh,
+                    &parent_ctx.destination,
                 )
                 .await
             }
@@ -1510,6 +1641,7 @@ async fn copy_file_fd(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
+    destination: &DestinationContext,
 ) -> Result<Summary, Error> {
     // bring `FileMeta::size()` into scope locally; importing the trait at module level would
     // collide with `std::os::unix::fs::MetadataExt` on `std::fs::Metadata` elsewhere in this file.
@@ -1579,8 +1711,17 @@ async fn copy_file_fd(
             }
         };
         return copy_current_regular(
-            prog_track, src_parent, dst_parent, dst_name, dst_path, src_path, current, plan,
-            settings, preserve,
+            prog_track,
+            src_parent,
+            dst_parent,
+            dst_name,
+            dst_path,
+            src_path,
+            current,
+            plan,
+            settings,
+            preserve,
+            destination,
         )
         .await;
     }
@@ -1647,6 +1788,7 @@ async fn copy_current_regular(
     plan: FilePlan,
     settings: &Settings,
     preserve: &preserve::Settings,
+    destination: &DestinationContext,
 ) -> Result<Summary, Error> {
     use crate::preserve::Metadata as _;
     let CurrentRegular {
@@ -1706,6 +1848,7 @@ async fn copy_current_regular(
         plan,
         settings,
         &mut copy_summary,
+        destination,
     )
     .await?;
     // keep source opening, IOPS reservation, and ACL capture ahead of creation. Only the first
@@ -1742,9 +1885,9 @@ async fn copy_current_regular(
         FileCopyStart::CreatedAndCopied(output) => output,
         FileCopyStart::CreateResult {
             source,
-            destination,
+            destination: created,
         } => {
-            let dst_file = match destination {
+            let dst_file = match created {
                 Ok(dst_file) => dst_file,
                 // the destination slot is occupied. `create_file`'s `O_EXCL` is the only way either route
                 // finds out that a writer got here between our last look and now: on the known-fresh route
@@ -1790,6 +1933,7 @@ async fn copy_current_regular(
                         plan,
                         settings,
                         &mut copy_summary,
+                        destination,
                     )
                     .await?;
                     // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
@@ -1871,6 +2015,7 @@ async fn copy_symlink_fd(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
+    destination: &DestinationContext,
 ) -> Result<Summary, Error> {
     // --ignore-existing in DRY-RUN: skip if the destination already exists (any type). A real copy
     // does NOT probe here, for the same reason [`copy_file_fd`] does not: `symlink_at` below fails
@@ -2002,13 +2147,18 @@ async fn copy_symlink_fd(
                 tracing::info!("'dst' is not a symlink, updating");
             }
             // remove the conflicting destination entry, then create the link fresh.
-            let rm_summary = remove_existing(
+            destination
+                .check_leaf_replacement_parent(dst_parent, dst_path)
+                .await
+                .map_err(|error| Error::new(error.into(), Default::default()))?;
+            let rm_summary = remove_existing_guarded(
                 prog_track,
                 dst_parent,
                 dst_name,
                 dst_path,
                 dst_handle.into_removal_snapshot(),
                 settings,
+                Some(destination.protection()),
             )
             .await?;
             let copy_summary = Summary {
@@ -2122,6 +2272,7 @@ fn skip_summary(skip: Summary, copy_summary: &Summary) -> Summary {
 /// before actually unlinking. Separating these steps ensures a source-open failure leaves the
 /// existing destination intact. The split buys nothing against *cancellation* — see
 /// [`copy_file_fd`] for why rcp does not chase that.
+#[allow(clippy::too_many_arguments)]
 async fn execute_dst_plan(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
@@ -2130,18 +2281,24 @@ async fn execute_dst_plan(
     plan: FilePlan,
     settings: &Settings,
     copy_summary: &mut Summary,
+    destination: &DestinationContext,
 ) -> Result<(), Error> {
     let dst_snapshot = match plan {
         FilePlan::Vacant => return Ok(()),
         FilePlan::Replace(dst_snapshot) => dst_snapshot,
     };
-    match remove_existing(
+    destination
+        .check_leaf_replacement_parent(dst_parent, dst_path)
+        .await
+        .map_err(|error| Error::new(error.into(), *copy_summary))?;
+    match remove_existing_guarded(
         prog_track,
         dst_parent,
         dst_name,
         dst_path,
         dst_snapshot,
         settings,
+        Some(destination.protection()),
     )
     .await
     {
@@ -2280,6 +2437,7 @@ pub(crate) async fn resolve_dst_dir(
     dst_path: &std::path::Path,
     settings: &Settings,
     reservation: &safedir::overlap::Reservation,
+    protection: &Arc<crate::input_protection::InputProtection>,
 ) -> Result<DirResolution, Error> {
     let output = reservation.clone();
     match dst_parent
@@ -2385,6 +2543,7 @@ pub(crate) async fn resolve_dst_dir(
                     dst_path,
                     dst_handle.into_removal_snapshot(),
                     move || mutation.commit(),
+                    Some(protection),
                 )
                 .await?;
                 let output = reservation.clone();
@@ -2445,7 +2604,14 @@ async fn remove_existing_non_directory(
     dst_path: &std::path::Path,
     dst_snapshot: RemovalSnapshot,
     after_unlink: impl FnOnce() + Send + 'static,
+    protection: Option<&Arc<crate::input_protection::InputProtection>>,
 ) -> Result<RmSummary, Error> {
+    if let Some(protection) = protection {
+        protection
+            .check_child(dst_parent, dst_name, dst_path)
+            .await
+            .map_err(|error| Error::new(error.into(), Default::default()))?;
+    }
     let removed_size = dst_snapshot.size();
     // single-entry, fd-relative removal contained to dst_parent; never follows a symlink.
     dst_parent
@@ -2499,6 +2665,38 @@ pub async fn remove_existing(
     dst_snapshot: RemovalSnapshot,
     settings: &Settings,
 ) -> Result<RmSummary, Error> {
+    remove_existing_guarded(
+        prog_track,
+        dst_parent,
+        dst_name,
+        dst_path,
+        dst_snapshot,
+        settings,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn remove_existing_guarded(
+    prog_track: &'static progress::Progress,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    dst_snapshot: RemovalSnapshot,
+    settings: &Settings,
+    protection: Option<&Arc<crate::input_protection::InputProtection>>,
+) -> Result<RmSummary, Error> {
+    if dst_snapshot.kind() == EntryKind::Dir
+        && let Some(protection) = protection
+    {
+        // rmdir needs only parent permission; reuse planning's identity before this by-name action.
+        // nonempty directories still receive a held classification check before chmod and descent
+        protection
+            .check_child(dst_parent, dst_name, dst_path)
+            .await
+            .and_then(|()| protection.check_directory_identity(dst_snapshot.identity(), dst_path))
+            .map_err(|error| Error::new(error.into(), Default::default()))?;
+    }
     match dst_snapshot.kind() {
         EntryKind::File | EntryKind::Symlink | EntryKind::Special => {
             remove_existing_non_directory(
@@ -2508,6 +2706,7 @@ pub async fn remove_existing(
                 dst_path,
                 dst_snapshot,
                 || {},
+                protection,
             )
             .await
         }
@@ -2531,7 +2730,7 @@ pub async fn remove_existing(
                     // fd-relative recursive removal of the subtree on the held parent: descent uses
                     // O_NOFOLLOW, so a concurrent symlink swap cannot redirect it out of dst_parent.
                     // Mirrors the remote destination path.
-                    rm::rm_child(
+                    rm::rm_child_admitted(
                         prog_track,
                         dst_parent,
                         dst_name,
@@ -2542,6 +2741,8 @@ pub async fn remove_existing(
                             dry_run: None,
                             time_filter: None,
                         },
+                        EntryAdmission::RootOrDelegated,
+                        protection.cloned(),
                     )
                     .await
                     .map_err(|err| {
@@ -9584,6 +9785,7 @@ mod copy_tests {
                 FilePlan::Vacant,
                 &settings,
                 &preservation,
+                &DestinationContext::parent(None),
             )
             .await?;
             assert_eq!(summary.files_copied, 1);
@@ -9657,6 +9859,7 @@ mod copy_tests {
                 plan,
                 &settings,
                 &preservation,
+                &DestinationContext::parent(None),
             )
             .await
             .expect_err("ACL failure must precede destination removal");
@@ -9730,6 +9933,7 @@ mod copy_tests {
             FilePlan::Vacant,
             &settings,
             &preserve::preserve_all(),
+            &DestinationContext::parent(None),
         )
         .await
         .expect_err("an unreadable payload descriptor must fail the data copy");
@@ -9778,6 +9982,7 @@ mod copy_tests {
             plan,
             &settings_with_delete(None),
             &mut copy_summary,
+            &DestinationContext::parent(Some(Arc::clone(&dst_parent))),
         )
         .await?;
         assert_eq!(copy_summary.rm_summary.files_removed, 2);
@@ -9792,6 +9997,7 @@ mod copy_tests {
             FilePlan::Vacant,
             &settings_with_delete(None),
             &mut copy_summary,
+            &DestinationContext::parent(Some(Arc::clone(&dst_parent))),
         )
         .await?;
         assert_eq!(copy_summary.rm_summary.files_removed, 2);
@@ -9828,6 +10034,7 @@ mod copy_tests {
             plan,
             &settings_with_delete(None),
             &mut copy_summary,
+            &DestinationContext::parent(Some(Arc::clone(&dst_parent))),
         )
         .await?;
         assert_eq!(copy_summary.rm_summary.files_removed, 2);
@@ -9867,6 +10074,7 @@ mod copy_tests {
             plan,
             &settings_with_delete(None),
             &mut copy_summary,
+            &DestinationContext::parent(Some(Arc::clone(&dst_parent))),
         )
         .await?;
 

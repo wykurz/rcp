@@ -3,6 +3,177 @@
 #[path = "../../common/tests/support/mounts.rs"]
 mod mounts;
 
+fn input_fixture(path: &std::path::Path, size: usize) -> anyhow::Result<Vec<u8>> {
+    std::fs::create_dir_all(path)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut config = common::filegen::FileGenConfig::new(path, vec![], 1, size);
+    config.leaf_files = true;
+    runtime.block_on(common::filegen::filegen(common::get_progress(), &config))?;
+    Ok(std::fs::read(path.join("file0"))?)
+}
+
+fn overwrite_operands(
+    first: &std::path::Path,
+    second: &std::path::Path,
+    destination: &std::path::Path,
+    strict: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rcp"));
+    command.args(["--overwrite", "--max-workers=2"]);
+    if strict {
+        command.arg("--require-toctou-safe");
+    }
+    command
+        .arg(first)
+        .arg(second)
+        .arg(format!("{}/", destination.display()))
+        .output()
+}
+
+fn assert_input_error(output: &std::process::Output) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        message.contains("overlap") || message.contains("input"),
+        "expected input protection error: {output:?}",
+    );
+}
+
+#[test]
+fn overwrite_preserves_a_later_directory_operand() -> anyhow::Result<()> {
+    for strict in [false, true] {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let first = root.join("from/A");
+        input_fixture(&first, 32)?;
+        std::fs::write(first.join("victim"), b"replacement")?;
+        let destination = root.join("dst");
+        let later = destination.join("A/victim/B");
+        let original = input_fixture(&later, 64)?;
+        let output = overwrite_operands(&first, &later, &destination, strict)?;
+        assert_eq!(
+            std::fs::read(later.join("file0")).expect("later input must survive"),
+            original,
+            "{output:?}",
+        );
+        assert_input_error(&output);
+    }
+    Ok(())
+}
+
+#[test]
+fn overwrite_preserves_descendants_of_a_later_directory_operand() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let first = root.join("from/A");
+    input_fixture(&first.join("B/nested"), 32)?;
+    let destination = root.join("dst");
+    let later = destination.join("A/B");
+    let original = input_fixture(&later.join("nested"), 64)?;
+    // strict dispatch makes the earlier copy reach B before the later input starts
+    let output = overwrite_operands(&first, &later, &destination, true)?;
+    assert_eq!(
+        std::fs::read(later.join("nested/file0"))?,
+        original,
+        "{output:?}"
+    );
+    assert_input_error(&output);
+    Ok(())
+}
+
+#[test]
+fn root_file_overwrite_preserves_a_later_input_tree() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let first = root.join("from");
+    input_fixture(&first, 32)?;
+    let later = root.join("input");
+    let destination = later.join("unvisited/deep");
+    let original = input_fixture(&destination, 64)?;
+    // keep the later root pending until the first operand reaches its replacement check
+    let output = overwrite_operands(&first.join("file0"), &later, &destination, true)?;
+    assert_eq!(
+        std::fs::read(destination.join("file0"))?,
+        original,
+        "{output:?}"
+    );
+    assert_input_error(&output);
+    Ok(())
+}
+
+#[test]
+fn overwrite_preserves_a_later_file_operand() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let first = root.join("from/A");
+    input_fixture(&first, 32)?;
+    std::fs::write(first.join("victim"), b"replacement")?;
+    let destination = root.join("dst");
+    let parent = destination.join("A/victim");
+    let original = input_fixture(&parent, 64)?;
+    let later = parent.join("file0");
+    let output = overwrite_operands(&first, &later, &destination, true)?;
+    assert_eq!(
+        std::fs::read(&later).expect("later input file must survive"),
+        original,
+        "{output:?}"
+    );
+    assert_input_error(&output);
+    Ok(())
+}
+
+#[test]
+fn overwrite_preserves_a_later_symlink_operand() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let first = root.join("from/A");
+    input_fixture(&first, 32)?;
+    std::fs::write(first.join("victim"), b"replacement")?;
+    let destination = root.join("dst");
+    let parent = destination.join("A/victim");
+    std::fs::create_dir_all(&parent)?;
+    let later = parent.join("link");
+    std::os::unix::fs::symlink("absent", &later)?;
+    let output = overwrite_operands(&first, &later, &destination, true)?;
+    assert_eq!(
+        std::fs::read_link(&later).expect("later input symlink must survive"),
+        std::path::Path::new("absent"),
+        "{output:?}"
+    );
+    assert_input_error(&output);
+    Ok(())
+}
+
+#[test]
+fn empty_directory_overwrite_preserves_a_later_input() -> anyhow::Result<()> {
+    for strict in [false, true] {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let first = root.join("from/A");
+        input_fixture(&first, 32)?;
+        std::fs::write(first.join("victim"), b"replacement")?;
+        let destination = root.join("dst");
+        let later = destination.join("A/victim");
+        std::fs::create_dir_all(&later)?;
+        // the later empty root has a distinct, valid output, so it stays pending or commits
+        // participation instead of failing its own admission and releasing protection
+        let output = overwrite_operands(&first, &later, &destination, strict)?;
+        assert!(
+            later.is_dir(),
+            "empty input must remain a directory: {output:?}"
+        );
+        assert_eq!(std::fs::read_dir(&later)?.count(), 0);
+        assert_input_error(&output);
+    }
+    Ok(())
+}
+
 #[test]
 fn ignore_existing_skips_a_non_directory_inside_the_source() -> anyhow::Result<()> {
     for preview in [false, true] {

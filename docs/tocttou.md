@@ -603,14 +603,34 @@ held parents so it can enumerate them; read failures stop that subtree before it
 reported. Opening readably at that point avoids adding a search-permission requirement merely to
 reopen an empty, readable directory.
 
-**Destination removal is not covered by this registry.** A destination containing a source or
-participating update tree can destroy that input through `--delete` or directory replacement under
-`--overwrite`; `rcp --delete src/a/b src` can remove `src/a/b`. The same problem applies to
-directory aliases and operands whose source traversal has not started. Do not use these
-arrangements. Errors elsewhere in a copy do not cancel every independent removal already in
-progress.
+Local destination removal also checks input protection. Before a destructive `rcp` batch starts,
+each selected explicit source root is opened and classified. Directory participation is reserved
+tentatively in the overlap registry; file and symlink roots instead record their parent/name slots.
+`rlink` records its selected source/update roots from the handles already used for dispatch.
+Preparation retains neither root descriptors nor admission credits. Failed admission releases
+tentative directory claims, allowing later operands to use those directories. Explicit leaf-root
+names remain protected as input intent for the invocation.
 
-These are recursion checks, not a new security boundary or an atomic topology snapshot. Concurrent
+Existing destination-directory admission rejects entry into pending directory roots before metadata
+changes or child work. Recursive removal checks its held directory classification before permission
+relaxation and verified descent, and checks the held parent/name before unlinking a leaf. Directory
+replacement first checks the identity captured during planning and the held parent/name before
+trying `rmdir`. This empty-directory fast path requires neither read access nor permission changes;
+a nonempty directory instead uses the protected removal walk. Regular-file and symlink roots are
+protected by parent/name, so a distinct hardlink may still be unlinked. A root leaf replacement
+checks the destination parent's available ancestry after comparison and skip decisions; nested
+leaves inherit admitted destination authority. `--delete` previews perform the same input checks;
+overwrite-only previews retain their permissive policy.
+
+There is no recursive input inventory, including for excluded subtrees. Added preparation work is
+proportional to explicit operand roots, plus available destination ancestry for actionable root-leaf
+replacements. Removal uses identities already obtained by its ordinary traversal; it does not scan
+inputs to search for aliases. Known input directories and explicit root slots are refused, but
+unseen aliases into a source subtree through bind mounts are outside this protection. A refusal
+preserves partial removal counts and stops removal of its ancestors; independent safe sibling work
+may already have completed. This is not an all-or-nothing overlap preflight.
+
+These overlap checks are not a new security boundary or an atomic topology snapshot. Concurrent
 renames can change ancestry after observation, and inode reuse after deletion can cause a
 conservative rejection. Identity comparison assumes distinct live directories have distinct
 `(dev, ino)` pairs; a filesystem that reports duplicate pairs can cause false overlap errors. The

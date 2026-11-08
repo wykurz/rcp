@@ -238,11 +238,11 @@ async fn identical_overwrite_plans_without_a_payload_probe() {
     assert_eq!(summary.files_unchanged, 1);
     assert_eq!(summary.files_copied, 0);
     assert_eq!(std::fs::read_to_string(&dst).expect("read dst"), "KEEP-ME");
-    // source parent open + admitted classification. Planning from the admitted metadata must not
-    // add a by-name probe, and the identical skip must not open the payload.
+    // three root-only protection probes (parent open, classification, parent identity), then the
+    // ordinary source parent open + classification. The identical skip must not open the payload.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        2,
+        5,
         "identical overwrite must not probe the source payload",
     );
     // destination parent open + overwrite-candidate classification; a skip performs no mutation.
@@ -623,5 +623,68 @@ async fn ignore_existing_adds_no_probe_for_directory_counterparts() {
             counts[0], counts[1],
             "ignore-existing must reuse directory resolution, preview={preview}"
         );
+    }
+}
+
+#[tokio::test]
+async fn overwrite_protection_adds_only_constant_root_probes() {
+    let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
+    for branches in [1, 8] {
+        for use_link in [false, true] {
+            let root = tempfile::tempdir().expect("fixture");
+            let src = root.path().join("source");
+            std::fs::create_dir(&src).expect("source root");
+            let mut config = common::filegen::FileGenConfig::new(&src, vec![branches], 3, 32);
+            config.leaf_files = true;
+            common::filegen::filegen(&PROGRESS, &config)
+                .await
+                .expect("input tree");
+            let mut counts = Vec::new();
+            for overwrite in [false, true] {
+                let mut settings = default_copy_settings();
+                settings.overwrite = overwrite;
+                let dst = root.path().join(format!("destination-{overwrite}"));
+                let sink = install_sink();
+                if use_link {
+                    let settings = link::Settings {
+                        copy_settings: settings,
+                        update_compare: Default::default(),
+                        update_exclusive: false,
+                        preserve: preserve::preserve_none(),
+                        filter: None,
+                        dry_run: None,
+                    };
+                    link::link(&PROGRESS, root.path(), &src, &dst, &None, &settings, false)
+                        .await
+                        .expect("fresh link");
+                } else {
+                    copy::copy(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &settings,
+                        &preserve::preserve_none(),
+                        false,
+                    )
+                    .await
+                    .expect("fresh copy");
+                }
+                congestion::clear_sample_sink();
+                counts.push((
+                    sink.metadata_count_for(congestion::Side::Source),
+                    sink.metadata_count_for(congestion::Side::Destination),
+                ));
+            }
+            assert_eq!(
+                counts[1].0 - counts[0].0,
+                if use_link { 0 } else { 2 },
+                "root preparation must not scale with input entries: link={use_link}, branches={branches}"
+            );
+            assert_eq!(
+                counts[0].1, counts[1].1,
+                "fresh output must need no extra destination probes"
+            );
+        }
     }
 }

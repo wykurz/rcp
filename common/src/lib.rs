@@ -123,6 +123,7 @@ pub mod filegen;
 pub mod filter;
 pub mod histogram_logger;
 pub mod histogram_panel;
+mod input_protection;
 pub mod link;
 pub mod observability;
 pub mod preserve;
@@ -559,6 +560,14 @@ pub async fn copy(
     session
         .copy(&PROGRESS, src, dst, settings, preserve, false)
         .await
+}
+
+/// Execute an operand prepared before local batch dispatch.
+pub async fn copy_prepared(
+    prepared: copy::PreparedCopy,
+    preserve: &preserve::Settings,
+) -> Result<copy::Summary, copy::Error> {
+    prepared.copy(&PROGRESS, preserve, false).await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<rm::Summary, rm::Error> {

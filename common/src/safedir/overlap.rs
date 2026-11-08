@@ -97,6 +97,14 @@ impl std::fmt::Debug for DirectoryOverlap {
 #[derive(Clone)]
 pub(crate) struct Reservation(Arc<ReservationInner>);
 
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("token", &self.0.token)
+            .finish_non_exhaustive()
+    }
+}
+
 struct ReservationInner {
     registry: Arc<DirectoryOverlap>,
     token: u64,
@@ -204,6 +212,15 @@ impl Reservation {
 }
 
 impl DirectoryOverlap {
+    pub(crate) fn input_owner(&self, identity: Identity) -> Option<Arc<Operand>> {
+        self.uses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inputs
+            .get(&identity)
+            .map(|uses| Arc::clone(uses.owner()))
+    }
+
     pub(crate) fn reserve(
         self: &Arc<Self>,
         inputs: &[&FileMeta],
@@ -543,6 +560,7 @@ mod tests {
                         &target,
                         &reuse_settings(),
                         &reservation,
+                        &Arc::new(crate::input_protection::InputProtection::new(Arc::default())),
                     )
                     .await
                 });
@@ -624,6 +642,7 @@ mod tests {
                         &target,
                         &reuse_settings(),
                         &reservation,
+                        &Arc::new(crate::input_protection::InputProtection::new(Arc::default())),
                     )
                     .await
                 });
@@ -695,6 +714,7 @@ mod tests {
                         &target,
                         &reuse_settings(),
                         &reservation,
+                        &Arc::new(crate::input_protection::InputProtection::new(Arc::default())),
                     )
                     .await
                 });
@@ -757,14 +777,25 @@ mod tests {
                         if state == 1 {
                             std::fs::create_dir(&container)?;
                         }
+                        let mut settings = reuse_settings();
+                        settings.dry_run = Some(crate::config::DryRunMode::Brief);
+                        let target = container.join("output");
+                        // stop at execution's classification, after the preview parent was held,
+                        // rather than at the separate root-only batch preparation
+                        let prepared = if link {
+                            None
+                        } else {
+                            Some(
+                                crate::copy::CopySession::default()
+                                    .prepare(&path.join("source"), &target, &settings)
+                                    .await?,
+                            )
+                        };
                         let mut gate = crate::testutils::BlockingPathGate::install(
                             path.join("source/.rcp-classified-entry"),
                         );
                         let task_path = path.clone();
-                        let target = container.join("output");
                         let task = tokio::spawn(async move {
-                            let mut settings = reuse_settings();
-                            settings.dry_run = Some(crate::config::DryRunMode::Brief);
                             if link {
                                 crate::link::link(
                                     crate::get_progress(),
@@ -786,17 +817,16 @@ mod tests {
                                 .map(|_| ())
                                 .map_err(|e| e.source)
                             } else {
-                                crate::copy::copy(
-                                    crate::get_progress(),
-                                    &task_path.join("source"),
-                                    &target,
-                                    &settings,
-                                    &crate::preserve::preserve_none(),
-                                    false,
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| e.source)
+                                prepared
+                                    .expect("copy operand prepared")
+                                    .copy(
+                                        crate::get_progress(),
+                                        &crate::preserve::preserve_none(),
+                                        false,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.source)
                             }
                         });
                         tokio::time::timeout(

@@ -729,10 +729,12 @@ unreadable there) — use `--modified-before` or a glibc build.
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
-**Known limitation:** destination removal does not protect source trees contained within it,
-including directory aliases. `--overwrite` or `--delete` can destroy the source in this arrangement;
-for example, `rcp --delete src/a/b src` can delete `src/a/b`. Avoid destinations containing a source
-or participating update tree.
+Local `rcp` and `rlink` refuse destination removals that reach a known source or participating
+update input. For example, `rcp --delete src/a/b src` reports an overlap instead of removing
+`src/a/b`. Explicit operand roots are checked before dispatch, so a later operand is protected
+before its traversal starts. These checks do not scan input trees a second time. They may report an
+error after safe sibling work has completed; there is no rollback. Do not rely on these checks to
+make copying over yourself through bind mounts or changing mount/rename arrangements safe.
 
 ## Delete (mirror)
 

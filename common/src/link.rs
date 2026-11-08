@@ -178,6 +178,7 @@ async fn hard_link_entry_fd(
     dst_name: &std::ffi::OsStr,
     dst_path: &std::path::Path,
     settings: &Settings,
+    destination: &copy::DestinationContext,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
     match dst_dir.hard_link_handle_at(src_handle, dst_name).await {
@@ -208,13 +209,18 @@ async fn hard_link_entry_fd(
             }
             tracing::info!("'dst' file type changed, removing and hard-linking");
             // fd-relative removal is contained to dst_dir (mirrors copy.rs).
-            let rm_summary = copy::remove_existing(
+            destination
+                .check_leaf_replacement_parent(dst_dir, dst_path)
+                .await
+                .map_err(|error| Error::new(error.into(), link_summary))?;
+            let rm_summary = copy::remove_existing_guarded(
                 prog_track,
                 dst_dir,
                 dst_name,
                 dst_path,
                 dst_handle.into_removal_snapshot(),
                 &settings.copy_settings,
+                Some(destination.protection()),
             )
             .await
             .map_err(|err| {
@@ -1100,7 +1106,7 @@ async fn link_internal(
     settings: &Settings,
     is_fresh: bool,
     admission: LinkEntryAdmission,
-    destination: copy::DestinationContext,
+    mut destination: copy::DestinationContext,
 ) -> Result<LinkEntryResult, Error> {
     let _prog_guard = prog_track.ops.guard();
     // reconstruct diagnostic paths and the deliberately path-based dereference fallback.
@@ -1253,6 +1259,32 @@ async fn link_internal(
                 }
             }
         }
+        if rel_path.as_os_str().is_empty()
+            && (settings.copy_settings.overwrite || settings.copy_settings.delete.is_some())
+        {
+            destination
+                .record_root(src_parent, name, &entry.src_handle, &src_path)
+                .await
+                .map_err(|error| Error::new(error.into(), Default::default()))?;
+            let mut directories = Vec::with_capacity(2);
+            if entry.src_handle.kind() == EntryKind::Dir {
+                directories.push(entry.src_handle.meta());
+            }
+            if let (Some((parent, name)), Some(handle), Some(path)) =
+                (update, entry.update_handle.as_ref(), update_path.as_deref())
+            {
+                destination
+                    .record_root(parent, name, handle, path)
+                    .await
+                    .map_err(|error| Error::new(error.into(), Default::default()))?;
+                if handle.kind() == EntryKind::Dir {
+                    directories.push(handle.meta());
+                }
+            }
+            destination
+                .reserve_roots(&directories)
+                .map_err(|error| Error::new(error.into(), Default::default()))?;
+        }
         // from this point every leaf-dispatch action retains the private entry bundle or an
         // `AdmittedLeaf` through its final fd-bearing work, including nested overwrite removal. A
         // delegated update action closes the comparison source handle, then transfers the selected
@@ -1326,6 +1358,7 @@ async fn link_internal(
                         dst_name,
                         &dst_path,
                         settings,
+                        &destination,
                     )
                     .await
                     .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -1403,6 +1436,7 @@ async fn link_internal(
                     dst_name,
                     &dst_path,
                     settings,
+                    &destination,
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -2323,6 +2357,7 @@ async fn link_dir_contents_prepared(
             settings.copy_settings.fail_early,
             settings.dry_run,
             &mut link_summary.copy_summary.rm_summary,
+            Some(destination.protection()),
         )
         .await
     {
@@ -2373,6 +2408,13 @@ async fn link_dir_contents_prepared(
             // operates on `dst_name` within the held `dst_parent` fd (never by path) and only
             // succeeds on an empty directory, so it is contained to `dst_parent`. `dst_parent` is
             // always Some here (None only in dry-run, where this arm is unreachable).
+            if let Some(parent) = dst_parent {
+                destination
+                    .protection()
+                    .check_child(parent, dst_name, dst_path)
+                    .await
+                    .map_err(|error| Error::new(error.into(), link_summary))?;
+            }
             let rmdir_result = match dst_parent {
                 Some(dst_parent) => dst_parent.rmdir_at(dst_name).await,
                 None => {
@@ -4783,6 +4825,7 @@ mod link_tests {
                 false,
                 None,
                 &mut summary.copy_summary.rm_summary,
+                None,
             )
             .await?;
 
@@ -4868,6 +4911,7 @@ mod link_tests {
                 false,
                 None,
                 &mut summary.copy_summary.rm_summary,
+                None,
             )
             .await?;
 
@@ -5015,6 +5059,7 @@ mod link_tests {
                 false,
                 None,
                 &mut summary.copy_summary.rm_summary,
+                None,
             )
             .await?;
 
@@ -5102,6 +5147,7 @@ mod link_tests {
                 false,
                 None,
                 &mut summary.copy_summary.rm_summary,
+                None,
             )
             .await?;
 
