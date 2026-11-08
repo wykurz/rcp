@@ -162,6 +162,25 @@ that sets `FOPEN_NONSEEKABLE` or `FOPEN_STREAM`; a seekable FUSE mount does not 
 an extra open/close per fallback listing, and `EACCES` if reopening `.` requires search permission
 the caller lacks, including on an empty directory with mode `0444`.
 
+**Directory-record memory safety** has focused `raw_directory_entry_` tests in
+`common/src/safedir.rs`. They call `directory_entry_from_raw` on records constructed in memory,
+covering short records and names longer than the nominal `libc::dirent::d_name` array while
+preserving non-UTF-8 bytes in owned names. Keep all production record field access in this helper:
+these tests do not exercise `next_raw_entry` or `readdir`. Run them under Miri when changing field
+access; native tests alone do not detect an oversized reference to a variable-sized libc record.
+
+Run the command below outside `nix develop`, with Cargo supplied by rustup and a nightly toolchain
+with its Miri component installed. The Nix shell supplies stable Cargo directly, which does not
+recognize rustup's `+nightly` syntax. Use the GNU target explicitly to override the repository's
+musl default:
+
+```bash
+cargo +nightly miri test --target x86_64-unknown-linux-gnu \
+  -p rcp-tools-common --lib raw_directory_entry -- --test-threads=1
+```
+
+This focused Miri check is opt-in; CI runs the tests natively.
+
 **Directory overlap tests** cover local copy/link destinations inside source and update roots,
 including deletion, dry runs, held parents after rename, and descriptor ownership on cancellation.
 Shared admission tests also cover missing or unreadable preview counterparts, failed reservations,
