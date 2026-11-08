@@ -15,7 +15,8 @@ class ProductionWorkflowTests(unittest.TestCase):
 
     def test_only_owner_manual_or_explicitly_enabled_schedule_can_build(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "schedule"})
-        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "17 8 * * 1,5"}])
+        self.assertEqual(self.workflow["on"]["schedule"],
+                         [{"cron": "17 8 * * 1,5"}, {"cron": "17 5 8 11 *"}])
         guard = self.workflow["jobs"]["validate"]["if"]
         for check in ("github.repository == 'wykurz/rcp'", "github.ref == 'refs/heads/main'",
                       "github.event_name == 'workflow_dispatch'", "vars.RCP_AWS_PRODUCTION_ENABLED == 'true'",
@@ -40,6 +41,24 @@ class ProductionWorkflowTests(unittest.TestCase):
                     self.assertEqual(output.read_text(), "revision=" + revision + "\n")
                 else:
                     self.assertFalse(output.exists())
+
+    def test_commissioning_schedule_has_a_finite_early_build_window(self):
+        from datetime import datetime, timedelta, timezone
+        from .production_workflow import COMMISSIONING_CRON, COMMISSIONING_END, COMMISSIONING_START, source
+        from .test_production_workflow_request import environment
+        env = environment(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true",
+                          RCP_REQUESTED_REVISION="", RCP_EVENT_SCHEDULE=COMMISSIONING_CRON)
+        step = next(step for step in self.workflow["jobs"]["validate"]["steps"] if step.get("id") == "source")
+        self.assertEqual(step["env"]["RCP_EVENT_SCHEDULE"], "${{ github.event.schedule }}")
+        for at in (COMMISSIONING_START, COMMISSIONING_END):
+            self.assertEqual(source(env, at), env["GITHUB_SHA"])
+        for at in (COMMISSIONING_START - timedelta(seconds=1),
+                   COMMISSIONING_END + timedelta(seconds=1),
+                   datetime(2027, 11, 8, 5, 17, tzinfo=timezone.utc)):
+            with self.subTest(at=at), self.assertRaisesRegex(ValueError, "commissioning schedule"):
+                source(env, at)
+        env["RCP_EVENT_SCHEDULE"] = "17 8 * * 1,5"
+        self.assertEqual(source(env, datetime(2027, 11, 8, 8, 17, tzinfo=timezone.utc)), env["GITHUB_SHA"])
 
     def test_schedule_has_no_privileged_dispatch_or_unreviewed_credentials(self):
         validate = self.workflow["jobs"]["validate"]

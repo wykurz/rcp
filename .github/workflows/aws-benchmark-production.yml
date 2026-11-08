@@ -5,6 +5,8 @@ on:
   schedule:
     # proposed two-slot UTC cadence; no job runs until the separate schedule gate is true
     - cron: '17 8 * * 1,5'
+    # temporary commissioning slot; remove after the approved November 8 scheduler test
+    - cron: '17 5 8 11 *'
   workflow_dispatch:
     inputs:
       mode:
@@ -45,6 +47,7 @@ jobs:
           RCP_REQUESTED_REVISION: ${{ inputs.revision }}
           RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
           RCP_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED }}
+          RCP_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: python3 -m infra.aws_benchmark.production_workflow
 
   build:
