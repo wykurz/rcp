@@ -86,8 +86,8 @@ class S3:
 
 
 class Fixture:
-    def __init__(self, temp_root):
-        expected = dict(binding("bulk-1g-metadata"), candidate="a" * 40,
+    def __init__(self, temp_root, *, suite="bulk-1g-metadata"):
+        expected = dict(binding(suite), candidate="a" * 40,
             workflow="wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads/main")
         pins = dict(region="us-east-1", account="123456789012", namespace="production", bucket="bucket",
             lt_id="lt-" + "1" * 17, lt_version="9", ami="ami-" + "2" * 17, source="f" * 40,
@@ -148,9 +148,9 @@ class Fixture:
         status = common.completed_status(request["run"], True)
         window, command = durable.window(request, bound), durable.worker_command(request, bound)
         worker = dict(window=window, request=command, status=status, harness_revision=pins["source"],
-            admission=dict(accepted=True, required_seconds=9852, remaining_seconds=10410),
+            admission=dict(accepted=True, required_seconds=common.durable_worker_reserve(request["plan"]), remaining_seconds=10410),
             guest_instance_id=INSTANCE, service_returncode=0,
-            timing_basis="projected workload with explicit headroom; not a measured complete run",
+            timing_basis=common.durable_plan_contract(request["plan"])["timing_basis"],
             runtime_origin="attempt_started_at")
         raw = archive([("worker.json", results.encoded(worker)), (results.RESULT, results.encoded(measurement(expected)))])
         self.s3.seed(self.paths.results, raw)
@@ -210,6 +210,52 @@ class CollectionTests(unittest.TestCase):
         again = self.fx.collector.collect(retire=True)
         self.assertEqual(again, value)
         self.assertEqual(len(self.fx.s3.writes), writes)
+    def test_100mb_fixed_budget_qualifies_and_freezes_a_distinct_public_record(self):
+        from .production_projection import bind
+        fx = Fixture(self.directory.name, suite="bulk-100m-metadata")
+        value = fx.collector.collect(retire=True)
+        self.assertEqual(value["state"], "success", value)
+        self.assertTrue(value["retired"])
+        ref = value["retention"]
+        manifest = json.loads(fx.s3.objects[ref["key"]][ref["version"]])
+        payloads = {name: fx.s3.objects[item["key"]][item["version"]]
+                    for name, item in manifest["retained"].items()}
+        collection.validate_retained(fx.store.record, manifest, payloads)
+        report = json.loads(payloads["report.json"])
+        self.assertTrue(report["benchmark_valid"], report)
+        self.assertEqual(report["qualification_outcome"], "passed")
+        self.assertEqual(report["evidence"]["worker"]["timing_basis"],
+                         "fixed qualification budget; workload duration not yet measured")
+        public = bind(report["public_projection"], ref["sha256"])
+        self.assertEqual(public["identity"]["suite"], "bulk-100m-metadata")
+        self.assertEqual({item["case_id"] for item in public["measurements"]}, {"bulk-100m-1024gb"})
+        self.assertEqual([len(item["samples"]) for item in public["measurements"]], [2, 2])
+        self.assertIn("does not prove content integrity", public["validation"])
+        self.assertEqual(len(fx.store.retire_calls), 1)
+        self.assertEqual(fx.collector.collect(retire=True), value)
+        self.assertEqual(len(fx.store.retire_calls), 1)
+
+    def test_100mb_archive_cannot_claim_the_one_gigabyte_projected_timing_basis(self):
+        fx = Fixture(self.directory.name, suite="bulk-100m-metadata")
+        with zipfile.ZipFile(io.BytesIO(fx.s3.objects[fx.paths.results]["1"])) as source:
+            files = {name: source.read(name) for name in source.namelist()}
+        worker = json.loads(files["worker.json"])
+        worker["timing_basis"] = "projected workload with explicit headroom; not a measured complete run"
+        files["worker.json"] = results.encoded(worker)
+        raw = archive(list(files.items()))
+        fx.s3.seed(fx.paths.results, raw)
+        status = common.completed_status(fx.store.record.state["request"]["run"], True)
+        fx.s3.seed(fx.paths.status, collection.encoded(dict(status, sha256=common.digest(raw))))
+        value = fx.collector.collect(retire=True)
+        self.assertEqual(value["state"], "failed", value)
+        self.assertTrue(value["retired"])
+        report = json.loads(fx.s3.objects[fx.collector.prefix + "report.json"]["1"])
+        self.assertTrue(any("unverified worker timing labels" in message
+                            for message in report["evidence"]["errors"]))
+        self.assertFalse(report["benchmark_valid"])
+        self.assertEqual(report["qualification_outcome"], "failed")
+        self.assertEqual(report["public_projection"]["measurements"], [])
+
     def test_production_submission_proof_does_not_broaden_legacy_cli_conclusions(self):
         self.assertEqual(results.CONCLUSIONS, ("success", "failure", "cancelled", "skipped"))
         self.assertIs(collection.CONCLUSIONS, results.SUBMISSION_CONCLUSIONS)

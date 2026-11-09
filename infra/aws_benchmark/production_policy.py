@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 
-from .common import BINARIES, MAX_BINARY, require, timestamp, utc
+from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, require, timestamp, utc
 from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
@@ -37,6 +37,7 @@ class Policy:
     owner_id: str
     enabled: bool = False
     manual_actor_ids: tuple = ()
+    manual_suites: tuple = ("bulk-1g-metadata",)
     schedule_slots: tuple = ()  # weekday (Monday=0), hour, minute in UTC
     scheduled_baseline: str = ""
     total_cap_microusd: int = 0
@@ -61,6 +62,10 @@ class Policy:
                 and len(set(self.manual_actor_ids)) == len(self.manual_actor_ids)
                 and all(isinstance(v, str) and re.fullmatch(r"[1-9][0-9]{0,19}", v)
                         for v in self.manual_actor_ids), "invalid explicit manual maintainer IDs")
+        require(type(self.manual_suites) is tuple and len(self.manual_suites) <= len(DURABLE_SUITES)
+                and all(isinstance(suite, str) and suite in DURABLE_SUITES for suite in self.manual_suites)
+                and len(set(self.manual_suites)) == len(self.manual_suites),
+                "invalid explicit manual file-set allowlist")
         require(type(self.schedule_slots) is tuple and len(self.schedule_slots) <= 3,
                 "at most three explicit weekly schedule slots are supported")
         for slot in self.schedule_slots:
@@ -81,6 +86,9 @@ class Policy:
         integer(self.daily_run_limit, 0, 10, "invalid daily admission limit")
         integer(self.runtime_seconds, durable.minimum_runtime(), durable.RUNTIME_SECONDS,
                 "runtime must fit the recorded workload plan")
+        for suite in self.manual_suites:
+            require(self.runtime_seconds >= durable.minimum_runtime(durable_plan_for_suite(suite)),
+                    "manual file set does not fit its explicit qualification budget")
         integer(self.capacity_seconds, 60, durable.CAPACITY_SECONDS, "capacity window exceeds 12 hours")
         integer(self.shutdown_seconds, durable.SHUTDOWN_ALLOWANCE_SECONDS, 3600,
                 "shutdown allowance is below the reviewed margin")
@@ -149,9 +157,9 @@ def manifest(value):
             "unexpected benchmark manifest fields")
     require(all(isinstance(value[side], str) and SHA.fullmatch(value[side]) for side in ("baseline", "candidate")),
             "benchmark revisions must be pinned full SHAs")
-    require(value["suite"] == "bulk-1g-metadata", "production suite is not allowlisted")
-    # the first unattended acceptance uses the measured A/A workload. A/B admission
-    # needs its own reviewed contract and must not reinterpret historical A/A proof.
+    require(value["suite"] in DURABLE_SUITES, "production suite is not allowlisted")
+    # all file sets here remain A/A. A/B admission needs a separately reviewed
+    # contract and must not reinterpret historical A/A proof.
     require(value["baseline"] == value["candidate"], "initial production acceptance requires A/A")
     binaries = value["binaries"]
     require(isinstance(binaries, dict) and set(binaries) == set(BINARIES), "unexpected binary manifest")
@@ -192,7 +200,9 @@ def authorize(policy, identity, run, value, now):
     slot = None
     if identity.event_name == "workflow_dispatch":
         require(identity.actor_id in (policy.owner_id, *policy.manual_actor_ids), "manual requester is not approved")
+        require(checked["suite"] in policy.manual_suites, "manual file set is not explicitly approved")
     elif identity.event_name == "schedule":
+        require(checked["suite"] == "bulk-1g-metadata", "scheduled file set is not approved")
         slot = schedule_slot(policy, run.created_at, now)
         require(identity.actor_id == policy.owner_id, "scheduled requester is not the approved owner")
         baseline = identity.sha if policy.scheduled_baseline == SCHEDULE_MAIN_AA else policy.scheduled_baseline

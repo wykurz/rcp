@@ -27,7 +27,7 @@ from benchmarks.run import load_manifest
 from benchmarks.verification import METADATA_POLICY
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
-                     DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve,
+                     DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve, durable_plan_contract,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, retryable_io, timestamp,
                      validate_admission, validate_request, validate_window)
@@ -425,7 +425,7 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
     status = completed_status(window["run"])
     metadata = {"window": window, "worker_started_at": timestamp(started)}
     if bounded:
-        metadata.update(guest_instance_id=identity, timing_basis="projected workload with explicit headroom; not a measured complete run",
+        metadata.update(guest_instance_id=identity, timing_basis=durable_plan_contract(window["plan"])["timing_basis"],
                         runtime_origin="attempt_started_at")
     stopped = True
     try:

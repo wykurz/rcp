@@ -838,3 +838,16 @@ References:
 [AWS GitHub claim mapping](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html),
 [AWS OIDC skew](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc.html),
 [STS sessions](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html).
+
+## Additional file-set coverage
+
+The recurring schedule remains 1 GB-file metadata A/A. Manual 100 MB qualification support is
+prepared separately; it is not enabled by merging the workflow choice. The server's `manual_suites`
+allowlist defaults to 1 GB only, including when reading existing policy payloads that predate that
+field. Scheduled admission independently requires the 1 GB suite. No runtime, budget, credential or
+access setting changes automatically when this code lands.
+
+See [incremental 100 MB qualification](LARGE_WORKLOADS.md#incremental-100-mb-metadata-qualification)
+for the fixed, explicitly unmeasured qualification budget, image/controller compatibility, live
+approval sequence and the separate million-file readiness limits. Qualify on a non-scheduled day;
+keep the existing daily-one, single-owner and cumulative-reservation controls intact.

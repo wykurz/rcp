@@ -21,7 +21,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from benchmarks.strict_json import parse_json
-from .common import BINARIES, Budget, require, utc
+from .common import BINARIES, DURABLE_SUITES, Budget, require, utc
 from .controller import oidc_session, read_binary
 from .production_transport import retryable_transport
 
@@ -95,15 +95,16 @@ def token(audience):
     return value
 
 
-def prepare(binary_root, revision):
+def prepare(binary_root, revision, *, suite="bulk-1g-metadata"):
     require(isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision), "source must be a full SHA")
+    require(suite in DURABLE_SUITES, "production file set is not allowlisted")
     root = Path(binary_root)
     binaries = {}
     for name in ("rcp", "rcpd", "filegen"):
         data = read_binary(root / name)
         for side in ("baseline", "candidate"):
             binaries[side + "/" + name] = data
-    manifest = dict(baseline=revision, candidate=revision, suite="bulk-1g-metadata",
+    manifest = dict(baseline=revision, candidate=revision, suite=suite,
         binaries={name: dict(sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
                   for name, data in binaries.items()})
     return manifest, binaries
@@ -253,6 +254,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binaries", type=Path, required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--suite", choices=DURABLE_SUITES, default="bulk-1g-metadata")
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument("--role", required=True)
@@ -266,7 +268,7 @@ def main():
     require(re.fullmatch(r"arn:aws:lambda:" + re.escape(args.region) + ":" + account
             + r":function:[A-Za-z0-9_-]{1,64}", args.function), "invalid admission function")
     require(re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", args.bucket), "invalid production bucket")
-    manifest, binaries = prepare(args.binaries, args.revision)
+    manifest, binaries = prepare(args.binaries, args.revision, suite=args.suite)
     budget = Budget(datetime.now(timezone.utc) + timedelta(seconds=60))
     session, _ = oidc_session(args.region, args.role, session_prefix="rcp-production-",
         duration_seconds=900, budget=budget, reserve=10)

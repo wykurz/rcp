@@ -38,7 +38,7 @@ class ProductionWorkflowTests(unittest.TestCase):
                                         cwd=ROOT, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
                 if valid:
-                    self.assertEqual(output.read_text(), "revision=" + revision + "\n")
+                    self.assertEqual(output.read_text(), "revision=" + revision + "\nsuite=bulk-1g-metadata\n")
                 else:
                     self.assertFalse(output.exists())
 

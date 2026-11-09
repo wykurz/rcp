@@ -36,6 +36,8 @@ _RECORDED_DURABLE_CONTRACTS = {
         plan=MappingProxyType(dict(version="bulk-metadata-plan-v1", work_seconds=3104, setup_seconds=100,
                   report_seconds=180, safety_factor=3, boot_reserve_seconds=300,
                   shutdown_reserve_seconds=300)),
+        suite="bulk-1g-metadata",
+        timing_basis="projected workload with explicit headroom; not a measured complete run",
         max_runtime=10800, max_provisioning=43200, max_attempts=720, delivery_drain_seconds=900,
         binary_names=("rcp", "rcpd", "filegen"),
         pin_patterns=MappingProxyType({
@@ -47,6 +49,15 @@ _RECORDED_DURABLE_CONTRACTS = {
             "bucket": r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]",
             "profile_arn": r"arn:aws:iam::{account}:instance-profile/[A-Za-z0-9+=,.@_/-]+"}))),
 }
+# the 100 MB plan is an experimental admission budget, not an extrapolated duration
+_RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"] = MappingProxyType(dict(
+    _RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"],
+    suite="bulk-100m-metadata",
+    timing_basis="fixed qualification budget; workload duration not yet measured",
+    plan=MappingProxyType(dict(version="bulk-100m-qualification-budget-v1",
+        minimum_worker_seconds=10200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
+DURABLE_SUITES = ("bulk-1g-metadata", "bulk-100m-metadata")
+
 # projected work, not a measured complete run; advance the version when any bound changes
 _CURRENT_DURABLE_CONTRACT = _RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]
 DURABLE_PLAN = dict(_CURRENT_DURABLE_CONTRACT["plan"])
@@ -84,6 +95,10 @@ SUITE_PROFILES = {
         runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY,
         verification_versions=_CLOUD_VERIFICATION_VERSIONS, admission=_METADATA_ADMISSION),
 }
+# prepared for separately approved direct qualification; legacy hour windows stay disabled
+SUITE_PROFILES["bulk-100m-metadata"] = dict(cases=("bulk-100m-1024gb",), repetitions=2,
+    runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY,
+    verification_versions=(_CLOUD_VERIFICATION_VERSIONS[-1],), active=False)
 SUITES = {name: profile["cases"] for name, profile in SUITE_PROFILES.items()}
 ACTIVE_SUITES = {name: cases for name, cases in SUITES.items() if SUITE_PROFILES[name].get("active", True)}
 LARGE_SUITES = {name: cases for name, cases in SUITES.items() if "policy" in SUITE_PROFILES[name]}
@@ -157,6 +172,13 @@ def validate_identity(value):
         require(value["baseline"] == value["candidate"], "A/A pilot requires identical revisions")
 
 
+def durable_plan_for_suite(suite):
+    """Select an explicit current contract; never scale another fixture's estimate."""
+    require(suite in DURABLE_SUITES, "direct qualification suite is not allowlisted")
+    return dict(DURABLE_PLAN if suite == "bulk-1g-metadata" else
+                _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"]["plan"])
+
+
 def durable_plan_contract(plan, *, exact=True):
     """Resolve a recorded version; current admission remains an explicit stricter check."""
     require(isinstance(plan, dict) and isinstance(plan.get("version"), str), "unknown durable workload plan")
@@ -165,16 +187,17 @@ def durable_plan_contract(plan, *, exact=True):
     require(all(type(value) is int for key, value in plan.items() if key != "version"),
             "durable plan durations must be integers")
     if exact:
-        require(plan == DURABLE_PLAN, "durable workload plan is not current")
+        require(plan == durable_plan_for_suite(recorded["suite"]), "durable workload plan is not current")
     return {**recorded, "plan": dict(recorded["plan"]), "pin_patterns": dict(recorded["pin_patterns"]),
             "binaries": tuple(f"{role}/{name}" for role in ("baseline", "candidate")
                               for name in recorded["binary_names"])}
 
 
 def durable_worker_reserve(plan, *, exact=True):
-    """Return the recognized plan's projected work plus its recorded planning headroom."""
+    """Return the recorded worker floor without reinterpreting historical plan semantics."""
     plan = durable_plan_contract(plan, exact=exact)["plan"]
-    return (plan["work_seconds"] + plan["report_seconds"]) * plan["safety_factor"]
+    return plan["minimum_worker_seconds"] if "minimum_worker_seconds" in plan else \
+        (plan["work_seconds"] + plan["report_seconds"]) * plan["safety_factor"]
 
 
 def durable_minimum_runtime(plan=None, *, exact=True):
@@ -225,10 +248,13 @@ def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
             "durable identity and timestamps must be strings")
     require(value["protocol"] in (DURABLE_PROTOCOL, DIRECT_PROTOCOL), "unsupported durable protocol")
     validate_identity(value)
-    require(value["suite"] == "bulk-1g-metadata" and value["baseline"] == value["candidate"],
+    require(value["suite"] in DURABLE_SUITES and value["baseline"] == value["candidate"],
             "durable qualification requires metadata-only A/A")
+    require(value["suite"] != "bulk-100m-metadata" or direct,
+            "100 MB qualification requires a direct instance-bound window")
     require(re.fullmatch(r"i-[0-9a-f]{17}", value["instance_id"]), "invalid durable instance identity")
     contract = durable_plan_contract(value["plan"], exact=exact)
+    require(contract["suite"] == value["suite"], "durable plan belongs to another file set")
     runtime = value["runtime_seconds"]
     plan = contract["plan"]
     require(type(runtime) is int and durable_minimum_runtime(value["plan"], exact=exact)
@@ -265,11 +291,11 @@ def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
 def validate_admission(value, *, window=False):
     """Apply current cloud policy without changing historical identity validation."""
     validate_identity(value)
-    require(value["suite"] in ACTIVE_SUITES,
-            "suite is disabled for new AWS runs until full-content verification fits the bounded window")
     if window and "protocol" in value:
         validate_durable_window(value, now=utc(value["launch_at"]), minimum=0)
         return
+    require(value["suite"] in ACTIVE_SUITES,
+            "suite is disabled for new AWS runs through this legacy path until separately qualified")
     if window:
         minimum = admission_contract(value["suite"])["window"]
         require(minimum <= (utc(value["deadline"]) - utc(value["opens"])).total_seconds() <= MAX_WINDOW,
