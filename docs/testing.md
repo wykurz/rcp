@@ -154,13 +154,17 @@ The hard-link race regression covers the walker above the directory-listing API.
 entire `rcp-tools-common` library test suite, keep the `TMPDIR` path shorter than roughly 75
 characters so temporary Unix socket paths fit the kernel's path-length limit.
 
-Nonseekable FUSE directories need a fresh, fd-relative open of `.` when the seek returns `ESPIPE`.
-The committed tests inject the seek result through a closure on an ordinary filesystem, exercising
-fallback control flow without validating actual kernel/FUSE behavior. No real FUSE fixture is
-committed. When changing it, manually verify repeated full and capped listings with a FUSE server
-that sets `FOPEN_NONSEEKABLE` or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Expect
-an extra open/close per fallback listing, and `EACCES` if reopening `.` requires search permission
-the caller lacks, including on an empty directory with mode `0444`.
+Nonseekable FUSE directories need a fresh description when the seek returns `ESPIPE`. The shared
+reopen helper first opens `.` relative to the held fd. On `EACCES`, it retries through
+`/proc/self/fd/<n>`, so a readable directory without search permission (including mode `0444`) can
+still be listed. The fallback requires `/proc` and read permission on the directory. Remote source
+cursors use the same helper on every filesystem. Permission tests cover both entry points, cursor
+offset independence, and a directory whose original path has been replaced. The committed tests
+inject the seek result through a closure on an ordinary filesystem, exercising fallback control flow
+without validating actual kernel/FUSE behavior. No real FUSE fixture is committed. When changing it,
+manually verify repeated full and capped listings with a FUSE server that sets `FOPEN_NONSEEKABLE`
+or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Expect an extra open/close per
+fallback listing, plus the failed `.` open when search permission is absent.
 
 **Directory-record memory safety** has focused `raw_directory_entry_` tests in
 `common/src/safedir.rs`. They call `directory_entry_from_raw` on records constructed in memory,

@@ -947,11 +947,14 @@ its opened directory fd. Symlink target and metadata come from one classificatio
 uses each classification snapshot for filtering, dispatch, and manifest comparison. It does not
 retain a tree-wide name map or re-enumerate a directory to find files.
 
-The hardened cursor has an independent open file description obtained fd-relatively from the held
-directory; a type hint alone never authorizes security-sensitive work. Held ancestors are not closed
-and reopened by path. The `-L` adapter uses the same single-cursor scheduling and accounting with
-its intentional symlink-following behavior. Dry-run performs one discovery for reporting, sends no
-Begin, End, or data jobs, and finishes with `DiscoveryComplete(false)`.
+The hardened cursor has an independent open file description anchored to the held directory. It
+opens `.` relative to that fd, retrying through `/proc/self/fd/<n>` on `EACCES` so readable
+directories without search permission can still be enumerated. The retry still requires read
+permission and a mounted `/proc`. A type hint alone never authorizes security-sensitive work. Held
+ancestors are not closed and reopened by path. The `-L` adapter uses the same single-cursor
+scheduling and accounting with its intentional symlink-following behavior. Dry-run performs one
+discovery for reporting, sends no Begin, End, or data jobs, and finishes with
+`DiscoveryComplete(false)`.
 
 If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
 without file-task admission, coalescing already-available outcomes as described in §7.4. Other
