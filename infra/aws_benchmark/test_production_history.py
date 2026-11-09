@@ -47,6 +47,8 @@ class HistoryTests(unittest.TestCase):
         for metric in ("duration", "cpu", "memory"):
             self.assertEqual(html.count("data-history-metric='" + metric + "'"), 4)
         self.assertEqual(html.count("<svg "), 3)
+        self.assertIn(projection.MEASUREMENT_CAVEAT, html)
+        self.assertIn(projection.VALIDATION, html)
         self.assertIn("not whole-host totals", html)
         self.assertIn("not confidence intervals", html)
         self.assertIn("No recorded qualified", html)
