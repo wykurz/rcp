@@ -2272,6 +2272,97 @@ fn can_read_unreadable_dir() -> bool {
     readable
 }
 
+#[test]
+fn test_remote_processes_readable_unsearchable_root() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!("skipping: capability overrides bypass directory permissions");
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let source = src_dir.path().join("readable_root");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let src_remote = format!("localhost:{}", source.display());
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    for (strict, preview) in [(false, false), (false, true), (true, false), (true, true)] {
+        let destination = dst_dir.path().join(format!("copy-{strict}-{preview}"));
+        let dst_remote = format!("localhost:{}", destination.display());
+        let mut args = vec![daemon.as_str(), "--fail-early", "--summary"];
+        if strict {
+            args.push("--require-toctou-safe");
+        }
+        if preview {
+            args.push("--dry-run=brief");
+        }
+        args.extend([src_remote.as_str(), dst_remote.as_str()]);
+        let output = run_rcp_with_args(&args);
+        print_command_output(&output);
+        assert!(
+            output.status.success(),
+            "strict={strict}, preview={preview}"
+        );
+        let summary = parse_summary_from_output(&output).expect("missing copy summary");
+        assert_eq!(summary.directories_created, 1);
+        assert_eq!(summary.files_copied, 0);
+        if preview {
+            assert!(!destination.exists());
+        } else {
+            assert_eq!(get_file_mode(&destination), 0o444);
+            assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        }
+    }
+}
+
+#[test]
+fn test_remote_unsearchable_empty_child_does_not_abort_siblings() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!("skipping: capability overrides bypass directory permissions");
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let source = src_dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let child = source.join("empty");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o444)).unwrap();
+    create_test_file(&source.join("payload"), "sibling content", 0o644);
+    let destination = dst_dir.path().join("destination");
+    let src_remote = format!("localhost:{}", source.display());
+    let dst_remote = format!("localhost:{}", destination.display());
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    let output = run_rcp_with_args(&[
+        &daemon,
+        "--fail-early",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(output.status.success());
+    assert_eq!(
+        get_file_content(&destination.join("payload")),
+        "sibling content"
+    );
+    assert_eq!(get_file_mode(&destination.join("empty")), 0o444);
+    assert_eq!(
+        std::fs::read_dir(destination.join("empty"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let summary = parse_summary_from_output(&output).expect("missing copy summary");
+    assert_eq!(summary.directories_created, 2);
+    assert_eq!(summary.files_copied, 1);
+}
+
 /// A classified but unreadable root sends Begin and End(0), then consumes Ready or Skipped.
 /// The directory lands empty and the original read failure remains an error for the operation.
 #[test]

@@ -529,8 +529,11 @@ Specific invariants enforced:
   reusing the earlier directory-open snapshot. These separately gated reads are not an atomic
   snapshot; consistency assumes the source metadata stays stable during capture. Mutations after
   capture do not update the preserved snapshot. Full and capped listings seek its description before
-  duplicating it; the `ESPIPE` fallback and independent cursors instead open `.` relative to that
-  held fd, creating a new description for the same directory inode without re-resolving its name.
+  duplicating it; the `ESPIPE` fallback and independent cursors instead reopen the held directory,
+  creating a new description for the same inode without re-resolving its name. They first open `.`
+  relative to the held fd; on `EACCES`, they follow its trusted `/proc/self/fd/<n>` magic link
+  instead. The descriptor remains owned throughout the open. This avoids requiring directory search
+  permission but still checks read permission, and the fallback fails if `/proc` is unavailable.
   Enumeration and metadata therefore remain bound to the same held directory. Remote source
   discovery uses one fd-relative cursor per directory in bounded batches; each discovered name is
   classified once for filtering and dispatch. A subsequently opened file data fd is checked again
@@ -955,8 +958,9 @@ fourth is an operational one the caller owes:
   pass, because the entry *is* that inode. This enables unauthorized reads, privileged chmod/chown
   of the aliased inode, and similar attacks (Scenario 4). No userspace scheme can defend against a
   missing `protected_hardlinks` guard. Verify with: `sysctl fs.protected_hardlinks`
-- **`/proc` mounted**: Used by `rchm` for file chmod (via `/proc/self/fd/<n>`). Standard on all
-  Linux distributions.
+- **`/proc` mounted**: Used by `rchm` for file chmod (via `/proc/self/fd/<n>`) and by directory
+  cursors or nonseekable listings when reopening `.` fails with `EACCES`. Standard on all Linux
+  distributions.
 - **Actor cannot create bind mounts or manipulate mount namespaces**: Requires privilege; an
   unprivileged actor cannot exploit this.
 - **A destination subtree has a single writer**: The reused-directory lockdown under
