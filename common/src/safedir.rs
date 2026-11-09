@@ -460,15 +460,29 @@ struct DirectoryDescriptor {
 
 impl DirectoryDescriptor {
     fn reopen(&self) -> std::io::Result<OwnedFd> {
+        self.reopen_with_proc_open(|path, flags| openat(AT_FDCWD, path, flags, Mode::empty()))
+    }
+
+    fn reopen_with_proc_open(
+        &self,
+        open_proc: impl FnOnce(&str, OFlag) -> nix::Result<OwnedFd>,
+    ) -> std::io::Result<OwnedFd> {
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-        match openat(self.as_fd(), c".", flags | OFlag::O_NOFOLLOW, Mode::empty()) {
-            Err(nix::errno::Errno::EACCES) => {
+        match openat(self.as_fd(), c".", flags, Mode::empty()) {
+            Err(permission @ nix::errno::Errno::EACCES) => {
                 // opening "." also needs search permission; the proc magic link opens the held
                 // inode without that extra requirement, but still checks read permission.
                 // self keeps the fd owned throughout the open, and following this trusted magic
                 // link is intentional: O_NOFOLLOW would reject it
                 let path = format!("/proc/self/fd/{}", self.as_raw_fd());
-                openat(AT_FDCWD, path.as_str(), flags, Mode::empty())
+                open_proc(&path, flags).map_err(|error| match error {
+                    // an unavailable proc path must not make the held directory appear missing.
+                    // retain resource and backend errors from an otherwise usable retry
+                    nix::errno::Errno::ENOENT
+                    | nix::errno::Errno::ENOTDIR
+                    | nix::errno::Errno::ELOOP => permission,
+                    error => error,
+                })
             }
             result => result,
         }
@@ -4205,43 +4219,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_lists_readable_directory_without_search_permission() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        for name in ["first", "second"] {
-            std::fs::write(tmp.path().join(name), b"content")?;
-        }
-        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
-        let _restore = RestoreDirectoryAccess(&root);
-        exhaust_shared_directory_offset(&root)?;
-        let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?;
-        fchmod(root.fd.as_fd(), Mode::from_bits_truncate(0o444))?;
-        if !directory_search_permission_is_enforced(&root)? {
-            return Ok(());
-        }
-        let mut first = root.entries().await?;
-        let mut second = root.entries().await?;
-        let limit = NonZeroUsize::new(1).unwrap();
-        let first_batch = first.next_batch(limit).await?;
-        let second_batch = second.next_batch(limit).await?;
-        for (mut cursor, batch) in [(first, first_batch), (second, second_batch)] {
-            let rest = cursor.next_batch(NonZeroUsize::new(64).unwrap()).await?;
-            let mut names: Vec<_> = batch
-                .into_iter()
-                .chain(rest)
-                .map(|entry| entry.name)
-                .collect();
-            names.sort();
-            assert_eq!(names, ["first", "second"]);
-            assert!(cursor.next_batch(limit).await?.is_empty());
-        }
-        assert_eq!(
-            nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
-            end
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn reopen_fails_when_read_permission_is_revoked() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
@@ -4265,36 +4242,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_cursors_do_not_share_directory_offsets() -> anyhow::Result<()> {
-        let root_path = testutils::create_temp_dir().await?;
-        for index in 0..80 {
-            tokio::fs::write(root_path.join(format!("file-{index:02}")), b"x").await?;
+    async fn reopen_distinguishes_unusable_proc_from_operational_failures() -> anyhow::Result<()> {
+        use nix::errno::Errno;
+
+        let tmp = tempfile::tempdir()?;
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        let _restore = RestoreDirectoryAccess(&root);
+        fchmod(root.fd.as_fd(), Mode::from_bits_truncate(0o444))?;
+        if !directory_search_permission_is_enforced(&root)? {
+            return Ok(());
         }
-        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
-        let mut first = root.entries().await?;
-        let mut second = root.entries().await?;
-        let limit = NonZeroUsize::new(64).unwrap();
-        let first_batch = first.next_batch(limit).await?;
-        let second_batch = second.next_batch(limit).await?;
-        let first_rest = first.next_batch(limit).await?;
-        let second_rest = second.next_batch(limit).await?;
-        let mut first_names: Vec<_> = first_batch
-            .into_iter()
-            .chain(first_rest)
-            .map(|e| e.name)
-            .collect();
-        let mut second_names: Vec<_> = second_batch
-            .into_iter()
-            .chain(second_rest)
-            .map(|e| e.name)
-            .collect();
-        first_names.sort();
-        second_names.sort();
+        // inject the proc open failure without requiring a private mount namespace;
+        // the initial dot open still exercises the real directory permission check
+        for (proc_error, expected) in [
+            (Errno::ENOENT, Errno::EACCES),
+            (Errno::ENOTDIR, Errno::EACCES),
+            (Errno::ELOOP, Errno::EACCES),
+            (Errno::EACCES, Errno::EACCES),
+            (Errno::EMFILE, Errno::EMFILE),
+            (Errno::ENFILE, Errno::ENFILE),
+            (Errno::ENOMEM, Errno::ENOMEM),
+            (Errno::EIO, Errno::EIO),
+        ] {
+            let error = root
+                .fd
+                .reopen_with_proc_open(|_, _| Err(proc_error))
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(expected as i32), "{proc_error}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_cursors_do_not_share_directory_offsets() -> anyhow::Result<()> {
         let expected: Vec<_> = (0..80)
             .map(|index| std::ffi::OsString::from(format!("file-{index:02}")))
             .collect();
-        assert_eq!(first_names, expected);
-        assert_eq!(second_names, expected);
+        for mode in [None, Some(0o444)] {
+            let tmp = tempfile::tempdir()?;
+            for name in &expected {
+                std::fs::write(tmp.path().join(name), b"content")?;
+            }
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+            let _restore = RestoreDirectoryAccess(&root);
+            exhaust_shared_directory_offset(&root)?;
+            let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur);
+            if let Some(mode) = mode {
+                fchmod(root.fd.as_fd(), Mode::from_bits_truncate(mode))?;
+                if !directory_search_permission_is_enforced(&root)? {
+                    continue;
+                }
+            }
+            let mut first = root.entries().await?;
+            let mut second = root.entries().await?;
+            let limit = NonZeroUsize::new(64).unwrap();
+            let first_batch = first.next_batch(limit).await?;
+            let second_batch = second.next_batch(limit).await?;
+            for (mut cursor, batch) in [(first, first_batch), (second, second_batch)] {
+                let rest = cursor.next_batch(limit).await?;
+                let mut names: Vec<_> = batch
+                    .into_iter()
+                    .chain(rest)
+                    .map(|entry| entry.name)
+                    .collect();
+                names.sort();
+                assert_eq!(names, expected, "mode={mode:?}");
+                assert!(cursor.next_batch(limit).await?.is_empty());
+            }
+            assert_eq!(
+                nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur),
+                end
+            );
+        }
         Ok(())
     }
 
@@ -5927,60 +5946,50 @@ mod tests {
 
     #[tokio::test]
     async fn listing_fd_reopens_the_held_directory_on_espipe() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let source = tmp.path().join("source");
-        std::fs::create_dir(&source)?;
-        std::fs::write(source.join("entry"), b"content")?;
-        let root = Dir::open_root_dir(&source, false, congestion::Side::Source).await?;
-        exhaust_shared_directory_offset(&root)?;
-        let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?;
-        // a replacement at the old path must not redirect the reopened listing
-        std::fs::rename(&source, tmp.path().join("moved"))?;
-        std::fs::create_dir(&source)?;
-        std::fs::write(source.join("replacement"), b"other")?;
-        for _ in 0..2 {
-            let fd = root.fd.listing_fd_with_seek(|fd| {
-                assert_eq!(fd.as_raw_fd(), root.fd.as_raw_fd());
-                Err(nix::errno::Errno::ESPIPE)
-            })?;
-            assert_eq!(stream_names(fd)?, ["entry"]);
-            assert_eq!(
-                nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
-                end
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn listing_fd_reopens_unsearchable_directory_after_path_replacement() -> anyhow::Result<()>
-    {
-        let tmp = tempfile::tempdir()?;
-        let source = tmp.path().join("source");
-        std::fs::create_dir(&source)?;
-        std::fs::write(source.join("entry"), b"content")?;
-        let root = Dir::open_root_dir(&source, false, congestion::Side::Source).await?;
-        let _restore = RestoreDirectoryAccess(&root);
-        exhaust_shared_directory_offset(&root)?;
-        let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?;
-        fchmod(root.fd.as_fd(), Mode::from_bits_truncate(0o444))?;
-        if !directory_search_permission_is_enforced(&root)? {
-            return Ok(());
-        }
-        std::fs::rename(&source, tmp.path().join("moved"))?;
-        let replacement = tmp.path().join("replacement");
-        std::fs::create_dir(&replacement)?;
-        std::fs::write(replacement.join("sentinel"), b"other")?;
-        std::os::unix::fs::symlink(&replacement, &source)?;
-        for _ in 0..2 {
-            let fd = root
-                .fd
-                .listing_fd_with_seek(|_| Err(nix::errno::Errno::ESPIPE))?;
-            assert_eq!(stream_names(fd)?, ["entry"]);
-            assert_eq!(
-                nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur)?,
-                end
-            );
+        for mode in [None, Some(0o444)] {
+            let tmp = tempfile::tempdir()?;
+            let parent = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+            let _restore_parent = RestoreDirectoryAccess(&parent);
+            let source = tmp.path().join("source");
+            std::fs::create_dir(&source)?;
+            std::fs::write(source.join("entry"), b"content")?;
+            let root = Dir::open_root_dir(&source, false, congestion::Side::Source).await?;
+            let _restore = RestoreDirectoryAccess(&root);
+            exhaust_shared_directory_offset(&root)?;
+            let end = nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur);
+            if let Some(mode) = mode {
+                fchmod(root.fd.as_fd(), Mode::from_bits_truncate(mode))?;
+                if !directory_search_permission_is_enforced(&root)? {
+                    continue;
+                }
+            }
+            // a replacement at the old path must not redirect the reopened listing
+            std::fs::rename(&source, tmp.path().join("moved"))?;
+            let replacement = tmp.path().join("replacement");
+            std::fs::create_dir(&replacement)?;
+            std::fs::write(replacement.join("sentinel"), b"other")?;
+            std::os::unix::fs::symlink(&replacement, &source)?;
+            if mode.is_some() {
+                // following the proc magic link works even when reopening its readlink text
+                // cannot traverse the directory's parent
+                fchmod(parent.fd.as_fd(), Mode::empty())?;
+                let path = std::fs::read_link(format!("/proc/self/fd/{}", root.fd.as_raw_fd()))?;
+                assert_eq!(
+                    std::fs::File::open(path).unwrap_err().raw_os_error(),
+                    Some(libc::EACCES)
+                );
+            }
+            for _ in 0..2 {
+                let fd = root.fd.listing_fd_with_seek(|fd| {
+                    assert_eq!(fd.as_raw_fd(), root.fd.as_raw_fd());
+                    Err(nix::errno::Errno::ESPIPE)
+                })?;
+                assert_eq!(stream_names(fd)?, ["entry"], "mode={mode:?}");
+                assert_eq!(
+                    nix::unistd::lseek(root.fd.as_fd(), 0, nix::unistd::Whence::SeekCur),
+                    end
+                );
+            }
         }
         Ok(())
     }

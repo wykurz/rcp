@@ -2454,8 +2454,8 @@ async fn link_dir_contents_prepared(
     // the update directory's metadata when an update tree is present at this level (it is the
     // materialized version, matching the old `update_metadata_opt` preference), else the source
     // directory's. the metadata comes from the held directory whose contents were enumerated
-    // (read-side fidelity, docs/tocttou.md), not the classify handles. an ESPIPE fallback opens "."
-    // relative to that held fd, so enumeration still uses the same directory inode
+    // (read-side fidelity, docs/tocttou.md), not the classify handles. an ESPIPE fallback reopens
+    // the held directory, so enumeration still uses the same directory inode
     tracing::debug!("set 'dst' directory metadata");
     let metadata_result = match dst_dir {
         Some(dst_dir) => {

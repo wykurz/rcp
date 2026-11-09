@@ -157,10 +157,12 @@ characters so temporary Unix socket paths fit the kernel's path-length limit.
 Nonseekable FUSE directories need a fresh description when the seek returns `ESPIPE`. The shared
 reopen helper first opens `.` relative to the held fd. On `EACCES`, it retries through
 `/proc/self/fd/<n>`, so a readable directory without search permission (including mode `0444`) can
-still be listed. The fallback requires `/proc` and read permission on the directory. Remote source
-cursors use the same helper on every filesystem. Permission tests cover both entry points, cursor
-offset independence, and a directory whose original path has been replaced. The committed tests
-inject the seek result through a closure on an ordinary filesystem, exercising fallback control flow
+still be listed. The fallback requires `/proc` and read permission on the directory. An unavailable
+proc path preserves the original permission error; resource and I/O errors remain visible. Remote
+source cursors use the same helper on every filesystem. Permission tests cover both entry points,
+cursor offset independence, and a renamed directory whose parent is no longer searchable. Injected
+proc-open failures check error reporting without mount privileges. The committed tests also inject
+the seek result through a closure on an ordinary filesystem, exercising fallback control flow
 without validating actual kernel/FUSE behavior. No real FUSE fixture is committed. When changing it,
 manually verify repeated full and capped listings with a FUSE server that sets `FOPEN_NONSEEKABLE`
 or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Expect an extra open/close per

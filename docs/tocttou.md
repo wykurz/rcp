@@ -603,8 +603,8 @@ the entire planned destination has been verified. Descendants retain that unavai
 state without reopening a path or walking upward lexically. Strict prefix symlink rejection remains
 in force. A delete preview instead opens existing destination directories readably through their
 held parents so it can enumerate them; read failures stop that subtree before its children are
-reported. Opening readably at that point avoids adding a search-permission requirement merely to
-reopen an empty, readable directory.
+reported. Opening readably at that point avoids an extra reopen and, for an empty directory without
+search permission, a dependency on the proc-fd fallback.
 
 Local destination removal also checks input protection. Before a destructive `rcp` batch starts,
 each selected explicit source root is opened and classified. Directory participation is reserved
@@ -958,9 +958,10 @@ fourth is an operational one the caller owes:
   pass, because the entry *is* that inode. This enables unauthorized reads, privileged chmod/chown
   of the aliased inode, and similar attacks (Scenario 4). No userspace scheme can defend against a
   missing `protected_hardlinks` guard. Verify with: `sysctl fs.protected_hardlinks`
-- **`/proc` mounted**: Used by `rchm` for file chmod (via `/proc/self/fd/<n>`) and by directory
-  cursors or nonseekable listings when reopening `.` fails with `EACCES`. Standard on all Linux
-  distributions.
+- **`/proc` mounted**: The `/proc/self/fd/<n>` magic links support held-file hard links in `rlink`,
+  descriptor-anchored chmod in `rchm` and removal, and metadata/ACL probes such as time filtering.
+  Directory cursors and nonseekable listings also use them when reopening `.` fails with `EACCES`.
+  Standard on all Linux distributions.
 - **Actor cannot create bind mounts or manipulate mount namespaces**: Requires privilege; an
   unprivileged actor cannot exploit this.
 - **A destination subtree has a single writer**: The reused-directory lockdown under
