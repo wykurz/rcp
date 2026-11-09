@@ -118,12 +118,14 @@ def _svg(points, metric, title, unit, figure_id):
         html += (f"<line x1='{left}' x2='{width-right}' y1='{yp:.3f}' y2='{yp:.3f}' "
                  "stroke='var(--border)'/><text x='68' y='" + f"{yp+4:.3f}" +
                  "' text-anchor='end' fill='var(--text)' font-size='12'>" +
-                 escape(_number(value)) + "</text>")
+                 escape(format(value, ".3g")) + "</text>")
     html += (f"<line x1='{left}' x2='{width-right}' y1='{top+plot_height}' y2='{top+plot_height}' "
              "stroke='var(--text)'/>")
     extrema = [min(points, key=lambda p: p["at"]), max(points, key=lambda p: p["at"])]
-    for point in {p["at"]: p for p in extrema}.values():
-        html += (f"<text x='{x(point):.3f}' y='{height-34}' text-anchor='middle' "
+    ticks = list({p["at"]: p for p in extrema}.values())
+    for index, point in enumerate(ticks):
+        anchor = "middle" if len(ticks) == 1 else ("start" if index == 0 else "end")
+        html += (f"<text x='{x(point):.3f}' y='{height-34}' text-anchor='{anchor}' "
                  "fill='var(--text)' font-size='11'>" + escape(point["date"]) + "</text>")
     html += (f"<text x='{left+plot_width/2:.3f}' y='{height-10}' text-anchor='middle' "
              "fill='var(--text)' font-size='12'>Worker-reported run start (UTC)</text>")

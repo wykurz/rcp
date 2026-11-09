@@ -145,6 +145,13 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             history.model({two["run_key"]: two}, {two["run_key"]: second})
 
+    def test_first_and_last_dates_align_inside_the_svg_viewport(self):
+        one, _, _ = example("123")
+        two, _, _ = example("124", "2026-11-09T07:30:02+00:00")
+        html = history.render({one["run_key"]: one, two["run_key"]: two}, {})
+        self.assertIn("x='78.000' y='236' text-anchor='start'", html)
+        self.assertIn("x='780.000' y='236' text-anchor='end'", html)
+
     def test_unobserved_setups_are_not_connected_across_runs(self):
         one, _, _ = example("123")
         two, _, _ = example("124", "2026-11-09T07:30:02+00:00")
