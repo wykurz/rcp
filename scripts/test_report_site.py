@@ -193,6 +193,25 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('exactly 100 times less', setup)
         self.assert_site_links_resolve()
 
+    def test_history_page_has_three_plots_per_file_set_and_preserves_frozen_records(self):
+        batch, values = self.diagnostic_batch(two=True)
+        result = self.build_retained(batch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('href="history.html"', index)
+        history = (self.output / 'aws-benchmarks/history.html').read_text()
+        for metric in ('duration', 'cpu', 'memory'):
+            self.assertEqual(history.count("data-history-metric='" + metric + "'"), 4)
+        self.assertIn('Worker-reported run start (UTC)', history)
+        self.assertIn('not independently attested', history)
+        self.assertIn('Peak command RSS', history)
+        self.assertNotIn('PRIVATE', history)
+        for value in values:
+            name = value['run_key'] + '.json'
+            self.assertEqual((self.output / 'aws-benchmarks/records' / name).read_bytes(),
+                             (batch[0] / name).read_bytes())
+        self.assert_site_links_resolve()
+
     def test_matching_observed_setups_are_described_once_not_repeated_per_run(self):
         batch, values = self.diagnostic_batch(two=True)
         result = self.build_retained(batch)

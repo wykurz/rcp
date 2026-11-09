@@ -300,17 +300,18 @@ def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
 
 def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='', footer=''):
     """Render frozen public JSON and numeric companions; never retained HTML or binaries."""
-    from infra.aws_benchmark import production_export
+    from infra.aws_benchmark import production_export, production_history
     title = 'AWS benchmarks · retained records' if retained else 'AWS benchmark history'
     retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
                  'This view is not permanent history.</p>' if retained else '')
-    pages, rows, setups = {}, [], {}
+    pages, rows, setups, normalized = {}, [], {}, {}
     diagnostics = diagnostics or {}
     if not set(diagnostics) <= set(records):
         raise ValueError('Resource diagnostics have no frozen public record')
     for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
         value = production_export.validate_public(production_export.results.json_value(
             raw, production_export.MAX_PUBLIC_RECORD))
+        normalized[run_key] = value
         identity = value['identity']
         report = Path('aws-benchmarks/runs') / (run_key + '.html')
         record = Path('aws-benchmarks/records') / (run_key + '.json')
@@ -344,6 +345,14 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         "<link rel='stylesheet' href='../assets/site.css'><link rel='stylesheet' href='../assets/report.css'>"
         "<body>" + site_header(Path('aws-benchmarks/setups.html'), has_aws_history=True) +
         "<main>" + setup_content + "<p><a href='index.html'>AWS benchmark runs</a></p></main></body></html>")
+    history_content = production_history.render(normalized, diagnostics)
+    pages[Path('aws-benchmarks/history.html')] = (
+        "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        "<title>AWS benchmark history plots</title>" + read_theme() +
+        "<link rel='stylesheet' href='../assets/site.css'><link rel='stylesheet' href='../assets/report.css'>"
+        "<body>" + site_header(Path('aws-benchmarks/history.html'), has_aws_history=True) +
+        "<main>" + history_content + "<p><a href='index.html'>AWS benchmark runs</a> · "
+        "<a href='setups.html'>Hardware and test setup</a></p></main></body></html>")
     pages[Path('aws-benchmarks/index.html')] = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)} · RCP Tools</title>{read_theme()}
@@ -351,6 +360,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
 <body><a class="skip-link" href="#report-content">Skip to report</a>
 {site_header(Path('aws-benchmarks/index.html'), has_aws_history=True)}
 <main id="report-content"><h1>{html.escape(title)}</h1>{retention}
+<p><a href="history.html">Duration, CPU and memory history plots by file set</a></p>
 <p>Retired AWS runs with verified resource termination. Failed consistency checks and unavailable evidence remain
 visible and are excluded from performance history. These records are separate from historical Depot measurements.</p>
 <p><a href="setups.html">Hardware, storage, filesystem and test setup</a>. Each run's resource diagnostics
