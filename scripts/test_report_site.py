@@ -204,6 +204,9 @@ class ReportSiteTests(unittest.TestCase):
             self.assertEqual(history.count("data-history-metric='" + metric + "'"), 4)
         self.assertIn('Worker-reported run start (UTC)', history)
         self.assertIn('not independently attested', history)
+        from infra.aws_benchmark.production_projection import MEASUREMENT_CAVEAT, VALIDATION
+        self.assertIn(MEASUREMENT_CAVEAT, history)
+        self.assertIn(VALIDATION, history)
         self.assertIn('Peak command RSS', history)
         self.assertNotIn('PRIVATE', history)
         for value in values:

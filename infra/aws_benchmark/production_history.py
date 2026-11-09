@@ -163,6 +163,7 @@ def _svg(points, metric, title, unit, figure_id):
 
 def _render(cases, unsupported, omitted):
     html = ("<section aria-labelledby='history-plots'><h1 id='history-plots'>Benchmark history plots</h1>"
+        "<p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" + escape(projection.VALIDATION) + "</p>"
         "<p>Each point is one qualified run and variant. The x-axis uses the frozen, worker-reported "
         "benchmark start timestamp, recorded before fixture preparation, not per-copy start, collection "
         "or retirement time. It is not independently attested.</p>"
