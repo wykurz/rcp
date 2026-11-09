@@ -476,6 +476,25 @@ class ReportSiteTests(unittest.TestCase):
                 self.assertNotIn('AWS benchmarks', (self.output / 'index.html').read_text())
                 self.assertFalse((self.output / 'aws-benchmarks/index.html').exists())
 
+    def test_supported_legacy_history_over_512_records_keeps_complete_site_inventory(self):
+        records = {}
+        for index in range(513):
+            value = self.aws_record(str(1000 + index))
+            value["measurements"][0]["case_id"] = "bulk-1g-1tb"
+            records[value["run_key"] + ".json"] = ("100644", json.dumps(value))
+        repository = self.aws_history(records)
+        result = self.build("--aws-history", str(repository))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = self.output / "aws-benchmarks/records"
+        self.assertEqual(len(list(directory.glob("*.json"))), 513)
+        oldest = "repo-655073755-run-1000.json"
+        self.assertEqual((directory / oldest).read_text(), records[oldest][1])
+        history = (self.output / "aws-benchmarks/history.html").read_text()
+        self.assertIn("481 older qualified runs", history)
+        self.assertIn("runs/repo-655073755-run-1512.html", history)
+        self.assertNotIn("runs/repo-655073755-run-1000.html", history)
+        self.assertTrue((self.output / "aws-benchmarks/runs/repo-655073755-run-1000.html").is_file())
+
     def test_aws_records_render_separately_with_resolving_links_and_public_json(self):
         passed, failed = self.aws_record(), self.aws_record('124', passed=False)
         records = {value['run_key'] + '.json': ('100644', value) for value in (passed, failed)}

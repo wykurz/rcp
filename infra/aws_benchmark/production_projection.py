@@ -9,6 +9,8 @@ from .json_bytes import encoded
 SCHEMA = "rcp-production-public-report-v1"
 MAX_PUBLIC_RECORD = 1024 * 1024
 MAX_PUBLIC_HTML = 2 * 1024 * 1024
+# shared complete legacy inventory bound; plot windows and retained discovery are separate
+MAX_PUBLIC_HISTORY_RUNS = 2000
 # public schemas are frozen history contracts. change these labels or the series-ID
 # algorithm only by adding a new schema; old records keep their original namespace.
 PUBLIC_CONTRACTS = {

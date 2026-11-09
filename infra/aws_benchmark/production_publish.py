@@ -21,6 +21,7 @@ from benchmarks.publish import git
 from . import production_bundle as codec, production_collection as collection
 from . import production_export as public, production_publication as publication
 from .common import Budget, digest, require
+from .production_projection import MAX_PUBLIC_HISTORY_RUNS
 from .history_contract import REPOSITORY_ID, HISTORY_REF
 from .history_git import git_env
 from .publication_artifacts import (MAX_TOTAL, MAX_HISTORY, MAX_INDEX, read, inventory,
@@ -28,7 +29,7 @@ from .publication_artifacts import (MAX_TOTAL, MAX_HISTORY, MAX_INDEX, read, inv
 
 DOWNLOAD_SCHEMA = "rcp-production-download-index-v1"
 PUBLIC_SCHEMA = "rcp-production-public-batch-v1"
-MAX_HISTORY_RUNS = 2000
+MAX_HISTORY_RUNS = MAX_PUBLIC_HISTORY_RUNS
 MAX_SECONDS = 600
 RUN = re.compile(r"repo-" + REPOSITORY_ID + r"-run-[1-9][0-9]{0,19}")
 
