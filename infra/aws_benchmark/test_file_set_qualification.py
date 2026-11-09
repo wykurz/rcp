@@ -135,6 +135,7 @@ class FileSetAdmissionTests(unittest.TestCase):
         value = asdict(policy())
         value.pop("manual_suites")
         value.pop("manual_runtime_seconds")
+        value.pop("extended_manual_not_after")
         self.assertEqual(len(value), 17)
         encoded = production_policy.canonical(value).decode()
         item = dict(pk={"S": "policy"}, version={"S": value["version"]},

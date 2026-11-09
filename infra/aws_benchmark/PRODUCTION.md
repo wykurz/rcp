@@ -875,3 +875,16 @@ DenyAll permission policy. Applying that source is a separate targeted legacy-st
 delete the old stack, because production still uses its launch template and security group. The
 unused writer App and ruleset bypass also require their separately reviewed retirement; this source
 does not delete registrations, keys, retained results, images or shared resources.
+
+New extended admissions also require a canonical UTC `extended_manual_not_after` timestamp. The
+service rejects missing or expired windows before reading App-backed run proof and rechecks the
+final immutable request creation time. The deadline limits new reservations; it does not cancel an
+already admitted run or move its capacity/runtime deadlines. Expired temporary policy remains
+readable and regular scheduled 1 GB admission is unchanged. Preserve the admitted policy version
+through upload, sealing and retirement; restoring the opt-in with a new version fences stale
+requests.
+
+Derive the expiry from authenticated recovery coverage before dispatch. The native 10h15m horizon
+starts at the retained request creation time, after workflow build/queue delays. Include cleanup and
+mutation margins; fresh credentials at dispatch alone do not guarantee coverage. A queued workflow
+that misses the server expiry must not receive a new reservation, even if the operator disconnects.

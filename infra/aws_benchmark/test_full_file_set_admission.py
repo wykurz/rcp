@@ -18,7 +18,8 @@ FULL = "all-filesets-metadata"
 
 def configured(**updates):
     return policy(**(dict(manual_suites=("bulk-1g-metadata", FULL),
-                         manual_runtime_seconds=28_800, monthly_cap_microusd=200_000_000,
+                         manual_runtime_seconds=28_800, extended_manual_not_after=(NOW + timedelta(minutes=45)).isoformat(),
+                          monthly_cap_microusd=200_000_000,
                          ancillary_microusd=4_947_200) | updates))
 
 

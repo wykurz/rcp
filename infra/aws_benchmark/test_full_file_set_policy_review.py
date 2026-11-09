@@ -6,7 +6,7 @@ from datetime import timedelta
 import unittest
 from unittest.mock import Mock
 
-from .production_handler import read_policy, _LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _POLICY_FIELDS
+from .production_handler import read_policy, _LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _EXTENDED_RUNTIME_POLICY_FIELDS, _POLICY_FIELDS
 from .production_policy import canonical, SCHEDULE_MAIN_AA, MAX_PRICE_AGE_SECONDS
 from .test_full_file_set_admission import FULL, configured, approve
 from .test_production_admission import Cloud
@@ -74,18 +74,18 @@ class FullFileSetPolicyReviewTests(unittest.TestCase):
         self.assertEqual(cloud.ddb.items["budget#total"], reserved)
 
     def test_only_exact_historical_and_current_envelopes_are_readable(self):
-        self.assertEqual(tuple(map(len, (_LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _POLICY_FIELDS))), (17, 18, 19))
+        self.assertEqual(tuple(map(len, (_LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _EXTENDED_RUNTIME_POLICY_FIELDS, _POLICY_FIELDS))), (17, 18, 19, 20))
         base = asdict(configured())
-        for names in (_LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _POLICY_FIELDS):
+        for names in (_LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _EXTENDED_RUNTIME_POLICY_FIELDS, _POLICY_FIELDS):
             value = {key: copy.deepcopy(base[key]) for key in names}
-            if names != _POLICY_FIELDS and "manual_suites" in value:
+            if names in (_LEGACY_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS) and "manual_suites" in value:
                 value["manual_suites"] = ["bulk-1g-metadata", "bulk-100m-metadata"]
             api = Mock()
             payload = canonical(value).decode()
             api.get_item.return_value = dict(Item={"pk": {"S": "policy"}, "version": {"S": base["version"]},
                 "enabled": {"BOOL": True}, "payload": {"S": payload}})
             parsed = read_policy(api, "production-table", "483465")
-            self.assertEqual(parsed.manual_runtime_seconds, 28_800 if names == _POLICY_FIELDS else 0)
+            self.assertEqual(parsed.manual_runtime_seconds, 28_800 if names in (_EXTENDED_RUNTIME_POLICY_FIELDS, _POLICY_FIELDS) else 0)
             self.assertEqual(api.get_item.return_value["Item"]["payload"]["S"], payload)
         for omitted in ("manual_suites", "runtime_seconds", "owner_id"):
             value = dict(base)

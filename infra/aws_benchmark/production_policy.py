@@ -49,6 +49,7 @@ class Policy:
     price_evidence: str = ""
     runtime_seconds: int = durable.RUNTIME_SECONDS
     manual_runtime_seconds: int = 0
+    extended_manual_not_after: str = ""
     capacity_seconds: int = durable.CAPACITY_SECONDS
     shutdown_seconds: int = durable.SHUTDOWN_ALLOWANCE_SECONDS
     schedule_delay_seconds: int = 1800
@@ -94,6 +95,11 @@ class Policy:
         require(self.manual_runtime_seconds == 0 or any(
             durable_plan_contract(durable_plan_for_suite(suite))["max_runtime"] > durable.RUNTIME_SECONDS
             for suite in self.manual_suites), "extended manual runtime has no approved file set")
+        require(type(self.extended_manual_not_after) is str and len(self.extended_manual_not_after) <= 40,
+                "invalid extended manual admission expiry")
+        if self.extended_manual_not_after:
+            require(timestamp(utc(self.extended_manual_not_after)) == self.extended_manual_not_after,
+                    "extended manual admission expiry must be canonical UTC")
         for suite in self.manual_suites:
             self.execution(suite)
         integer(self.shutdown_seconds, durable.SHUTDOWN_ALLOWANCE_SECONDS, 3600,
@@ -115,6 +121,12 @@ class Policy:
         require(durable.minimum_runtime(contract["plan"]) <= runtime <= contract["max_runtime"],
                 "manual file set does not fit its explicit qualification budget")
         return runtime, min(self.capacity_seconds, contract["max_provisioning"])
+
+    def check_admission_time(self, now, *, runtime_seconds):
+        """Bound only new extended admissions; existing runs keep their original deadlines."""
+        if runtime_seconds > durable.RUNTIME_SECONDS:
+            require(bool(self.extended_manual_not_after) and utc(now) < utc(self.extended_manual_not_after),
+                    "extended manual admission window is closed")
 
     def reservation(self, now, *, suite="bulk-1g-metadata"):
         return self.quote(now, suite=suite)["reserve_microusd"]
@@ -238,6 +250,7 @@ def authorize(policy, identity, run, value, now):
     else:
         raise ValueError("only approved manual and scheduled requests may enter admission")
     quote = policy.quote(now, suite=checked["suite"])
+    policy.check_admission_time(now, runtime_seconds=quote["runtime_seconds"])
     if quote["runtime_seconds"] > durable.RUNTIME_SECONDS:
         require(identity.event_name == "workflow_dispatch" and identity.actor_id == policy.owner_id,
                 "extended qualification requires the immutable owner")
