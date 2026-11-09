@@ -101,12 +101,15 @@ class Admission:
         require(identity.run_attempt == "1", "workflow reruns cannot create a new reservation")
         policy = self.policy()
         # reject disabled/unfunded assignments before reading an App key for run proof
-        policy.reservation(self.now(), suite=checked["suite"])
+        checked_at = self.now()
+        quote = policy.quote(checked_at, suite=checked["suite"])
+        policy.check_admission_time(checked_at, runtime_seconds=quote["runtime_seconds"])
         observed = self.run_reader.read(identity)
         approved = authorize(policy, identity, observed, checked, self.now())
         require((self.now() - utc(observed.created_at)).total_seconds() + UPLOAD_SECONDS < MAX_RUN_AGE_SECONDS,
                 "workflow run has insufficient time for input upload")
         created = self.now()
+        policy.check_admission_time(created, runtime_seconds=approved["runtime_seconds"])
         producer = dict(run=identity.run_id + "-" + identity.run_attempt,
             baseline=checked["baseline"], candidate=checked["candidate"], suite=checked["suite"],
             controller=identity.workflow_sha)

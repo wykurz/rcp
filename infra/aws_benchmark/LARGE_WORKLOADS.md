@@ -344,3 +344,10 @@ No large-file generation, image build, permission change or worker launch occurs
 this source. Keep the scheduled suite unchanged during commissioning. After the full-set result,
 inspect actual per-phase time, whole-unit memory, storage pressure and costs before choosing routine
 timeouts or scheduling the broader suite.
+
+The extended profile needs a finite, server-enforced manual admission expiry in addition to the
+explicit runtime opt-in. Operator recovery planning uses the immutable admitted request timestamp,
+not GitHub dispatch time; validation, build and runner queues can consume the admission window. The
+expiry does not terminate accepted work or extend its native deadlines. If admission is late or
+unproven, restore only the exact temporary opt-in with a new policy version and reconcile ownership;
+preserve all counters and independent cleanup guards, and never blindly redispatch.
