@@ -228,6 +228,24 @@ fingerprint of the malformed resource bytes. Failed execution requires `unavaila
 `execution_failed`, regardless of resource-file contents. Both supervisor and child use `LC_ALL=C`
 and `LANG=C`.
 
+The AWS retained-report site has a separate history page with duration, CPU and memory plots for
+each configured fileset. Each run/variant point uses the frozen median wall time, the median of user
+plus system CPU seconds **computed per copy**, and the median per-copy peak RSS converted from KiB
+to MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are command-scope
+statistics, not total host CPU or simultaneous process-tree memory; repetitions are not summed. The
+x-axis is the worker-reported benchmark start before fixture preparation, not collection or
+retirement time, and it is not independently attested.
+
+Resource points require complete matching repeat coverage. Missing evidence is unavailable, never
+zero-filled or interpolated. Frozen series IDs, variants, observed setups and diagnostic versions
+separate traces; unknown setup evidence is not pooled across runs. Run, series and setup links
+retain provenance without rewriting frozen JSON. Pending, failed and evidence-unavailable runs
+remain in the inventory without performance points. The plots cover still-retained 90-day records,
+not permanent history. A bounded window shows the newest 32 qualified runs and at most 256
+case/variant points; large labels can shorten the window further. The omitted count and a link to
+the complete retained run inventory stay visible. Local copies and any future loopback remote
+measurements require distinct validated contracts.
+
 Either option records phase costs: fixture generation and initial verification on the run;
 preparation (including cache preparation but excluding result persistence), verification and
 destination cleanup on each trial; and total elapsed run time. These completed-phase costs are
