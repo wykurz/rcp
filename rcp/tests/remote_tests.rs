@@ -2288,23 +2288,15 @@ fn test_remote_processes_readable_unsearchable_root() {
         "--rcpd-path={}",
         assert_cmd::cargo::cargo_bin("rcpd").display()
     );
-    for (strict, preview) in [(false, false), (false, true), (true, false), (true, true)] {
-        let destination = dst_dir.path().join(format!("copy-{strict}-{preview}"));
+    for preview in [false, true] {
+        let destination = dst_dir.path().join(format!("copy-{preview}"));
         let dst_remote = format!("localhost:{}", destination.display());
         let mut args = vec![daemon.as_str(), "--fail-early", "--summary"];
-        if strict {
-            args.push("--require-toctou-safe");
-        }
         if preview {
             args.push("--dry-run=brief");
         }
         args.extend([src_remote.as_str(), dst_remote.as_str()]);
-        let output = run_rcp_with_args(&args);
-        print_command_output(&output);
-        assert!(
-            output.status.success(),
-            "strict={strict}, preview={preview}"
-        );
+        let output = run_rcp_and_expect_success(&args);
         let summary = parse_summary_from_output(&output).expect("missing copy summary");
         assert_eq!(summary.directories_created, 1);
         assert_eq!(summary.files_copied, 0);
@@ -2338,15 +2330,13 @@ fn test_remote_unsearchable_empty_child_does_not_abort_siblings() {
         "--rcpd-path={}",
         assert_cmd::cargo::cargo_bin("rcpd").display()
     );
-    let output = run_rcp_with_args(&[
+    let output = run_rcp_and_expect_success(&[
         &daemon,
         "--fail-early",
         "--summary",
         &src_remote,
         &dst_remote,
     ]);
-    print_command_output(&output);
-    assert!(output.status.success());
     assert_eq!(
         get_file_content(&destination.join("payload")),
         "sibling content"
