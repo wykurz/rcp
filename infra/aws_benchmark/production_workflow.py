@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 
-from .common import require
+from .common import DURABLE_SUITES, require
 
 OWNER = "483465"
 REPOSITORY = "wykurz/rcp"
@@ -50,12 +50,25 @@ def source(environment):
     return revision
 
 
+def selection(environment):
+    """Validate all inputs before emitting any build or paid-submission output."""
+    revision = source(environment)
+    requested = environment.get("RCP_REQUESTED_SUITE", "")
+    if environment["GITHUB_EVENT_NAME"] == "schedule":
+        require(requested in ("", "bulk-1g-metadata"), "scheduled requests cannot select another file set")
+        suite = "bulk-1g-metadata"
+    else:
+        suite = requested or "bulk-1g-metadata"
+        require(suite in DURABLE_SUITES, "manual file set is not allowlisted")
+    return revision, suite
+
+
 def main():
-    revision = source(os.environ)
+    revision, suite = selection(os.environ)
     destination = os.environ.get("GITHUB_OUTPUT", "")
     require(destination != "", "workflow output destination is missing")
     with Path(destination).open("a", encoding="utf-8") as stream:
-        stream.write("revision=" + revision + "\n")
+        stream.write("revision=" + revision + "\nsuite=" + suite + "\n")
 
 
 if __name__ == "__main__":

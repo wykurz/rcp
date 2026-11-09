@@ -219,3 +219,60 @@ and workflow-policy tests remain applicable.
 These tests do not measure million-file performance, prove an hour is sufficient, qualify the Ubuntu
 image/tool versions on instance-store hardware, or perform live cutoff/cancellation acceptance.
 Those checks belong to a separately approved disposable qualification run.
+
+## Incremental 100 MB metadata qualification
+
+`bulk-100m-metadata` reuses the existing `bulk-100m-1024gb` shape: 10,240 files of 100,000,000
+decimal bytes, totaling 1.024 TB. It uses the same separate ext4 filesystems, capacity margins,
+metadata-only verifier and two balanced adjacent pairs (four copies) as the 1 GB metadata suite. It
+records a distinct suite/case identity; these measurements must not be pooled with the 1 GB case or
+historical full-content scans. Only the current complete five-field cloud verification contract is
+recognized for this new suite; old 1 GB verification settings are not invented for it.
+
+This is prepared support, not live qualification or permission to spend. The Monday/Friday schedule
+still selects `bulk-1g-metadata` regardless of manual inputs. The 100 MB profile stays disabled in
+legacy 60-minute operator windows. A direct instance-bound attempt must carry its own exact
+`bulk-100m-qualification-budget-v1` plan: at least 10,200 seconds left at worker admission, with
+300-second boot and shutdown reserves. This requires the existing maximum 10,800-second allocation.
+These numbers define an **experimental fixed qualification budget**, not a measured or predicted
+completion time. The plan does not copy or scale the 1 GB-derived 3,104-second projection. Existing
+per-command timeouts, the absolute deadline, reporting reserve, single-allocation rule and cleanup
+horizon remain unchanged; insufficient startup time fails closed and no deadline is extended.
+
+The production `manual_suites` policy is a separate server-owned opt-in. Its default is exactly
+`["bulk-1g-metadata"]`; an exact legacy policy payload without this field retains that same
+authority. Unknown or incomplete payloads still fail closed. Even an explicit manual 100 MB opt-in
+cannot change the scheduled suite. The manual workflow choice is validated before emitting build
+outputs, but the server remains authoritative and rejects an unapproved suite before reservation or
+launch.
+
+Before a separately approved paid qualification:
+
+1. Merge reviewed code and prepare compatible controller, collector and reader support. Preserve
+   existing 1 GB request bytes, plan versions and frozen reports. Do not change the live server
+   policy merely because code now recognizes another suite. Read-only publication support may land
+   before qualification, but a new controller package must not be mixed with an old worker image or
+   launch-template startup: the exact reviewed worker hash intentionally changes.
+2. Build a reviewed worker AMI: `install-worker.sh` bakes the common/worker/harness code, so the old
+   image cannot run this contract. Prepare its numeric launch-template version and exact coordinator
+   image-pin permission update, preserving rollback versions and all other access. The expected
+   design needs no new App, key, role class or AWS service-action category; the concrete image-pin
+   change and live deployment still need action-time approval. Between regular slots and only after
+   prior ownership is retired, close admission under that approval, perform the coordinated package,
+   image and launch-pin update, verify exact compatibility, then restore the approved admission
+   state. Keep native cleanup guards intact and do not displace a scheduled run.
+3. Approve one manual 100 MB A/A qualification, its exact runtime/budget allowance, narrowly scoped
+   `manual_suites` update and cleanup. Use a day other than Monday or Friday: the existing daily-one
+   and single-owner controls must not be bypassed to squeeze another run beside the regular suite.
+   Keep the live scheduled suite at 1 GB during this stage.
+4. Inspect actual generation, four-copy, metadata-walk, cleanup and resource-use evidence. Record
+   failures and partial output honestly. Successful completion would qualify this bounded workload;
+   it would not establish broad variance, content integrity or small-file scalability.
+
+The remaining `bulk-1m-1024gb` shape has 1,024,000 files and 1.024 TB; `tiny-1k-10240k` has
+10,240,000 files and 10.24 GB. They remain disabled for cloud execution. Capacity arithmetic fits
+current theoretical array/inode limits, but actual available-space admission remains mandatory. The
+generator currently queues per-file tasks before joining them, so million-file memory and runtime
+behavior need separate qualification or later bounded-generator work. This queue structure is not
+evidence of an observed out-of-memory failure. Do not enable all cases as one batch or infer
+small-file readiness from the 100 MB case.

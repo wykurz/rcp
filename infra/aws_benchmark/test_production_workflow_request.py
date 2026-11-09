@@ -75,7 +75,7 @@ class RequestTests(unittest.TestCase):
                     cwd=ROOT, env=env, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
                 self.assertEqual(result.stdout, b"")
-                self.assertEqual(output.read_text() if output.exists() else "", "revision=" + SHA + "\n" if valid else "")
+                self.assertEqual(output.read_text() if output.exists() else "", "revision=" + SHA + "\nsuite=bulk-1g-metadata\n" if valid else "")
 
 
 if __name__ == "__main__":

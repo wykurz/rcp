@@ -135,7 +135,7 @@ class ResultTests(unittest.TestCase):
         self.assertTrue((self.output / "dashboard/index.html").exists())
 
     def test_disabled_suites_keep_archived_identity_and_full_content_results(self):
-        for suite in common.SUITES.keys() - common.ACTIVE_SUITES.keys():
+        for suite in common.LARGE_SUITES.keys() - common.METADATA_SUITES.keys():
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 self.assertEqual(identity.validate(expected), expected)
@@ -150,7 +150,9 @@ class ResultTests(unittest.TestCase):
                 self.assertEqual((output / "raw/results.zip").read_bytes(), (source / "results.zip").read_bytes())
 
     def test_historical_streaming_policy_without_inline_threshold_is_readable(self):
-        for suite in common.LARGE_SUITES:
+        historical = [suite for suite in common.LARGE_SUITES
+                      if "inline_bytes" not in common.verification_contracts(suite)[0]]
+        for suite in historical:
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 raw = measurement(expected)

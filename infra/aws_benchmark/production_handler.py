@@ -40,6 +40,11 @@ MAX_EVENT_BYTES = 32 * 1024
 MAX_POLICY_BYTES = 16 * 1024
 SUBMIT_WORKFLOW_PATH = ".github/workflows/aws-benchmark-production.yml"
 _POLICY_FIELDS = frozenset(field.name for field in fields(Policy))
+# frozen pre-file-set envelope; future dataclass fields must not redefine its keys
+_LEGACY_POLICY_FIELDS = frozenset({"version", "owner_id", "enabled", "manual_actor_ids", "schedule_slots",
+    "scheduled_baseline", "total_cap_microusd", "monthly_cap_microusd", "daily_run_limit", "hourly_microusd",
+    "ancillary_microusd", "priced_at", "price_evidence", "runtime_seconds", "capacity_seconds",
+    "shutdown_seconds", "schedule_delay_seconds"})
 
 
 class InvalidRequest(ValueError):
@@ -67,7 +72,8 @@ def read_policy(dynamodb, table, owner_id):
     """Read the exact versioned server envelope used by RunStore's transaction.
 
     Item attributes are exactly pk:S=policy, version:S, enabled:BOOL, payload:S.
-    payload is canonical JSON containing every Policy field. Its version and
+    payload is canonical JSON containing every Policy field, or the exact legacy
+    field set without manual_suites (which retains only the original 1 GB authority). Its version and
     enabled values must match the transaction fence attributes without coercion.
     Policy-content changes require a new immutable version. The emergency enabled
     toggle may keep its version but must update both envelope and payload values.
@@ -90,7 +96,7 @@ def read_policy(dynamodb, table, owner_id):
         text = item["payload"]["S"]
         require(0 < len(text.encode("utf-8")) <= MAX_POLICY_BYTES, "invalid server policy")
         value = parse_json(text)
-        require(isinstance(value, dict) and set(value) == _POLICY_FIELDS
+        require(isinstance(value, dict) and set(value) in (_POLICY_FIELDS, _LEGACY_POLICY_FIELDS)
                 and canonical(value).decode() == text, "invalid server policy")
         require(type(value["enabled"]) is bool and value["enabled"] == item["enabled"]["BOOL"]
                 and value["version"] == item["version"]["S"] and value["owner_id"] == owner_id,
@@ -100,6 +106,10 @@ def read_policy(dynamodb, table, owner_id):
                 "invalid server policy")
         require(all(isinstance(slot, list) and len(slot) == 3 for slot in value["schedule_slots"]),
                 "invalid server policy")
+        # absent in recorded policies: preserve the old 1 GB-only authority
+        suites = value.get("manual_suites", ["bulk-1g-metadata"])
+        require(isinstance(suites, list) and len(suites) <= 2, "invalid server policy")
+        value["manual_suites"] = tuple(suites)
         value["manual_actor_ids"] = tuple(value["manual_actor_ids"])
         value["schedule_slots"] = tuple(tuple(slot) for slot in value["schedule_slots"])
         return Policy(**value)

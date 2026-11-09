@@ -13,7 +13,7 @@ import re
 from .common import (DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
                      durable_worker_reserve, durable_plan_contract, durable_minimum_runtime,
                      validate_durable_hashes, validate_durable_pins, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
-                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity)
+                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity, durable_plan_for_suite, DURABLE_SUITES)
 
 PROTOCOL = DIRECT_PROTOCOL
 CAPACITY_SECONDS = DURABLE_MAX_PROVISIONING
@@ -43,10 +43,11 @@ def validate(value, *, exact=True):
         "unexpected direct request fields")
     require(value["protocol"] == PROTOCOL, "unknown direct capacity protocol")
     validate_identity(value)
-    require(value["suite"] == "bulk-1g-metadata", "direct qualification requires metadata suite")
+    require(value["suite"] in DURABLE_SUITES, "direct qualification requires metadata suite")
     require(value["baseline"] == value["candidate"], "direct qualification requires A/A revisions")
     require(re.fullmatch(r"[0-9a-f]{40}", value["controller"]) is not None, "invalid controller revision")
     contract = durable_plan_contract(value["plan"], exact=exact)
+    require(contract["suite"] == value["suite"], "direct plan belongs to another file set")
     seconds = value["runtime_seconds"]
     require(type(seconds) is int and minimum_runtime(value["plan"], exact=exact) <= seconds <= contract["max_runtime"],
             "runtime does not fit the explicit workload/headroom plan or exceeds 180 minutes")
@@ -64,7 +65,7 @@ def request(identity, created, hashes, pins, *, runtime_seconds=RUNTIME_SECONDS,
     value = {k: identity[k] for k in ("run", "baseline", "candidate", "suite", "controller")}
     value.update(protocol=PROTOCOL, created_at=timestamp(created), capacity_deadline=timestamp(expiry),
                  outer_deadline=timestamp(expiry + timedelta(seconds=runtime_seconds)), runtime_seconds=runtime_seconds,
-                 plan=dict(PLAN), sha256=dict(hashes), pins=dict(pins))
+                 plan=durable_plan_for_suite(identity["suite"]), sha256=dict(hashes), pins=dict(pins))
     return validate(value)
 
 

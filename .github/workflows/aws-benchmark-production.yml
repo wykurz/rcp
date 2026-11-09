@@ -19,6 +19,14 @@ on:
         description: Nonsecret finite approval JSON for identity-test only; see PRODUCTION.md
         type: string
         required: false
+      suite:
+        description: Manual file set; requires server approval and qualified image (scheduled runs stay 1 GB)
+        type: choice
+        options:
+          - bulk-1g-metadata
+          - bulk-100m-metadata
+        default: bulk-1g-metadata
+        required: true
       revision:
         description: Full source SHA for the initial four-copy A/A qualification (blank uses main)
         type: string
@@ -34,6 +42,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       revision: ${{ steps.source.outputs.revision }}
+      suite: ${{ steps.source.outputs.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,6 +52,7 @@ jobs:
         env:
           RCP_MODE: ${{ inputs.mode || 'benchmark' }}
           RCP_REQUESTED_REVISION: ${{ inputs.revision }}
+          RCP_REQUESTED_SUITE: ${{ inputs.suite }}
           RCP_PRODUCTION_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_ENABLED }}
           RCP_SCHEDULE_ENABLED: ${{ vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED }}
           RCP_EVENT_SCHEDULE: ${{ github.event.schedule }}
@@ -118,6 +128,7 @@ jobs:
       - name: Reserve, upload data and submit the existing run
         env:
           REVISION: ${{ needs.validate.outputs.revision }}
+          SUITE: ${{ needs.validate.outputs.suite }}
           REGION: ${{ vars.RCP_AWS_PRODUCTION_REGION }}
           ROLE: ${{ vars.RCP_AWS_PRODUCTION_SUBMIT_ROLE }}
           FUNCTION: ${{ vars.RCP_AWS_PRODUCTION_ADMISSION_FUNCTION }}
@@ -125,7 +136,7 @@ jobs:
           AUDIENCE: ${{ vars.RCP_AWS_PRODUCTION_AUDIENCE }}
         run: |
           python3 -m infra.aws_benchmark.production_client \
-            --binaries "$RUNNER_TEMP/candidate-data" --revision "$REVISION" \
+            --binaries "$RUNNER_TEMP/candidate-data" --revision "$REVISION" --suite "$SUITE" \
             --receipt "$RUNNER_TEMP/production-admission.json" \
             --region "$REGION" --role "$ROLE" --function "$FUNCTION" \
             --bucket "$BUCKET" --audience "$AUDIENCE"

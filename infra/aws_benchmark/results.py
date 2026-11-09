@@ -19,7 +19,7 @@ from . import identity
 from .json_bytes import encoded
 from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
                      digest, measurement_contract, verification_contract, verification_contracts, require, utc,
-                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_worker_reserve, validate_durable_hashes, validate_durable_window, validate_request)
+                     DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_plan_contract, durable_worker_reserve, validate_durable_hashes, validate_durable_window, validate_request)
 
 
 MAX_METADATA = 1024 * 1024
@@ -316,7 +316,7 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
         window = receipt["window"]
         labels = recorded_timing_labels(worker)
         require(labels == dict(runtime_origin="attempt_started_at" if window["protocol"] == DIRECT_PROTOCOL else "launch_at",
-                basis="projected workload with explicit headroom; not a measured complete run"),
+                basis=durable_plan_contract(window["plan"])["timing_basis"]),
                 "unverified worker timing labels")
         validate_durable_window(window, now=utc(window["launch_at"]), minimum=0, exact=True)
         validate_request(receipt["request"], window)
