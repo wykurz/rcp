@@ -94,13 +94,14 @@ class Admission:
             if existing.closed or existing.state["phase"] != "awaiting-inputs" or identity.run_attempt !=                     existing.admission["initial_payload"]["producer"]["run_attempt"]:
                 return receipt(existing)
             require(checked == existing.admission["initial_payload"]["manifest"], "existing upload manifest differs")
-            self.policy().reservation(self.now())
+            self.policy().reservation(self.now(), suite=checked["suite"])
             self.run_reader.read(identity)
             store.load()  # require the same active slot before issuing scoped upload capabilities
             return self.upload_urls(identity, existing)
         require(identity.run_attempt == "1", "workflow reruns cannot create a new reservation")
         policy = self.policy()
-        policy.reservation(self.now())
+        # reject disabled/unfunded assignments before reading an App key for run proof
+        policy.reservation(self.now(), suite=checked["suite"])
         observed = self.run_reader.read(identity)
         approved = authorize(policy, identity, observed, checked, self.now())
         require((self.now() - utc(observed.created_at)).total_seconds() + UPLOAD_SECONDS < MAX_RUN_AGE_SECONDS,
@@ -111,7 +112,7 @@ class Admission:
             controller=identity.workflow_sha)
         request = durable.request(producer, created,
             {name: value["sha256"] for name, value in checked["binaries"].items()}, self.config.pins(),
-            runtime_seconds=policy.runtime_seconds, capacity_seconds=policy.capacity_seconds)
+            runtime_seconds=approved["runtime_seconds"], capacity_seconds=approved["capacity_seconds"])
         state = durable.initial_lease(request)
         state["phase"] = "awaiting-inputs"
         state["sealed_inputs"] = None

@@ -304,8 +304,9 @@ Resources:
                 aws:RequestTag/rcp:namespace: {Ref: ResourcePrefix}
               NumericEquals: {'ec2:MetadataHttpPutResponseHopLimit': 1}
               StringLike: {'aws:RequestTag/rcp:run': '?*', 'aws:RequestTag/rcp:attempt': '?*', 'aws:RequestTag/rcp:deadline': '?*', 'aws:RequestTag/rcp:created-at': '?*'}
+              StringEqualsIfExists: {'aws:RequestTag/rcp:runtime-profile': 'all-filesets-8h-v1'}
               ForAllValues:StringEquals:
-                aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at']
+                aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at', 'rcp:runtime-profile']
           - Effect: Allow
             Action: ec2:RunInstances
             Resource: {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'}
@@ -329,9 +330,17 @@ Resources:
                 aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at']
           - Effect: Allow
             Action: ec2:CreateTags
-            Resource:
-            - {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
-            - {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'}
+            Resource: {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'}
+            Condition:
+              StringEquals:
+                ec2:CreateAction: RunInstances
+                aws:RequestTag/rcp:namespace: {Ref: ResourcePrefix}
+              StringEqualsIfExists: {'aws:RequestTag/rcp:runtime-profile': 'all-filesets-8h-v1'}
+              ForAllValues:StringEquals:
+                aws:TagKeys: ['rcp:namespace', 'rcp:run', 'rcp:attempt', 'rcp:deadline', 'rcp:created-at', 'rcp:runtime-profile']
+          - Effect: Allow
+            Action: ec2:CreateTags
+            Resource: {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'}
             Condition:
               StringEquals:
                 ec2:CreateAction: RunInstances

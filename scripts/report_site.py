@@ -292,18 +292,22 @@ def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
                  if index['processing_complete'] and not index['observations'] and index['active']['state'] == 'idle'
                  else 'No public records are available to display in this snapshot. See the observations below.')
         status = '<p>' + empty + '</p>' + status
-    return render_aws_benchmarks(records, retained=True, status=status, footer=(
+    diagnostics = production_reports.public_diagnostics(directory, index, records=records)
+    return render_aws_benchmarks(records, diagnostics=diagnostics, retained=True, status=status, footer=(
         '<p>Reader revision: <code>' + html.escape(reader_revision) + '</code><br>'
         'Snapshot inventory SHA256: <code>' + html.escape(inventory_sha256) + '</code></p>'))
 
 
-def render_aws_benchmarks(records, *, retained=False, status='', footer=''):
-    """Render frozen public JSON only; retained HTML and binaries are never inputs."""
+def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='', footer=''):
+    """Render frozen public JSON and numeric companions; never retained HTML or binaries."""
     from infra.aws_benchmark import production_export
     title = 'AWS benchmarks · retained records' if retained else 'AWS benchmark history'
     retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
                  'This view is not permanent history.</p>' if retained else '')
-    pages, rows = {}, []
+    pages, rows, setups = {}, [], {}
+    diagnostics = diagnostics or {}
+    if not set(diagnostics) <= set(records):
+        raise ValueError('Resource diagnostics have no frozen public record')
     for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
         value = production_export.validate_public(production_export.results.json_value(
             raw, production_export.MAX_PUBLIC_RECORD))
@@ -311,7 +315,18 @@ def render_aws_benchmarks(records, *, retained=False, status='', footer=''):
         report = Path('aws-benchmarks/runs') / (run_key + '.html')
         record = Path('aws-benchmarks/records') / (run_key + '.json')
         pages[record] = raw.decode('utf-8')
-        pages[report] = production_export.render(value) + retention + (
+        extra = diagnostics.get(run_key)
+        if extra is None:
+            extra = production_export.resource_diagnostics.unavailable(value)
+        setup_href = None
+        if extra is not None:
+            production_export.resource_diagnostics.validate(extra, value)
+            if extra['setup'] is not None:
+                setups[extra['setup_id']] = extra['setup']
+                setup_href = '../setups.html#setup-' + extra['setup_id']
+            pages[Path('aws-benchmarks/diagnostics') / (run_key + '.json')] = (
+                production_export.collection.encoded(extra).decode('utf-8'))
+        pages[report] = production_export.render(value, diagnostics=extra, setup_href=setup_href) + retention + (
             '<p><a href="../index.html">' + html.escape(title) + '</a> · '
             f'<a href="../records/{run_key}.json">Public JSON record</a> · '
             '<a href="../../index.html#top">RCP Tools</a></p>')
@@ -320,6 +335,15 @@ def render_aws_benchmarks(records, *, retained=False, status='', footer=''):
         cells = '<td><a href="runs/' + run_key + '.html">' + html.escape(fields[0]) + '</a></td>'
         cells += ''.join('<td>' + html.escape(field) + '</td>' for field in fields[1:])
         rows.append('<tr>' + cells + '</tr>')
+    setup_content = production_export.resource_diagnostics.configuration_html(setups)
+    if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
+        raise ValueError('Central AWS setup page exceeds public HTML bound')
+    pages[Path('aws-benchmarks/setups.html')] = (
+        "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        "<title>AWS benchmark setup</title>" + read_theme() +
+        "<link rel='stylesheet' href='../assets/site.css'><link rel='stylesheet' href='../assets/report.css'>"
+        "<body>" + site_header(Path('aws-benchmarks/setups.html'), has_aws_history=True) +
+        "<main>" + setup_content + "<p><a href='index.html'>AWS benchmark runs</a></p></main></body></html>")
     pages[Path('aws-benchmarks/index.html')] = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)} · RCP Tools</title>{read_theme()}
@@ -329,8 +353,10 @@ def render_aws_benchmarks(records, *, retained=False, status='', footer=''):
 <main id="report-content"><h1>{html.escape(title)}</h1>{retention}
 <p>Retired AWS runs with verified resource termination. Failed consistency checks and unavailable evidence remain
 visible and are excluded from performance history. These records are separate from historical Depot measurements.</p>
+<p><a href="setups.html">Hardware, storage, filesystem and test setup</a>. Each run's resource diagnostics
+link to its observed setup. Missing historical measurements remain explicitly unavailable.</p>
 <p>{html.escape(production_export.projection.MEASUREMENT_CAVEAT)}</p>
-<p>{html.escape(production_export.VALIDATION)} Four copies form two local pairs; a small run does not
+<p>{html.escape(production_export.VALIDATION)} Each file set has four copies forming two local pairs; a small run does not
 establish broad variance. Compare only matching workload and measurement contracts.</p>
 <div class="table-scroll"><table><thead><tr><th>Run</th><th>Collected at</th><th>Suite</th>
 <th>Comparison</th><th>Qualification</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>

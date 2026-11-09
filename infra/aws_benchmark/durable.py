@@ -9,11 +9,12 @@ from decimal import Decimal
 import hashlib
 import json
 import re
+from types import MappingProxyType
 
 from .common import (DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
                      durable_worker_reserve, durable_plan_contract, durable_minimum_runtime,
                      validate_durable_hashes, validate_durable_pins, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
-                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity, durable_plan_for_suite, DURABLE_SUITES)
+                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity, durable_plan_for_suite, DURABLE_SUITES, FULL_RUNTIME_PROFILE)
 
 PROTOCOL = DIRECT_PROTOCOL
 CAPACITY_SECONDS = DURABLE_MAX_PROVISIONING
@@ -32,6 +33,10 @@ TAG_ATTEMPT = "rcp:attempt"
 TAG_DEADLINE = "rcp:deadline"
 TAG_CREATED = "rcp:created-at"
 TAG_KEYS = {TAG_NAMESPACE, TAG_RUN, TAG_ATTEMPT, TAG_DEADLINE, TAG_CREATED}
+TAG_RUNTIME_PROFILE = "rcp:runtime-profile"
+# the independent scan must interpret this instance tag without any DDB read
+RUNTIME_PROFILES = MappingProxyType({FULL_RUNTIME_PROFILE: MappingProxyType(dict(
+    runtime_seconds=28800, max_attempts=120))})
 PIN_KEYS = frozenset(durable_plan_contract(PLAN)["pin_patterns"])
 minimum_runtime = durable_minimum_runtime
 
@@ -50,7 +55,7 @@ def validate(value, *, exact=True):
     require(contract["suite"] == value["suite"], "direct plan belongs to another file set")
     seconds = value["runtime_seconds"]
     require(type(seconds) is int and minimum_runtime(value["plan"], exact=exact) <= seconds <= contract["max_runtime"],
-            "runtime does not fit the explicit workload/headroom plan or exceeds 180 minutes")
+            "runtime does not fit the explicit workload/headroom plan or recorded cap")
     created, expiry, outer = (utc(value[k]) for k in ("created_at", "capacity_deadline", "outer_deadline"))
     require(0 < (expiry - created).total_seconds() <= contract["max_provisioning"], "capacity wait exceeds the recorded policy")
     require(outer == expiry + timedelta(seconds=seconds), "control reconciliation horizon differs")
@@ -79,7 +84,8 @@ def initial_lease(value):
 
 def attempt(value, ordinal, now):
     validate(value)
-    require(type(ordinal) is int and 1 <= ordinal <= MAX_ATTEMPTS, "capacity attempt bound exhausted")
+    require(type(ordinal) is int and 1 <= ordinal <= durable_plan_contract(value["plan"])["max_attempts"],
+            "capacity attempt bound exhausted")
     require(utc(value["created_at"]) <= now < utc(value["capacity_deadline"]), "capacity request expired")
     result = dict(id=value["run"] + "-" + str(ordinal), ordinal=ordinal, started_at=timestamp(now),
                   close_at=timestamp(now + timedelta(seconds=value["runtime_seconds"])), parameters={})
@@ -88,9 +94,17 @@ def attempt(value, ordinal, now):
     return result
 
 
-def tags(value, allocation):
+def volume_tags(value, allocation):
     return {TAG_NAMESPACE: value["pins"]["namespace"], TAG_RUN: value["run"], TAG_ATTEMPT: allocation["id"],
             TAG_DEADLINE: allocation["close_at"], TAG_CREATED: allocation["started_at"]}
+
+
+def tags(value, allocation):
+    result = volume_tags(value, allocation)
+    profile = durable_plan_contract(value["plan"]).get("runtime_profile")
+    if profile is not None:
+        result[TAG_RUNTIME_PROFILE] = profile
+    return result
 
 
 def instance_tags(instance):
@@ -107,12 +121,17 @@ def tagged_expiry(instance, namespace, now):
     require(values.get(TAG_NAMESPACE) == namespace, "instance is outside managed namespace")
     require(TAG_KEYS <= set(values), "missing allocation deadline tags")
     require(re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,4}", values[TAG_RUN]), "invalid run tag")
-    validate_attempt_id(values[TAG_RUN], values[TAG_ATTEMPT])
+    profile = values.get(TAG_RUNTIME_PROFILE)
+    require(profile is None or profile in RUNTIME_PROFILES, "unknown tagged runtime profile")
+    bounds = RUNTIME_PROFILES[profile] if profile is not None else dict(
+        runtime_seconds=RUNTIME_SECONDS, max_attempts=MAX_ATTEMPTS)
+    validate_attempt_id(values[TAG_RUN], values[TAG_ATTEMPT], maximum=bounds["max_attempts"])
+    runtime = bounds["runtime_seconds"]
     start, close, launch = utc(values[TAG_CREATED]), utc(values[TAG_DEADLINE]), utc(instance["LaunchTime"])
     require(timestamp(start) == values[TAG_CREATED] and timestamp(close) == values[TAG_DEADLINE],
             "deadline tags must be canonical UTC")
-    require(start <= launch <= now and 0 < (close - start).total_seconds() <= RUNTIME_SECONDS
-            and close <= launch + timedelta(seconds=RUNTIME_SECONDS), "excessive or inconsistent tagged deadline")
+    require(start <= launch <= now and 0 < (close - start).total_seconds() <= runtime
+            and close <= launch + timedelta(seconds=runtime), "excessive or inconsistent tagged deadline")
     return close
 
 
@@ -137,7 +156,9 @@ def validate_allocation_instance(value, instance, allocation):
              {g["GroupId"] for g in instance.get("SecurityGroups", [])} == {pins["security_group"]}),
             "instance network or profile differs")
     observed = instance_tags(instance)
-    require(all(observed.get(k) == v for k, v in tags(value, allocation).items()), "allocation tags differ")
+    expected = tags(value, allocation)
+    require(all(observed.get(k) == v for k, v in expected.items()) and
+            observed.get(TAG_RUNTIME_PROFILE) == expected.get(TAG_RUNTIME_PROFILE), "allocation tags differ")
     return launch
 
 
@@ -201,10 +222,12 @@ def launch_outcome(state, outcome):
 
 
 def cost_projection(*, hourly, ancillary, runtime_seconds=RUNTIME_SECONDS,
-                    capacity_seconds=CAPACITY_SECONDS, shutdown_seconds=SHUTDOWN_ALLOWANCE_SECONDS):
-    require(type(runtime_seconds) is int and minimum_runtime() <= runtime_seconds <= RUNTIME_SECONDS,
+                    capacity_seconds=CAPACITY_SECONDS, shutdown_seconds=SHUTDOWN_ALLOWANCE_SECONDS, plan=None):
+    plan = PLAN if plan is None else plan
+    contract = durable_plan_contract(plan)
+    require(type(runtime_seconds) is int and minimum_runtime(plan) <= runtime_seconds <= contract["max_runtime"],
             "invalid priced runtime")
-    require(type(capacity_seconds) is int and 0 < capacity_seconds <= CAPACITY_SECONDS, "invalid priced wait")
+    require(type(capacity_seconds) is int and 0 < capacity_seconds <= contract["max_provisioning"], "invalid priced wait")
     require(type(shutdown_seconds) is int and shutdown_seconds >= SHUTDOWN_ALLOWANCE_SECONDS,
             "at least sixteen minutes of shutdown planning allowance is required")
     rate, other = Decimal(str(hourly)), Decimal(str(ancillary))

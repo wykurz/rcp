@@ -213,3 +213,52 @@ permissions.
 Offline tests exercise complete/partial/cancelled results, malformed and oversized archives, forged
 metadata, run/ref substitution, policy mismatch, idempotence and conflicting replay. They cannot
 prove future GitHub artifact delivery, AWS image observations, or candidate measurement honesty.
+
+## Public resource diagnostics and setup
+
+The keyless report keeps each frozen public record, qualification verdict and series identity
+unchanged. A separate rcp-public-resource-diagnostics-v1 companion can supplement its presentation
+with resource observations from the exact versioned raw archive referenced by the retired manifest.
+The archive digest and retirement digest remain visible. The exporter does not execute archive
+contents, copy retained HTML, or run today's qualification validator again.
+
+Per-copy GNU-time fields are user CPU seconds, system CPU seconds, peak RSS in **KiB**, voluntary
+and involuntary context switches, and minor and major page faults. The scope is one local command,
+its threads and waited descendants. CPU time can exceed wall time on multiple threads. Peak RSS is
+neither whole-host consumption nor a sum of simultaneous processes. Failed or incomplete command
+resource output stays explicitly unavailable; it is never filled with zero.
+
+Optional system-sampling summaries are separate diagnostics. Their fixed instrumentation descriptor,
+cadence and limits identify their measurement contract. Phase elapsed time, sampled cgroup memory,
+cgroup CPU and I/O counter deltas, logical-device I/O, and host aggregate CPU/memory observations
+are not per-process attribution. Sampled maxima can miss peaks. A cgroup lifetime high-water mark
+can include earlier phases and is not a phase-local maximum. An observed phase end does not
+establish phase success. Counter resets, unsupported files, incomplete sampling and missing
+historical observations remain explicit.
+
+The public setup page groups observed CPU model/count, host RAM when recorded, kernel, architecture,
+filesystem, array member count/model/size and configuration by a stable fingerprint. It excludes
+run-varying free-space counters, paths, device identifiers, serials, hostnames, environment
+variables and process inventories. Historical guest RAM is not inferred from an EC2 instance type.
+The configured design is described separately from observed facts, and each run links to its setup
+so material differences stay visible.
+
+All sizes in the file-set description are decimal bytes. The existing 1 KB fixture is 10,240,000
+files of 1,000 bytes, or 10.24 GB total. This is already exactly 100 times smaller than the 1.024 TB
+100 MB and 1 MB fixtures; no second reduction is applied.
+
+For old records, backfill is presentation-only. The reader first authenticates the frozen public
+record and retirement-bound manifest, then reads only the exact retained archive version and
+verifies its size and SHA256. A successful record's copy samples must match the frozen samples
+before resource fields can supplement it. The companion uses fixed numeric/label allowlists and
+independent byte/count bounds. Missing, expired, corrupt or over-budget raw evidence makes only the
+supplement unavailable; it cannot replace the frozen verdict or silently erase timing history.
+
+The keyless snapshot's existing 512 MiB source budget includes diagnostic reads. It reserves the
+manifest bounds and exact raw-body size **before** requesting data, including failed or partial body
+reads; no read retry occurs. Output remains subject to the existing 64 MiB artifact budget.
+Snapshots containing companions use the version-two artifact index; version-one directories stay
+readable. Both the frozen record and companion are bound to the current authenticated job's
+cross-job inventory. Public records do not gain service credentials or write permissions, but daily
+backfill can add bounded S3 reads and data transfer; these are operating overhead, not free or an
+AWS-enforced spending cap.

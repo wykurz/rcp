@@ -151,6 +151,11 @@ def prepare_output(data, budget, uid, gid, execute):
 
 def prepare(data, case, budget, uid, gid, execute):
     """Fail before formatting unless all disks and both newly created arrays pass."""
+    cases = (case,) if isinstance(case, dict) else tuple(case)
+    require(1 <= len(cases) <= 4 and all(isinstance(item, dict) for item in cases), "invalid storage case set")
+    if len(cases) > 1:
+        require(all(isinstance(item.get("id"), str) for item in cases) and
+                len({item["id"] for item in cases}) == len(cases), "duplicate or missing storage case identity")
     arrays = {side: Path("/dev/md") / ("rcp-" + side) for side in SIDES}
     require(all(not os.path.lexists(path) for path in arrays.values()), "target RAID array already exists")
     unused_targets(data)
@@ -176,10 +181,16 @@ def prepare(data, case, budget, uid, gid, execute):
         for side, (fd, number, _) in opened.items():
             format_mount(fd, number, data / side, budget, execute,
                          geometry=("-b", "4096", "-N", str(INODES)))
-        proof = capacity.check_pair(data / "source", data / "destination", case)
+        # each serial case must fit independently; arrays are formatted exactly once
+        proofs = [capacity.check_pair(data / "source", data / "destination", item) for item in cases]
         for side in SIDES:
             os.chown(data / side, uid, gid)
         prepare_output(data, budget, uid, gid, execute)
-        return dict(layout="two-disjoint-raid0-ext4-v1", capacity=proof,
-            arrays={side: dict(device=number, members=members, chunk_bytes=CHUNK_BYTES)
-                    for side, (_, number, members) in opened.items()})
+        result = dict(layout="two-disjoint-raid0-ext4-v1", capacity=proofs[0],
+            arrays={side: dict(device=number, members=members, chunk_bytes=CHUNK_BYTES,
+                member_models=[disk["model"].strip() for disk in disks[index * 2:index * 2 + 2]],
+                member_bytes=[disk["size"] for disk in disks[index * 2:index * 2 + 2]])
+                for index, (side, (_, number, members)) in enumerate(opened.items())})
+        if len(cases) > 1:
+            result["capacity_by_case"] = {item["id"]: proof for item, proof in zip(cases, proofs)}
+        return result

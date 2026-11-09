@@ -134,6 +134,8 @@ class FileSetAdmissionTests(unittest.TestCase):
     def test_legacy_wire_policy_remains_byte_identical_and_one_gigabyte_only(self):
         value = asdict(policy())
         value.pop("manual_suites")
+        value.pop("manual_runtime_seconds")
+        self.assertEqual(len(value), 17)
         encoded = production_policy.canonical(value).decode()
         item = dict(pk={"S": "policy"}, version={"S": value["version"]},
                     enabled={"BOOL": value["enabled"]}, payload={"S": encoded})
@@ -193,7 +195,7 @@ class FileSetAdmissionTests(unittest.TestCase):
             authorize(configured, SUITE, who)
 
     def test_unrecognized_duplicate_and_underfunded_manual_suite_policies_fail_closed(self):
-        for suites in ((SUITE, SUITE), ("bulk-1m-metadata",), [SUITE], (True,), ([SUITE],)):
+        for suites in ((SUITE, SUITE), ("unrecognized-metadata",), [SUITE], (True,), ([SUITE],)):
             with self.subTest(suites=suites), self.assertRaises(ValueError):
                 policy(manual_suites=suites)
         with self.assertRaisesRegex(ValueError, "qualification budget"):
@@ -213,11 +215,17 @@ class FileSetWorkflowTests(unittest.TestCase):
     def test_actual_cli_pins_schedules_and_validates_manual_suite_before_any_output(self):
         cases = [("workflow_dispatch", "", True, OLD_SUITE),
                  ("workflow_dispatch", SUITE, True, SUITE),
-                 ("workflow_dispatch", "bulk-1m-metadata", False, None),
+                 ("workflow_dispatch", "bulk-1m-metadata", True, "bulk-1m-metadata"),
+                 ("workflow_dispatch", "tiny-1k-metadata", True, "tiny-1k-metadata"),
+                 ("workflow_dispatch", "all-filesets-metadata", True, "all-filesets-metadata"),
+                 ("workflow_dispatch", "unrecognized-metadata", False, None),
                  ("workflow_dispatch", "bulk-100m-metadata\nsuite=untrusted", False, None),
                  ("schedule", "", True, OLD_SUITE),
                  ("schedule", OLD_SUITE, True, OLD_SUITE),
-                 ("schedule", SUITE, False, None)]
+                 ("schedule", SUITE, False, None),
+                 ("schedule", "bulk-1m-metadata", False, None),
+                 ("schedule", "tiny-1k-metadata", False, None),
+                 ("schedule", "all-filesets-metadata", False, None)]
         for event, requested, accepted, expected in cases:
             with self.subTest(event=event, requested=requested), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "output"
@@ -236,7 +244,7 @@ class FileSetWorkflowTests(unittest.TestCase):
         workflow = yaml.load((ROOT / ".github/workflows/aws-benchmark-production.yml").read_text(), Loader=yaml.BaseLoader)
         selected = workflow["on"]["workflow_dispatch"]["inputs"]["suite"]
         self.assertEqual(selected["default"], OLD_SUITE)
-        self.assertEqual(selected["options"], [OLD_SUITE, SUITE])
+        self.assertEqual(selected["options"], list(common.DURABLE_SUITES))
         self.assertEqual(workflow["jobs"]["validate"]["outputs"]["suite"], "${{ steps.source.outputs.suite }}")
         step = next(x for x in workflow["jobs"]["validate"]["steps"] if x.get("id") == "source")
         self.assertEqual(step["env"]["RCP_REQUESTED_SUITE"], "${{ inputs.suite }}")
@@ -258,9 +266,15 @@ class FileSetWorkflowTests(unittest.TestCase):
             self.assertEqual(new["suite"], SUITE)
             self.assertEqual(old_binaries, new_binaries)
             self.assertEqual(old["binaries"], new["binaries"])
+            for suite in ("bulk-1m-metadata", "tiny-1k-metadata", "all-filesets-metadata"):
+                with self.subTest(suite=suite):
+                    selected, binaries = production_client.prepare(root, "a" * 40, suite=suite)
+                    self.assertEqual(selected["suite"], suite)
+                    self.assertEqual(binaries, old_binaries)
+                    self.assertEqual(selected["binaries"], old["binaries"])
         with patch.object(production_client, "read_binary") as read:
             with self.assertRaises(ValueError):
-                production_client.prepare("unused", "a" * 40, suite="bulk-1m-metadata")
+                production_client.prepare("unused", "a" * 40, suite="unrecognized-metadata")
             read.assert_not_called()
 
 

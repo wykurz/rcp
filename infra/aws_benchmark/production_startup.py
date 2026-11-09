@@ -13,7 +13,7 @@ import re
 
 OUTPUT_CONTRACT = "production-mailbox-sha256-v1"
 # reviewed upload implementation; a worker change requires a fresh image and explicit pin review
-OUTPUT_WORKER_SHA256 = "814f2ce113cdc3c24051a06ff9c29e4ec2b2620435ddbf1dce4dc0c88a6f7bcc"
+OUTPUT_WORKER_SHA256 = "0f8db4e9901a84f1023c2135731ad1bd816be54d2a42a5bd169a4fb857831bfa"
 OUTPUT_CONTRACT_FILE = "production-output-contract.txt"
 OUTPUT_WORKER_FILE = "infra/aws_benchmark/worker.py"
 MAX_USER_DATA_BYTES = 16 * 1024
@@ -58,6 +58,7 @@ def reviewed_startup(*, account, bucket, region):
             "  exit 1\n"
             "fi\n"
             "systemd-run --unit=rcp-supervisor --working-directory=/opt/rcp-benchmark "
+            "--property=Type=notify --property=NotifyAccess=main "
             "--property=RuntimeMaxSec=10800 --property=TimeoutStopSec=10 "
             "--property=KillMode=control-group --property=SendSIGKILL=yes "
             "--property=FailureAction=poweroff --property=SuccessAction=poweroff "

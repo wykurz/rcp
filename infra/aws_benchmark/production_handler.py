@@ -45,6 +45,7 @@ _LEGACY_POLICY_FIELDS = frozenset({"version", "owner_id", "enabled", "manual_act
     "scheduled_baseline", "total_cap_microusd", "monthly_cap_microusd", "daily_run_limit", "hourly_microusd",
     "ancillary_microusd", "priced_at", "price_evidence", "runtime_seconds", "capacity_seconds",
     "shutdown_seconds", "schedule_delay_seconds"})
+_FILE_SET_POLICY_FIELDS = _LEGACY_POLICY_FIELDS | {"manual_suites"}
 
 
 class InvalidRequest(ValueError):
@@ -96,7 +97,7 @@ def read_policy(dynamodb, table, owner_id):
         text = item["payload"]["S"]
         require(0 < len(text.encode("utf-8")) <= MAX_POLICY_BYTES, "invalid server policy")
         value = parse_json(text)
-        require(isinstance(value, dict) and set(value) in (_POLICY_FIELDS, _LEGACY_POLICY_FIELDS)
+        require(isinstance(value, dict) and set(value) in (_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _LEGACY_POLICY_FIELDS)
                 and canonical(value).decode() == text, "invalid server policy")
         require(type(value["enabled"]) is bool and value["enabled"] == item["enabled"]["BOOL"]
                 and value["version"] == item["version"]["S"] and value["owner_id"] == owner_id,

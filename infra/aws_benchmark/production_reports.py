@@ -13,6 +13,7 @@ import re
 import time
 
 from . import production_collection as collection, production_export as public
+from . import production_diagnostics as diagnostics
 from . import production_publication as publication
 from .common import Budget, ValidationError, digest, require
 from .history_contract import OWNER_ID, PUBLICATION_WORKFLOW, REPOSITORY, REPOSITORY_ID
@@ -20,9 +21,10 @@ from .publication_artifacts import (MAX_HISTORY, MAX_INDEX, MAX_TOTAL, inventory
     persist, read, verify_inventory, outputs)
 
 SCHEMA = "rcp-production-retained-reports-v1"
+DIAGNOSTIC_SCHEMA = "rcp-production-retained-reports-v2"
 RETENTION_DAYS = 90
 MAX_SECONDS = 600
-MAX_SOURCE_PER_RECORD = 3 * collection.MAX_DOCUMENT + collection.MAX_REPORT
+MAX_SOURCE_PER_RECORD = 3 * collection.MAX_DOCUMENT + collection.MAX_REPORT + 8
 RUN = re.compile(r"repo-" + REPOSITORY_ID + r"-run-[1-9][0-9]{0,19}")
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -103,9 +105,10 @@ def observation(value, *, active=False):
 
 
 def snapshot(reader, output, reader_revision, *, clock=time.monotonic, now=None):
-    """Rebuild from small frozen reports, with no raw archive downloads or prior Git cache."""
+    """Rebuild frozen reports and optional bounded raw-resource companions; no Git cache."""
     revision(reader_revision)
-    started, source_budget, total, observations, records = clock(), 0, 0, [], []
+    started, source_budget, total = clock(), 0, 0
+    observations, records, diagnostic_refs, diagnostic_candidates = [], [], [], []
     output = Path(output)
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
     try:
@@ -135,15 +138,41 @@ def snapshot(reader, output, reader_revision, *, clock=time.monotonic, now=None)
                 (output / (run_key + ".json")).write_bytes(raw)
                 records.append(dict(run_key=run_key, sha256=digest(raw), bytes=len(raw)))
                 total += len(raw)
+                diagnostic_candidates.append((key, record))
             status = {name: item for name, item in value.items() if name != "record"}
             observations.append(observation(dict(status, run_key=run_key)))
         except Exception as error:
             observations.append(dict(run_key=run_key, state="held", retired=False,
                 reason=collection.results.diagnostic(error)))
+    # Frozen records have priority. Optional raw reads must never starve canonical history.
+    if callable(getattr(reader, "public_diagnostics", None)):
+        for key, record in sorted(diagnostic_candidates,
+                key=lambda item: int(item[1]["run_key"].rsplit("-", 1)[1]), reverse=True):
+            if clock() - started >= MAX_SECONDS:
+                break
+            run_key = record["run_key"]
+            fallback = collection.encoded(diagnostics.unavailable(record, "raw_budget"))
+            if total + len(fallback) + MAX_INDEX > MAX_HISTORY:
+                continue
+            extra, consumed = reader.public_diagnostics(key, record,
+                maximum_bytes=max(0, MAX_TOTAL - source_budget))
+            require(type(consumed) is int and 0 <= consumed <= MAX_TOTAL - source_budget,
+                    "diagnostic source budget differs")
+            source_budget += consumed
+            diagnostics.validate(extra, record)
+            data = collection.encoded(extra)
+            if total + len(data) + MAX_INDEX > MAX_HISTORY:
+                data = fallback
+            (output / (run_key + ".diagnostics.json")).write_bytes(data)
+            diagnostic_refs.append(dict(run_key=run_key, sha256=digest(data), bytes=len(data)))
+            total += len(data)
     value = dict(schema=SCHEMA, repository_id=REPOSITORY_ID, reader_revision=reader_revision,
         observed_at=(now or datetime.now(timezone.utc)).isoformat(), retention_days=RETENTION_DAYS,
         discovery_complete=True, processing_complete=not any(x["state"] == "deferred" for x in observations),
         active=active, observations=observations, records=sorted(records, key=lambda x: x["run_key"]))
+    if diagnostic_refs:
+        value.update(schema=DIAGNOSTIC_SCHEMA,
+                     diagnostics=sorted(diagnostic_refs, key=lambda item: item["run_key"]))
     persist(output / "index.json", value)
     proof = inventory(output, limit=MAX_HISTORY)
     public_batch(output, reader_revision, proof)
@@ -158,7 +187,9 @@ def public_batch(source, reader_revision, expected):
     index = collection.results.json_value(read(source / "index.json", MAX_INDEX), MAX_INDEX)
     fields = {"schema", "repository_id", "reader_revision", "observed_at", "retention_days",
               "discovery_complete", "processing_complete", "active", "observations", "records"}
-    require(isinstance(index, dict) and set(index) == fields and index["schema"] == SCHEMA and
+    if isinstance(index, dict) and index.get("schema") == DIAGNOSTIC_SCHEMA:
+        fields.add("diagnostics")
+    require(isinstance(index, dict) and set(index) == fields and index["schema"] in {SCHEMA, DIAGNOSTIC_SCHEMA} and
             index["repository_id"] == REPOSITORY_ID and index["reader_revision"] == reader_revision and
             type(index["retention_days"]) is int and index["retention_days"] == RETENTION_DAYS and
             index["discovery_complete"] is True and type(index["processing_complete"]) is bool,
@@ -190,10 +221,39 @@ def public_batch(source, reader_revision, expected):
         record = public.validate_public(collection.results.json_value(raw, public.MAX_PUBLIC_RECORD))
         require(record["run_key"] == ref["run_key"], "retained public record identity differs")
         found[ref["run_key"]] = raw
+    extra = public_diagnostics(source, index, records=found)
     require(set(found) == {name for name, item in observed.items() if item["state"] == "ready"} and
-            {p.name for p in source.iterdir()} == {name + ".json" for name in found} | {"index.json"},
+            {p.name for p in source.iterdir()} == {name + ".json" for name in found} |
+                {name + ".diagnostics.json" for name in extra} | {"index.json"},
             "retained public file set differs from observations")
     return found, index
+
+
+def public_diagnostics(source, index, *, records=None):
+    """Validate optional numeric companions under the same trusted artifact inventory."""
+    source = Path(source)
+    refs = index.get("diagnostics", [])
+    require(isinstance(refs, list) and len(refs) <= publication.MAX_RUNS,
+            "diagnostic reference count exceeds bound")
+    require(index.get("schema") == DIAGNOSTIC_SCHEMA or not refs,
+            "legacy report index has diagnostic references")
+    found = {}
+    for ref in refs:
+        require(isinstance(ref, dict) and set(ref) == {"run_key", "sha256", "bytes"} and
+                isinstance(ref["run_key"], str) and RUN.fullmatch(ref["run_key"]) and
+                ref["run_key"] not in found, "invalid diagnostic reference")
+        if records is None:
+            raw_record = read(source / (ref["run_key"] + ".json"), public.MAX_PUBLIC_RECORD)
+        else:
+            require(ref["run_key"] in records, "diagnostics have no frozen record")
+            raw_record = records[ref["run_key"]]
+        record = public.validate_public(collection.results.json_value(raw_record, public.MAX_PUBLIC_RECORD))
+        raw = read(source / (ref["run_key"] + ".diagnostics.json"), diagnostics.MAX_DOCUMENT)
+        require(type(ref["bytes"]) is int and len(raw) == ref["bytes"] and ref["sha256"] == digest(raw),
+                "diagnostic reference differs")
+        found[ref["run_key"]] = diagnostics.validate(
+            collection.results.json_value(raw, diagnostics.MAX_DOCUMENT), record)
+    return found
 
 
 def deployable(index):

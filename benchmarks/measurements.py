@@ -7,7 +7,7 @@ import re
 import sys
 import time
 
-from benchmarks import operations
+from benchmarks import operations, telemetry
 from benchmarks.strict_json import parse_json
 
 
@@ -70,6 +70,10 @@ def identity(context):
     for key in ("local_resources", "measurement_environment", "command_clocks"):
         if key in context:
             result[key] = context[key]
+    if "system_telemetry" in context:
+        if context["system_telemetry"] != telemetry.descriptor():
+            raise ValueError("unsupported system telemetry policy")
+        result["system_telemetry"] = telemetry.descriptor()
     if "build_provenance" in context:
         result["declared_build_configuration"] = {key: {field: sorted(build[field]) if field == "features" else build[field] for field in ("target", "profile", "features", "rustflags", "rustc")}
                                                    for key, build in context["build_provenance"]["builds"].items()}
@@ -215,6 +219,8 @@ def _validate(run):
     context = run["context"]
     if not isinstance(context, dict) or not isinstance(run["trials"], list) or any(not isinstance(row, dict) for row in run["trials"]):
         raise ValueError("measurement context must be an object and trials an array of objects")
+    if "system_telemetry" in context and context["system_telemetry"] != telemetry.descriptor():
+        raise ValueError("unsupported system telemetry policy")
     resource = context.get("local_resources")
     if resource is None and any("resources" in row for row in run["trials"]):
         raise ValueError("resource trials require context.local_resources")

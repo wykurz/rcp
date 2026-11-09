@@ -110,6 +110,9 @@ def conditions_match(conditions, context):
             elif operator == "NumericEquals":
                 if key not in context or float(context[key]) != float(expected):
                     return False
+            elif operator == "StringEqualsIfExists":
+                if key in context and context[key] not in sequence(expected):
+                    return False
             elif operator in {"StringEquals", "ArnEquals"}:
                 if context.get(key) not in sequence(expected):
                     return False
@@ -417,8 +420,26 @@ class ProductionStackTests(unittest.TestCase):
             equals = statement.get("Condition", {}).get("ArnEquals", {})
             if "ec2:InstanceProfile" in equals:
                 equals["ec2:InstanceProfile"] = {"Fn::GetAtt": ["WorkerInstanceProfile", "Arn"]}
+        # the only extension is an exact optional profile on instances, never volumes
+        expanded = []
+        for statement in expected:
+            resources = sequence(statement["Resource"])
+            if statement["Action"] == "ec2:CreateTags":
+                instance, volume = deepcopy(statement), deepcopy(statement)
+                instance["Resource"], volume["Resource"] = resources
+                instance["Condition"]["StringEqualsIfExists"] = {
+                    "aws:RequestTag/rcp:runtime-profile": "all-filesets-8h-v1"}
+                instance["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"].append("rcp:runtime-profile")
+                expanded.extend((instance, volume))
+            else:
+                if statement["Action"] == "ec2:RunInstances" and any(
+                        "instance/*" in str(resource) for resource in resources):
+                    statement["Condition"]["StringEqualsIfExists"] = {
+                        "aws:RequestTag/rcp:runtime-profile": "all-filesets-8h-v1"}
+                    statement["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"].append("rcp:runtime-profile")
+                expanded.append(statement)
         actual = [s for s in current if s["Action"] in ("ec2:RunInstances", "ec2:CreateTags", "iam:PassRole")]
-        self.assertEqual(actual, expected)
+        self.assertEqual(actual, expanded)
         context = launch_context()
         self.assertTrue(permits("CoordinatorRole", "ec2:RunInstances", INSTANCE, context))
         for key, bad in {"ec2:LaunchTemplate": "other", "ec2:InstanceProfile": "other", "ec2:InstanceType": "c5d.metal",

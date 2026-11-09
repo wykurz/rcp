@@ -265,11 +265,12 @@ class Service:
             self.api["ec2"], self.config.lt_id, self.config.lt_version))
         self.verify_startup(data)
         interface = dict(data["NetworkInterfaces"][0], SubnetId=self.config.subnet)
-        tags = [{"Key": k, "Value": v} for k, v in sorted(durable.tags(request, allocation).items())]
+        tag_sets = {"instance": durable.tags(request, allocation), "volume": durable.volume_tags(request, allocation)}
         return dict(LaunchTemplate={"LaunchTemplateId": self.config.lt_id, "Version": self.config.lt_version},
             MinCount=1, MaxCount=1, ClientToken=allocation["token"], NetworkInterfaces=[interface],
             IamInstanceProfile={"Arn": self.config.profile_arn},
-            TagSpecifications=[{"ResourceType": kind, "Tags": copy.deepcopy(tags)} for kind in ("instance", "volume")])
+            TagSpecifications=[{"ResourceType": kind, "Tags": [{"Key": k, "Value": v}
+                for k, v in sorted(tag_sets[kind].items())]} for kind in ("instance", "volume")])
 
     def schedule(self, *, binding):
         return dict(Name="runtime-" + binding["attempt_id"], GroupName=self.config.runtime_group,
@@ -537,7 +538,7 @@ class Service:
             return
         if seen["root_volumes"]:
             return
-        expected = durable.tags(state["request"], state["attempt"])
+        expected = durable.volume_tags(state["request"], state["attempt"])
         roots, token = [], None
         for _ in range(10):
             parameters = dict(Filters=[{"Name": "tag:" + key, "Values": [value]}

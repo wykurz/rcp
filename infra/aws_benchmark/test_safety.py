@@ -456,34 +456,30 @@ class PolicyTests(unittest.TestCase):
         self.assertLessEqual(upload, 5)
         self.assertGreaterEqual(job["timeout-minutes"], required)
 
-    def test_runtime_has_only_one_capacity_write_and_exact_mailbox_keys(self):
+    def test_retired_runtime_has_only_deny_all_and_keeps_closed_group_and_workflow(self):
         import yaml
         root = Path(__file__).parent
         stack = yaml.safe_load((root / "stack.yaml").read_text())
         resources = stack["Resources"]
         asg = resources["WorkerGroup"]["Properties"]
         self.assertEqual([asg[k] for k in ("MinSize", "DesiredCapacity", "MaxSize")], ["0"] * 3)
-        policy = resources["RuntimeRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
-        actions = [a for p in policy for a in ([p["Action"]] if isinstance(p["Action"], str) else p["Action"])]
-        self.assertEqual(set(actions), {"autoscaling:SetDesiredCapacity", "autoscaling:DescribeAutoScalingGroups",
-            "autoscaling:DescribeScheduledActions", "ec2:DescribeInstances", "s3:GetObject", "s3:PutObject"})
-        self.assertEqual(policy[0]["Resource"], {"Fn::GetAtt": ["WorkerGroup", "AutoScalingGroupARN"]})
-        for statement in policy[2:]:
-            self.assertNotIn("*", json.dumps(statement["Resource"]))
+        role = resources["RuntimeRole"]["Properties"]
+        self.assertEqual([p["Effect"] for p in role["AssumeRolePolicyDocument"]["Statement"]], ["Deny"])
+        self.assertEqual(role["Policies"], [{"PolicyName": "BenchmarkRuntime", "PolicyDocument": {
+            "Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "*", "Resource": "*"}]}}])
         workflow = yaml.safe_load((root.parents[1] / ".github/workflows/aws-benchmark.yml").read_text())
         self.assertNotIn("id-token", workflow["permissions"])
         self.assertNotIn("id-token", workflow["jobs"]["build"]["permissions"])
         self.assertEqual(workflow["jobs"]["benchmark"]["environment"], "aws-benchmark")
 
 
-    def test_both_roles_match_shared_mailbox_keys(self):
+    def test_worker_role_keeps_exact_shared_mailbox_keys_after_runtime_retirement(self):
         import yaml
         stack = yaml.safe_load((Path(__file__).parent / "stack.yaml").read_text())
         inputs = {common.REQUEST_KEY, *("input/" + key for key in common.BINARIES)}
         outputs = {common.RESULTS_KEY, common.STATUS_KEY}
         expected = {
             "WorkerRole": {"s3:GetObject": {common.WINDOW_KEY, *inputs}, "s3:PutObject": outputs},
-            "RuntimeRole": {"s3:GetObject": {common.WINDOW_KEY, *outputs}, "s3:PutObject": inputs},
         }
         for role, permissions in expected.items():
             policy = stack["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]

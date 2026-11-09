@@ -288,6 +288,46 @@ class Reader:
         require(self.record(record.run_key) == (record, item), "retirement record changed during download")
         return value
 
+    def public_diagnostics(self, key, public_record, *, maximum_bytes):
+        """Read an optional retirement-bound archive without changing its frozen verdict.
+
+        The caller supplies the already authenticated frozen record. Diagnostics
+        are supplemental: unavailable/expired raw data cannot erase that record.
+        """
+        from . import production_diagnostics as diagnostics
+        require(type(maximum_bytes) is int and maximum_bytes >= 0, "invalid diagnostic read budget")
+        manifest_cost = 2 * (collection.MAX_DOCUMENT + 2)
+        if maximum_bytes < manifest_cost:
+            return diagnostics.unavailable(public_record, "raw_budget"), 0
+        consumed = manifest_cost
+        try:
+            record, item, raw, _ = self._retired_manifest(key)
+            manifest = collection.results.json_value(raw)
+            _public_manifest(record, manifest)
+            require(public_record["run_key"] == record.run_key and
+                    public_record["retirement_sha256"] == record.retirement_sha256 and
+                    public_record["benchmark_valid"] == manifest["benchmark_valid"] and
+                    public_record["identity"] == {name: manifest["identity"][name] for name in
+                        ("run", "run_url", "suite", "baseline", "candidate", "controller")},
+                    "diagnostic frozen record identity differs")
+            ref = manifest["retained"].get("results.zip")
+            if ref is None:
+                return diagnostics.unavailable(public_record, "raw_unavailable"), consumed
+            raw_cost = ref["bytes"] + 2  # Objects.read checks two possible trailing bytes.
+            if raw_cost + manifest_cost > maximum_bytes:
+                return diagnostics.unavailable(public_record, "raw_budget"), consumed
+            # Reserve before the request: a failed/checksum-invalid body still consumes bytes.
+            consumed += raw_cost
+            archive = self.objects.referenced(ref,
+                "production/runs/" + record.run_key + "/collection/results.zip", ref["bytes"])
+            value = diagnostics.from_archive(public_record, archive)
+            require(self.record(record.run_key) == (record, item),
+                    "retirement changed during diagnostic read")
+            return value, consumed
+        except Exception:
+            # raw SDK bodies, archive names and local paths are never public reasons.
+            return diagnostics.unavailable(public_record, "raw_unavailable"), consumed
+
     def observe_public(self, key):
         """Observe the frozen public path with the same pending/held semantics as raw evidence."""
         retired = False

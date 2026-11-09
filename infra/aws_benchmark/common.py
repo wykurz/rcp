@@ -56,7 +56,29 @@ _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"] = MappingProxyT
     timing_basis="fixed qualification budget; workload duration not yet measured",
     plan=MappingProxyType(dict(version="bulk-100m-qualification-budget-v1",
         minimum_worker_seconds=10200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
-DURABLE_SUITES = ("bulk-1g-metadata", "bulk-100m-metadata")
+# fixed experimental budgets deliberately make no extrapolated duration claim
+for _suite, _version in (("bulk-1m-metadata", "bulk-1m-qualification-budget-v1"),
+                          ("tiny-1k-metadata", "tiny-1k-qualification-budget-v1")):
+    _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+        _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"], suite=_suite,
+        plan=MappingProxyType(dict(version=_version, minimum_worker_seconds=10200,
+                                  boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
+FULL_FILE_SET_SUITE = "all-filesets-metadata"
+FULL_RUNTIME_PROFILE = "all-filesets-8h-v1"
+_RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"] = MappingProxyType(dict(
+    _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"], suite=FULL_FILE_SET_SUITE,
+    max_runtime=28800, max_provisioning=7200, max_attempts=120,
+    runtime_profile=FULL_RUNTIME_PROFILE, reservation_microusd=50_000_000,
+    plan=MappingProxyType(dict(version="all-filesets-qualification-budget-v1",
+        minimum_worker_seconds=28200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
+_CURRENT_PLAN_VERSIONS = MappingProxyType({
+    "bulk-1g-metadata": "bulk-metadata-plan-v1",
+    "bulk-100m-metadata": "bulk-100m-qualification-budget-v1",
+    "bulk-1m-metadata": "bulk-1m-qualification-budget-v1",
+    "tiny-1k-metadata": "tiny-1k-qualification-budget-v1",
+    FULL_FILE_SET_SUITE: "all-filesets-qualification-budget-v1",
+})
+DURABLE_SUITES = tuple(_CURRENT_PLAN_VERSIONS)
 
 # projected work, not a measured complete run; advance the version when any bound changes
 _CURRENT_DURABLE_CONTRACT = _RECORDED_DURABLE_CONTRACTS["bulk-metadata-plan-v1"]
@@ -99,6 +121,11 @@ SUITE_PROFILES = {
 SUITE_PROFILES["bulk-100m-metadata"] = dict(cases=("bulk-100m-1024gb",), repetitions=2,
     runner_label="aws-c5d24-ext4-raid0-metadata-v1", policy=METADATA_POLICY,
     verification_versions=(_CLOUD_VERIFICATION_VERSIONS[-1],), active=False)
+for _suite, _cases in (("bulk-1m-metadata", ("bulk-1m-1024gb",)),
+                        ("tiny-1k-metadata", ("tiny-1k-10240k",)),
+                        (FULL_FILE_SET_SUITE, ("bulk-1g-1tb", "bulk-100m-1024gb",
+                                               "bulk-1m-1024gb", "tiny-1k-10240k"))):
+    SUITE_PROFILES[_suite] = dict(SUITE_PROFILES["bulk-100m-metadata"], cases=_cases)
 SUITES = {name: profile["cases"] for name, profile in SUITE_PROFILES.items()}
 ACTIVE_SUITES = {name: cases for name, cases in SUITES.items() if SUITE_PROFILES[name].get("active", True)}
 LARGE_SUITES = {name: cases for name, cases in SUITES.items() if "policy" in SUITE_PROFILES[name]}
@@ -175,8 +202,7 @@ def validate_identity(value):
 def durable_plan_for_suite(suite):
     """Select an explicit current contract; never scale another fixture's estimate."""
     require(suite in DURABLE_SUITES, "direct qualification suite is not allowlisted")
-    return dict(DURABLE_PLAN if suite == "bulk-1g-metadata" else
-                _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"]["plan"])
+    return dict(_RECORDED_DURABLE_CONTRACTS[_CURRENT_PLAN_VERSIONS[suite]]["plan"])
 
 
 def durable_plan_contract(plan, *, exact=True):
@@ -250,8 +276,8 @@ def validate_durable_window(value, now=None, minimum=RESERVE, *, exact=True):
     validate_identity(value)
     require(value["suite"] in DURABLE_SUITES and value["baseline"] == value["candidate"],
             "durable qualification requires metadata-only A/A")
-    require(value["suite"] != "bulk-100m-metadata" or direct,
-            "100 MB qualification requires a direct instance-bound window")
+    require(value["suite"] == "bulk-1g-metadata" or direct,
+            "experimental qualification requires a direct instance-bound window")
     require(re.fullmatch(r"i-[0-9a-f]{17}", value["instance_id"]), "invalid durable instance identity")
     contract = durable_plan_contract(value["plan"], exact=exact)
     require(contract["suite"] == value["suite"], "durable plan belongs to another file set")
@@ -347,8 +373,9 @@ def completed_status(run, success=False):
 class Budget:
     """A wall-clock deadline plus a monotonic ceiling; clock changes cannot extend it."""
 
-    def __init__(self, deadline, *, ceiling_seconds=MAX_WINDOW + MAX_OPEN_LEAD):
-        require(type(ceiling_seconds) is int and 0 < ceiling_seconds <= DURABLE_MAX_RUNTIME,
+    def __init__(self, deadline, *, ceiling_seconds=MAX_WINDOW + MAX_OPEN_LEAD, plan=None):
+        maximum = DURABLE_MAX_RUNTIME if plan is None else durable_plan_contract(plan)["max_runtime"]
+        require(type(ceiling_seconds) is int and 0 < ceiling_seconds <= maximum,
                 "invalid monotonic budget ceiling")
         self.deadline = utc(deadline).timestamp()
         self.end = time.monotonic() + min(ceiling_seconds, self.deadline - time.time())
