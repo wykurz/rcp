@@ -34,7 +34,7 @@ def _summary(values, *, frozen=None):
 
 def model(records, companions):
     """Keep duration independent of optional resources; never pool unknown setups."""
-    require(isinstance(records, dict) and len(records) <= 512 and
+    require(isinstance(records, dict) and len(records) <= projection.MAX_PUBLIC_HISTORY_RUNS and
             isinstance(companions, dict) and set(companions) <= set(records),
             "history input exceeds its bounded record set")
     cases = {case: [] for case in CASES}

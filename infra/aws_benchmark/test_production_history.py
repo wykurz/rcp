@@ -274,6 +274,27 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("complete retained run inventory", html)
         self.assertIn("run-1004.html", html)
 
+    def test_supported_legacy_inventory_limit_keeps_separate_plot_bounds(self):
+        from . import production_publish
+        self.assertEqual(projection.MAX_PUBLIC_HISTORY_RUNS, production_publish.MAX_HISTORY_RUNS)
+        record, _, _ = example()
+        records = {}
+        for index in range(projection.MAX_PUBLIC_HISTORY_RUNS):
+            value = copy.deepcopy(record)
+            run = str(10000 + index)
+            value.update(run_key="repo-655073755-run-" + run)
+            value["identity"].update(run=run + "-1",
+                run_url="https://github.com/wykurz/rcp/actions/runs/" + run + "/attempts/1")
+            records[value["run_key"]] = value
+        html = history.render(records, {})
+        self.assertLessEqual(len(html.encode()), projection.MAX_PUBLIC_HTML)
+        self.assertIn("1968 older qualified runs", html)
+        self.assertNotIn("run-10000.html", html)
+        self.assertIn("run-11999.html", html)
+        records["extra"] = record
+        with self.assertRaisesRegex(ValueError, "bounded record set"):
+            history.render(records, {})
+
     def test_output_remains_bounded(self):
         record, _, _ = example()
         with patch.object(projection, "MAX_PUBLIC_HTML", 100):
