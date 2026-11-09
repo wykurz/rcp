@@ -28,7 +28,7 @@ class ProductionStartupTests(unittest.TestCase):
         self.assertIn("--unit=rcp-supervisor", command)
         self.assertIn("--working-directory=/opt/rcp-benchmark", command)
         properties = {part.removeprefix("--property=") for part in command if part.startswith("--property=")}
-        self.assertEqual(properties, {"RuntimeMaxSec=10800", "TimeoutStopSec=10", "KillMode=control-group",
+        self.assertEqual(properties, {"Type=notify", "NotifyAccess=main", "RuntimeMaxSec=10800", "TimeoutStopSec=10", "KillMode=control-group",
                                       "SendSIGKILL=yes", "FailureAction=poweroff", "SuccessAction=poweroff"})
         executable = command.index("/opt/rcp-benchmark/venv/bin/python")
         self.assertEqual(command[executable:], ["/opt/rcp-benchmark/venv/bin/python", "-m",

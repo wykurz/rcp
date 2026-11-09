@@ -23,7 +23,7 @@ progress remove-ssm
 python3 -m infra.aws_benchmark.guest_security --remove-ssm
 progress packages
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm libsystemd0 systemd
 # avoid background monitoring/check wakeups; leave md assembly and udev intact
 for unit in mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer \
     mdcheck_start.service mdcheck_continue.service mdmonitor.service mdmonitor-oneshot.service; do
@@ -39,7 +39,7 @@ python3 -m venv /opt/rcp-benchmark/venv
 /opt/rcp-benchmark/venv/bin/pip install --require-hashes -r infra/aws_benchmark/requirements.txt
 progress harness
 cp -r benchmarks /opt/rcp-benchmark/
-cp infra/aws_benchmark/{__init__,common,worker,production_startup,production_mailbox,large_storage,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
+cp infra/aws_benchmark/{__init__,common,worker,production_startup,production_mailbox,large_storage,supervisor_notify,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
 install -m 0755 infra/aws_benchmark/cache_client.py /opt/rcp-benchmark/bin/sudo
 python3 -m infra.aws_benchmark.maintenance
 python3 -m infra.aws_benchmark.guest_security
@@ -52,6 +52,9 @@ progress verify-unprivileged
 cd /opt/rcp-benchmark
 runuser -u rcp-benchmark -- /usr/bin/python3 -B -c \
   'import benchmarks.run; import infra.aws_benchmark.cache_client; import infra.aws_benchmark.worker'
+progress supervisor-notify-acceptance
+python3 -B -m infra.aws_benchmark.supervisor_notify --image-self-test > /opt/rcp-benchmark/supervisor-notify-acceptance.json
+chmod 0444 /opt/rcp-benchmark/supervisor-notify-acceptance.json
 progress output-contract
 python3 -B -c 'from infra.aws_benchmark.production_startup import install_output_contract; install_output_contract("/opt/rcp-benchmark")'
 progress complete

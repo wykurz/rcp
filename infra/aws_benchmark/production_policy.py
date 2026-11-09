@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 
-from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, require, timestamp, utc
+from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, durable_plan_contract, require, timestamp, utc
 from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
@@ -48,6 +48,7 @@ class Policy:
     priced_at: str = "1970-01-01T00:00:00+00:00"
     price_evidence: str = ""
     runtime_seconds: int = durable.RUNTIME_SECONDS
+    manual_runtime_seconds: int = 0
     capacity_seconds: int = durable.CAPACITY_SECONDS
     shutdown_seconds: int = durable.SHUTDOWN_ALLOWANCE_SECONDS
     schedule_delay_seconds: int = 1800
@@ -62,7 +63,7 @@ class Policy:
                 and len(set(self.manual_actor_ids)) == len(self.manual_actor_ids)
                 and all(isinstance(v, str) and re.fullmatch(r"[1-9][0-9]{0,19}", v)
                         for v in self.manual_actor_ids), "invalid explicit manual maintainer IDs")
-        require(type(self.manual_suites) is tuple and len(self.manual_suites) <= len(DURABLE_SUITES)
+        require(type(self.manual_suites) is tuple and len(self.manual_suites) <= 2
                 and all(isinstance(suite, str) and suite in DURABLE_SUITES for suite in self.manual_suites)
                 and len(set(self.manual_suites)) == len(self.manual_suites),
                 "invalid explicit manual file-set allowlist")
@@ -86,10 +87,15 @@ class Policy:
         integer(self.daily_run_limit, 0, 10, "invalid daily admission limit")
         integer(self.runtime_seconds, durable.minimum_runtime(), durable.RUNTIME_SECONDS,
                 "runtime must fit the recorded workload plan")
-        for suite in self.manual_suites:
-            require(self.runtime_seconds >= durable.minimum_runtime(durable_plan_for_suite(suite)),
-                    "manual file set does not fit its explicit qualification budget")
         integer(self.capacity_seconds, 60, durable.CAPACITY_SECONDS, "capacity window exceeds 12 hours")
+        maximum = max(durable_plan_contract(durable_plan_for_suite(suite))["max_runtime"]
+                      for suite in DURABLE_SUITES)
+        integer(self.manual_runtime_seconds, 0, maximum, "invalid extended manual runtime")
+        require(self.manual_runtime_seconds == 0 or any(
+            durable_plan_contract(durable_plan_for_suite(suite))["max_runtime"] > durable.RUNTIME_SECONDS
+            for suite in self.manual_suites), "extended manual runtime has no approved file set")
+        for suite in self.manual_suites:
+            self.execution(suite)
         integer(self.shutdown_seconds, durable.SHUTDOWN_ALLOWANCE_SECONDS, 3600,
                 "shutdown allowance is below the reviewed margin")
         integer(self.schedule_delay_seconds, 1, 3600, "invalid schedule lateness allowance")
@@ -98,7 +104,23 @@ class Policy:
         require(isinstance(self.price_evidence, str) and len(self.price_evidence.encode()) <= 2048,
                 "invalid price evidence")
 
-    def reservation(self, now):
+    def execution(self, suite):
+        """Derive one suite-bound runtime/capacity selection for admission and pricing."""
+        contract = durable_plan_contract(durable_plan_for_suite(suite))
+        extended = contract["max_runtime"] > durable.RUNTIME_SECONDS
+        if extended:
+            require(suite in self.manual_suites and self.manual_runtime_seconds > 0,
+                    "extended manual qualification is not explicitly approved")
+        runtime = self.manual_runtime_seconds if extended else self.runtime_seconds
+        require(durable.minimum_runtime(contract["plan"]) <= runtime <= contract["max_runtime"],
+                "manual file set does not fit its explicit qualification budget")
+        return runtime, min(self.capacity_seconds, contract["max_provisioning"])
+
+    def reservation(self, now, *, suite="bulk-1g-metadata"):
+        return self.quote(now, suite=suite)["reserve_microusd"]
+
+    def quote(self, now, *, suite="bulk-1g-metadata"):
+        """Bind the reservation to the same normalized execution parameters."""
         require(self.enabled, "production admission is disabled")
         require(0 <= (utc(now) - utc(self.priced_at)).total_seconds() <= MAX_PRICE_AGE_SECONDS,
                 "server price evidence is stale")
@@ -106,11 +128,17 @@ class Policy:
                 "server price and ancillary allowances are not configured")
         require(self.total_cap_microusd > 0 and self.monthly_cap_microusd > 0 and self.daily_run_limit > 0,
                 "server cost and run allowances are not configured")
-        seconds = self.runtime_seconds + self.shutdown_seconds
+        runtime, capacity = self.execution(suite)
+        seconds = runtime + self.shutdown_seconds
         amount = (self.hourly_microusd * seconds + 3599) // 3600 + self.ancillary_microusd
+        fixed = durable_plan_contract(durable_plan_for_suite(suite)).get("reservation_microusd")
+        if fixed is not None:
+            require(type(fixed) is int and 0 < amount <= fixed,
+                    "price exceeds the fixed qualification reservation")
+            amount = fixed
         require(amount <= min(self.total_cap_microusd, self.monthly_cap_microusd),
                 "full possible allocation does not fit policy allowances")
-        return amount
+        return dict(runtime_seconds=runtime, capacity_seconds=capacity, reserve_microusd=amount)
 
 
 def producer_identity(identity):
@@ -190,7 +218,6 @@ def schedule_slot(policy, created, now):
 
 def authorize(policy, identity, run, value, now):
     """Derive authorization solely from verified claims/run metadata and server policy."""
-    reserve = policy.reservation(now)
     require(isinstance(run, WorkflowRun) and run.producer_fingerprint == producer_fingerprint(identity)
             and 0 <= (utc(now) - utc(run.observed_at)).total_seconds() <= 60
             and 0 <= (utc(now) - utc(run.created_at)).total_seconds() <= MAX_RUN_AGE_SECONDS,
@@ -210,11 +237,15 @@ def authorize(policy, identity, run, value, now):
                 "scheduled revisions differ from approved baseline and main")
     else:
         raise ValueError("only approved manual and scheduled requests may enter admission")
+    quote = policy.quote(now, suite=checked["suite"])
+    if quote["runtime_seconds"] > durable.RUNTIME_SECONDS:
+        require(identity.event_name == "workflow_dispatch" and identity.actor_id == policy.owner_id,
+                "extended qualification requires the immutable owner")
     producer = producer_identity(identity)
     producer["created_at"] = run.created_at
     run_key = "repo-" + identity.repository_id + "-run-" + identity.run_id
     epoch = hashlib.sha256(run_key.encode()).hexdigest()
     intent = dict(producer=producer, manifest=checked, policy_version=policy.version)
     return dict(run_key=run_key, epoch=epoch, fingerprint=hashlib.sha256(canonical(intent)).hexdigest(),
-        producer=producer, manifest=checked, reserve_microusd=reserve, schedule_slot=slot,
+        producer=producer, manifest=checked, schedule_slot=slot, **quote,
         month=utc(now).strftime("%Y-%m"), day=utc(now).strftime("%Y-%m-%d"))

@@ -185,7 +185,8 @@ class ExperimentBoundaries(unittest.TestCase):
         snapshots = []
         case = dict(id='synthetic', directory_widths=[1], files_per_leaf=1, file_size_bytes=1)
         variant = dict(id='rcp-default', tool='rcp', args=['--summary', '--max-files-in-flight=1'], processes=1)
-        def persist(_output, record):
+        def persist(_output, record, *, sampler=None):
+            self.assertIsNone(sampler)
             clock[0] += .25
             snapshots.append(copy.deepcopy(record))
         def tool(path, *args):

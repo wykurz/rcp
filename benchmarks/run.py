@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming
+from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming, telemetry
 from benchmarks.operations import expected_counts
 from benchmarks.verification import (DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label,
     DEFAULT_READ_SIZE, DEFAULT_BATCH_MULTIPLIER, MismatchError, failure_proof, observed_error,
@@ -514,7 +514,9 @@ def _revision():
     return {"commit": commit or None, "branch": branch or None, "dirty": None if status is None else bool(status)}
 
 
-def _persist(output, record):
+def _persist(output, record, *, sampler=None):
+    if sampler is not None:
+        sampler.attach(record)
     temporary = output / "results.json.tmp"
     temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     temporary.replace(output / "results.json")
@@ -646,6 +648,7 @@ def _arguments(argv):
     parser.add_argument("--no-timings", action="store_true", help="disable scoped timing collection for overhead diagnostics")
     parser.add_argument("--paired-seed", type=int, help="opt into adjacent balanced local rcp/base pairs; repetitions counts pairs and must be even")
     parser.add_argument("--local-resources", action="store_true", help="collect local single-process GNU-time CPU/RSS/context-switch metrics")
+    parser.add_argument("--system-telemetry", action="store_true", help="sample bounded Linux host/cgroup diagnostics every ten seconds; local mode only")
     parser.add_argument("--resource-time", type=Path, help="GNU time executable for --local-resources")
     parser.add_argument("--build-provenance", type=Path, help="local-only schema-one caller-declared build metadata bound to executable hashes")
     parser.add_argument("--command-clocks", action="store_true", help="record bracketed local command clock observations without changing elapsed timing")
@@ -727,6 +730,10 @@ def main(argv=None):
     args = _arguments(argv)
     run_started = time.monotonic()
     collect_costs = args.paired_seed is not None or args.local_resources
+    sampler = None
+    def phase(name, case_index=None, trial_index=None):
+        if sampler is not None:
+            sampler.mark(name, case_index, trial_index)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
@@ -747,7 +754,7 @@ def main(argv=None):
     storage_ids = {"source": args.source_storage_id, "destination": args.destination_storage_id}
     record["context"]["storage_ids"] = storage_ids
     record["context"]["timing_request"] = "disabled" if args.no_timings else "automatic"
-    _persist(output, record)
+    _persist(output, record, sampler=sampler)
     source_scratch = None
     destination_scratch = None
     try:
@@ -759,6 +766,13 @@ def main(argv=None):
             record["context"]["pairing"] = pairs.configuration(args.paired_seed, args.repetitions)
         if (collect_costs or args.build_provenance is not None) and not args.command_clocks:
             record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
+        if args.system_telemetry:
+            if args.mode != "local":
+                raise ValueError("system telemetry requires local mode")
+            record["context"]["system_telemetry"] = telemetry.descriptor()
+            sampler = telemetry.Sampler(output, args.source_root, args.destination_root)
+            with SignalCancellation():
+                sampler.start()
         manifest = load_manifest(args.manifest)
         cases = _select(manifest["cases"], args.cases or ["tiny-10k"], "case")
         all_directory_files = any("files_per_directory" in case for case in cases)
@@ -812,7 +826,7 @@ def main(argv=None):
             record["context"]["capacity_policy"] = args.capacity_policy
         record["cases"] = cases
         record["variants"] = variants
-        _persist(output, record)
+        _persist(output, record, sampler=sampler)
         for root in (args.source_root, args.destination_root):
             if not root.is_dir():
                 raise ValueError(f"scratch parent does not exist: {root}")
@@ -851,7 +865,7 @@ def main(argv=None):
         experiment = measurements.identity(record["context"])
         endpoints = environment(args.source_root, args.destination_root)
         record["context"]["environment"] = endpoints
-        _persist(output, record)
+        _persist(output, record, sampler=sampler)
         tools = {key: value["path"] for key, value in record["tools"].items()}
         timing_capability = {}
         timing_collection = {}
@@ -865,8 +879,9 @@ def main(argv=None):
             timing_collection[variant["id"]] = "disabled" if args.no_timings else "coarse" if capable else "unsupported"
         record["context"]["timing_capability"] = timing_capability
         record["context"]["timing_collection"] = timing_collection
-        _persist(output, record)
-        for case in cases:
+        _persist(output, record, sampler=sampler)
+        for case_index, case in enumerate(cases):
+            phase("capacity", case_index)
             if args.check_capacity:
                 record["context"].setdefault("capacity_admission", {})[case["id"]] = capacity.check_pair(
                     args.source_root, args.destination_root, case, **args.capacity_policy)
@@ -878,6 +893,7 @@ def main(argv=None):
             if leaf_files:
                 filegen_command.append("--leaf-files")
             filegen_command.append(f"--bufsize={min(case['file_size_bytes'], 1048576)}")
+            phase("generation", case_index)
             generation_started = time.monotonic()
             generated = subprocess.run(filegen_command, capture_output=True, text=True, timeout=args.timeout)
             if collect_costs:
@@ -887,6 +903,7 @@ def main(argv=None):
             if generated.returncode:
                 raise RuntimeError(f"filegen failed for {case['id']} ({generated.returncode})")
             source = fixture_root / "filegen"
+            phase("initial_verification", case_index)
             initial_started = time.monotonic()
             source_scan = (streaming.scan_tree(source, args.verification_workers, expected_counts(case), policy=verification_policy, inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
                            if args.streaming_verification else scan_tree(source))
@@ -902,7 +919,7 @@ def main(argv=None):
             expected_transfer = operations.transfer_counts(operation, source_scan["counts"])
             case["fixture_digest"] = source_scan["digest"]
             case["realized_counts"] = source_scan["counts"]
-            _persist(output, record)
+            _persist(output, record, sampler=sampler)
             for iteration in range(1, args.repetitions + 1):
                 order = variants[(iteration - 1) % len(variants):] + variants[:(iteration - 1) % len(variants)]
                 if args.paired_seed is not None:
@@ -924,13 +941,16 @@ def main(argv=None):
                     if args.local_resources:
                         trial["resources"] = {"status": "unavailable", "metrics": None}
                     record["trials"].append(trial)
-                    _persist(output, record)
+                    trial_index = len(record["trials"]) - 1
+                    phase("capacity", case_index, trial_index)
+                    _persist(output, record, sampler=sampler)
                     with _TrialOutcome(trial) as active:
                         preparation_started = time.monotonic()
                         active.stage = "capacity"
                         if args.check_capacity:
                             capacity.check(args.destination_root, case, **args.capacity_policy)
                         active.stage = "preparation"
+                        phase("preparation", case_index, trial_index)
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         if operation != "fresh":
                             stale = operations.seed_destination(source, destination, source_scan, source_metadata, stale_names)
@@ -951,13 +971,15 @@ def main(argv=None):
                         if args.rtt_ms is not None:
                             trial["transport_artifacts"] = str(output / "transport" / trial_path)
                         active.stage = "cache"
+                        phase("cache", case_index, trial_index)
                         proof = _prepare_cache(args.cache, source, args.timeout, source_scan, source_metadata)
                         if args.cache == "source-verified":
                             trial["cache_validation"] = proof
                         if collect_costs:
                             measurements.add_cost(trial, "preparation", preparation_started)
-                        _persist(output, record)
+                        _persist(output, record, sampler=sampler)
                         active.stage = "command"
+                        phase("command", case_index, trial_index)
                         if args.rtt_ms is not None:
                             identities = {key: record["tools"][key + "-baseline" if variant["id"] == "rcp-baseline" else key]["sha256"] for key in (("rcp", "rcpd") if variant["tool"] == "rcp" else ("rsync",))}
                             outcome = transport.execute_trial(variant, source, destination, selected_tools,
@@ -975,6 +997,7 @@ def main(argv=None):
                         trial.update(outcome)
                         timing_error = None
                         active.stage = "timings"
+                        phase("timings", case_index, trial_index)
                         if timing_policy == "coarse":
                             expected_roles = ["rcp-master"] * len(commands)
                             if args.mode == "loopback":
@@ -986,6 +1009,7 @@ def main(argv=None):
                                 trial["timings"]["reports"] = error.reports
                                 timing_error = str(error)
                         active.stage = "destination"
+                        phase("destination", case_index, trial_index)
                         trial["validation"] = ((streaming.validate_tree(destination, source_scan, args.verification_workers, inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
                             if args.streaming_verification else validate_tree(source, destination, source_scan))
                             if outcome["ok"] else {"ok": False, "error": (outcome.get("failure") or {}).get("message") or "command failed or timed out"})
@@ -994,15 +1018,18 @@ def main(argv=None):
                         if outcome["ok"]:
                             if operations.summary_supported(variant):
                                 active.stage = "summary"
+                                phase("summary", case_index, trial_index)
                                 text = "\n".join(Path(path).read_text() for item in outcome["logs"] for path in item.values())
                                 trial["copy_summary"], trial["summary_validation"] = operations.summary_proof(variant, text, expected_transfer)
                                 if not trial["summary_validation"]["ok"]:
                                     raise operations.VerificationError(trial["summary_validation"], "summary")
                                 active.stage = "metadata"
+                                phase("metadata", case_index, trial_index)
                                 trial["metadata_validation"] = (trial["validation"]["metadata"] if args.streaming_verification
                                     else operations.validate_metadata(destination, source_metadata))
                             if source_metadata is not None:
                                 active.stage = "source"
+                                phase("source", case_index, trial_index)
                                 trial["source_validation"] = (streaming.validate_tree(source, source_scan, args.verification_workers, source=True,
                                     inline_bytes=args.verification_inline_bytes, read_bytes=args.verification_read_bytes, batch_depth=args.verification_batch_depth)
                                     if args.streaming_verification else operations.validate_source(source, source_scan, source_metadata))
@@ -1012,15 +1039,17 @@ def main(argv=None):
                             trial["validation"]["timing_error"] = timing_error
                             if outcome["ok"]:
                                 active.stage = "timings"
+                                phase("timings", case_index, trial_index)
                                 raise RuntimeError(f"timing collection failed: {timing_error}")
                         if collect_costs:
                             measurements.add_cost(trial, "verification", active.verification_started)
                             active.verification_started = None
                         trial["status"] = "ok" if outcome["ok"] and trial["validation"]["ok"] and trial.get("source_validation", {}).get("ok", True) else "failed"
-                        _persist(output, record)
+                        _persist(output, record, sampler=sampler)
                         if trial["status"] != "ok":
                             raise RuntimeError(f"trial {trial_path} failed: {trial.get('error') or trial['validation'].get('error')}; exit_codes={trial['exit_codes']}; timed_out={trial['timed_out']}")
                         active.stage = "cleanup"
+                        phase("cleanup", case_index, trial_index)
                         cleanup_started = time.monotonic()
                         shutil.rmtree(destination)
                         if collect_costs:
@@ -1041,7 +1070,8 @@ def main(argv=None):
                     owned_semantics = {**transport.semantics(args.rtt_ms), "observations": observations[0]}
                 case_summaries.append({"series_id": series_id({key: value for key, value in case.items() if key not in ("fixture_digest", "realized_counts")}, variant, args.cache, args.mode, args.runner_label, endpoints, record["tools"], storage_ids, args.ssh_transport_profile, timing_collection[variant["id"]], timing_capability.get(variant["id"]), record["context"]["timing_request"], operation_revision=operations.CONTRACT_REVISION, owned_transport=owned_semantics, experiment=experiment, verification=record["context"].get("verification")), "case_id": case["id"], "variant_id": variant["id"], "unit": "seconds", "median": median, "minimum": min(samples), "maximum": max(samples), "stdev": statistics.stdev(samples) if len(samples) > 1 else 0.0, "samples": samples, "files_per_second": source_scan["counts"]["files"] / median if median else 0.0})
             record["summaries"].extend(case_summaries)
-            _persist(output, record)
+            _persist(output, record, sampler=sampler)
+            phase("cleanup", case_index)
             shutil.rmtree(fixture_root)
         record["status"] = "complete"
         shutil.rmtree(source_scratch)
@@ -1057,11 +1087,16 @@ def main(argv=None):
                 _TrialOutcome(trial).__exit__(type(exc), exc, exc.__traceback__)
         if source_scratch or destination_scratch:
             record["context"]["failure_artifacts"] = {"source_scratch": str(source_scratch) if source_scratch else "", "destination_scratch": str(destination_scratch) if destination_scratch else ""}
-        _persist(output, record)
+        _persist(output, record, sampler=sampler)
         raise
+    finally:
+        if sampler is not None:
+            with SignalCancellation():
+                sampler.finish(record["status"] == "complete")
+            _persist(output, record, sampler=sampler)
     if collect_costs:
         measurements.add_cost(record, "total", run_started)
-    _persist(output, record)
+    _persist(output, record, sampler=sampler)
     return record
 
 

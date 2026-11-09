@@ -77,7 +77,9 @@ def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execu
         identity={key: identity[key] for key in ("run", "run_url", "suite", "baseline", "candidate", "controller")},
         comparison=comparison_label(identity, evidence["controller"]), measurements=[],
         series_contract=contract["series_contract"],
-        note="Four copies form two local pairs; this small run does not establish broad variance.")
+        note=("Each file set has four copies forming two local pairs; this small run does not establish broad variance."
+              if identity["suite"] == "all-filesets-metadata" else
+              "Four copies form two local pairs; this small run does not establish broad variance."))
     if collected_at is not None:
         value.update(collected_at=timestamp(results.utc(collected_at)),
                      qualification_outcome=outcome or ("passed" if valid else "failed"))

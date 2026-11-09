@@ -27,7 +27,7 @@ from benchmarks.run import load_manifest
 from benchmarks.verification import METADATA_POLICY
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
-                     DIRECT_PROTOCOL, DURABLE_MAX_RUNTIME, durable_worker_reserve, durable_plan_contract,
+                     DIRECT_PROTOCOL, FULL_FILE_SET_SUITE, durable_worker_reserve, durable_plan_contract,
                      archive_name_supported, completed_status, digest, error_code, get_bytes, get_json,
                      measurement_contract, verification_contract, put_json, require, retry_io, retryable_io, timestamp,
                      validate_admission, validate_request, validate_window)
@@ -35,7 +35,7 @@ from .cache_client import SOCKET
 from .maintenance import check_quiet
 from .guest_security import check_ssm_absent
 from .common import LARGE_SUITES
-from . import large_storage
+from . import large_storage, supervisor_notify
 from .production_mailbox import MailboxPaths
 
 ROOT = Path("/opt/rcp-benchmark")
@@ -109,6 +109,8 @@ def command(window, seconds):
     if large:
         file_limit, timeout = "1073741824", "1200"
         source_storage, destination_storage = "c5d-raid0-ext4-source-v1", "c5d-raid0-ext4-destination-v1"
+    if window["suite"] == FULL_FILE_SET_SUITE:
+        timeout = "7200"
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -148,6 +150,8 @@ def command(window, seconds):
                  "--verification-batch-depth", str(verification["batch_depth"]), "--check-capacity"]
         if verification["policy"] == METADATA_POLICY:
             argv += ["--verification-mode", "metadata-size"]
+    if window["suite"] == FULL_FILE_SET_SUITE:
+        argv += ["--system-telemetry"]
     for case in SUITES[window["suite"]]:
         argv += ["--case", case]
     return argv
@@ -400,6 +404,27 @@ def consume_durable_assignment(window):
         os.close(directory)
 
 
+def supervisor_notifier(budget):
+    return supervisor_notify.Notifier(budget) if os.environ.get("NOTIFY_SOCKET") else None
+
+
+def extend_supervisor_runtime(window, request, identity, budget, notifier):
+    """Send one finite extension only after consuming a fully instance-bound assignment."""
+    if window["suite"] != FULL_FILE_SET_SUITE:
+        return None
+    require(os.geteuid() == 0, "supervisor runtime extension requires root")
+    validate_window(window, minimum=0)
+    validate_request(request, window)
+    require(window["protocol"] == DIRECT_PROTOCOL and window["instance_id"] == identity
+            and window["runtime_seconds"] == 28800 and notifier is not None,
+            "supervisor extension lacks exact instance/runtime/notification binding")
+    microseconds = notifier.extend(budget, maximum_seconds=window["runtime_seconds"],
+                                   shutdown_seconds=window["plan"]["shutdown_reserve_seconds"])
+    return dict(extension_usec=microseconds, barrier_processed=True,
+                note="finite same-main-PID notification; initial three-hour property remains unchanged")
+
+
+
 def run(s3, bucket, *, direct=False, production_account=None, region=None):
     require(production_account is None or direct, "production mailbox requires direct launch mode")
     protocol = DIRECT_PROTOCOL if direct else None
@@ -410,6 +435,10 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
     budget = Budget(started + timedelta(seconds=ASSIGNMENT_WAIT_SECONDS if bounded else 60))
     signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
+    notifier = supervisor_notifier(budget)
+    if notifier is not None:
+        # Type=notify must become ready before potentially blocking assignment IO.
+        notifier.ready(budget)
     identity = instance_identity(budget) if bounded else None
     paths = MailboxPaths.for_instance(production_account, region, identity) if production_account is not None \
         else MailboxPaths.legacy()
@@ -420,7 +449,8 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
     # Trust no retained metadata or extended alarm until the complete window is
     # validated. Late valid windows still reach the admission failure report.
     deadline = validate_window(window, minimum=0)
-    budget = Budget(deadline, ceiling_seconds=DURABLE_MAX_RUNTIME) if bounded else Budget(deadline)
+    budget = Budget(deadline, ceiling_seconds=durable_plan_contract(window["plan"])["max_runtime"],
+                    plan=window["plan"]) if bounded else Budget(deadline)
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     status = completed_status(window["run"])
     metadata = {"window": window, "worker_started_at": timestamp(started)}
@@ -437,6 +467,9 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
             admission_contract(window["suite"])["worker"]
         if bounded:
             consume_durable_assignment(window)
+            extension = extend_supervisor_runtime(window, request, identity, budget, notifier)
+            if extension is not None:
+                metadata["supervisor_runtime"] = extension
         def admit_storage():
             remaining = budget.left()
             metadata["admission"] = {"checked_at": timestamp(datetime.now(timezone.utc)),
@@ -463,19 +496,21 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
         if window["suite"] in LARGE_SUITES:
             manifest = load_manifest(ROOT / "benchmarks/large-cases.json")
             cases = {case["id"]: case for case in manifest["cases"]}
-            case_id, = SUITES[window["suite"]]
-            require(case_id in cases, "suite case is missing from the large manifest")
-            case = cases[case_id]
+            case_ids = SUITES[window["suite"]]
+            require(all(case_id in cases for case_id in case_ids), "suite case is missing from the large manifest")
+            selected = tuple(cases[case_id] for case_id in case_ids)
             admit_storage()
-            metadata["storage"] = large_storage.prepare(DATA, case, budget, account.pw_uid, account.pw_gid, execute)
+            metadata["storage"] = large_storage.prepare(DATA, selected[0] if len(selected) == 1 else selected,
+                budget, account.pw_uid, account.pw_gid, execute)
         else:
             admit_storage()
             metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
         cache_server(budget, account.pw_uid)
         try:
             stopped = False
-            completed = subprocess.run(command(window, budget.left(RESERVE)),
-                timeout=budget.left(RESERVE) + 15, check=False)
+            argv = command(window, budget.left(RESERVE))
+            metadata["command_timeout_seconds"] = int(argv[argv.index("--timeout") + 1])
+            completed = subprocess.run(argv, timeout=budget.left(RESERVE) + 15, check=False)
             status["success"] = completed.returncode == 0
             metadata["service_returncode"] = completed.returncode
         except Exception as error:

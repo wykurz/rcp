@@ -141,6 +141,93 @@ class ReportSiteTests(unittest.TestCase):
                 if url.fragment and target.suffix == '.html':
                     self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
 
+    def diagnostic_batch(self, *, two=False):
+        from infra.aws_benchmark import production_diagnostics as diagnostics
+        from infra.aws_benchmark.test_production_diagnostics import inputs
+        from infra.aws_benchmark.production_publish import inventory
+        _, raw, worker = inputs()
+        values = [self.aws_record()]
+        values[0]['measurements'] = [
+            dict(case_id='bulk-1g-1tb', variant_id=variant, series_id='s-' + variant,
+                median=sum(samples) / len(samples), samples=samples)
+            for variant, samples in [('rcp-default', [621.653719, 621.398035]),
+                                     ('rcp-baseline', [621.099793, 621.336719])]]
+        if two:
+            second = json.loads(json.dumps(values[0]))
+            second['run_key'] = 'repo-655073755-run-124'
+            second['identity'].update(run='124-1', run_url='https://github.com/wykurz/rcp/actions/runs/124/attempts/1')
+            values.append(second)
+        directory, revision, _ = self.retained_batch(values)
+        index = json.loads((directory / 'index.json').read_text())
+        index.update(schema='rcp-production-retained-reports-v2', diagnostics=[])
+        for value in values:
+            extra = diagnostics.derive(value, b'archive', raw, worker)
+            body = json.dumps(extra, separators=(',', ':')).encode()
+            (directory / (value['run_key'] + '.diagnostics.json')).write_bytes(body)
+            index['diagnostics'].append(dict(run_key=value['run_key'],
+                sha256=hashlib.sha256(body).hexdigest(), bytes=len(body)))
+        (directory / 'index.json').write_text(json.dumps(index))
+        return (directory, revision, inventory(directory)), values
+
+    def test_retained_resources_backfill_preserves_frozen_json_and_links_to_central_setup(self):
+        batch, values = self.diagnostic_batch()
+        value = values[0]
+        source = batch[0] / (value['run_key'] + '.json')
+        original = source.read_bytes()
+        result = self.build_retained(batch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copied = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
+        self.assertEqual(copied.read_bytes(), original)
+        self.assertEqual(source.read_bytes(), original)
+        page = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
+        self.assertIn('Peak RSS KiB', page)
+        self.assertIn('93,644', page)
+        self.assertIn('System CPU s', page)
+        self.assertIn('canonical qualification record', page)
+        self.assertIn('../setups.html#setup-', page)
+        self.assertNotIn('PRIVATE', page)
+        setup = (self.output / 'aws-benchmarks/setups.html').read_text()
+        self.assertIn('Intel(R) Xeon(R) Platinum', setup)
+        self.assertIn('Observed host RAM</th><td>not recorded', setup)
+        self.assertIn('10,240,000', setup)
+        self.assertIn('exactly 100 times less', setup)
+        self.assert_site_links_resolve()
+
+    def test_matching_observed_setups_are_described_once_not_repeated_per_run(self):
+        batch, values = self.diagnostic_batch(two=True)
+        result = self.build_retained(batch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        setup = (self.output / 'aws-benchmarks/setups.html').read_text()
+        self.assertEqual(setup.count("<section id='setup-"), 1)
+        for value in values:
+            page = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
+            self.assertNotIn('8275CL', page)
+            self.assertIn('Observed hardware, storage and test setup', page)
+
+    def test_central_setup_page_obeys_the_public_html_bound(self):
+        from unittest.mock import patch
+        import report_site
+        from infra.aws_benchmark import production_export
+        with patch.object(production_export, 'MAX_PUBLIC_HTML', 100):
+            with self.assertRaisesRegex(ValueError, 'Central AWS setup'):
+                report_site.render_aws_benchmarks({})
+
+    def test_reinventoried_diagnostic_identity_tampering_fails_before_site_writes(self):
+        from infra.aws_benchmark.production_publish import inventory
+        batch, values = self.diagnostic_batch()
+        directory, revision, _ = batch
+        path = directory / (values[0]['run_key'] + '.diagnostics.json')
+        value = json.loads(path.read_text())
+        value['retirement_sha256'] = '9' * 64
+        raw = json.dumps(value).encode()
+        path.write_bytes(raw)
+        index = json.loads((directory / 'index.json').read_text())
+        index['diagnostics'][0].update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+        (directory / 'index.json').write_text(json.dumps(index))
+        result = self.build_retained((directory, revision, inventory(directory)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.output / 'aws-benchmarks/index.html').exists())
+
     def test_retained_directory_cli_uses_no_git_and_preserves_frozen_json_and_links(self):
         value = self.aws_record()
         value.update(schema='rcp-production-public-report-v3', qualification_outcome='passed',

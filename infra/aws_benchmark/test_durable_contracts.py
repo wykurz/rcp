@@ -52,7 +52,9 @@ class DurableContractTests(unittest.TestCase):
                   binary_names=v2["binary_names"] + ("future-tool",),
                   pin_patterns=dict(v2["pin_patterns"], future="reviewed"))
         with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {v2["plan"]["version"]: v2}), \
-             patch.object(common, "DURABLE_PLAN", v2["plan"]):
+             patch.object(common, "DURABLE_PLAN", v2["plan"]), \
+             patch.object(common, "_CURRENT_PLAN_VERSIONS", dict(common._CURRENT_PLAN_VERSIONS,
+                 **{"bulk-1g-metadata": v2["plan"]["version"]})):
             changed = copy.deepcopy(value)
             changed.update(plan=dict(v2["plan"]), runtime_seconds=12000,
                 capacity_deadline=common.timestamp(NOW + timedelta(seconds=43260)),

@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile
 
 from . import production_collection as collection, results
+from . import production_diagnostics as resource_diagnostics
 from .common import require
 
 from . import production_projection as projection
@@ -86,7 +87,20 @@ def stage(bundle, destination):
                 pass
 
 
-def render(value):
+def diagnostic_companion(bundle):
+    """Derive optional resource presentation without altering frozen history bytes."""
+    bundle.validate()
+    record = project(bundle)
+    archive = bundle.payloads.get("results.zip")
+    if archive is None:
+        return resource_diagnostics.unavailable(record, "raw_unavailable")
+    try:
+        return resource_diagnostics.from_archive(record, archive)
+    except Exception:
+        return resource_diagnostics.unavailable(record, "invalid_diagnostics")
+
+
+def render(value, *, diagnostics=None, setup_href=None):
     """Escaped script-free public HTML from allowlisted fields, never retained HTML."""
     validate_public(value)
     identity = value["identity"]
@@ -103,5 +117,7 @@ def render(value):
         "<p><a href='" + escape(identity["run_url"], quote=True) + "'>Workflow attempt</a></p><table>" + rows + "</table>"
         "<p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" + escape(value["note"]) + "</p><table><tr><th>Case</th><th>Variant</th><th>Median seconds</th>"
         "<th>Samples in seconds</th></tr>" + metrics + "</table>")
+    if diagnostics is not None:
+        html += resource_diagnostics.render(diagnostics, value, setup_href=setup_href)
     require(len(html.encode()) <= MAX_PUBLIC_HTML, "rendered public HTML exceeds bound")
     return html

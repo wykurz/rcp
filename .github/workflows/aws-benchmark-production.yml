@@ -20,15 +20,18 @@ on:
         type: string
         required: false
       suite:
-        description: Manual file set; requires server approval and qualified image (scheduled runs stay 1 GB)
+        description: Manual file-set profile; requires server approval and qualified image (scheduled runs stay 1 GB)
         type: choice
         options:
           - bulk-1g-metadata
           - bulk-100m-metadata
+          - bulk-1m-metadata
+          - tiny-1k-metadata
+          - all-filesets-metadata
         default: bulk-1g-metadata
         required: true
       revision:
-        description: Full source SHA for the initial four-copy A/A qualification (blank uses main)
+        description: Full source SHA for A/A qualification; four copies per file set (blank uses main)
         type: string
         required: false
 

@@ -276,3 +276,71 @@ generator currently queues per-file tasks before joining them, so million-file m
 behavior need separate qualification or later bounded-generator work. This queue structure is not
 evidence of an observed out-of-memory failure. Do not enable all cases as one batch or infer
 small-file readiness from the 100 MB case.
+
+## Full-file-set learning profile
+
+The all-filesets-metadata profile prepares the four existing large shapes together: 1 GB, 100 MB, 1
+MB and 1 KB files. They run sequentially on one worker, with one generated source and four balanced
+A/A copies per case. Each case is cleaned before the next; array preparation happens once and
+capacity is checked for every selected case. Individual 1 MB and 1 KB metadata profiles are also
+recognized, but recognition is not live authorization. Default and Monday/Friday scheduled requests
+remain 1 GB only.
+
+Sizes are decimal bytes. The tiny shape is already 10,240,000 files of 1,000 bytes, totaling 10.24
+GB, compared with 1.024 TB for the 100 MB and 1 MB shapes: exactly 100 times less payload. Its
+allocated file blocks are about 41.94 GB before directory overhead and capacity margins. Do not
+reduce this fixture a second time or confuse it with the historical tiny-10k smoke fixture (10,240
+files of 1,024 bytes, about 10 MiB).
+
+The new immutable full-set plan allows an eight-hour allocation, with 300-second boot and shutdown
+reserves and a 28,200-second worker admission floor. This is an experimental budget, not a
+completion prediction. Generation and copy commands get a two-hour limit; absolute assignment,
+service and controller cutoffs still dominate every phase. Twenty generation/copy commands plus
+validation and cleanup do not each receive eight hours. Failure must retain completed trials, phase
+evidence and explicit incomplete/unattempted cases; partial work is diagnostic, not a successful
+full-set performance qualification.
+
+Only this profile has a two-hour capacity-search ceiling (at most 120 attempts), so its formal
+reconciliation horizon is at most ten hours and fifteen minutes after admission. The normal
+twelve-hour capacity search and three-hour allocation stay unchanged. The existing sixteen-hour
+state-machine ceiling is sufficient; no broad orchestration-timeout increase is needed.
+
+The server policy must explicitly allow all-filesets-metadata and set manual_runtime_seconds to
+28800. Exact older 17-field and 18-field policies default this new field to zero and gain no
+extended runtime. Keep the two-suite manual limit, ordinarily 1 GB plus the full-set experiment.
+Even explicitly listed maintainers cannot request the extended profile: it requires the immutable
+owner and a manual event. Runtime, capacity and reservation are derived together from this validated
+policy and immutable suite contract, not workflow-supplied durations or prices.
+
+The normal guest supervisor starts with its existing three-hour bound. Only root-owned worker code
+may request a bounded systemd runtime extension after validating and consuming the exact
+instance-bound full-set assignment, before executing candidate code. It uses the documented main-PID
+notification protocol and acknowledgement; changing RuntimeMaxSec on an already-running unit is
+unsupported. Ordinary requests never extend their supervisor. The independent janitor does not
+depend on DynamoDB for expiry. An instance-only runtime-profile tag identifies the reviewed
+eight-hour bound; a missing tag retains three hours and unknown/mismatched values fail closed.
+Volume tags keep their original five-field form. The exact coordinator tag permission change and new
+AMI/resource pin still need live security approval and target-image acceptance.
+
+The full-set reservation is fixed at $50 and rejects price calculations above that amount, rather
+than silently increasing it. The current $4.608/hour price plus sixteen-minute shutdown and existing
+ancillary allowance calculates $43.04 for eight hours. This is a planning reservation, not a
+verified bill, AWS-enforced cost cap or another allowance. Live deployment, updated AMI/tag
+permissions and expanded run need one concrete approval bundle before execution. Reuse previously
+reserved setup overhead only after checking its remaining allocation. Do not spend on an
+intermediate image or run solely to qualify each smaller case.
+
+Periodic telemetry is enabled for the full-set experiment, not silently added to existing scheduled
+measurement identities. It samples host CPU/memory/pressure, the measurement cgroup and logical
+source/destination device counters every ten seconds, with bounded samples, bytes, duration and
+phase transitions. The fixed sampler policy enters the series identity; sample values do not.
+Missing data is unavailable, never a zero measurement. Existing GNU-time CPU, RSS, context-switch
+and page-fault evidence remains scoped to each local copy command and its waited descendants,
+separate from host/cgroup diagnostics. Cgroup I/O can reflect block-layer accounting; it is not
+uniquely physical transferred bytes. See the report setup and resource sections for observed
+configuration and limitations.
+
+No large-file generation, image build, permission change or worker launch occurs merely by merging
+this source. Keep the scheduled suite unchanged during commissioning. After the full-set result,
+inspect actual per-phase time, whole-unit memory, storage pressure and costs before choosing routine
+timeouts or scheduling the broader suite.

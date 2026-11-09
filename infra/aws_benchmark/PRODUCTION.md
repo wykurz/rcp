@@ -851,3 +851,27 @@ See [incremental 100 MB qualification](LARGE_WORKLOADS.md#incremental-100-mb-met
 for the fixed, explicitly unmeasured qualification budget, image/controller compatibility, live
 approval sequence and the separate million-file readiness limits. Qualify on a non-scheduled day;
 keep the existing daily-one, single-owner and cumulative-reservation controls intact.
+
+### Extended full-file-set commissioning
+
+The manual workflow also recognizes 1 MB, 1 KB and all-filesets metadata profiles. Default server
+authority and scheduled requests remain 1 GB only. The combined profile needs both its explicit
+manual_suites opt-in and manual_runtime_seconds=28800; absent extended-runtime fields in recorded
+policies mean zero, not an automatic upgrade. It is immutable-owner-only even when ordinary manual
+maintainers are configured. Ordinary runtime, capacity, schedule slots and reservations stay
+unchanged. Full-set admission derives its two-hour capacity, eight-hour allocation and fixed $50
+reservation from the selected immutable contract; a price above that reservation is rejected.
+
+Before any live attempt, review the rebuilt worker, startup/hash/launch bindings and exact
+instance-only runtime-profile tag permission. The tag carries a bounded runtime profile, not
+authority to ignore the ledger, one-worker rule or budget. Guest and independent expiry guards
+remain required. Select a non-Monday/Friday day with the full reconciliation and cleanup window
+clear of the next regular slot, authenticate with sufficient recovery coverage, and retain the same
+durable one-shot journal through dispatch, collection and retirement. Restoring the experimental
+opt-in requires an operator write; it has no automatic expiry.
+
+The original ASG-era RuntimeRole source is retired with deny-only trust and a single explicit
+DenyAll permission policy. Applying that source is a separate targeted legacy-stack operation: never
+delete the old stack, because production still uses its launch template and security group. The
+unused writer App and ruleset bypass also require their separately reviewed retirement; this source
+does not delete registrations, keys, retained results, images or shared resources.

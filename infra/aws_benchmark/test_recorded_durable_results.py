@@ -46,7 +46,9 @@ class RecordedDurableResultTests(unittest.TestCase):
             before, raw, _ = results.inspect(source, expected, "success")
             self.assertEqual(before["errors"], [])
             with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {v2["plan"]["version"]: v2}), \
-                 patch.object(common, "DURABLE_PLAN", v2["plan"]):
+                 patch.object(common, "DURABLE_PLAN", v2["plan"]), \
+                 patch.object(common, "_CURRENT_PLAN_VERSIONS", dict(common._CURRENT_PLAN_VERSIONS,
+                     **{"bulk-1g-metadata": v2["plan"]["version"]})):
                 evidence = results.ingest(source, output, expected, "success")
                 self.assertEqual(evidence["errors"], [])
                 self.assertFalse(evidence["history_eligible"])
@@ -97,7 +99,9 @@ class RecordedDurableResultTests(unittest.TestCase):
         v2 = common.durable_plan_contract(common.DURABLE_PLAN)
         v2.update(plan=dict(v2["plan"], version="bulk-metadata-plan-v2"), max_attempts=1)
         with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {v2["plan"]["version"]: v2}), \
-             patch.object(common, "DURABLE_PLAN", v2["plan"]):
+             patch.object(common, "DURABLE_PLAN", v2["plan"]), \
+                 patch.object(common, "_CURRENT_PLAN_VERSIONS", dict(common._CURRENT_PLAN_VERSIONS,
+                     **{"bulk-1g-metadata": v2["plan"]["version"]})):
             self.assertEqual(common.validate_durable_window(window, now=common.utc(window["launch_at"]),
                                                            minimum=0, exact=False), common.utc(window["deadline"]))
             current = dict(window, plan=v2["plan"])

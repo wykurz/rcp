@@ -346,7 +346,11 @@ class HistoricalLeaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "deployment pins changed"):
             c.service.load()
         c.service.config = c.config
-        with patch.object(common, "DURABLE_PLAN", {**common.DURABLE_PLAN, "version": "future-plan"}):
+        future = common.durable_plan_contract(common.DURABLE_PLAN)
+        future["plan"] = dict(future["plan"], version="future-plan")
+        with patch.dict(common._RECORDED_DURABLE_CONTRACTS, {"future-plan": future}), \
+             patch.object(common, "_CURRENT_PLAN_VERSIONS", dict(common._CURRENT_PLAN_VERSIONS,
+                 **{"bulk-1g-metadata": "future-plan"})):
             with self.assertRaisesRegex(ValueError, "not current"):
                 c.service.load()
 

@@ -182,7 +182,7 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
+          - Effect: Deny
             Principal:
               Federated: {Ref: GitHubOidcProviderArn}
             Action: sts:AssumeRoleWithWebIdentity
@@ -195,31 +195,9 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Effect: Allow
-                Action: autoscaling:SetDesiredCapacity
-                Resource: {Fn::GetAtt: [WorkerGroup, AutoScalingGroupARN]}
-              - Effect: Allow
-                Action:
-                  - autoscaling:DescribeAutoScalingGroups
-                  - autoscaling:DescribeScheduledActions
-                  - ec2:DescribeInstances
+              - Effect: Deny
+                Action: '*'
                 Resource: '*'
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource:
-                  - {Fn::Sub: '${Artifacts.Arn}/control/window.json'}
-                  - {Fn::Sub: '${Artifacts.Arn}/output/results.zip'}
-                  - {Fn::Sub: '${Artifacts.Arn}/output/status.json'}
-              - Effect: Allow
-                Action: s3:PutObject
-                Resource:
-                  - {Fn::Sub: '${Artifacts.Arn}/input/request.json'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcp'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/rcpd'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/baseline/filegen'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcp'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/rcpd'}
-                  - {Fn::Sub: '${Artifacts.Arn}/input/candidate/filegen'}
 Outputs:
   AutoScalingGroupName:
     Value: {Ref: WorkerGroup}
