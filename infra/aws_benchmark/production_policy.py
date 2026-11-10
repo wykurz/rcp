@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 
-from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, durable_plan_contract, require, timestamp, utc
+from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, durable_plan_contract, require, timestamp, utc, validate_durable_pins
 from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
@@ -24,6 +24,12 @@ PRODUCER_FIELDS = ("repository", "repository_id", "repository_owner_id", "ref", 
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def launch_pins_sha256(pins):
+    """Bind an admission envelope to the exact validated worker launch configuration."""
+    validate_durable_pins(pins, durable.PLAN)
+    return hashlib.sha256(canonical({"schema": "rcp-production-launch-pins-v1", "pins": pins})).hexdigest()
 
 
 def integer(value, minimum, maximum, message):

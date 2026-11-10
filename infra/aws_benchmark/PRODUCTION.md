@@ -54,6 +54,44 @@ spending. A reservation is a conservative accounting control, not measured AWS b
 dollar ceiling. IAM cannot enforce a positive DynamoDB numeric increment; the reviewed admission
 code is part of this boundary.
 
+### Bind admission to a deployment during cutover
+
+The policy envelope can include a fifth attribute,
+`launch_pins_sha256: {"S": "<64 lowercase hex characters>"}`. Compute it with
+`production_policy.launch_pins_sha256(config.pins())` from the actual numeric launch-template
+version, AMI, worker source revision and remaining validated deployment pins. This is a
+domain-separated canonical digest, not a credential or a hash of the controller ZIP. The production
+handler supplies the pins captured when it built the admission service. A bound envelope with
+missing or mismatched pins rejects before a new reservation, GitHub App read or upload capability.
+
+Legacy four-attribute envelopes retain their existing behavior. Older deployed handlers reject the
+new fifth attribute. For a production cutover, use both the binding and a **new immutable policy
+version**: the new version rejects a decision prepared before the fence, while the envelope binding
+rejects an old invocation that reads policy only after the deployment. Reusing the old enabled
+version is unsafe. A fixed wait derived from Lambda's Invoke timeout alone does not prove that all
+old configuration has drained; initialization and invocation are separate lifecycle phases.
+
+Keep the existing safeguards and use a reviewed operator sequence:
+
+1. In one serializable transaction, require the active owner to be absent and conditionally disable
+   the exact current policy envelope. Preserve its raw payload field set, counters and calendar; do
+   not serialize optional Policy defaults into an older stored payload.
+2. Keep that fence closed while updating the reviewed code and launch configuration. Verify actual
+   code hashes, full configuration, IAM, physical idle state and the independent guard. Check the
+   immutable object and actual numeric launch-template version, not guessed identifiers.
+3. Reopen only after successful verification, using a bound envelope for the target pins and a new
+   immutable enabled version. Preserve the prior allowance, requester and calendar authority.
+4. On failure or uncertainty, keep admission closed until a compatible target and its exact pins are
+   verified. A rollback to legacy code cannot simply remove the binding and reopen: a newer
+   invocation may still hold the other configuration. Use compatible forward recovery. An optional
+   envelope-aware rollback target must be proven against the complete old launch configuration,
+   including worker/startup compatibility; parser support alone is insufficient.
+
+This code adds no policy, permission or deployment by itself. Live cutover, restoration and recovery
+remain separately reviewed operations. See the AWS
+[update-state contract](https://docs.aws.amazon.com/lambda/latest/dg/functions-states.html) and
+[execution lifecycle](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html).
+
 ## Runtime and recovery
 
 Capacity requests can retry for at most 12 hours only after explicit no-allocation failures. A
