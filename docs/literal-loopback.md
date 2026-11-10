@@ -85,6 +85,20 @@ for recovery. Keep private fixture files out of Git, public reports and chat.
 just benchmark-loopback-smoke --recover UUID_FROM_PRIVATE_EVIDENCE
 ```
 
+Before stopping, the owner saves the original measurement and copy outcome separately from cleanup.
+After a durable stopped proof, recovery resumes fixture cleanup rather than recapturing the active
+unit. The saved observation, stop and cleanup records must match the plan hash and exact original
+unit/invocation/cgroup. Recovery checks manager inactivity again; an unloaded unit or cleared
+InvocationID is accepted only with that scoped stopped proof. It also checks that the exact cgroup
+name is absent or recursively empty on the genuine cgroup2 hierarchy. This is a current vacancy
+snapshot under cooperative privileged ownership, **not original-cgroup measurement evidence**. No
+counters are reconstructed. A successful cleanup preserves an original copy failure.
+
+A removal intent precedes deletion. If deletion completed before its receipt was saved, recovery
+reconciles the missing fixture without deleting again. A fixture present after a saved removal
+receipt holds for investigation. Old or incomplete evidence without the required scoped phases also
+holds; recovery never fabricates a missing stopped proof.
+
 Recovery adopts only the retained plan and never changes inputs or resends a start/stop intent. A
 completed result is historical evidence, not a fresh resource readback. If an uncertain start left
 no observable unit/cgroup identity, automated recovery holds rather than guessing; operator
