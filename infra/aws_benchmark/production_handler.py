@@ -32,7 +32,7 @@ from .production_admission import Admission
 from .production_auth import GitHubIdentityError, GitHubIdentityVerifier, MAX_TOKEN_BYTES
 from .production_github import GitHubRunError, GitHubRateLimitError, GitHubRunReader
 from .production_github_app import GitHubAppConfig, cached_provider
-from .production_policy import Policy, canonical, manifest
+from .production_policy import Policy, canonical, launch_pins_sha256, manifest
 from .production_errors import transient
 
 
@@ -70,11 +70,14 @@ def _event(value):
         raise InvalidRequest("invalid request") from None
 
 
-def read_policy(dynamodb, table, owner_id):
+def read_policy(dynamodb, table, owner_id, *, launch_pins=None):
     """Read the exact versioned server envelope used by RunStore's transaction.
 
-    Item attributes are exactly pk:S=policy, version:S, enabled:BOOL, payload:S.
-    payload is canonical JSON containing every Policy field, or the exact legacy
+    Item attributes are pk:S=policy, version:S, enabled:BOOL, payload:S, with an
+    optional launch_pins_sha256:S binding. A bound envelope requires matching
+    deployment pins. Readers predating this attribute reject it instead of
+    admitting work with obsolete configuration during a deployment cutover.
+    The payload is canonical JSON containing every Policy field, or the exact legacy
     field set without manual_suites (which retains only the original 1 GB authority). Its version and
     enabled values must match the transaction fence attributes without coercion.
     Policy-content changes require a new immutable version. The emergency enabled
@@ -87,7 +90,9 @@ def read_policy(dynamodb, table, owner_id):
                 "invalid policy configuration")
         response = dynamodb.get_item(TableName=table, Key={"pk": {"S": "policy"}}, ConsistentRead=True)
         item = response.get("Item")
-        require(isinstance(item, dict) and set(item) == {"pk", "version", "enabled", "payload"},
+        require(isinstance(item, dict) and set(item) in (
+                    {"pk", "version", "enabled", "payload"},
+                    {"pk", "version", "enabled", "payload", "launch_pins_sha256"}),
                 "invalid server policy")
         require(item["pk"] == {"S": "policy"}, "invalid server policy")
         for name in ("version", "payload"):
@@ -95,6 +100,12 @@ def read_policy(dynamodb, table, owner_id):
                     and isinstance(item[name]["S"], str), "invalid server policy")
         require(isinstance(item["enabled"], dict) and set(item["enabled"]) == {"BOOL"}
                 and type(item["enabled"]["BOOL"]) is bool, "invalid server policy")
+        if "launch_pins_sha256" in item:
+            binding = item["launch_pins_sha256"]
+            require(isinstance(binding, dict) and set(binding) == {"S"}
+                    and isinstance(binding["S"], str) and re.fullmatch(r"[0-9a-f]{64}", binding["S"])
+                    and launch_pins is not None and binding["S"] == launch_pins_sha256(launch_pins),
+                    "server policy deployment differs")
         text = item["payload"]["S"]
         require(0 < len(text.encode("utf-8")) <= MAX_POLICY_BYTES, "invalid server policy")
         value = parse_json(text)
@@ -203,7 +214,7 @@ def build_admission(*, api=None, clock=time.time):
         repository_owner_id=owner_id, clock=clock, observation_factory=cached_provider(app).observation)
     clients = SubmissionClients(config.region) if api is None else api
     return Admission(clients, config, machine,
-        lambda: read_policy(clients["dynamodb"], config.table, owner_id),
+        lambda: read_policy(clients["dynamodb"], config.table, owner_id, launch_pins=config.pins()),
         _StandardMachineVerifier(verifier, clients, machine), reader,
         now=lambda: datetime.fromtimestamp(clock(), timezone.utc))
 
