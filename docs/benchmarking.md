@@ -140,6 +140,10 @@ current remote implementation, `--max-files-in-flight=128` remains limited by th
 nine variants: the three defaults plus six rcp limits. Nine repetitions let each variant occupy
 every trial position once.
 
+For the separate, explicitly privileged native functional smoke with fresh per-copy cgroup
+accounting, see [Literal-loopback native smoke](literal-loopback.md). It is not wired into the
+benchmark schedule or historical series.
+
 ## Optional command clock observations
 
 `--command-clocks` adds local command-boundary MONOTONIC, MONOTONIC_RAW and REALTIME observations.
