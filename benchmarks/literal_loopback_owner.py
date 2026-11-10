@@ -303,11 +303,49 @@ class NativePort:
         contract.need(self.cg is not None, "held original cgroup proof unavailable; preserve fixture")
         return {"manager_inactive": True, "cgroup_proof": cgroup_empty(self.cg)}
 
-    def remove_fixture(self):
+    def recover_stopped(self, identity):
+        """Current vacancy only; never recapture original metrics after stop."""
+        current = self.inspect()
+        contract.need(current.get("LoadState") in ("loaded", "not-found") and
+                      current.get("ActiveState") in ("inactive", "failed") and
+                      (current.get("LoadState") == "not-found" or
+                       current.get("Description") == self.plan["description"]) and
+                      current.get("InvocationID", "") in ("", "0" * 32, identity.invocation_id) and
+                      current.get("ControlGroup", "") in ("", identity.cgroup),
+                      "cleanup recovery found an active or replacement unit")
+        # systemd may clear InvocationID/ControlGroup or unload the stopped unit.
+        # The journal proves the original stop; this is a fresh vacancy snapshot,
+        # under the same cooperative privileged-manager assumption as stop().
+        parent = root_directory("/sys/fs/cgroup/system.slice")
+        fd = None
+        try:
+            require_cgroup2(parent)
+            try:
+                fd = os.open(self.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                return
+            require_cgroup2(fd)
+            contract.need(os.fstat(fd).st_dev == os.fstat(parent).st_dev,
+                          "current cgroup is not on the expected hierarchy")
+            events = contract._fields(held_read(fd, "cgroup.events", 4096).decode())
+            contract.need(events.get("populated") == 0, "current cgroup has live descendants")
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(parent)
+
+    def remove_fixture(self, *, previously_removed=False):
         contract.need(shutil.rmtree.avoids_symlink_attacks, "FD-safe recursive cleanup unavailable")
         parent = root_directory(FIXTURES)
         try:
-            info = os.stat(self.plan["id"], dir_fd=parent, follow_symlinks=False)
+            try:
+                info = os.stat(self.plan["id"], dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                # A prior removal may have completed before its reply/marker
+                # or directory sync. Reconcile the durable parent entry too.
+                os.fsync(parent)
+                return
+            contract.need(not previously_removed, "fixture reappeared after recorded removal")
             contract.need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
                           not info.st_mode & 0o022, "owned fixture identity differs")
             shutil.rmtree(self.plan["id"], dir_fd=parent)
@@ -321,8 +359,23 @@ class NativePort:
             self.cg = None
 
 
+def identity_record(identity):
+    return dict(unit=identity.unit, invocation_id=identity.invocation_id, cgroup=identity.cgroup)
+
+
+def retained_identity(plan, record):
+    """Decode a scoped identity without depending on live active-unit properties."""
+    contract.need(isinstance(record, dict), "retained unit identity missing")
+    unit = contract.unit_name(plan["id"])
+    invocation = record.get("invocation_id", "")
+    expected = dict(unit=unit, invocation_id=invocation, cgroup="/system.slice/" + unit)
+    contract.need(record == expected and re.fullmatch(r"[0-9a-f]{32}", invocation) and
+                  invocation != "0" * 32, "retained unit identity differs")
+    return contract.RetainedUnit(**record)
+
+
 def run_owned(port, journal, plan, *, clock=time.monotonic, sleep=time.sleep):
-    """One start, verified counters, and cleanup of only the retained invocation."""
+    """Resume durable observation, stop and fixture-cleanup phases without resends."""
     contract.need(journal.one("plan") == plan, "retained plan differs")
     previous = journal.one("result")
     if previous is not None:
@@ -330,68 +383,107 @@ def run_owned(port, journal, plan, *, clock=time.monotonic, sleep=time.sleep):
                       previous.get("profile") == contract.PROFILE and previous.get("cleanup") == "verified",
                       "completed historical result differs")
         return previous
-    identity = None
     result = dict(schema=contract.SCHEMA, profile=contract.PROFILE, id=plan["id"],
                   status="failed", cleanup="held", metrics=None)
-    deadline = clock() + contract.MAX_NATIVE_SECONDS + 30
-    expected_start = {"id": plan["id"], "unit": plan["unit"],
-        "plan_sha256": hashlib.sha256(encoded(plan)).hexdigest()}
+    plan_hash = hashlib.sha256(encoded(plan)).hexdigest()
+    expected_start = dict(id=plan["id"], unit=plan["unit"], plan_sha256=plan_hash)
     start_intent = journal.one("start-intent")
     contract.need(start_intent is None or start_intent == expected_start, "retained start intent differs")
-    contract.need(start_intent is not None or
-                  all(journal.one(key) is None for key in ("unit-identity", "stop-intent", "stopped")),
+    later = ("unit-identity", "observation", "stop-intent", "stopped",
+             "fixture-remove-intent", "fixture-removed")
+    contract.need(start_intent is not None or all(journal.one(key) is None for key in later),
                   "later state exists without a start intent")
     try:
-        if start_intent is None:
-            contract.need(port.inspect().get("LoadState") == "not-found", "trial unit already exists")
-            journal.put("start-intent", expected_start)
+        record = journal.one("unit-identity")
+        retained = retained_identity(plan, record) if record is not None else None
+        scope = dict(plan_sha256=plan_hash, identity=record)
+        observation, stop_intent, stopped, remove_intent, removed = (
+            journal.one(key) for key in later[1:])
+        if observation is not None:
+            contract.need(retained is not None and isinstance(observation, dict) and
+                          set(observation) == {"scope", "result"} and observation["scope"] == scope,
+                          "retained observation scope differs")
+            observed = observation["result"]
+            contract.need(isinstance(observed, dict) and
+                          all(observed.get(key) == result[key] for key in ("schema", "profile", "id", "cleanup")) and
+                          observed.get("status") in ("passed", "failed") and
+                          (observed["status"] != "passed" or
+                           (isinstance(observed.get("metrics"), dict) and
+                            observed.get("copy", {}).get("fixed_fixture_content_verified") is True)),
+                          "retained observation result differs")
+            result = dict(observed)
+        contract.need(stop_intent is None or
+                      (observation is not None and stop_intent == scope),
+                      "retained stop intent differs")
+        if stopped is not None:
+            contract.need(stop_intent is not None and isinstance(stopped, dict) and
+                          stopped.get("scope") == scope and stopped.get("manager_inactive") is True and
+                          stopped.get("cgroup_proof") in ("held-original-cgroup-removed",
+                              "held-original-cgroup-recursively-empty") and
+                          set(stopped) == {"scope", "manager_inactive", "cgroup_proof"},
+                          "retained stopped proof differs")
+        contract.need(remove_intent is None or (stopped is not None and remove_intent == scope),
+                      "retained fixture-removal intent differs")
+        contract.need(removed is None or (remove_intent is not None and removed == scope),
+                      "retained fixture-removal proof differs")
+
+        if stopped is not None:
+            # No capture/start/stop or new measurement after durable stopped proof.
+            port.recover_stopped(retained)
+        else:
+            identity = None
             try:
-                port.start()
-            except BaseException as error:
-                journal.put("start-outcome-uncertain", {"error_type": type(error).__name__})
-        # A prior/lost start is reconciled by observation only; never resend.
-        properties = port.inspect()
-        captured = port.capture(properties)
-        evidence = dict(unit=captured.unit, invocation_id=captured.invocation_id,
-                        cgroup=captured.cgroup)
-        journal.put("unit-identity", evidence)
-        identity = captured
-        while True:
-            contract.need(clock() < deadline, "native smoke deadline exceeded")
-            properties = port.inspect()
-            identity.check(properties)
-            if properties.get("ActiveState") == "active" and properties.get("SubState") == "exited":
-                result["metrics"] = port.metrics(properties)
-                break
-            contract.need(properties.get("ActiveState") not in ("failed", "inactive"),
-                          "copy unit failed before measurement")
-            sleep(.1)
-        result["copy"] = port.validate_copy()
-        result["status"] = "passed"
-    except BaseException as error:
-        result["failure"] = {"error_type": type(error).__name__, "message": str(error)[:512]}
-    finally:
-        if identity is not None:
-            try:
-                expected_stop = {"unit": identity.unit, "invocation_id": identity.invocation_id}
-                stop_intent = journal.one("stop-intent")
-                contract.need(stop_intent is None or stop_intent == expected_stop,
-                              "retained stop intent differs")
-                if stop_intent is None:
-                    journal.put("stop-intent", expected_stop)
+                if start_intent is None:
+                    contract.need(port.inspect().get("LoadState") == "not-found", "trial unit already exists")
+                    journal.put("start-intent", expected_start)
                     try:
-                        port.stop(identity)
+                        port.start()
                     except BaseException as error:
-                        journal.put("stop-outcome-uncertain", {"error_type": type(error).__name__})
-                stopped = port.stopped(identity)
-                journal.put("stopped", stopped)
-                port.remove_fixture()
-                journal.put("fixture-removed", {"id": plan["id"]})
-                result["cleanup"] = "verified"
+                        journal.put("start-outcome-uncertain", {"error_type": type(error).__name__})
+                # A prior/lost start is reconciled by observation only; never resend.
+                captured = port.capture(port.inspect())
+                journal.put("unit-identity", identity_record(captured))
+                identity = captured
+                scope = dict(plan_sha256=plan_hash, identity=identity_record(identity))
+                if observation is None:
+                    deadline = clock() + contract.MAX_NATIVE_SECONDS + 30
+                    while True:
+                        contract.need(clock() < deadline, "native smoke deadline exceeded")
+                        properties = port.inspect()
+                        identity.check(properties)
+                        if properties.get("ActiveState") == "active" and properties.get("SubState") == "exited":
+                            result["metrics"] = port.metrics(properties)
+                            break
+                        contract.need(properties.get("ActiveState") not in ("failed", "inactive"),
+                                      "copy unit failed before measurement")
+                        sleep(.1)
+                    result["copy"] = port.validate_copy()
+                    result["status"] = "passed"
             except BaseException as error:
-                result["cleanup_failure"] = {"error_type": type(error).__name__,
-                                             "message": str(error)[:512]}
-                result["status"] = "failed"
+                if observation is not None or identity is None:
+                    raise
+                result["failure"] = {"error_type": type(error).__name__, "message": str(error)[:512]}
+            # Preserve the original measurement/copy outcome before irreversible stop.
+            # A cleanup failure never replaces this record with an invented observation.
+            if observation is None:
+                journal.put("observation", dict(scope=scope, result=result))
+            if stop_intent is None:
+                journal.put("stop-intent", scope)
+                try:
+                    port.stop(identity)
+                except BaseException as error:
+                    journal.put("stop-outcome-uncertain", {"error_type": type(error).__name__})
+            journal.put("stopped", dict(scope=scope, **port.stopped(identity)))
+
+        if remove_intent is None:
+            journal.put("fixture-remove-intent", scope)
+        port.remove_fixture(previously_removed=removed is not None)
+        journal.put("fixture-removed", scope)
+        result["cleanup"] = "verified"
+    except BaseException as error:
+        result["cleanup_failure"] = {"error_type": type(error).__name__, "message": str(error)[:512]}
+        result["status"] = "failed"
+    finally:
         try:
             if result["cleanup"] == "verified":
                 journal.put("result", result)
