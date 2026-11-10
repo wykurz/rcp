@@ -21,6 +21,10 @@ The rcp remote copy system uses a three-node architecture:
 The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer.
 All TCP connections (Master↔rcpd and Source↔Destination) are encrypted with TLS by default.
 
+Keep remote source and destination trees disjoint, including on the same host: remote copies have no
+[overlap check](tocttou.md#remote-sourcedestination-overlap) and can copy their own output
+recursively.
+
 ## TLS Encryption
 
 By default, all TCP connections are encrypted using TLS 1.3 with self-signed certificates and

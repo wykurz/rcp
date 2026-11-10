@@ -52,7 +52,7 @@ pub enum WireAcls {
     /// touch the destination entry's ACLs (for a strict-mode locked reused directory, its
     /// original default ACL is restored by the lockdown guard).
     Unknown,
-    /// Read from the source entry (its own fd on the hardened walk; by path under `-L`):
+    /// Read from the source entry's held descriptor:
     /// authoritative, including the "has none" case.
     Captured {
         /// `system.posix_acl_access`; `None` = the source has none (an instruction to REMOVE).

@@ -139,34 +139,52 @@ Local file operation tests in each tool's `tests/` directory:
 **Directory listing tests** should also run with `TMPDIR` on Btrfs when changing held-directory
 enumeration. Btrfs records a directory-entry cutoff when a descriptor is opened, and duplicating the
 descriptor retains it. Full and capped listings must refresh that view before reading, including the
-first listing after creating children through a held directory. The exhausted-offset tests also
-catch a missing initial seek on filesystems such as ext4; Btrfs exercises the entry-cutoff behavior
-after creation. These tests require no sandbox exemption:
+first listing after creating children through a held directory. Remote cursors refresh once, in the
+first batch's blocking read job, and keep their position across later batches. The exhausted-offset
+tests also catch a missing initial seek on filesystems such as ext4; the cursor test advances the
+shared offset while the read waits for a blocking thread. Btrfs additionally exercises the cutoff
+after creation and rename replacement between cursor opening and its first read. These tests require
+no sandbox exemption:
 
 ```bash
 TMPDIR=/path/on/btrfs just test -p rcp-tools-common --lib \
   -E 'test(read_entries_) | test(capped_entries_) |
+      test(cursor_) | test(independent_cursors_) |
       test(make_dir_creates_and_returns_usable_dir) |
       test(hard_link_entry_swap_never_leaks_sentinel)'
+TMPDIR=/path/on/btrfs just test -p rcp-tools-rcp --lib \
+  -E 'test(discovery_sees_file_replaced_after_cursor_open)'
 ```
 
 The hard-link race regression covers the walker above the directory-listing API. When running the
 entire `rcp-tools-common` library test suite, keep the `TMPDIR` path shorter than roughly 75
 characters so temporary Unix socket paths fit the kernel's path-length limit.
 
-Nonseekable FUSE directories need a fresh description when the seek returns `ESPIPE`. The shared
-reopen helper first opens `.` relative to the held fd. On `EACCES`, it retries through
+The seek does not provide a snapshot: a rename replacement after it can still move a name beyond
+Btrfs's cutoff. On FUSE, a client seek need not refresh a server's separately held Btrfs
+description, so it can retain an earlier cutoff even before the first read. This applies to both
+full listings and streaming cursors. Verifying that backend window requires a FUSE server over
+Btrfs; the tests above cover native Btrfs. Source-presence checks before `--delete` pruning remain
+necessary.
+
+Repeated listings of nonseekable FUSE directories need a fresh description when the seek returns
+`ESPIPE`; an independent cursor already has an unread description and continues without seeking. The
+shared reopen helper first opens `.` relative to the held fd. On `EACCES`, it retries through
 `/proc/self/fd/<n>`, so a readable directory without search permission (including mode `0444`) can
 still be listed. The fallback requires `/proc` and read permission on the directory. An unavailable
-proc path preserves the original permission error; resource and I/O errors remain visible. Remote
-source cursors use the same helper on every filesystem. Permission tests cover both entry points,
+proc path preserves the original permission error; resource and I/O errors remain visible. Default
+remote source cursors use the same helper on every filesystem; `-L` cursors open the source path
+directly and then retain that descriptor. Permission tests cover both shared-helper entry points,
 cursor offset independence, and a renamed directory whose parent is no longer searchable. Injected
 proc-open failures check error reporting without mount privileges. The committed tests also inject
 the seek result through a closure on an ordinary filesystem, exercising fallback control flow
 without validating actual kernel/FUSE behavior. No real FUSE fixture is committed. When changing it,
 manually verify repeated full and capped listings with a FUSE server that sets `FOPEN_NONSEEKABLE`
-or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Expect an extra open/close per
-fallback listing, plus the failed `.` open when search permission is absent.
+or `FOPEN_STREAM`; a seekable FUSE mount does not exercise it. Also run `rcp --force-remote` copies
+(ordinary and `-L`) and an ordinary remote dry run from that mount to a destination outside the
+source tree. Use several hundred entries in one directory to verify continuation across cursor
+batches, checking that every name is visited once without `ESPIPE` failures. Expect an extra
+open/close per local fallback listing.
 
 **Directory-record memory safety** has focused `raw_directory_entry_` tests in
 `common/src/safedir.rs`. They call `directory_entry_from_raw` on records constructed in memory,

@@ -126,6 +126,10 @@ Remote copy from one host to another:
 Copies files from `host1` to `host2`. The `rcpd` process is automatically started on both hosts via
 SSH.
 
+Keep remote source and destination trees disjoint: `rcp server:/data server:/data/sub/backup` can
+copy its own output recursively because remote copies have no
+[overlap check](docs/tocttou.md#remote-sourcedestination-overlap).
+
 Copy from remote host to local machine:
 
 ```fish

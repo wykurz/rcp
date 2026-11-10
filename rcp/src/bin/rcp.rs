@@ -444,8 +444,9 @@ struct Args {
     ///
     /// Normally, when both source and destination are local paths (including paths
     /// with `localhost:` prefix), rcp performs a local copy. This flag forces the
-    /// use of the remote copy protocol (rcpd) instead, which is useful for testing
-    /// or when you want consistent behavior across local and remote operations.
+    /// use of the remote copy protocol (rcpd) instead, which is useful for testing.
+    /// Remote mode does not check whether source and destination trees overlap;
+    /// keep them disjoint to avoid copying the destination into itself.
     ///
     /// Requires paths to use the `localhost:` prefix (e.g., `localhost:/path/to/file`).
     #[arg(long, help_heading = "Remote copy options")]

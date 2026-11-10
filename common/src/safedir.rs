@@ -533,11 +533,21 @@ type CursorReadHook = Box<dyn FnMut(usize, RawFd) -> std::io::Result<()> + Send>
 /// An independently opened directory stream whose offset survives batch boundaries.
 pub struct DirectoryCursor {
     iterator: Option<OwnedDirectoryStream>,
+    first_read: bool,
     #[cfg(test)]
     read_hook: Option<CursorReadHook>,
 }
 
 impl DirectoryCursor {
+    fn new(iterator: OwnedDirectoryStream) -> Self {
+        Self {
+            iterator: Some(iterator),
+            first_read: true,
+            #[cfg(test)]
+            read_hook: None,
+        }
+    }
+
     /// Read access and default ACLs from this cursor's open directory.
     ///
     /// The stream moves through the gated reads without opening or duplicating a descriptor.
@@ -579,14 +589,13 @@ impl DirectoryCursor {
             Ok(iterator)
         })
         .await?;
-        Ok(Self {
-            iterator: Some(iterator),
-            #[cfg(test)]
-            read_hook: None,
-        })
+        Ok(Self::new(iterator))
     }
 
     /// Read at most `limit` entries, excluding `.` and `..`; an empty batch means EOF.
+    ///
+    /// The first batch refreshes the description's position immediately before reading. Later
+    /// batches preserve it; this is not a snapshot of a concurrently changing directory.
     ///
     /// An error or cancellation after admission ends this cursor. The blocking job then owns and
     /// closes its iterator, so a later call cannot rewind or duplicate already yielded entries.
@@ -594,14 +603,36 @@ impl DirectoryCursor {
         &mut self,
         limit: NonZeroUsize,
     ) -> std::io::Result<Vec<DirectoryEntry>> {
+        self.next_batch_with_seek(limit, |fd| {
+            nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)
+        })
+        .await
+    }
+
+    async fn next_batch_with_seek(
+        &mut self,
+        limit: NonZeroUsize,
+        seek: impl FnOnce(BorrowedFd<'_>) -> nix::Result<libc::off_t> + Send + 'static,
+    ) -> std::io::Result<Vec<DirectoryEntry>> {
         throttle::get_ops_token().await;
         let mut iterator = self
             .iterator
             .take()
             .ok_or_else(|| std::io::Error::other("directory cursor was interrupted or failed"))?;
+        let first_read = std::mem::take(&mut self.first_read);
         #[cfg(test)]
         let mut read_hook = self.read_hook.take();
         let (returned, entries) = run_fd_admitted_blocking(move || {
+            if first_read {
+                // refresh btrfs's open-time cutoff after all waits, before libc buffers entries.
+                // a FUSE seek need not refresh the server's separately held backing description
+                match seek(iterator.as_fd()) {
+                    Ok(_) => {}
+                    // this independent stream has never been read, so ESPIPE needs no reopen
+                    Err(nix::errno::Errno::ESPIPE) => {}
+                    Err(error) => return Err(nix_to_io(error)),
+                }
+            }
             let mut entries = Vec::with_capacity(limit.get());
             while entries.len() < limit.get() {
                 #[cfg(test)]
@@ -707,6 +738,13 @@ impl AsRawFd for OwnedDirectoryStream {
     fn as_raw_fd(&self) -> RawFd {
         // SAFETY: self owns the live DIR stream until Drop.
         unsafe { libc::dirfd(self.dir.as_ptr()) }
+    }
+}
+
+impl AsFd for OwnedDirectoryStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: this stream owns the descriptor until Drop, after the borrow ends
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
 
@@ -1427,11 +1465,7 @@ impl Dir {
             OwnedDirectoryStream::from_fd(dir.reopen()?, dir.credit.clone())
         })
         .await?;
-        Ok(DirectoryCursor {
-            iterator: Some(iterator),
-            #[cfg(test)]
-            read_hook: None,
-        })
+        Ok(DirectoryCursor::new(iterator))
     }
 
     /// Enumerate the directory's entries (excluding `.` and `..`).
@@ -1468,7 +1502,8 @@ impl Dir {
         let dir = self.fd.clone();
         run_fd_admitted_blocking(move || {
             // refresh the held description's offset and btrfs entry cutoff before duplicating.
-            // this includes the first listing after creating children through the held directory
+            // this includes the first listing after creating children through the held directory.
+            // a FUSE seek need not refresh the server's separately held backing description
             let fd = dir.listing_fd_with_seek(|fd| {
                 nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)
             })?;
@@ -4136,6 +4171,172 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cursor_refreshes_after_waiting_for_the_blocking_pool() -> anyhow::Result<()> {
+        static PROGRESS: std::sync::LazyLock<crate::progress::Progress> =
+            std::sync::LazyLock::new(crate::progress::Progress::new);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                let tmp = tempfile::tempdir()?;
+                crate::filegen::write_file(&PROGRESS, tmp.path().join("entry"), 1, 1, 0)
+                    .await
+                    .map_err(|error| error.source)?;
+                let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+                for dereference in [false, true] {
+                    let mut cursor = if dereference {
+                        DirectoryCursor::open_following_symlinks(
+                            tmp.path(),
+                            congestion::Side::Source,
+                            Arc::new(()),
+                        )
+                        .await?
+                    } else {
+                        root.entries().await?
+                    };
+                    let stream = cursor.iterator.as_ref().unwrap();
+                    let fd = stream.as_fd().try_clone_to_owned()?;
+                    // a nonseekable stream cannot model an advanced position that must rewind
+                    match nix::unistd::lseek(&fd, 0, nix::unistd::Whence::SeekCur) {
+                        Err(nix::errno::Errno::ESPIPE) => continue,
+                        result => {
+                            result?;
+                        }
+                    }
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                    });
+                    started_rx.await?;
+                    let limit = NonZeroUsize::new(1).unwrap();
+                    let mut read = Box::pin(cursor.next_batch(limit));
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                    // advance the shared kernel position while the read is queued, without
+                    // filling this cursor's libc buffer or rewinding the duplicate on drop
+                    assert_eq!(stream_names(fd.try_clone()?)?, ["entry"]);
+                    assert_ne!(nix::unistd::lseek(&fd, 0, nix::unistd::Whence::SeekCur)?, 0);
+                    release_tx.send(())?;
+                    let batch = read.await?;
+                    blocker.await?;
+                    assert_eq!(batch.len(), 1, "dereference={dereference}");
+                    assert_eq!(batch[0].name, "entry");
+                    assert!(cursor.next_batch(limit).await?.is_empty());
+                }
+                anyhow::Ok(())
+            })
+    }
+
+    #[tokio::test]
+    async fn cursor_sees_replacement_before_first_batch() -> anyhow::Result<()> {
+        static PROGRESS: std::sync::LazyLock<crate::progress::Progress> =
+            std::sync::LazyLock::new(crate::progress::Progress::new);
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source)?;
+        let entry = source.join("entry");
+        crate::filegen::write_file(&PROGRESS, entry.clone(), 1, 1, 0)
+            .await
+            .map_err(|error| error.source)?;
+        let root = Dir::open_root_dir(&source, false, congestion::Side::Source).await?;
+        for dereference in [false, true] {
+            let mut cursor = if dereference {
+                DirectoryCursor::open_following_symlinks(
+                    &source,
+                    congestion::Side::Source,
+                    Arc::new(()),
+                )
+                .await?
+            } else {
+                root.entries().await?
+            };
+            cursor.read_acls(congestion::Side::Source).await?;
+            let replacement = tmp.path().join("replacement");
+            crate::filegen::write_file(&PROGRESS, replacement.clone(), 2, 2, 0)
+                .await
+                .map_err(|error| error.source)?;
+            std::fs::rename(replacement, &entry)?;
+            let batch = cursor.next_batch(NonZeroUsize::new(64).unwrap()).await?;
+            assert_eq!(batch.len(), 1, "dereference={dereference}");
+            assert_eq!(batch[0].name, "entry");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_reads_nonseekable_stream_without_reopening_or_restarting() -> anyhow::Result<()>
+    {
+        static PROGRESS: std::sync::LazyLock<crate::progress::Progress> =
+            std::sync::LazyLock::new(crate::progress::Progress::new);
+        let tmp = tempfile::tempdir()?;
+        for name in ["first", "second"] {
+            crate::filegen::write_file(&PROGRESS, tmp.path().join(name), 1, 1, 0)
+                .await
+                .map_err(|error| error.source)?;
+        }
+        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+        let mut cursor = root.entries().await?;
+        let held_fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+        let limit = NonZeroUsize::new(1).unwrap();
+        let first = cursor
+            .next_batch_with_seek(limit, move |fd| {
+                assert_eq!(fd.as_raw_fd(), held_fd);
+                Err(nix::errno::Errno::ESPIPE)
+            })
+            .await?;
+        assert_eq!(cursor.iterator.as_ref().unwrap().as_raw_fd(), held_fd);
+        let second = cursor
+            .next_batch_with_seek(limit, |_| panic!("continuing a cursor must not seek again"))
+            .await?;
+        let mut names: Vec<_> = first
+            .into_iter()
+            .chain(second)
+            .map(|entry| entry.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["first", "second"]);
+        assert!(
+            cursor
+                .next_batch_with_seek(limit, |_| {
+                    panic!("reaching EOF must not restart the cursor")
+                })
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_seek_failure_releases_credit_and_prevents_restart() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let credit = Arc::new(());
+        let remaining = Arc::downgrade(&credit);
+        let mut cursor =
+            DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
+                .await?;
+        let limit = NonZeroUsize::new(1).unwrap();
+        assert_eq!(
+            cursor
+                .next_batch_with_seek(limit, |_| Err(nix::errno::Errno::EIO))
+                .await
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(
+            remaining.upgrade().is_none(),
+            "failed seek retained descriptor credit"
+        );
+        assert!(
+            cursor.next_batch(limit).await.is_err(),
+            "failed cursor restarted"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cursor_visits_each_entry_once_across_batches() -> anyhow::Result<()> {
         let root_path = testutils::create_temp_dir().await?;
@@ -4295,8 +4496,32 @@ mod tests {
             }
             let mut first = root.entries().await?;
             let mut second = root.entries().await?;
+            // inspect kernel positions before first-read seeks and buffering can hide sharing
+            let position = |cursor: &DirectoryCursor| {
+                nix::unistd::lseek(
+                    cursor.iterator.as_ref().unwrap().as_fd(),
+                    0,
+                    nix::unistd::Whence::SeekCur,
+                )
+            };
+            let first_start = position(&first);
+            let second_start = position(&second);
+            for (name, start) in [("first", first_start), ("second", second_start)] {
+                if start != Err(nix::errno::Errno::ESPIPE) {
+                    assert_eq!(
+                        start,
+                        Ok(0),
+                        "{name} cursor inherited an offset, mode={mode:?}"
+                    );
+                }
+            }
             let limit = NonZeroUsize::new(64).unwrap();
             let first_batch = first.next_batch(limit).await?;
+            assert_eq!(
+                position(&second),
+                second_start,
+                "reading the first cursor moved the second, mode={mode:?}"
+            );
             let second_batch = second.next_batch(limit).await?;
             for (mut cursor, batch) in [(first, first_batch), (second, second_batch)] {
                 let rest = cursor.next_batch(limit).await?;
