@@ -1892,6 +1892,7 @@ mod tests {
         struct FailEarlyClassificationVisitor {
             filter: FilterSettings,
             leaf_started: Arc<std::sync::atomic::AtomicBool>,
+            release_on_leaf_start: std::sync::Mutex<Option<throttle::PendingMetaGuard>>,
         }
 
         impl WalkVisitor for FailEarlyClassificationVisitor {
@@ -1927,6 +1928,13 @@ mod tests {
                 _leaf: AdmittedLeaf,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 self.leaf_started.store(true, Ordering::SeqCst);
+                // let the missing sibling acquire admission only after this visitor has started
+                drop(
+                    self.release_on_leaf_start
+                        .lock()
+                        .expect("leaf-start admission lock poisoned")
+                        .take(),
+                );
                 std::future::pending().await
             }
 
@@ -2767,11 +2775,10 @@ mod tests {
             Ok(())
         }
 
-        /// Fail-early classification errors cancel and fully drop every sibling task capture,
-        /// whether the runtime had polled that sibling yet or not.
+        /// Fail-early classification errors cancel a started sibling and drop its task captures.
         #[tokio::test(flavor = "current_thread")]
-        async fn fail_early_classification_error_aborts_and_quiesces_siblings() -> anyhow::Result<()>
-        {
+        async fn fail_early_classification_error_aborts_and_quiesces_started_sibling()
+        -> anyhow::Result<()> {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("gated"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
@@ -2787,6 +2794,9 @@ mod tests {
             let visitor = Arc::new(FailEarlyClassificationVisitor {
                 filter,
                 leaf_started: Arc::clone(&leaf_started),
+                release_on_leaf_start: std::sync::Mutex::new(Some(
+                    throttle::pending_meta_permit().await,
+                )),
             });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
@@ -2823,6 +2833,82 @@ mod tests {
                 vec![0, 1],
                 "fail-early returned before all scheduled child captures were dropped"
             );
+            let returned = admission
+                .run_with_timeout(Duration::from_secs(1), async {
+                    [
+                        throttle::pending_meta_permit().await,
+                        throttle::pending_meta_permit().await,
+                    ]
+                })
+                .await
+                .context("fail-early cleanup retained PendingMeta admission")?;
+            drop(returned);
+            Ok(())
+        }
+
+        /// A classification error drops the next child's prepared context before admitting it.
+        #[tokio::test(flavor = "current_thread")]
+        async fn fail_early_classification_error_drops_unadmitted_sibling() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            tokio::fs::write(root.join("gated"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_files_in_flight(1);
+            let dir = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut filter = FilterSettings::default();
+            filter.add_exclude("protected/")?;
+            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let visitor = Arc::new(FailEarlyClassificationVisitor {
+                filter,
+                leaf_started: Arc::clone(&leaf_started),
+                release_on_leaf_start: std::sync::Mutex::new(None),
+            });
+            let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+            let dir_ctx = TaskDropContext::root(dropped_tx);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            // the missing child owns the only permit. Its error must win over the capacity it
+            // releases, so the second child's context is dropped without starting its visitor
+            let error = admission
+                .run_with_timeout(
+                    Duration::from_secs(20),
+                    scope_tasks(walk_dir_entries(
+                        visitor,
+                        dir,
+                        &parent_cx,
+                        &dir_ctx,
+                        vec![
+                            (OsString::from("gone"), Some(EntryKind::File)),
+                            (OsString::from("gated"), Some(EntryKind::File)),
+                        ],
+                    )),
+                )
+                .await
+                .context("fail-early authoritative walk did not terminate")?
+                .expect_err("the vanished child classification must fail");
+            let mut dropped = Vec::new();
+            while let Ok(id) = dropped_rx.try_recv() {
+                dropped.push(id);
+            }
+            dropped.sort_unstable();
+            assert!(format!("{:#}", error.source).contains("gone"));
+            assert!(
+                !leaf_started.load(Ordering::SeqCst),
+                "fail-early started a sibling that was waiting for admission"
+            );
+            assert_eq!(dir_ctx.next_id.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                dropped,
+                vec![0, 1],
+                "fail-early returned before both prepared child contexts were dropped"
+            );
+            let returned = admission
+                .run_with_timeout(Duration::from_secs(1), throttle::pending_meta_permit())
+                .await
+                .context("fail-early cleanup retained PendingMeta admission")?;
+            drop(returned);
             Ok(())
         }
 
@@ -2847,13 +2933,16 @@ mod tests {
             let visitor = Arc::new(FailEarlyClassificationVisitor {
                 filter,
                 leaf_started: Arc::clone(&leaf_started),
+                release_on_leaf_start: std::sync::Mutex::new(Some(
+                    throttle::pending_meta_permit().await,
+                )),
             });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
 
-            // the first two entries reserve both permits before their tasks need to be polled, so
-            // constructing the third child reaches a saturated admission wait. Only reaping
+            // the first visitor releases the reserved permit when it starts, admitting `gone`.
+            // constructing the third child then reaches a saturated admission wait. Only reaping
             // `gone` and cancelling its siblings can make this return; consuming the released
             // permit instead would advance far enough to construct the fourth child.
             let error = admission
@@ -2900,7 +2989,12 @@ mod tests {
                 "fail-early returned before every created task capture was dropped"
             );
             let returned = admission
-                .run_with_timeout(Duration::from_secs(1), throttle::pending_meta_permit())
+                .run_with_timeout(Duration::from_secs(1), async {
+                    [
+                        throttle::pending_meta_permit().await,
+                        throttle::pending_meta_permit().await,
+                    ]
+                })
                 .await
                 .context("fail-early cleanup retained PendingMeta admission")?;
             drop(returned);
