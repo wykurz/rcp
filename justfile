@@ -169,6 +169,10 @@ benchmark-run *ARGS:
 benchmark-test:
     python3 -m unittest discover -s benchmarks -p 'test_*.py'
 
+# Explicit native loopback smoke; requires a separately approved trusted root context.
+benchmark-loopback-smoke *ARGS:
+    python3 -m benchmarks.literal_loopback_owner "$@"
+
 # Validate AWS window, IAM, and worker failure paths without AWS calls.
 aws-benchmark-test:
     python3 -m unittest discover -s infra/aws_benchmark -t . -p 'test_*.py'
