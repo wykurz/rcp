@@ -536,13 +536,18 @@ Specific invariants enforced:
   permission but still checks read permission, and the fallback fails if `/proc` is unavailable.
   Enumeration and metadata therefore remain bound to the same held directory. Remote source
   discovery uses one fd-relative cursor per directory in bounded batches; each discovered name is
-  classified once for filtering and dispatch. A subsequently opened file data fd is checked again
-  and supplies the wire header's metadata and ACLs for the bytes it sends. The remote *destination*
-  is fidelity-safe by construction — it writes the received bytes and applies the received metadata
-  to its single created fd, so there are no two source fds to mismatch.
-  `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
-  source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
-  `-L`/`--dereference` path.
+  classified once for filtering and dispatch. The cursor seeks once immediately before its first
+  batch, refreshing Btrfs's open-time cutoff after admission waits; subsequent batches keep their
+  position. A fresh nonseekable stream proceeds without seeking. Enumeration is not a snapshot:
+  replacements after the refresh can still be omitted, and a FUSE seek may not refresh the server's
+  backing description (see
+  [remote enumeration limits](remote_protocol.md#71-source-discovery-and-entry-accounting)). A
+  subsequently opened file data fd is checked again and supplies the wire header's metadata and ACLs
+  for the bytes it sends. The remote *destination* is fidelity-safe by construction — it writes the
+  received bytes and applies the received metadata to its single created fd, so there are no two
+  source fds to mismatch. `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by
+  forbidding by-name source-payload reads (`read_link_at`, `File::open`) in the hardened modules,
+  outside the `-L`/`--dereference` path.
 
 ### Local input/output directory overlap
 
@@ -638,7 +643,20 @@ renames can change ancestry after observation, and inode reuse after deletion ca
 conservative rejection. Identity comparison assumes distinct live directories have distinct
 `(dev, ino)` pairs; a filesystem that reports duplicate pairs can cause false overlap errors. The
 existing held-descriptor and contained-by-name action guarantees remain the security contract.
-Remote copy uses separate endpoints and does not perform this local overlap check.
+
+### Remote source/destination overlap
+
+Remote copies do not perform the local overlap checks. Keep source and destination trees disjoint,
+even when both endpoints name the same host. A destination below an existing source subdirectory is
+particularly prone to being copied into itself: `rcp server:/data server:/data/sub/backup` can
+create `backup` before the source enumerates `sub`, then grow nested copies of its own output,
+possibly exiting successfully. No `--force-remote` flag is needed when the operands select remote
+operation.
+
+The risk applies to new and existing destinations at any depth, on every filesystem. A newly created
+direct-child destination, such as in `rcp --force-remote localhost:/data localhost:/data/backup`,
+can also be included, depending on creation and enumeration timing. Remote overlap is not detected
+through alternative hostnames, symlinks, or bind mounts either.
 
 ### Strict operand resolution (`--require-toctou-safe`)
 

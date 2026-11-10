@@ -76,6 +76,9 @@ Both roles validate that `MasterHello` carries the same preview policy before di
 - Starts two separate rcpd processes with different roles
 - Both processes share the same SSH session but have distinct connections
 
+Sharing an SSH session does not enable the local overlap checks: remote source and destination trees
+must be disjoint (see [remote overlap limits](tocttou.md#remote-sourcedestination-overlap)).
+
 **Auto-deployment compatibility:** Auto-deployment applies the same exact compatibility policy as
 normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
 candidate in search order (beside `rcp`, then the local shell's POSIX `command -v rcpd`) and
@@ -584,7 +587,7 @@ that restores the directory's ORIGINAL default ACL (the lockdown snapshot) — t
 | -------------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                               |
 | `DirectoryBegin`                                                     | both, when captured        | read from the held directory: `O_NOFOLLOW` in hardened mode, the following cursor in `-L` mode; the default ACL governs inheritance |
-| a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                                |
+| a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only reading its entries failed — so it answers the probe like any other                       |
 | a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest answer to give: the destination leaves the destination directory's ACLs untouched             |
 | `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                                  |
 | `ExistingEntry` (manifest)                                           | `Unknown`                  | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                            |
@@ -956,6 +959,14 @@ scheduling and accounting with its intentional symlink-following behavior. Dry-r
 discovery for reporting, sends no Begin, End, or data jobs, and finishes with
 `DiscoveryComplete(false)`.
 
+Before its first read, the cursor seeks to the start in the same blocking job that reads the batch,
+after any ops-throttle, Begin-credit, control-channel, or blocking-pool waits. This refreshes the
+open-time directory-entry cutoff on Btrfs. Later batches keep their position; discovery never
+rewinds or performs another traversal. A nonseekable cursor (`ESPIPE`) uses its fresh, unread
+description without seeking. Other seek errors follow the cursor-error handling below. The
+fd-relative dry-run walker uses the same cursor; the `-L` dry-run walker uses its path-based
+iterator.
+
 If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
 without file-task admission, coalescing already-available outcomes as described in §7.4. Other
 admitted files enter the bounded file queue. Their jobs wait for Ready and the complete manifest,
@@ -984,10 +995,15 @@ description sends `FileSkipped`. A cursor error after Begin seals the children a
 collect-errors mode, records the error, and lets siblings and existing file jobs continue;
 fail-early aborts.
 
-Concurrent mutation is observed through one cursor, without a filesystem snapshot. A name added
-after the cursor passes may not be seen. A name that disappears or changes type after admission
-fails or skips safely; a compatible regular replacement may be sent with its own data-fd metadata.
-The count describes admitted work, not a stable inventory of the source tree.
+Concurrent mutation is observed through one cursor, without a filesystem snapshot. Added names may
+not be seen. On Btrfs, replacing a file by rename after the initial seek can move its directory
+entry beyond the cursor's cutoff, so even a name that existed throughout the copy can be omitted.
+The initial seek narrows the window; it does not eliminate it. A FUSE client seek may also leave a
+server's separately held backing-directory description unchanged, retaining an earlier cutoff.
+Nonseekable streams cannot refresh that cutoff through seeking either. An omitted name is never
+admitted and need not produce an error. A name that disappears or changes type after admission fails
+or skips safely; a compatible regular replacement may be sent with its own data-fd metadata. The
+count describes admitted work, not a stable inventory of the source tree.
 
 ### 7.2 Root Item Handling
 

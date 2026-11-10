@@ -9900,10 +9900,8 @@ fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
     );
 }
 
-/// `-L`/`--dereference` uses a path-based source adapter: it does not retain the
-/// transient enumeration descriptor for the later ACL capture, so that read opens the directory by
-/// path. Without this the dereference walk would quietly send no directory ACLs — and "no ACL" is a
-/// request to CLEAR, so the destination would strip them rather than merely fail to copy them.
+/// Remote `--dereference` preserves file and directory ACLs, with directory ACLs captured through
+/// the held enumeration cursor before `DirectoryBegin`.
 #[test]
 fn test_remote_acl_round_trip_with_dereference() {
     require_local_ssh();

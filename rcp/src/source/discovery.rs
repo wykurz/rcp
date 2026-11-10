@@ -2160,6 +2160,70 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn discovery_sees_file_replaced_after_cursor_open() -> anyhow::Result<()> {
+        static PROGRESS: std::sync::LazyLock<common::progress::Progress> =
+            std::sync::LazyLock::new(common::progress::Progress::new);
+        for dereference in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let source_path = temp.path().join("source");
+            std::fs::create_dir(&source_path)?;
+            let entry = source_path.join("entry");
+            let replacement = temp.path().join("replacement");
+            for (path, size) in [(&entry, 1), (&replacement, 2)] {
+                common::filegen::write_file(&PROGRESS, path.clone(), size, size, 0)
+                    .await
+                    .map_err(|error| error.source)?;
+            }
+            let hooks = Hooks::new({
+                let source_path = source_path.clone();
+                let entry = entry.clone();
+                move |event, path, _| {
+                    let replace = event == "cursor" && path == source_path;
+                    let entry = entry.clone();
+                    let replacement = replacement.clone();
+                    Box::pin(async move {
+                        if replace {
+                            std::fs::rename(replacement, entry)?;
+                        }
+                        Ok(())
+                    })
+                }
+            });
+            let (source, send, receive, errors) = connection(
+                &source_path,
+                dereference,
+                1,
+                1,
+                vec![Box::new(tokio::io::sink())],
+            );
+            let (source, peer) = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                HOOKS.scope(
+                    hooks.clone(),
+                    common::task_scope::scope_tasks(async {
+                        tokio::join!(source, acknowledge_directories(send, receive))
+                    }),
+                ),
+            )
+            .await?;
+            source?;
+            peer?;
+            assert!(!errors.has_errors());
+            assert_eq!(std::fs::metadata(&entry)?.len(), 2);
+            let events = hooks.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(event, path, _)| event == "classified" && path == &entry)
+                    .count(),
+                1,
+                "replacement omitted or classified twice, dereference={dereference}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn directory_enumeration_failure_reports_its_source_path() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let hooks = Hooks::new(|event, _, _| {
