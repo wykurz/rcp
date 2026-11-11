@@ -967,6 +967,14 @@ description without seeking. Other seek errors follow the cursor-error handling 
 fd-relative dry-run walker uses the same cursor; the `-L` dry-run walker uses its path-based
 iterator.
 
+A live cursor that has observed EOF returns an empty batch without consuming an ops token or
+scheduling blocking work. Enumeration is terminal: entries added after that EOF are not sought out,
+and no extra read probes for later listing errors. A full batch alone does not establish EOF.
+Observing EOF does not close the stream or drop its reference to lifetime credit; an ACL error or
+cancellation still leaves a failed cursor. The production cursor ACL read occurs before enumeration
+on the `-L` path. On successful enumeration, discovery drops the cursor after processing the last
+batch's names and receiving the empty batch, which can follow inline descendant scans.
+
 If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
 without file-task admission, coalescing already-available outcomes as described in §7.4. Other
 admitted files enter the bounded file queue. Their jobs wait for Ready and the complete manifest,
@@ -1222,7 +1230,7 @@ limit, remain startup errors.
 
 | Work                       | Bound and release point                                                               |
 | -------------------------- | ------------------------------------------------------------------------------------- |
-| Concurrent scans           | W; normal scans release at EOF, reserve scans when their inline subtree scan ends.    |
+| Concurrent scans           | W; normal scans release after an empty batch, reserve scans after their subtree scan. |
 | Concurrent classifications | Q and source PendingMeta admission A; both release before descent.                    |
 | Normal directory lifetimes | N; credit covers both endpoints until release and last local descriptor closure.      |
 | Reserved lifetimes         | R outstanding lifetimes in one subtree; one inline scan pipelines their completion.   |
@@ -1256,8 +1264,9 @@ R bounds reserved ancestry below the lane's entry point, not total path depth. C
 work affects where that entry occurs. Raising the affected daemon's inherited SSH-session limit
 increases available directory capacity. For a nested depth error, collect-errors mode records and
 skips that subtree while other work continues; `--fail-early` aborts. Normal inline descent moves
-the parent's scan permit into its child and reacquires one after that child returns. EOF releases
-normal scanner resources before joining descendants.
+the parent's scan permit into its child and reacquires one after that child returns. After the empty
+batch ends enumeration, discovery releases normal scanner resources before joining outstanding
+descendant tasks; processing the last nonempty batch can already have scanned inline descendants.
 
 Ready waits stay within Q: each file's parent Begin already owns directory lifetime admission, and
 destination preparation/announcement does not need a source file-job permit. The destination
