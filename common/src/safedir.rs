@@ -534,6 +534,7 @@ type CursorReadHook = Box<dyn FnMut(usize, RawFd) -> std::io::Result<()> + Send>
 pub struct DirectoryCursor {
     iterator: Option<OwnedDirectoryStream>,
     first_read: bool,
+    exhausted: bool,
     #[cfg(test)]
     read_hook: Option<CursorReadHook>,
 }
@@ -543,6 +544,7 @@ impl DirectoryCursor {
         Self {
             iterator: Some(iterator),
             first_read: true,
+            exhausted: false,
             #[cfg(test)]
             read_hook: None,
         }
@@ -597,6 +599,9 @@ impl DirectoryCursor {
     /// The first batch refreshes the description's position immediately before reading. Later
     /// batches preserve it; this is not a snapshot of a concurrently changing directory.
     ///
+    /// While the cursor remains live, observed EOF makes later batches empty without admission
+    /// or blocking work. EOF alone does not close the stream; a full batch does not establish EOF.
+    ///
     /// An error or cancellation after admission ends this cursor. The blocking job then owns and
     /// closes its iterator, so a later call cannot rewind or duplicate already yielded entries.
     pub async fn next_batch(
@@ -614,6 +619,10 @@ impl DirectoryCursor {
         limit: NonZeroUsize,
         seek: impl FnOnce(BorrowedFd<'_>) -> nix::Result<libc::off_t> + Send + 'static,
     ) -> std::io::Result<Vec<DirectoryEntry>> {
+        // a later ACL failure or cancellation leaves no iterator and must not look like EOF
+        if self.exhausted && self.iterator.is_some() {
+            return Ok(Vec::new());
+        }
         throttle::get_ops_token().await;
         let mut iterator = self
             .iterator
@@ -622,7 +631,7 @@ impl DirectoryCursor {
         let first_read = std::mem::take(&mut self.first_read);
         #[cfg(test)]
         let mut read_hook = self.read_hook.take();
-        let (returned, entries) = run_fd_admitted_blocking(move || {
+        let (returned, entries, exhausted) = run_fd_admitted_blocking(move || {
             if first_read {
                 // refresh btrfs's open-time cutoff after all waits, before libc buffers entries.
                 // a FUSE seek need not refresh the server's separately held backing description
@@ -634,12 +643,14 @@ impl DirectoryCursor {
                 }
             }
             let mut entries = Vec::with_capacity(limit.get());
+            let mut exhausted = false;
             while entries.len() < limit.get() {
                 #[cfg(test)]
                 if let Some(read_hook) = read_hook.as_mut() {
                     read_hook(entries.len(), iterator.as_raw_fd())?;
                 }
                 let Some(entry) = iterator.next_raw_entry()? else {
+                    exhausted = true;
                     break;
                 };
                 if entry.name == "." || entry.name == ".." {
@@ -647,10 +658,11 @@ impl DirectoryCursor {
                 }
                 entries.push(entry);
             }
-            Ok((iterator, entries))
+            Ok((iterator, entries, exhausted))
         })
         .await?;
         self.iterator = Some(returned);
+        self.exhausted = exhausted;
         Ok(entries)
     }
 }
@@ -4338,29 +4350,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_visits_each_entry_once_across_batches() -> anyhow::Result<()> {
-        let root_path = testutils::create_temp_dir().await?;
-        for index in 0..150 {
-            tokio::fs::write(root_path.join(format!("file-{index:03}")), b"x").await?;
-        }
-        let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
-        let mut cursor = root.entries().await?;
-        let mut names = Vec::new();
-        let mut batch_sizes = Vec::new();
-        loop {
-            let batch = cursor.next_batch(NonZeroUsize::new(64).unwrap()).await?;
-            if batch.is_empty() {
-                break;
+    async fn cursor_eof_never_reads_again_after_empty_short_or_full_batches() -> anyhow::Result<()>
+    {
+        for (count, limit, sizes) in [
+            (0, 3, vec![0]),
+            (1, 3, vec![1]),
+            (3, 3, vec![3, 0]),
+            (4, 3, vec![3, 1]),
+            (6, 3, vec![3, 3, 0]),
+            (7, 3, vec![3, 3, 1]),
+            (150, 64, vec![64, 64, 22]),
+        ] {
+            let tmp = tempfile::tempdir()?;
+            let expected: Vec<_> = (0..count)
+                .map(|index| std::ffi::OsString::from(format!("file-{index:03}")))
+                .collect();
+            for name in &expected {
+                crate::filegen::write_file(crate::get_progress(), tmp.path().join(name), 1, 1, 0)
+                    .await
+                    .map_err(|error| error.source)?;
             }
-            batch_sizes.push(batch.len());
-            names.extend(batch.into_iter().map(|entry| entry.name));
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+            let mut cursor = root.entries().await?;
+            let limit = NonZeroUsize::new(limit).unwrap();
+            let mut names = Vec::new();
+            for size in sizes {
+                let batch = cursor.next_batch(limit).await?;
+                assert_eq!(batch.len(), size, "entry count={count}");
+                names.extend(batch.into_iter().map(|entry| entry.name));
+            }
+            names.sort();
+            assert_eq!(names, expected);
+            cursor.read_hook = Some(Box::new(|_, _| {
+                Err(std::io::Error::other(
+                    "an EOF cursor issued another directory read",
+                ))
+            }));
+            let submissions = testutils::BlockingSubmissions::start();
+            for _ in 0..3 {
+                assert!(cursor.next_batch(limit).await?.is_empty());
+            }
+            assert_eq!(submissions.count(), 0, "entry count={count}, limit={limit}");
         }
-        names.sort();
-        let expected: Vec<_> = (0..150)
-            .map(|index| std::ffi::OsString::from(format!("file-{index:03}")))
-            .collect();
-        assert_eq!(batch_sizes, [64, 64, 22]);
-        assert_eq!(names, expected);
+        Ok(())
+    }
+
+    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
+    #[tokio::test]
+    async fn cursor_eof_retains_its_descriptor_and_credit_for_acl_reads() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let access = restrictive_access_acl();
+        let default = permissive_acl();
+        set_xattr_at(tmp.path(), ACL_ACCESS_XATTR, &access);
+        set_xattr_at(tmp.path(), ACL_DEFAULT_XATTR, &default);
+        let credit = Arc::new(());
+        let remaining = Arc::downgrade(&credit);
+        let mut cursor =
+            DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
+                .await?;
+        let fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+        let identity = testutils::FdIdentityProbe::capture(fd)?;
+        let limit = NonZeroUsize::new(64).unwrap();
+        assert!(cursor.next_batch(limit).await?.is_empty());
+        assert!(!identity.original_is_closed()?);
+        assert!(remaining.upgrade().is_some());
+        let acls = cursor.read_acls(congestion::Side::Source).await?;
+        assert_eq!(acls.access, Some(access));
+        assert_eq!(acls.default, Some(default));
+        assert_eq!(cursor.iterator.as_ref().unwrap().as_raw_fd(), fd);
+        cursor.read_hook = Some(Box::new(|_, _| {
+            Err(std::io::Error::other(
+                "an ACL read cleared the cursor's EOF",
+            ))
+        }));
+        assert!(cursor.next_batch(limit).await?.is_empty());
+        drop(cursor);
+        assert!(identity.original_is_closed()?);
+        assert!(remaining.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_eof_does_not_hide_a_later_acl_failure() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let credit = Arc::new(());
+        let remaining = Arc::downgrade(&credit);
+        let mut cursor =
+            DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
+                .await?;
+        let identity =
+            testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
+        let limit = NonZeroUsize::new(64).unwrap();
+        assert!(cursor.next_batch(limit).await?.is_empty());
+        let _failure = testutils::BlockingPathGate::fail_once(tmp.path(), libc::EIO);
+        assert_eq!(
+            cursor
+                .read_acls(congestion::Side::Source)
+                .await
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(identity.original_is_closed()?);
+        assert!(remaining.upgrade().is_none());
+        assert!(
+            cursor.next_batch(limit).await.is_err(),
+            "failed cursor became successful EOF"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_eof_does_not_hide_a_cancelled_acl_read() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let credits = Arc::new(tokio::sync::Semaphore::new(1));
+        let credit = Arc::new(credits.clone().acquire_owned().await?);
+        let mut cursor =
+            DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
+                .await?;
+        let identity =
+            testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
+        let limit = NonZeroUsize::new(64).unwrap();
+        assert!(cursor.next_batch(limit).await?.is_empty());
+        let mut gate = testutils::BlockingPathGate::install(tmp.path());
+        let mut read = Box::pin(cursor.read_acls(congestion::Side::Source));
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(20), gate.wait_started()).await??;
+        drop(read);
+        let descriptor_retained = !identity.original_is_closed()?;
+        let credit_retained = credits.available_permits() == 0;
+        let result = cursor.next_batch(limit).await;
+        gate.release_all();
+        let returned =
+            tokio::time::timeout(std::time::Duration::from_secs(20), credits.acquire()).await??;
+        assert!(descriptor_retained, "started ACL read lost its descriptor");
+        assert!(credit_retained, "started ACL read lost its credit");
+        assert!(result.is_err(), "cancelled cursor became successful EOF");
+        assert!(identity.original_is_closed()?);
+        drop(returned);
         Ok(())
     }
 

@@ -143,8 +143,9 @@ first listing after creating children through a held directory. Remote cursors r
 first batch's blocking read job, and keep their position across later batches. The exhausted-offset
 tests also catch a missing initial seek on filesystems such as ext4; the cursor test advances the
 shared offset while the read waits for a blocking thread. Btrfs additionally exercises the cutoff
-after creation and rename replacement between cursor opening and its first read. These tests require
-no sandbox exemption:
+after creation and rename replacement between cursor opening and its first read. The recipe also
+selects cursor lifecycle tests; the ACL-content test requires POSIX ACL xattrs and is excluded from
+the Nix sandbox, while the listing-position regressions need no exemption:
 
 ```bash
 TMPDIR=/path/on/btrfs just test -p rcp-tools-common --lib \
