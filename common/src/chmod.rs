@@ -1905,10 +1905,9 @@ mod tests {
         dir: std::path::PathBuf,
         entry_name: &'static str,
         sentinel: std::path::PathBuf,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> crate::testutils::SwapperGuard {
         use std::os::unix::fs::PermissionsExt;
-        std::thread::spawn(move || {
+        crate::testutils::SwapperGuard::spawn(move |stop| {
             let entry = dir.join(entry_name);
             let staged_real = dir.join("__staged_real");
             let staged_link = dir.join("__staged_link");
@@ -1964,13 +1963,11 @@ mod tests {
         tokio::fs::write(&entry_path, b"REAL").await?;
         std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644))?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = if swap_entries {
             Some(spawn_file_symlink_swapper(
                 target_dir.clone(),
                 "entry",
                 sentinel.clone(),
-                stop.clone(),
             ))
         } else {
             tokio::fs::remove_file(&entry_path).await?;
@@ -2012,10 +2009,7 @@ mod tests {
             );
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(swapper) = swapper {
-            swapper.join().expect("swapper thread panicked");
-        }
+        drop(swapper);
         if !swap_entries {
             assert_eq!(
                 caught, 0,

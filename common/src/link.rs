@@ -8720,24 +8720,6 @@ mod link_tests {
     mod race_tests {
         use super::*;
 
-        struct SwapperGuard {
-            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            thread: Option<std::thread::JoinHandle<()>>,
-        }
-
-        impl Drop for SwapperGuard {
-            fn drop(&mut self) {
-                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                if let Some(thread) = self.thread.take() {
-                    let result = thread.join();
-                    // preserve the original test panic if the swapper also panicked
-                    if !std::thread::panicking() {
-                        result.expect("swapper thread panicked");
-                    }
-                }
-            }
-        }
-
         // repeatedly swap `dir/entry_name` between a real regular file (content `REAL_CONTENT`) and
         // a symlink pointing at `sentinel`, using rename so each individual state is atomic. Runs on
         // a dedicated OS thread so it makes progress regardless of the tokio runtime's scheduling.
@@ -8745,14 +8727,12 @@ mod link_tests {
             dir: std::path::PathBuf,
             entry_name: &'static str,
             sentinel: std::path::PathBuf,
-        ) -> SwapperGuard {
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let thread_stop = stop.clone();
-            let thread = std::thread::spawn(move || {
+        ) -> crate::testutils::SwapperGuard {
+            crate::testutils::SwapperGuard::spawn(move |stop| {
                 let entry = dir.join(entry_name);
                 let staged_real = dir.join("__staged_real");
                 let staged_link = dir.join("__staged_link");
-                while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = std::fs::remove_file(&staged_real);
                     if std::fs::write(&staged_real, b"REAL_CONTENT").is_err() {
                         continue;
@@ -8762,11 +8742,7 @@ mod link_tests {
                     let _ = std::os::unix::fs::symlink(&sentinel, &staged_link);
                     let _ = std::fs::rename(&staged_link, &entry);
                 }
-            });
-            SwapperGuard {
-                stop,
-                thread: Some(thread),
-            }
+            })
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8791,7 +8767,7 @@ mod link_tests {
             // overwrite=true so each iteration's destination need not be empty; no update tree, so
             // `src/sub/entry` takes the hard-link path (or copy-as-symlink when caught mid-swap).
             let settings = common_settings(false, true);
-            let mut caught_swaps = 0usize;
+            let mut failed_iterations = 0usize;
             let mut linked_real = 0usize;
             let mut linked_symlinks = 0usize;
             for i in 0..200 {
@@ -8826,7 +8802,7 @@ mod link_tests {
                 }
                 match result {
                     Ok(_) => {}
-                    Err(_) => caught_swaps += 1, // a swap was caught mid-link (failed closed)
+                    Err(_) => failed_iterations += 1,
                 }
                 // CORE ASSERTION: if a regular file landed at the destination it holds the REAL
                 // content — never the sentinel's secret. The entry may instead be a symlink
@@ -8873,11 +8849,11 @@ mod link_tests {
             // sanity: the concurrent iterations did observable work, excluding the stable control.
             // the safety assertions above hold on every iteration regardless of timing
             tracing::info!(
-                "link file/symlink swap: caught_swaps={caught_swaps}, linked_real={linked_real}, linked_symlinks={linked_symlinks}"
+                "link file/symlink swap: failed_iterations={failed_iterations}, linked_real={linked_real}, linked_symlinks={linked_symlinks}"
             );
             assert!(
-                caught_swaps + linked_real + linked_symlinks > 0,
-                "expected at least one observable outcome across 199 concurrent iterations"
+                linked_real + linked_symlinks > 0,
+                "expected an actual file or symlink across 199 concurrent iterations"
             );
             Ok(())
         }

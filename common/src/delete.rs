@@ -1172,9 +1172,8 @@ mod tests {
     fn spawn_extra_swapper(
         dst: std::path::PathBuf,
         sentinel: std::path::PathBuf,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
+    ) -> crate::testutils::SwapperGuard {
+        crate::testutils::SwapperGuard::spawn(move |stop| {
             let extra = dst.join("extra");
             let staged_dir = dst.join("__staged_extra_dir");
             let staged_link = dst.join("__staged_extra_link");
@@ -1228,8 +1227,7 @@ mod tests {
         let dst = root.join("dst");
         tokio::fs::create_dir(&dst).await?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let swapper = spawn_extra_swapper(dst.clone(), sentinel.clone(), stop.clone());
+        let swapper = spawn_extra_swapper(dst.clone(), sentinel.clone());
 
         // empty keep-set: `extra` (and any other entry) is extraneous and marked for pruning.
         let keep: HashSet<OsString> = HashSet::new();
@@ -1276,10 +1274,15 @@ mod tests {
             )
             .await
             .expect("prune must not hang under concurrent dir swapping");
-            match result {
-                Ok(_) => pruned += 1,
-                Err(_) => errored += 1, // a swap was caught mid-walk (failed closed) — accepted
-            }
+            let summary = match result {
+                Ok(summary) => summary,
+                Err(error) => {
+                    errored += 1;
+                    error.summary
+                }
+            };
+            pruned +=
+                summary.files_removed + summary.symlinks_removed + summary.directories_removed;
             // CORE SAFETY ASSERTION (holds on every iteration regardless of timing): the
             // out-of-tree sentinel tree and its files are NEVER deleted — neither by following a
             // symlinked `extra` (unlink removes the link, not the target) nor by descending it
@@ -1300,13 +1303,12 @@ mod tests {
             );
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.join().expect("extra swapper thread panicked");
+        drop(swapper);
         // sanity (not the safety assertion): the run did observable work across the iterations.
         tracing::info!("prune extra-dir swap: pruned={pruned}, errored={errored}");
         assert!(
-            pruned + errored > 0,
-            "expected at least one observable outcome across the iterations"
+            pruned > 0,
+            "expected actual removals across the concurrent iterations"
         );
         Ok(())
     }
