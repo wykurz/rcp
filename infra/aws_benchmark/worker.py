@@ -24,6 +24,7 @@ import zipfile
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from benchmarks.run import load_manifest
+from benchmarks import cache
 from benchmarks.verification import METADATA_POLICY
 
 from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, admission_contract, clients,
@@ -64,17 +65,76 @@ def prepare_storage(budget, uid, gid):
         return [disk["path"] for disk, _ in selected]
 
 
-def handle_cache(connection, budget, uid):
-    connection.settimeout(2)
-    _, peer, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    require(peer == uid and connection.recv(16) == b"drop\n", "invalid cache request")
-    os.sync()
-    budget.left(RESERVE)
-    Path("/proc/sys/vm/drop_caches").write_text("3\n")
-    connection.sendall(b"ok\n")
+class CacheHistory:
+    """Keep bounded trusted observations even when the unprivileged peer disappears."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []
+        self.omitted = 0
+        self.operations = 0
+
+    def begin(self):
+        with self.lock:
+            self.operations += 1
+            return self.operations
+
+    def record(self, **event):
+        with self.lock:
+            if len(self.events) < 256:
+                self.events.append(event)
+            else:
+                self.omitted += 1
+
+    def snapshot(self):
+        with self.lock:
+            return {"events": list(self.events), "omitted": self.omitted, "operations": self.operations}
 
 
-def cache_server(budget, uid):
+def handle_cache(connection, budget, uid, history=None):
+    history = history if history is not None else CacheHistory()
+    started = time.monotonic_ns()
+    operation_id = history.begin()
+    def record(**event):
+        history.record(operation=operation_id,
+                       elapsed_seconds=(time.monotonic_ns() - started) / 1_000_000_000, **event)
+    stage, phases = "request", {}
+    deadline = min(cache.deadline_after(2), started + int(budget.left(RESERVE) * 1_000_000_000))
+    record(stage=stage, status="started")
+    try:
+        _, peer, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        require(peer == uid, "invalid cache peer")
+        requested = cache.request_deadline(cache.receive(connection, deadline, cache.MAX_REQUEST))
+        # the caller's deadline is not authority to extend the worker's reserve
+        deadline = min(requested, cache.deadline_after(cache.MAX_SECONDS),
+                       time.monotonic_ns() + int(budget.left(RESERVE) * 1_000_000_000))
+        for stage, operation in (("sync", os.sync),
+                ("drop", lambda: Path("/proc/sys/vm/drop_caches").write_text("3\n"))):
+            cache.remaining(deadline)
+            budget.left(RESERVE)
+            phase_started = time.monotonic_ns()
+            record(stage=stage, status="started")
+            operation()
+            phases[stage] = (time.monotonic_ns() - phase_started) / 1_000_000_000
+            record(stage=stage, status="returned", phase_seconds=phases[stage])
+            # kernel sync/reclaim cannot be reliably cancelled by a socket timeout
+            cache.remaining(deadline)
+            budget.left(RESERVE)
+        stage = "reply"
+        result = {"version": cache.VERSION, "ok": True, "stage": stage, "phases_seconds": phases}
+    except (OSError, ValueError) as error:
+        result = {"version": cache.VERSION, "ok": False, "stage": stage,
+                  "phases_seconds": phases, "error_type": type(error).__name__[:80]}
+        if isinstance(error, OSError) and type(error.errno) is int and 0 <= error.errno <= 4095:
+            result["errno"] = error.errno
+        record(stage=stage, status="failed", error_type=result["error_type"])
+    try:
+        cache.send(connection, result, deadline, cache.MAX_REPLY)
+        record(stage="reply", status="sent", ok=result["ok"])
+    except (OSError, ValueError) as error:
+        record(stage="reply", status="not-confirmed", error_type=type(error).__name__[:80])
+
+
+def cache_server(budget, uid, history=None):
     server = socket.socket(socket.AF_UNIX)
     server.bind(SOCKET)
     os.chmod(SOCKET, 0o666)
@@ -93,9 +153,11 @@ def cache_server(budget, uid):
                     continue
                 with connection:
                     try:
-                        handle_cache(connection, budget, uid)
+                        handle_cache(connection, budget, uid, history)
                     except (OSError, ValueError, TimeoutError):
-                        pass
+                        # failures before a request is decoded still leave a bounded record
+                        if history is not None:
+                            history.record(stage="request", status="not-confirmed")
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     return thread
@@ -129,6 +191,7 @@ def command(window, seconds):
     argv += ["--property=" + key + "=" + value for key, value in properties.items()]
     argv += ["--setenv=PATH=/opt/rcp-benchmark/bin:/usr/bin:/bin",
              "--setenv=PYTHONPATH=" + str(ROOT), "--setenv=LC_ALL=C", "--setenv=LANG=C",
+             "--setenv=" + cache.WORKER_DEADLINE_ENV + "=" + str(time.monotonic_ns() + int(seconds * 1_000_000_000)),
              "--setenv=RCP_BENCH_BASELINE_COMMIT=" + window["baseline"],
              "--setenv=GITHUB_REPOSITORY=wykurz/rcp", "/usr/bin/python3", "-m", "benchmarks.run",
              "--bin-dir", str(STATE / "candidate"), "--baseline-bin-dir", str(STATE / "baseline"),
@@ -136,7 +199,8 @@ def command(window, seconds):
              "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
              "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
-             "--timeout", timeout, "--runner-label", contract["runner_label"],
+             "--timeout", timeout, "--cache-timeout", "1200" if window["suite"] == FULL_FILE_SET_SUITE else "600",
+             "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
              "--source-storage-id", source_storage,
              "--destination-storage-id", destination_storage,
@@ -454,6 +518,7 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
     signal.setitimer(signal.ITIMER_REAL, budget.left())
     status = completed_status(window["run"])
     metadata = {"window": window, "worker_started_at": timestamp(started)}
+    cache_history = CacheHistory()
     if bounded:
         metadata.update(guest_instance_id=identity, timing_basis=durable_plan_contract(window["plan"])["timing_basis"],
                         runtime_origin="attempt_started_at")
@@ -505,7 +570,7 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
         else:
             admit_storage()
             metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
-        cache_server(budget, account.pw_uid)
+        cache_server(budget, account.pw_uid, cache_history)
         try:
             stopped = False
             argv = command(window, budget.left(RESERVE))
@@ -527,6 +592,7 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
         status.update(success=False, error=error_detail(error))
     # Never read candidate-owned paths until all descendants are gone. Failed
     # teardown still reports the trusted outcome without touching those paths.
+    metadata["cache_control"] = cache_history.snapshot()
     publish_report(s3, bucket, DATA / "output" if stopped else None, metadata, status, budget, paths=paths)
 
 

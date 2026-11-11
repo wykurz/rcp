@@ -120,12 +120,13 @@ class BuildContractTests(unittest.TestCase):
         self.assertIn("--property=SuccessAction=poweroff", user_data)
 
     def test_cache_shim_accepts_the_real_harness_drop_invocation(self):
-        with patch.object(harness.sys, "platform", "linux"), patch.object(harness.subprocess, "run") as run:
+        with patch.object(harness.sys, "platform", "linux"), patch.object(harness.cache.time, "monotonic_ns", return_value=100_000_000_000), patch.object(harness.subprocess, "run") as run:
             harness._prepare_cache("linux-drop-caches", Path("/unused"), 30)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[0].args[0], ["sync"])
         self.assertEqual(run.call_args.args[0], ["sudo", *cache_client.EXPECTED])
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertEqual(run.call_args.kwargs["env"][harness.cache.DEADLINE_ENV], "130000000000")
 
 
     def test_worker_argv_parses_and_resolves_every_allowlisted_suite(self):
@@ -143,6 +144,10 @@ class BuildContractTests(unittest.TestCase):
                 self.assertTrue(args.local_resources)
                 self.assertTrue(args.no_timings)
                 self.assertEqual(args.mode, "local")
+                self.assertEqual(args.cache_timeout, 1200 if suite == common.FULL_FILE_SET_SUITE else 600)
+                deadline_options = [item for item in command if item.startswith("--setenv=" + harness.cache.WORKER_DEADLINE_ENV + "=")]
+                self.assertEqual(len(deadline_options), 1)
+                self.assertGreater(int(deadline_options[0].rsplit("=", 1)[1]), 0)
 
     def test_userdata_submission_failure_powers_off_without_requiring_worker_directory(self):
         script = ami_image.reviewed_startup("operator-window", "test-bucket", "us-east-1")

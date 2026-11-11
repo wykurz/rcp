@@ -19,7 +19,7 @@ def fake_stat(value, **changes):
 
 def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=None,
                 outcome=None, summary=True, streaming_verification=True, cache="linux-drop-caches",
-                summary_text=None, extra_args=(), cache_fault=None):
+                summary_text=None, extra_args=(), cache_fault=None, cache_prepare=None):
     binary, manifest = TimingTests()._fixture(root)
     if summary:
         contents = json.loads(manifest.read_text())
@@ -38,11 +38,13 @@ def run_fixture(root, *, policy=streaming.POLICY, scan_fault=None, copy_fault=No
             with mock.patch.object(streaming.os, "read", side_effect=AssertionError("payload read")):
                 return original_scan(path, *args, **kwargs)
         return original_scan(path, *args, **kwargs)
-    def prepare_cache(*args):
+    def prepare_cache(*args, **kwargs):
         events.append("drop")
         if cache_fault:
             cache_fault()
-        return original_cache(*args) if cache == "source-verified" else None
+        if cache_prepare is not None:
+            return cache_prepare(*args, **kwargs)
+        return original_cache(*args, **kwargs) if cache == "source-verified" else None
     def execute(commands, logdir, timeout, **kwargs):
         nonlocal copied_source
         events.append("copy")

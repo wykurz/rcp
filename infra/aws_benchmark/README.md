@@ -304,13 +304,28 @@ instance role itself has only fixed S3 reads/writes, no provisioning rights. Thi
 isolation for a dedicated disposable host, not a separate kernel or a hostile-code VM.
 
 Targeted suites use the existing `linux-drop-caches` policy. A root-owned executable named `sudo`
-accepts exactly the harness's fixed cache-drop argv and sends a fixed request to a root supervisor
-UNIX socket. The helper verifies the peer UID, calls `sync`, and writes `3` to `drop_caches`; it
-accepts no paths or commands. No sudoers grant is installed. Fixture generation, validation, source
-reuse, pairing and cleanup stay in the existing harness. Existing suites retain full SHA-256
-validation; the explicitly named `bulk-1g-metadata` performance suite checks structure, metadata and
-sizes without reading payload contents. Its reports disclose that content integrity is not checked.
-The random-byte `filegen` fixture policy is unchanged; no sparse or all-zero replacements are used.
+accepts exactly the harness's fixed cache-drop argv and sends a bounded, versioned request to a root
+supervisor UNIX socket. It carries only the fixed operation and one monotonic deadline. The helper
+verifies the peer UID and independently clamps that deadline to two hours and the remaining worker
+budget, preserving the collection reserve. It calls `sync` and writes `3` to `drop_caches`; it
+accepts no paths or commands. No sudoers grant is installed. The client/server must be baked
+together; no legacy-protocol fallback or operation retry is permitted after an uncertain response.
+
+The harness's `--cache-timeout` includes its initial sync and the entire broker request. Worker
+defaults are 600 seconds, or 1200 seconds for full-fileset qualification. Each stage rechecks the
+same deadline before proceeding. Expiry during broker sync prevents starting cache drop; expiry
+during cache drop or reply prevents claiming success. Kernel sync/reclaim is not reliably
+interruptible by closing a socket, so independent worker alarms, systemd limits and native shutdown
+remain authoritative. The trusted worker records at most 256 broker-stage observations plus an
+omission count in `worker.json`; each event includes a root-generated broker-operation ordinal and
+elapsed time. The ordinal is not a trial index: a same-UID peer can issue additional fixed-operation
+requests. The harness retains bounded command diagnostics in private trial records. A short locked
+snapshot neither waits for a stuck broker thread nor claims it was cancelled. Failed preparation
+always aborts the trial before a copy can start. Fixture generation, validation, source reuse,
+pairing and cleanup stay in the existing harness. Existing suites retain full SHA-256 validation;
+the explicitly named `bulk-1g-metadata` performance suite checks structure, metadata and sizes
+without reading payload contents. Its reports disclose that content integrity is not checked. The
+random-byte `filegen` fixture policy is unchanged; no sparse or all-zero replacements are used.
 
 The initial worker control read has a separate 60-second bootstrap deadline and bounded retries.
 Once a complete, valid control document arrives, its absolute cutoff replaces that bootstrap
