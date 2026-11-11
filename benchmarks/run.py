@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming, telemetry
+from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming, telemetry, cache
 from benchmarks.operations import expected_counts
 from benchmarks.verification import (DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label,
     DEFAULT_READ_SIZE, DEFAULT_BATCH_MULTIPLIER, MismatchError, failure_proof, observed_error,
@@ -572,7 +572,7 @@ def _persist(output, record, *, sampler=None):
     (output / "summary.md").write_text("\n".join(lines) + "\n")
 
 
-def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
+def _prepare_cache(policy, source, timeout, expected=None, metadata=None, *, diagnostics=None):
     if policy == "source-verified":
         if expected is None or metadata is None:
             raise ValueError("source-verified requires the initial source snapshots")
@@ -581,6 +581,11 @@ def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
             raise operations.VerificationError(proof, "source")
         return proof
     if policy == "uncontrolled":
+        return
+    if policy == "linux-drop-caches":
+        if sys.platform != "linux":
+            raise ValueError("linux-drop-caches requires Linux")
+        cache.prepare(timeout, diagnostics if diagnostics is not None else {})
         return
     subprocess.run(["sync"], check=True, timeout=timeout)
     if policy == "source-warm":
@@ -603,9 +608,6 @@ def _prepare_cache(policy, source, timeout, expected=None, metadata=None):
                     else:
                         raise MismatchError(f"non-regular cache entry: {path}")
         return
-    if sys.platform != "linux":
-        raise ValueError("linux-drop-caches requires Linux")
-    subprocess.run(["sudo", "-n", "sh", "-c", "printf 3 > /proc/sys/vm/drop_caches"], check=True, capture_output=True, text=True, timeout=timeout)
 
 
 def _select(items, selected, kind):
@@ -641,6 +643,8 @@ def _arguments(argv):
     parser.add_argument("--cache", choices=("source-warm", "linux-drop-caches", "uncontrolled", "source-verified"), default="source-warm")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--cache-timeout", type=float, default=cache.DEFAULT_SECONDS,
+                        help="whole linux-drop-caches preparation deadline, including sync (default 600s; max 7200s)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runner-label", type=_nonblank, default="local")
     parser.add_argument("--files-in-flight")
@@ -667,6 +671,8 @@ def _arguments(argv):
                             help=f"capacity {name.replace('_', ' ')} override (default {value}); requires --check-capacity")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks/inodes on distinct scratch filesystems")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.cache_timeout) or not 0 < args.cache_timeout <= cache.MAX_SECONDS:
+        parser.error("--cache-timeout must be finite and in (0, 7200] seconds")
     for option in ("verification_mode", "verification_workers", "verification_inline_bytes", "verification_read_bytes", "verification_batch_depth"):
         if getattr(args, option) is not None and not args.streaming_verification:
             parser.error("--" + option.replace("_", "-") + " requires --streaming-verification")
@@ -737,7 +743,7 @@ def main(argv=None):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
-    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": _fixture_policy(metadata_only=args.verification_mode == "metadata-size"), "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
+    record = {"schema_version": 1, "run_id": uuid.uuid4().hex, "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "revision": _revision(), "context": {"runner_label": args.runner_label, "topology": args.mode, "purpose": args.purpose, "cache_policy": args.cache, "cache_timeout_seconds": args.cache_timeout if args.cache == "linux-drop-caches" else None, "timing_policy": TIMING_POLICY, "verification_policy": VERIFICATION_POLICY, "source": str(args.source_root.resolve()), "destination": str(args.destination_root.resolve()), "repository": os.environ.get("GITHUB_REPOSITORY", ""), "run_url": os.environ.get("BENCHMARK_RUN_URL", ""), "fixture_policy": _fixture_policy(metadata_only=args.verification_mode == "metadata-size"), "fixture_contract_revision": FIXTURE_CONTRACT_REVISION, "directory_count_policy": "directories below fixture root; excludes fixture root"}, "tools": {}, "cases": [], "variants": [], "trials": [], "summaries": []}
     if args.command_clocks:
         record["context"]["command_clocks"] = clocks.POLICY
         record["context"]["measurement_environment"] = {key: os.environ[key] for key in measurements.ENVIRONMENT_KEYS if key in os.environ}
@@ -972,7 +978,10 @@ def main(argv=None):
                             trial["transport_artifacts"] = str(output / "transport" / trial_path)
                         active.stage = "cache"
                         phase("cache", case_index, trial_index)
-                        proof = _prepare_cache(args.cache, source, args.timeout, source_scan, source_metadata)
+                        cache_diagnostics = trial.setdefault("cache_preparation", {}) if args.cache == "linux-drop-caches" else None
+                        proof = _prepare_cache(args.cache, source,
+                            args.cache_timeout if args.cache == "linux-drop-caches" else args.timeout,
+                            source_scan, source_metadata, diagnostics=cache_diagnostics)
                         if args.cache == "source-verified":
                             trial["cache_validation"] = proof
                         if collect_costs:

@@ -29,6 +29,7 @@ class InputsTests(unittest.TestCase):
         self.assertIn("infra/aws_benchmark/production_projection.py", sources)
         self.assertIn("infra/aws_benchmark/production_objects.py", sources)
         self.assertEqual(package.ENTRYPOINTS["infra.aws_benchmark.production_collection_handler"], ("lambda_handler",))
+        self.assertIn("benchmarks/cache.py", sources)
         self.assertIn("assets/site-theme.html", sources)
         self.assertNotIn("infra/aws_benchmark/production_client.py", sources)
         self.assertFalse(any("test_" in name or "/.git/" in name or "credentials" in name for name in sources))
@@ -41,6 +42,12 @@ class InputsTests(unittest.TestCase):
         sources = package.source_snapshot(package.ROOT)
         sources["infra/aws_benchmark/production_handler.py"] += b"\nfrom . import private_configuration\n"
         with self.assertRaisesRegex(ValueError, "unreviewed or missing"):
+            package.verify_source_closure(sources)
+
+    def test_cache_boundary_cannot_be_omitted_from_the_reviewed_source_closure(self):
+        sources = package.source_snapshot(package.ROOT)
+        del sources["benchmarks/cache.py"]
+        with self.assertRaisesRegex(ValueError, "unreviewed or missing source dependency.*benchmarks.cache"):
             package.verify_source_closure(sources)
 
     def test_startup_verifier_cannot_be_omitted_from_the_lambda_closure(self):

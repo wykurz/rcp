@@ -256,19 +256,21 @@ class ControllerTests(unittest.TestCase):
 
 class WorkerTests(unittest.TestCase):
     def test_cache_helper_only_exposes_fixed_operation_to_worker_uid(self):
-        for uid, request, valid in ((123, b"drop\n", True), (0, b"drop\n", False), (123, b"shell\n", False)):
+        request = {"version": 1, "operation": "drop", "deadline_ns": worker.cache.deadline_after(60)}
+        for uid, operation, valid in ((123, "drop", True), (0, "drop", False), (123, "shell", False)):
             connection = Mock()
             connection.getsockopt.return_value = struct.pack("3i", 1, uid, 123)
-            connection.recv.return_value = request
+            connection.recv.return_value = (json.dumps(dict(request, operation=operation)) + "\n").encode()
+            budget = Mock()
+            budget.left.return_value = 60
             with patch.object(worker.os, "sync") as sync, patch.object(worker.Path, "write_text") as write:
+                worker.handle_cache(connection, budget, 123)
+                result = worker.cache.response(json.loads(connection.sendall.call_args.args[0]))
+                self.assertEqual(result["ok"], valid)
                 if valid:
-                    worker.handle_cache(connection, Mock(), 123)
                     sync.assert_called_once()
                     write.assert_called_once_with("3\n")
-                    connection.sendall.assert_called_once_with(b"ok\n")
                 else:
-                    with self.assertRaises(ValueError):
-                        worker.handle_cache(connection, Mock(), 123)
                     sync.assert_not_called()
                     write.assert_not_called()
 

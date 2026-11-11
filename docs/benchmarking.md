@@ -545,6 +545,20 @@ Cache modes are procedures, not assumptions:
 - `uncontrolled` performs no cache preparation and labels the results accordingly. It is useful for
   quick diagnostics, not interchangeable with either controlled series.
 
+For `linux-drop-caches`, `--cache-timeout` bounds the whole preparation operation, including the
+first sync; it is independent of the timed copy's `--timeout`. The default is 600 seconds and the
+supported maximum is 7200 seconds. A timeout, failed cache command, cancellation or uncertain broker
+reply fails the trial before any copy starts. There is no retry or warm-cache fallback. Raw trial
+records retain bounded stdout/stderr, return code or exception type, per-command elapsed time and
+truncation flags in `cache_preparation`. These diagnostics are private evidence, not public log
+output. Successful AWS broker replies additionally include sync and cache-drop timings.
+
+A client timeout cannot establish that blocking kernel sync/reclaim stopped. The AWS worker keeps
+its independent runtime limits and shutdown guard, and retains bounded broker-stage observations in
+trusted `worker.json` even if the client disconnects. The full-fileset worker uses a 1200-second
+cache-preparation limit; other worker suites use 600 seconds. Updating the code does not update an
+already baked image: ship the revised harness, facade and broker together in a newly reviewed AMI.
+
 Linux cache dropping does not establish cold ZFS ARC, L2ARC, storage-controller or device caches. On
 the original servers, record the exact cache procedure and relevant ZFS cache observations. See the
 [Linux cache-dropping documentation](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html#drop-caches).
