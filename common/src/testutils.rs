@@ -10,6 +10,41 @@ use std::os::unix::fs::MetadataExt;
 
 static ADMISSION_LIMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Stops and joins a race-test worker on every exit, including assertion failures.
+#[cfg(test)]
+#[must_use = "keep the guard alive while the swapper is needed"]
+pub(crate) struct SwapperGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl SwapperGuard {
+    pub(crate) fn spawn(run: impl FnOnce(&std::sync::atomic::AtomicBool) + Send + 'static) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || run(&thread_stop));
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SwapperGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            // preserve the original test panic if the worker also panicked
+            if !std::thread::panicking() {
+                result.expect("swapper thread panicked");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static COPY_FILE_RANGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1057,6 +1092,62 @@ mod tests {
     use futures::FutureExt as _;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
+
+    fn report_swapper_stopped(
+        stop: &std::sync::atomic::AtomicBool,
+        finished: std::sync::mpsc::Sender<()>,
+    ) {
+        // bound a broken guard's worker lifetime; correct cleanup needs no timing assumption
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "swapper was not stopped"
+            );
+            std::thread::yield_now();
+        }
+        finished
+            .send(())
+            .expect("completion receiver must remain live");
+    }
+
+    #[test]
+    fn swapper_stops_and_joins_on_drop() {
+        let (finished, completed) = std::sync::mpsc::channel();
+        let swapper = SwapperGuard::spawn(move |stop| report_swapper_stopped(stop, finished));
+        drop(swapper);
+        assert_eq!(completed.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn swapper_stops_and_joins_when_test_panics() {
+        let (finished, completed) = std::sync::mpsc::channel();
+        let panic = std::panic::catch_unwind(move || {
+            let _swapper = SwapperGuard::spawn(move |stop| report_swapper_stopped(stop, finished));
+            panic!("original test panic");
+        })
+        .expect_err("the test panic must propagate");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"original test panic"));
+        assert_eq!(completed.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn swapper_propagates_worker_panic_on_normal_exit() {
+        let panic = std::panic::catch_unwind(|| {
+            let _swapper = SwapperGuard::spawn(|_| panic!("worker panic"));
+        });
+        assert!(panic.is_err(), "a failed worker must fail the test");
+    }
+
+    #[test]
+    fn swapper_preserves_test_panic_when_worker_also_panics() {
+        let panic = std::panic::catch_unwind(|| {
+            let _swapper = SwapperGuard::spawn(|_| panic!("worker panic"));
+            panic!("original test panic");
+        })
+        .expect_err("the test panic must propagate");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"original test panic"));
+    }
 
     struct DelayedDrop(Duration);
 

@@ -2649,9 +2649,8 @@ mod tests {
         fn spawn_dir_symlink_swapper(
             tree: std::path::PathBuf,
             sentinel: std::path::PathBuf,
-            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        ) -> std::thread::JoinHandle<()> {
-            std::thread::spawn(move || {
+        ) -> crate::testutils::SwapperGuard {
+            crate::testutils::SwapperGuard::spawn(move |stop| {
                 let sub = tree.join("sub");
                 let staged_dir = tree.join("__staged_sub_dir");
                 let staged_link = tree.join("__staged_sub_link");
@@ -2700,9 +2699,8 @@ mod tests {
             tokio::fs::create_dir(sentinel.join("subdir")).await?;
             tokio::fs::write(sentinel.join("subdir").join("secret2.txt"), b"SECRET-2").await?;
 
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let swapper =
-                spawn_dir_symlink_swapper(root.to_path_buf(), sentinel.clone(), stop.clone());
+            let tree = root.join("tree");
+            let swapper = spawn_dir_symlink_swapper(tree.clone(), sentinel.clone());
 
             let settings = Settings {
                 fail_early: false,
@@ -2720,7 +2718,6 @@ mod tests {
                 // classified/descended mid-swap. On even iterations we additionally seed `sub` as a
                 // symlink-to-sentinel up front, deterministically exercising the "intermediate is a
                 // symlink at classification time → unlink the link, never recurse the target" path.
-                let tree = root.join("tree");
                 let _ = tokio::fs::create_dir(&tree).await;
                 for d in 0..16 {
                     let sib = tree.join(format!("sib_{d}"));
@@ -2746,10 +2743,15 @@ mod tests {
                 )
                 .await
                 .expect("rm must not hang under concurrent dir swapping");
-                match result {
-                    Ok(_) => removed += 1,
-                    Err(_) => errored += 1, // a swap was caught mid-walk (failed closed) — accepted
-                }
+                let summary = match result {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        errored += 1;
+                        error.summary
+                    }
+                };
+                removed +=
+                    summary.files_removed + summary.symlinks_removed + summary.directories_removed;
                 // CORE SAFETY ASSERTION (holds on every iteration regardless of timing): the
                 // out-of-tree sentinel tree and its files are NEVER deleted by rm — neither by
                 // following a symlinked `sub` (unlink removes the link, not the target) nor by
@@ -2769,16 +2771,15 @@ mod tests {
                     "iteration {i}: sentinel/subdir/secret2.txt was deleted — rm recursed through the symlink"
                 );
                 // clean up any leftover tree before the next iteration (best-effort).
-                let _ = tokio::fs::remove_dir_all(root.join("tree")).await;
+                let _ = tokio::fs::remove_dir_all(&tree).await;
             }
 
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            swapper.join().expect("dir swapper thread panicked");
+            drop(swapper);
             // sanity (not the safety assertion): the run did observable work across the iterations.
             tracing::info!("intermediate dir swap: removed={removed}, errored={errored}");
             assert!(
-                removed + errored > 0,
-                "expected at least one observable outcome across the iterations"
+                removed > 0,
+                "expected actual removals across the concurrent iterations"
             );
             Ok(())
         }

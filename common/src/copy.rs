@@ -8978,9 +8978,8 @@ mod copy_tests {
         dir: std::path::PathBuf,
         entry_name: &'static str,
         sentinel: std::path::PathBuf,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
+    ) -> crate::testutils::SwapperGuard {
+        crate::testutils::SwapperGuard::spawn(move |stop| {
             let entry = dir.join(entry_name);
             let staged_real = dir.join("__staged_real");
             let staged_link = dir.join("__staged_link");
@@ -9016,7 +9015,6 @@ mod copy_tests {
         tokio::fs::create_dir(&sub).await?;
         tokio::fs::write(sub.join("entry"), "REAL_CONTENT").await?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut swapper = None;
 
         let settings = toctou_settings();
@@ -9031,7 +9029,6 @@ mod copy_tests {
                     sub.clone(),
                     "entry",
                     sentinel.clone(),
-                    stop.clone(),
                 ));
             }
             let dst = test_path.join(format!("dst_{i}"));
@@ -9088,8 +9085,7 @@ mod copy_tests {
             let _ = tokio::fs::remove_dir_all(&dst).await;
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.unwrap().join().expect("swapper thread panicked");
+        drop(swapper);
         // concurrent outcomes are diagnostic; the separate admitted-source test proves the boundary
         tracing::info!(
             "file/symlink swap: caught_swaps={caught_swaps}, copied_real={copied_real}, \
@@ -9117,12 +9113,10 @@ mod copy_tests {
         tokio::fs::create_dir(&real_sub).await?;
         tokio::fs::write(real_sub.join("real.txt"), "REAL_CONTENT").await?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
             let src = src.clone();
             let outside = outside.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
+            crate::testutils::SwapperGuard::spawn(move |stop| {
                 let sub = src.join("sub");
                 let staged_dir = src.join("__staged_sub_dir");
                 let staged_link = src.join("__staged_sub_link");
@@ -9201,8 +9195,7 @@ mod copy_tests {
             let _ = tokio::fs::remove_dir_all(&dst).await;
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.join().expect("dir swapper thread panicked");
+        drop(swapper);
         Ok(())
     }
 
@@ -9253,12 +9246,10 @@ mod copy_tests {
         let dst = test_path.join("dst");
         tokio::fs::create_dir(&dst).await?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
             let dst = dst.clone();
             let out_of_tree = out_of_tree.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
+            crate::testutils::SwapperGuard::spawn(move |stop| {
                 let mid = dst.join("mid");
                 let staged_dir = dst.join("__staged_mid_dir");
                 let staged_link = dst.join("__staged_mid_link");
@@ -9323,10 +9314,7 @@ mod copy_tests {
             }
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper
-            .join()
-            .expect("intermediate-swap swapper thread panicked");
+        drop(swapper);
         // sanity: the out-of-tree subtree itself also survived intact.
         assert!(
             oot_deeper.join("sub0").is_dir(),
@@ -10189,11 +10177,9 @@ mod copy_tests {
         tokio::fs::create_dir(&sub).await?;
         tokio::fs::write(sub.join("entry"), "REAL_CONTENT").await?;
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
             let sub = sub.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
+            crate::testutils::SwapperGuard::spawn(move |stop| {
                 let entry = sub.join("entry");
                 let staged_real = sub.join("__staged_real");
                 let staged_fifo = sub.join("__staged_fifo");
@@ -10258,8 +10244,7 @@ mod copy_tests {
             let _ = tokio::fs::remove_dir_all(&dst).await;
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        swapper.join().expect("fifo swapper thread panicked");
+        drop(swapper);
         Ok(())
     }
 
