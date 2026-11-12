@@ -48,7 +48,7 @@ ASSIGNMENT_WAIT_SECONDS = 120
 
 
 def execute(argv, budget, **kwargs):
-    return subprocess.run(argv, check=True, timeout=min(60, budget.left(RESERVE)), **kwargs)
+    return subprocess.run(argv, check=True, timeout=min(3600, budget.left(RESERVE)), **kwargs)
 
 
 def prepare_storage(budget, uid, gid):
@@ -98,14 +98,14 @@ def handle_cache(connection, budget, uid, history=None):
         history.record(operation=operation_id,
                        elapsed_seconds=(time.monotonic_ns() - started) / 1_000_000_000, **event)
     stage, phases = "request", {}
-    deadline = min(cache.deadline_after(2), started + int(budget.left(RESERVE) * 1_000_000_000))
+    deadline = min(cache.deadline_after(60), started + int(budget.left(RESERVE) * 1_000_000_000))
     record(stage=stage, status="started")
     try:
         _, peer, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         require(peer == uid, "invalid cache peer")
         requested = cache.request_deadline(cache.receive(connection, deadline, cache.MAX_REQUEST))
         # the caller's deadline is not authority to extend the worker's reserve
-        deadline = min(requested, cache.deadline_after(cache.MAX_SECONDS),
+        deadline = min(requested, cache.deadline_after(cache.MAX_BROKER_SECONDS),
                        time.monotonic_ns() + int(budget.left(RESERVE) * 1_000_000_000))
         for stage, operation in (("sync", os.sync),
                 ("drop", lambda: Path("/proc/sys/vm/drop_caches").write_text("3\n"))):
@@ -166,13 +166,11 @@ def cache_server(budget, uid, history=None):
 def command(window, seconds):
     contract = measurement_contract(window["suite"])
     large = window["suite"] in LARGE_SUITES
-    file_limit, timeout = "536870912", "600"
+    file_limit, timeout = "536870912", str(max(1, int(seconds)))
     source_storage, destination_storage = "c5d-local-ext4-source", "c5d-local-ext4-destination"
     if large:
-        file_limit, timeout = "1073741824", "1200"
+        file_limit = "1073741824"
         source_storage, destination_storage = "c5d-raid0-ext4-source-v1", "c5d-raid0-ext4-destination-v1"
-    if window["suite"] == FULL_FILE_SET_SUITE:
-        timeout = "7200"
     properties = {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
@@ -199,7 +197,7 @@ def command(window, seconds):
              "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
              "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
-             "--timeout", timeout, "--cache-timeout", "1200" if window["suite"] == FULL_FILE_SET_SUITE else "600",
+             "--timeout", timeout,
              "--runner-label", contract["runner_label"],
              "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
              "--source-storage-id", source_storage,

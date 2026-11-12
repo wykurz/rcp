@@ -639,7 +639,8 @@ class DirectGuestTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--verification-mode") + 1], "metadata-size")
             self.assertEqual(argv[argv.index("--cache") + 1], "linux-drop-caches")
             self.assertEqual(argv[argv.index("--repetitions") + 1], "2")
-            self.assertEqual(argv[argv.index("--timeout") + 1], "1200")
+            self.assertEqual(argv[argv.index("--timeout") + 1], "10230")
+            self.assertIn("--property=RuntimeMaxSec=10230", argv)
             prepare.assert_called_once()
             identity.assert_called_once()
 

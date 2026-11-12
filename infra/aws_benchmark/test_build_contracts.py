@@ -125,8 +125,8 @@ class BuildContractTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[0].args[0], ["sync"])
         self.assertEqual(run.call_args.args[0], ["sudo", *cache_client.EXPECTED])
-        self.assertEqual(run.call_args.kwargs["timeout"], 30)
-        self.assertEqual(run.call_args.kwargs["env"][harness.cache.DEADLINE_ENV], "130000000000")
+        self.assertEqual(run.call_args.kwargs["timeout"], 1200)
+        self.assertEqual(run.call_args.kwargs["env"][harness.cache.DEADLINE_ENV], "1300000000000")
 
 
     def test_worker_argv_parses_and_resolves_every_allowlisted_suite(self):
@@ -144,7 +144,7 @@ class BuildContractTests(unittest.TestCase):
                 self.assertTrue(args.local_resources)
                 self.assertTrue(args.no_timings)
                 self.assertEqual(args.mode, "local")
-                self.assertEqual(args.cache_timeout, 1200 if suite == common.FULL_FILE_SET_SUITE else 600)
+                self.assertIsNone(args.cache_timeout)
                 deadline_options = [item for item in command if item.startswith("--setenv=" + harness.cache.WORKER_DEADLINE_ENV + "=")]
                 self.assertEqual(len(deadline_options), 1)
                 self.assertGreater(int(deadline_options[0].rsplit("=", 1)[1]), 0)
