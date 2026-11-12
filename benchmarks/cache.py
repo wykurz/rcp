@@ -12,8 +12,8 @@ from benchmarks.strict_json import parse_json
 
 DEADLINE_ENV = "RCP_BENCH_CACHE_DEADLINE_NS"
 WORKER_DEADLINE_ENV = "RCP_BENCH_WORKER_DEADLINE_NS"
-MAX_SECONDS = 7200
-DEFAULT_SECONDS = 600
+MAX_BROKER_SECONDS = 8 * 3600
+DEFAULT_SECONDS = 1200
 MAX_REQUEST = 256
 MAX_REPLY = 4096
 DIAGNOSTIC_BYTES = 2048
@@ -30,9 +30,23 @@ def remaining(deadline):
 
 
 def deadline_after(seconds):
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= MAX_SECONDS or not math.isfinite(seconds):
-        raise ValueError(f"cache timeout must be finite and in (0, {MAX_SECONDS}] seconds")
-    return time.monotonic_ns() + int(seconds * 1_000_000_000)
+    now = time.monotonic_ns()
+    # validate representability before multiplying or converting a large finite float
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not 0 < seconds < (2**63 - 1 - now) / 1_000_000_000
+            or not math.isfinite(seconds)):
+        raise ValueError("cache timeout must be finite, positive and fit the monotonic deadline")
+    deadline = now + int(seconds * 1_000_000_000)
+    remaining(deadline)
+    return deadline
+
+
+def default_seconds(command_timeout):
+    # legacy preparation gave sync and the following command separate timeout budgets
+    deadline_after(command_timeout)
+    value = max(DEFAULT_SECONDS, 2 * command_timeout)
+    deadline_after(value)
+    return value
 
 
 def receive(connection, deadline, limit):
@@ -135,16 +149,20 @@ def _checked(argv, deadline, stage, report, *, env=None):
         return observation
 
 
-def prepare(seconds, report):
+def prepare(seconds, report, *, inherit_worker=False):
     """Fail the trial on any uncertain operation, without replay or warm-cache fallback."""
-    report.update(timeout_seconds=seconds, status="running", commands=[])
+    report.update(timeout_seconds=seconds, policy="explicit-or-local", status="running", commands=[])
     try:
         deadline = deadline_after(seconds)
         worker_deadline = os.environ.get(WORKER_DEADLINE_ENV)
         if worker_deadline is not None:
             if not worker_deadline.isascii() or not worker_deadline.isdecimal() or len(worker_deadline) > 19:
                 raise ValueError("invalid worker cache deadline")
-            deadline = min(deadline, int(worker_deadline))
+            worker_deadline = int(worker_deadline)
+            remaining(worker_deadline)
+            deadline = worker_deadline if inherit_worker else min(deadline, worker_deadline)
+            if inherit_worker:
+                report.update(timeout_seconds=remaining(deadline), policy="remaining-worker-budget")
         report["effective_timeout_seconds"] = remaining(deadline)
         _checked(["sync"], deadline, "sync", report)
         result = _checked(["sudo", "-n", "sh", "-c", "printf 3 > /proc/sys/vm/drop_caches"],

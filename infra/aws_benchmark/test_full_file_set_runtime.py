@@ -233,7 +233,8 @@ class SupervisorTests(unittest.TestCase):
         first, second, events, notifier, measurements, preparations, measured = self.run_full()
         self.assertTrue(first["status"]["success"])
         self.assertEqual(first["supervisor_runtime"]["extension_usec"], 28_708_000_000)
-        self.assertEqual(first["command_timeout_seconds"], 7200)
+        self.assertGreater(first["command_timeout_seconds"], 7200)
+        self.assertLessEqual(first["command_timeout_seconds"], 28800)
         self.assertTrue(first["supervisor_runtime"]["barrier_processed"])
         self.assertFalse(second["status"]["success"])
         self.assertEqual(second["status"]["error"]["type"], "FileExistsError")
@@ -243,11 +244,12 @@ class SupervisorTests(unittest.TestCase):
         argv = measured.args[0]
         self.assertIn("--system-telemetry", argv)
         self.assertIn("--no-timings", argv)
-        self.assertEqual(argv[argv.index("--timeout") + 1], "7200")
+        self.assertEqual(int(argv[argv.index("--timeout") + 1]), first["command_timeout_seconds"])
+        self.assertIn("--property=RuntimeMaxSec=" + str(first["command_timeout_seconds"]), argv)
         self.assertEqual([argv[i + 1] for i, v in enumerate(argv) if v == "--case"], list(common.SUITES[SUITE]))
         old = worker.command(dict(suite="bulk-1g-metadata", baseline="a" * 40), 600)
         self.assertNotIn("--system-telemetry", old)
-        self.assertEqual(old[old.index("--timeout") + 1], "1200")
+        self.assertEqual(old[old.index("--timeout") + 1], "600")
 
     def test_ordinary_notify_worker_readies_but_never_extends(self):
         from unittest.mock import Mock
@@ -257,7 +259,8 @@ class SupervisorTests(unittest.TestCase):
                 worker.run(cloud.api["s3"], "bucket", direct=True)
             metadata, _ = report(cloud)
             self.assertTrue(metadata["status"]["success"])
-            self.assertEqual(metadata["command_timeout_seconds"], 1200)
+            self.assertGreater(metadata["command_timeout_seconds"], 1200)
+            self.assertLessEqual(metadata["command_timeout_seconds"], 10800)
             notifier.ready.assert_called_once()
             notifier.extend.assert_not_called()
             measure.assert_called_once()

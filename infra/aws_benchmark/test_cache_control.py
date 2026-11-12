@@ -96,9 +96,9 @@ class CacheControlTests(unittest.TestCase):
         self.assertTrue(any(e.get("error_type") == "TimeoutError" and e["stage"] == "sync" for e in history["events"]))
 
     def test_worker_budget_and_server_cap_override_untrusted_deadline(self):
-        for seconds, elapsed in ((5, 6), (20_000, cache.MAX_SECONDS + 1)):
+        for seconds, elapsed in ((5, 6), (cache.MAX_BROKER_SECONDS * 2, cache.MAX_BROKER_SECONDS + 1)):
             with self.subTest(seconds=seconds):
-                connection, history, _, path, _ = self.broker(lambda clock: self.request(clock, 30_000),
+                connection, history, _, path, _ = self.broker(lambda clock: self.request(clock, cache.MAX_BROKER_SECONDS * 3),
                     budget_seconds=seconds, sync=lambda clock: clock.advance(elapsed))
                 self.assertFalse(connection.sent)
                 path.assert_not_called()
@@ -319,8 +319,99 @@ class CacheControlTests(unittest.TestCase):
             with self.subTest(value=invalid), self.assertRaises(ValueError):
                 cache.response(invalid)
 
+    def test_omitted_cloud_override_uses_remaining_worker_budget_beyond_old_sync_limits(self):
+        for command_timeout, slow_sync in ((1200, 1300), (7200, 7300)):
+            clock = Clock()
+            report = {}
+            calls = []
+            def execute(argv, **kwargs):
+                calls.append((argv[0], kwargs["timeout"]))
+                if argv[0] == "sync":
+                    clock.advance(slow_sync)
+            deadline = clock.ns + 20_000_000_000_000
+            with self.subTest(command_timeout=command_timeout), \
+                    mock.patch.object(cache.time, "monotonic_ns", clock), \
+                    mock.patch.dict(os.environ, {cache.WORKER_DEADLINE_ENV: str(deadline)}), \
+                    mock.patch.object(cache.subprocess, "run", side_effect=execute):
+                run._prepare_cache("linux-drop-caches", Path("/unused"), command_timeout, diagnostics=report)
+            self.assertEqual(report["policy"], "remaining-worker-budget")
+            self.assertEqual(report["timeout_seconds"], 20000)
+            self.assertEqual(report["effective_timeout_seconds"], 20000)
+            self.assertEqual(calls, [("sync", 20000), ("sudo", 20000 - slow_sync)])
+            self.assertEqual(report["status"], "complete")
+
+    def test_standalone_defaults_preserve_both_legacy_command_budgets(self):
+        for command_timeout, expected in ((30, 1200), (600, 1200), (1200, 2400), (7200, 14400)):
+            report = {}
+            with self.subTest(command_timeout=command_timeout), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(cache.subprocess, "run"):
+                run._prepare_cache("linux-drop-caches", Path("/unused"), command_timeout, diagnostics=report)
+            self.assertEqual(report["timeout_seconds"], expected)
+            self.assertLessEqual(report["effective_timeout_seconds"], expected)
+        self.assertIsNone(run._arguments(["--output", "/unused"]).cache_timeout)
+        self.assertEqual(run._arguments(["--output", "/unused", "--cache-timeout", "14400"]).cache_timeout, 14400)
+
+    def test_invalid_worker_deadline_never_falls_back_or_spawns(self):
+        for raw in ("", "nan", "-1", "0", str(2**63), "1", "1" * 30):
+            report = {}
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {cache.WORKER_DEADLINE_ENV: raw}), \
+                    mock.patch.object(cache.subprocess, "run") as invoked, self.assertRaises((ValueError, TimeoutError)):
+                cache.prepare(1200, report, inherit_worker=True)
+            invoked.assert_not_called()
+            self.assertEqual(report["status"], "failed")
+
+    def test_numeric_timeout_overflow_is_a_validation_failure(self):
+        for value in (float("inf"), float("nan"), 1e308, 10**400, True, 0, -1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cache.default_seconds(value)
+        with self.assertRaises(ValueError):
+            cache.default_seconds(5_000_000_000)
+
+    def test_header_wait_is_generous_but_still_bounded_by_root_budget(self):
+        for delay, budget_seconds, succeeds in ((10, 3600, True), (61, 3600, False), (10, 5, False)):
+            clock = Clock()
+            connection = Connection(self.request(clock, 120))
+            original = connection.recv
+            def delayed(count):
+                clock.advance(delay)
+                return original(count)
+            connection.recv = delayed
+            budget = mock.Mock()
+            budget.left.return_value = budget_seconds
+            history = worker.CacheHistory()
+            with self.subTest(delay=delay, budget=budget_seconds), \
+                    mock.patch.object(cache.time, "monotonic_ns", clock), \
+                    mock.patch.object(worker.os, "sync") as synced, mock.patch.object(worker, "Path") as path:
+                worker.handle_cache(connection, budget, os.getuid(), history)
+            self.assertEqual(synced.call_count, int(succeeds))
+            self.assertEqual(path.return_value.write_text.call_count, int(succeeds))
+            if succeeds:
+                self.assertTrue(cache.response(json.loads(connection.sent))["ok"])
+            else:
+                self.assertFalse(connection.sent)
+
+    def test_worker_inner_allowances_inherit_work_budget_without_extending_it(self):
+        for suite in ("aa-smoke", "bulk-1g-metadata", worker.FULL_FILE_SET_SUITE):
+            for seconds in (17.5, 14400.5):
+                with self.subTest(suite=suite, seconds=seconds):
+                    argv = worker.command(dict(suite=suite, baseline="a" * 40), seconds)
+                    self.assertEqual(argv[argv.index("--timeout") + 1], str(int(seconds)))
+                    self.assertIn("--property=RuntimeMaxSec=" + str(int(seconds)), argv)
+                    self.assertNotIn("--cache-timeout", argv)
+
+    def test_storage_wait_is_generous_and_clipped_before_collection_reserve(self):
+        for left, expected in ((7200, 3600), (1800, 1800), (17, 17)):
+            budget = mock.Mock()
+            budget.left.return_value = left
+            with self.subTest(left=left), mock.patch.object(worker.subprocess, "run") as invoked:
+                worker.execute(["mkfs.ext4", "/dev/dummy"], budget)
+            budget.left.assert_called_once_with(worker.RESERVE)
+            self.assertEqual(invoked.call_args.kwargs["timeout"], expected)
+            self.assertTrue(invoked.call_args.kwargs["check"])
+
     def test_cache_timeout_cli_is_independent_and_finite(self):
-        for value in ("0", "-1", "nan", "inf", "7201"):
+        for value in ("0", "-1", "nan", "inf", "1e308", "1e-30"):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run._arguments(["--output", "/unused", "--cache-timeout", value])
         args = run._arguments(["--output", "/unused", "--timeout", "7200", "--cache-timeout", "1200"])
