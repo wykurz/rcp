@@ -119,6 +119,14 @@ jobs:
           # restore only the verified tag locally; keep the source pinned without another fetch
           git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
+      # the selected release source may predate the inventory validator
+      - name: Checkout package inventory validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
@@ -142,8 +150,10 @@ jobs:
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh deb -p rcp-tools-rlink
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh deb -p rcp-tools-rrm
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh deb -p rcp-tools-rcmp
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh deb -p rcp-tools-rchm
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh deb -p rcp-tools-filegen
           # cargo-deb keeps package archives in target/debian even with an explicit build target.
+          python3 -I "$GITHUB_WORKSPACE/controller/scripts/check-release-packages.py" deb amd64 target/debian --source-root "$GITHUB_WORKSPACE"
           zip rcp-deb-amd64-${RELEASE_TAG}.zip target/debian/*.deb
           ls -la rcp-deb-amd64-${RELEASE_TAG}.zip
 
@@ -185,6 +195,14 @@ jobs:
           # restore only the verified tag locally; keep the source pinned without another fetch
           git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
+      # the selected release source may predate the inventory validator
+      - name: Checkout package inventory validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
@@ -210,7 +228,9 @@ jobs:
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rlink -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rrm -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rcmp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p rchm -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=x86_64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=x86_64-unknown-linux-musl -p filegen -s "version = \"$RPM_VERSION\""
+          python3 -I "$GITHUB_WORKSPACE/controller/scripts/check-release-packages.py" rpm amd64 target/x86_64-unknown-linux-musl/generate-rpm --source-root "$GITHUB_WORKSPACE"
           zip rcp-rpm-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
@@ -252,6 +272,14 @@ jobs:
           # restore only the verified tag locally; keep the source pinned without another fetch
           git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
+      # the selected release source may predate the inventory validator
+      - name: Checkout package inventory validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
 
@@ -275,8 +303,10 @@ jobs:
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh deb --no-build -p rcp-tools-rlink
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh deb --no-build -p rcp-tools-rrm
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh deb --no-build -p rcp-tools-rcmp
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh deb --no-build -p rcp-tools-rchm
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh deb --no-build -p rcp-tools-filegen
           # cargo-deb keeps package archives in target/debian even with an explicit build target.
+          python3 -I "$GITHUB_WORKSPACE/controller/scripts/check-release-packages.py" deb arm64 target/debian --source-root "$GITHUB_WORKSPACE"
           zip rcp-deb-arm64-${RELEASE_TAG}.zip target/debian/*.deb
           ls -la rcp-deb-arm64-${RELEASE_TAG}.zip
 
@@ -318,6 +348,14 @@ jobs:
           # restore only the verified tag locally; keep the source pinned without another fetch
           git tag -- "$RELEASE_TAG" "$RELEASE_COMMIT"
 
+      # the selected release source may predate the inventory validator
+      - name: Checkout package inventory validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
 
@@ -342,7 +380,9 @@ jobs:
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rlink -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rrm -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rcmp -s "version = \"$RPM_VERSION\""
+          CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p rchm -s "version = \"$RPM_VERSION\""
           CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh generate-rpm --target=aarch64-unknown-linux-musl -p filegen -s "version = \"$RPM_VERSION\""
+          python3 -I "$GITHUB_WORKSPACE/controller/scripts/check-release-packages.py" rpm arm64 target/aarch64-unknown-linux-musl/generate-rpm --source-root "$GITHUB_WORKSPACE"
           zip rcp-rpm-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
           ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 

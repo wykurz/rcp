@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 import yaml
@@ -32,8 +33,9 @@ class RpmVersionTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.manifest = self.root / "Cargo.toml"
 
-    def manifest_version(self, version):
-        self.manifest.write_text('[workspace.package]\nversion = ' + json.dumps(version) + '\n')
+    def manifest_version(self, version, members=()):
+        self.manifest.write_text('[workspace]\nmembers = ' + json.dumps(list(members)) +
+                                 '\n[workspace.package]\nversion = ' + json.dumps(version) + '\n')
 
     def invoke(self, tag):
         return subprocess.run([sys.executable, str(HELPER), tag], cwd=self.root,
@@ -82,11 +84,26 @@ class RpmVersionTests(unittest.TestCase):
         scripts = self.root / "scripts"
         scripts.mkdir()
         shutil.copyfile(HELPER, scripts / HELPER.name)
+        controller = self.root / "controller/scripts"
+        controller.mkdir(parents=True)
+        shutil.copyfile(ROOT / "scripts/check-release-packages.py", controller / "check-release-packages.py")
+        with (ROOT / "Cargo.toml").open("rb") as stream:
+            members = tomllib.load(stream)["workspace"]["members"]
+        for member in members:
+            (self.root / member).mkdir()
+            shutil.copyfile(ROOT / member / "Cargo.toml", self.root / member / "Cargo.toml")
         # record the real shell's argument boundaries without compiling or publishing packages
         cargo = scripts / "cargo-host.sh"
-        cargo.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+        cargo.write_text("#!/usr/bin/env python3\nimport json, os, pathlib, sys, tomllib\n"
                          "with open(os.environ['RPM_TRACE'], 'a') as out:\n"
-                         "    out.write(json.dumps([os.environ.get('CARGO_BUILD_TARGET'), sys.argv[1:]]) + '\\n')\n")
+                         "    out.write(json.dumps([os.environ.get('CARGO_BUILD_TARGET'), sys.argv[1:]]) + '\\n')\n"
+                         "if sys.argv[1] == 'generate-rpm':\n"
+                         "    name = 'rcp-tools-' + sys.argv[sys.argv.index('-p') + 1]\n"
+                         "    version = tomllib.loads(sys.argv[sys.argv.index('-s') + 1])['version']\n"
+                         "    target = os.environ['CARGO_BUILD_TARGET']\n"
+                         "    directory = pathlib.Path('target') / target / 'generate-rpm'\n"
+                         "    directory.mkdir(parents=True, exist_ok=True)\n"
+                         "    (directory / (name + '-' + version + '-1.' + target.split('-')[0] + '.rpm')).write_bytes(b'package fixture')\n")
         cargo.chmod(0o755)
         binaries = self.root / "bin"
         binaries.mkdir()
@@ -107,11 +124,13 @@ class RpmVersionTests(unittest.TestCase):
             self.assertEqual(step.get("shell", "bash"), "bash")
             for version, expected in CASES.items():
                 with self.subTest(job=job_name, version=version):
-                    self.manifest_version(version)
+                    self.manifest_version(version, members)
+                    for path in self.root.glob("target/*/generate-rpm/*.rpm"):
+                        path.unlink()
                     trace = self.root / "trace.jsonl"
                     trace.unlink(missing_ok=True)
                     env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ["PATH"],
-                               RELEASE_TAG="v" + version, RPM_TRACE=str(trace))
+                               RELEASE_TAG="v" + version, RPM_TRACE=str(trace), GITHUB_WORKSPACE=str(self.root))
                     env.pop("BASH_ENV", None)
                     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.root,
                                             env=env, capture_output=True, text=True)
@@ -120,7 +139,7 @@ class RpmVersionTests(unittest.TestCase):
                     generated = [(arch, args) for arch, args in calls if args[0] == "generate-rpm"]
                     self.assertEqual(generated, [(target, ["generate-rpm", "--target=" + target, "-p", package,
                                                           "-s", 'version = "' + expected + '"'])
-                                                 for package in ("rcp", "rlink", "rrm", "rcmp", "filegen")])
+                                                 for package in ("rcp", "rlink", "rrm", "rcmp", "rchm", "filegen")])
                     trace.unlink()
                     env["RELEASE_TAG"] = "v9.9.9"
                     mismatch = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.root,
