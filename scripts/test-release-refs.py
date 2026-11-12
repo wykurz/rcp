@@ -242,7 +242,7 @@ def consumer_checkouts(flows, outputs, sha):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             yield flow_name + "/" + job_name + "/" + name, step, nested
             for step in job.get("steps", []):
-                if step.get("uses", "").startswith("actions/checkout@") and job_name != "upload-release":
+                if step.get("uses", "").startswith("actions/checkout@") and step.get("with", {}).get("path") != "controller":
                     yield flow_name + "/" + job_name, step, values
 
 
@@ -940,7 +940,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertEqual(env.get("RELEASE_TAG"), TAG, job_name)
                         if step.get("uses", "").startswith("actions/checkout@"):
                             checkouts += 1
-                            self.assertEqual(step["with"]["ref"], "${{ github.sha }}" if job_name == "upload-release" else COMMIT, job_name)
+                            if step["with"].get("path") == "controller":
+                                self.assertEqual(name, "release.yml")
+                                self.assertIn(job_name, BUILDS | {"upload-release"})
+                                self.assertEqual(step["with"], {"ref": "${{ github.sha }}", "path": "controller",
+                                                                "persist-credentials": "false"})
+                            else:
+                                self.assertNotIn("path", step["with"])
+                                self.assertEqual(step["with"]["ref"], COMMIT, job_name)
                             self.assertEqual(step["with"]["persist-credentials"], "false", job_name)
                         if step.get("uses", "").startswith("softprops/action-gh-release@"):
                             releases += 1
@@ -959,7 +966,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                             self.assertNotIn("make_latest", step["with"], job_name)
                         self.assertNotIn("inputs.release_tag", str(step))
                 self.assertEqual(validations, 1)
-                self.assertEqual(checkouts, 7 if name == "release.yml" else 2)
+                self.assertEqual(checkouts, 11 if name == "release.yml" else 2)
                 self.assertEqual(releases, 3 if name == "release.yml" else 0)
 
     def test_dispatch_input_schema_matches_the_typed_test_context(self):
@@ -1037,7 +1044,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(recipe, "release-ref-test recipe must exist")
         self.assertEqual([line.strip() for line in recipe[1].splitlines() if line.strip()],
                          ["python3 scripts/test-release-refs.py", "python3 scripts/test-release-rpm-version.py",
-                           "python3 scripts/test-stage-release-assets.py"])
+                           "python3 scripts/test-stage-release-assets.py", "python3 scripts/test-release-packages.py"])
 
     def test_reusable_validation_forwards_nonempty_pin_to_every_checkout(self):
         flow = workflow("validate.yml")
