@@ -66,6 +66,8 @@ Runs on every push and pull request to `main`:
   required lint job
 - **documentation**: Builds documentation with strict warnings
 - **test**: Runs the full test suite using cargo-nextest
+- **Btrfs**: The debug job reruns the common library and the remote discovery listing regression on
+  a temporary Btrfs filesystem, with tests running as the ordinary runner user
 
 ### release.yml
 

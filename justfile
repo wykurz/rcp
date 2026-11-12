@@ -44,6 +44,8 @@ lint: _lint-build _lint-targets
     just report-check
     @echo "🔍 Testing the Depot CI helper..."
     ./scripts/test-depot-ci.sh
+    @echo "🔍 Testing the Btrfs mount helper..."
+    python3 scripts/test-with-btrfs.py
     @echo "🔍 Testing the Docker helper..."
     ./scripts/test-docker-helpers.sh
     @echo "🔍 Testing the error logging linter..."
@@ -96,6 +98,11 @@ fmt:
 # Run tests (debug mode, using nextest by default)
 test *ARGS:
     ./scripts/cargo-host.sh nextest run "$@"
+
+# Run directory-sensitive suites on a temporary Btrfs filesystem (passwordless sudo required)
+test-btrfs *ARGS:
+    ./scripts/with-btrfs.sh ./scripts/cargo-host.sh nextest run -p rcp-tools-common -p rcp-tools-rcp --lib --no-tests=fail -E 'package(=rcp-tools-common)' "$@"
+    ./scripts/with-btrfs.sh ./scripts/cargo-host.sh nextest run -p rcp-tools-common -p rcp-tools-rcp --lib --no-tests=fail -E 'package(=rcp-tools-rcp) & test(discovery_sees_file_replaced_after_cursor_open)' "$@"
 
 # exercise release-tag identity and workflow propagation without publishing anything
 release-ref-test:
