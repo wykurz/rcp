@@ -136,6 +136,26 @@ Local file operation tests in each tool's `tests/` directory:
 - **rlink**: Hard-linking operations
 - **rcmp**: File comparison
 
+**Btrfs coverage** runs the entire common library suite and the remote discovery regression for
+rename replacement before the first cursor read. GitHub's musl debug job runs it after its ordinary
+tests, reusing compiled artifacts. To reproduce it locally:
+
+```bash
+just test-btrfs
+```
+
+This requires Linux with Btrfs and loop-device support, `btrfs-progs`, `util-linux`, and
+passwordless sudo. Run it as an ordinary user so permission tests remain meaningful. The helper
+creates an 8 GiB sparse image, mounts it below a short private `/tmp` path, verifies the filesystem
+type, and sets `TMPDIR` for the test command. Only mount, ownership setup, and unmount use sudo. It
+unmounts before removing its fixture on success or failure; if unmount fails, it reports the
+retained path and fails rather than deleting mounted contents. Setup failures never fall back to the
+host filesystem.
+
+Depot keeps its ordinary filesystem coverage: its current runner kernel mounts Btrfs with `noacl`
+and rejects enabling ACLs, so it cannot run this complete suite. The Btrfs step requires ACL support
+and does not skip those tests.
+
 **Directory listing tests** should also run with `TMPDIR` on Btrfs when changing held-directory
 enumeration. Btrfs records a directory-entry cutoff when a descriptor is opened, and duplicating the
 descriptor retains it. Full and capped listings must refresh that view before reading, including the
@@ -504,7 +524,8 @@ For more troubleshooting, see `tests/docker/README.md`.
 The `.github/workflows/validate.yml` workflow runs:
 
 1. **Lint, documentation, and policy checks** through the host wrapper and repository scripts
-2. **Debug and release tests plus doctests** against the x86_64-musl CI target
+2. **Debug and release tests plus doctests** against the x86_64-musl CI target. The debug job also
+   reruns the common library and remote discovery regression on Btrfs.
 3. **Sudo-gated debug and release tests** in their corresponding test jobs
 4. **Non-chaos Docker tests** in a separate multi-host job
 5. **MSRV, glibc release, and Nix shell/package checks** in dedicated jobs
@@ -528,6 +549,9 @@ just ci  # lint + Nix targets when available + doc + test-all (debug + release +
 release + doctest + Docker checks CI does, plus full Nix target checks when Nix is available. It is
 the one command to run before pushing. It's a close proxy for the CI matrix rather than a
 byte-for-byte match; a few CI steps live outside it:
+
+- **Btrfs directory tests.** The debug job runs `just test-btrfs` on a disposable loop-mounted
+  filesystem. This privileged setup is opt-in locally and is not part of `just depot-ci`.
 
 - **Sudo-gated and isolated mount tests.** CI runs `test(~sudo)` in a separate step in both debug
   and release. The debug step also selects ignored `binary(=directory_overlap)` fixtures and sets

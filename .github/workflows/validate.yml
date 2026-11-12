@@ -142,6 +142,9 @@ jobs:
     - name: Test Depot CI helper
       run: ./scripts/test-depot-ci.sh
 
+    - name: Test Btrfs mount helper
+      run: python3 scripts/test-with-btrfs.py
+
     - name: Test benchmark harness
       run: just benchmark-test
 
@@ -215,7 +218,7 @@ jobs:
         # strace tests in rcp/tests/acls.rs check opt-in ACL probe costs; those in
         # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
         # native test runs fail without it; copied bytes cannot prove either property.
-        sudo apt-get install -y musl-tools pkg-config strace
+        sudo apt-get install -y musl-tools pkg-config strace btrfs-progs
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Setup SSH for localhost
@@ -239,6 +242,11 @@ jobs:
     - name: Install cargo-nextest
       run: ./scripts/cargo-install-host.sh cargo-nextest --version 0.9.85 --locked
 
+    - name: Install just
+      uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+      with:
+        tool: just
+
     - name: Test (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
@@ -246,6 +254,13 @@ jobs:
         set -o pipefail
         # Run tests with nextest for better output
         ./scripts/cargo-host.sh nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
+
+    - name: Test directory operations on Btrfs (musl debug)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: |
+        set -o pipefail
+        just test-btrfs --no-capture 2>&1 | tee -a test_output_musl_debug.log
 
     - name: Test sudo-required and isolated mount tests (musl debug)
       env:
