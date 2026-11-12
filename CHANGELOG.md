@@ -7,6 +7,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-11
+
+### Added
+
+- Add retained AWS benchmark duration and resource history plots, public resource diagnostics, and
+  guarded recurring AWS benchmark schedules (#382, #392, #394).
+
+### Changed
+
+- Reject `rcp` and `rlink` destinations inside an input tree, reporting the conflicting operand
+  before any work starts (#381).
+- Skip further directory reads and rate admission once a listing reaches end of file (#400).
+
+### Fixed
+
+- Fix Btrfs listings omitting entries created after a directory was opened, locally and for remote
+  sources, by refreshing directory cursors before the first read (#375, #396).
+- Fix `--delete` pruning destination entries whose source names were concurrently replaced and
+  omitted from a Btrfs listing (#380).
+- Fix local `--overwrite` and `--delete` removals destroying a pending input operand (#386).
+- Fix reopening readable directories that lack search permission (#393).
+- Fix undefined behavior when decoding short or long-named directory records (#388).
+- Fix remote daemon shutdown discarding queued log and preview output (#402).
+
 ## [0.41.0] - 2026-11-01
 
 ### Added
@@ -1285,7 +1309,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.41.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/wykurz/rcp/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/wykurz/rcp/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/wykurz/rcp/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/wykurz/rcp/compare/v0.38.0...v0.39.0
