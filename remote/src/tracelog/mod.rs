@@ -1,5 +1,6 @@
-// Re-export RcpdType from common to avoid duplication
+use anyhow::Context as _;
 use chrono::TimeZone;
+// re-export RcpdType from common to avoid duplication
 pub use common::RcpdType;
 
 // static storage for the latest progress from each rcpd process
@@ -14,25 +15,33 @@ pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::Ser
 
 /// Sends tracing messages from rcpd to the master process over the TCP stream.
 ///
-/// CANCEL SAFETY: both branches are cancel-safe:
-/// - `receiver.recv()`: tokio mpsc channel recv is cancel-safe
-/// - `cancellation_token.cancelled()`: cancel-safe (just polls a flag)
+/// Shutdown closes message admission and drains the accepted queue, even when producers retain
+/// sender clones. An in-flight frame finishes before shutdown is observed. The owner must bound
+/// this drain and abort the task on timeout; dropping an interrupted send also discards its stream.
 pub async fn run_sender<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
     mut send_stream: crate::streams::SendStream<W>,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    while let Some(msg) = tokio::select! {
-        msg = receiver.recv() => msg,
-        _ = cancellation_token.cancelled() => {
-            println!("Remote tracing sender done");
-            return Ok(());
-        }
-    } {
-        if let Err(e) = send_stream.send_batch_message(&msg).await {
-            eprintln!("Failed to send tracing message: {e:#}");
-        }
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled(), if !receiver.is_closed() => {
+                receiver.close();
+                continue;
+            }
+            message = receiver.recv() => message,
+        };
+        let Some(message) = message else { break };
+        send_stream
+            .send_batch_message(&message)
+            .await
+            .context("failed to forward tracing message")?;
     }
+    send_stream
+        .close()
+        .await
+        .context("failed to close tracing stream")?;
     println!("Remote tracing sender done, no more messages to send");
     Ok(())
 }
@@ -110,18 +119,4 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin + Send>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rcpd_type_display() {
-        assert_eq!(format!("{}", RcpdType::Source), "source");
-        assert_eq!(format!("{}", RcpdType::Destination), "destination");
-    }
-
-    #[test]
-    fn test_rcpd_type_debug() {
-        assert_eq!(format!("{:?}", RcpdType::Source), "Source");
-        assert_eq!(format!("{:?}", RcpdType::Destination), "Destination");
-    }
-}
+mod tests;
