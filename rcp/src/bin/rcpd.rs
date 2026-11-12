@@ -698,6 +698,22 @@ where
     .await
 }
 
+const TRACING_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn finish_tracing_sender(
+    task: remote::AbortOnDropTask<()>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    // the same grace bounds an in-flight frame and the remaining queue. The task guard aborts
+    // on expiry or caller cancellation instead of detaching a sender blocked on the master
+    cancellation_token.cancel();
+    match tokio::time::timeout(TRACING_DRAIN_GRACE, task.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("Tracing sender task failed: {error:#}"),
+        Err(_) => eprintln!("Timed out draining remote tracing messages"),
+    }
+}
+
 #[instrument]
 async fn async_main(
     args: Args,
@@ -802,13 +818,14 @@ async fn async_main(
     let tracing_cancel = tokio_util::sync::CancellationToken::new();
     let tracing_task = {
         let cancel = tracing_cancel.clone();
-        tokio::spawn(async move {
+        remote::AbortOnDropTask::new(tokio::spawn(async move {
             if let Err(e) =
                 remote::tracelog::run_sender(tracing_receiver, tracing_send_stream, cancel).await
             {
-                tracing::warn!("Tracing sender failed: {e:#}");
+                // its receiver is gone, so reporting through tracing would lose this diagnostic
+                eprintln!("Tracing sender failed: {e:#}");
             }
-        })
+        }))
     };
     // check if stdin is available for monitoring
     // SSH with -T closes stdin immediately, so we only monitor if it's actually open
@@ -850,15 +867,8 @@ async fn async_main(
         result_committed,
     )
     .await;
-    // cancel tracing task and wait for it to finish — BOUNDED: the sender polls its cancellation
-    // token only between messages, so one suspended mid-send on a partitioned (or
-    // stopped-reading) master would otherwise hold this await for a whole transport timeout
-    // (another keepalive budget, or the kernel's ~15min retransmission limit with keepalive
-    // disabled), defeating the watchdog's prompt teardown. On the ordinary path the final flush
-    // completes in milliseconds; a sender that cannot flush within the bound has no one left
-    // reading it — stop waiting and let process exit reclaim the socket.
-    tracing_cancel.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracing_task).await;
+    // finish queued output while the master still owns its tracing receiver
+    finish_tracing_sender(tracing_task, tracing_cancel).await;
     match rcpd_result {
         remote::protocol::RcpdResult::Success {
             message,
@@ -992,6 +1002,93 @@ fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocked_tracing_sender() -> (
+        remote::AbortOnDropTask<()>,
+        tokio_util::sync::CancellationToken,
+        tokio::io::DuplexStream,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(common::remote_tracing::TracingMessage::Log {
+                timestamp: std::time::UNIX_EPOCH,
+                level: "INFO".to_owned(),
+                target: "rcp::source".to_owned(),
+                message: "queued preview".to_owned(),
+            })
+            .unwrap();
+        let (writer, reader) = tokio::io::duplex(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let token = shutdown.clone();
+        let task = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            remote::tracelog::run_sender(receiver, remote::streams::SendStream::new(writer), token)
+                .await
+                .unwrap();
+        }));
+        (task, shutdown, reader)
+    }
+
+    async fn assert_tracing_writer_was_aborted(mut reader: tokio::io::DuplexStream) {
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("the sender must release its stream after shutdown ends")
+        .unwrap();
+        // only the byte already buffered may remain. A detached sender resumes once we read
+        // and sends the rest of the frame, which would make an EOF-only assertion pass
+        assert!(
+            remaining.len() <= 1,
+            "sender continued writing after shutdown: {} bytes",
+            remaining.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracing_sender_timeout_aborts_a_blocked_write() {
+        let (task, shutdown, mut reader) = blocked_tracing_sender();
+        reader.read_u8().await.unwrap();
+        let started = tokio::time::Instant::now();
+        finish_tracing_sender(task, shutdown).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert_tracing_writer_was_aborted(reader).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_tracing_sender_shutdown_aborts_a_blocked_write() {
+        let (task, shutdown, mut reader) = blocked_tracing_sender();
+        reader.read_u8().await.unwrap();
+        let mut finish = Box::pin(finish_tracing_sender(task, shutdown));
+        assert!(futures::poll!(&mut finish).is_pending());
+        drop(finish);
+        assert_tracing_writer_was_aborted(reader).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracing_sender_shutdown_waits_for_queued_output() -> anyhow::Result<()> {
+        let (task, shutdown, reader) = blocked_tracing_sender();
+        let mut stream = remote::streams::RecvStream::new(reader);
+        let receive = async {
+            let message = stream
+                .recv_object::<common::remote_tracing::TracingMessage>()
+                .await?;
+            let Some(common::remote_tracing::TracingMessage::Log { message, .. }) = message else {
+                panic!("shutdown must forward the queued preview");
+            };
+            assert_eq!(message, "queued preview");
+            assert!(
+                stream
+                    .recv_object::<common::remote_tracing::TracingMessage>()
+                    .await?
+                    .is_none()
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        let ((), received) = tokio::join!(finish_tracing_sender(task, shutdown), receive);
+        received
+    }
 
     struct HeldCapture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for HeldCapture {

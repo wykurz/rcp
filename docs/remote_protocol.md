@@ -921,6 +921,16 @@ After successful wire results, a failed daemon exit or process wait still fails 
 includes errors flushing explicitly requested timing artifacts during daemon shutdown. Earlier
 operation or protocol failures remain the primary error; teardown still drains tracing receivers.
 
+After the daemon operation finishes, its tracing sender closes message admission when it observes
+the shutdown request and forwards the already-accepted messages in order before closing the stream.
+Live tracing/progress producers do not keep this drain open. A frame already being sent completes
+before the sender handles shutdown; it is never cancelled and restarted on the same stream. The
+daemon gives the in-flight frame and queued messages one shared five-second grace. A transport
+failure ends forwarding, and grace expiry or caller cancellation aborts the owned sender rather than
+detaching it. Forwarding remains best effort: a failed or stalled peer can lose remaining output,
+and these failures do not replace the operation result. The master keeps its tracing receivers alive
+while waiting for daemon exit, then gives them their existing final drain grace.
+
 **rcpd Lifecycle Management:**
 
 - **stdin watchdog**: Monitors stdin for EOF to detect master disconnection (SSH-level: fires when
