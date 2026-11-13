@@ -15,6 +15,8 @@ mod fixtures;
 mod remote_command;
 #[path = "support/remote_log.rs"]
 mod remote_log;
+#[path = "support/summary.rs"]
+mod summary;
 use fixtures::{
     create_test_file, describe_samples, get_file_content, get_file_mode, sample_while_running,
     setup_test_env,
@@ -24,6 +26,7 @@ use remote_command::{
     run_rcp_with_args_at_default_verbosity, run_rcp_with_args_home_and_env, shell_quote_for_test,
 };
 use remote_log::{rcpd_logs_contain, rcpd_role_hellos_received};
+use summary::parse_summary_from_output;
 
 fn cache_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".cache/rcp/bin")
@@ -576,61 +579,6 @@ fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     output
 }
 
-macro_rules! parse_field {
-    ($line:expr, $prefix:expr, $target:expr, $found_any:expr) => {
-        if let Some(value) = $line.strip_prefix($prefix) {
-            $target = value.parse().ok()?;
-            $found_any = true;
-            continue;
-        }
-    };
-}
-
-#[rustfmt::skip]
-fn parse_summary_from_output(output: &std::process::Output) -> Option<common::copy::Summary> {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut summary = common::copy::Summary::default();
-    let mut found_any = false;
-    for line in stdout.lines() {
-        // special handling for bytes_copied which has a unit suffix (e.g., "40 B")
-        if let Some(value_str) = line.strip_prefix("bytes copied: ") {
-            // strip unit suffix by taking only the numeric part
-            if let Some(num_str) = value_str.split_whitespace().next() {
-                summary.bytes_copied = num_str.parse().ok()?;
-                found_any = true;
-                continue;
-            }
-        }
-        parse_field!(line, "files copied: ", summary.files_copied, found_any);
-        parse_field!(line, "symlinks created: ", summary.symlinks_created, found_any);
-        parse_field!(line, "directories created: ", summary.directories_created, found_any);
-        parse_field!(line, "files unchanged: ", summary.files_unchanged, found_any);
-        parse_field!(line, "symlinks unchanged: ", summary.symlinks_unchanged, found_any);
-        parse_field!(line, "directories unchanged: ", summary.directories_unchanged, found_any);
-        parse_field!(line, "files removed: ", summary.rm_summary.files_removed, found_any);
-        parse_field!(line, "symlinks removed: ", summary.rm_summary.symlinks_removed, found_any);
-        parse_field!(line, "directories removed: ", summary.rm_summary.directories_removed, found_any);
-        parse_field!(line, "files skipped: ", summary.files_skipped, found_any);
-        parse_field!(line, "symlinks skipped: ", summary.symlinks_skipped, found_any);
-        parse_field!(line, "directories skipped: ", summary.directories_skipped, found_any);
-        parse_field!(line, "specials skipped: ", summary.specials_skipped, found_any);
-        // special handling for bytes_removed which has a unit suffix (e.g., "40 B")
-        if let Some(value_str) = line.strip_prefix("bytes removed: ")
-            && let Some(num_str) = value_str.split_whitespace().next()
-        {
-            summary.rm_summary.bytes_removed = num_str.parse().ok()?;
-            found_any = true;
-            continue;
-        }
-        // If no prefix matched, do nothing.
-    }
-    if found_any {
-        Some(summary)
-    } else {
-        None
-    }
-}
-
 /// A long `$HOME` must not break remote copies.
 ///
 /// The SSH connection-multiplexing socket used to live under `$HOME/.local/state`, and
@@ -887,7 +835,7 @@ fn test_remote_copy_directory() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 2);
     assert_eq!(summary.directories_created, 1);
-    assert_eq!(summary.bytes_copied, 40); // "remote dir content 1" (20) + "remote dir content 2" (20)
+    assert_eq!(summary.bytes_copied, "40 B"); // "remote dir content 1" (20) + "remote dir content 2" (20)
 }
 
 #[test]
@@ -1245,17 +1193,10 @@ fn test_remote_copy_many_small_files() {
             "file_{i:04}.txt content mismatch"
         );
     }
-    // verify files were copied by checking stdout for the count
-    // (parse_summary_from_output may fail due to bytes_copied having KB/MB suffix)
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&format!("files copied: {num_files}")),
-        "Expected 'files copied: {num_files}' in output"
-    );
-    assert!(
-        stdout.contains("directories created: 1"),
-        "Expected 'directories created: 1' in output"
-    );
+    let summary = parse_summary_from_output(&output).expect("summary with rounded byte total");
+    assert_eq!(summary.files_copied, num_files);
+    assert_eq!(summary.directories_created, 1);
+    assert_eq!(summary.bytes_copied, "2.7 KiB");
 }
 
 #[test]
@@ -1321,8 +1262,8 @@ fn test_remote_copy_with_overwrite() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 1);
     assert_eq!(summary.rm_summary.files_removed, 1); // file-to-file overwrite removes the old file first
-    assert_eq!(summary.rm_summary.bytes_removed, 11); // "old content"
-    assert_eq!(summary.bytes_copied, 26); // "new content that is longer"
+    assert_eq!(summary.rm_summary.bytes_removed, "11 B"); // "old content"
+    assert_eq!(summary.bytes_copied, "26 B"); // "new content that is longer"
 }
 
 #[test]
@@ -1469,7 +1410,7 @@ fn test_remote_copy_without_overwrite_fails() {
     // verify summary shows no files copied (error occurred before copy)
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0);
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
 }
 
 #[test]
@@ -1780,7 +1721,7 @@ fn test_remote_overwrite_directory_with_directory() {
     assert_eq!(summary.files_copied, 3); // file1, file2, file3
     assert_eq!(summary.rm_summary.files_removed, 1); // file1.txt overwrite removes the old file first
     assert_eq!(summary.directories_created, 0); // directory already existed
-    assert_eq!(summary.bytes_copied, 24); // "content1" (8) + "content2" (8) + "content3" (8)
+    assert_eq!(summary.bytes_copied, "24 B"); // "content1" (8) + "content2" (8) + "content3" (8)
 }
 
 /// A reused destination directory announces Ready only after building its overwrite manifest.
@@ -1842,7 +1783,7 @@ fn test_remote_overwrite_file_with_directory() {
     assert_eq!(summary.rm_summary.files_removed, 1); // old "mydir" file was removed
     assert_eq!(summary.directories_created, 1); // new "mydir" directory created
     assert_eq!(summary.files_copied, 1); // nested.txt copied
-    assert_eq!(summary.bytes_copied, 14); // "nested content"
+    assert_eq!(summary.bytes_copied, "14 B"); // "nested content"
 }
 
 #[test]
@@ -1868,7 +1809,7 @@ fn test_remote_overwrite_directory_with_file() {
     assert_eq!(summary.rm_summary.files_removed, 1); // nested.txt was removed
     assert_eq!(summary.rm_summary.directories_removed, 1); // old directory was removed
     assert_eq!(summary.files_copied, 1); // new file copied
-    assert_eq!(summary.bytes_copied, 12); // "file content"
+    assert_eq!(summary.bytes_copied, "12 B"); // "file content"
 }
 
 /// Startup raises the soft limit before removal fans out, including inside a single file job.
@@ -2166,7 +2107,7 @@ fn test_remote_copy_directory_with_unreadable_files_continue() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 3);
     assert_eq!(summary.directories_created, 1);
-    assert_eq!(summary.bytes_copied, 54); // sum of 3 readable files
+    assert_eq!(summary.bytes_copied, "54 B"); // sum of 3 readable files
     // verify non-zero exit code
     assert!(!output.status.success());
 }
@@ -2584,7 +2525,7 @@ fn test_remote_copy_all_operations_fail() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0);
     assert_eq!(summary.directories_created, 1);
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
     // verify non-zero exit code
     assert!(!output.status.success());
 }
@@ -4585,7 +4526,7 @@ fn test_remote_copy_empty_directory_root() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0);
     assert_eq!(summary.directories_created, 1);
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
 }
 
 #[test]
@@ -4618,7 +4559,7 @@ fn test_remote_copy_empty_nested_directories() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0);
     assert_eq!(summary.directories_created, 4); // root + 3 subdirs
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
 }
 
 #[test]
@@ -4673,7 +4614,7 @@ fn test_remote_copy_empty_file_root() {
     // verify summary
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 1);
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
 }
 
 #[test]
@@ -8097,7 +8038,7 @@ fn remote_capacity_one_manifests_and_rejected_subtree_complete() {
             let summary = parse_summary_from_output(&output).unwrap();
             assert_eq!(summary.files_copied, 6);
             assert_eq!(summary.files_unchanged, 6);
-            assert_eq!(summary.bytes_copied, 18);
+            assert_eq!(summary.bytes_copied, "18 B");
             assert!(
                 logs.contains("skipping transfer (manifest)"),
                 "source manifest skips must execute in the daemon logs: {logs}"
@@ -8997,7 +8938,7 @@ fn test_remote_overwrite_skips_identical_files_in_directory() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 0, "no file should be copied");
     assert_eq!(summary.files_unchanged, 3, "all 3 files unchanged");
-    assert_eq!(summary.bytes_copied, 0, "no bytes written");
+    assert_eq!(summary.bytes_copied, "0 B", "no bytes written");
     assert!(
         logs.contains("skipping transfer (manifest)"),
         "source-skip marker should appear (proving data was not sent) in the daemon logs: {logs}"
@@ -9032,7 +8973,10 @@ fn test_remote_overwrite_partial_overlap_transfers_only_changed() {
     assert_eq!(summary.files_unchanged, 1, "same.txt unchanged");
     assert_eq!(summary.files_copied, 2, "changed.txt + new.txt copied");
     // only the changed + new files' bytes cross the wire (18 + 9); same.txt contributes none
-    assert_eq!(summary.bytes_copied, 27, "only changed.txt + new.txt bytes");
+    assert_eq!(
+        summary.bytes_copied, "27 B",
+        "only changed.txt + new.txt bytes"
+    );
     assert_eq!(
         get_file_content(&dst_sub.join("changed.txt")),
         "new longer content"
@@ -9170,7 +9114,7 @@ fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     // still correct: identical files are unchanged (destination drains them), no bytes written
     assert_eq!(summary.files_unchanged, 2);
-    assert_eq!(summary.bytes_copied, 0);
+    assert_eq!(summary.bytes_copied, "0 B");
     assert!(
         !logs.contains("skipping transfer (manifest)"),
         "above the cap the manifest is omitted, so the source must NOT skip-by-manifest: {logs}"
