@@ -281,16 +281,21 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
         initial_cwnd: 5,
         ..congestion::RatioConfig::default()
     });
-    let (unit, decision_rx, mut snapshot_rx) = congestion::ControlUnit::new(
+    let (unit, mut decision_rx, mut snapshot_rx) = congestion::ControlUnit::new(
         "pipeline-test",
         controller,
         metadata_rx,
         std::time::Duration::from_millis(20),
     );
     let handle = unit.spawn();
-    // give ControlUnit a moment to publish its initial decision
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let initial_decision = *decision_rx.borrow();
+    // wait for publication rather than assuming the controller has already been scheduled
+    let initial_decision = *tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        decision_rx.wait_for(|decision| decision.max_in_flight.is_some()),
+    )
+    .await
+    .expect("controller startup timed out")
+    .expect("controller stopped before publishing its initial decision");
     assert_eq!(
         initial_decision.max_in_flight,
         Some(5),
@@ -316,9 +321,14 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
     )
     .await
     .expect("rm succeeds");
-    // give the ControlUnit time to consume samples across a few ticks
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let final_snapshot = *snapshot_rx.borrow();
+    // the watch retains progress even when publication precedes this wait
+    let final_snapshot = *tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        snapshot_rx.wait_for(|snapshot| snapshot.samples_seen > samples_before),
+    )
+    .await
+    .expect("controller sample publication timed out")
+    .expect("controller stopped before publishing consumed samples");
     let final_decision = *decision_rx.borrow();
     congestion::clear_sample_sink();
     handle.abort();
