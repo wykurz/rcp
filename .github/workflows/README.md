@@ -69,6 +69,34 @@ Runs on every push and pull request to `main`:
 - **Btrfs**: The debug job reruns the common library and the remote discovery listing regression on
   a temporary Btrfs filesystem, with tests running as the ordinary runner user
 
+Documentation-only pull requests and verified workspace-version bumps use lightweight validation.
+This includes both PRs opened by `just release`; eligibility depends on the complete Git diff, not
+the branch name, author or label. There are no labels or per-release exemptions to maintain:
+
+- Prose files (`.md`, `.markdown`, `.rst`, `.adoc`) qualify anywhere in the repository, including
+  additions, deletions and renames. Common image, PDF and HTML assets qualify under `docs/` and
+  `assets/`. Executable files, symlinks and file mode/type changes do not qualify. Other extensions
+  retain full validation; `.txt`, for example, can contain requirements or test fixtures.
+- A version bump must change only `Cargo.toml`, `Cargo.lock` and optional documentation. The helper
+  compares parsed TOML snapshots and discovers package names from the workspace member manifests.
+  Only a consistent change to the workspace version, internal dependency versions and workspace
+  package versions in the lockfile qualifies. Dependencies, checksums, features and all other
+  metadata must stay identical. Unsupported metadata layouts retain full validation. Nix package
+  versions follow `Cargo.toml` automatically, so the version helper no longer edits `flake.nix`.
+
+Markdown formatting, report rendering/link/hash checks, release source identity regressions, package
+metadata checks and lightweight policy/helper tests still run in the required
+`validate / lint-and-docs` job. Rust compilation, Clippy, rustdoc, MSRV, debug/release/Btrfs tests,
+Docker tests and Nix validation are skipped for these PRs. The reporting checks install only their
+reporting dependencies; the AWS SDK and offline AWS tests remain part of full validation.
+
+The workflow still starts and retains all existing required check names: a conditional job skip
+[satisfies a required status check](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+Failure to read the Git evidence or determine validation scope fails the required lint job. Empty
+diffs, mixed code/documentation changes and unverified version changes retain full validation. Main
+pushes and release/tag or explicitly pinned validation calls also retain full coverage. This
+exemption does not change release publication or its checks.
+
 ### release.yml
 
 Builds, publishes binary packages, and publishes to crates.io when a tag is pushed. Triggered by
@@ -206,4 +234,5 @@ workflow when adding or removing workspace members.
 ### validate.yml
 
 Reusable workflow that runs all validation checks (format, lint, tests, documentation). Called by
-other workflows to ensure quality gates pass before proceeding.
+other workflows to ensure quality gates pass before proceeding. Ordinary pull requests may use the
+lightweight validation described above; release consumers always validate their pinned source fully.

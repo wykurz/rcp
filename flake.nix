@@ -18,6 +18,9 @@
       "aarch64-linux"
     ] (system:
       let
+        workspaceVersion =
+          (builtins.fromTOML (builtins.readFile (self.outPath + "/Cargo.toml")))
+          .workspace.package.version;
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
@@ -315,7 +318,7 @@
         mkRcpPackage = { packageName, binaryName, description }:
           packageRustPlatform.buildRustPackage {
             pname = binaryName;
-            version = "0.43.0";
+            version = workspaceVersion;
             src = ./.;
 
             cargoLock = {
@@ -455,7 +458,7 @@
           # All tools in one package
           rcp-all = packageRustPlatform.buildRustPackage {
             pname = "rcp-all";
-            version = "0.43.0";
+            version = workspaceVersion;
             src = ./.;
 
             cargoLock = {

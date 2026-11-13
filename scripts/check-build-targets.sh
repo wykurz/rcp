@@ -883,8 +883,11 @@ if not isinstance(nix_job, dict):
     reject("GitHub Nix job is missing")
 if has_run_shell_default(workflow) or has_run_shell_default(nix_job):
     reject("GitHub Nix all-systems flake check must not inherit a custom shell")
-if "if" in nix_job:
-    reject("GitHub Nix job must not be conditional")
+if "if" in nix_job and (
+    nix_job["if"] != "needs.scope.outputs.mode == 'full'"
+    or nix_job.get("needs") != "scope"
+):
+    reject("GitHub Nix job may only skip documentation or verified version-only PRs")
 if nix_job.get("continue-on-error") not in (None, False):
     reject("GitHub Nix job must gate all-systems evaluation failures")
 

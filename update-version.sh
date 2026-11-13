@@ -1,4 +1,4 @@
 #!/bin/sh
 git push rad main
-sed -i "s/version = \"$1\"/version = \"$2\"/" Cargo.toml flake.nix
+sed -i "s/version = \"$1\"/version = \"$2\"/" Cargo.toml
 cargo update --workspace

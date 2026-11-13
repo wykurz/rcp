@@ -434,6 +434,22 @@ create_fixture "$TEMP_DIR/coherent"
 expect_success "$TEMP_DIR/coherent"
 expect_success_without_nix "$TEMP_DIR/coherent"
 
+fixture=$(mutated_fixture github-nix-lightweight-exemption)
+sed -i "/^  nix:/a\\
+    needs: scope\n    if: needs.scope.outputs.mode == 'full'" \
+    "$fixture/.github/workflows/validate.yml"
+expect_success_without_nix "$fixture"
+
+fixture=$(mutated_fixture github-nix-unrelated-exemption)
+sed -i '/^  nix:/a\
+    if: false' "$fixture/.github/workflows/validate.yml"
+expect_failure_without_nix 'GitHub Nix job may only skip documentation or verified version-only PRs' "$fixture"
+
+fixture=$(mutated_fixture github-nix-exemption-without-scope)
+sed -i "/^  nix:/a\\
+    if: needs.scope.outputs.mode == 'full'" "$fixture/.github/workflows/validate.yml"
+expect_failure_without_nix 'GitHub Nix job may only skip documentation or verified version-only PRs' "$fixture"
+
 fixture=$(mutated_fixture github-nix-flake-check-builds-all-systems)
 sed -i 's/ --no-build//' "$fixture/.github/workflows/validate.yml"
 expect_failure_without_nix 'GitHub Nix all-systems flake check command is not exact' "$fixture"

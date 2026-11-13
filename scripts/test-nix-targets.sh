@@ -15,10 +15,22 @@ if [ "$#" -gt 0 ]; then
     EVALUATE_ONLY=yes
 fi
 
+VERSION_ROOT="$(mktemp -d)"
+trap 'rm -rf "$VERSION_ROOT"' EXIT
+printf '[workspace.package]\nversion = "999.0.0-metadata-test"\n' > "$VERSION_ROOT/Cargo.toml"
+export RCP_NIX_VERSION_TEST_ROOT="$VERSION_ROOT"
+
 RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
   let
     root = builtins.toPath (builtins.getEnv "RCP_NIX_TEST_ROOT");
     flake = builtins.getFlake (builtins.getEnv "RCP_NIX_TEST_ROOT");
+    manifestVersion = (builtins.fromTOML (builtins.readFile (root + "/Cargo.toml")))
+      .workspace.package.version;
+    versionedOutputs = (import (root + "/flake.nix")).outputs (flake.inputs // {
+      self = flake // versionedOutputs // {
+        outPath = builtins.getEnv "RCP_NIX_VERSION_TEST_ROOT";
+      };
+    });
 
     expectedTargets = {
       x86_64-linux = "x86_64-unknown-linux-musl";
@@ -174,6 +186,9 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
         compilerProviders = compilerProviderNamesOf package.nativeBuildInputs;
       in
         [
+          (equals "${label} follows the workspace version" manifestVersion package.version)
+          (equals "${label} follows a changed workspace version" "999.0.0-metadata-test"
+            versionedOutputs.packages.${system}.${packageName}.version)
           (equals "${label} build platform" expectedBuildPlatforms.${system}
             package.stdenv.buildPlatform.config)
           (equals "${label} host platform" expectedHostPlatforms.${system}

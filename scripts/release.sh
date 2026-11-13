@@ -500,7 +500,7 @@ else
     echo ""
     echo "This will update:"
     echo "  - Cargo.toml (workspace version + internal deps)"
-    echo "  - flake.nix"
+    echo "  - Cargo.lock (workspace package versions; Nix follows Cargo.toml)"
     echo ""
     read -p "Proceed? [Y/n] " -n 1 -r
     echo
@@ -540,7 +540,7 @@ else
     if [[ $REPLY =~ ^[Nn]$ ]]; then
         echo "Aborted. The version bump is left uncommitted in your working tree;"
         echo "a re-run won't resume from here until you commit it or discard it"
-        echo "(git checkout -- Cargo.toml Cargo.lock flake.nix)."
+        echo "(git checkout -- Cargo.toml Cargo.lock)."
         exit 0
     fi
 
