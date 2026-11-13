@@ -984,6 +984,8 @@ async fn dry_run_traverse_fd(
             Ok(())
         }
         common::walk::EntryKind::Dir => {
+            // only symlink target reads need the classification handle after dispatch
+            drop(handle);
             if should_report {
                 tracing::info!(
                     target: "dry_run",

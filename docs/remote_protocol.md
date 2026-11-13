@@ -984,13 +984,17 @@ description without seeking. Other seek errors follow the cursor-error handling 
 fd-relative dry-run walker uses the same cursor; the `-L` dry-run walker uses its path-based
 iterator.
 
-A live cursor that has observed EOF returns an empty batch without consuming an ops token or
-scheduling blocking work. Enumeration is terminal: entries added after that EOF are not sought out,
-and no extra read probes for later listing errors. A full batch alone does not establish EOF.
-Observing EOF does not close the stream or drop its reference to lifetime credit; an ACL error or
-cancellation still leaves a failed cursor. The production cursor ACL read occurs before enumeration
-on the `-L` path. On successful enumeration, discovery drops the cursor after processing the last
-batch's names and receiving the empty batch, which can follow inline descendant scans.
+A cursor that has observed EOF returns an empty batch without consuming an ops token or scheduling
+blocking work. Enumeration is terminal: entries added after that EOF are not sought out, and no
+extra read probes for later listing errors. A full batch alone does not establish EOF. The blocking
+read closes the stream and drops its reference to lifetime credit as soon as it observes EOF, before
+returning a short final batch for processing or inline descendant scans. Other owners, including the
+directory registry and held parent descriptors, retain lifetime credit as described in §7.8. ACL
+reads require an open stream; the production cursor ACL read occurs before enumeration on the `-L`
+path. A read failure, or cancellation after the cursor hands its stream to owned work, leaves a
+failed cursor, which cannot restart or report successful EOF. Cancelling a batch while it waits for
+an ops token leaves the cursor usable. Discovery still sends End after processing all names and
+receiving the empty batch.
 
 If a directory is Ready and its manifest proves a file unchanged, discovery sends `FileUnchanged`
 without file-task admission, coalescing already-available outcomes as described in §7.4. Other

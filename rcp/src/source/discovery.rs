@@ -1633,6 +1633,13 @@ mod tests {
         Ok(())
     }
 
+    fn source_descriptors(root: &Path) -> std::io::Result<usize> {
+        Ok(std::fs::read_dir("/proc/self/fd")?
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .count())
+    }
+
     #[tokio::test]
     async fn pipelined_directory_descriptors_stay_within_admitted_ownership_bounds()
     -> anyhow::Result<()> {
@@ -1660,22 +1667,21 @@ mod tests {
         for index in 0..70 {
             std::fs::create_dir(temp.path().join(format!("wide-{index}")))?;
         }
-        fn source_descriptors(root: &Path) -> std::io::Result<usize> {
-            Ok(std::fs::read_dir("/proc/self/fd")?
-                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-                .filter(|target| target.starts_with(root))
-                .count())
-        }
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hooks = Hooks::new({
             let peak = peak.clone();
+            let depth = depth.clone();
             let root = temp.path().to_owned();
-            move |event, _, _| {
+            move |event, path, _| {
                 let measure = event == "cursor";
                 let peak = peak.clone();
+                let depth = depth.clone();
+                let relative_depth = path.strip_prefix(&root).unwrap().components().count();
                 let root = root.clone();
                 Box::pin(async move {
                     if measure {
+                        depth.fetch_max(relative_depth, std::sync::atomic::Ordering::SeqCst);
                         peak.fetch_max(
                             source_descriptors(&root)?,
                             std::sync::atomic::Ordering::SeqCst,
@@ -1714,10 +1720,7 @@ mod tests {
             359
         );
         let held = peak.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            held >= 24,
-            "the measurement must observe the live depth-12 path"
-        );
+        assert_eq!(depth.load(std::sync::atomic::Ordering::SeqCst), 12);
         // each directory owns at most a held Dir and cursor, with four transient fds per leaf.
         // the trusted parent above this fixture is outside the measured subtree.
         let bound = 2 * (NORMAL + RESERVE) + 4 * LEAF_CAPACITY;
@@ -2654,7 +2657,20 @@ mod tests {
                 deep.push("child");
                 std::fs::create_dir(&deep)?;
             }
-            let hooks = Hooks::new(|_, _, _| Box::pin(async { Ok(()) }));
+            let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hooks = Hooks::new({
+                let root = temp.path().to_owned();
+                let peak = peak.clone();
+                move |event, _, _| {
+                    if event == "cursor" {
+                        peak.fetch_max(
+                            source_descriptors(&root).unwrap(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }
+                    Box::pin(async { Ok(()) })
+                }
+            });
             let (source, send, recv, errors) =
                 connection(temp.path(), dereference, 1, 1, Vec::new());
             let (source, messages) = tokio::time::timeout(
@@ -2690,6 +2706,12 @@ mod tests {
                     has_root_item: true
                 })
             ));
+            // short batches close ancestor cursors before descent. The hardened walk still
+            // holds its 13 directory handles; the following walk needs only the active cursor
+            assert_eq!(
+                peak.load(std::sync::atomic::Ordering::SeqCst),
+                if dereference { 1 } else { 14 }
+            );
             let events = hooks.events.lock().unwrap();
             assert_eq!(
                 events

@@ -532,19 +532,32 @@ type CursorReadHook = Box<dyn FnMut(usize, RawFd) -> std::io::Result<()> + Send>
 
 /// An independently opened directory stream whose offset survives batch boundaries.
 pub struct DirectoryCursor {
-    iterator: Option<OwnedDirectoryStream>,
-    first_read: bool,
-    exhausted: bool,
+    state: CursorState,
     #[cfg(test)]
     read_hook: Option<CursorReadHook>,
+}
+
+enum CursorState {
+    Open {
+        iterator: OwnedDirectoryStream,
+        position: CursorPosition,
+    },
+    Exhausted,
+    Failed,
+}
+
+enum CursorPosition {
+    Unread,
+    Reading,
 }
 
 impl DirectoryCursor {
     fn new(iterator: OwnedDirectoryStream) -> Self {
         Self {
-            iterator: Some(iterator),
-            first_read: true,
-            exhausted: false,
+            state: CursorState::Open {
+                iterator,
+                position: CursorPosition::Unread,
+            },
             #[cfg(test)]
             read_hook: None,
         }
@@ -554,13 +567,20 @@ impl DirectoryCursor {
     ///
     /// The stream moves through the gated reads without opening or duplicating a descriptor.
     /// An error or cancellation ends this cursor; started work owns its stream and credit.
+    /// Read ACLs before enumeration reaches EOF, which closes the stream.
     pub async fn read_acls(&mut self, side: congestion::Side) -> std::io::Result<Acls> {
-        let iterator = self
-            .iterator
-            .take()
-            .ok_or_else(|| std::io::Error::other("directory cursor was interrupted or failed"))?;
+        if matches!(self.state, CursorState::Exhausted) {
+            return Err(std::io::Error::other("directory cursor is exhausted"));
+        }
+        let CursorState::Open { iterator, position } =
+            std::mem::replace(&mut self.state, CursorState::Failed)
+        else {
+            return Err(std::io::Error::other(
+                "directory cursor was interrupted or failed",
+            ));
+        };
         let (iterator, acls) = read_acls_owned(iterator, side, true).await?;
-        self.iterator = Some(iterator);
+        self.state = CursorState::Open { iterator, position };
         Ok(acls)
     }
 
@@ -599,8 +619,8 @@ impl DirectoryCursor {
     /// The first batch refreshes the description's position immediately before reading. Later
     /// batches preserve it; this is not a snapshot of a concurrently changing directory.
     ///
-    /// While the cursor remains live, observed EOF makes later batches empty without admission
-    /// or blocking work. EOF alone does not close the stream; a full batch does not establish EOF.
+    /// Observed EOF closes the stream before returning the batch and makes later batches empty
+    /// without admission or blocking work. A full batch alone does not establish EOF.
     ///
     /// An error or cancellation after admission ends this cursor. The blocking job then owns and
     /// closes its iterator, so a later call cannot rewind or duplicate already yielded entries.
@@ -619,20 +639,29 @@ impl DirectoryCursor {
         limit: NonZeroUsize,
         seek: impl FnOnce(BorrowedFd<'_>) -> nix::Result<libc::off_t> + Send + 'static,
     ) -> std::io::Result<Vec<DirectoryEntry>> {
-        // a later ACL failure or cancellation leaves no iterator and must not look like EOF
-        if self.exhausted && self.iterator.is_some() {
-            return Ok(Vec::new());
+        match self.state {
+            CursorState::Exhausted => return Ok(Vec::new()),
+            CursorState::Failed => {
+                return Err(std::io::Error::other(
+                    "directory cursor was interrupted or failed",
+                ));
+            }
+            CursorState::Open { .. } => {}
         }
         throttle::get_ops_token().await;
-        let mut iterator = self
-            .iterator
-            .take()
-            .ok_or_else(|| std::io::Error::other("directory cursor was interrupted or failed"))?;
-        let first_read = std::mem::take(&mut self.first_read);
+        let CursorState::Open {
+            mut iterator,
+            position,
+        } = std::mem::replace(&mut self.state, CursorState::Failed)
+        else {
+            return Err(std::io::Error::other(
+                "directory cursor was interrupted or failed",
+            ));
+        };
         #[cfg(test)]
         let mut read_hook = self.read_hook.take();
-        let (returned, entries, exhausted) = run_fd_admitted_blocking(move || {
-            if first_read {
+        let (state, entries) = run_fd_admitted_blocking(move || {
+            if matches!(position, CursorPosition::Unread) {
                 // refresh btrfs's open-time cutoff after all waits, before libc buffers entries.
                 // a FUSE seek need not refresh the server's separately held backing description
                 match seek(iterator.as_fd()) {
@@ -643,26 +672,31 @@ impl DirectoryCursor {
                 }
             }
             let mut entries = Vec::with_capacity(limit.get());
-            let mut exhausted = false;
             while entries.len() < limit.get() {
                 #[cfg(test)]
                 if let Some(read_hook) = read_hook.as_mut() {
                     read_hook(entries.len(), iterator.as_raw_fd())?;
                 }
                 let Some(entry) = iterator.next_raw_entry()? else {
-                    exhausted = true;
-                    break;
+                    // close before callers process a short final batch or descend into children
+                    drop(iterator);
+                    return Ok((CursorState::Exhausted, entries));
                 };
                 if entry.name == "." || entry.name == ".." {
                     continue;
                 }
                 entries.push(entry);
             }
-            Ok((iterator, entries, exhausted))
+            Ok((
+                CursorState::Open {
+                    iterator,
+                    position: CursorPosition::Reading,
+                },
+                entries,
+            ))
         })
         .await?;
-        self.iterator = Some(returned);
-        self.exhausted = exhausted;
+        self.state = state;
         Ok(entries)
     }
 }
@@ -4120,6 +4154,7 @@ fn is_single_component(name: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::resource_tests::cursor_stream;
     use super::*;
     use crate::preserve::Metadata;
     use crate::testutils;
@@ -4208,7 +4243,7 @@ mod tests {
                     } else {
                         root.entries().await?
                     };
-                    let stream = cursor.iterator.as_ref().unwrap();
+                    let stream = cursor_stream(&cursor);
                     let fd = stream.as_fd().try_clone_to_owned()?;
                     // a nonseekable stream cannot model an advanced position that must rewind
                     match nix::unistd::lseek(&fd, 0, nix::unistd::Whence::SeekCur) {
@@ -4291,7 +4326,7 @@ mod tests {
         }
         let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
         let mut cursor = root.entries().await?;
-        let held_fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+        let held_fd = cursor_stream(&cursor).as_raw_fd();
         let limit = NonZeroUsize::new(1).unwrap();
         let first = cursor
             .next_batch_with_seek(limit, move |fd| {
@@ -4299,7 +4334,7 @@ mod tests {
                 Err(nix::errno::Errno::ESPIPE)
             })
             .await?;
-        assert_eq!(cursor.iterator.as_ref().unwrap().as_raw_fd(), held_fd);
+        assert_eq!(cursor_stream(&cursor).as_raw_fd(), held_fd);
         let second = cursor
             .next_batch_with_seek(limit, |_| panic!("continuing a cursor must not seek again"))
             .await?;
@@ -4395,53 +4430,73 @@ mod tests {
         Ok(())
     }
 
-    #[cfg_attr(rcp_nix_sandbox, ignore = "Nix sandbox cannot write POSIX ACL xattrs")]
     #[tokio::test]
-    async fn cursor_eof_retains_its_descriptor_and_credit_for_acl_reads() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let access = restrictive_access_acl();
-        let default = permissive_acl();
-        set_xattr_at(tmp.path(), ACL_ACCESS_XATTR, &access);
-        set_xattr_at(tmp.path(), ACL_DEFAULT_XATTR, &default);
-        let credit = Arc::new(());
-        let remaining = Arc::downgrade(&credit);
-        let mut cursor =
-            DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
-                .await?;
-        let fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
-        let identity = testutils::FdIdentityProbe::capture(fd)?;
-        let limit = NonZeroUsize::new(64).unwrap();
-        assert!(cursor.next_batch(limit).await?.is_empty());
-        assert!(!identity.original_is_closed()?);
-        assert!(remaining.upgrade().is_some());
-        let acls = cursor.read_acls(congestion::Side::Source).await?;
-        assert_eq!(acls.access, Some(access));
-        assert_eq!(acls.default, Some(default));
-        assert_eq!(cursor.iterator.as_ref().unwrap().as_raw_fd(), fd);
-        cursor.read_hook = Some(Box::new(|_, _| {
-            Err(std::io::Error::other(
-                "an ACL read cleared the cursor's EOF",
-            ))
-        }));
-        assert!(cursor.next_batch(limit).await?.is_empty());
-        drop(cursor);
-        assert!(identity.original_is_closed()?);
-        assert!(remaining.upgrade().is_none());
+    async fn cursor_eof_releases_its_descriptor_and_credit_before_returning_the_batch()
+    -> anyhow::Result<()> {
+        for (count, sizes) in [(0, vec![0]), (1, vec![1]), (3, vec![3, 0]), (4, vec![3, 1])] {
+            let tmp = tempfile::tempdir()?;
+            for index in 0..count {
+                crate::filegen::write_file(
+                    crate::get_progress(),
+                    tmp.path().join(format!("file-{index}")),
+                    1,
+                    1,
+                    0,
+                )
+                .await
+                .map_err(|error| error.source)?;
+            }
+            let credit = Arc::new(());
+            let remaining = Arc::downgrade(&credit);
+            let mut cursor = DirectoryCursor::open_following_symlinks(
+                tmp.path(),
+                congestion::Side::Source,
+                credit,
+            )
+            .await?;
+            let identity = testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?;
+            let limit = NonZeroUsize::new(3).unwrap();
+            for size in sizes {
+                let batch = cursor.next_batch(limit).await?;
+                assert_eq!(batch.len(), size, "entry count={count}");
+                let eof = size < 3;
+                assert_eq!(
+                    identity.original_is_closed()?,
+                    eof,
+                    "entry count={count}, batch={size}"
+                );
+                assert_eq!(
+                    remaining.upgrade().is_none(),
+                    eof,
+                    "entry count={count}, batch={size}"
+                );
+            }
+            let submissions = testutils::BlockingSubmissions::start();
+            assert!(cursor.read_acls(congestion::Side::Source).await.is_err());
+            assert!(cursor.next_batch(limit).await?.is_empty());
+            assert_eq!(
+                submissions.count(),
+                0,
+                "an exhausted cursor reopened its directory"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn cursor_eof_does_not_hide_a_later_acl_failure() -> anyhow::Result<()> {
+    async fn cursor_partial_read_does_not_hide_a_later_acl_failure() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
+        crate::filegen::write_file(crate::get_progress(), tmp.path().join("entry"), 1, 1, 0)
+            .await
+            .map_err(|error| error.source)?;
         let credit = Arc::new(());
         let remaining = Arc::downgrade(&credit);
         let mut cursor =
             DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
                 .await?;
-        let identity =
-            testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
-        let limit = NonZeroUsize::new(64).unwrap();
-        assert!(cursor.next_batch(limit).await?.is_empty());
+        let identity = testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?;
+        let limit = NonZeroUsize::new(1).unwrap();
+        assert_eq!(cursor.next_batch(limit).await?.len(), 1);
         let _failure = testutils::BlockingPathGate::fail_once(tmp.path(), libc::EIO);
         assert_eq!(
             cursor
@@ -4461,17 +4516,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_eof_does_not_hide_a_cancelled_acl_read() -> anyhow::Result<()> {
+    async fn cursor_partial_read_does_not_hide_a_cancelled_acl_read() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
+        crate::filegen::write_file(crate::get_progress(), tmp.path().join("entry"), 1, 1, 0)
+            .await
+            .map_err(|error| error.source)?;
         let credits = Arc::new(tokio::sync::Semaphore::new(1));
         let credit = Arc::new(credits.clone().acquire_owned().await?);
         let mut cursor =
             DirectoryCursor::open_following_symlinks(tmp.path(), congestion::Side::Source, credit)
                 .await?;
-        let identity =
-            testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
-        let limit = NonZeroUsize::new(64).unwrap();
-        assert!(cursor.next_batch(limit).await?.is_empty());
+        let identity = testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?;
+        let limit = NonZeroUsize::new(1).unwrap();
+        assert_eq!(cursor.next_batch(limit).await?.len(), 1);
         let mut gate = testutils::BlockingPathGate::install(tmp.path());
         let mut read = Box::pin(cursor.read_acls(congestion::Side::Source));
         assert!(futures::poll!(read.as_mut()).is_pending());
@@ -4626,7 +4683,7 @@ mod tests {
             // inspect kernel positions before first-read seeks and buffering can hide sharing
             let position = |cursor: &DirectoryCursor| {
                 nix::unistd::lseek(
-                    cursor.iterator.as_ref().unwrap().as_fd(),
+                    cursor_stream(cursor).as_fd(),
                     0,
                     nix::unistd::Whence::SeekCur,
                 )
@@ -4677,7 +4734,7 @@ mod tests {
         }
         let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
         let mut cursor = root.entries().await?;
-        let fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+        let fd = cursor_stream(&cursor).as_raw_fd();
         cursor.read_hook = Some(Box::new(|accepted, _| {
             if accepted == 1 {
                 Err(std::io::Error::from_raw_os_error(libc::EIO))
@@ -4714,21 +4771,15 @@ mod tests {
         let root_path = testutils::create_temp_dir().await?;
         let root = Dir::open_root_dir(&root_path, false, congestion::Side::Source).await?;
         let mut inspect = root.entries().await?;
+        let CursorState::Open {
+            iterator: inspect, ..
+        } = &mut inspect.state
+        else {
+            panic!("fresh cursor has no stream");
+        };
         let mut raw_names = [
-            inspect
-                .iterator
-                .as_mut()
-                .unwrap()
-                .next_raw_entry()?
-                .unwrap()
-                .name,
-            inspect
-                .iterator
-                .as_mut()
-                .unwrap()
-                .next_raw_entry()?
-                .unwrap()
-                .name,
+            inspect.next_raw_entry()?.unwrap().name,
+            inspect.next_raw_entry()?.unwrap().name,
         ];
         raw_names.sort();
         assert_eq!(
@@ -4738,14 +4789,7 @@ mod tests {
                 std::ffi::OsString::from("..")
             ]
         );
-        assert!(
-            inspect
-                .iterator
-                .as_mut()
-                .unwrap()
-                .next_raw_entry()?
-                .is_none()
-        );
+        assert!(inspect.next_raw_entry()?.is_none());
         let mut cursor = root.entries().await?;
         let admission = testutils::AdmissionLimit::new().await;
         admission.set_files_in_flight(1);

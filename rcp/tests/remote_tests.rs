@@ -5705,6 +5705,73 @@ fn test_remote_dry_run_directory() {
     );
 }
 
+/// Preview releases idle descriptors before descending, including when a parent spans batches.
+#[tokio::test]
+async fn remote_dry_run_deep_tree_fits_a_low_hard_descriptor_limit() {
+    require_local_ssh();
+    for (siblings, depth, descriptor_limit) in [(0, 96, 160), (70, 40, 128)] {
+        let fixture = tempfile::tempdir().unwrap();
+        let src = fixture.path().join("source");
+        std::fs::create_dir(&src).unwrap();
+        let mut directory = src.clone();
+        for _ in 0..depth {
+            let child = directory.join("child");
+            std::fs::create_dir(&child).unwrap();
+            for index in 0..siblings {
+                common::filegen::write_file(
+                    common::get_progress(),
+                    directory.join(format!("file-{index}")),
+                    0,
+                    1,
+                    0,
+                )
+                .await
+                .unwrap();
+            }
+            directory = child;
+        }
+        common::filegen::write_file(common::get_progress(), directory.join("payload"), 1, 1, 0)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("payload", directory.join("link")).unwrap();
+        let wrapper = fixture.path().join("limited-rcpd");
+        let daemon = shell_quote_for_test(&assert_cmd::cargo::cargo_bin("rcpd"));
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nulimit -n {descriptor_limit} || exit 1\nexec {daemon} \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let daemon_arg = format!("--rcpd-path={}", wrapper.display());
+        let src_remote = format!("localhost:{}", src.display());
+        let dst = fixture.path().join("destination");
+        let dst_remote = format!("localhost:{}", dst.display());
+        for dereference in [false, true] {
+            let mut args = vec![
+                "--dry-run=brief",
+                "--fail-early",
+                "--summary",
+                "--max-connections=1",
+                daemon_arg.as_str(),
+                src_remote.as_str(),
+                dst_remote.as_str(),
+            ];
+            if dereference {
+                args.push("-L");
+            }
+            let output = run_rcp_and_expect_success(&args);
+            let summary = parse_summary_from_output(&output).expect("preview summary missing");
+            assert_eq!(summary.directories_created, depth + 1);
+            assert_eq!(
+                summary.files_copied,
+                siblings * depth + 1 + usize::from(dereference)
+            );
+            assert_eq!(summary.symlinks_created, usize::from(!dereference));
+            assert!(!dst.exists(), "preview created its destination");
+        }
+    }
+}
+
 /// Test remote copy with filtered root file - should not hang, nothing copied.
 #[test]
 fn test_remote_filter_excludes_root_file() {
