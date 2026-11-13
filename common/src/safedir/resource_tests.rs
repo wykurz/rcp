@@ -1,6 +1,13 @@
 use super::*;
 use anyhow::Context as _;
 
+pub(super) fn cursor_stream(cursor: &DirectoryCursor) -> &OwnedDirectoryStream {
+    match &cursor.state {
+        CursorState::Open { iterator, .. } => iterator,
+        _ => panic!("cursor has no open stream"),
+    }
+}
+
 fn gate_descriptor_stage(
     fd: RawFd,
     stage: Option<&str>,
@@ -91,7 +98,7 @@ async fn directory_credit_outlives_parent_and_closes_cursor_before_release() -> 
     );
     let cursor = dir.entries().await?;
     let cursor_probe =
-        crate::testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
+        crate::testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?;
     drop(dir);
     assert!(dir_probe.original_is_closed()?);
     assert_eq!(
@@ -121,8 +128,7 @@ async fn following_cursor_retains_credit_and_follows_the_requested_symlink() -> 
         credit(&gate).await,
     )
     .await?;
-    let probe =
-        crate::testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?;
+    let probe = crate::testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?;
     assert_eq!(
         gate.available_permits(),
         0,
@@ -309,7 +315,7 @@ async fn cancelled_following_cursor_acl_read_keeps_credit_until_its_descriptor_c
         credit(&gate).await,
     )
     .await?;
-    let cursor_fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+    let cursor_fd = cursor_stream(&cursor).as_raw_fd();
     let mut barrier = crate::testutils::BlockingPathGate::install(&child);
     let task = tokio::spawn(async move { cursor.read_acls(congestion::Side::Source).await });
     let fd =
@@ -349,12 +355,12 @@ async fn cursor_acl_reads_preserve_its_position_and_descriptor() -> anyhow::Resu
         credit(&gate).await,
     )
     .await?;
-    let fd = cursor.iterator.as_ref().unwrap().as_raw_fd();
+    let fd = cursor_stream(&cursor).as_raw_fd();
     let first = cursor.next_batch(NonZeroUsize::new(1).unwrap()).await?;
     let acls = cursor.read_acls(congestion::Side::Source).await?;
     assert!(acls.access.is_none());
     assert!(acls.default.is_none());
-    assert_eq!(cursor.iterator.as_ref().unwrap().as_raw_fd(), fd);
+    assert_eq!(cursor_stream(&cursor).as_raw_fd(), fd);
     let second = cursor.next_batch(NonZeroUsize::new(1).unwrap()).await?;
     assert_ne!(first[0].name, second[0].name);
     assert!(
@@ -363,7 +369,7 @@ async fn cursor_acl_reads_preserve_its_position_and_descriptor() -> anyhow::Resu
             .await?
             .is_empty()
     );
-    assert_eq!(gate.available_permits(), 0);
+    assert_eq!(gate.available_permits(), 1, "EOF retained cursor credit");
     drop(cursor);
     assert_eq!(gate.available_permits(), 1);
     Ok(())
@@ -407,7 +413,7 @@ async fn created_directory_lifetime_guard_runs_after_directory_and_cursor_close(
     let cursor = dir.entries().await?;
     descriptors.lock().unwrap().extend([
         crate::testutils::FdIdentityProbe::capture(dir.fd.as_raw_fd())?,
-        crate::testutils::FdIdentityProbe::capture(cursor.iterator.as_ref().unwrap().as_raw_fd())?,
+        crate::testutils::FdIdentityProbe::capture(cursor_stream(&cursor).as_raw_fd())?,
     ]);
     drop(guard);
     drop(dir);

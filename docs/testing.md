@@ -164,8 +164,8 @@ first batch's blocking read job, and keep their position across later batches. T
 tests also catch a missing initial seek on filesystems such as ext4; the cursor test advances the
 shared offset while the read waits for a blocking thread. Btrfs additionally exercises the cutoff
 after creation and rename replacement between cursor opening and its first read. The recipe also
-selects cursor lifecycle tests; the ACL-content test requires POSIX ACL xattrs and is excluded from
-the Nix sandbox, while the listing-position regressions need no exemption:
+selects cursor lifecycle tests, including descriptor closure on EOF and ownership during cancelled
+reads. These listing and cursor regressions need no Nix sandbox exemption:
 
 ```bash
 TMPDIR=/path/on/btrfs just test -p rcp-tools-common --lib \
