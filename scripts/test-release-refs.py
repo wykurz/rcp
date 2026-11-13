@@ -420,7 +420,8 @@ class ReleaseTagTests(unittest.TestCase):
         self.assertEqual(step["uses"], CHECKOUT, "review the checkout adapter when upgrading the action")
         settings = step.get("with", {})
         self.assertLessEqual(set(settings), {"ref", "persist-credentials", "fetch-depth"})
-        self.assertEqual(settings.get("fetch-depth", "1"), "1")
+        depth = settings.get("fetch-depth", "1")
+        self.assertIn(depth, ("0", "1"))
         ref = str(expression(settings.get("ref", ""), values)).strip()
         commit = ""
         if not ref:
@@ -446,7 +447,8 @@ class ReleaseTagTests(unittest.TestCase):
         repo.mkdir()
         self.git(repo, "init", "-b", "main")
         self.git(repo, "remote", "add", "origin", self.source.as_uri())
-        fetched = self.git(repo, "fetch", "--no-tags", "--depth=1", "origin", *specs, check=check)
+        depth_args = ["--depth=1"] if depth == "1" else []
+        fetched = self.git(repo, "fetch", "--no-tags", *depth_args, "origin", *specs, check=check)
         if fetched.returncode == 0:
             if ref and not upper.startswith("REFS/"):
                 branch = "refs/remotes/origin/" + ref
@@ -1030,9 +1032,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_release_regressions_run_in_required_lint_job(self):
         flow = workflow("validate.yml")
         job = flow["jobs"]["lint-and-docs"]
-        self.assertNotIn("if", job)
+        # scope failures must reach the required lint gate instead of skipping every required job
+        self.assertEqual(job["if"], "always()")
         self.assertNotIn("continue-on-error", job)
-        self.assertEqual(dependencies(job), [])
+        self.assertEqual(dependencies(job), ["scope"])
         matches = [s for s in job["steps"] if "release-ref-test" in s.get("run", "")]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["run"], "just release-ref-test")

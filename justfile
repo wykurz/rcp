@@ -67,6 +67,7 @@ lint: _lint-build _lint-targets
     @echo "🔍 Checking action pin consistency..."
     ./scripts/check-action-pins.py
     just release-ref-test
+    just validation-scope-test
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
     @echo "🔍 Checking walk-driver usage..."
@@ -110,6 +111,10 @@ release-ref-test:
     python3 scripts/test-release-rpm-version.py
     python3 scripts/test-stage-release-assets.py
     python3 scripts/test-release-packages.py
+
+# Exercise documentation and version-only CI routing without starting builds
+validation-scope-test:
+    python3 scripts/test-validation-scope.py
 
 # Run tests in release mode
 test-release *ARGS:

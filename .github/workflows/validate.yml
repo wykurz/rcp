@@ -19,27 +19,82 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-docs:
+  scope:
     runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.changes.outputs.mode }}
     steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      if: github.event_name == 'pull_request' && inputs.ref == ''
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Determine validation scope
+      id: changes
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        SOURCE_REF: ${{ inputs.ref }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        # Tags, main pushes and explicitly pinned release calls always validate fully.
+        mode=full
+        if [ "$EVENT_NAME" = pull_request ] && [ -z "$SOURCE_REF" ]; then
+          mode=$(python3 scripts/validation-scope.py "$BASE_SHA" "$HEAD_SHA")
+        fi
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+  lint-and-docs:
+    needs: scope
+    # A failed scope job must fail this required check, not turn every required job into a skip.
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ needs.scope.outputs.mode }}
+    steps:
+    - name: Verify validation scope
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+        VALIDATION_MODE: ${{ needs.scope.outputs.mode }}
+      run: |
+        if [ "$SCOPE_RESULT" != success ]; then
+          echo "::error::Validation scope job did not succeed ($SCOPE_RESULT)"
+          exit 1
+        fi
+        case "$VALIDATION_MODE" in
+          full|docs|version) ;;
+          *) echo "::error::Missing or invalid validation scope"; exit 1 ;;
+        esac
+
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Install Nix
+      if: needs.scope.outputs.mode == 'full'
       uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
     - name: Setup Rust
+      if: needs.scope.outputs.mode == 'full'
       uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       with:
         components: rustfmt, clippy
         target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
+      if: needs.scope.outputs.mode == 'full'
       run: |
         sudo apt-get update
         sudo apt-get install -y jq musl-tools pkg-config python3-yaml
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+
+    - name: Install lightweight check dependencies
+      if: needs.scope.outputs.mode != 'full'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq python3-yaml
 
     - name: Install just
       uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
@@ -47,6 +102,7 @@ jobs:
         tool: just
 
     - name: Format
+      if: needs.scope.outputs.mode == 'full'
       run: ./scripts/cargo-host.sh fmt --check
 
     # The CLI version is pinned here for reproducibility, but formatting output
@@ -64,7 +120,7 @@ jobs:
 
     - uses: ./.depot/actions/setup-report-python
       with:
-        aws-benchmark-tests: "true"
+        aws-benchmark-tests: ${{ needs.scope.outputs.mode == 'full' && 'true' || 'false' }}
 
     - name: Check report publishing, links, and preserved measurement hashes
       run: just report-check
@@ -86,6 +142,7 @@ jobs:
       run: ./scripts/check-rust-version.sh
 
     - name: Check build target consistency
+      if: needs.scope.outputs.mode == 'full'
       run: |
         ./scripts/test-check-build-targets.sh
         ./scripts/check-build-targets.sh
@@ -97,6 +154,9 @@ jobs:
 
     - name: Test release source identity
       run: just release-ref-test
+
+    - name: Test validation scope
+      run: just validation-scope-test
 
     - name: Check action pins
       run: |
@@ -146,20 +206,24 @@ jobs:
       run: python3 scripts/test-with-btrfs.py
 
     - name: Test benchmark harness
+      if: needs.scope.outputs.mode == 'full'
       run: just benchmark-test
 
     - name: Test AWS benchmark safety offline
+      if: needs.scope.outputs.mode == 'full'
       run: just aws-benchmark-test
 
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 
     - name: Lint
+      if: needs.scope.outputs.mode == 'full'
       run: ./scripts/cargo-host.sh clippy --workspace --all-targets -- -D warnings
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
 
     - name: Documentation
+      if: needs.scope.outputs.mode == 'full'
       run: ./scripts/cargo-host.sh doc --no-deps --workspace
       env:
         RUSTDOCFLAGS: --cfg tokio_unstable -D warnings
@@ -168,6 +232,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     needs: lint-and-docs
+    if: needs.lint-and-docs.outputs.mode == 'full'
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -202,6 +267,7 @@ jobs:
   test-musl-debug:
     runs-on: ubuntu-latest
     needs: lint-and-docs
+    if: needs.lint-and-docs.outputs.mode == 'full'
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -288,6 +354,7 @@ jobs:
   test-musl-release:
     runs-on: ubuntu-latest
     needs: lint-and-docs
+    if: needs.lint-and-docs.outputs.mode == 'full'
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -361,6 +428,7 @@ jobs:
   test-docker:
     runs-on: ubuntu-latest
     needs: lint-and-docs
+    if: needs.lint-and-docs.outputs.mode == 'full'
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -407,6 +475,7 @@ jobs:
   build-glibc:
     runs-on: ubuntu-latest
     needs: lint-and-docs
+    if: needs.lint-and-docs.outputs.mode == 'full'
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -420,9 +489,11 @@ jobs:
 
   # Validate the Nix flake and its source-owned sandbox test selection. None of the jobs above
   # touch Nix, so a flake.lock bump (Dependabot opens grouped `nix` PRs) could break `nix build`
-  # or the dev shell while the rest of CI stays green. Runs in parallel -- it's independent of
-  # the Rust lint/test jobs and gives fast feedback on the exact thing it guards.
+  # or the dev shell while the rest of CI stays green. Runs in parallel with the Rust lint/test
+  # jobs after scope classification, except for documentation and verified version-only PRs.
   nix:
+    needs: scope
+    if: needs.scope.outputs.mode == 'full'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
