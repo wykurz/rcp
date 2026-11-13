@@ -2440,12 +2440,14 @@ pub(crate) async fn resolve_dst_dir(
     protection: &Arc<crate::input_protection::InputProtection>,
 ) -> Result<DirResolution, Error> {
     let output = reservation.clone();
+    let mutation = reservation.clone();
     match dst_parent
-        .make_dir_checked(name, safedir::DST_DIR_CREATE_MODE, move |meta| {
-            output.output(meta)?;
-            output.commit();
-            Ok(())
-        })
+        .make_dir_checked(
+            name,
+            safedir::DST_DIR_CREATE_MODE,
+            move |meta| output.output(meta),
+            move || mutation.commit(),
+        )
         .await
     {
         Ok(dir) => {
@@ -2547,12 +2549,14 @@ pub(crate) async fn resolve_dst_dir(
                 )
                 .await?;
                 let output = reservation.clone();
+                let mutation = reservation.clone();
                 let dir = dst_parent
-                    .make_dir_checked(name, safedir::DST_DIR_CREATE_MODE, move |meta| {
-                        output.output(meta)?;
-                        output.commit();
-                        Ok(())
-                    })
+                    .make_dir_checked(
+                        name,
+                        safedir::DST_DIR_CREATE_MODE,
+                        move |meta| output.output(meta),
+                        move || mutation.commit(),
+                    )
                     .await
                     .with_context(|| format!("cannot create directory {:?}", dst_path))
                     .map_err(|err| {

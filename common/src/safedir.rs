@@ -801,6 +801,32 @@ impl Drop for OwnedDirectoryStream {
     }
 }
 
+/// Commit a completed blocking mutation unless its caller confirms that cleanup rolled it back.
+/// Constructed only after the first mutation succeeds; queued work instead retains the callback.
+struct MutationCommit<F: FnOnce()> {
+    on_mutation: Option<F>,
+}
+
+impl<F: FnOnce()> MutationCommit<F> {
+    fn new(on_mutation: F) -> Self {
+        Self {
+            on_mutation: Some(on_mutation),
+        }
+    }
+
+    fn rollback(mut self) {
+        self.on_mutation.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for MutationCommit<F> {
+    fn drop(&mut self) {
+        if let Some(on_mutation) = self.on_mutation.take() {
+            on_mutation();
+        }
+    }
+}
+
 impl Dir {
     /// Wrap a directory fd rcp merely OPENED (as opposed to created): its inherited-ACL state is
     /// unknown, so files created in it must assume the worst — see `children_may_inherit`.
@@ -1244,26 +1270,37 @@ impl Dir {
             // Take uid ownership — this locks the prior owner out of any further chown/chmod. If it
             // fails the directory is left untouched (transparent), which is fail-safe.
             fchown(raw, Some(Uid::from_raw(euid)), None).map_err(nix_to_io)?;
-            // the closure owns tentative admission through queued/started work. Only a successful
-            // mutation makes history permanent, including if the async waiter was cancelled.
-            on_mutation();
+            // keep admission until this blocking job either rolls back or leaves a mutation,
+            // including when the async waiter has been cancelled
+            let mutation = MutationCommit::new(on_mutation);
             // Restrict to owner-only IMMEDIATELY, so EVERY later failure leaves the directory no wider
             // than a successful copy would. Drop to a plain 0o700 first — there is no special bit to
             // lose yet; the setgid bit (if wanted) is re-added below, once the gid is correct. If the
             // chmod fails, roll the ownership back AND CHECK the rollback, so we never silently leave
             // the directory copier-owned at its original (possibly permissive) mode.
-            if let Err(chmod_err) = fchmod(raw, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)
-            {
+            let restrict = || {
+                #[cfg(test)]
+                let _gate = resource_tests::gate_directory_lockdown_chmod(raw.as_raw_fd())?;
+                fchmod(raw, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)
+            };
+            if let Err(chmod_err) = restrict() {
                 // roll the ownership back AND VERIFY it landed with an fstat: a non-honoring backend
                 // can report a false chown success, so we must never claim a restore that did not
                 // happen.
-                match fchown(raw, Some(Uid::from_raw(orig_uid)), None)
-                    .map_err(nix_to_io)
-                    .and_then(|()| fstat(raw).map_err(nix_to_io))
-                {
+                let rollback = (|| {
+                    #[cfg(test)]
+                    let _gate =
+                        resource_tests::gate_directory_lockdown_rollback(raw.as_raw_fd())?;
+                    fchown(raw, Some(Uid::from_raw(orig_uid)), None).map_err(nix_to_io)?;
+                    fstat(raw).map_err(nix_to_io)
+                })();
+                match rollback {
                     // rollback landed: back to the prior owner at its original mode (the failed chmod
                     // changed nothing). Report the chmod cause.
-                    Ok(st) if st.st_uid == orig_uid => return Err(chmod_err),
+                    Ok(st) if st.st_uid == orig_uid => {
+                        mutation.rollback();
+                        return Err(chmod_err);
+                    }
                     // rollback reported success but did not take effect (non-honoring backend).
                     Ok(st) => {
                         return Err(std::io::Error::new(
@@ -1405,26 +1442,35 @@ impl Dir {
     /// who wants the destination tree's inheritance policy honored should not be using this flag on
     /// that tree.
     pub async fn make_dir(&self, name: &OsStr, mode: u32) -> std::io::Result<Dir> {
-        self.make_dir_with_credit(name, mode, None, |_| Ok(()))
+        self.make_dir_with_credit(name, mode, None, |_| Ok(()), || {})
             .await
     }
 
     /// Create a child and check its held metadata in the same blocking job.
     ///
     /// The check runs before strict-mode ACL sanitation. A metadata or check failure triggers the
-    /// same best-effort empty-directory cleanup as an open or ACL failure. Existing creation APIs
-    /// perform no extra metadata read.
+    /// same best-effort empty-directory cleanup as an open or ACL failure. The mutation callback
+    /// runs inside the blocking job unless cleanup confirms that the opened directory was removed.
+    /// It retains its captures through cleanup even when the waiter is cancelled. Verifying removal
+    /// adds a held-descriptor stat only after failed setup and a successful cleanup unlink.
     pub(crate) async fn make_dir_checked(
         &self,
         name: &OsStr,
         mode: u32,
         check: impl FnOnce(&FileMeta) -> std::io::Result<()> + Send + 'static,
+        on_mutation: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Dir> {
-        self.make_dir_with_credit(name, mode, None, move |dir| {
-            let meta = snapshot_directory_meta(dir.fd.as_fd())?;
-            dir.captured_identity = Some((meta.dev(), meta.ino()));
-            check(&meta)
-        })
+        self.make_dir_with_credit(
+            name,
+            mode,
+            None,
+            move |dir| {
+                let meta = snapshot_directory_meta(dir.fd.as_fd())?;
+                dir.captured_identity = Some((meta.dev(), meta.ino()));
+                check(&meta)
+            },
+            on_mutation,
+        )
         .await
     }
 
@@ -1435,7 +1481,7 @@ impl Dir {
         mode: u32,
         credit: Arc<dyn std::fmt::Debug + Send + Sync>,
     ) -> std::io::Result<Dir> {
-        self.make_dir_with_credit(name, mode, Some(credit), |_| Ok(()))
+        self.make_dir_with_credit(name, mode, Some(credit), |_| Ok(()), || {})
             .await
     }
 
@@ -1445,6 +1491,7 @@ impl Dir {
         mode: u32,
         credit: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
         check: impl FnOnce(&mut Dir) -> std::io::Result<()> + Send + 'static,
+        on_mutation: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Dir> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -1460,6 +1507,8 @@ impl Dir {
                 Mode::from_bits_truncate(mode),
             )
             .map_err(nix_to_io)?;
+            let mutation = MutationCommit::new(on_mutation);
+            let mut created = None;
             let result = (|| {
                 let open_flags =
                     OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
@@ -1472,29 +1521,39 @@ impl Dir {
                 .map_err(nix_to_io)?;
                 // own the descriptor before any fallible ACL/stat action or task handoff can
                 // outlive the awaiting caller; failure closes it before releasing its credit
-                let mut created = Dir {
+                let created = created.insert(Dir {
                     captured_identity: None,
                     fd: Arc::new(DirectoryDescriptor { fd, credit }),
                     side,
                     children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
-                };
+                });
                 #[cfg(test)]
                 let _visit = resource_tests::gate_opened_descriptor(created.fd.as_raw_fd())?;
-                check(&mut created)?;
+                check(created)?;
                 if strict {
+                    #[cfg(test)]
+                    let _gate =
+                        resource_tests::gate_directory_creation_acls(created.fd.as_raw_fd())?;
                     // strip the inheritance-carrying default ACL before the access ACL
                     apply_one_acl(created.fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)?;
                     apply_one_acl(created.fd.as_raw_fd(), ACL_ACCESS_XATTR, None)?;
                 }
-                Ok(created)
+                Ok(())
             })();
             if result.is_err() {
                 // open, sanitation, or metadata failure: remove the slot best-effort. rmdir
                 // cannot follow a symlink or remove a populated replacement; an earlier identity
-                // observation would not bind this by-name removal
-                let _ = unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
+                // observation would not bind this by-name removal. only release history if the
+                // held directory itself is gone, rather than an empty replacement at its old name
+                if unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir).is_ok()
+                    && created.as_ref().is_some_and(|created| {
+                        fstat(created.fd.as_fd()).is_ok_and(|meta| meta.st_nlink == 0)
+                    })
+                {
+                    mutation.rollback();
+                }
             }
-            result
+            result.map(|()| created.expect("successful setup owns its directory"))
         })
         .await
     }
@@ -2471,8 +2530,9 @@ pub async fn lockdown_reused_dir(
     lockdown_reused_dir_with(dir, handle, || {}).await
 }
 
-/// Keep admission ownership tentative through verification and queued work, then notify after the
-/// first successful mutation. The blocking closure owns the callback if its waiter is cancelled.
+/// Keep admission ownership tentative through verification and queued work, then notify if the
+/// takeover leaves a mutation. A failed chmod whose ownership rollback succeeds does not notify.
+/// The blocking closure owns the callback if its waiter is cancelled.
 /// Outside strict mode no mutation occurs and the callback is dropped without being invoked.
 pub(crate) async fn lockdown_reused_dir_with(
     dir: &Dir,
@@ -5879,10 +5939,15 @@ mod tests {
                 if create {
                     let (sender, snapshot) = tokio::sync::oneshot::channel();
                     let dir = root
-                        .make_dir_checked(OsStr::new("child"), 0o700, move |meta| {
-                            let _ = sender.send(meta.clone());
-                            Ok(())
-                        })
+                        .make_dir_checked(
+                            OsStr::new("child"),
+                            0o700,
+                            move |meta| {
+                                let _ = sender.send(meta.clone());
+                                Ok(())
+                            },
+                            || {},
+                        )
                         .await?;
                     Ok((dir, snapshot.await.map_err(std::io::Error::other)?))
                 } else {
@@ -5919,9 +5984,12 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
         let error = root
-            .make_dir_checked(OsStr::new("child"), 0o700, |_meta| {
-                Err(std::io::Error::from_raw_os_error(libc::EIO))
-            })
+            .make_dir_checked(
+                OsStr::new("child"),
+                0o700,
+                |_meta| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                || {},
+            )
             .await
             .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));

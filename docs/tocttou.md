@@ -579,18 +579,26 @@ One registry shared across local operands, parallel branches, and delegated upda
 input and output `(dev, ino)` identities with the operation responsible for them. Admission reserves
 identities atomically, so concurrent opposite uses cannot both pass. An unsuccessful admission
 releases its own tentative reservations; it does not erase another admission's reservation or
-committed history. Once traversal or destination mutation commits participation, the history remains
-for the invocation, including strict-mode sequential operands. An error names the conflicting
-operation even when that operation has already completed. This conservative policy also prevents
-later operands from consuming earlier output.
+committed history. Empty-directory cleanup confirmed through the held descriptor, or a verified
+ownership rollback after failed setup, releases that setup's tentative claim. After a successful
+cleanup unlink, a stat of the held directory must show zero links; removing an empty replacement at
+its old name does not release the surviving directory's claim. If cleanup cannot be confirmed, or
+setup leaves a mutation, history remains even if the awaiting task was cancelled. Once traversal or
+a retained destination mutation commits participation, the history remains for the invocation,
+including strict-mode sequential operands. An error names the conflicting operation even when that
+operation has already completed. This conservative policy also prevents later operands from
+consuming earlier output.
 
 Existing output identity is checked through its held descriptor before strict-mode lockdown or
-metadata changes. Fresh creation retains registration ownership through the blocking job that can
-outlive a cancelled waiter. Replacing a non-directory commits its input reservation only after
-`unlinkat` succeeds, inside that same blocking job; a failed removal releases its tentative history.
-An overlap error inhibits that directory's `--delete` pruning through the ordinary child-error path.
-Work completed earlier can leave partial output; discovering an alias later does not roll it back.
-This registry does not provide transactional rollback.
+metadata changes. Fresh creation retains registration ownership through sanitation and any cleanup
+inside the blocking job that can outlive a cancelled waiter. Strict takeover similarly retains its
+claim through ownership rollback; failures after restricting the directory keep the mutation
+history. Replacing a non-directory commits its input reservation only after `unlinkat` succeeds,
+inside that same blocking job; a failed removal releases its tentative history. That successful
+removal stays committed if subsequent directory creation fails and cleans up. An overlap error
+inhibits that directory's `--delete` pruning through the ordinary child-error path. Work completed
+earlier can leave partial output; discovering an alias later does not roll it back. This registry
+does not provide transactional rollback.
 
 The registry and ancestry cache retain identities rather than descriptors, with memory proportional
 to encountered directories and prepared destination containers. Ancestry evidence is reused for the

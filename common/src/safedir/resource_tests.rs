@@ -41,6 +41,24 @@ pub(super) fn gate_directory_lockdown(
     gate_descriptor_stage(fd, Some(".rcp-directory-lockdown"))
 }
 
+pub(super) fn gate_directory_lockdown_chmod(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-lockdown-chmod"))
+}
+
+pub(super) fn gate_directory_lockdown_rollback(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-lockdown-rollback"))
+}
+
+pub(super) fn gate_directory_creation_acls(
+    fd: RawFd,
+) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {
+    gate_descriptor_stage(fd, Some(".rcp-directory-creation-acls"))
+}
+
 pub(super) fn gate_directory_acl(
     fd: RawFd,
 ) -> std::io::Result<Option<crate::testutils::BlockingPathGateVisit>> {

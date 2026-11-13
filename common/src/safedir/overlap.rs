@@ -519,6 +519,279 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum FailedSetup {
+        CreationAcl,
+        CreationStat,
+        OverwriteAcl,
+        RenamedCreationAcl,
+        Lockdown,
+    }
+
+    fn setup_failure_history(
+        test: &str,
+        setup: FailedSetup,
+        cleanup_fails: bool,
+        cancellations: &[bool],
+    ) -> anyhow::Result<()> {
+        if !strict_child(test.trim_start_matches("common::"))? {
+            return Ok(());
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                for &cancel in cancellations {
+                    let root = tempfile::tempdir()?;
+                    let path = root.path().canonicalize()?;
+                    let target = path.join("output");
+                    let moved = path.join("moved-output");
+                    let renamed = matches!(setup, FailedSetup::RenamedCreationAcl);
+                    let create = !matches!(setup, FailedSetup::Lockdown);
+                    std::fs::create_dir(path.join("source"))?;
+                    if matches!(setup, FailedSetup::OverwriteAcl) {
+                        std::fs::write(&target, "removed by overwrite")?;
+                    } else if !create {
+                        std::fs::create_dir(&target)?;
+                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+                    }
+                    let parent = Arc::new(
+                        Dir::open_root_dir(&path, false, congestion::Side::Destination).await?,
+                    );
+                    let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
+                    let registry = Arc::new(DirectoryOverlap::default());
+                    let reservation =
+                        registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+                    let mut gate = crate::testutils::BlockingPathGate::install(if create {
+                        target.clone()
+                    } else {
+                        target.join(".rcp-directory-lockdown")
+                    });
+                    let _failure = crate::testutils::BlockingPathGate::fail_once(
+                        if renamed { &moved } else { &target }.join(match setup {
+                            FailedSetup::CreationAcl
+                            | FailedSetup::OverwriteAcl
+                            | FailedSetup::RenamedCreationAcl => ".rcp-directory-creation-acls",
+                            FailedSetup::CreationStat => ".rcp-directory-stat",
+                            FailedSetup::Lockdown => ".rcp-directory-lockdown-chmod",
+                        }),
+                        libc::EIO,
+                    );
+                    let _rollback_failure = (!create && cleanup_fails).then(|| {
+                        crate::testutils::BlockingPathGate::fail_once(
+                            target.join(".rcp-directory-lockdown-rollback"),
+                            libc::EPERM,
+                        )
+                    });
+                    let protection = Arc::new(crate::input_protection::InputProtection::new(
+                        Arc::clone(&registry),
+                    ));
+                    let task_target = target.clone();
+                    let task = tokio::spawn(async move {
+                        crate::copy::resolve_dst_dir(
+                            crate::get_progress(),
+                            &parent,
+                            OsStr::new("output"),
+                            &task_target,
+                            &reuse_settings(),
+                            &reservation,
+                            &protection,
+                        )
+                        .await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+                        .await??;
+                    if renamed {
+                        std::fs::rename(&target, &moved)?;
+                        std::fs::create_dir(&target)?;
+                    }
+                    if create && cleanup_fails {
+                        // a populated directory makes the real cleanup rmdir fail with ENOTEMPTY
+                        std::fs::write(target.join("retained"), "keep")?;
+                    }
+                    if cancel {
+                        task.abort();
+                        assert!(task.await.err().expect("cancelled task").is_cancelled());
+                        assert!(
+                            registry.output(&source).is_err(),
+                            "started work owns its input"
+                        );
+                        gate.release_all();
+                    } else {
+                        gate.release_all();
+                        let error = task
+                            .await?
+                            .err()
+                            .expect("injected setup failure must surface");
+                        if matches!(setup, FailedSetup::OverwriteAcl) {
+                            assert_eq!(error.summary.rm_summary.files_removed, 1);
+                        }
+                        if create || !cleanup_fails {
+                            assert!(
+                                error.source.chain().any(|cause| {
+                                    cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                        error.raw_os_error() == Some(libc::EIO)
+                                    })
+                                }),
+                                "setup must report the injected I/O error: {error:#}"
+                            );
+                        } else {
+                            assert!(format!("{error:#}").contains("could not roll ownership back"));
+                        }
+                    }
+                    // one blocking worker ensures cancelled setup and its cleanup finish first
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::task::spawn_blocking(|| ()),
+                    )
+                    .await??;
+                    if create {
+                        assert_eq!(target.exists(), cleanup_fails);
+                        if cleanup_fails {
+                            assert_eq!(std::fs::read_to_string(target.join("retained"))?, "keep");
+                        }
+                    } else {
+                        assert_eq!(
+                            std::fs::metadata(&target)?.permissions().mode() & 0o777,
+                            0o755
+                        );
+                    }
+                    assert_eq!(
+                        registry.output(&source).is_err(),
+                        cleanup_fails || renamed || matches!(setup, FailedSetup::OverwriteAcl),
+                        "only mutations that were not rolled back may retain input history"
+                    );
+                    if renamed {
+                        let original =
+                            Dir::open_root_dir(&moved, false, congestion::Side::Destination)
+                                .await?
+                                .meta()
+                                .await?;
+                        assert!(
+                            registry.input(&original).is_err(),
+                            "surviving output stays registered"
+                        );
+                    }
+                }
+                anyhow::Ok(())
+            })
+    }
+
+    #[test]
+    fn failed_creation_cleanup_releases_history() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(module_path!(), "::failed_creation_cleanup_releases_history"),
+            FailedSetup::CreationAcl,
+            false,
+            &[false],
+        )
+    }
+
+    #[test]
+    fn cancelled_failed_creation_cleanup_releases_history() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::cancelled_failed_creation_cleanup_releases_history"
+            ),
+            FailedSetup::CreationAcl,
+            false,
+            &[true],
+        )
+    }
+
+    #[test]
+    fn failed_creation_cleanup_retains_history_when_directory_remains() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_creation_cleanup_retains_history_when_directory_remains"
+            ),
+            FailedSetup::CreationAcl,
+            true,
+            &[false, true],
+        )
+    }
+
+    #[test]
+    fn failed_creation_stat_retains_history_when_directory_remains() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_creation_stat_retains_history_when_directory_remains"
+            ),
+            FailedSetup::CreationStat,
+            true,
+            &[false, true],
+        )
+    }
+
+    #[test]
+    fn failed_lockdown_rollback_releases_history() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_lockdown_rollback_releases_history"
+            ),
+            FailedSetup::Lockdown,
+            false,
+            &[false],
+        )
+    }
+
+    #[test]
+    fn cancelled_failed_lockdown_rollback_releases_history() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::cancelled_failed_lockdown_rollback_releases_history"
+            ),
+            FailedSetup::Lockdown,
+            false,
+            &[true],
+        )
+    }
+
+    #[test]
+    fn failed_lockdown_rollback_retains_history_when_restore_fails() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_lockdown_rollback_retains_history_when_restore_fails"
+            ),
+            FailedSetup::Lockdown,
+            true,
+            &[false, true],
+        )
+    }
+
+    #[test]
+    fn failed_replacement_creation_keeps_successful_unlink_history() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_replacement_creation_keeps_successful_unlink_history"
+            ),
+            FailedSetup::OverwriteAcl,
+            false,
+            &[false, true],
+        )
+    }
+
+    #[test]
+    fn failed_creation_keeps_history_when_cleanup_removes_a_replacement() -> anyhow::Result<()> {
+        setup_failure_history(
+            concat!(
+                module_path!(),
+                "::failed_creation_keeps_history_when_cleanup_removes_a_replacement"
+            ),
+            FailedSetup::RenamedCreationAcl,
+            false,
+            &[false, true],
+        )
+    }
+
     #[test]
     fn strict_reuse_identity_mismatch_releases_history() -> anyhow::Result<()> {
         if !strict_child(
@@ -1161,12 +1434,14 @@ mod tests {
             ready.await?;
             let submissions = crate::testutils::BlockingSubmissions::start();
             let task = tokio::spawn(async move {
+                let mutation = reservation.clone();
                 parent
-                    .make_dir_checked(OsStr::new("output"), 0o700, move |meta| {
-                        reservation.output(meta)?;
-                        reservation.commit();
-                        Ok(())
-                    })
+                    .make_dir_checked(
+                        OsStr::new("output"),
+                        0o700,
+                        move |meta| reservation.output(meta),
+                        move || mutation.commit(),
+                    )
                     .await
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1200,13 +1475,17 @@ mod tests {
         let (finished, done) = tokio::sync::oneshot::channel();
         let task_parent = Arc::clone(&parent);
         let task = tokio::spawn(async move {
+            let mutation = reservation.clone();
             task_parent
-                .make_dir_checked(OsStr::new("output"), 0o700, move |meta| {
-                    reservation.output(meta)?;
-                    reservation.commit();
-                    let _ = finished.send(());
-                    Ok(())
-                })
+                .make_dir_checked(
+                    OsStr::new("output"),
+                    0o700,
+                    move |meta| reservation.output(meta),
+                    move || {
+                        mutation.commit();
+                        let _ = finished.send(());
+                    },
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started()).await??;
