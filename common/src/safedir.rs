@@ -24,6 +24,7 @@ use crate::timing::metadata::{Phase as MetadataTimingPhase, scope as metadata_ti
 use crate::walk::EntryKind;
 
 pub(crate) mod overlap;
+mod proc_fd;
 
 #[cfg(test)]
 mod resource_tests;
@@ -460,12 +461,12 @@ struct DirectoryDescriptor {
 
 impl DirectoryDescriptor {
     fn reopen(&self) -> std::io::Result<OwnedFd> {
-        self.reopen_with_proc_open(|path, flags| openat(AT_FDCWD, path, flags, Mode::empty()))
+        self.reopen_with_proc_open(|fd, flags| fd.open(flags))
     }
 
     fn reopen_with_proc_open(
         &self,
-        open_proc: impl FnOnce(&str, OFlag) -> nix::Result<OwnedFd>,
+        open_proc: impl FnOnce(proc_fd::ProcFd<'_>, OFlag) -> nix::Result<OwnedFd>,
     ) -> std::io::Result<OwnedFd> {
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
         match openat(self.as_fd(), c".", flags, Mode::empty()) {
@@ -474,8 +475,7 @@ impl DirectoryDescriptor {
                 // inode without that extra requirement, but still checks read permission.
                 // self keeps the fd owned throughout the open, and following this trusted magic
                 // link is intentional: O_NOFOLLOW would reject it
-                let path = format!("/proc/self/fd/{}", self.as_raw_fd());
-                open_proc(&path, flags).map_err(|error| match error {
+                open_proc(proc_fd::ProcFd::new(self.as_fd()), flags).map_err(|error| match error {
                     // an unavailable proc path must not make the held directory appear missing.
                     // retain resource and backend errors from an otherwise usable retry
                     nix::errno::Errno::ENOENT
@@ -1863,18 +1863,7 @@ impl Dir {
         let side = self.side;
         let dst_name = dst_name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::HardLink, move || {
-            let proc_path = format!("/proc/self/fd/{}", src_owned.as_raw_fd());
-            // AT_SYMLINK_FOLLOW: the /proc entry is a magic symlink that must be
-            // dereferenced to reach the pinned inode (without the flag, linkat would
-            // try to hard-link the magic symlink itself, which is not permitted).
-            linkat(
-                AT_FDCWD,
-                proc_path.as_str(),
-                dst_dir.as_fd(),
-                dst_name.as_bytes(),
-                AtFlags::AT_SYMLINK_FOLLOW,
-            )
-            .map_err(nix_to_io)
+            proc_fd::ProcFd::new(src_owned.as_fd()).hard_link_at(dst_dir.as_fd(), &dst_name)
         })
         .await
     }
@@ -2433,7 +2422,8 @@ fn rollback_default_acl(
         // name the directory rather than the descriptor: a mass abort restores many at once, and
         // "fd 47" tells an operator nothing about which tree to repair. Best-effort — a fd whose
         // target is gone falls back to the raw number rather than failing the restore.
-        let path = std::fs::read_link(format!("/proc/self/fd/{raw}"))
+        let path = proc_fd::ProcFd::new(fd.as_fd())
+            .diagnostic_path()
             .map_or_else(|_| format!("<fd {raw}>"), |p| p.display().to_string());
         let restore = apply_one_acl(raw, ACL_DEFAULT_XATTR, original.as_deref());
         match (restore, &original) {
@@ -2835,21 +2825,6 @@ fn flistxattr_names(fd: RawFd) -> std::io::Result<Vec<u8>> {
     listxattr_retry(|buf, len| unsafe { libc::flistxattr(fd, buf, len) })
 }
 
-/// `listxattr` on a PATH, following symlinks — used only for the `/proc/self/fd/N` magic symlink,
-/// which must be dereferenced to reach the inode an `O_PATH` handle pins.
-///
-/// See [`has_acl_via_proc_fd`] for why the probe cannot go through the handle's fd directly.
-fn listxattr_names_at_path(path: &CStr) -> std::io::Result<Vec<u8>> {
-    // SAFETY: `path` is a NUL-terminated C string that outlives the call and the kernel writes at
-    // most `len` bytes into `buf` (or nothing at all when `buf` is null and `len` is 0).
-    // the only caller passes /proc/self/fd/N for an fd it already holds, so this resolves to that
-    // PINNED inode: inode-exact, not a by-name lookup a swap could redirect.
-    let probe = |buf, len| {
-        unsafe { libc::listxattr(path.as_ptr(), buf, len) } // rcp-toctou-allow: /proc/self/fd magic symlink to a held fd
-    };
-    listxattr_retry(probe)
-}
-
 /// Whether the NUL-separated `list` produced by [`flistxattr_names`] contains `name`.
 fn names_contain(list: &[u8], name: &CStr) -> bool {
     list.split(|byte| *byte == 0).any(|n| n == name.to_bytes())
@@ -3047,9 +3022,7 @@ async fn has_acl_via_proc_fd(handle: &Handle, side: congestion::Side) -> std::io
     // alive for the syscall's full duration even if the originating Handle is dropped.
     let owned = handle.as_fd().try_clone_to_owned()?;
     let names = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-        let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", owned.as_raw_fd()))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-        listxattr_names_at_path(&proc_path)
+        proc_fd::ProcFd::new(owned.as_fd()).xattr_names()
     })
     .await?;
     Ok(names_contain(&names, ACL_ACCESS_XATTR) || names_contain(&names, ACL_DEFAULT_XATTR))
@@ -3363,17 +3336,7 @@ pub(crate) async fn chmod_via_proc_fd(
     // cancellable.
     let owned = handle.as_fd().try_clone_to_owned()?;
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
-        let proc_path = format!("/proc/self/fd/{}", owned.as_raw_fd());
-        // FollowSymlink: the /proc entry is a magic symlink that must be
-        // dereferenced to reach the pinned inode (NoFollowSymlink would chmod the
-        // magic link itself, a silent no-op).
-        nix::sys::stat::fchmodat(
-            AT_FDCWD,
-            proc_path.as_str(),
-            Mode::from_bits_truncate(mode),
-            nix::sys::stat::FchmodatFlags::FollowSymlink,
-        )
-        .map_err(nix_to_io)
+        proc_fd::ProcFd::new(owned.as_fd()).chmod(mode)
     })
     .await
 }
@@ -3394,8 +3357,7 @@ pub(crate) async fn stat_meta_via_proc_fd(
 ) -> std::io::Result<std::fs::Metadata> {
     let owned = handle.as_fd().try_clone_to_owned()?;
     run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-        let proc_path = format!("/proc/self/fd/{}", owned.as_raw_fd());
-        std::fs::metadata(proc_path)
+        proc_fd::ProcFd::new(owned.as_fd()).metadata()
     })
     .await
 }

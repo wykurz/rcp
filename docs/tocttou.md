@@ -987,7 +987,10 @@ fourth is an operational one the caller owes:
 - **`/proc` mounted**: The `/proc/self/fd/<n>` magic links support held-file hard links in `rlink`,
   descriptor-anchored chmod in `rchm` and removal, and metadata/ACL probes such as time filtering.
   Directory cursors and nonseekable listings also use them when reopening `.` fails with `EACCES`.
-  Standard on all Linux distributions.
+  These operations share `safedir::proc_fd::ProcFd`, which borrows the descriptor through the
+  synchronous operation inside its existing owned blocking job. Its separate diagnostic readlink
+  returns display text only; that text is never used to select an inode. Standard on all Linux
+  distributions.
 - **Actor cannot create bind mounts or manipulate mount namespaces**: Requires privilege; an
   unprivileged actor cannot exploit this.
 - **A destination subtree has a single writer**: The reused-directory lockdown under
