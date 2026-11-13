@@ -70,6 +70,13 @@ For dry runs, the master passes hidden `--preview-only` to both roles. Before re
 selects local leaf/metadata admission without reserving E data streams or N/R directory lifetimes.
 Both roles validate that `MasterHello` carries the same preview policy before dispatching work.
 
+A remote preview reports traversal failures as an unsuccessful operation, including descendant
+metadata, symlink, directory-listing, and unsupported-entry errors. Without `--fail-early`, the
+source continues previewing siblings, completes the empty `DiscoveryComplete`/`DestinationDone`
+exchange, and returns the collected error with its partial preview summary. With `--fail-early`, it
+stops at the first error. Explicitly excluded or permitted `--skip-specials` entries are not errors.
+A preview does not create its destination or verify that file contents can be read.
+
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
 - Discovers, verifies, and deploys rcpd only once (if needed)

@@ -507,6 +507,7 @@ async fn dry_run_traverse(
     is_root: bool,
     dry_run_mode: common::config::DryRunMode,
     summary: &mut common::copy::Summary,
+    errors: &common::error_collector::ErrorCollector,
 ) -> anyhow::Result<()> {
     let src_metadata = match common::walk::run_metadata_probed(
         common::Side::Source,
@@ -524,10 +525,7 @@ async fn dry_run_traverse(
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-            if settings.fail_early || is_root {
-                return Err(e.into());
-            }
-            return Ok(());
+            return Err(e.into());
         }
     };
     let is_dir = src_metadata.is_dir();
@@ -593,10 +591,7 @@ async fn dry_run_traverse(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed reading symlink {src:?}: {e:#}");
-                if settings.fail_early {
-                    return Err(e.into());
-                }
-                return Ok(());
+                return Err(e.into());
             }
         };
         if should_report {
@@ -644,9 +639,7 @@ async fn dry_run_traverse(
                 src_metadata.file_type()
             );
             tracing::error!("{:#}", &err);
-            if settings.fail_early {
-                return Err(err);
-            }
+            return Err(err);
         }
         return Ok(());
     }
@@ -712,10 +705,7 @@ async fn dry_run_traverse(
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
-            if settings.fail_early {
-                return Err(e.into());
-            }
-            return Ok(());
+            return Err(e.into());
         }
     };
     loop {
@@ -736,6 +726,7 @@ async fn dry_run_traverse(
                     false,
                     dry_run_mode,
                     summary,
+                    errors,
                 )
                 .await
                 {
@@ -743,15 +734,13 @@ async fn dry_run_traverse(
                     if settings.fail_early {
                         return Err(e);
                     }
+                    errors.push(e);
                 }
             }
             Ok(None) => break,
             Err(e) => {
                 tracing::error!("Failed traversing src directory {src:?}: {e:#}");
-                if settings.fail_early {
-                    return Err(e);
-                }
-                break;
+                return Err(e);
             }
         }
     }
@@ -822,6 +811,7 @@ async fn dry_run_traverse_fd(
     is_root: bool,
     dry_run_mode: common::config::DryRunMode,
     summary: &mut common::copy::Summary,
+    errors: &common::error_collector::ErrorCollector,
 ) -> anyhow::Result<()> {
     // classify the entry: fd-relative via the held parent fd, or — for the default-path
     // root only (`Lazy`) — by path stat, so a root the filter excludes never requires
@@ -831,10 +821,7 @@ async fn dry_run_traverse_fd(
             Ok(handle) => (handle.kind(), handle.meta().size(), Some(handle)),
             Err(e) => {
                 tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-                if settings.fail_early || is_root {
-                    return Err(e.into());
-                }
-                return Ok(());
+                return Err(e.into());
             }
         },
         DryRunDirSource::Lazy(_) => {
@@ -848,10 +835,7 @@ async fn dry_run_traverse_fd(
                 Ok(md) => (common::walk::EntryKind::from_metadata(&md), md.len(), None),
                 Err(e) => {
                     tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-                    if settings.fail_early || is_root {
-                        return Err(e.into());
-                    }
-                    return Ok(());
+                    return Err(e.into());
                 }
             }
         }
@@ -949,10 +933,7 @@ async fn dry_run_traverse_fd(
                 Ok(target) => target,
                 Err(e) => {
                     tracing::error!("Failed reading symlink {src:?}: {e:#}");
-                    if settings.fail_early {
-                        return Err(e.into());
-                    }
-                    return Ok(());
+                    return Err(e.into());
                 }
             };
             if should_report {
@@ -991,17 +972,14 @@ async fn dry_run_traverse_fd(
                 progress().specials_skipped.inc();
             } else {
                 // without --skip-specials, real copy would error on this file type — so the dry
-                // run must too. A root special is always fatal (matches the real copy's exit 1);
-                // a nested one respects --fail-early.
+                // run must too. The parent traversal decides whether to continue with siblings.
                 let err = anyhow::anyhow!(
                     "dry-run: {:?} -> {:?} unsupported (special) file type",
                     src,
                     dst
                 );
                 tracing::error!("{:#}", &err);
-                if settings.fail_early || is_root {
-                    return Err(err);
-                }
+                return Err(err);
             }
             Ok(())
         }
@@ -1105,6 +1083,7 @@ async fn dry_run_traverse_fd(
                             false,
                             dry_run_mode,
                             summary,
+                            errors,
                         )
                         .await
                         {
@@ -1112,6 +1091,7 @@ async fn dry_run_traverse_fd(
                             if settings.fail_early {
                                 return Err(error);
                             }
+                            errors.push(error);
                         }
                     }
                 }
@@ -1120,10 +1100,7 @@ async fn dry_run_traverse_fd(
             .await;
             if let Err(error) = enumeration {
                 tracing::error!("Cannot enumerate directory {src:?}: {error:#}");
-                if settings.fail_early || is_root {
-                    return Err(error);
-                }
-                return Ok(());
+                return Err(error);
             }
             // after recursing, check if anything was added inside this directory.
             // if nothing was added AND this directory doesn't directly match an include pattern,
@@ -1188,37 +1165,61 @@ async fn handle_dry_run_connection(
     // operand resolution a symlinked operand prefix fails closed at the parent open. `-L`
     // keeps the path-based reporter (follows symlinks by request; documented not hardened).
     let mut summary = common::copy::Summary::default();
-    if settings.dereference {
-        dry_run_traverse(settings, src, dst, src, true, dry_run_mode, &mut summary).await?;
-    } else {
-        let operand = common::walk::split_root_operand(src).await?;
-        let display = operand.display.clone();
-        // strict operand resolution: open the parent EAGERLY (openat2 RESOLVE_NO_SYMLINKS)
-        // so a symlinked operand prefix fails closed before anything is reported. On the
-        // default path the parent is opened lazily — only if the walk proceeds past the
-        // root filter — so an excluded root under an execute-only (0111) parent skips
-        // cleanly, matching the local copy's root-filter behavior (see DryRunDirSource).
-        let parent = if common::safedir::strict_operand_resolution() {
-            let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
-                .await
-                .with_context(|| format!("cannot open parent directory of dry-run source {src:?}"))?
-                .into_tree();
-            DryRunDirSource::Opened(Arc::new(parent))
+    let errors = common::error_collector::ErrorCollector::default();
+    let traversal = async {
+        if settings.dereference {
+            dry_run_traverse(
+                settings,
+                src,
+                dst,
+                src,
+                true,
+                dry_run_mode,
+                &mut summary,
+                &errors,
+            )
+            .await?;
         } else {
-            DryRunDirSource::Lazy(operand.parent.clone())
-        };
-        dry_run_traverse_fd(
-            settings,
-            &parent,
-            &operand.name,
-            &display,
-            dst,
-            &display,
-            true,
-            dry_run_mode,
-            &mut summary,
-        )
-        .await?;
+            let operand = common::walk::split_root_operand(src).await?;
+            let display = operand.display.clone();
+            // strict operand resolution: open the parent EAGERLY (openat2 RESOLVE_NO_SYMLINKS)
+            // so a symlinked operand prefix fails closed before anything is reported. On the
+            // default path the parent is opened lazily — only if the walk proceeds past the
+            // root filter — so an excluded root under an execute-only (0111) parent skips
+            // cleanly, matching the local copy's root-filter behavior (see DryRunDirSource).
+            let parent = if common::safedir::strict_operand_resolution() {
+                let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
+                    .await
+                    .with_context(|| {
+                        format!("cannot open parent directory of dry-run source {src:?}")
+                    })?
+                    .into_tree();
+                DryRunDirSource::Opened(Arc::new(parent))
+            } else {
+                DryRunDirSource::Lazy(operand.parent.clone())
+            };
+            dry_run_traverse_fd(
+                settings,
+                &parent,
+                &operand.name,
+                &display,
+                dst,
+                &display,
+                true,
+                dry_run_mode,
+                &mut summary,
+                &errors,
+            )
+            .await?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(source) = traversal {
+        if settings.fail_early {
+            return Err(common::copy::Error { source, summary }.into());
+        }
+        errors.push(source);
     }
     // tell destination we're done with directory structure (nothing was sent in dry-run)
     {
@@ -1260,7 +1261,12 @@ async fn handle_dry_run_connection(
         summary.directories_created,
         summary.symlinks_created
     );
-    Ok(("dry-run complete".to_string(), summary))
+    // complete the empty discovery handshake before reporting collected traversal failures so
+    // the idle destination can finish normally rather than observing a truncated session
+    match errors.into_error() {
+        Some(source) => Err(common::copy::Error { source, summary }.into()),
+        None => Ok(("dry-run complete".to_string(), summary)),
+    }
 }
 
 #[instrument(skip(master_send_stream, cert_key))]
