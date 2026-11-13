@@ -7,8 +7,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 linter="$script_dir/check-source-read-fidelity.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
-mkdir -p "$fixture/common/src" "$fixture/rcp/src/source"
-files=(common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/source.rs rcp/src/source/discovery.rs)
+mkdir -p "$fixture/common/src/safedir" "$fixture/rcp/src/source"
+files=(common/src/copy.rs common/src/link.rs common/src/safedir.rs common/src/safedir/proc_fd.rs rcp/src/source.rs rcp/src/source/discovery.rs)
 for file in "${files[@]}"; do
     : > "$fixture/$file"
 done
@@ -60,6 +60,14 @@ RS
 expect_result 1 '::open_following_symlinks('
 cat > "$fixture/rcp/src/source/discovery.rs" <<'RS'
 fn dereferenced_directory() { DirectoryCursor::open_following_symlinks(path, side, credit); } // rcp-toctou-allow: explicit -L directory walk
+RS
+expect_result 0 'Source-read fidelity check passed'
+cat > "$fixture/common/src/safedir/proc_fd.rs" <<'RS'
+fn source_acl() { unsafe { libc::listxattr(path, buffer, len) }; }
+RS
+expect_result 1 'common/src/safedir/proc_fd.rs:'
+cat > "$fixture/common/src/safedir/proc_fd.rs" <<'RS'
+fn source_acl() { unsafe { libc::listxattr(path, buffer, len) }; } // rcp-toctou-allow: held proc magic link
 RS
 expect_result 0 'Source-read fidelity check passed'
 rm "$fixture/rcp/src/source/discovery.rs"

@@ -21,11 +21,11 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 echo "🔍 Checking source-read fidelity (no by-name/path source payload reads)..."
 
-# safedir.rs is scanned too because it is where the fd-paired primitives themselves live: a by-path
+# safedir and its proc-fd helpers are scanned because the fd-paired primitives live there: a by-path
 # read added next to them is exactly the regression the `*xattr` patterns below exist to catch, and
 # it would not be caught by scanning only the callers. Its own tests read by path deliberately and
 # sit inside the final test module, which this scan excludes.
-FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/source.rs rcp/src/source/discovery.rs"
+FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs common/src/safedir/proc_fd.rs rcp/src/source.rs rcp/src/source/discovery.rs"
 # the by-name / by-path SOURCE payload reads. NOT metadata/symlink_metadata: those have legitimate
 # dst-existence / -L / test uses and are not the drift vector (metadata pairing is structural).
 #
