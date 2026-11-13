@@ -56,70 +56,99 @@ fn settings(dereference: bool) -> common::copy::Settings {
 }
 
 #[tokio::test]
-async fn dry_run_requires_destination_done() -> anyhow::Result<()> {
-    for acknowledge in [false, true] {
-        let source = tempfile::tempdir()?;
-        let destination = source.path().join("preview");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let tcp_config = remote::TcpConfig::default();
-        let (accepted, peer) = tokio::try_join!(
-            async {
-                remote::accept_tcp_control(&listener, &tcp_config)
-                    .await
-                    .map_err(anyhow::Error::from)
-            },
-            remote::connect_tcp_control(listener.local_addr()?, &tcp_config),
-        )?;
-        let settings = settings(false);
-        let source_operation = handle_dry_run_connection(
-            accepted.0,
-            &settings,
-            source.path(),
-            &destination,
-            common::config::DryRunMode::Brief,
-            None,
-            5,
-        );
-        let destination_operation = async {
-            let (mut send, mut receive) = remote::tls::connect_bounded(
-                None,
-                remote::tls::SERVER_NAME_SOURCE,
-                peer,
-                std::time::Duration::from_secs(5),
-                "dry-run test control",
-            )
-            .await?;
-            assert!(matches!(
-                receive
-                    .recv_object::<remote::protocol::SourceMessage>()
-                    .await?,
-                Some(remote::protocol::SourceMessage::DiscoveryComplete {
-                    has_root_item: false
-                })
-            ));
-            if acknowledge {
-                send.send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
+async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result<()> {
+    for dereference in [false, true] {
+        for failure in ["none", "descendant", "root"] {
+            for acknowledge in [false, true] {
+                let source = tempfile::tempdir()?;
+                std::fs::write(source.path().join("readable"), "payload")?;
+                let unsupported = source.path().join("unsupported");
+                let _socket = if failure == "none" {
+                    None
+                } else {
+                    Some(std::os::unix::net::UnixListener::bind(&unsupported)?)
+                };
+                let source_path = if failure == "root" {
+                    unsupported.as_path()
+                } else {
+                    source.path()
+                };
+                let destination = source.path().join("preview");
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let tcp_config = remote::TcpConfig::default();
+                let (accepted, peer) = tokio::try_join!(
+                    async {
+                        remote::accept_tcp_control(&listener, &tcp_config)
+                            .await
+                            .map_err(anyhow::Error::from)
+                    },
+                    remote::connect_tcp_control(listener.local_addr()?, &tcp_config),
+                )?;
+                let settings = settings(dereference);
+                let source_operation = handle_dry_run_connection(
+                    accepted.0,
+                    &settings,
+                    source_path,
+                    &destination,
+                    common::config::DryRunMode::Brief,
+                    None,
+                    5,
+                );
+                let destination_operation = async {
+                    let (mut send, mut receive) = remote::tls::connect_bounded(
+                        None,
+                        remote::tls::SERVER_NAME_SOURCE,
+                        peer,
+                        std::time::Duration::from_secs(5),
+                        "dry-run test control",
+                    )
                     .await?;
+                    assert!(matches!(
+                        receive
+                            .recv_object::<remote::protocol::SourceMessage>()
+                            .await?,
+                        Some(remote::protocol::SourceMessage::DiscoveryComplete {
+                            has_root_item: false
+                        })
+                    ));
+                    if acknowledge {
+                        send.send_control_message(
+                            &remote::protocol::DestinationMessage::DestinationDone,
+                        )
+                        .await?;
+                    }
+                    send.close().await?;
+                    anyhow::Ok(())
+                };
+                let (result, peer_result) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(source_operation, destination_operation)
+                    })
+                    .await?;
+                peer_result?;
+                if acknowledge {
+                    let summary = if failure == "none" {
+                        result?.1
+                    } else {
+                        let error = result
+                            .expect_err("an incomplete preview must fail")
+                            .downcast::<common::copy::Error>()
+                            .expect("preview errors must retain their partial summary");
+                        assert!(format!("{:#}", error.source).contains("unsupported"));
+                        error.summary
+                    };
+                    assert_eq!(summary.files_copied, usize::from(failure != "root"));
+                    assert_eq!(summary.bytes_copied, if failure == "root" { 0 } else { 7 });
+                } else {
+                    let error = result.expect_err("control EOF cannot acknowledge a dry run");
+                    assert!(
+                        format!("{error:#}").contains("DestinationDone"),
+                        "{error:#}"
+                    );
+                }
+                assert!(!destination.exists());
             }
-            send.close().await?;
-            anyhow::Ok(())
-        };
-        let (result, peer_result) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                tokio::join!(source_operation, destination_operation)
-            })
-            .await?;
-        peer_result?;
-        if acknowledge {
-            result?;
-        } else {
-            let error = result.expect_err("control EOF cannot acknowledge a dry run");
-            assert!(
-                format!("{error:#}").contains("DestinationDone"),
-                "{error:#}"
-            );
         }
-        assert!(!destination.exists());
     }
     Ok(())
 }

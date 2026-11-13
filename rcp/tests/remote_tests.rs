@@ -5492,6 +5492,170 @@ fn remote_encrypted_dry_run_outlives_data_connection_timeout() {
 }
 
 /// Test remote dry-run mode with brief output - should not hang and show what would be copied.
+/// A partial preview must not look successful after a recoverable descendant failure.
+#[test]
+fn remote_dry_run_reports_descendant_errors_and_previews_siblings() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let source = src_dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    create_test_file(&source.join("readable"), "sibling payload", 0o644);
+    let _socket = std::os::unix::net::UnixListener::bind(source.join("unsupported")).unwrap();
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    let src_remote = format!("localhost:{}", source.display());
+    for dereference in [false, true] {
+        for policy in ["collect", "fail-early", "skip", "exclude"] {
+            let destination = dst_dir
+                .path()
+                .join(format!("preview-{dereference}-{policy}"));
+            let dst_remote = format!("localhost:{}", destination.display());
+            let mut args = vec![daemon.as_str(), "--dry-run=brief"];
+            if dereference {
+                args.push("--dereference");
+            }
+            match policy {
+                "fail-early" => args.push("--fail-early"),
+                "skip" => args.push("--skip-specials"),
+                "exclude" => args.push("--exclude=unsupported"),
+                _ => {}
+            }
+            args.extend([src_remote.as_str(), dst_remote.as_str()]);
+            let output = run_rcp_with_args(&args);
+            let expected_success = matches!(policy, "skip" | "exclude");
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!expected_success)),
+                "{dereference}/{policy}"
+            );
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !expected_success {
+                assert!(
+                    logs.contains("unsupported") && logs.contains("file type"),
+                    "{logs}"
+                );
+            }
+            if policy != "fail-early" {
+                assert!(
+                    logs.lines()
+                        .any(|line| line.contains("/readable") && line.contains("would copy:")),
+                    "{logs}"
+                );
+            }
+            assert!(
+                !destination.exists(),
+                "a preview must never create its destination"
+            );
+        }
+    }
+}
+
+#[test]
+fn remote_dry_run_reports_unreadable_descendants() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!("skipping: capability overrides bypass directory permissions");
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let source = src_dir.path().join("source");
+    let unreadable = source.join("unreadable");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    create_test_file(&unreadable.join("hidden"), "inaccessible payload", 0o644);
+    create_test_file(&source.join("readable"), "sibling payload", 0o644);
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    let src_remote = format!("localhost:{}", source.display());
+    for dereference in [false, true] {
+        for fail_early in [false, true] {
+            let destination = dst_dir
+                .path()
+                .join(format!("preview-{dereference}-{fail_early}"));
+            let dst_remote = format!("localhost:{}", destination.display());
+            let mut args = vec![daemon.as_str(), "--dry-run=brief"];
+            if dereference {
+                args.push("--dereference");
+            }
+            if fail_early {
+                args.push("--fail-early");
+            }
+            args.extend([src_remote.as_str(), dst_remote.as_str()]);
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let output = run_rcp_with_args(&args);
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{dereference}/{fail_early}");
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                logs.contains("Permission denied") && logs.contains("unreadable"),
+                "{logs}"
+            );
+            if !fail_early {
+                assert!(
+                    logs.lines()
+                        .any(|line| line.contains("/readable") && line.contains("would copy:")),
+                    "{logs}"
+                );
+            }
+            assert!(!destination.exists());
+        }
+    }
+}
+
+#[test]
+fn remote_dry_run_reports_dereferenced_dangling_descendants() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let source = src_dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    create_test_file(&source.join("readable"), "sibling payload", 0o644);
+    std::os::unix::fs::symlink("missing", source.join("dangling")).unwrap();
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    let src_remote = format!("localhost:{}", source.display());
+    for dereference in [false, true] {
+        let destination = dst_dir.path().join(format!("preview-{dereference}"));
+        let dst_remote = format!("localhost:{}", destination.display());
+        let mut args = vec![daemon.as_str(), "--dry-run=brief"];
+        if dereference {
+            args.push("--dereference");
+        }
+        args.extend([src_remote.as_str(), dst_remote.as_str()]);
+        let output = run_rcp_with_args(&args);
+        assert_eq!(output.status.code(), Some(i32::from(dereference)));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if dereference {
+            assert!(
+                logs.contains("No such file or directory") && logs.contains("dangling"),
+                "{logs}"
+            );
+        }
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("/readable") && line.contains("would copy:")),
+            "{logs}"
+        );
+        assert!(!destination.exists());
+    }
+}
+
 #[test]
 fn test_remote_dry_run_brief() {
     require_local_ssh();
