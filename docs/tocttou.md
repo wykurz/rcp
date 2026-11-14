@@ -589,9 +589,12 @@ cleanup unlink, a stat of the held directory must show zero links; removing an e
 its old name does not release the surviving directory's claim. If cleanup cannot be confirmed, or
 setup leaves a mutation, history remains even if the awaiting task was cancelled. Once traversal or
 a retained destination mutation commits participation, the history remains for the invocation,
-including strict-mode sequential operands. An error names the conflicting operation even when that
-operation has already completed. This conservative policy also prevents later operands from
-consuming earlier output.
+including strict-mode sequential operands. An error names the conflicting operation and whether the
+directory participated as source, update, or both, even when that operation has already completed.
+Delegated update copies retain their update role through descendants. Concurrent operands can
+encounter either side of a conflict first; diagnostics retain the first committed participation,
+without imposing an operand execution order. This conservative policy also prevents later operands
+from consuming earlier output.
 
 Existing output identity is checked through its held descriptor before strict-mode lockdown or
 metadata changes. Fresh creation retains registration ownership through sanitation and any cleanup

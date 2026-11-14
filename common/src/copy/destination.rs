@@ -2,7 +2,7 @@
 
 use super::{DirResolution, Error, Settings, Summary};
 use crate::input_protection::InputProtection;
-use crate::safedir::overlap::{DirectoryOverlap, Evidence, Operand};
+use crate::safedir::overlap::{DirectoryOverlap, Evidence, InputRole, Operand};
 use crate::safedir::{self, Dir, FileMeta, PreviewEntry};
 use anyhow::Context as _;
 use std::ffi::OsStr;
@@ -15,6 +15,8 @@ pub(crate) struct DestinationContext {
     registry: Arc<DirectoryOverlap>,
     protection: Arc<InputProtection>,
     operand: Arc<Operand>,
+    // a delegated copy keeps the selected input's role through descendants and dereference
+    pub(super) input_role: InputRole,
     // explicit root participation stays tentative until ordinary admission/mutation commits it
     _root_claim: Option<safedir::overlap::Reservation>,
 }
@@ -65,6 +67,7 @@ pub(crate) struct PreparedDestination {
     registry: Arc<DirectoryOverlap>,
     protection: Arc<InputProtection>,
     operand: Arc<Operand>,
+    input_role: InputRole,
 }
 
 impl PreparedDestination {
@@ -78,6 +81,7 @@ impl PreparedDestination {
             registry: Arc::clone(&self.registry),
             protection: Arc::clone(&self.protection),
             operand: Arc::clone(&self.operand),
+            input_role: self.input_role,
             _root_claim: None,
         }
     }
@@ -170,12 +174,18 @@ impl DestinationContext {
                 destination: named_root.to_owned(),
                 destination_ancestors: Default::default(),
             }),
+            input_role: InputRole::Source,
             _root_claim: None,
         }
     }
 
     pub(crate) fn protection(&self) -> &Arc<InputProtection> {
         &self.protection
+    }
+
+    pub(crate) fn with_input_role(mut self, role: InputRole) -> Self {
+        self.input_role = role;
+        self
     }
 
     pub(crate) async fn record_root(
@@ -192,7 +202,10 @@ impl DestinationContext {
         Ok(())
     }
 
-    pub(crate) fn reserve_roots(&mut self, inputs: &[&FileMeta]) -> std::io::Result<()> {
+    pub(crate) fn reserve_roots(
+        &mut self,
+        inputs: &[(InputRole, &FileMeta)],
+    ) -> std::io::Result<()> {
         if !inputs.is_empty() {
             self._root_claim = Some(self.registry.reserve(
                 inputs,
@@ -275,7 +288,7 @@ impl DestinationContext {
     pub(crate) async fn enter(
         &self,
         prog_track: &'static crate::progress::Progress,
-        inputs: &[&FileMeta],
+        inputs: &[(InputRole, &FileMeta)],
         preservation: PreservationSource<'_>,
         name: &OsStr,
         path: &Path,
@@ -440,6 +453,7 @@ impl DestinationContext {
                 registry: Arc::clone(&self.registry),
                 protection: Arc::clone(&self.protection),
                 operand: Arc::clone(&self.operand),
+                input_role: self.input_role,
             },
             directory,
             snapshot,
@@ -464,6 +478,7 @@ impl DestinationContext {
                 destination: "test destination".into(),
                 destination_ancestors: Default::default(),
             }),
+            input_role: InputRole::Source,
         }
         .child()
     }
@@ -525,6 +540,7 @@ pub(crate) async fn test_prepared(
         registry: context.registry,
         protection: context.protection,
         operand: context.operand,
+        input_role: context.input_role,
     })
 }
 
