@@ -309,13 +309,97 @@ class DiagnosticProjectionTests(unittest.TestCase):
     def test_central_setup_explains_decimal_workloads_and_missing_ram(self):
         record, raw, worker = inputs()
         value = diagnostics.derive(record, b"archive", raw, worker)
-        page = diagnostics.configuration_html({value["setup_id"]: value["setup"]})
+        page = diagnostics.configuration_html([dict(run="42458459014-1", href="runs/a.html", setup=value["setup"])])
         self.assertIn("10,240,000", page)
         self.assertIn("exactly 100 times less", page)
         self.assertIn("decimal bytes", page)
         self.assertIn("not inferred", page)
         self.assertIn("gp3 EBS root", page)
         self.assertIn("local NVMe instance-store", page)
+        self.assertIn("<th scope='row'>Observed host RAM</th><td>not recorded</td>", page)
+        for section in ("machine", "datasets", "method", "observed"):
+            self.assertIn("id='" + section + "'", page)
+        self.assertNotIn("<script", page)
+
+    def test_setup_rows_classify_fields_and_keep_unrecorded_values_unknown(self):
+        record, raw, worker = inputs()
+        setup = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        listed = diagnostics.setup_rows(setup)
+        rows = {(group, label): (text, kind) for group, label, text, kind in listed}
+        self.assertEqual(len(rows), len(listed))
+        self.assertEqual(rows[("Machine", "CPU model")],
+                         ("Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz", "hardware"))
+        self.assertEqual(rows[("Machine", "Logical CPUs")], (None, "hardware"))
+        self.assertEqual(rows[("Machine", "Usable CPUs")], ("96", "hardware"))
+        self.assertEqual(rows[("Machine", "Observed host RAM")], (None, "context"))
+        self.assertEqual(rows[("System software", "Kernel")], ("7.0.0-1014-aws", "software"))
+        self.assertEqual(rows[("Method", "Cache preparation")], ("linux-drop-caches", "software"))
+        self.assertEqual(rows[("Source storage", "Filesystem")], ("ext4", "hardware"))
+        self.assertEqual(rows[("Source storage", "Device sizes")],
+                         ("900,000,000,000 bytes, 900,000,000,000 bytes", "hardware"))
+        self.assertEqual(rows[("Destination storage", "Mount options")],
+                         ("nodev, nosuid, relatime, rw, stripe=256", "software"))
+        self.assertEqual({kind for _, kind in rows.values()}, {"hardware", "software", "context"})
+
+    def test_central_setup_states_shared_values_once_and_lists_only_recorded_differences(self):
+        record, raw, worker = inputs()
+        first = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        raw["system_setup"] = dict(logical_cpu_count=dict(status="available", value=96))
+        second = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        observed = [dict(run="1-1", href="runs/repo-1-run-1.html", setup=first),
+                    dict(run="2-1", href="runs/repo-1-run-2.html", setup=second)]
+        page = diagnostics.configuration_html(observed)
+        self.assertEqual(page.count("Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz"), 1)
+        self.assertNotIn("id='setup-differences'", page)
+        # a field that only the newer run recorded is a value, not a difference
+        self.assertIn("<th scope='row'>Logical CPUs</th><td>96 <small>(recorded by 1 of 2 runs)</small></td>", page)
+        raw["context"]["environment"]["kernel"] = "7.0.0-1020-aws"
+        third = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        page = diagnostics.configuration_html(observed + [dict(run="3-1", href="runs/repo-1-run-3.html", setup=third)])
+        self.assertIn("id='setup-differences'", page)
+        self.assertIn("<td>7.0.0-1014-aws / 7.0.0-1020-aws <small>", page)
+        self.assertIn("<a href='runs/repo-1-run-3.html'>3-1</a>", page)
+        self.assertEqual(page.count("Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz"), 1)
+
+    def test_central_setup_merges_identical_source_and_destination_storage(self):
+        record, raw, worker = inputs()
+        setup = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        page = diagnostics.configuration_html([dict(run="1-1", href="runs/a.html", setup=setup)])
+        self.assertIn("Source and destination storage", page)
+        self.assertEqual(page.count("<th scope='row'>Filesystem</th>"), 1)
+        worker["storage"]["arrays"]["destination"]["chunk_bytes"] = 1048576
+        setup = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        page = diagnostics.configuration_html([dict(run="1-1", href="runs/a.html", setup=setup)])
+        self.assertEqual(page.count("<th scope='row'>Filesystem</th>"), 2)
+
+    def test_run_appendix_states_identical_storage_arrays_once(self):
+        record, raw, worker = inputs()
+        setup = diagnostics.derive(record, b"archive", raw, worker)["setup"]
+        table = diagnostics.setup_html(setup)
+        self.assertIn("<th colspan='2' scope='rowgroup'>Source and destination storage</th>", table)
+        self.assertEqual(table.count("<th scope='row'>Filesystem</th>"), 1)
+        worker["storage"]["arrays"]["destination"]["chunk_bytes"] = 1048576
+        table = diagnostics.setup_html(diagnostics.derive(record, b"archive", raw, worker)["setup"])
+        self.assertIn("<th colspan='2' scope='rowgroup'>Destination storage</th>", table)
+        self.assertEqual(table.count("<th scope='row'>Filesystem</th>"), 2)
+
+    def test_central_setup_without_observations_says_so_and_rejects_invalid_setups(self):
+        self.assertIn("No observed setup was available in this snapshot.", diagnostics.configuration_html([]))
+        with self.assertRaises(ValueError):
+            diagnostics.configuration_html([dict(run="1-1", href="runs/a.html", setup=dict(cpu_model="<script>"))])
+
+    def test_run_diagnostics_keep_the_observed_setup_in_a_collapsed_appendix(self):
+        record, raw, worker = inputs()
+        value = diagnostics.derive(record, b"archive", raw, worker)
+        text = diagnostics.render(value, record)
+        self.assertIn("id='resource-diagnostics'", text)
+        self.assertIn("id='observed-setup'", text)
+        self.assertIn("</summary><table><tbody><tr><th colspan='2' scope='rowgroup'>Machine</th></tr>"
+                      "<tr><th scope='row'>CPU model</th>", text)
+        self.assertNotIn("setups.html#setup-", text)
+        self.assertNotIn("<script", text)
+        missing = diagnostics.render(diagnostics.unavailable(record), record)
+        self.assertIn("No observed setup was recorded for this run.", missing)
 
 
 class RetainedDiagnosticReadTests(unittest.TestCase):
@@ -446,10 +530,10 @@ class RetainedDiagnosticReadTests(unittest.TestCase):
         record = export.project(bundle)
         before = export.render(record)
         details = export.diagnostic_companion(bundle)
-        after = export.render(record, diagnostics=details,
-            setup_href="../setups.html#setup-" + details["setup_id"])
-        self.assertTrue(after.startswith(before))
+        after = export.render(record, diagnostics=details)
+        self.assertNotIn("Resource diagnostics", before)
         self.assertIn("Resource diagnostics", after)
+        self.assertIn("id='observed-setup'", after)
         self.assertEqual(export.project(bundle), record)
         self.assertEqual(export.render(record), before)
 
