@@ -76,7 +76,7 @@ class ReportSiteTests(unittest.TestCase):
             comparison='A/A qualification', measurements=[], note='Two local pairs do not establish broad variance.')
         if passed:
             value.update(timestamp='2026-10-22T19:00:00Z', verification={'policy': 'metadata-size'},
-                measurements=[dict(case_id='bulk', variant_id='candidate', series_id='aws-local-ext4-v1',
+                measurements=[dict(case_id='bulk', variant_id='rcp-default', series_id='aws-local-ext4-v1',
                     median=620.5, samples=[620, 621])])
         return value
 
@@ -169,7 +169,7 @@ class ReportSiteTests(unittest.TestCase):
         (directory / 'index.json').write_text(json.dumps(index))
         return (directory, revision, inventory(directory)), values
 
-    def test_retained_resources_backfill_preserves_frozen_json_and_links_to_central_setup(self):
+    def test_retained_resources_backfill_preserves_frozen_json_and_appends_the_observed_setup(self):
         batch, values = self.diagnostic_batch()
         value = values[0]
         source = batch[0] / (value['run_key'] + '.json')
@@ -184,47 +184,102 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('93,644', page)
         self.assertIn('System CPU s', page)
         self.assertIn('canonical qualification record', page)
-        self.assertIn('../setups.html#setup-', page)
+        self.assertIn("<details><summary>Hardware, storage and software recorded by this run</summary>", page)
+        self.assertIn('8275CL', page)
+        self.assertIn('href="../records/' + value['run_key'] + '.json"', page)
+        self.assertIn('href="../diagnostics/' + value['run_key'] + '.json"', page)
+        self.assertNotIn('setups.html#setup-', page)
         self.assertNotIn('PRIVATE', page)
         setup = (self.output / 'aws-benchmarks/setups.html').read_text()
         self.assertIn('Intel(R) Xeon(R) Platinum', setup)
         self.assertIn('Observed host RAM</th><td>not recorded', setup)
         self.assertIn('10,240,000', setup)
         self.assertIn('exactly 100 times less', setup)
+        self.assertIn("id='reading'", setup)
+        self.assertIn('not confidence intervals', setup)
         self.assert_site_links_resolve()
 
-    def test_history_page_has_three_plots_per_file_set_and_preserves_frozen_records(self):
+    def test_landing_page_leads_with_history_plots_and_preserves_frozen_records(self):
         batch, values = self.diagnostic_batch(two=True)
         result = self.build_retained(batch)
         self.assertEqual(result.returncode, 0, result.stderr)
         index = (self.output / 'aws-benchmarks/index.html').read_text()
-        self.assertIn('href="history.html"', index)
-        history = (self.output / 'aws-benchmarks/history.html').read_text()
         for metric in ('duration', 'cpu', 'memory'):
-            self.assertEqual(history.count("data-history-metric='" + metric + "'"), 4)
-        self.assertIn('Worker-reported run start (UTC)', history)
-        self.assertIn('not independently attested', history)
+            self.assertEqual(index.count("data-history-metric='" + metric + "'"), 1)
+        self.assertEqual(index.count('<svg '), 3)
+        self.assertLess(index.index('data-history-metric'), index.index('id="runs"'))
+        self.assertLess(index.index('id="runs"'), index.index('id="collection-status"'))
+        self.assertIn('over worker-reported run start', index)
+        self.assertIn('Peak memory', index)
+        self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.', index)
         from infra.aws_benchmark.production_projection import MEASUREMENT_CAVEAT, VALIDATION
-        self.assertIn(MEASUREMENT_CAVEAT, history)
-        self.assertIn(VALIDATION, history)
-        self.assertIn('Peak command RSS', history)
-        self.assertNotIn('PRIVATE', history)
+        self.assertIn(MEASUREMENT_CAVEAT, index)
+        self.assertIn(VALIDATION, index)
+        self.assertLess(index.index(MEASUREMENT_CAVEAT), index.index('data-history-metric'))
+        self.assertNotIn('PRIVATE', index)
+        self.assertEqual(index.count('<script'), 1)
         for value in values:
             name = value['run_key'] + '.json'
             self.assertEqual((self.output / 'aws-benchmarks/records' / name).read_bytes(),
                              (batch[0] / name).read_bytes())
         self.assert_site_links_resolve()
 
-    def test_matching_observed_setups_are_described_once_not_repeated_per_run(self):
+    def test_old_history_address_redirects_to_the_landing_page_without_scripts(self):
+        result = self.build_retained(self.retained_batch([self.aws_record()]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stub = (self.output / 'aws-benchmarks/history.html').read_text()
+        self.assertIn('<meta http-equiv="refresh" content="0; url=index.html#history">', stub)
+        self.assertIn('<a href="index.html#history">', stub)
+        self.assertNotIn('<script', stub)
+        self.assertNotIn('<svg', stub)
+        self.assert_site_links_resolve()
+
+    def test_matching_observed_setups_are_described_once_and_kept_as_run_appendices(self):
         batch, values = self.diagnostic_batch(two=True)
         result = self.build_retained(batch)
         self.assertEqual(result.returncode, 0, result.stderr)
         setup = (self.output / 'aws-benchmarks/setups.html').read_text()
-        self.assertEqual(setup.count("<section id='setup-"), 1)
+        self.assertEqual(setup.count('Intel(R) Xeon(R) Platinum 8275CL'), 1)
+        self.assertIn('merged across the 2 runs', setup)
+        self.assertNotIn("id='setup-", setup)
         for value in values:
             page = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
-            self.assertNotIn('8275CL', page)
-            self.assertIn('Observed hardware, storage and test setup', page)
+            self.assertIn("id='observed-setup'", page)
+            self.assertEqual(page.count('8275CL'), 1)
+
+    def test_aws_pages_share_the_site_shell_and_section_navigation(self):
+        from infra.aws_benchmark.production_projection import MEASUREMENT_CAVEAT, VALIDATION
+        value = self.aws_record()
+        result = self.build_retained(self.retained_batch([value]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = {'aws-benchmarks/index.html': ('#history', '#runs', '#collection-status', 'setups.html'),
+                    'aws-benchmarks/setups.html': ('index.html#history', 'index.html#runs', '#observed', '#reading'),
+                    'aws-benchmarks/runs/' + value['run_key'] + '.html':
+                        ('../index.html#history', '../index.html#runs', '../setups.html', '#results', '#raw-data')}
+        for relative, links in expected.items():
+            with self.subTest(page=relative):
+                page = (self.output / relative).read_text()
+                elements = Elements(page)
+                self.assertEqual([attrs.get('class') for tag, attrs in elements.tags if tag == 'header'], ['site-header'])
+                styles = [attrs['href'] for tag, attrs in elements.tags
+                          if tag == 'link' and attrs.get('rel') == 'stylesheet']
+                self.assertEqual([Path(style).name for style in styles], ['site.css', 'report.css', 'aws.css'])
+                navigation = page[page.index('<nav aria-label="AWS benchmark pages">'):]
+                navigation = navigation[:navigation.index('</nav>')]
+                hrefs = [attrs.get('href') for tag, attrs in Elements(navigation).tags if tag == 'a']
+                for link in links:
+                    self.assertIn(link, hrefs)
+                # the only script is the generator's own static theme script
+                self.assertEqual(page.count('<script'), 1)
+                self.assertIn('<script id="site-theme">', page)
+                self.assertIn('class="theme-toggle"', page)
+                # the trust statements travel with every page that shows worker-reported values
+                self.assertIn(MEASUREMENT_CAVEAT, page)
+                self.assertIn(VALIDATION, page)
+        self.assertTrue((self.output / 'assets/aws.css').is_file())
+        detail = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
+        self.assertIn('<title>Run 123-1 · AWS benchmarks · RCP Tools</title>', detail)
+        self.assert_site_links_resolve()
 
     def test_central_setup_page_obeys_the_public_html_bound(self):
         from unittest.mock import patch
@@ -275,6 +330,8 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('Collected at', detail)
         self.assertIn(value['collected_at'], detail)
         self.assertNotIn('1999-01-01', detail)
+        # nothing needs attention, so the observation table stays folded away
+        self.assertIn('<details><summary>Observations in this snapshot</summary>', index)
         self.assert_site_links_resolve()
 
     def test_complete_empty_retained_snapshot_is_visible_and_honest(self):
@@ -317,6 +374,7 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('No public records are available to display', page)
         self.assertNotIn('no retained public records were found', page)
         self.assertIn('Record processing: incomplete', page)
+        self.assertIn('<details open><summary>Observations in this snapshot</summary>', page)
         self.assertIn('not a fresh physical teardown check', page)
         for state in ('pending', 'held', 'deferred'):
             self.assertIn('<td>' + state + '</td>', page)
@@ -505,10 +563,13 @@ class ReportSiteTests(unittest.TestCase):
         self.assertEqual(len(list(directory.glob("*.json"))), 513)
         oldest = "repo-655073755-run-1000.json"
         self.assertEqual((directory / oldest).read_text(), records[oldest][1])
-        history = (self.output / "aws-benchmarks/history.html").read_text()
+        index = (self.output / "aws-benchmarks/index.html").read_text()
+        history, runs = index[index.index("id='history'"):index.index('id="runs"')], index[index.index('id="runs"'):]
         self.assertIn("481 older qualified runs", history)
         self.assertIn("runs/repo-655073755-run-1512.html", history)
         self.assertNotIn("runs/repo-655073755-run-1000.html", history)
+        self.assertIn("runs/repo-655073755-run-1000.html", runs)
+        self.assertEqual(runs.count("<span class='badge badge-passed'>"), 513)
         self.assertTrue((self.output / "aws-benchmarks/runs/repo-655073755-run-1000.html").is_file())
 
     def test_aws_records_render_separately_with_resolving_links_and_public_json(self):
@@ -530,7 +591,8 @@ class ReportSiteTests(unittest.TestCase):
             page = self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')
             self.assertIn('Cleanup', page.read_text())
             self.assertIn('verified', page.read_text())
-            self.assertNotIn('<script', page.read_text())
+            body = page.read_text().split('<article class="aws">')[1]
+            self.assertNotIn('<script', body)
         for page in self.output.rglob('*.html'):
             for tag, attrs in Elements(page.read_text()).tags:
                 value = attrs.get('href') if tag in {'a', 'link'} else attrs.get('src')

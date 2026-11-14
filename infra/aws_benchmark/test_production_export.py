@@ -192,6 +192,41 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("1999-01-01", rendered)
         self.assertNotIn("\u202e", rendered)
         self.assertNotIn("<td>passed</td>", rendered)
+        # the page shell and its theme script belong to the site generator, not to record rendering
+        self.assertTrue(rendered.startswith("<h1>"))
+        self.assertNotIn("<!doctype", rendered.lower())
+        self.assertNotIn("<script", rendered)
+        self.assertIn("<span class='badge badge-passed'>consistency checks passed</span>", rendered)
+
+    def test_run_page_summarizes_the_plotted_point_and_lists_frozen_measurements(self):
+        legacy = json.loads((Path(__file__).with_name("fixtures") / "production-public-report-v1.json").read_text())
+        html = export.render(legacy)
+        self.assertIn("id='results'", html)
+        # identical binaries: the summary is the median of all four copies, as plotted
+        self.assertIn("<p class='value'>1.50 <span class='unit'>s</span></p>", html)
+        self.assertIn("1.00–2.00 s over 4 copies", html)
+        self.assertIn("unavailable", html)
+        for cell in ("<td><code>rcp-baseline</code></td>", "<td>2.000</td>", "<td>2.000, 2.000</td>",
+                     ">75abaff72b84</code>"):
+            self.assertIn(cell, html)
+        self.assertIn("<a href='https://github.com/wykurz/rcp/commit/" + "a" * 40 + "'><code>aaaaaaa</code></a>", html)
+        self.assertIn("resource termination verified", html)
+
+    def test_run_page_names_both_revisions_when_they_differ(self):
+        value = export.project(self.reader.download(self.key))
+        value["identity"]["baseline"] = "b" * 40
+        html = export.render(value)
+        self.assertIn("<dt>Candidate</dt>", html)
+        self.assertIn("<dt>Baseline</dt>", html)
+        self.assertIn("/commit/" + "b" * 40, html)
+
+    def test_failed_run_page_has_no_performance_summary(self):
+        failed = json.loads((Path(__file__).with_name("fixtures") /
+                             "production-public-report-v1-failed.json").read_text())
+        html = export.render(failed)
+        self.assertIn("<span class='badge badge-failed'>failed; excluded from performance history</span>", html)
+        self.assertIn("This run has no performance measurements.", html)
+        self.assertNotIn("class='value'", html)
 
     def test_collector_time_requires_canonical_utc_while_legacy_records_stay_readable(self):
         value = export.project(self.reader.download(self.key))

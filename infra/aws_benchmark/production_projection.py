@@ -33,6 +33,8 @@ VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 
 MEASUREMENT_CAVEAT = ("Measurements are self-reported by the benchmark worker and are not independently attested. "
     "Candidate code can alter measurement files; consistency checks and verified resource cleanup do not prove honest timings.")
+# frozen comparison wording for one source revision built into identical binaries
+IDENTICAL_BINARIES = "A/A (identical source revision and binary digests)"
 
 
 def comparison_label(identity, controller):
@@ -51,7 +53,7 @@ def comparison_label(identity, controller):
             for role in ("baseline", "candidate") for name in names):
         return "Same source revision; binary identity unavailable"
     if all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in names):
-        return "A/A (identical source revision and binary digests)"
+        return IDENTICAL_BINARIES
     return "Same source revision; different binary digests (not A/A)"
 
 

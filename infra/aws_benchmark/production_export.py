@@ -14,6 +14,7 @@ import tempfile
 
 from . import production_collection as collection, results
 from . import production_diagnostics as resource_diagnostics
+from . import production_history as history
 from .common import require
 
 from . import production_projection as projection
@@ -100,24 +101,73 @@ def diagnostic_companion(bundle):
         return resource_diagnostics.unavailable(record, "invalid_diagnostics")
 
 
-def render(value, *, diagnostics=None, setup_href=None):
-    """Escaped script-free public HTML from allowlisted fields, never retained HTML."""
+def badge(value):
+    """Show the frozen outcome wording; the class only selects its colour."""
+    kind = {"passed": "passed", "failed": "failed"}.get(projection.qualification_outcome(value), "unavailable")
+    return "<span class='badge badge-" + kind + "'>" + escape(projection.outcome_label(value)) + "</span>"
+
+
+def commit_html(identity, revision):
+    """Link a validated revision to its commit in the repository that ran the workflow."""
+    repository = identity["run_url"].split("/actions/")[0]
+    return ("<a href='" + escape(repository + "/commit/" + revision) + "'><code>" +
+            escape(revision[:7]) + "</code></a>")
+
+
+def collected_html(value):
+    """Show the trusted collection time readably while keeping its exact form in the markup."""
+    if "collected_at" not in value:
+        return escape(projection.collected_time(value))
+    return history.time_html(value["collected_at"])
+
+
+def render(value, *, diagnostics=None):
+    """Escaped script-free page body from allowlisted fields, never retained HTML.
+
+    The caller supplies the document shell, so nothing here depends on where the page is served.
+    """
     validate_public(value)
-    identity = value["identity"]
-    fields = [("Run", identity["run"]), ("Suite", identity["suite"]), ("Comparison", value["comparison"]),
-        ("Baseline", identity["baseline"]), ("Candidate", identity["candidate"]),
-        ("Qualification", projection.outcome_label(value)), ("Cleanup", "resource termination verified"),
-        ("Collected at", projection.collected_time(value)),
-        ("Validation", value["validation"])]
-    rows = "".join("<tr><th>" + escape(name) + "</th><td>" + escape(str(item)) + "</td></tr>" for name, item in fields)
-    metrics = "".join("<tr>" + "".join("<td>" + escape(str(item[key])) + "</td>" for key in
-        ("case_id", "variant_id", "median", "samples")) + "</tr>" for item in value["measurements"])
-    html = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-        "<title>AWS benchmark " + escape(identity["run"]) + "</title><h1>AWS benchmark</h1>"
-        "<p><a href='" + escape(identity["run_url"], quote=True) + "'>Workflow attempt</a></p><table>" + rows + "</table>"
-        "<p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" + escape(value["note"]) + "</p><table><tr><th>Case</th><th>Variant</th><th>Median seconds</th>"
-        "<th>Samples in seconds</th></tr>" + metrics + "</table>")
     if diagnostics is not None:
-        html += resource_diagnostics.render(diagnostics, value, setup_href=setup_href)
+        resource_diagnostics.validate(diagnostics, value)
+    identity = value["identity"]
+    commit = lambda revision: commit_html(identity, revision)
+    facts = ([("Commit", commit(identity["candidate"]))] if identity["baseline"] == identity["candidate"] else
+             [("Candidate", commit(identity["candidate"])), ("Baseline", commit(identity["baseline"]))])
+    facts += [("Controller", commit(identity["controller"])),
+        ("Suite", "<code>" + escape(identity["suite"]) + "</code>"), ("Comparison", escape(value["comparison"])),
+        ("Collected at", collected_html(value)), ("Cleanup", "resource termination verified"),
+        ("Validation", escape(value["validation"])),
+        ("Workflow", "<a href='" + escape(identity["run_url"]) + "'>Workflow attempt</a>")]
+    html = ("<h1>Run " + escape(identity["run"]) + " " + badge(value) + "</h1><dl class='facts'>" +
+        "".join("<div><dt>" + name + "</dt><dd>" + item + "</dd></div>" for name, item in facts) +
+        "</dl><aside class='note'><p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" +
+        escape(value["note"]) + "</p></aside><section aria-labelledby='results'><h2 id='results'>Results</h2>")
+    if not value["measurements"]:
+        html += "<p>This run has no performance measurements.</p>"
+    for case, item in history.point(value, diagnostics).items():
+        html += ("<h3>" + history.CASES[case] + "</h3><p>This run as one history point: the median of the "
+            "copies made by the build under test" + (", counting every copy because baseline and candidate "
+            "binaries are identical" if item["pooled"] else "") + ".</p><div class='metrics'>")
+        for metric, title, unit in history.METRICS:
+            data = item[metric]
+            html += "<div class='metric'><h4>" + title + "</h4>" + (
+                "<p class='value'>unavailable</p><p class='delta'>No recorded value for this run.</p>"
+                if data is None else
+                "<p class='value'>" + history.rounded(data["value"]) + " <span class='unit'>" + unit +
+                "</span></p><p class='delta'>" + history.rounded(data["low"]) + "–" + history.rounded(data["high"]) +
+                " " + unit + " over " + history.plural(data["samples"], "copy", "copies") + "</p>") + "</div>"
+        html += "</div>"
+    if value["measurements"]:
+        html += ("<h3>Frozen measurements</h3><div class='table-scroll'><table class='data'><thead><tr><th>Case</th>"
+            "<th>Variant</th><th>Copies</th><th>Median s</th><th>Samples s</th><th>Frozen series</th></tr></thead>"
+            "<tbody>" + "".join(
+                "<tr><td><code>" + escape(item["case_id"]) + "</code></td><td><code>" + escape(item["variant_id"]) +
+                "</code></td><td>" + str(len(item["samples"])) + "</td><td>" + history.exact(item["median"]) +
+                "</td><td>" + ", ".join(history.exact(sample) for sample in item["samples"]) +
+                "</td><td><code title='" + escape(item["series_id"]) + "'>" + escape(item["series_id"][:12]) +
+                "</code></td></tr>" for item in value["measurements"]) + "</tbody></table></div>")
+    html += "</section>"
+    if diagnostics is not None:
+        html += resource_diagnostics.render(diagnostics, value)
     require(len(html.encode()) <= MAX_PUBLIC_HTML, "rendered public HTML exceeds bound")
     return html

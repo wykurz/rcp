@@ -423,73 +423,171 @@ def _display(value, suffix=""):
     return "not recorded" if value is None else escape(str(value)) + suffix
 
 
-def setup_html(value):
-    """Render observed setup only; unknown historical RAM is never filled from a SKU."""
+def _count(value):
+    return None if value is None else str(value)
+
+
+def _size(value):
+    return None if value is None else f"{value:,} bytes"
+
+
+def setup_rows(value):
+    """List every observed field once as (group, label, text, kind); None text means not recorded.
+
+    Kind says what a recorded difference between runs means for history: a
+    hardware difference starts a new trend line, a software difference is
+    marked on the line, and context is displayed only.
+    """
     validate_setup(value)
+    ram, sampler = value["host_memory_total_bytes"], value["instrumentation"]
     rows = [
-        ("CPU model", _display(value["cpu_model"])),
-        ("Logical CPU count", _display(value["logical_cpu_count"])),
-        ("Effective CPU affinity count", _display(value["effective_cpu_count"])),
-        ("Observed host RAM", "not recorded" if value["host_memory_total_bytes"] is None else
-            f'{value["host_memory_total_bytes"] / 2 ** 30:.2f} GiB ({value["host_memory_total_bytes"]:,} bytes)'),
-        ("OS / kernel / architecture", " / ".join(_display(value[key]) for key in ("os", "kernel", "architecture"))),
-        ("Cache preparation", _display(value["cache_policy"])),
-        ("Verification", _display(value["verification_policy"])),
-        ("Pairing", _display(value["pairing_policy"])),
-        ("System sampler", "not recorded" if value["instrumentation"] is None else
-            escape(value["instrumentation"]["policy"]) + " (10-second cadence)"),
+        ("Machine", "CPU model", value["cpu_model"], "hardware"),
+        ("Machine", "Logical CPUs", _count(value["logical_cpu_count"]), "hardware"),
+        ("Machine", "Usable CPUs", _count(value["effective_cpu_count"]), "hardware"),
+        ("Machine", "Architecture", value["architecture"], "hardware"),
+        ("Machine", "Observed host RAM",
+            None if ram is None else f"{ram / 2 ** 30:.2f} GiB ({ram:,} bytes)", "context"),
+        ("System software", "OS", value["os"], "software"),
+        ("System software", "Kernel", value["kernel"], "software"),
+        ("Method", "Cache preparation", value["cache_policy"], "software"),
+        ("Method", "Verification", value["verification_policy"], "software"),
+        ("Method", "Pairing", value["pairing_policy"], "software"),
+        ("Method", "System sampler",
+            None if sampler is None else sampler["policy"] + " (10-second cadence)", "context"),
     ]
     for side in ("source", "destination"):
-        item = value[side]
+        item, group = value[side], side.title() + " storage"
         rows += [
-            (side.title() + " filesystem", _display(item["filesystem"])),
-            (side.title() + " layout", _display(item["layout"]) + "; members: " + _display(item["member_count"])),
-            (side.title() + " device models", escape(", ".join(item["member_models"])) if item["member_models"] else "not recorded"),
-            (side.title() + " member sizes", ", ".join(f"{x:,} bytes" for x in item["member_bytes"]) if item["member_bytes"] else "not recorded"),
-            (side.title() + " RAID chunk / filesystem block", _display(item["chunk_bytes"], " bytes") + " / " +
-                _display(item["block_bytes"], " bytes")),
-            (side.title() + " mount options", escape(", ".join(item["mount_options"])) or "not recorded"),
+            (group, "Filesystem", item["filesystem"], "hardware"),
+            (group, "Layout", item["layout"], "hardware"),
+            (group, "Devices", _count(item["member_count"]), "hardware"),
+            (group, "Device models", ", ".join(item["member_models"]) or None, "hardware"),
+            (group, "Device sizes", ", ".join(_size(x) for x in item["member_bytes"]) or None, "hardware"),
+            (group, "RAID chunk", _size(item["chunk_bytes"]), "hardware"),
+            (group, "Filesystem block", _size(item["block_bytes"]), "hardware"),
+            (group, "Mount options", ", ".join(item["mount_options"]) or None, "software"),
         ]
-    return "<table><tbody>" + "".join("<tr><th>" + escape(name) + "</th><td>" + value + "</td></tr>"
-        for name, value in rows) + "</tbody></table>"
+    return rows
 
 
-def configuration_html(setups):
-    """Describe stable configured design once, alongside observed per-setup differences."""
+def _setup_table(rows):
+    """Render (group, label, escaped cell) rows as one table with a body per group.
+
+    The source and destination arrays are built alike, so identical rows are stated once.
+    """
+    groups = {}
+    for group, label, cell in rows:
+        groups.setdefault(group, []).append((label, cell))
+    if groups["Source storage"] == groups["Destination storage"]:
+        groups = {("Source and destination storage" if title == "Source storage" else title): cells
+                  for title, cells in groups.items() if title != "Destination storage"}
+    return "<table>" + "".join(
+        "<tbody><tr><th colspan='2' scope='rowgroup'>" + escape(title) + "</th></tr>" + "".join(
+            "<tr><th scope='row'>" + escape(label) + "</th><td>" + cell + "</td></tr>" for label, cell in cells) +
+        "</tbody>" for title, cells in groups.items()) + "</table>"
+
+
+def setup_html(value):
+    """Render one run's observed setup; unknown historical RAM is never filled from a SKU."""
+    return _setup_table((group, label, _display(text)) for group, label, text, _ in setup_rows(value))
+
+
+def _observed_html(observations):
+    """Merge what the runs recorded: one value where every recording run agrees."""
+    seen = {}
+    for item in observations:
+        for group, label, text, _ in setup_rows(item["setup"]):
+            values = seen.setdefault((group, label), {})
+            if text is not None:
+                values.setdefault(text, []).append(item)
+    rows, differences = [], []
+    for (group, label), values in seen.items():
+        if not values:
+            cell = "not recorded"
+        elif len(values) == 1:
+            (text, runs), = values.items()
+            cell = escape(text)
+            if len(runs) < len(observations):
+                cell += f" <small>(recorded by {len(runs)} of {len(observations)} runs)</small>"
+        else:
+            cell = (" / ".join(escape(text) for text in values) +
+                    " <small>(<a href='#setup-differences'>differs between runs</a>)</small>")
+            parts = []
+            for text, runs in values.items():
+                # runs are in time order; the first and last bound each value without a long list
+                links = [("<a href='" + escape(run["href"], quote=True) + "'>" + escape(run["run"]) + "</a>")
+                         for run in (runs if len(runs) < 3 else (runs[0], runs[-1]))]
+                where = (", ".join(links) if len(runs) < 3 else
+                         f"{len(runs)} runs from " + links[0] + " to " + links[1])
+                parts.append("<code>" + escape(text) + "</code> in " + where)
+            differences.append("<li><strong>" + escape(group + ": " + label) + "</strong>: " +
+                               "; ".join(parts) + "</li>")
+        rows.append((group, label, cell))
+    text = _setup_table(rows)
+    if differences:
+        text += ("<h3 id='setup-differences'>Differences between runs</h3><p>Only fields whose recorded "
+            "values differ are listed. A field that an older run did not record is not a difference.</p>"
+            "<ul>" + "".join(differences) + "</ul>")
+    return text
+
+
+def configuration_html(observations):
+    """Describe the shared configured design once, then the observed values merged across runs.
+
+    Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
+    """
     text = (
-        "<section aria-labelledby='test-setup'><h2 id='test-setup'>Test setup and measurement scope</h2>"
-        "<p>The configured AWS worker is a Linux x86-64 <code>c5d.24xlarge</code>. The AWS instance-type specification is 96 vCPUs (48 cores), 192 GiB RAM and four 900 GB local SSD/NVMe devices; this is provider configuration, not recovered guest RAM evidence. Benchmark data is "
-        "placed on local NVMe instance-store storage, split into two disjoint two-member RAID0 arrays, "
-        "one for source and one for destination. The arrays use ext4, 512 KiB RAID chunks and 4 KiB "
-        "filesystem blocks; filesystem creation requests 16,000,000 inodes per array. Available bytes "
-        "and inodes are checked before each fixture. The separate encrypted 16 GiB gp3 EBS root disk "
-        "holds the OS and tools; it is not the benchmark data disk.</p>"
-        "<p>This is the current configured design, not a substitute for observed host evidence; historical runs may differ. The observed "
-        "CPU model, CPU count, RAM, kernel, filesystem and device models are grouped below. Missing "
-        "historical fields stay “not recorded”; RAM is not inferred from the instance type. A run links "
-        "to its exact setup fingerprint, so changes remain visible without repeating the whole table.</p>"
-        "<p>The copy datapath is local on one host, not a network copy; package and evidence transfers happen outside copy measurement. Fixtures are random bytes without a fixed seed, generated with filegen --leaf-files and a write buffer of min(file size, 1 MiB). Release x86-64 musl binary source revisions and digests are recorded for each run. Each selected file set uses two balanced adjacent A/A pairs: four fresh local copies with "
-        "identical baseline and candidate binary digests. Linux cache dropping occurs before copies; "
-        "validation checks paths, types, counts, sizes and metadata, not file contents. Generation, "
-        "cache preparation, validation and deletion are outside copy wall-time measurement. RCP uses its version-specific default settings apart from summary output, with no supplied bandwidth or operations throttle. Commands "
-        "run as an unprivileged user in an isolated measurement service with a configured 180 GiB "
-        "memory ceiling, 8,192 kernel-task ceiling and 1,048,576 open-file limit. Those are controls, not observed consumption "
-        "or a bound on queued Tokio futures.</p>"
-        "<table><thead><tr><th>File set</th><th>Files</th><th>Bytes per file</th><th>Total logical data</th></tr></thead>"
+        "<section aria-labelledby='machine'><h2 id='machine'>Machine and storage</h2><ul>"
+        "<li><strong>Instance.</strong> The configured AWS worker is a Linux x86-64 <code>c5d.24xlarge</code>. "
+        "The AWS instance-type specification is 96 vCPUs (48 cores), 192 GiB RAM and four 900 GB local "
+        "SSD/NVMe devices; this is provider configuration, not recovered guest RAM evidence.</li>"
+        "<li><strong>Benchmark data.</strong> Benchmark data is placed on local NVMe instance-store storage, "
+        "split into two disjoint two-member RAID0 arrays, one for source and one for destination.</li>"
+        "<li><strong>Filesystem.</strong> The arrays use ext4, 512 KiB RAID chunks and 4 KiB filesystem "
+        "blocks; filesystem creation requests 16,000,000 inodes per array. Available bytes and inodes are "
+        "checked before each fixture.</li>"
+        "<li><strong>Root disk.</strong> The separate encrypted 16 GiB gp3 EBS root disk holds the OS and "
+        "tools; it is not the benchmark data disk.</li></ul>"
+        "<p>This is the current configured design, not a substitute for observed host evidence; historical "
+        "runs may differ. What the workers recorded is under <a href='#observed'>Observed values</a>.</p></section>"
+        "<section aria-labelledby='datasets'><h2 id='datasets'>Datasets</h2>"
+        "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Files</th><th>Bytes per file</th>"
+        "<th>Total logical data</th></tr></thead>"
         "<tbody><tr><td>1 GB</td><td>1,000</td><td>1,000,000,000</td><td>1 TB</td></tr>"
         "<tr><td>100 MB</td><td>10,240</td><td>100,000,000</td><td>1.024 TB</td></tr>"
         "<tr><td>1 MB</td><td>1,024,000</td><td>1,000,000</td><td>1.024 TB</td></tr>"
-        "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr></tbody></table>"
+        "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr></tbody></table></div>"
         "<p>Sizes above are decimal bytes. The 1 KB file set has exactly 100 times less total logical "
         "data than the 1.024 TB sets; it still exercises over ten million files. No file-set "
-        "definition establishes a completed AWS qualification. Consult each run's suite, outcome and diagnostics.</p></section>")
-    for fingerprint, value in sorted(setups.items()):
-        require(fingerprint == setup_id(value), "setup fingerprint differs")
-        text += ("<section id='setup-" + fingerprint + "'><h2>Observed setup <code>" +
-            fingerprint[:12] + "</code></h2>" + setup_html(value) + "</section>")
-    if not setups:
+        "definition establishes a completed AWS qualification. Consult each run's suite, outcome and "
+        "diagnostics.</p></section>"
+        "<section aria-labelledby='method'><h2 id='method'>Method</h2><ul>"
+        "<li><strong>Copy.</strong> The copy datapath is local on one host, not a network copy; package and "
+        "evidence transfers happen outside copy measurement. RCP uses its version-specific default settings "
+        "apart from summary output, with no supplied bandwidth or operations throttle.</li>"
+        "<li><strong>Fixtures.</strong> Fixtures are random bytes without a fixed seed, generated with "
+        "<code>filegen --leaf-files</code> and a write buffer of min(file size, 1 MiB).</li>"
+        "<li><strong>Binaries.</strong> Release x86-64 musl binary source revisions and digests are recorded "
+        "for each run.</li>"
+        "<li><strong>Repeats.</strong> Each selected file set uses two balanced adjacent A/A pairs: four "
+        "fresh local copies with identical baseline and candidate binary digests.</li>"
+        "<li><strong>Caches and validation.</strong> Linux cache dropping occurs before copies; validation "
+        "checks paths, types, counts, sizes and metadata, not file contents.</li>"
+        "<li><strong>What is timed.</strong> Generation, cache preparation, validation and deletion are "
+        "outside copy wall-time measurement.</li>"
+        "<li><strong>Limits.</strong> Commands run as an unprivileged user in an isolated measurement service "
+        "with a configured 180 GiB memory ceiling, 8,192 kernel-task ceiling and 1,048,576 open-file limit. "
+        "Those are controls, not observed consumption or a bound on queued Tokio futures.</li></ul></section>"
+        "<section aria-labelledby='observed'><h2 id='observed'>Observed values</h2>")
+    if observations:
+        count = len(observations)
+        text += ("<p>What the workers recorded, merged across the " + str(count) +
+            (" run" if count == 1 else " runs") + " in this snapshot that recorded a setup. Missing "
+            "historical fields stay “not recorded”; RAM is not inferred from the instance type.</p>" +
+            _observed_html(observations))
+    else:
         text += "<p>No observed setup was available in this snapshot.</p>"
-    return text
+    return text + "</section>"
 
 
 def _delta(metrics, key):
@@ -534,35 +632,43 @@ def system_html(value):
         "<p>CPU busy excludes idle and I/O-wait ticks. Device sector counters use 512-byte sectors. "
         "Indexes are zero-based in recorded case/trial order. Ten-second sampling can miss short phases and boundary activity. Sampled cgroup-current maxima are not exact peaks, and any cgroup lifetime peak may include "
         "earlier phases. “Observed” means a phase ended, not that the benchmark phase succeeded.</p>"
-        "<div class='table-scroll'><table><thead><tr><th>Phase</th><th>Case index</th><th>Trial index</th>"
+        "<div class='table-scroll'><table class='data'><thead><tr><th>Phase</th><th>Case index</th><th>Trial index</th>"
         "<th>Observation</th><th>Elapsed s</th><th>Cgroup CPU</th><th>Sampled cgroup memory max</th>"
         "<th>Host memory available min</th><th>Host CPU busy</th><th>Source logical reads</th>"
         "<th>Destination logical writes</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
 
 
-def render(value, record, *, setup_href=None):
+def render(value, record):
+    """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged. Measurements "
         "remain worker-reported, not independently attested.</p><p>Process-resource availability: " +
-        escape(value["status"]) + ".</p><p>" + escape(PROCESS_SCOPE) + "</p>")
-    text += ("<p>Recorded allocation limit: " + _display(value["limits"]["allocation_seconds"], " seconds") +
-        "; recorded per-command timeout: " + _display(value["limits"]["command_timeout_seconds"], " seconds") + ".</p>")
+        escape(value["status"]) + ". " + escape(PROCESS_SCOPE) + "</p>")
     if value["reason"] == "phase_summary_budget":
         text += ("<p>Optional sampled phase detail exceeded the public document budget and is omitted. "
             "Per-copy process metrics and observed setup remain shown; the bounded raw telemetry "
             "journal remains in private retained evidence.</p>")
-    if value["archive_sha256"]:
-        text += "<p>Source archive SHA256: <code>" + value["archive_sha256"] + "</code>.</p>"
-    if value["setup"] is not None:
-        if setup_href is not None:
-            require(re.fullmatch(r"\.\./setups[.]html#setup-[0-9a-f]{64}", setup_href),
-                    "invalid setup link")
-            text += ("<p><a href='" + setup_href + "'>Observed hardware, storage and test setup <code>" +
-                value["setup_id"][:12] + "</code></a></p>")
+    rows = []
+    for trial in value["trials"]:
+        metrics = trial["metrics"]
+        fields = [str(trial["iteration"]), trial["status"]]
+        if metrics is None:
+            fields += ["unavailable"] * len(METRICS)
         else:
-            text += setup_html(value["setup"])
+            fields += [f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
+            fields += [f"{metrics[key]:,}" for key in METRICS[2:]]
+        rows.append("<tr><td><code>" + escape(trial["case_id"]) + "</code></td><td><code>" +
+                    escape(trial["variant_id"]) + "</code></td>" +
+                    "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
+    if rows:
+        text += ("<div class='table-scroll'><table class='data'><thead><tr><th>Case</th><th>Variant</th><th>Repeat</th>"
+            "<th>Resource status</th><th>User CPU s</th><th>System CPU s</th><th>Peak RSS KiB</th>"
+            "<th>Voluntary switches</th><th>Involuntary switches</th><th>Minor faults</th><th>Major faults</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+    else:
+        text += "<p>No per-copy process-resource measurements are available.</p>"
     if value["cases"]:
         progress_rows = []
         for case in value["cases"]:
@@ -572,32 +678,31 @@ def render(value, record, *, setup_href=None):
             fields = (case["case_id"], case["definition_status"], str(case["copy_trials"]),
                       str(case["successful_copies"]), stage)
             progress_rows.append("<tr>" + "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
-        text += ("<h3>Recorded case progress</h3><p>Diagnostic activity only; this table does not qualify "
-            "individual cases or turn partial copies into performance samples.</p><table><thead><tr>"
-            "<th>Case</th><th>Definition</th><th>Copy trials recorded</th><th>Successful copy outcomes</th>"
-            "<th>Activity evidence</th></tr></thead><tbody>" + "".join(progress_rows) + "</tbody></table>")
-    rows = []
-    for trial in value["trials"]:
-        metrics = trial["metrics"]
-        fields = [trial["case_id"], trial["variant_id"], str(trial["iteration"]), trial["status"]]
-        if metrics is None:
-            fields += ["unavailable"] * len(METRICS)
-        else:
-            fields += [f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
-            fields += [f"{metrics[key]:,}" for key in METRICS[2:]]
-        rows.append("<tr>" + "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
-    if rows:
-        text += ("<div class='table-scroll'><table><thead><tr><th>Case</th><th>Variant</th><th>Repeat</th>"
-            "<th>Resource status</th><th>User CPU s</th><th>System CPU s</th><th>Peak RSS KiB</th>"
-            "<th>Voluntary switches</th><th>Involuntary switches</th><th>Minor faults</th><th>Major faults</th>"
-            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
-    else:
-        text += "<p>No per-copy process-resource measurements are available.</p>"
-    text += "<h3>Sampled run phases</h3><p>" + escape(SYSTEM_SCOPE) + "</p>" + system_html(value["system"])
+        # how far an unqualified run got is the first thing its reader looks for
+        text += ("<details" + ("" if record["benchmark_valid"] else " open") +
+            "><summary>Recorded case progress</summary><p>Diagnostic activity only; this table does not qualify "
+            "individual cases or turn partial copies into performance samples.</p><div class='table-scroll'>"
+            "<table><thead><tr><th>Case</th><th>Definition</th><th>Copy trials recorded</th>"
+            "<th>Successful copy outcomes</th><th>Activity evidence</th></tr></thead><tbody>" +
+            "".join(progress_rows) + "</tbody></table></div></details>")
+    text += ("<details><summary>Sampled run phases</summary><p>" + escape(SYSTEM_SCOPE) + "</p>" +
+             system_html(value["system"]))
     for trial in value["trials"]:
         if trial["system"]["status"] == "unavailable":
             continue
         text += ("<details><summary>Sampled phases: " + escape(trial["case_id"]) + " / " +
             escape(trial["variant_id"]) + " / repeat " + str(trial["iteration"]) + "</summary>" +
             system_html(trial["system"]) + "</details>")
+    text += ("</details><details><summary>Run limits and source archive</summary><p>Recorded allocation limit: " +
+        _display(value["limits"]["allocation_seconds"], " seconds") + "; recorded per-command timeout: " +
+        _display(value["limits"]["command_timeout_seconds"], " seconds") + ".</p>")
+    if value["archive_sha256"]:
+        text += "<p>Source archive SHA256: <code>" + value["archive_sha256"] + "</code>.</p>"
+    text += ("</details></section><section aria-labelledby='observed-setup'>"
+             "<h2 id='observed-setup'>Observed setup</h2>")
+    if value["setup"] is None:
+        text += "<p>No observed setup was recorded for this run.</p>"
+    else:
+        text += ("<details><summary>Hardware, storage and software recorded by this run</summary>" +
+                 setup_html(value["setup"]) + "</details>")
     return text + "</section>"

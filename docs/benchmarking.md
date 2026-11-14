@@ -232,23 +232,33 @@ fingerprint of the malformed resource bytes. Failed execution requires `unavaila
 `execution_failed`, regardless of resource-file contents. Both supervisor and child use `LC_ALL=C`
 and `LANG=C`.
 
-The AWS retained-report site has a separate history page with duration, CPU and memory plots for
-each configured fileset. Each run/variant point uses the frozen median wall time, the median of user
-plus system CPU seconds **computed per copy**, and the median per-copy peak RSS converted from KiB
-to MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are command-scope
-statistics, not total host CPU or simultaneous process-tree memory; repetitions are not summed. The
-x-axis is the worker-reported benchmark start before fixture preparation, not collection or
-retirement time, and it is not independently attested.
+The AWS retained-report site opens on the performance history: duration, CPU and memory plots for
+each file set that has qualified runs. The trend follows the build under test with rcp's default
+settings. Each point is one qualified run and summarizes its copies: when the run's baseline and
+candidate binaries are identical every copy counts, otherwise only the candidate's copies do. A
+point shows the median copy wall time (a single contributing measurement keeps its frozen median),
+the median of user plus system CPU seconds **computed per copy**, and the median per-copy peak RSS
+converted from KiB to MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are
+command-scope statistics, not total host CPU or simultaneous process-tree memory; repetitions are
+not summed. The x-axis is the worker-reported benchmark start before fixture preparation, not
+collection or retirement time, and it is not independently attested. The value axis is fitted to the
+data and is never narrower than 5% either side of its centre.
 
-Resource points require complete matching repeat coverage. Missing evidence is unavailable, never
-zero-filled or interpolated. Frozen series IDs, variants, observed setups and diagnostic versions
-separate traces; unknown setup evidence is not pooled across runs. Run, series and setup links
-retain provenance without rewriting frozen JSON. Pending, failed and evidence-unavailable runs
-remain in the inventory without performance points. The plots cover still-retained 90-day records,
-not permanent history. A bounded window shows the newest 32 qualified runs and at most 256
-case/variant points; large labels can shorten the window further. The omitted count and a link to
-the complete retained run inventory stay visible. Local copies and any future loopback remote
-measurements require distinct validated contracts.
+Runs of a file set are joined in time order across code versions, harness revisions, frozen series
+IDs and machine instances. A new line starts only when the measurement contract changes or a
+recorded hardware value differs from the last recorded one: CPU model or count, architecture,
+storage devices, layout or filesystem. Any other recorded change, such as the kernel, is marked on
+the line, and a field that an older run did not record is not a change. Resource points require
+complete resource metrics for every plotted copy. Missing evidence is unavailable, never zero-filled
+or interpolated, and no line crosses it. Run links and the data table retain provenance (frozen
+series IDs and the observed setup) without rewriting frozen JSON. Failed and evidence-unavailable
+runs remain in the run list without performance points; pending runs appear under collection status.
+The plots cover still-retained 90-day records, not permanent history. A bounded window shows the
+newest 32 qualified runs; an oversized page shortens the window further. The omitted count stays
+visible and every run stays in the list. The machine, storage, datasets and method are described
+once on the test setup page, where the values the runs recorded are merged into one table; each run
+page keeps its own observed setup as a collapsed appendix. Local copies and any future loopback
+remote measurements require distinct validated contracts.
 
 Either option records phase costs: fixture generation and initial verification on the run;
 preparation (including cache preparation but excluding result persistence), verification and
@@ -882,12 +892,12 @@ the new changes page. Copies of `history.json`, `changes.json`, and `changes.md`
 links working. These compatibility routes are generated with `--with-benchmark-history`.
 
 The shared header and stylesheet are in `scripts/report-site/header.html` and `site.css`; the
-landing page uses `landing.html`, `landing.css`, and `landing.js` in the same directory. The landing
-page reads its featured timings and fileset size from the tables in `docs/reports/performance.md`
-and derives both charts from one shared scale. The build rejects missing or ambiguous measurement
-rows and checks README section links in the landing page and shared header. The report content
-remains wider than the shared header to accommodate tables and figures; mobile gutters match
-throughout.
+landing page uses `landing.html`, `landing.css`, and `landing.js` in the same directory, and the AWS
+benchmark pages share `aws-page.html` and `aws.css`. The landing page reads its featured timings and
+fileset size from the tables in `docs/reports/performance.md` and derives both charts from one
+shared scale. The build rejects missing or ambiguous measurement rows and checks README section
+links in the landing page and shared header. The report content remains wider than the shared header
+to accommodate tables and figures; mobile gutters match throughout.
 
 Historical Depot performance records remain in `benchmark-history`; the retired benchmark workflow
 no longer writes new records. The unused `benchmark-history-updated` Pages trigger is removed. No

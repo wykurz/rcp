@@ -1,0 +1,60 @@
+/* AWS benchmark pages: report typography plus stat tiles, charts, badges and key facts */
+:root { --series: #cd5969; --chart-grid: #232326; }
+:root[data-theme="light"] { --series: #9b1c31; --chart-grid: #e8e8ec; }
+
+.aws h1 { max-width: none; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; }
+.aws .lede { max-width: 72ch; margin: 0 0 1.3rem; color: var(--muted); font-size: 1.05rem; }
+.aws .note { max-width: 110ch; margin: 0 0 .5rem; padding: .65rem 1rem; border-left: 3px solid var(--border); background: var(--surface); color: var(--muted); font-size: .82rem; line-height: 1.55; }
+.aws .note p { margin: .2rem 0; }
+.aws section > p, .aws section > ul { max-width: 100ch; }
+.aws .dataset, .aws .reading, .aws .window, .aws .empty, .aws .changes { color: var(--muted); font-size: .9rem; }
+.aws .dataset { margin-top: -.4rem; }
+.aws .changes { padding-left: 1.2rem; }
+.aws small { color: var(--muted); }
+
+/* a stat tile on top of its trend; three tiles per file set */
+.aws .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin: 1.2rem 0 .9rem; }
+.aws .metric { min-width: 0; max-width: 620px; margin: 0; padding: 1rem 1.1rem .8rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.aws .metric h3, .aws .metric h4 { margin: 0; color: var(--muted); font-size: .8rem; font-weight: 600; line-height: 1.4; }
+.aws .metric .value { margin: .1rem 0 0; font-size: 1.75rem; font-weight: 650; line-height: 1.25; letter-spacing: -.02em; }
+.aws .metric .unit { color: var(--muted); font-size: .95rem; font-weight: 500; letter-spacing: 0; }
+.aws .metric .delta, .aws .metric .gap { margin: .1rem 0 0; color: var(--muted); font-size: .8rem; line-height: 1.5; }
+.aws .metric .gap { margin-top: .5rem; }
+
+.aws .chart { display: block; width: 100%; height: auto; margin-top: .7rem; }
+.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart .grid { stroke: var(--chart-grid); stroke-width: 1; }
+.chart .axis { stroke: var(--border); stroke-width: 1; }
+.chart .line { stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .range { stroke: var(--series); stroke-width: 1.5; stroke-linecap: round; opacity: .45; }
+.chart .dot { fill: var(--series); stroke: var(--surface); stroke-width: 2; }
+.chart .marker { stroke: var(--muted); stroke-width: 1; opacity: .75; }
+.chart .marker-label { font-size: 10px; }
+/* the revealed overlay is the hover and keyboard-focus indicator for a point */
+.chart a.pt { cursor: pointer; outline: none; }
+.chart a.pt:hover .hover, .chart a.pt:focus-visible .hover { visibility: visible; }
+.chart .guide { stroke: var(--muted); stroke-width: 1; }
+.chart .ring { fill: none; stroke: var(--text); stroke-width: 2; }
+.chart .tip rect { fill: var(--surface-raised); stroke: var(--border); }
+.chart .tip text { font-size: 11.5px; }
+.chart .tip .tip-value { fill: var(--text); font-size: 14px; font-weight: 650; }
+
+.aws .badge { display: inline-block; padding: .2rem .65rem; border-radius: 999px; font-size: .78rem; font-weight: 600; line-height: 1.45; letter-spacing: 0; white-space: nowrap; vertical-align: middle; }
+.aws .badge-passed { background: var(--success-background); color: var(--success-text); }
+.aws .badge-failed { background: var(--error-background); color: var(--error-text); }
+.aws .badge-unavailable { background: var(--warning-background); color: var(--warning-text); }
+
+.aws .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .9rem 1.5rem; margin: 1.1rem 0 1.2rem; padding: 1rem 1.1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.aws .facts div { min-width: 0; }
+.aws .facts dt { color: var(--muted); font-size: .76rem; }
+.aws .facts dd { margin: .1rem 0 0; font-size: .92rem; line-height: 1.5; overflow-wrap: anywhere; }
+
+.aws details { margin: 1rem 0; }
+.aws summary { cursor: pointer; font-size: .95rem; font-weight: 600; }
+.aws details details { margin-left: 1rem; }
+/* measurement tables scroll sideways instead of wrapping numbers and identifiers */
+.aws table.data td { white-space: nowrap; }
+/* key and value rows read as a list; only group headings carry the heavy rule */
+.aws tbody th { border-top: 0; border-bottom: 1px solid var(--border); background: none; font-weight: 600; }
+.aws tbody th[colspan] { padding-top: 1.1rem; border-bottom: 2px solid var(--rule); color: var(--muted); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }
+.contents a[aria-current] { color: var(--text); font-weight: 600; }
