@@ -921,14 +921,9 @@ mod tests {
                 });
                 tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
                     .await??;
-                let (release, blocked) = std::sync::mpsc::channel();
-                let (started, ready) = tokio::sync::oneshot::channel();
-                let blocker = tokio::task::spawn_blocking(move || {
-                    let _ = started.send(());
-                    let _ = blocked.recv();
-                });
+                let mut blocker = crate::testutils::BlockingWorker::spawn();
                 gate.release_all();
-                ready.await?;
+                blocker.wait_started().await?;
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     while submissions.count() < 4 {
                         tokio::task::yield_now().await;
@@ -938,8 +933,7 @@ mod tests {
                 task.abort();
                 assert!(task.await.err().expect("cancelled task").is_cancelled());
                 registry.output(&source)?;
-                release.send(())?;
-                blocker.await?;
+                blocker.finish().await?;
                 tokio::task::spawn_blocking(|| ()).await?;
                 assert_eq!(
                     std::fs::metadata(path.join("output"))?.permissions().mode() & 0o777,
@@ -1425,13 +1419,8 @@ mod tests {
             let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
             let registry = Arc::new(DirectoryOverlap::default());
             let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
-            let (release, blocked) = std::sync::mpsc::channel();
-            let (started, ready) = tokio::sync::oneshot::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                let _ = started.send(());
-                let _ = blocked.recv();
-            });
-            ready.await?;
+            let mut blocker = crate::testutils::BlockingWorker::spawn();
+            blocker.wait_started().await?;
             let submissions = crate::testutils::BlockingSubmissions::start();
             let task = tokio::spawn(async move {
                 let mutation = reservation.clone();
@@ -1453,8 +1442,7 @@ mod tests {
             task.abort();
             assert!(task.await.expect_err("cancelled task").is_cancelled());
             registry.output(&source)?;
-            release.send(())?;
-            blocker.await?;
+            blocker.finish().await?;
             tokio::task::spawn_blocking(|| ()).await?;
             assert!(!root.path().join("output").exists());
             anyhow::Ok(())
