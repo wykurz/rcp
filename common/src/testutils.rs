@@ -1018,24 +1018,54 @@ where
     Ok((observations, caller_observation))
 }
 
-pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
-    let mut idx = 0;
-    loop {
-        let tmp_dir = std::env::temp_dir().join(format!("rcp_test{}", &idx));
-        if let Err(error) = tokio::fs::create_dir(&tmp_dir).await {
-            match error.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    idx += 1;
-                }
-                _ => return Err(error.into()),
-            }
-        } else {
-            return Ok(tmp_dir);
-        }
+/// Owns a removable fixture root and reserves its namespace until dropped.
+#[cfg(test)]
+#[derive(Debug)]
+#[must_use = "keep the fixture owner alive while its paths are in use"]
+pub(crate) struct TestDir {
+    root: std::path::PathBuf,
+    _parent: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl TestDir {
+    pub(crate) fn as_path(&self) -> &std::path::Path {
+        &self.root
     }
 }
 
-pub async fn setup_test_dir() -> Result<std::path::PathBuf> {
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.as_path()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn create_temp_dir() -> Result<TestDir> {
+    tokio::task::spawn_blocking(|| {
+        let parent = tempfile::Builder::new().prefix("rcp_test-").tempdir()?;
+        let root = parent.path().join("root");
+        std::fs::create_dir(&root)?;
+        Ok(TestDir {
+            root,
+            _parent: parent,
+        })
+    })
+    .await?
+}
+
+#[cfg(test)]
+pub(crate) async fn setup_test_dir() -> Result<TestDir> {
     // create a temporary directory
     let tmp_dir = create_temp_dir().await?;
     // foo
@@ -1135,6 +1165,52 @@ mod tests {
     use futures::FutureExt as _;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn removed_fixture_stays_absent_when_another_is_created() -> Result<()> {
+        let first = create_temp_dir().await?;
+        let first_path = first.to_path_buf();
+        tokio::fs::remove_dir(&first_path).await?;
+
+        let second = create_temp_dir().await?;
+        assert!(
+            !first_path.exists(),
+            "another fixture recreated the removed root {first_path:?}"
+        );
+        drop(first);
+        assert!(second.is_dir(), "dropping one fixture removed another");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_fixture_removes_its_namespace() -> Result<()> {
+        let fixture = create_temp_dir().await?;
+        let path = fixture.to_path_buf();
+        let namespace = path.parent().unwrap().to_path_buf();
+        tokio::fs::create_dir(path.join("nested")).await?;
+        tokio::fs::write(path.join("nested/payload"), b"fixture data").await?;
+
+        drop(fixture);
+        assert!(!path.exists(), "fixture contents survived their owner");
+        assert!(!namespace.exists(), "fixture namespace survived its owner");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unwinding_fixture_scope_removes_its_namespace() -> Result<()> {
+        let fixture = create_temp_dir().await?;
+        let path = fixture.to_path_buf();
+        let namespace = path.parent().unwrap().to_path_buf();
+
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            let _fixture = fixture;
+            panic!("fixture-owning scope panicked");
+        }));
+        assert!(result.is_err());
+        assert!(!path.exists(), "unwinding left the fixture root behind");
+        assert!(!namespace.exists(), "unwinding left the namespace behind");
+        Ok(())
+    }
 
     fn run_blocking_worker_test(test: impl std::future::Future<Output = Result<()>>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()

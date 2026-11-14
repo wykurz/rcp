@@ -3786,7 +3786,7 @@ mod copy_tests {
         let mut settings = settings_with_delete(delete_on());
         settings.dry_run = Some(DryRunMode::Brief);
         settings.dereference = mode == PreviewOperation::Dereference;
-        let task_root = root.clone();
+        let task_root = root.to_path_buf();
         let task_dst = dst.clone();
         let task = tokio::spawn(async move {
             if mode == PreviewOperation::Link || mode == PreviewOperation::DelegatedCopy {
@@ -4705,7 +4705,7 @@ mod copy_tests {
         Ok(())
     }
 
-    async fn setup_test_dir_and_copy() -> Result<std::path::PathBuf, anyhow::Error> {
+    async fn setup_test_dir_and_copy() -> Result<testutils::TestDir, anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = copy(
