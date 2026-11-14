@@ -265,13 +265,16 @@ support, not that the code is broken. Fixtures write the xattrs directly rather 
 hand for reading an ACL by eye while debugging, but nothing in the suite uses it. See
 [POSIX ACLs](acls.md).
 
-**Syscall-tracing tests** in `rcp/tests/acls.rs`, `rcp/tests/reflink.rs`, and
-`rlink/tests/reflink.rs` require `strace(1)`, which is included in the dev shell. The ACL tests
-check opt-in probe costs, and the reflink tests verify that the selected policy controls
-`copy_file_range` use, including copies during `rlink --update`. Checking copied bytes alone cannot
-verify either property. Native test runs fail when `strace` is unavailable. These tests carry
-source-owned `rcp_nix_sandbox` exemptions because the Nix sandbox cannot provide tracing; native CI
-runs the syscall assertions.
+**Syscall-tracing tests** in `rcp/tests/acls.rs`, `rcp/tests/reflink.rs`,
+`rcp/tests/overlap_cost.rs`, and `rlink/tests/reflink.rs` require `strace(1)`, which is included in
+the dev shell. The ACL tests check opt-in probe costs, and the reflink tests verify that the
+selected policy controls `copy_file_range` use, including copies during `rlink --update`. Checking
+copied bytes alone cannot verify either property. The overlap tests independently bound ancestry
+opens, metadata reads, and mount-ID samples along known fixture directories for single and
+concurrent copy/preview operands. They also verify output bytes or preview actions, and detect
+repeated walks during child traversal. Native test runs fail when `strace` is unavailable. These
+tests carry source-owned `rcp_nix_sandbox` exemptions because the Nix sandbox cannot provide
+tracing; native CI runs the syscall assertions.
 
 ### Remote Integration Tests
 
