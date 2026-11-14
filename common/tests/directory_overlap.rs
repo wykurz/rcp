@@ -654,25 +654,32 @@ async fn shared_ancestry_diagnostic_is_independent_of_first_committer() -> anyho
 }
 
 #[tokio::test]
-async fn same_operand_overlap_names_its_update_input() -> anyhow::Result<()> {
+async fn same_operand_overlap_identifies_source_and_update_roles() -> anyhow::Result<()> {
     for preview in [false, true] {
-        for same_input in [false, true] {
+        for role in ["source", "update", "both"] {
             let root = tempfile::tempdir()?;
             let source = root.path().join("source");
             fixture(&source).await?;
-            let update = if same_input {
+            let update = if role == "both" {
                 source.clone()
             } else {
                 let update = root.path().join("update");
                 fixture(&update).await?;
                 update
             };
-            let destination = update.join("output");
+            let destination = if role == "source" { &source } else { &update }.join("output");
             let error = run(true, &source, &destination, Some(&update), preview, false)
                 .await
-                .expect_err("a destination inside the update input must be rejected");
+                .expect_err("a destination inside an input must be rejected");
             let message = format!("{error:#}");
             assert!(message.contains("overlap"), "{message}");
+            let label = match role {
+                "source" => "source directory",
+                "update" => "update directory",
+                "both" => "directory used as both source and update",
+                _ => unreachable!(),
+            };
+            assert!(message.contains(label), "{message}");
             assert!(message.contains(&format!("{:?}", source)), "{message}");
             assert!(
                 message.contains(&format!("(update {update:?})")),
@@ -680,6 +687,45 @@ async fn same_operand_overlap_names_its_update_input() -> anyhow::Result<()> {
             );
             assert!(message.contains(&format!("{:?}", destination)), "{message}");
             assert!(!destination.exists());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegated_update_descendants_retain_their_input_role() -> anyhow::Result<()> {
+    for preview in [false, true] {
+        for replaces_source_file in [false, true] {
+            let root = tempfile::tempdir()?;
+            let source = root.path().join("source");
+            let update = root.path().join("update");
+            let destination = root.path().join("destination");
+            fixture(&source).await?;
+            fixture(&update.join("only/nested")).await?;
+            fixture(&destination).await?;
+            let original = std::fs::read(update.join("only/nested/file0"))?;
+            if replaces_source_file {
+                std::fs::write(source.join("only"), b"old source file")?;
+            }
+            std::os::unix::fs::symlink(&destination, update.join("only/nested/back"))?;
+            let mut settings = copy_settings(preview);
+            settings.dereference = true;
+            settings.delete = None;
+            let error =
+                run_with_settings(true, &source, &destination, Some(&update), false, settings)
+                    .await
+                    .expect_err("an update descendant must not consume the destination");
+            let message = format!("{error:#}");
+            assert!(message.contains("update directory"), "{message}");
+            assert!(
+                message.contains(&format!("(update {update:?})")),
+                "{message}"
+            );
+            assert_eq!(std::fs::read(update.join("only/nested/file0"))?, original);
+            assert_eq!(
+                std::fs::read_link(update.join("only/nested/back"))?,
+                destination
+            );
         }
     }
     Ok(())

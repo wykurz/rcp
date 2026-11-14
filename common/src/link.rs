@@ -1269,7 +1269,7 @@ async fn link_internal(
                 .map_err(|error| Error::new(error.into(), Default::default()))?;
             let mut directories = Vec::with_capacity(2);
             if entry.src_handle.kind() == EntryKind::Dir {
-                directories.push(entry.src_handle.meta());
+                directories.push((safedir::overlap::InputRole::Source, entry.src_handle.meta()));
             }
             if let (Some((parent, name)), Some(handle), Some(path)) =
                 (update, entry.update_handle.as_ref(), update_path.as_deref())
@@ -1279,7 +1279,7 @@ async fn link_internal(
                     .await
                     .map_err(|error| Error::new(error.into(), Default::default()))?;
                 if handle.kind() == EntryKind::Dir {
-                    directories.push(handle.meta());
+                    directories.push((safedir::overlap::InputRole::Update, handle.meta()));
                 }
             }
             destination
@@ -1318,7 +1318,9 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    destination.clone(),
+                    destination
+                        .clone()
+                        .with_input_role(safedir::overlap::InputRole::Update),
                     settings,
                     is_fresh,
                     admission,
@@ -1379,7 +1381,9 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    destination.clone(),
+                    destination
+                        .clone()
+                        .with_input_role(safedir::overlap::InputRole::Update),
                     settings,
                     is_fresh,
                     admission,
@@ -1400,7 +1404,9 @@ async fn link_internal(
                     update_path,
                     dst_root,
                     rel_path,
-                    destination.clone(),
+                    destination
+                        .clone()
+                        .with_input_role(safedir::overlap::InputRole::Update),
                     settings,
                     is_fresh,
                     admission,
@@ -1660,7 +1666,10 @@ async fn link_dir_entry(
         ),
         None => (&src_dir, &src_meta, src_path),
     };
-    let inputs = [&src_meta, meta];
+    let inputs = [
+        (safedir::overlap::InputRole::Source, &src_meta),
+        (safedir::overlap::InputRole::Update, meta),
+    ];
     let inputs = &inputs[..if update_dir.is_some() { 2 } else { 1 }];
     let admission = destination
         .enter(
@@ -1955,7 +1964,7 @@ async fn process_update_only_entry(
         &update_entry_path,
         &dst_root,
         &entry_rel,
-        destination,
+        destination.with_input_role(safedir::overlap::InputRole::Update),
         &settings,
         is_fresh,
         entry,

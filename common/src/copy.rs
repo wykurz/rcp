@@ -424,10 +424,14 @@ impl CopySession {
                         .record_root(&parent, &target.name, &entry, &target.display)
                         .await?;
                     if entry.kind() == EntryKind::Dir {
-                        destination.reserve_roots(&[entry.meta()])?;
+                        destination.reserve_roots(&[(
+                            safedir::overlap::InputRole::Source,
+                            entry.meta(),
+                        )])?;
                     }
                 } else if entry.kind() == EntryKind::Dir {
-                    destination.reserve_roots(&[entry.meta()])?;
+                    destination
+                        .reserve_roots(&[(safedir::overlap::InputRole::Source, entry.meta())])?;
                 }
                 Ok(())
             })
@@ -1420,7 +1424,7 @@ impl WalkVisitor for CopyVisitor {
             .destination
             .enter(
                 self.prog_track,
-                &[&src_meta],
+                &[(parent_ctx.destination.input_role, &src_meta)],
                 destination::PreservationSource {
                     dir: &src_dir,
                     meta: &src_meta,

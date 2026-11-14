@@ -45,7 +45,7 @@ impl InputProtection {
         if let Some(owner) = self.registry.input_owner(identity) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("cannot remove {path:?}: overlaps an input of {owner}"),
+                format!("cannot remove {path:?}: overlaps {owner}"),
             ));
         }
         Ok(())

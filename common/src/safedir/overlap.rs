@@ -32,28 +32,78 @@ impl std::fmt::Display for Operand {
     }
 }
 
-#[derive(Default)]
-struct Uses {
-    committed: Option<Arc<Operand>>,
-    // one pending owner is usual; concurrent aliases may spill until one commits.
-    pending: SmallVec<[(u64, Arc<Operand>); 1]>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputRole {
+    Source,
+    Update,
+    SourceAndUpdate,
 }
 
-impl Uses {
-    fn reserve(&mut self, token: u64, operand: &Arc<Operand>) -> bool {
+impl std::fmt::Display for InputRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Source => "source directory",
+            Self::Update => "update directory",
+            Self::SourceAndUpdate => "directory used as both source and update",
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct InputOwner {
+    operand: Arc<Operand>,
+    role: InputRole,
+}
+
+impl std::fmt::Display for InputOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} of operand {}", self.role, self.operand)
+    }
+}
+
+struct Uses<T> {
+    committed: Option<T>,
+    // one pending owner is usual; concurrent aliases may spill until one commits.
+    pending: SmallVec<[(u64, T); 1]>,
+}
+
+impl<T> Default for Uses<T> {
+    fn default() -> Self {
+        Self {
+            committed: None,
+            pending: SmallVec::new(),
+        }
+    }
+}
+
+impl<T> Uses<T> {
+    fn reserve(&mut self, token: u64, owner: T) -> bool {
         if self.committed.is_some() || self.pending.iter().any(|(owner, _)| *owner == token) {
             return false;
         }
-        self.pending.push((token, Arc::clone(operand)));
+        self.pending.push((token, owner));
         true
     }
 
-    fn commit(&mut self, operand: &Arc<Operand>) {
+    fn commit(&mut self, owner: T) {
         if self.committed.is_none() {
-            self.committed = Some(Arc::clone(operand));
+            self.committed = Some(owner);
             // permanent history subsumes every pending alias, including owners still in flight.
             self.pending = SmallVec::new();
         }
+    }
+
+    fn commit_reserved(&mut self, token: u64) {
+        if self.committed.is_some() {
+            return;
+        }
+        let index = self
+            .pending
+            .iter()
+            .position(|(owner, _)| *owner == token)
+            .expect("a committing reservation owns its pending use");
+        let (_, owner) = self.pending.swap_remove(index);
+        self.commit(owner);
     }
 
     fn release(&mut self, token: u64) {
@@ -62,7 +112,7 @@ impl Uses {
         }
     }
 
-    fn owner(&self) -> &Arc<Operand> {
+    fn owner(&self) -> &T {
         self.committed
             .as_ref()
             .or_else(|| self.pending.first().map(|(_, owner)| owner))
@@ -70,11 +120,39 @@ impl Uses {
     }
 }
 
+fn release_uses<T>(
+    uses: &mut std::collections::HashMap<Identity, Uses<T>>,
+    identities: &[Identity],
+    token: u64,
+) {
+    for id in identities {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = uses.entry(*id) else {
+            continue;
+        };
+        entry.get_mut().release(token);
+        if entry.get().committed.is_none() && entry.get().pending.is_empty() {
+            entry.remove();
+        }
+    }
+}
+
+fn commit_uses<T>(
+    uses: &mut std::collections::HashMap<Identity, Uses<T>>,
+    identities: &[Identity],
+    token: u64,
+) {
+    for id in identities {
+        uses.get_mut(id)
+            .expect("reservation owns its registered use")
+            .commit_reserved(token);
+    }
+}
+
 #[derive(Default)]
 struct DirectoryUses {
     next_token: u64,
-    inputs: std::collections::HashMap<Identity, Uses>,
-    outputs: std::collections::HashMap<Identity, Uses>,
+    inputs: std::collections::HashMap<Identity, Uses<InputOwner>>,
+    outputs: std::collections::HashMap<Identity, Uses<Arc<Operand>>>,
 }
 
 /// Invocation history and ancestry snapshots. Neither cache retains descriptors or admission credits.
@@ -128,22 +206,8 @@ impl Drop for ReservationInner {
             .outputs
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let DirectoryUses {
-            inputs: input_uses,
-            outputs: output_uses,
-            ..
-        } = &mut *uses;
-        for (map, identities) in [(input_uses, &self.inputs), (output_uses, &*outputs)] {
-            for id in identities {
-                let std::collections::hash_map::Entry::Occupied(mut entry) = map.entry(*id) else {
-                    continue;
-                };
-                entry.get_mut().release(self.token);
-                if entry.get().committed.is_none() && entry.get().pending.is_empty() {
-                    entry.remove();
-                }
-            }
-        }
+        release_uses(&mut uses.inputs, &self.inputs, self.token);
+        release_uses(&mut uses.outputs, outputs, self.token);
     }
 }
 
@@ -168,19 +232,8 @@ impl Reservation {
             .outputs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let DirectoryUses {
-            inputs: input_uses,
-            outputs: output_uses,
-            ..
-        } = &mut *uses;
-        for (map, identities) in [(input_uses, &self.0.inputs), (output_uses, &*outputs)] {
-            for id in identities {
-                let entry = map
-                    .get_mut(id)
-                    .expect("reservation owns its registered use");
-                entry.commit(&self.0.operand);
-            }
-        }
+        commit_uses(&mut uses.inputs, &self.0.inputs, self.0.token);
+        commit_uses(&mut uses.outputs, &outputs, self.0.token);
         self.0
             .committed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -199,8 +252,8 @@ impl Reservation {
         }
         let owners = uses.outputs.entry(id).or_default();
         if self.0.committed.load(std::sync::atomic::Ordering::Acquire) {
-            owners.commit(&self.0.operand);
-        } else if owners.reserve(self.0.token, &self.0.operand) {
+            owners.commit(Arc::clone(&self.0.operand));
+        } else if owners.reserve(self.0.token, Arc::clone(&self.0.operand)) {
             self.0
                 .outputs
                 .lock()
@@ -212,38 +265,42 @@ impl Reservation {
 }
 
 impl DirectoryOverlap {
-    pub(crate) fn input_owner(&self, identity: Identity) -> Option<Arc<Operand>> {
+    pub(crate) fn input_owner(&self, identity: Identity) -> Option<InputOwner> {
         self.uses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .inputs
             .get(&identity)
-            .map(|uses| Arc::clone(uses.owner()))
+            .map(|uses| uses.owner().clone())
     }
 
     pub(crate) fn reserve(
         self: &Arc<Self>,
-        inputs: &[&FileMeta],
+        inputs: &[(InputRole, &FileMeta)],
         outputs: &Evidence,
         operand: Arc<Operand>,
     ) -> std::io::Result<Reservation> {
-        let mut identities = Identities::new();
-        for meta in inputs {
+        let mut incoming = SmallVec::<[(Identity, InputRole); 2]>::new();
+        for (role, meta) in inputs {
             let id = (meta.dev(), meta.ino());
-            if !identities.contains(&id) {
-                identities.push(id);
+            if let Some((_, previous)) = incoming.iter_mut().find(|(identity, _)| *identity == id) {
+                if previous != role {
+                    *previous = InputRole::SourceAndUpdate;
+                }
+            } else {
+                incoming.push((id, *role));
             }
         }
         let mut uses = self
             .uses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for id in &identities {
+        for (id, role) in &incoming {
             if outputs.contains(id) {
-                return Err(input_overlap_error(&operand, &operand, id));
+                return Err(input_overlap_error(&operand, &operand, *role, id));
             }
             if let Some(owners) = uses.outputs.get(id) {
-                return Err(input_overlap_error(owners.owner(), &operand, id));
+                return Err(input_overlap_error(owners.owner(), &operand, *role, id));
             }
         }
         for id in outputs {
@@ -253,14 +310,25 @@ impl DirectoryOverlap {
         }
         let token = uses.next_token;
         uses.next_token += 1;
-        identities.retain(|id| uses.inputs.entry(*id).or_default().reserve(token, &operand));
+        let mut identities = Identities::new();
+        for (id, role) in incoming {
+            if uses.inputs.entry(id).or_default().reserve(
+                token,
+                InputOwner {
+                    operand: Arc::clone(&operand),
+                    role,
+                },
+            ) {
+                identities.push(id);
+            }
+        }
         let mut registered_outputs = Identities::new();
         for id in outputs {
             if uses
                 .outputs
                 .entry(*id)
                 .or_default()
-                .reserve(token, &operand)
+                .reserve(token, Arc::clone(&operand))
             {
                 registered_outputs.push(*id);
             }
@@ -299,14 +367,14 @@ impl DirectoryOverlap {
     }
 }
 
-fn overlap_error(owner: &Arc<Operand>, current: &Arc<Operand>) -> std::io::Error {
-    let message = if Arc::ptr_eq(owner, current) {
-        format!("input and destination directories overlap in this operand {current}")
-    } else {
+fn overlap_error(input: &InputOwner, output: &Arc<Operand>) -> std::io::Error {
+    let message = if Arc::ptr_eq(&input.operand, output) {
         format!(
-            "input and destination directories overlap between this operand {current} \
-             and another operand {owner}"
+            "{} overlaps destination in this operand {output}",
+            input.role
         )
+    } else {
+        format!("{input} overlaps destination of another operand {output}")
     };
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
 }
@@ -314,6 +382,7 @@ fn overlap_error(owner: &Arc<Operand>, current: &Arc<Operand>) -> std::io::Error
 fn input_overlap_error(
     owner: &Arc<Operand>,
     current: &Arc<Operand>,
+    role: InputRole,
     identity: &Identity,
 ) -> std::io::Error {
     let contains = |operand: &Operand| {
@@ -323,15 +392,21 @@ fn input_overlap_error(
             .is_some_and(|ancestors| ancestors.contains(identity))
     };
     let message = if contains(current) {
-        format!("input directory overlaps destination ancestry for this operand {current}")
+        format!("{role} overlaps destination ancestry for this operand {current}")
     } else if contains(owner) {
         // a shared ancestor is evidence about a destination, not the first committer's source
         format!(
-            "input directory in this operand {current} overlaps destination ancestry for {:?}",
+            "{role} in this operand {current} overlaps destination ancestry for {:?}",
             owner.destination
         )
     } else {
-        return overlap_error(owner, current);
+        return overlap_error(
+            &InputOwner {
+                operand: Arc::clone(current),
+                role,
+            },
+            owner,
+        );
     };
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
 }
@@ -437,8 +512,12 @@ impl DirectoryOverlap {
         Ok(())
     }
     fn input(self: &Arc<Self>, meta: &FileMeta) -> std::io::Result<()> {
-        self.reserve(&[meta], &Evidence::new(), test_operand())?
-            .commit();
+        self.reserve(
+            &[(InputRole::Source, meta)],
+            &Evidence::new(),
+            test_operand(),
+        )?
+        .commit();
         Ok(())
     }
     fn output(self: &Arc<Self>, meta: &FileMeta) -> std::io::Result<()> {
@@ -561,8 +640,11 @@ mod tests {
                     );
                     let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
                     let registry = Arc::new(DirectoryOverlap::default());
-                    let reservation =
-                        registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+                    let reservation = registry.reserve(
+                        &[(InputRole::Source, &source)],
+                        &Evidence::new(),
+                        test_operand(),
+                    )?;
                     let mut gate = crate::testutils::BlockingPathGate::install(if create {
                         target.clone()
                     } else {
@@ -820,7 +902,11 @@ mod tests {
                 );
                 let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
                 let registry = Arc::new(DirectoryOverlap::default());
-                let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+                let reservation = registry.reserve(
+                    &[(InputRole::Source, &source)],
+                    &Evidence::new(),
+                    test_operand(),
+                )?;
                 let mut gate = crate::testutils::BlockingPathGate::install(
                     path.join("output/.rcp-classified-entry"),
                 );
@@ -903,7 +989,11 @@ mod tests {
                 );
                 let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
                 let registry = Arc::new(DirectoryOverlap::default());
-                let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+                let reservation = registry.reserve(
+                    &[(InputRole::Source, &source)],
+                    &Evidence::new(),
+                    test_operand(),
+                )?;
                 let mut gate = crate::testutils::BlockingPathGate::install(path.join("output"));
                 let target = path.join("output");
                 let submissions = crate::testutils::BlockingSubmissions::start();
@@ -968,7 +1058,11 @@ mod tests {
                 let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
                 let output = parent.open_dir(OsStr::new("output")).await?.meta().await?;
                 let registry = Arc::new(DirectoryOverlap::default());
-                let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+                let reservation = registry.reserve(
+                    &[(InputRole::Source, &source)],
+                    &Evidence::new(),
+                    test_operand(),
+                )?;
                 let mut gate = crate::testutils::BlockingPathGate::install(
                     path.join("output/.rcp-directory-lockdown"),
                 );
@@ -1167,8 +1261,11 @@ mod tests {
         let mut reservations = Vec::new();
         for _ in 0..8 {
             // aliased source/update and repeated output registration each belong to one token.
-            let reservation =
-                registry.reserve(&[&meta, &meta], &Evidence::new(), test_operand())?;
+            let reservation = registry.reserve(
+                &[(InputRole::Source, &meta), (InputRole::Update, &meta)],
+                &Evidence::new(),
+                test_operand(),
+            )?;
             reservation.output(&output)?;
             reservation.output(&output)?;
             reservations.push(reservation);
@@ -1183,6 +1280,132 @@ mod tests {
         Ok(())
     }
 
+    fn diagnostic_operand(name: &str) -> Arc<Operand> {
+        Arc::new(Operand {
+            source: format!("{name}-source").into(),
+            update: Some(format!("{name}-update").into()),
+            destination: format!("{name}-destination").into(),
+            destination_ancestors: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn first_committing_alias_retains_its_input_role() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+        let meta = dir.meta().await?;
+        let registry = Arc::new(DirectoryOverlap::default());
+        let earlier = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            diagnostic_operand("earlier"),
+        )?;
+        let later = registry.reserve(
+            &[(InputRole::Update, &meta)],
+            &Evidence::new(),
+            diagnostic_operand("later"),
+        )?;
+        later.commit();
+        drop(later);
+        earlier.commit();
+        drop(earlier);
+        let message = registry.output(&meta).unwrap_err().to_string();
+        assert!(message.contains("update directory"), "{message}");
+        assert!(message.contains("later-update"), "{message}");
+        assert!(!message.contains("earlier-source"), "{message}");
+        let protection = crate::input_protection::InputProtection::new(registry);
+        let message = protection
+            .check_directory(&meta, std::path::Path::new("removed"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("update directory"), "{message}");
+        assert!(message.contains("later-update"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rolled_back_alias_leaves_the_other_input_role_intact() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+        let meta = dir.meta().await?;
+        let registry = Arc::new(DirectoryOverlap::default());
+        let source = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            diagnostic_operand("kept"),
+        )?;
+        let update = registry.reserve(
+            &[(InputRole::Update, &meta)],
+            &Evidence::new(),
+            diagnostic_operand("rolled-back"),
+        )?;
+        drop(update);
+        let message = registry.output(&meta).unwrap_err().to_string();
+        assert!(message.contains("source directory"), "{message}");
+        assert!(message.contains("kept-source"), "{message}");
+        assert!(!message.contains("rolled-back-update"), "{message}");
+        drop(source);
+        registry.output(&meta)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_update_alias_reports_both_roles_after_commit() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+        let meta = dir.meta().await?;
+        let registry = Arc::new(DirectoryOverlap::default());
+        let both = registry.reserve(
+            &[(InputRole::Source, &meta), (InputRole::Update, &meta)],
+            &Evidence::new(),
+            diagnostic_operand("both"),
+        )?;
+        both.commit();
+        drop(both);
+        registry
+            .reserve(
+                &[(InputRole::Source, &meta)],
+                &Evidence::new(),
+                diagnostic_operand("later"),
+            )?
+            .commit();
+        let message = registry.output(&meta).unwrap_err().to_string();
+        assert!(message.contains("both source and update"), "{message}");
+        assert!(message.contains("both-source"), "{message}");
+        assert!(message.contains("both-update"), "{message}");
+        assert!(!message.contains("later-source"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_conflicting_with_output_reports_the_incoming_role() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+        let meta = dir.meta().await?;
+        let registry = Arc::new(DirectoryOverlap::default());
+        registry
+            .reserve(
+                &[],
+                &Evidence::from([(meta.dev(), meta.ino())]),
+                diagnostic_operand("output"),
+            )?
+            .commit();
+        for role in [InputRole::Source, InputRole::Update] {
+            let message = registry
+                .reserve(
+                    &[(role, &meta)],
+                    &Evidence::new(),
+                    diagnostic_operand("input"),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(&format!("{role} of operand")), "{message}");
+            assert!(message.contains("input-source"), "{message}");
+            assert!(message.contains("output-destination"), "{message}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn source_and_update_reserve_atomically() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -1194,7 +1417,11 @@ mod tests {
         registry.output(&update)?;
         assert!(
             registry
-                .reserve(&[&source, &update], &Evidence::new(), test_operand())
+                .reserve(
+                    &[(InputRole::Source, &source), (InputRole::Update, &update)],
+                    &Evidence::new(),
+                    test_operand()
+                )
                 .is_err()
         );
         registry.output(&source)?;
@@ -1207,7 +1434,11 @@ mod tests {
         let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
         let meta = dir.meta().await?;
         let registry = Arc::new(DirectoryOverlap::default());
-        let reservation = registry.reserve(&[&meta], &Evidence::new(), test_operand())?;
+        let reservation = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            test_operand(),
+        )?;
         let (started, ready) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _reservation = reservation;
@@ -1228,8 +1459,16 @@ mod tests {
         let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
         let meta = dir.meta().await?;
         let registry = Arc::new(DirectoryOverlap::default());
-        let committed = registry.reserve(&[&meta], &Evidence::new(), test_operand())?;
-        let tentative = registry.reserve(&[&meta], &Evidence::new(), test_operand())?;
+        let committed = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            test_operand(),
+        )?;
+        let tentative = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            test_operand(),
+        )?;
         committed.commit();
         drop(committed);
         drop(tentative);
@@ -1340,11 +1579,15 @@ mod tests {
             destination: "committed-output".into(),
             destination_ancestors: Default::default(),
         });
-        let committed = registry.reserve(&[&meta], &Evidence::new(), owner)?;
+        let committed = registry.reserve(&[(InputRole::Source, &meta)], &Evidence::new(), owner)?;
         committed.output(&output)?;
         let mut aliases = Vec::new();
         for _ in 0..8 {
-            let alias = registry.reserve(&[&meta], &Evidence::new(), test_operand())?;
+            let alias = registry.reserve(
+                &[(InputRole::Source, &meta)],
+                &Evidence::new(),
+                test_operand(),
+            )?;
             alias.output(&output)?;
             alias.output(&late_output)?;
             aliases.push(alias);
@@ -1354,20 +1597,31 @@ mod tests {
         // permanent history subsumes all concurrent pending ownership, not just this token's.
         {
             let uses = registry.uses.lock().unwrap();
-            for entry in uses.inputs.values().chain(uses.outputs.values()) {
-                assert!(entry.committed.is_some());
-                assert!(entry.pending.is_empty());
+            for (committed, pending) in uses
+                .inputs
+                .values()
+                .map(|entry| (entry.committed.is_some(), entry.pending.len()))
+                .chain(
+                    uses.outputs
+                        .values()
+                        .map(|entry| (entry.committed.is_some(), entry.pending.len())),
+                )
+            {
+                assert!(committed);
+                assert_eq!(pending, 0);
             }
         }
-        let later = registry.reserve(&[&meta], &Evidence::new(), test_operand())?;
+        let later = registry.reserve(
+            &[(InputRole::Source, &meta)],
+            &Evidence::new(),
+            test_operand(),
+        )?;
         later.output(&output)?;
         {
             let uses = registry.uses.lock().unwrap();
             assert!(
-                uses.inputs
-                    .values()
-                    .chain(uses.outputs.values())
-                    .all(|entry| entry.pending.is_empty())
+                uses.inputs.values().all(|entry| entry.pending.is_empty())
+                    && uses.outputs.values().all(|entry| entry.pending.is_empty())
             );
         }
         // both rollback and commit of aliases preserve the first committed provenance.
@@ -1418,7 +1672,11 @@ mod tests {
             );
             let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
             let registry = Arc::new(DirectoryOverlap::default());
-            let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+            let reservation = registry.reserve(
+                &[(InputRole::Source, &source)],
+                &Evidence::new(),
+                test_operand(),
+            )?;
             let mut blocker = crate::testutils::BlockingWorker::spawn();
             blocker.wait_started().await?;
             let submissions = crate::testutils::BlockingSubmissions::start();
@@ -1458,7 +1716,11 @@ mod tests {
             Arc::new(Dir::open_root_dir(root.path(), false, congestion::Side::Destination).await?);
         let source = parent.open_dir(OsStr::new("source")).await?.meta().await?;
         let registry = Arc::new(DirectoryOverlap::default());
-        let reservation = registry.reserve(&[&source], &Evidence::new(), test_operand())?;
+        let reservation = registry.reserve(
+            &[(InputRole::Source, &source)],
+            &Evidence::new(),
+            test_operand(),
+        )?;
         let mut gate = crate::testutils::BlockingPathGate::install(root.path().join("output"));
         let (finished, done) = tokio::sync::oneshot::channel();
         let task_parent = Arc::clone(&parent);
