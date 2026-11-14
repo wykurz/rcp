@@ -1,6 +1,6 @@
 //! Physical destination authority shared by local copy and link directory admission.
 
-use super::{DirResolution, DirSlot, Error, Settings, Summary};
+use super::{DirResolution, Error, Settings, Summary};
 use crate::input_protection::InputProtection;
 use crate::safedir::overlap::{DirectoryOverlap, Evidence, Operand};
 use crate::safedir::{self, Dir, FileMeta, PreviewEntry};
@@ -23,6 +23,7 @@ pub(crate) struct DestinationContext {
 enum Origin {
     Root {
         named_root: std::path::PathBuf,
+        real_parent: Option<Arc<Dir>>,
         preview_parent: Option<PreviewParent>,
     },
     Prepared(PreparedParent),
@@ -88,10 +89,21 @@ pub(crate) enum Admission {
     Skip(Summary),
     Entered {
         destination: PreparedDestination,
-        slot: Option<DirSlot>,
-        preview: Option<Arc<Dir>>,
+        directory: EnteredDirectory,
         snapshot: SourceSnapshot,
     },
+}
+
+/// Directory state retained from admission through traversal and finalization.
+pub(crate) struct EnteredDirectory {
+    pub(crate) dir: Option<Arc<Dir>>,
+    /// The same held parent used to create or reuse `dir`, retained for empty-directory cleanup.
+    pub(crate) parent: Option<Arc<Dir>>,
+    pub(crate) preview: Option<Arc<Dir>>,
+    pub(crate) summary: Summary,
+    pub(crate) is_fresh: bool,
+    pub(crate) we_created: bool,
+    pub(crate) reused_lock: Option<safedir::ReusedDirLock>,
 }
 
 /// Mutable preservation data sampled before traversal from the chosen held input.
@@ -147,6 +159,7 @@ impl DestinationContext {
         Self {
             origin: Origin::Root {
                 named_root: named_root.to_owned(),
+                real_parent: None,
                 preview_parent: None,
             },
             registry,
@@ -199,6 +212,13 @@ impl DestinationContext {
             self.protection.check_root_parent(parent, path).await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn with_root_parent(mut self, parent: Option<&Arc<Dir>>) -> Self {
+        if let Origin::Root { real_parent, .. } = &mut self.origin {
+            *real_parent = parent.cloned();
+        }
+        self
     }
 
     pub(crate) fn with_preview_parent(mut self, parent: Option<PreviewParent>) -> Self {
@@ -257,11 +277,11 @@ impl DestinationContext {
         prog_track: &'static crate::progress::Progress,
         inputs: &[&FileMeta],
         preservation: PreservationSource<'_>,
-        dst_parent: Option<&Arc<Dir>>,
         name: &OsStr,
         path: &Path,
         settings: &Settings,
         dry_run: Option<crate::config::DryRunMode>,
+        is_fresh: bool,
     ) -> Result<Admission, Error> {
         let readable = settings.delete.is_some();
         let preview = dry_run.is_some();
@@ -274,8 +294,10 @@ impl DestinationContext {
                     .map_err(|error| Error::new(error, Summary::default()))?;
                 (None, Some(entry), evidence)
             }
-            (Origin::Root { .. }, false) => {
-                let parent = dst_parent.expect("a real root has a held destination parent");
+            (Origin::Root { real_parent, .. }, false) => {
+                let parent = real_parent
+                    .as_ref()
+                    .expect("a real root has a held destination parent");
                 let evidence = self
                     .registry
                     .ancestors(parent)
@@ -359,7 +381,7 @@ impl DestinationContext {
                 ));
             }
         };
-        let (parent, slot, preview_dir) = if let Some(entry) = entry {
+        let (parent, directory) = if let Some(entry) = entry {
             let preview_dir = if let PreviewEntry::Directory(dir) = &entry {
                 reservation
                     .output(&dir.meta)
@@ -368,7 +390,21 @@ impl DestinationContext {
             } else {
                 None
             };
-            (PreparedParent::Preview(entry), None, preview_dir)
+            (
+                PreparedParent::Preview(entry),
+                EnteredDirectory {
+                    dir: None,
+                    parent: None,
+                    preview: preview_dir,
+                    summary: Summary {
+                        directories_created: 1,
+                        ..Default::default()
+                    },
+                    is_fresh,
+                    we_created: true,
+                    reused_lock: None,
+                },
+            )
         } else {
             let parent = parent.expect("real admission retains its parent");
             match super::resolve_dst_dir(
@@ -385,8 +421,15 @@ impl DestinationContext {
                 DirResolution::Skip(summary) => return Ok(Admission::Skip(summary)),
                 DirResolution::Proceed(slot) => (
                     PreparedParent::Real(Arc::clone(&slot.dir)),
-                    Some(slot),
-                    None,
+                    EnteredDirectory {
+                        dir: Some(slot.dir),
+                        parent: Some(parent),
+                        preview: None,
+                        summary: slot.summary,
+                        is_fresh: slot.is_fresh,
+                        we_created: slot.we_created,
+                        reused_lock: slot.reused_lock,
+                    },
                 ),
             }
         };
@@ -398,8 +441,7 @@ impl DestinationContext {
                 protection: Arc::clone(&self.protection),
                 operand: Arc::clone(&self.operand),
             },
-            slot,
-            preview: preview_dir,
+            directory,
             snapshot,
         })
     }
