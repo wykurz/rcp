@@ -2207,7 +2207,7 @@ mod tests {
             let files_per_level = 5;
             let limit = 1;
             // create a directory chain deeper than the permit limit, with files at each level
-            let mut dir = test_path.clone();
+            let mut dir = test_path.to_path_buf();
             for level in 0..depth {
                 tokio::fs::create_dir_all(&dir).await?;
                 for f in 0..files_per_level {

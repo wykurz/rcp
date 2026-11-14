@@ -852,7 +852,7 @@ mod cmp_tests {
     static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
         std::sync::LazyLock::new(preserve::preserve_all);
 
-    async fn setup_test_dirs(preserve: bool) -> Result<std::path::PathBuf> {
+    async fn setup_test_dirs(preserve: bool) -> Result<testutils::TestDir> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         copy::copy(

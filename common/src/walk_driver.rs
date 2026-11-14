@@ -1424,7 +1424,7 @@ mod tests {
                 .await?
                 .into_tree(),
         );
-        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
         let mut filter = FilterSettings::default();
         filter.add_exclude("skip")?;
         let visitor = Arc::new(CountingVisitor {
@@ -1531,7 +1531,7 @@ mod tests {
         tokio::fs::write(root.join("file"), b"included").await?;
         tokio::fs::create_dir(root.join("directory")).await?;
         let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
-        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+        let cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
         let mut filter = FilterSettings::default();
         filter.add_exclude("file/")?;
         filter.add_exclude("directory/")?;
@@ -2229,7 +2229,7 @@ mod tests {
             admission: crate::testutils::AdmissionLimit,
             task: tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
             release: Arc<tokio::sync::Notify>,
-            root: std::path::PathBuf,
+            root: crate::testutils::TestDir,
         ) -> anyhow::Result<()> {
             // wake the blocked visitor before aborting so either exit path can make progress.
             release.notify_waiters();
@@ -2246,7 +2246,7 @@ mod tests {
                     Err(error) => Some(error),
                 };
             drop(admission);
-            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+            let cleanup_result = tokio::fs::remove_dir_all(&root).await;
 
             if let Err(error) = task_result
                 && !error.is_cancelled()
@@ -2270,7 +2270,7 @@ mod tests {
             tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
             crate::testutils::FdIdentityProbe,
             Arc<tokio::sync::Notify>,
-            std::path::PathBuf,
+            crate::testutils::TestDir,
         )> {
             let root = crate::testutils::create_temp_dir().await?;
             let leaf_path = root.join("leaf");
@@ -2619,7 +2619,11 @@ mod tests {
                 filter: Some(filter),
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), std::ffi::OsStr::new("root"), root.clone());
+            let parent_cx = root_cx(
+                Arc::clone(&dir),
+                std::ffi::OsStr::new("root"),
+                root.to_path_buf(),
+            );
             admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
@@ -2690,7 +2694,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let walk = scope_tasks(walk_dir_entries(
                 visitor,
                 dir,
@@ -2748,7 +2752,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let error = admission
                 .run_with_timeout(
                     Duration::from_secs(20),
@@ -2800,7 +2804,7 @@ mod tests {
             });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let error = admission
                 .run_with_timeout(
                     Duration::from_secs(20),
@@ -2868,7 +2872,7 @@ mod tests {
             });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             // the missing child owns the only permit. Its error must win over the capacity it
             // releases, so the second child's context is dropped without starting its visitor
             let error = admission
@@ -2939,7 +2943,7 @@ mod tests {
             });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
 
             // the first visitor releases the reserved permit when it starts, admitting `gone`.
             // constructing the third child then reaches a saturated admission wait. Only reaping
@@ -3031,7 +3035,7 @@ mod tests {
                 skip_release: std::sync::Mutex::new(Some(b_release_rx)),
                 events: events_tx,
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let operation = tokio::spawn(async move {
                 scope_tasks(walk_dir_entries(
                     visitor,
@@ -3131,7 +3135,7 @@ mod tests {
                 filter: Some(filter),
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let walk = scope_tasks(walk_dir_entries(
                 visitor,
                 dir,
@@ -3182,7 +3186,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let walk = scope_tasks(walk_dir_entries(
                 visitor,
                 dir,
@@ -3233,7 +3237,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let (summary, processed) = admission
                 .run_with_timeout(
                     Duration::from_secs(20),
@@ -3280,7 +3284,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let walk = scope_tasks(walk_dir_entries(
                 visitor,
                 dir,
@@ -3369,7 +3373,7 @@ mod tests {
                 authoritative_filter: true,
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let (summary, processed) = admission
                 .run_with_timeout(
                     Duration::from_secs(20),
@@ -3410,7 +3414,7 @@ mod tests {
             let visitor = Arc::new(CountingVisitor {
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&parent), OsStr::new("root"), root);
+            let parent_cx = root_cx(Arc::clone(&parent), OsStr::new("root"), root.to_path_buf());
             let result = admission
                 .run_with_timeout(
                     Duration::from_secs(1),
@@ -3551,7 +3555,7 @@ mod tests {
                 filter: Some(filter),
                 ..Default::default()
             });
-            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.clone());
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.to_path_buf());
             let result = admission
                 .run_with_timeout(
                     Duration::from_secs(20),

@@ -3138,7 +3138,7 @@ mod link_tests {
 
     async fn setup_disappearing_update_root_case() -> Result<
         (
-            std::path::PathBuf,
+            testutils::TestDir,
             std::path::PathBuf,
             std::path::PathBuf,
             std::path::PathBuf,
@@ -3757,7 +3757,7 @@ mod link_tests {
         Ok(())
     }
 
-    async fn setup_test_dir_and_link() -> Result<std::path::PathBuf, anyhow::Error> {
+    async fn setup_test_dir_and_link() -> Result<testutils::TestDir, anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
