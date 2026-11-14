@@ -288,6 +288,22 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('AWS benchmarks', (self.output / 'reports/index.html').read_text())
         self.assert_site_links_resolve()
 
+    def test_retained_page_surfaces_recorded_progress_without_final_measurements(self):
+        from infra.aws_benchmark import production_progress
+        value = dict(schema=production_progress.SCHEMA, worker_outcome='succeeded',
+            close_category='instance_exited', capacity_deadline='2026-11-13T20:28:48+00:00',
+            worker_deadline='2026-11-13T11:24:03+00:00', retirement_not_before='2026-11-13T23:43:48+00:00',
+            instance_termination='recorded', cleanup_stage='not_recorded', cleanup_verified_at=None)
+        active = dict(state='pending', retired=False, run_key='repo-655073755-run-123',
+            phase='closing', reason='ownership remains held until collection and retirement', progress=value)
+        result = self.build_retained(self.retained_batch(active=active))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        page = (self.output / 'aws-benchmarks/index.html').read_text()
+        self.assertIn('success recorded (provisional', page)
+        self.assertIn('Earliest retirement safety time: 2026-11-13T23:43:48+00:00', page)
+        self.assertIn('not a fresh EC2 check', page)
+        self.assertIn('No public records are available to display', page)
+
     def test_held_pending_and_deferred_snapshot_is_not_empty_success_and_escapes_data(self):
         active = dict(state='pending', retired=False, run_key='repo-655073755-run-123',
                       phase='<script>phase</script>', reason='Waiting & watching "lease"')

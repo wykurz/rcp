@@ -39,7 +39,7 @@ class PublicationWorkflowTests(unittest.TestCase):
     def test_public_reporting_has_no_writer_or_launch_lane_and_preserves_bounded_reader_test(self):
         self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch", "push", "schedule"})
         self.assertEqual(self.workflow["on"]["push"]["branches"], ["main"])
-        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "43 9 * * *"}])
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "43 9 * * *"}, {"cron": "43 3 * * 2,6"}])
         self.assertEqual(set(self.jobs), {"download", "pages", "reader-test"})
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         reader = self.jobs["download"]
@@ -64,6 +64,27 @@ class PublicationWorkflowTests(unittest.TestCase):
         self.assertIn("inputs.mode == 'reader-test'", bounded["if"])
         self.assertIn("github.event_name == 'workflow_dispatch'", bounded["if"])
         self.assertIn("acceptance_publication_workflow", str(bounded))
+
+    def test_post_drain_reporting_follows_both_regular_benchmark_windows(self):
+        from datetime import datetime, timedelta, timezone
+        from .common import DURABLE_PLAN, durable_plan_contract
+        from .test_production_policy import policy
+        from .production_policy import MAX_RUN_AGE_SECONDS
+        configured = policy(schedule_delay_seconds=3600)
+        with self.assertRaises(ValueError):
+            policy(schedule_delay_seconds=3601)
+        # maximum schedule lateness and admitted workflow age precede the capacity/runtime windows,
+        # then the immutable 15m drain and a generous one-hour collection margin.
+        for weekday, report_weekday in ((0, 1), (4, 5)):
+            slot = datetime(2026, 11, 9 + weekday, 8, 17, tzinfo=timezone.utc)
+            latest = slot + timedelta(seconds=configured.schedule_delay_seconds + MAX_RUN_AGE_SECONDS +
+                configured.capacity_seconds + configured.runtime_seconds + durable_plan_contract(DURABLE_PLAN)["delivery_drain_seconds"])
+            reporting = (slot + timedelta(days=1)).replace(hour=3, minute=43)
+            self.assertEqual(reporting.weekday(), report_weekday)
+            self.assertGreaterEqual(reporting - latest, timedelta(hours=1))
+        scheduled = self.workflow["on"]["schedule"]
+        self.assertEqual(len(scheduled), 2)
+        self.assertEqual(scheduled[1]["cron"], "43 3 * * 2,6")
 
     def test_real_download_identity_script_rejects_wrong_source_actor_or_flags_under_optimized_python(self):
         script = next(x["run"] for x in self.jobs["download"]["steps"] if x.get("name", "").startswith("Require the exact"))

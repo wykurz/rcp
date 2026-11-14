@@ -103,12 +103,18 @@ def history(repository):
 def observation(value):
     require(isinstance(value, dict) and value.get("state") in {"idle", "pending", "held", "ready", "published", "deferred"}
             and type(value.get("retired")) is bool and
-            set(value) <= {"state", "retired", "run_key", "phase", "reason"}, "invalid publication observation")
+            set(value) <= {"state", "retired", "run_key", "phase", "reason", "progress"}, "invalid publication observation")
     if "run_key" in value:
         require(isinstance(value["run_key"], str) and RUN.fullmatch(value["run_key"]), "invalid observed run")
     for key in ("phase", "reason"):
         if key in value:
             require(isinstance(value[key], str) and len(value[key]) <= 512, "unbounded publication observation")
+    if "progress" in value:
+        require(value["state"] == "pending" and value["retired"] is False and
+                "run_key" in value and isinstance(value.get("phase"), str) and
+                value["phase"] in publication.PHASES,
+                "progress is not a retired verdict")
+        publication.progress.validate(value["progress"])
     return value
 
 
@@ -287,6 +293,9 @@ def summary(index, records=()):
                   for state in ("ready", "published", "pending", "held", "deferred")}
         text = "AWS publication: " + ", ".join(str(count) + " " + state for state, count in counts.items())
         text += ". Active owner: " + index["active"]["state"] + ".\n\n"
+        if "progress" in index["active"]:
+            text += "".join("- " + line + "\n" for line in publication.progress.lines(index["active"]["progress"]))
+            text += "\n"
         for item in index["observations"]:
             if item["state"] in {"held", "deferred"}:
                 # keep bounded diagnostics on one line and inside a code span.

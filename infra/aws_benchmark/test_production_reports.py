@@ -86,6 +86,48 @@ class ReportsTests(unittest.TestCase):
         path.write_bytes(reports.collection.encoded(value))
         return reports.inventory(output, limit=reports.MAX_HISTORY)
 
+    def test_actual_inspect_summary_exposes_provisional_recorded_progress(self):
+        state = copy.deepcopy(self.fx.store.record.state)
+        self.fx.service.read_worker_status(state)
+        value = publication.progress.observe(state, run_key=RUN_KEY)
+        active = dict(state="pending", retired=False, run_key=RUN_KEY, phase="closing",
+                      reason="ownership remains held until collection and retirement", progress=value)
+        output, proof = self.batch(self.fake_reader({}, active=active))
+        summary = self.root / "progress-summary"
+        result = self.cli("inspect", "--input", str(output), "--reader-revision", REVISION,
+            "--expected-sha256", proof, "--require-complete",
+            environment={"GITHUB_STEP_SUMMARY": str(summary)}, optimized=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = summary.read_text()
+        self.assertIn("success recorded (provisional", text)
+        self.assertIn("Earliest retirement safety time", text)
+        self.assertIn("not a fresh EC2 check", text)
+        found, index = reports.public_batch(output, REVISION, proof)
+        self.assertEqual(found, {})
+        self.assertFalse(index["active"]["retired"])
+        self.assertNotIn("benchmark_valid", index["active"]["progress"])
+
+    def test_recomputed_inventory_cannot_promote_progress_into_final_or_leak_private_fields(self):
+        state = copy.deepcopy(self.fx.store.record.state)
+        self.fx.service.read_worker_status(state)
+        value = publication.progress.observe(state, run_key=RUN_KEY)
+        active = dict(state="pending", retired=False, run_key=RUN_KEY, phase="closing",
+                      progress=value)
+        output, _ = self.batch(self.fake_reader({}, active=active))
+        original = (output / "index.json").read_bytes()
+        cases = [
+            lambda x: x["active"]["progress"].update(private="secret"),
+            lambda x: x["active"]["progress"].update(benchmark_valid=True),
+            lambda x: x["active"]["progress"].update(worker_outcome="<script>"),
+            lambda x: x["active"].update(retired=True),
+            lambda x: x["active"].pop("run_key"),
+        ]
+        for mutate in cases:
+            (output / "index.json").write_bytes(original)
+            proof = self.change_index(output, mutate)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                reports.public_batch(output, REVISION, proof)
+
     def test_snapshot_inventory_batch_and_actual_inspect_cli_outputs(self):
         output, proof = self.batch()
         found, index = reports.public_batch(output, REVISION, proof)

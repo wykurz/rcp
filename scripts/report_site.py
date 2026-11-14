@@ -273,7 +273,9 @@ def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
     rows = []
     for observation in [index['active'], *index['observations']]:
         fields = (observation.get('run_key', '—'), observation['state'],
-                  observation.get('phase', '—'), observation.get('reason', '—'),
+                  observation.get('phase', '—'), observation.get('reason', '—') +
+                  (' ' + ' '.join(production_reports.publication.progress.lines(observation['progress']))
+                   if 'progress' in observation else ''),
                   'yes' if observation['retired'] else 'no')
         rows.append('<tr>' + ''.join('<td>' + html.escape(value) + '</td>' for value in fields) + '</tr>')
     processing = 'complete' if index['processing_complete'] else 'incomplete; some records are deferred'
@@ -283,6 +285,7 @@ def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
         'Discovery: complete. Record processing: ' + processing + '.</p>'
         '<p>The first row is the lease observation at that time; it is not a fresh physical teardown check. '
         'Retirement and cleanup verification belong to individual retained records. '
+        'Recorded worker outcomes are provisional until retirement-bound validation. '
         'Pending, held and deferred entries are not successful measurements.</p>'
         '<div class="table-scroll"><table><thead><tr><th>Run</th><th>State</th><th>Phase</th>'
         '<th>Details</th><th>Retirement recorded</th></tr></thead><tbody>' + ''.join(rows) +
