@@ -1109,6 +1109,7 @@ async fn link_internal(
     mut destination: copy::DestinationContext,
 ) -> Result<LinkEntryResult, Error> {
     let _prog_guard = prog_track.ops.guard();
+    destination = destination.with_root_parent(dst_parent);
     // reconstruct diagnostic paths and the deliberately path-based dereference fallback.
     let src_path = walk::join_rel(src_root, rel_path);
     let dst_path = walk::join_rel(dst_root, rel_path);
@@ -1528,7 +1529,6 @@ async fn link_internal(
         prog_track,
         src_parent,
         update_for_dir,
-        dst_parent,
         name,
         dst_name,
         src_root,
@@ -1618,7 +1618,6 @@ async fn link_dir_entry(
     prog_track: &'static progress::Progress,
     src_parent: &Arc<Dir>,
     update: Option<(&Arc<Dir>, &std::ffi::OsStr)>,
-    dst_parent: Option<&Arc<Dir>>,
     name: &std::ffi::OsStr,
     dst_name: &std::ffi::OsStr,
     src_root: &std::path::Path,
@@ -1673,11 +1672,11 @@ async fn link_dir_entry(
                 path: meta_path,
                 acl: settings.preserve.dir.acl,
             },
-            dst_parent,
             dst_name,
             dst_path,
             &settings.copy_settings,
             settings.dry_run,
+            is_fresh,
         )
         .await
         .map_err(|error| {
@@ -1693,8 +1692,7 @@ async fn link_dir_entry(
         })?;
     let copy::destination::Admission::Entered {
         destination,
-        slot,
-        preview,
+        directory,
         snapshot,
     } = admission
     else {
@@ -1706,35 +1704,25 @@ async fn link_dir_entry(
             ..Default::default()
         });
     };
-    let (dst_dir, base, child_is_fresh, we_created, reused_lock) = match slot {
-        Some(slot) => (
-            Some(slot.dir),
-            slot.summary,
-            slot.is_fresh,
-            slot.we_created,
-            slot.reused_lock,
-        ),
-        None => {
-            crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
-            (
-                None,
-                CopySummary {
-                    directories_created: 1,
-                    ..Default::default()
-                },
-                is_fresh,
-                true,
-                None,
-            )
-        }
-    };
+    let copy::destination::EnteredDirectory {
+        dir: dst_dir,
+        parent: dst_parent,
+        preview,
+        summary: base,
+        is_fresh: child_is_fresh,
+        we_created,
+        reused_lock,
+    } = directory;
+    if settings.dry_run.is_some() {
+        crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
+    }
     link_dir_contents_prepared(
         prog_track,
         &src_dir,
         snapshot,
         update_dir.as_ref(),
         dst_dir.as_ref(),
-        dst_parent,
+        dst_parent.as_ref(),
         dst_name,
         src_root,
         dst_root,
@@ -2949,6 +2937,61 @@ mod link_tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn admitted_link_cleanup_uses_creation_parent() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let src = root.path().join("source");
+        let dst = root.path().join("destination");
+        let held = root.path().join("held-destination");
+        std::fs::create_dir_all(src.join("child"))?;
+        let mut config = crate::filegen::FileGenConfig::new(src.join("child"), vec![], 1, 8);
+        config.leaf_files = true;
+        crate::filegen::filegen(&PROGRESS, &config).await?;
+        std::fs::create_dir(&dst)?;
+        let src_parent = Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+        let held_parent =
+            Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+        std::fs::rename(&dst, &held)?;
+        std::fs::create_dir_all(dst.join("child"))?;
+        let replacement_parent =
+            Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("*.selected")?;
+        let mut settings = common_settings(false, false);
+        settings.filter = Some(filter.clone());
+        settings.copy_settings.filter = Some(filter);
+        // admission chooses the held parent, independently of the adapter's display-path parent
+        let summary = link_internal(
+            &PROGRESS,
+            &src_parent,
+            None,
+            Some(&replacement_parent),
+            std::ffi::OsStr::new("child"),
+            &src,
+            &dst,
+            None,
+            std::path::Path::new("child"),
+            UpdateRootRequirement::Optional,
+            &settings,
+            false,
+            EntryAdmission::RootOrDelegated.into(),
+            copy::DestinationContext::parent(Some(held_parent)),
+        )
+        .await?
+        .summary;
+        assert!(
+            !held.join("child").exists(),
+            "the created empty child must be removed"
+        );
+        assert!(
+            dst.join("child").is_dir(),
+            "the replacement parent must stay untouched"
+        );
+        assert_eq!(summary.copy_summary.directories_created, 0);
+        assert_eq!(summary.copy_summary.files_skipped, 1);
+        Ok(())
     }
 
     fn common_settings(dereference: bool, overwrite: bool) -> Settings {

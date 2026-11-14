@@ -1230,7 +1230,10 @@ impl WalkVisitor for CopyVisitor {
     fn root_dir_context(&self) -> CopyDirContext {
         CopyDirContext {
             dst_dir: self.dst_parent.clone(),
-            destination: self.destination.clone(),
+            destination: self
+                .destination
+                .clone()
+                .with_root_parent(self.dst_parent.as_ref()),
             is_fresh: self.root_is_fresh,
         }
     }
@@ -1424,11 +1427,11 @@ impl WalkVisitor for CopyVisitor {
                     path: src_path,
                     acl: self.preserve.dir.acl,
                 },
-                parent_ctx.dst_dir.as_ref(),
                 &dst_name,
                 &dst_path,
                 &self.settings,
                 self.settings.dry_run,
+                is_fresh,
             )
             .await
             .map_err(|error| {
@@ -1441,8 +1444,7 @@ impl WalkVisitor for CopyVisitor {
             })?;
         let destination::Admission::Entered {
             destination,
-            slot,
-            preview,
+            directory,
             snapshot,
         } = admission
         else {
@@ -1451,30 +1453,18 @@ impl WalkVisitor for CopyVisitor {
             };
             return Ok(DirAction::Skip(summary));
         };
-        let (dst_dir, dst_parent, base, child_is_fresh, we_created, reused_lock) = match slot {
-            Some(slot) => (
-                Some(slot.dir),
-                parent_ctx.dst_dir.clone(),
-                slot.summary,
-                slot.is_fresh,
-                slot.we_created,
-                slot.reused_lock,
-            ),
-            None => {
-                crate::dry_run::report_action("copy", src_path, Some(&dst_path), "dir");
-                (
-                    None,
-                    None,
-                    Summary {
-                        directories_created: 1,
-                        ..Default::default()
-                    },
-                    is_fresh,
-                    true,
-                    None,
-                )
-            }
-        };
+        let destination::EnteredDirectory {
+            dir: dst_dir,
+            parent: dst_parent,
+            preview,
+            summary: base,
+            is_fresh: child_is_fresh,
+            we_created,
+            reused_lock,
+        } = directory;
+        if self.settings.dry_run.is_some() {
+            crate::dry_run::report_action("copy", src_path, Some(&dst_path), "dir");
+        }
         Ok(DirAction::Descend {
             dir: Arc::clone(&src_dir),
             child_ctx: CopyDirContext {
@@ -2785,6 +2775,57 @@ mod copy_tests {
         std::sync::LazyLock::new(preserve::preserve_none);
     static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
         std::sync::LazyLock::new(preserve::preserve_all);
+
+    #[tokio::test]
+    async fn admitted_copy_cleanup_uses_creation_parent() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let src = root.path().join("source");
+        let dst = root.path().join("destination");
+        let held = root.path().join("held-destination");
+        std::fs::create_dir_all(src.join("child"))?;
+        let mut config = crate::filegen::FileGenConfig::new(src.join("child"), vec![], 1, 8);
+        config.leaf_files = true;
+        crate::filegen::filegen(&PROGRESS, &config).await?;
+        std::fs::create_dir(&dst)?;
+        let src_parent = Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+        let held_parent =
+            Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+        std::fs::rename(&dst, &held)?;
+        std::fs::create_dir_all(dst.join("child"))?;
+        let replacement_parent =
+            Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("*.selected")?;
+        let mut settings = settings_with_delete(None);
+        settings.filter = Some(filter);
+        // the adapter's display-path parent may differ from its inherited admission authority
+        let summary = copy_child(
+            &PROGRESS,
+            &src_parent,
+            Some(&replacement_parent),
+            OsStr::new("child"),
+            &src.join("child"),
+            &dst,
+            std::path::Path::new("child"),
+            &settings,
+            &NO_PRESERVE_SETTINGS,
+            false,
+            DestinationContext::parent(Some(held_parent)),
+            AdmittedEntry::new(src_parent.child(OsStr::new("child")).await?, None),
+        )
+        .await?;
+        assert!(
+            !held.join("child").exists(),
+            "the created empty child must be removed"
+        );
+        assert!(
+            dst.join("child").is_dir(),
+            "the replacement parent must stay untouched"
+        );
+        assert_eq!(summary.directories_created, 0);
+        assert_eq!(summary.files_skipped, 1);
+        Ok(())
+    }
 
     fn settings_with_delete(delete: Option<DeleteSettings>) -> Settings {
         Settings {

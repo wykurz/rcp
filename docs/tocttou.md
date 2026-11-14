@@ -556,7 +556,11 @@ participating input identities, resolve the output or skip, then admit traversal
 directories register together. Only a prepared destination can provide a child's lookup authority;
 children inherit held descriptors or an explicit preview state, never a reconstructed display or
 filter path. Root preparation retains the actual resolved authority rather than a boolean saying a
-check ran.
+check ran. Directory admission returns its selected held parent together with the created or reused
+directory. Copy and link retain that parent for empty-directory cleanup, including delegated walks;
+cleanup does not reconstruct its authority from a display path or a separate adapter parent. The
+final removal still acts by name through that parent and does not promise exact final-entry
+identity.
 
 The held destination parent's available ancestors are checked before creating the corresponding
 output. Encountering a source or participating update directory in that set rejects the subtree.
