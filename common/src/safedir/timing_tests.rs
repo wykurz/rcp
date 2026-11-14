@@ -211,13 +211,8 @@ fn cancelled_queued_metadata_has_no_execution_sample() -> anyhow::Result<()> {
         let capture = Capture::new(true)?;
         let file = tempfile::tempfile()?;
         let identity = crate::testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = tokio::task::spawn_blocking(move || {
-            let _ = started_tx.send(());
-            let _ = release_rx.recv();
-        });
-        started_rx.await?;
+        let mut blocker = crate::testutils::BlockingWorker::spawn();
+        blocker.wait_started().await?;
         let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
         let mut work = Box::pin(
             with_fd_admission(admission, async move {
@@ -240,8 +235,7 @@ fn cancelled_queued_metadata_has_no_execution_sample() -> anyhow::Result<()> {
         let closed_before_release = identity.original_is_closed();
         let mut next_permit = Box::pin(throttle::open_file_permit());
         let capacity_returned = futures::poll!(next_permit.as_mut()).is_ready();
-        drop(release_tx);
-        blocker.await?;
+        blocker.finish().await?;
         assert!(work_started_rx.await.is_err(), "cancelled work ran");
         assert!(closed_before_release?, "queued fd survived cancellation");
         assert!(capacity_returned, "queued cancellation retained admission");
@@ -275,13 +269,8 @@ fn cancelled_running_metadata_times_actual_worker_lifetime() -> anyhow::Result<(
         let file = tempfile::tempfile()?;
         let identity = crate::testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
         let capture = Capture::new(true)?;
-        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
-        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = tokio::task::spawn_blocking(move || {
-            let _ = blocker_started_tx.send(());
-            let _ = release_blocker_rx.recv();
-        });
-        blocker_started_rx.await?;
+        let mut blocker = crate::testutils::BlockingWorker::spawn();
+        blocker.wait_started().await?;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let mut work = Box::pin(
@@ -303,8 +292,7 @@ fn cancelled_running_metadata_times_actual_worker_lifetime() -> anyhow::Result<(
         assert!(futures::poll!(work.as_mut()).is_pending());
         // the congestion sample must already be running while the work is queued
         let queued_at = std::time::Instant::now();
-        drop(release_blocker_tx);
-        blocker.await?;
+        blocker.finish().await?;
         started_rx.await.context("metadata worker did not start")?;
         drop(work);
         let cancelled_at = std::time::Instant::now();

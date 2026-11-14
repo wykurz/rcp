@@ -4274,13 +4274,8 @@ mod tests {
                             result?;
                         }
                     }
-                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-                    let (release_tx, release_rx) = std::sync::mpsc::channel();
-                    let blocker = tokio::task::spawn_blocking(move || {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.recv();
-                    });
-                    started_rx.await?;
+                    let mut blocker = crate::testutils::BlockingWorker::spawn();
+                    blocker.wait_started().await?;
                     let limit = NonZeroUsize::new(1).unwrap();
                     let mut read = Box::pin(cursor.next_batch(limit));
                     assert!(futures::poll!(read.as_mut()).is_pending());
@@ -4288,9 +4283,8 @@ mod tests {
                     // filling this cursor's libc buffer or rewinding the duplicate on drop
                     assert_eq!(stream_names(fd.try_clone()?)?, ["entry"]);
                     assert_ne!(nix::unistd::lseek(&fd, 0, nix::unistd::Whence::SeekCur)?, 0);
-                    release_tx.send(())?;
+                    blocker.finish().await?;
                     let batch = read.await?;
-                    blocker.await?;
                     assert_eq!(batch.len(), 1, "dereference={dereference}");
                     assert_eq!(batch[0].name, "entry");
                     assert!(cursor.next_batch(limit).await?.is_empty());
@@ -4980,13 +4974,8 @@ mod tests {
             let limits = testutils::AdmissionLimit::new().await;
             limits.set_files_in_flight(1);
             let guard = throttle::open_file_permit().await;
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            let blocker = tokio::task::spawn_blocking(move || {
-                let _ = started_tx.send(());
-                let _ = release_rx.recv();
-            });
-            started_rx.await?;
+            let mut blocker = testutils::BlockingWorker::spawn();
+            blocker.wait_started().await?;
             let mut work = Box::pin(with_fd_admission(guard.admission(), operation(capture)));
             let queued = futures::poll!(work.as_mut()).is_pending();
             // leave the queued job as the only strong admission owner before dropping it
@@ -4998,8 +4987,7 @@ mod tests {
             let returned = next_file.as_mut().now_or_never();
             let capacity_returned_before_release = returned.is_some();
             // collect failures only after releasing and joining the occupied worker
-            drop(release_tx);
-            blocker.await?;
+            blocker.finish().await?;
             tokio::task::spawn_blocking(|| ()).await?;
             let permit = match returned {
                 Some(permit) => permit,

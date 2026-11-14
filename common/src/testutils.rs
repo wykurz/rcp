@@ -10,6 +10,49 @@ use std::os::unix::fs::MetadataExt;
 
 static ADMISSION_LIMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Holds one blocking-pool worker. Dropping the guard releases it.
+#[cfg(test)]
+#[must_use = "keep the guard alive while the blocking worker is needed"]
+pub(crate) struct BlockingWorker {
+    started: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl BlockingWorker {
+    /// Enqueues the worker without waiting for it to start.
+    pub(crate) fn spawn() -> Self {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = blocked.recv();
+        });
+        Self {
+            started: ready,
+            release,
+            worker,
+        }
+    }
+
+    /// Waits for occupation once; a cancelled pending wait can be retried.
+    pub(crate) async fn wait_started(&mut self) -> Result<()> {
+        (&mut self.started)
+            .await
+            .context("blocking worker ended before signalling readiness")
+    }
+
+    /// Releases and joins the worker; dropping the guard also releases it.
+    pub(crate) async fn finish(self) -> Result<()> {
+        let Self {
+            release, worker, ..
+        } = self;
+        drop(release);
+        worker.await.context("blocking worker failed")
+    }
+}
+
 /// Stops and joins a race-test worker on every exit, including assertion failures.
 #[cfg(test)]
 #[must_use = "keep the guard alive while the swapper is needed"]
@@ -1092,6 +1135,106 @@ mod tests {
     use futures::FutureExt as _;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
+
+    fn run_blocking_worker_test(test: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        let result = runtime.block_on(
+            AssertUnwindSafe(async {
+                tokio::time::timeout(Duration::from_secs(5), test)
+                    .await
+                    .context("blocking-worker test did not finish")?
+            })
+            .catch_unwind(),
+        );
+        // a regression that strands the worker must fail without hanging runtime teardown
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn blocking_worker_holds_pool_until_finished() -> Result<()> {
+        run_blocking_worker_test(async {
+            let mut blocker = BlockingWorker::spawn();
+            blocker.wait_started().await?;
+            let mut queued = tokio::task::spawn_blocking(|| ());
+            assert!(futures::poll!(&mut queued).is_pending());
+            blocker.finish().await?;
+            queued.await?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn blocking_worker_drop_releases_pool() -> Result<()> {
+        run_blocking_worker_test(async {
+            let mut blocker = BlockingWorker::spawn();
+            blocker.wait_started().await?;
+            let mut queued = tokio::task::spawn_blocking(|| ());
+            assert!(futures::poll!(&mut queued).is_pending());
+            drop(blocker);
+            queued.await?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn blocking_worker_unwind_releases_pool_and_preserves_panic() -> Result<()> {
+        run_blocking_worker_test(async {
+            let panic = tokio::spawn(async {
+                let mut blocker = BlockingWorker::spawn();
+                blocker.wait_started().await.unwrap();
+                panic!("original test panic");
+            })
+            .await
+            .expect_err("the test panic must propagate")
+            .into_panic();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"original test panic"));
+            tokio::task::spawn_blocking(|| ()).await?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn blocking_worker_cancelled_while_queued_releases_pool() -> Result<()> {
+        run_blocking_worker_test(async {
+            let mut first = BlockingWorker::spawn();
+            first.wait_started().await?;
+            let (enqueued, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let mut blocker = BlockingWorker::spawn();
+                enqueued.send(()).unwrap();
+                blocker.wait_started().await
+            });
+            ready.await?;
+            task.abort();
+            assert!(task.await.expect_err("cancelled task").is_cancelled());
+            first.finish().await?;
+            tokio::task::spawn_blocking(|| ()).await?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn blocking_worker_readiness_survives_cancelled_wait() -> Result<()> {
+        run_blocking_worker_test(async {
+            let mut first = BlockingWorker::spawn();
+            first.wait_started().await?;
+            let mut queued = BlockingWorker::spawn();
+            let mut ready = Box::pin(queued.wait_started());
+            assert!(futures::poll!(ready.as_mut()).is_pending());
+            drop(ready);
+            first.finish().await?;
+            queued.wait_started().await?;
+            queued.finish().await?;
+            Ok(())
+        })
+    }
 
     fn report_swapper_stopped(
         stop: &std::sync::atomic::AtomicBool,
