@@ -1,6 +1,8 @@
 """Offline contracts and real render/package checks for the Pages artifact handoff."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -203,7 +205,9 @@ class BenchmarkWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
             with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
-                self.assertFalse(reports.site_gate(self.site_environment(), observe=lambda: "c" * 40))
+                with contextlib.redirect_stdout(io.StringIO()) as warning:
+                    self.assertFalse(reports.site_gate(self.site_environment(), observe=lambda: "c" * 40))
+                self.assertIn("::warning::Pages source is stale;", warning.getvalue())
                 self.assertIn("current=false\n", output.read_text())
                 output.unlink()
                 self.assertTrue(reports.site_gate(self.site_environment(), observe=lambda: READER))
