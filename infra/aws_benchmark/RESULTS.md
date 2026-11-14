@@ -236,12 +236,15 @@ can include earlier phases and is not a phase-local maximum. An observed phase e
 establish phase success. Counter resets, unsupported files, incomplete sampling and missing
 historical observations remain explicit.
 
-The public setup page groups observed CPU model/count, host RAM when recorded, kernel, architecture,
-filesystem, array member count/model/size and configuration by a stable fingerprint. It excludes
-run-varying free-space counters, paths, device identifiers, serials, hostnames, environment
+The public setup page describes the configured design once and merges what the runs recorded into
+one table: CPU model/count, host RAM when recorded, kernel, architecture, filesystem, array member
+count/model/size and configuration. A value appears once when every recording run agrees. Fields
+whose recorded values differ are listed with the runs that recorded each value; a field that an
+older run did not record is not a difference. Each run page keeps its own observed setup as a
+collapsed appendix, and the companion JSON keeps the stable setup fingerprint. Observed setups
+exclude run-varying free-space counters, paths, device identifiers, serials, hostnames, environment
 variables and process inventories. Historical guest RAM is not inferred from an EC2 instance type.
-The configured design is described separately from observed facts, and each run links to its setup
-so material differences stay visible.
+The configured design is described separately from observed facts.
 
 All sizes in the file-set description are decimal bytes. The existing 1 KB fixture is 10,240,000
 files of 1,000 bytes, or 10.24 GB total. This is already exactly 100 times smaller than the 1.024 TB

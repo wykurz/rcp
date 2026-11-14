@@ -256,6 +256,34 @@ def render(source, root, route, routes, *, has_aws_history=False):
     return page, assets, seen, sections
 
 
+def aws_link(label, target, *, nested=False, current=False):
+    return ('<li' + (' class="level-h3"' if nested else '') + '><a href="' + html.escape(target, quote=True) + '"' +
+            (' aria-current="page"' if current else '') + '>' + html.escape(label) + '</a></li>')
+
+
+def aws_navigation(route, *, status):
+    """List the AWS section pages; links into the current page stay within the document."""
+    home, setup = Path('aws-benchmarks/index.html'), Path('aws-benchmarks/setups.html')
+    index = '' if route == home else relative_url(home, route)
+    items = [aws_link('History', index + '#history'), aws_link('Runs', index + '#runs')]
+    if status:
+        items.append(aws_link('Collection status', index + '#collection-status'))
+    return items + [aws_link('Test setup', '#report-content' if route == setup else relative_url(setup, route),
+                             current=route == setup)]
+
+
+def aws_page(route, title, body, navigation, footer=''):
+    """Wrap generated AWS content in the shared site shell with section navigation."""
+    return Template((ASSETS / 'aws-page.html').read_text(encoding='utf-8')).substitute(
+        title=html.escape(title), theme=read_theme(), header=site_header(route, has_aws_history=True),
+        site_stylesheet=relative_url(Path('assets/site.css'), route),
+        stylesheet=relative_url(Path('assets/report.css'), route),
+        aws_stylesheet=relative_url(Path('assets/aws.css'), route),
+        navigation=''.join(navigation), body=body,
+        footer=footer + 'RCP Tools · <a href="' + relative_url(Path('aws-benchmarks/index.html'), route) +
+               '">AWS benchmarks</a>')
+
+
 def aws_benchmark_pages(repository):
     """Read legacy Git history as data, never checked-out code."""
     from infra.aws_benchmark import production_publish
@@ -279,35 +307,42 @@ def retained_aws_benchmark_pages(directory, reader_revision, inventory_sha256):
                   'yes' if observation['retired'] else 'no')
         rows.append('<tr>' + ''.join('<td>' + html.escape(value) + '</td>' for value in fields) + '</tr>')
     processing = 'complete' if index['processing_complete'] else 'incomplete; some records are deferred'
+    # the table is folded away only when every observation is a finished, published record
+    attention = (not records or index['active']['state'] != 'idle' or
+                 any(observation['state'] != 'ready' for observation in index['observations']))
     status = (
-        '<section aria-labelledby="collection-status"><h2 id="collection-status">Snapshot status</h2>'
+        '<section aria-labelledby="collection-status"><h2 id="collection-status">Collection status</h2>'
         '<p>Observed at: <time>' + html.escape(index['observed_at']) + '</time>. '
         'Discovery: complete. Record processing: ' + processing + '.</p>'
+        '<details' + (' open' if attention else '') + '><summary>Observations in this snapshot</summary>'
         '<p>The first row is the lease observation at that time; it is not a fresh physical teardown check. '
         'Retirement and cleanup verification belong to individual retained records. '
         'Recorded worker outcomes are provisional until retirement-bound validation. '
         'Pending, held and deferred entries are not successful measurements.</p>'
         '<div class="table-scroll"><table><thead><tr><th>Run</th><th>State</th><th>Phase</th>'
         '<th>Details</th><th>Retirement recorded</th></tr></thead><tbody>' + ''.join(rows) +
-        '</tbody></table></div></section>')
-    if not records:
-        empty = ('Discovery and processing completed; no retained public records were found.'
-                 if index['processing_complete'] and not index['observations'] and index['active']['state'] == 'idle'
-                 else 'No public records are available to display in this snapshot. See the observations below.')
-        status = '<p>' + empty + '</p>' + status
+        '</tbody></table></div></details></section>')
+    empty = '' if records else (
+        'Discovery and processing completed; no retained public records were found.'
+        if index['processing_complete'] and not index['observations'] and index['active']['state'] == 'idle'
+        else 'No public records are available to display in this snapshot. See the observations below.')
     diagnostics = production_reports.public_diagnostics(directory, index, records=records)
-    return render_aws_benchmarks(records, diagnostics=diagnostics, retained=True, status=status, footer=(
+    return render_aws_benchmarks(records, diagnostics=diagnostics, retained=True, status=status, empty=empty, footer=(
         '<p>Reader revision: <code>' + html.escape(reader_revision) + '</code><br>'
         'Snapshot inventory SHA256: <code>' + html.escape(inventory_sha256) + '</code></p>'))
 
 
-def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='', footer=''):
-    """Render frozen public JSON and numeric companions; never retained HTML or binaries."""
+def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='', empty='', footer=''):
+    """Render frozen public JSON and numeric companions; never retained HTML or binaries.
+
+    Record-derived content comes from script-free renderers; the shared shell adds
+    only the generator's own static theme script.
+    """
     from infra.aws_benchmark import production_export, production_history
-    title = 'AWS benchmarks · retained records' if retained else 'AWS benchmark history'
+    home, setup = Path('aws-benchmarks/index.html'), Path('aws-benchmarks/setups.html')
     retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
                  'This view is not permanent history.</p>' if retained else '')
-    pages, rows, setups, normalized = {}, [], {}, {}
+    pages, rows, observed, normalized = {}, [], [], {}
     diagnostics = diagnostics or {}
     if not set(diagnostics) <= set(records):
         raise ValueError('Resource diagnostics have no frozen public record')
@@ -317,64 +352,63 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         normalized[run_key] = value
         identity = value['identity']
         report = Path('aws-benchmarks/runs') / (run_key + '.html')
-        record = Path('aws-benchmarks/records') / (run_key + '.json')
-        pages[record] = raw.decode('utf-8')
+        pages[Path('aws-benchmarks/records') / (run_key + '.json')] = raw.decode('utf-8')
         extra = diagnostics.get(run_key)
         if extra is None:
             extra = production_export.resource_diagnostics.unavailable(value)
-        setup_href = None
-        if extra is not None:
-            production_export.resource_diagnostics.validate(extra, value)
-            if extra['setup'] is not None:
-                setups[extra['setup_id']] = extra['setup']
-                setup_href = '../setups.html#setup-' + extra['setup_id']
-            pages[Path('aws-benchmarks/diagnostics') / (run_key + '.json')] = (
-                production_export.collection.encoded(extra).decode('utf-8'))
-        pages[report] = production_export.render(value, diagnostics=extra, setup_href=setup_href) + retention + (
-            '<p><a href="../index.html">' + html.escape(title) + '</a> · '
-            f'<a href="../records/{run_key}.json">Public JSON record</a> · '
-            '<a href="../../index.html#top">RCP Tools</a></p>')
-        qualification = production_export.projection.outcome_label(value)
-        fields = (identity['run'], production_export.projection.collected_time(value), identity['suite'], value['comparison'], qualification)
-        cells = '<td><a href="runs/' + run_key + '.html">' + html.escape(fields[0]) + '</a></td>'
-        cells += ''.join('<td>' + html.escape(field) + '</td>' for field in fields[1:])
-        rows.append('<tr>' + cells + '</tr>')
-    setup_content = production_export.resource_diagnostics.configuration_html(setups)
+        production_export.resource_diagnostics.validate(extra, value)
+        if extra['setup'] is not None:
+            observed.append(dict(run=identity['run'], href='runs/' + run_key + '.html', setup=extra['setup']))
+        pages[Path('aws-benchmarks/diagnostics') / (run_key + '.json')] = (
+            production_export.collection.encoded(extra).decode('utf-8'))
+        body = production_export.render(value, diagnostics=extra) + (
+            '<section aria-labelledby="raw-data"><h2 id="raw-data">Raw data</h2><ul>'
+            f'<li><a href="../records/{run_key}.json">Public JSON record</a>: '
+            'the frozen record this page is rendered from.</li>'
+            f'<li><a href="../diagnostics/{run_key}.json">Resource diagnostics JSON</a>: '
+            'per-copy resources, sampled phases and the observed setup.</li></ul>' + retention + '</section>')
+        name = 'Run ' + identity['run']
+        pages[report] = aws_page(report, name + ' · AWS benchmarks', body, aws_navigation(report, status=status) + [
+            aws_link(name, '#report-content', current=True), aws_link('Results', '#results', nested=True),
+            aws_link('Resource diagnostics', '#resource-diagnostics', nested=True),
+            aws_link('Observed setup', '#observed-setup', nested=True), aws_link('Raw data', '#raw-data', nested=True)])
+        rows.append('<tr><td><a href="runs/' + run_key + '.html">' + html.escape(identity['run']) + '</a></td><td>' +
+                    production_export.badge(value) + '</td><td><code>' + html.escape(identity['suite']) +
+                    '</code></td><td>' + production_export.commit_html(identity, identity['candidate']) +
+                    '</td><td>' + production_export.collected_html(value) + '</td></tr>')
+    # the frozen trust statements travel with every page that shows worker-reported values
+    note = ('<aside class="note" aria-label="About these numbers"><p>' +
+            html.escape(production_export.projection.MEASUREMENT_CAVEAT) + '</p><p>' +
+            html.escape(production_export.VALIDATION) + ' A few copies per run do not establish broad variance.</p>' +
+            retention + '</aside>')
+    setup_content = (
+        '<h1>Test setup</h1><p class="lede">Every run uses the same machine type, storage layout, datasets and '
+        "method, so they are described here once. What an individual run observed is in that run's appendix and "
+        'its diagnostics JSON.</p>' + note +
+        production_export.resource_diagnostics.configuration_html(observed[::-1]) + production_history.reading_html())
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
-    pages[Path('aws-benchmarks/setups.html')] = (
-        "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-        "<title>AWS benchmark setup</title>" + read_theme() +
-        "<link rel='stylesheet' href='../assets/site.css'><link rel='stylesheet' href='../assets/report.css'>"
-        "<body>" + site_header(Path('aws-benchmarks/setups.html'), has_aws_history=True) +
-        "<main>" + setup_content + "<p><a href='index.html'>AWS benchmark runs</a></p></main></body></html>")
-    history_content = production_history.render(normalized, diagnostics)
+    pages[setup] = aws_page(setup, 'Test setup · AWS benchmarks', setup_content, aws_navigation(setup, status=status) + [
+        aws_link(label, '#' + fragment, nested=True) for fragment, label in (
+            ('machine', 'Machine and storage'), ('datasets', 'Datasets'), ('method', 'Method'),
+            ('observed', 'Observed values'), ('reading', 'Reading the plots'))])
+    # the plots used to live here; keep the address working without a script
     pages[Path('aws-benchmarks/history.html')] = (
-        "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-        "<title>AWS benchmark history plots</title>" + read_theme() +
-        "<link rel='stylesheet' href='../assets/site.css'><link rel='stylesheet' href='../assets/report.css'>"
-        "<body>" + site_header(Path('aws-benchmarks/history.html'), has_aws_history=True) +
-        "<main>" + history_content + "<p><a href='index.html'>AWS benchmark runs</a> · "
-        "<a href='setups.html'>Hardware and test setup</a></p></main></body></html>")
-    pages[Path('aws-benchmarks/index.html')] = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(title)} · RCP Tools</title>{read_theme()}
-<link rel="stylesheet" href="../assets/site.css"><link rel="stylesheet" href="../assets/report.css"></head>
-<body><a class="skip-link" href="#report-content">Skip to report</a>
-{site_header(Path('aws-benchmarks/index.html'), has_aws_history=True)}
-<main id="report-content"><h1>{html.escape(title)}</h1>{retention}
-<p><a href="history.html">Duration, CPU and memory history plots by file set</a></p>
-<p>Retired AWS runs with verified resource termination. Failed consistency checks and unavailable evidence remain
-visible and are excluded from performance history. These records are separate from historical Depot measurements.</p>
-<p><a href="setups.html">Hardware, storage, filesystem and test setup</a>. Each run's resource diagnostics
-link to its observed setup. Missing historical measurements remain explicitly unavailable.</p>
-<p>{html.escape(production_export.projection.MEASUREMENT_CAVEAT)}</p>
-<p>{html.escape(production_export.VALIDATION)} Each file set has four copies forming two local pairs; a small run does not
-establish broad variance. Compare only matching workload and measurement contracts.</p>
-<div class="table-scroll"><table><thead><tr><th>Run</th><th>Collected at</th><th>Suite</th>
-<th>Comparison</th><th>Qualification</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
-{status}{footer}</main></body></html>
-"""
+        '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+        '<meta http-equiv="refresh" content="0; url=index.html#history">'
+        '<title>AWS benchmarks · RCP Tools</title></head>'
+        '<body><p>The history plots are on the <a href="index.html#history">AWS benchmarks</a> page.</p></body></html>\n')
+    runs = ('<p>Retired AWS runs with verified resource termination, newest first. Failed and unavailable runs '
+            'stay listed and are excluded from the plots. These records are separate from historical Depot '
+            'measurements.</p><div class="table-scroll"><table class="data"><thead><tr><th>Run</th><th>Result</th>'
+            '<th>Suite</th>'
+            '<th>Commit</th><th>Collected</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>'
+            if rows else '<p>' + html.escape(empty or 'No public records are listed.') + '</p>')
+    pages[home] = aws_page(home, 'AWS benchmarks', (
+        '<h1>AWS benchmarks</h1><p class="lede">How long rcp takes to copy fixed datasets on one AWS machine type, '
+        'tracked from commit to commit.</p>' + note + production_history.render(normalized, diagnostics) +
+        '<section id="runs" aria-labelledby="runs-title"><h2 id="runs-title">Runs</h2>' + runs + '</section>' +
+        status), aws_navigation(home, status=status), footer)
     return pages
 
 
@@ -439,7 +473,7 @@ def build(root, output, *, has_dashboard=False, aws_history=None, aws_records=No
             if fragment not in headings[target]:
                 kind = 'report' if target in routes else 'repository'
                 raise ValueError(f'Missing {kind} section in {page}: {value}')
-    for name in ('site.css', 'report.css', 'landing.css', 'landing.js'):
+    for name in ('site.css', 'report.css', 'aws.css', 'landing.css', 'landing.js'):
         assets[Path('assets') / name] = ASSETS / name
     assets[Path('assets/logo.svg')] = root / 'assets/logo.svg'
     if has_dashboard:
