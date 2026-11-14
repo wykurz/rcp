@@ -7,6 +7,8 @@ on:
   schedule:
     # reporting cadence only; the separate gate defaults closed
     - cron: '43 9 * * *'
+    # after Monday/Friday's maximum normal capacity/runtime/drain window and collection margin
+    - cron: '43 3 * * 2,6'
   workflow_dispatch:
     inputs:
       mode:

@@ -651,8 +651,8 @@ for a new month or to make an attempt fit. The development ceiling does not esta
 monthly operating allowance. Price evidence still expires after 31 days. No controller or workflow
 gets automatic policy-edit or credential-refresh authority.
 
-The separate keyless reporting workflow declares a daily 09:43 UTC poll behind
-`RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and the independent
+The separate keyless reporting workflow declares a daily 09:43 UTC poll and a Tuesday/Saturday 03:43
+UTC post-drain refresh behind `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and the independent
 `RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED=true`. It reads retained frozen reports and never
 launches work. Main-only owner identity, exact artifact/inventory bindings and complete-scan
 requirements still apply. Its `reader-test` remains manual-only. Read-only schedule activation and
@@ -660,11 +660,27 @@ its operating allowance still require approval; this code neither changes live f
 recurring benchmarks. No history writer key or per-report environment approval is needed.
 
 A scheduled submission job can finish many hours before the cloud collector retires ownership. The
-daily reporting scan revisits retained runs rather than treating the submit job conclusion as
-workload completion. Runtime/watchdog/collector recovery remains independent of desktop sessions;
-local operator restart, an assumed provider expiry or another dispatch cannot replace missing
-retirement proof. Both repository schedule gates are absent/off by default. This PR dispatches
-nothing, grants no live permission and does not initialize or alter the current closed ledger.
+reporting scans revisit retained runs rather than treating the submit job conclusion as workload
+completion. The Tuesday/Saturday refresh follows the regular Monday/Friday 08:17 UTC slot, even with
+the maximum one-hour normal-policy lateness, two-hour accepted workflow age, 12-hour capacity
+search, three-hour allocation and 15-minute drain, plus more than an hour for collection. This is a
+reporting opportunity, not a promise that recovery has completed: outages can leave a pending/held
+observation, and the daily poll or an existing manual publish refresh can observe later progress.
+
+Before retirement, the snapshot and Actions summary also show an allowlisted controller-recorded
+worker outcome, safe close category, fixed deadlines and cleanup stage. A recorded worker success is
+provisional; only a retirement-bound validated report establishes a benchmark result. Cleanup
+timestamps describe recorded controller verification, not a new EC2 query or proof of current
+physical state. Missing, invalid or foreign committed status is shown as unavailable; raw status
+messages, logs, credentials and AWS identities are not copied into the public progress fields. These
+observations reuse the existing active/run GetItem permission and add no AWS service reads, IAM
+grants, worker invocations or controller deployment. The frozen measurement records and their
+retirement checks remain unchanged.
+
+Runtime/watchdog/collector recovery remains independent of desktop sessions; local operator restart,
+an assumed provider expiry or another dispatch cannot replace missing retirement proof. Both
+repository schedule gates are absent/off by default. This PR dispatches nothing, grants no live
+permission and does not initialize or alter the current closed ledger.
 
 ### Manual identity-only workflow acceptance
 

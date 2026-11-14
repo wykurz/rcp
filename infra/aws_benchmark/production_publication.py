@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import re
 import time
 
-from . import production_collection as collection, production_projection as projection
+from . import production_collection as collection, production_projection as projection, production_progress as progress
 from .common import MAX_RESULT, digest, require
 from .production_store import PHASES, RunStore
 
@@ -243,7 +243,8 @@ class Reader:
         phase = record.state["phase"]
         require(phase in PHASES, "invalid active phase")
         return dict(state="pending", retired=False, run_key=run_key, phase=phase,
-                    reason="ownership remains held until collection and retirement")
+                    reason="ownership remains held until collection and retirement",
+                    progress=progress.observe(record.state, run_key=run_key))
 
     def _retired_manifest(self, key):
         run_key = self.run_key(key)

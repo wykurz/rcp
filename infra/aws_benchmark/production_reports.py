@@ -90,7 +90,7 @@ def site_gate(environment, *, observe=None):
 
 
 def observation(value, *, active=False):
-    require(isinstance(value, dict) and set(value) <= {"state", "retired", "run_key", "phase", "reason"} and
+    require(isinstance(value, dict) and set(value) <= {"state", "retired", "run_key", "phase", "reason", "progress"} and
             value.get("state") in {"idle", "pending", "held", "ready", "published", "deferred"} and
             type(value.get("retired")) is bool, "invalid retained reporting observation")
     if "run_key" in value:
@@ -98,6 +98,12 @@ def observation(value, *, active=False):
     for key in ("phase", "reason"):
         if key in value:
             require(isinstance(value[key], str) and len(value[key]) <= 512, "unbounded reporting observation")
+    if "progress" in value:
+        require(value["state"] == "pending" and value["retired"] is False and
+                "run_key" in value and isinstance(value.get("phase"), str) and
+                value["phase"] in publication.PHASES,
+                "progress is not a retired verdict")
+        publication.progress.validate(value["progress"])
     if active:
         require(value["state"] in {"idle", "pending", "held"} and value["retired"] is False,
                 "invalid active ownership observation")
@@ -267,6 +273,11 @@ def summary(index):
         counts = {state: sum(x["state"] == state for x in index["observations"]) for state in ("ready", "pending", "held", "deferred")}
         text = "Retained AWS reporting: " + ", ".join(str(n) + " " + state for state, n in counts.items())
         text += ". Active ownership observation: " + index["active"]["state"] + ".\n\n"
+        active = index["active"]
+        if "progress" in active:
+            text += "Active run: " + active["run_key"] + " (recorded snapshot at " + index["observed_at"] + ").\n\n"
+            text += "".join("- " + line + "\n" for line in publication.progress.lines(active["progress"]))
+            text += "\n"
         text += "Still-retained view under the 90-day AWS lifecycle; deletion timing may vary. Not permanent history or a new physical cleanup proof.\n\n"
         for item in index["observations"]:
             if item["state"] in {"held", "deferred"}:
