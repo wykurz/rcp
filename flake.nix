@@ -313,6 +313,9 @@
         # not invalidate otherwise reusable release units between the two phases.
         nixSandboxRustflags = ''target.'cfg(all())'.rustflags=["--cfg","tokio_unstable","--cfg","rcp_nix_sandbox"]'';
         nixSandboxCargoFlags = [ "--config" nixSandboxRustflags ];
+        # avoid cross-crate LTO for every test executable while retaining release optimization
+        # and local thin LTO. The install hook saves the production build before checks run.
+        nixSandboxTestFlags = nixSandboxCargoFlags ++ [ "--config" "profile.release.lto=false" ];
 
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }:
@@ -329,7 +332,7 @@
 
             # Build and test only the specific package
             cargoBuildFlags = [ "-p" packageName ] ++ nixSandboxCargoFlags;
-            cargoTestFlags = [ "-p" packageName ] ++ nixSandboxCargoFlags;
+            cargoTestFlags = [ "-p" packageName ] ++ nixSandboxTestFlags;
 
             checkFlags = [ "--test-threads=1" ];
 
@@ -472,7 +475,7 @@
             inherit buildInputs nativeBuildInputs;
 
             cargoBuildFlags = nixSandboxCargoFlags;
-            cargoTestFlags = nixSandboxCargoFlags;
+            cargoTestFlags = nixSandboxTestFlags;
             checkFlags = [ "--test-threads=1" ];
 
             meta = with pkgs.lib; {
