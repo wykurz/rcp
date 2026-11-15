@@ -25,9 +25,11 @@ MAX_TRIALS = 128
 MAX_NUMBER = (1 << 63) - 1
 PROCESS_SCOPE = ("One local copy command, its threads and waited descendants. CPU seconds may exceed "
                  "wall time; peak RSS is a per-command peak, not host memory or a sum of processes.")
-REMOTE_PROCESS_SCOPE = ("A local copy is one command with its threads and waited descendants. A remote copy is "
-                        "three processes measured separately: the rcp command with the ssh clients it starts, the "
-                        "source rcpd and the destination rcpd. CPU seconds may exceed wall time; peak RSS is a "
+# figures of a run with remote cells are rcp's own (--output-format=json), never an outside measurement
+REMOTE_PROCESS_SCOPE = ("Each figure is what a process reports about itself as it finishes, from the kernel's "
+                        "accounting of that process. A local copy is one rcp process with its threads. A remote "
+                        "copy is three processes: the rcp command, without the ssh clients it starts, the source "
+                        "rcpd and the destination rcpd. CPU seconds may exceed wall time; peak RSS is a "
                         "per-process peak, not host memory or a sum of processes.")
 SYSTEM_SCOPE = ("Sampled host/cgroup diagnostics associated with phase windows, not per-process "
                 "attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.")
@@ -680,8 +682,8 @@ def configuration_html(observations, *, remote=False):
         "the same host: <code>rcp --force-remote</code> starts a source and a destination <code>rcpd</code> over "
         "SSH, on a private sshd that the benchmark runs on loopback, and the daemons exchange the data over "
         "loopback TCP with rcp's default encryption. Every address is 127.0.0.1. No network hardware and no added "
-        "latency are involved, so this measures the remote protocol, not a network. CPU time and peak memory are "
-        "recorded for the <code>rcp</code> command and for each daemon.</li>")
+        "latency are involved, so this measures the remote protocol, not a network. The <code>rcp</code> command "
+        "and each daemon report their own CPU time and peak memory.</li>")
     repeats = "of each file set under each scenario" if remote else "of each file set"
     text = (
         "<section aria-labelledby='machine'><h2 id='machine'>Machine and storage</h2><ul>"

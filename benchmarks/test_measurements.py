@@ -93,6 +93,14 @@ class PairTests(unittest.TestCase):
 
 
 class ResourceSchemaTests(unittest.TestCase):
+    def test_a_stop_signal_while_reading_figures_is_not_taken_for_an_unreadable_file(self):
+        # the harness raises a stop signal as an InterruptedError, which is an OSError too
+        with mock.patch.object(Path, 'read_bytes', side_effect=InterruptedError('SIGTERM')), \
+                self.assertRaises(InterruptedError):
+            measurements.collect('figures.json', True)
+        with mock.patch.object(Path, 'read_bytes', side_effect=PermissionError('unreadable')):
+            self.assertEqual(measurements.collect('figures.json', True)['status'], 'unavailable')
+
     def test_strict_resource_values_and_missing_bytes(self):
         metrics={key:0 for key in (*measurements.FLOATS,*measurements.COUNTS,'exit_code')}
         measurements.validate_metrics(metrics)

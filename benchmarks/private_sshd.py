@@ -8,7 +8,9 @@ SSH side for one run:
 - a launcher named `ssh`, found before any other, that sends every connection to that sshd;
   a login must print nothing of its own, because rcp reads the first line an rcpd prints as its
   readiness record (so the account needs a home directory that sshd can enter);
-- an rcpd wrapper that marks the daemons it starts and measures each one with GNU time.
+- a mark on every session (`SetEnv` in the sshd configuration), so that a daemon that outlives
+  its copy can be found and ended. sshd starts each remote command in a session of its own,
+  outside the copy command's process group.
 
 Everything lives in one private directory under the temporary directory and is removed when the
 run ends. Keys are made per run and never leave that directory: it is not under the results,
@@ -23,7 +25,6 @@ from pathlib import Path
 import pwd
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import socket
@@ -31,18 +32,16 @@ import subprocess
 import tempfile
 import time
 
-from benchmarks import measurements
 from benchmarks.signals import SignalCancellation
 
 PROFILE = "private-sshd-ipv4-loopback-v1"
 ADDRESS = "127.0.0.1"
-ROLES = ("source", "destination")
-# carried by every process the wrapper starts, so a daemon that outlives its copy can be found
+# in the environment of every session, so a daemon that outlives its copy can be found
 MARKER = "RCP_BENCH_ENDPOINT"
-# seconds allowed for sshd to accept its first login, for a daemon's figures to appear after
-# its copy has ended, and for sshd to exit when asked
+# seconds allowed for sshd to accept its first login, for a daemon to exit by itself after a
+# copy that succeeded, and for sshd to exit when asked
 READY_SECONDS = 30
-ROLE_WAIT_SECONDS = 5
+EXIT_SECONDS = 5
 STOP_SECONDS = 5
 PORT_ATTEMPTS = 3
 COMMAND_SECONDS = 30
@@ -108,10 +107,10 @@ def _last_line(text, first=False):
 
 
 class Endpoint:
-    """One run's private sshd, ssh launcher and rcpd wrapper."""
+    """One run's private sshd and ssh launcher."""
 
-    def __init__(self, rcpd, *, log, sshd=None, ssh=None, keygen=None, resource_time=None):
-        self.rcpd, self.log, self.resource_time = Path(rcpd), Path(log), resource_time
+    def __init__(self, *, log, sshd=None, ssh=None, keygen=None):
+        self.log = Path(log)
         self.requested = dict(sshd=sshd, ssh=ssh, keygen=keygen)
         self.tools, self.identities = {}, {}
         self.token = secrets.token_hex(16)
@@ -144,7 +143,7 @@ class Endpoint:
         return True
 
     def stop(self):
-        """End sshd and anything the wrapper started, and remove the keys. Safe at any point.
+        """End sshd and anything a session started, and remove the keys. Safe at any point.
 
         What a stop signal interrupts stays remembered, so calling again finishes the job.
         """
@@ -175,43 +174,19 @@ class Endpoint:
         """Variables for the copy: the launcher is the first `ssh` it finds."""
         return dict(PATH=os.pathsep.join((str(self.directory / "bin"), os.environ.get("PATH", os.defpath))))
 
-    def command(self, local):
-        """Turn a local copy command into the same copy through rcpd, both ends on loopback."""
+    @staticmethod
+    def command(local, rcpd):
+        """Turn a local copy command into the same copy through that rcpd, both ends on loopback."""
         *command, source, destination = local
-        return [*command, "--force-remote", f"--bind-ip={ADDRESS}", f"--rcpd-path={self.directory / 'rcpd'}",
+        return [*command, "--force-remote", f"--bind-ip={ADDRESS}", f"--rcpd-path={rcpd}",
                 f"{ADDRESS}:{source}", f"{ADDRESS}:{destination}"]
 
     def descriptor(self):
         """What the results record about how remote copies were made."""
         return dict(profile=PROFILE, address=ADDRESS, ssh=self.identities["ssh"], sshd=self.identities["sshd"])
 
-    def clear(self):
-        """Forget the figures of the previous copy."""
-        for path in (self.directory / "roles").iterdir():
-            path.unlink()
-
-    def roles(self, successful):
-        """CPU and memory of each daemon of the copy that just ended, or None when not measured.
-
-        A daemon writes its figures as it exits. rcp has normally waited for its daemons by
-        then; the short wait covers one that is still on its way out. A copy that failed has no
-        figures worth waiting for.
-        """
-        if self.resource_time is None:
-            return None
-        paths = {role: self.directory / "roles" / (role + ".json") for role in ROLES}
-        def written(path):
-            try:
-                return path.stat().st_size > 0
-            except FileNotFoundError:
-                return False
-        deadline = time.monotonic() + ROLE_WAIT_SECONDS
-        while successful and time.monotonic() < deadline and not all(map(written, paths.values())):
-            time.sleep(.05)
-        return {role: measurements.collect(path, successful) for role, path in paths.items()}
-
     def reap(self, grace=0):
-        """End every process the wrapper started that is still running; return how many.
+        """End every process a session started that is still running; return how many.
 
         A daemon that hangs is not in the copy command's process group: sshd starts it in a
         session of its own. Left alone it would keep working during the next copy. After a
@@ -281,8 +256,7 @@ class Endpoint:
         self.directory = directory
         for value, pattern, what in ((str(directory), SAFE_PATH, "temporary directory"),
                                      (self.account, ACCOUNT, "account name"),
-                                     *((str(path), SAFE_PATH, "tool path") for path in (
-                                         *self.tools.values(), self.rcpd, *filter(None, [self.resource_time])))):
+                                     (str(self.tools["ssh"]), SAFE_PATH, "path of ssh")):
             if not pattern.fullmatch(value):
                 raise EndpointError(f"the {what} cannot be written into an ssh configuration or a script: {value!r}")
         self.identities = {name: identity(self.tools[name]) for name in ("ssh", "sshd")}
@@ -292,22 +266,10 @@ class Endpoint:
             (directory / name).chmod(0o600)
         (directory / "authorized_keys").write_text((directory / "identity.pub").read_text())
         (directory / "authorized_keys").chmod(0o600)
-        (directory / "roles").mkdir(mode=0o700)
         (directory / "bin").mkdir(mode=0o700)
         # rcp passes StrictHostKeyChecking=no; the first value given wins, so the key stays checked
         self._script(directory / "bin" / "ssh",
                      f"exec {self.tools['ssh']} -F {directory}/ssh_config -o StrictHostKeyChecking=yes \"$@\"\n")
-        daemon = str(self.rcpd)
-        measured = ""
-        if self.resource_time is not None:
-            measured = ("role=\nprevious=\nfor argument in \"$@\"; do\n"
-                        "  case \"$previous\" in --role) role=$argument ;; esac\n"
-                        "  case \"$argument\" in --role=*) role=${argument#--role=} ;; esac\n"
-                        "  previous=$argument\ndone\n"
-                        "case \"$role\" in\n  " + "|".join(ROLES) + ")\n"
-                        f"    exec {self.resource_time} --quiet --format {shlex.quote(measurements.FORMAT)} "
-                        f"--output {directory}/roles/$role.json -- {daemon} \"$@\" ;;\nesac\n")
-        self._script(directory / "rcpd", f"{MARKER}={self.token}\nexport {MARKER}\n{measured}exec {daemon} \"$@\"\n")
 
     @staticmethod
     def _script(path, body):
@@ -326,7 +288,7 @@ class Endpoint:
             "KbdInteractiveAuthentication no", "UsePAM no", "PermitRootLogin no", "StrictModes no",
             "PermitUserEnvironment no", "PermitUserRC no", "DisableForwarding yes", "UseDNS no",
             "PrintMotd no", "LoginGraceTime 30", "LogLevel VERBOSE",
-            # a session carries the mark from its first instruction, before the wrapper has run
+            # every session carries the mark from its first instruction
             f"SetEnv {MARKER}={self.token}")) + "\n")
         (directory / "ssh_config").write_text("\n".join((
             "Host *", f"  HostName {ADDRESS}", f"  Port {self.port}", f"  User {self.account}",
@@ -391,7 +353,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     with tempfile.TemporaryDirectory() as scratch:
         log = Path(scratch, "sshd.log")
-        endpoint = Endpoint("/bin/true", log=log, sshd=args.sshd, ssh=args.ssh, keygen=args.ssh_keygen)
+        endpoint = Endpoint(log=log, sshd=args.sshd, ssh=args.ssh, keygen=args.ssh_keygen)
         try:
             endpoint.start()
             print("private sshd endpoint ready:", endpoint.descriptor()["sshd"]["version"] or "unknown version")

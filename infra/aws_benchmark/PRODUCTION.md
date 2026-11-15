@@ -949,7 +949,9 @@ that misses the server expiry must not receive a new reservation, even if the op
 The matrix suites measure the build under test, with rcp's default settings, on several file sets in
 one allocation. A *cell* is one file set under one scenario. Each cell is three copies made by one
 build. There is no baseline build, no pairing and no verification of what was copied: a copy counts
-when rcp exits zero and reports the expected file count.
+when rcp exits zero and reports the expected file count. CPU and memory are what rcp reports about
+itself in its JSON summary; the `revision` input may still name a revision from before rcp could
+print one, which is then timed without those figures.
 [The matrix runner](../../docs/benchmarking.md#performance-only-matrix-runs) describes what a run
 promises, and [the worker profile](LARGE_WORKLOADS.md#performance-only-matrix) how it runs on AWS.
 

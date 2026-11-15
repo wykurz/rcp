@@ -14,7 +14,8 @@ from .test_production_collection import Fixture
 from .test_production_publication import ReadOnlyS3, stored
 
 SUITE = "matrix-commission-local"
-FAILED = dict(status="failed", stage="copy", message="copy 1 failed with exit code 3; see logs/commission-10k/local/1/0.stderr.log")
+FAILED = dict(status="failed", stage="copy",
+              message="copy 1 failed with exit code 3; see 0.stdout.log and 0.stderr.log in logs/commission-10k/local/1")
 
 
 class MatrixPublicationTests(unittest.TestCase):

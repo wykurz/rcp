@@ -100,6 +100,7 @@ class RemoteHistoryTests(unittest.TestCase):
         text = history.reading_html(remote=True)
         self.assertIn('Remote copies over loopback have <a href="remote.html">a page of their own</a>', text)
         self.assertIn("source and the destination <code>rcpd</code>", text)
+        self.assertIn("Each process reports its own CPU time and peak memory", text)
         # no word the pages never define
         self.assertIn("A run counts for every file set and scenario it measured", text)
         self.assertNotIn("cell", text)
@@ -115,6 +116,7 @@ class RemoteHistoryTests(unittest.TestCase):
         self.assertIn("The copy datapath is local on one host, not a network copy", earlier)
         self.assertIn("<code>matrix-commission-local</code>", earlier)
         self.assertIn("<strong>Remote copies.</strong>", text)
+        self.assertIn("The <code>rcp</code> command and each daemon report their own CPU time and peak memory", text)
         # loopback is a network device too: what is absent is hardware and added latency
         self.assertIn("No network hardware and no added latency are involved", text)
         self.assertNotIn("no network device", text)

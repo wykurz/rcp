@@ -258,6 +258,17 @@ class MatrixMethodTextTests(unittest.TestCase):
                 self.assertNotIn(word, page)
         self.assertNotIn("future remote modes require their own validated contract", reading)
 
+    def test_the_reading_notes_say_who_measures_cpu_and_memory(self):
+        reading = history.reading_html()
+        self.assertIn("Matrix runs record what rcp reports about itself in its summary, read from the kernel's "
+                      "accounting of its own process.", reading)
+        self.assertIn("Paired runs are measured from outside with GNU <code>time</code>.", reading)
+        # no matrix run was ever measured another way
+        self.assertNotIn("first matrix runs", reading)
+        # rcp copies in one process, so there is nothing else to count
+        self.assertIn("CPU and RSS cover the copy command with all its threads", reading)
+        self.assertNotIn("waited descendants", reading)
+
 
 if __name__ == "__main__":
     unittest.main()

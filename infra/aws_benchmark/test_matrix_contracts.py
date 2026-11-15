@@ -117,7 +117,9 @@ class MatrixContractTests(unittest.TestCase):
                 self.assertEqual((args.repetitions, args.timeout, args.cache, args.purpose, args.runner_label),
                                  (3, 3600, "linux-drop-caches", contract["purpose"], contract["runner_label"]))
                 self.assertEqual(args.bin_dir, worker.STATE / "candidate")
-                self.assertEqual(args.resource_time, Path("/usr/bin/time"))
+                # CPU and memory are what rcp reports about itself: nothing measures it from outside
+                self.assertNotIn("--resource-time", argv)
+                self.assertNotIn("/usr/bin/time", argv)
                 self.assertTrue(args.check_capacity)
                 self.assertTrue(args.system_telemetry)
                 self.assertEqual(args.manifest, worker.ROOT / "benchmarks/matrix-cases.json")
@@ -136,6 +138,8 @@ class MatrixContractTests(unittest.TestCase):
         argv = worker.command(dict(suite="bulk-1g-metadata", baseline="a" * 40), 600)
         self.assertIn("benchmarks.run", argv)
         self.assertIn("--baseline-bin-dir", argv)
+        # the paired harness measures each command with GNU time, as before
+        self.assertEqual(argv[argv.index("--resource-time") + 1], "/usr/bin/time")
         self.assertIn("--setenv=RCP_BENCH_BASELINE_COMMIT=" + "a" * 40, argv)
         self.assertEqual(argv[argv.index("--timeout") + 1], "600")
 

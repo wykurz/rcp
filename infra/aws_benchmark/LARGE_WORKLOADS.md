@@ -357,15 +357,17 @@ preserve all counters and independent cleanup guards, and never blindly redispat
 ## Performance-only matrix
 
 The `matrix-*` suites run `python3 -m benchmarks.matrix` on the worker instead of the paired
-harness. They use the same two RAID0 arrays, capacity checks, cache broker, sandbox and resource
-collection as the profiles above, and differ in what they measure and how they end. The
-[production runbook](PRODUCTION.md#benchmark-matrix) covers admission, qualification and rollout.
+harness. They use the same two RAID0 arrays, capacity checks, cache broker and sandbox as the
+profiles above, and differ in what they measure, where a copy's CPU and memory figures come from,
+and how they end. The [production runbook](PRODUCTION.md#benchmark-matrix) covers admission,
+qualification and rollout.
 
-- **What runs.** One build (the candidate binaries) with rcp's default settings and `--summary`.
-  Each cell is one file set copied three times, locally or through `rcpd` over loopback; caches are
-  dropped before every copy. The fixture of a file set is generated once, its destination is removed
-  after every copy and the fixture after its last cell, so the next file set has the space. Nothing
-  is read back: no initial snapshot, no tree walk, no source re-validation.
+- **What runs.** One build (the candidate binaries) with rcp's default settings and
+  `--summary --output-format=json`. Each cell is one file set copied three times, locally or through
+  `rcpd` over loopback; caches are dropped before every copy. The fixture of a file set is generated
+  once, its destination is removed after every copy and the fixture after its last cell, so the next
+  file set has the space. Nothing is read back: no initial snapshot, no tree walk, no source
+  re-validation.
 - **Time.** The allocation reaches the runner as one deadline. Each command (generation, cache
   preparation, a copy) gets the same generous 3600-second limit, which exists to catch hangs. A
   command that the end of the allocation cuts short is `interrupted`, the cells after it are
@@ -397,6 +399,9 @@ collection as the profiles above, and differ in what they measure and how they e
   runner ends any daemon still running, since `sshd` starts daemons outside the copy's process
   group. [Remote cells](../../docs/benchmarking.md#remote-cells) has the details.
 
-The per-copy CPU, memory and sampled phases are published as before. For a local copy their scope is
-the one command. For a remote copy the same GNU `time` figures are recorded three times: for the
-`rcp` command, for the source `rcpd` and for the destination `rcpd`.
+The per-copy CPU, memory and sampled phases are published as before. A matrix run records what rcp
+reports about itself: the worker asks every copy for its summary as JSON (`--output-format=json`)
+and no CPU or memory figure is measured from outside. For a local copy that is the one `rcp`
+process. For a remote copy it is three sets of figures: the `rcp` command, the source `rcpd` and the
+destination `rcpd`. A revision from before rcp had `--output-format` is still timed, from its text
+summary, and has no CPU or memory figures.

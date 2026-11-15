@@ -5,7 +5,6 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import tempfile
 import threading
@@ -14,17 +13,30 @@ import unittest
 from unittest import mock
 
 from benchmarks import matrix, private_sshd, run
-from benchmarks.test_matrix import FILEGEN
-from benchmarks.test_private_sshd import KEYGEN, SSH, SSHD, TIME, tools
+from benchmarks.test_matrix import FILEGEN, RECORDED, REPORTED
+from benchmarks.test_private_sshd import KEYGEN, SSH, SSHD, tools
+
+# what the stand-in rcp reports for each daemon, and what the runner records of it
+DAEMONS = dict(source=dict(REPORTED, cpu_time_user_ms=30000, peak_rss_bytes=50 * 1024 * 1024),
+               destination=dict(REPORTED, cpu_time_user_ms=20000, peak_rss_bytes=30 * 1024 * 1024))
+RECORDED_DAEMONS = dict(source=dict(RECORDED, user_seconds=30.0, max_rss_kib=50 * 1024),
+                        destination=dict(RECORDED, user_seconds=20.0, max_rss_kib=30 * 1024))
 
 # stands in for rcp. A remote copy must name loopback everywhere and starts one daemon per role
 # over `ssh`, each in a session of its own, as sshd does.
 RCP = r'''#!/usr/bin/env python3
-import os, pathlib, shutil, signal, subprocess, sys, time
+import json, os, pathlib, shutil, signal, subprocess, sys, time
+old = os.environ.get("FAKE_RCP_BUILD") == "old"
+if old and any(item.startswith("--output-format") for item in sys.argv[1:]):
+    # a build from before the option existed: its argument parser refuses it, --version or not
+    print("error: unexpected argument '--output-format' found", file=sys.stderr)
+    sys.exit(2)
 if "--version" in sys.argv:
     print("rcp 1")
     sys.exit(0)
 arguments, state = sys.argv[1:], pathlib.Path(os.environ["FAKE_STATE"])
+if not old and "--output-format=json" not in arguments[:-2]:
+    sys.exit("the runner reads the JSON summary")
 remote, operands = "--force-remote" in arguments, sys.argv[-2:]
 if remote:
     if "--bind-ip=127.0.0.1" not in arguments or not all(item.startswith("127.0.0.1:/") for item in operands):
@@ -36,9 +48,15 @@ source, destination = map(pathlib.Path, operands)
 plan = dict(item.split("=") for item in os.environ.get("FAKE_RCP", "").split(",") if item)
 behaviour = plan.get(source.parent.name + (":remote" if remote else ""), "ok")
 if remote:
-    wrapper = next(item.partition("=")[2] for item in arguments if item.startswith("--rcpd-path="))
-    daemons = [subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no", "127.0.0.1", wrapper, "--role", role],
+    daemon = next(item.partition("=")[2] for item in arguments if item.startswith("--rcpd-path="))
+    started = state / "rcpd.pids"
+    before = len(started.read_text().split()) if started.exists() else 0
+    daemons = [subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no", "127.0.0.1", daemon, "--role", role],
                                 start_new_session=True) for role in ("source", "destination")]
+    # rcp goes on only once both daemons have told it that they are up
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and (not started.exists() or len(started.read_text().split()) < before + 2):
+        time.sleep(.01)
     if behaviour == "hang":
         time.sleep(300)
     if behaviour != "linger" and any(daemon.wait() for daemon in daemons):
@@ -49,10 +67,22 @@ if remote:
             (state / "break-sshd").write_text("")
         os.kill(int((state / "sshd.pid").read_text()), signal.SIGKILL)
 shutil.copytree(source, destination)
-print(f"files copied: {sum(len(names) for _, _, names in os.walk(destination))}")
-print("files unchanged: 0")
+if old:
+    # the text summary is all such a build has
+    print("files copied: %d\nfiles unchanged: 0" % sum(len(names) for _, _, names in os.walk(destination)))
+    sys.exit(0)
+summary = dict(REPORTED, files_copied=sum(len(names) for _, _, names in os.walk(destination)), files_unchanged=0)
+if remote and behaviour != "nodaemons":
+    # what each daemon sent the master about itself, with the host it ran on
+    summary["remote"] = {role: dict(figures, host="127.0.0.1") for role, figures in DAEMONS.items()}
+    if behaviour == "onedaemon":
+        del summary["remote"]["source"]["minor_page_faults"]
+    if behaviour == "blinddaemon":
+        # a daemon that is named without any statistics
+        summary["remote"]["source"] = dict(host="127.0.0.1")
+print(json.dumps(summary))
 sys.exit(3 if behaviour == "exit" else 0)
-'''
+'''.replace("REPORTED", repr(REPORTED)).replace("DAEMONS", repr(DAEMONS))
 
 # stands in for rcpd: records that it ran, and can outlive the copy that started it
 RCPD = r'''#!/bin/sh
@@ -79,7 +109,7 @@ class RemoteCellTests(unittest.TestCase):
         tools(self.bin, filegen=FILEGEN, rcp=RCP, rcpd=RCPD)
         self.tools = tools(self.root / "tools", sshd=SSHD.replace(
             'if "-t" in sys.argv:', 'if "-t" in sys.argv and (state / "break-sshd").exists():\n    sys.exit(1)\n'
-            'if "-t" in sys.argv:'), ssh=SSH, keygen=KEYGEN, time=TIME)
+            'if "-t" in sys.argv:'), ssh=SSH, keygen=KEYGEN)
         self.manifest = self.root / "manifest.json"
         self.manifest.write_text(json.dumps(dict(schema_version=1, cases=[
             dict(id=name, directory_widths=[2], files_per_leaf=2, file_size_bytes=3) for name in ("alpha", "beta")],
@@ -95,7 +125,7 @@ class RemoteCellTests(unittest.TestCase):
                      "--source-root", str(self.root / "source"), "--destination-root", str(self.root / "destination"),
                      "--cache", "uncontrolled", "--repetitions", "2", "--output", str(self.root / "out"),
                      "--sshd", str(self.tools["sshd"]), "--ssh", str(self.tools["ssh"]),
-                     "--ssh-keygen", str(self.tools["keygen"]), "--resource-time", str(self.tools["time"])]
+                     "--ssh-keygen", str(self.tools["keygen"])]
         for cell in cells:
             arguments += ["--cell", cell]
         return [*arguments, *extra]
@@ -111,9 +141,17 @@ class RemoteCellTests(unittest.TestCase):
     def outcomes(self, record):
         return [(cell["case_id"], cell["scenario"], cell["outcome"]["status"]) for cell in record["cells"]]
 
-    def endpoint_directory(self, record, cell=1):
-        command = record["cells"][cell]["copies"][0]["command"]
-        return Path(next(item.partition("=")[2] for item in command if item.startswith("--rcpd-path="))).parent
+    @contextlib.contextmanager
+    def endpoint_directories(self):
+        """Collect the private directories that endpoints make while the block runs."""
+        made, mkdtemp = [], tempfile.mkdtemp
+        def recording(**options):
+            path = mkdtemp(**options)
+            if options.get("prefix") == "rcp-bench-ssh-":
+                made.append(Path(path))
+            return path
+        with mock.patch.object(private_sshd.tempfile, "mkdtemp", recording):
+            yield made
 
     def assert_stopped(self, pids):
         deadline = time.monotonic() + 10
@@ -124,27 +162,28 @@ class RemoteCellTests(unittest.TestCase):
             # a process that has ended is gone or a zombie, whose command line reads empty
             self.assertFalse(Path(f"/proc/{pid}/cmdline").exists() and Path(f"/proc/{pid}/cmdline").read_bytes(), pid)
 
-    def test_a_remote_cell_copies_over_loopback_and_measures_each_daemon(self):
-        record = self.run_matrix()
+    def test_a_remote_cell_copies_over_loopback_and_records_what_each_process_reports(self):
+        with self.endpoint_directories() as made:
+            record = self.run_matrix()
         self.assertEqual(record["status"], "complete")
         self.assertEqual(self.outcomes(record), [("alpha", "local", "complete"), ("alpha", "remote", "complete")])
         local, remote = record["cells"]
         self.assertNotEqual(local["cell_id"], remote["cell_id"])
-        directory = self.endpoint_directory(record)
+        directory, = made
         fixture = record["file_sets"][0]["generation"]["command"][1] + "/filegen"
         for copy in remote["copies"]:
             self.assertEqual(copy["status"], "ok")
             executable, *options, source, destination = copy["command"]
             self.assertEqual(executable, str(self.bin / "rcp"))
-            self.assertEqual(options, ["--summary", "--force-remote", "--bind-ip=127.0.0.1",
-                                       f"--rcpd-path={directory}/rcpd"])
+            # the daemon is the build under test itself: nothing stands between rcp and it
+            self.assertEqual(options, ["--summary", "--output-format=json", "--force-remote", "--bind-ip=127.0.0.1",
+                                       f"--rcpd-path={self.bin}/rcpd"])
             self.assertEqual(source, "127.0.0.1:" + fixture)
             self.assertRegex(destination, r"^127\.0\.0\.1:/.*/alpha/remote/[12]$")
-            # the copy command as for a local cell, and each daemon on its own
-            self.assertEqual(copy["resources"]["status"], "complete")
-            self.assertEqual(sorted(copy["role_resources"]), ["destination", "source"])
-            for role in copy["role_resources"].values():
-                self.assertEqual((role["status"], role["metrics"]["max_rss_kib"]), ("complete", 2048))
+            # the rcp process as for a local cell, and each daemon as it reported to the master
+            self.assertEqual(copy["resources"], dict(status="complete", metrics=RECORDED))
+            self.assertEqual(copy["role_resources"], {role: dict(status="complete", metrics=metrics)
+                                                      for role, metrics in RECORDED_DAEMONS.items()})
             self.assertNotIn("leftover_processes", copy)
             self.assertEqual(copy["copy_summary"], dict(files_copied=4, files_unchanged=0))
         for copy in local["copies"]:
@@ -154,7 +193,8 @@ class RemoteCellTests(unittest.TestCase):
         self.assertEqual(record["context"]["remote"], dict(
             profile="private-sshd-ipv4-loopback-v1", address="127.0.0.1",
             ssh=private_sshd.identity(self.tools["ssh"]), sshd=private_sshd.identity(self.tools["sshd"])))
-        # two daemons per copy ran, through the wrapper
+        self.assertEqual(record["context"]["resources"], dict(policy="rcp-output-json-v1"))
+        # two daemons per copy ran
         self.assertEqual(len((self.state / "rcpd.pids").read_text().split()), 4)
         # nothing of the endpoint outlives the run, and no key ever reaches the archived results
         self.assertFalse(directory.exists())
@@ -162,6 +202,7 @@ class RemoteCellTests(unittest.TestCase):
         for path in (self.root / "out").rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"PRIVATE KEY", path.read_bytes(), path)
+                self.assertNotIn(b"RCP_BENCH_ENDPOINT", path.read_bytes(), path)
         self.assertIn("Server listening", (self.root / "out/logs/sshd.log").read_text())
         self.assertEqual(list((self.root / "destination").iterdir()), [])
         self.assertIn("| alpha | remote | complete |", (self.root / "out/summary.md").read_text())
@@ -196,34 +237,24 @@ class RemoteCellTests(unittest.TestCase):
         self.assertEqual(record["cells"][0]["outcome"]["message"], "copy 1 did not finish within 6 s")
         # the daemon was started by sshd in a session of its own, outside the copy's process group
         self.assertGreaterEqual(hung["leftover_processes"], 1)
-        self.assertEqual({role["status"] for role in hung["role_resources"].values()}, {"unavailable"})
+        # a copy that never finished reported nothing about any process
+        self.assertNotIn("resources", hung)
+        self.assertNotIn("role_resources", hung)
         self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
         for copy in record["cells"][1]["copies"]:
             self.assertNotIn("leftover_processes", copy)
             self.assertEqual({role["status"] for role in copy["role_resources"].values()}, {"complete"})
 
     def test_daemons_that_end_a_moment_after_a_good_copy_are_not_taken_for_hung_ones(self):
-        # with and without the resource supervisor: either way the daemons are given time to exit
-        for extra in ((), ("--no-resources",)):
-            with self.subTest(extra=extra):
-                arguments = self.arguments(cells=("alpha:remote",))
-                if extra:
-                    position = arguments.index("--resource-time")
-                    del arguments[position:position + 2]
-                with mock.patch.dict(os.environ, {"FAKE_RCP": "alpha:remote=linger", "FAKE_RCPD": "slow-exit"}), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    record = matrix.main(arguments)
-                cell, = record["cells"]
-                self.assertEqual((cell["outcome"]["status"], [copy["status"] for copy in cell["copies"]]),
-                                 ("complete", ["ok", "ok"]))
-                for copy in cell["copies"]:
-                    self.assertNotIn("leftover_processes", copy)
-                    if not extra:
-                        self.assertEqual({role["status"] for role in copy["role_resources"].values()}, {"complete"})
-                # every daemon ended by itself: none was killed
-                self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
-                shutil.rmtree(self.root / "out")
-                (self.state / "rcpd.pids").unlink()
+        record = self.run_matrix(cells=("alpha:remote",),
+                                 environment={"FAKE_RCP": "alpha:remote=linger", "FAKE_RCPD": "slow-exit"})
+        cell, = record["cells"]
+        self.assertEqual((cell["outcome"]["status"], [copy["status"] for copy in cell["copies"]]),
+                         ("complete", ["ok", "ok"]))
+        for copy in cell["copies"]:
+            self.assertNotIn("leftover_processes", copy)
+        # every daemon ended by itself: none was killed
+        self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
 
     def test_a_listener_that_dies_between_copies_is_started_again(self):
         record = self.run_matrix(cells=("alpha:remote",), environment={"FAKE_RCP": "alpha:remote=killsshd"})
@@ -252,23 +283,93 @@ class RemoteCellTests(unittest.TestCase):
         # a file set with nothing left to measure is not generated at all
         self.assertEqual([item["generation"]["status"] for item in record["file_sets"]], ["ok", "not_run"])
 
-    def test_daemon_figures_that_cannot_be_read_do_not_fail_the_copy(self):
-        self.tools["time"].write_text(TIME.replace('stream.write(form + "\\n")', 'stream.write("not the figures")'))
-        record = self.run_matrix(cells=("alpha:remote",))
-        cell, = record["cells"]
-        self.assertEqual((cell["outcome"]["status"], [copy["status"] for copy in cell["copies"]]),
-                         ("complete", ["ok", "ok"]))
-        for copy in cell["copies"]:
+    def test_a_summary_without_a_daemon_s_figures_does_not_fail_the_copy(self):
+        record = self.run_matrix(cells=("alpha:remote", "beta:remote"), environment={
+            "FAKE_RCP": "alpha:remote=nodaemons,beta:remote=onedaemon"})
+        self.assertEqual(self.outcomes(record), [("alpha", "remote", "complete"), ("beta", "remote", "complete")])
+        for copy in record["cells"][0]["copies"]:
+            self.assertEqual(copy["resources"]["status"], "complete")
             self.assertEqual({(role["status"], role["metrics"]) for role in copy["role_resources"].values()},
-                             {("invalid", None)})
+                             {("unavailable", None)})
+        # one daemon's figures being unusable costs that daemon's, not the other's
+        for copy in record["cells"][1]["copies"]:
+            self.assertEqual((copy["role_resources"]["source"]["status"], copy["role_resources"]["source"]["error"]),
+                             ("unavailable", "minor_page_faults is missing or is not a count"))
+            self.assertEqual(copy["role_resources"]["destination"],
+                             dict(status="complete", metrics=RECORDED_DAEMONS["destination"]))
+
+    def test_a_daemon_named_without_statistics_has_none_recorded(self):
+        record = self.run_matrix(cells=("alpha:remote",), environment={"FAKE_RCP": "alpha:remote=blinddaemon"})
+        self.assertEqual(self.outcomes(record), [("alpha", "remote", "complete")])
+        for copy in record["cells"][0]["copies"]:
+            self.assertEqual(copy["role_resources"]["source"], dict(
+                status="unavailable", metrics=None, error="the summary has no statistics for this process"))
+            self.assertEqual(copy["role_resources"]["destination"],
+                             dict(status="complete", metrics=RECORDED_DAEMONS["destination"]))
 
     def test_a_remote_copy_that_fails_fails_its_cell_like_a_local_one(self):
         record = self.run_matrix(cells=("alpha:remote", "alpha:local"), environment={"FAKE_RCP": "alpha:remote=exit"})
         self.assertEqual(self.outcomes(record), [("alpha", "remote", "failed"), ("alpha", "local", "complete")])
         self.assertEqual(record["cells"][0]["outcome"]["message"],
-                         "copy 1 failed with exit code 3; see logs/alpha/remote/1/0.stderr.log")
-        self.assertEqual({role["status"] for role in record["cells"][0]["copies"][0]["role_resources"].values()},
-                         {"unavailable"})
+                         "copy 1 failed with exit code 3; see 0.stdout.log and 0.stderr.log in logs/alpha/remote/1")
+        # what a failed copy printed is not read
+        for key in ("copy_summary", "resources", "role_resources"):
+            self.assertNotIn(key, record["cells"][0]["copies"][0])
+
+    def test_a_build_without_the_json_summary_copies_remotely_without_figures(self):
+        record = self.run_matrix(environment={"FAKE_RCP_BUILD": "old"})
+        self.assertEqual(self.outcomes(record), [("alpha", "local", "complete"), ("alpha", "remote", "complete")])
+        self.assertEqual(record["context"]["summary_format"], "text")
+        self.assertNotIn("resources", record["context"])
+        for copy in record["cells"][1]["copies"]:
+            _, *options, _, _ = copy["command"]
+            self.assertEqual(options, ["--summary", "--force-remote", "--bind-ip=127.0.0.1",
+                                       f"--rcpd-path={self.bin}/rcpd"])
+            self.assertEqual(copy["copy_summary"], dict(files_copied=4, files_unchanged=0))
+            self.assertNotIn("resources", copy)
+            self.assertNotIn("role_resources", copy)
+
+    def test_an_unforeseen_error_in_a_remote_cell_ends_its_daemons_before_the_next_cell(self):
+        bound, reap, failed, reaped = matrix._bound_logs, private_sshd.Endpoint.reap, [], []
+
+        def failing(directory):
+            # the copy has ended and one of its daemons is still running
+            if str(directory).endswith("alpha/remote/1") and not failed:
+                failed.append(directory)
+                raise RuntimeError("nobody foresaw this")
+            return bound(directory)
+
+        def recording(endpoint, grace=0):
+            started = (self.root / "out/logs/beta").exists()
+            reaped.append((grace, reap(endpoint, grace), started))
+            return reaped[-1][1]
+        with mock.patch.object(matrix, "_bound_logs", failing), \
+                mock.patch.object(private_sshd.Endpoint, "reap", recording):
+            record = self.run_matrix("--repetitions", "1", cells=("alpha:remote", "beta:local"),
+                                     environment={"FAKE_RCP": "alpha:remote=linger", "FAKE_RCPD": "hang-once"})
+        self.assertEqual(self.outcomes(record), [("alpha", "remote", "failed"), ("beta", "local", "complete")])
+        self.assertEqual((record["cells"][0]["outcome"]["stage"], record["cells"][0]["outcome"]["message"]),
+                         ("harness", "unexpected RuntimeError: nobody foresaw this"))
+        # ended at once, and before the next cell was measured: a daemon must not work through it
+        grace, ended, started = reaped[0]
+        self.assertEqual((grace, started), (0, False))
+        self.assertGreaterEqual(ended, 1)
+        self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
+
+    def test_a_stop_signal_while_daemons_are_ended_is_not_taken_for_a_failed_cleanup(self):
+        class Stopped:
+            def reap(self, grace=0):
+                raise InterruptedError("SIGTERM")
+
+        class Broken:
+            def reap(self, grace=0):
+                raise PermissionError("no access")
+        with self.assertRaises(InterruptedError):
+            matrix._end_daemons(Stopped(), {}, True)
+        # ending daemons is housekeeping: when it fails otherwise, that is not the copy's failure
+        item = {}
+        matrix._end_daemons(Broken(), item, False)
+        self.assertEqual(item, {})
 
     def test_a_stop_signal_ends_the_endpoint_and_removes_its_keys(self):
         calls, made, mkdtemp = [], [], tempfile.mkdtemp
@@ -360,7 +461,7 @@ class RemoteCellTests(unittest.TestCase):
         self.assertFalse(Path(made[0]).exists())
 
     def test_a_daemon_still_running_when_its_time_to_exit_is_up_is_ended_and_counted(self):
-        with mock.patch.object(private_sshd, "ROLE_WAIT_SECONDS", .3):
+        with mock.patch.object(private_sshd, "EXIT_SECONDS", .3):
             record = self.run_matrix("--repetitions", "1", cells=("alpha:remote", "beta:remote"),
                                      environment={"FAKE_RCP": "alpha:remote=linger", "FAKE_RCPD": "hang-once"})
         # the copy was good: rcp reported it, and a daemon that would not leave is not rcp failing to copy
