@@ -87,7 +87,8 @@ jobs:
       if: needs.scope.outputs.mode == 'full'
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq musl-tools pkg-config python3-yaml
+        # openssh-server: the benchmark harness tests start a private, unprivileged sshd
+        sudo apt-get install -y jq musl-tools openssh-server pkg-config python3-yaml
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Install lightweight check dependencies

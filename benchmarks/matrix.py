@@ -7,6 +7,13 @@ counts when the command exits zero and its own summary reports the expected
 transfer counts; trees are never walked or hashed. Correctness is covered
 elsewhere; this runner only measures.
 
+The `local` scenario copies between two directories. The `remote` scenario makes
+the same copy through rcp's remote path on one host: rcp starts a source and a
+destination rcpd over SSH, on a private sshd that this runner owns and that
+listens on IPv4 loopback only (benchmarks/private_sshd.py). The time measured is
+the rcp command's, as for a local copy; CPU and memory are recorded for the rcp
+command and for each daemon.
+
 The results are saved after every step, so a run that is stopped keeps the cells
 it finished. Once the allocation has ended nothing more is removed: clearing
 millions of files could outlast the time that is left, and the worker's storage
@@ -33,16 +40,16 @@ import tempfile
 import time
 import uuid
 
-from benchmarks import cache, capacity, measurements, operations, run, telemetry
+from benchmarks import cache, capacity, measurements, operations, private_sshd, run, telemetry
 from benchmarks.signals import SignalCancellation
 from benchmarks.verification import SUMMARY_POLICY
 
 SCHEMA = "rcp-benchmark-matrix-v1"
 POLICY = SUMMARY_POLICY
 VARIANT = "rcp-default"
-SCENARIOS = ("local",)
-# how each scenario reaches its data; remote scenarios will map to the loopback transport
-TOPOLOGY = {"local": "local"}
+SCENARIOS = ("local", "remote")
+# how each scenario reaches its data: directly, or through rcpd on this host's loopback
+TOPOLOGY = {"local": "local", "remote": "loopback"}
 PURPOSES = ("performance", "commissioning")
 CACHE_POLICIES = ("linux-drop-caches", "uncontrolled")
 RUN_STATUSES = ("running", "complete", "partial", "failed")
@@ -101,6 +108,9 @@ def _arguments(argv):
     parser.add_argument("--resource-time", type=Path, help="GNU time executable for per-copy CPU and memory")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks and inodes before generating")
     parser.add_argument("--system-telemetry", action="store_true", help="sample bounded host and cgroup diagnostics")
+    parser.add_argument("--sshd", type=Path, help="sshd for remote cells; by default the one on PATH or in /usr/sbin")
+    parser.add_argument("--ssh", type=Path, help="ssh client for remote cells; by default the one on PATH")
+    parser.add_argument("--ssh-keygen", type=Path, help="ssh-keygen for remote cells; by default the one on PATH")
     parser.add_argument("--runner-label", default="local")
     parser.add_argument("--purpose", choices=PURPOSES, default="performance")
     parser.add_argument("--output", type=Path, required=True)
@@ -189,6 +199,30 @@ def _remove(path, timeout):
     return "removed" if done.returncode == 0 else "failed"
 
 
+def _settle_daemons(endpoint, item, successful):
+    """Record each daemon's CPU and memory for one remote copy, then end any daemon still running.
+
+    These are measuring aids and housekeeping: a failure here is not the copy's.
+    """
+    try:
+        roles = endpoint.roles(successful)
+        if roles is not None:
+            item["role_resources"] = roles
+    except InterruptedError:
+        raise
+    except OSError:
+        pass
+    try:
+        # daemons of a good copy are on their way out; anything else is ended at once
+        leftover = endpoint.reap(private_sshd.ROLE_WAIT_SECONDS if successful else 0)
+        if leftover:
+            item["leftover_processes"] = leftover
+    except InterruptedError:
+        raise
+    except OSError:
+        pass
+
+
 def _bound_logs(directory):
     """Cut every command log directly in a directory to a head and a tail, in place.
 
@@ -255,7 +289,9 @@ def main(argv=None):
     validate(record)
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
-    sampler = None
+    sampler = endpoint = None
+    # why remote cells cannot be measured, once the private ssh endpoint is known to be unusable
+    unreachable = None
     source_scratch = destination_scratch = None
     # ended: the allocation leaves no time for another command; finished: the plan ran to its end
     ended = finished = False
@@ -279,6 +315,24 @@ def main(argv=None):
         destination_scratch = Path(tempfile.mkdtemp(prefix="rcp-matrix-destination-", dir=args.destination_root)).resolve()
         _persist(output, record, sampler)
         trial_index = 0
+
+        def remote(cell):
+            return TOPOLOGY[cell["scenario"]] == "loopback"
+
+        if any(remote(cell) for cell in record["cells"]):
+            if allocation.limit(args.timeout) is None:
+                ended = True
+            else:
+                endpoint = private_sshd.Endpoint(paths["rcpd"], log=output / "logs" / "sshd.log", sshd=args.sshd,
+                                                 ssh=args.ssh, keygen=args.ssh_keygen, resource_time=resource_time)
+                try:
+                    endpoint.start()
+                    context["remote"] = endpoint.descriptor()
+                except InterruptedError:
+                    raise
+                except (private_sshd.EndpointError, OSError, subprocess.SubprocessError) as error:
+                    # the cells that need no endpoint are still measured
+                    unreachable = f"the private ssh endpoint could not be started: {error}"
 
         def mark(phase, case_index, trial=None):
             if sampler is not None:
@@ -370,8 +424,11 @@ def main(argv=None):
 
         def measure(case_index, cell, source, expected):
             """Copy one cell's file set the configured number of times and settle the cell's outcome."""
-            nonlocal ended, trial_index
-            copies = args.repetitions
+            nonlocal ended, trial_index, unreachable
+            copies, loopback = args.repetitions, remote(cell)
+            if loopback and unreachable is not None:
+                settle([cell], "failed", "transport", unreachable)
+                return
             for iteration in range(1, copies + 1):
                 limit = None if ended else allocation.limit(args.timeout)
                 if limit is None:
@@ -383,9 +440,24 @@ def main(argv=None):
                 trial = Path(cell["case_id"]) / cell["scenario"] / str(iteration)
                 destination = destination_scratch / trial
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                commands = run.plan_commands(variant, source, destination, paths, TOPOLOGY[cell["scenario"]])
+                commands = run.plan_commands(variant, source, destination, paths, "local")
+                restarted = False
+                if loopback:
+                    commands = [endpoint.command(command) for command in commands]
+                    try:
+                        restarted = endpoint.ensure()
+                    except InterruptedError:
+                        raise
+                    except (private_sshd.EndpointError, OSError, subprocess.SubprocessError) as error:
+                        # later remote cells fail at once instead of generating a file set for nothing
+                        unreachable = f"the private ssh endpoint stopped and could not be started again: {error}"
+                        settle([cell], "failed", "transport", "the private ssh endpoint stopped and could not be "
+                               f"started again before copy {iteration}: {error}")
+                        return
                 # until a step says otherwise the copy is under way: that is what a stop finds on disk
                 item = dict(iteration=iteration, trial_index=trial_index, status="interrupted", command=commands[0])
+                if restarted:
+                    item["endpoint_restarted"] = True
                 trial_index += 1
                 cell["copies"].append(item)
                 settle([cell], "interrupted", "cache",
@@ -420,6 +492,9 @@ def main(argv=None):
                 save()
                 mark("command", case_index, item["trial_index"])
                 options = dict(resource_time=resource_time) if resource_time is not None else {}
+                if loopback:
+                    options["environment"] = endpoint.environment()
+                    endpoint.clear()
                 try:
                     outcome = run.execute_commands(commands, output / "logs" / trial, limit[0],
                                                    stable_summary_locale=True, **options)
@@ -431,6 +506,8 @@ def main(argv=None):
                 # the copy stands on its own exit status: unreadable CPU and memory figures leave
                 # them unavailable for this copy and are not a failure of rcp
                 succeeded = outcome["ok"] or outcome.get("payload_status") == "succeeded"
+                if loopback:
+                    _settle_daemons(endpoint, item, succeeded and not outcome["timed_out"])
                 if outcome["timed_out"]:
                     ended = limit[1]
                     item["status"] = "interrupted" if ended else "timed_out"
@@ -491,6 +568,11 @@ def main(argv=None):
             if ended:
                 settle(cells, "not_run", None, "allocation ended before this cell")
                 continue
+            if unreachable is not None and all(remote(cell) for cell in cells):
+                # nothing here can be measured: the file set is not generated for it
+                settle(cells, "failed", "transport", unreachable)
+                save()
+                continue
             fixture = source_scratch / case["id"]
             # an error nobody foresaw costs the file set or the cell it happened in, never the
             # ones after it. A stop signal is an exception too, and still ends the run.
@@ -519,6 +601,8 @@ def main(argv=None):
                     raise
                 except Exception as error:
                     fail([cell], error)
+                    if endpoint is not None and remote(cell):
+                        _settle_daemons(endpoint, {}, False)
                     _bound_logs(output / "logs" / case["id"] / cell["scenario"] / str(len(cell["copies"])))
                     free(destination_scratch / case["id"] / cell["scenario"], case_index)
                 save()
@@ -536,10 +620,17 @@ def main(argv=None):
     finally:
         # save first; a stop signal that arrives now waits until the results are on disk
         with SignalCancellation():
-            measurements.add_cost(record, "total", run_started)
-            if sampler is not None:
-                sampler.finish(record["status"] != "failed")
-            _persist(output, record, sampler)
+            try:
+                measurements.add_cost(record, "total", run_started)
+                if sampler is not None:
+                    sampler.finish(record["status"] != "failed")
+                _persist(output, record, sampler)
+            finally:
+                if endpoint is not None:
+                    # sshd runs in a session of its own and would outlive this process: it and the
+                    # keys go with the run, whatever ended it, a save that failed included
+                    endpoint.stop()
+                    _bound_logs(output / "logs")
         # a stopped run must exit within seconds and an ended allocation has no time left to spend
         for scratch in (source_scratch, destination_scratch):
             limit = allocation.limit(args.timeout) if finished and not ended and scratch is not None else None

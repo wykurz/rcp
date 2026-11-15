@@ -34,7 +34,9 @@ manager, and install the report dependencies from `scripts/report-site-requireme
 Python environment. Offline AWS safety tests additionally require the pinned SDK and
 JWT/cryptography closure in `infra/aws_benchmark/production-requirements.txt` (CPython 3.12 or 3.14,
 Linux x86_64), or the dependencies provided by `nix develop`. These tests do not call AWS. The
-report and AWS dependencies are required by `just lint`. Then install the remaining tools:
+report and AWS dependencies are required by `just lint`, and so is OpenSSH (`sshd`, `ssh` and
+`ssh-keygen`): the benchmark harness tests start a private, unprivileged `sshd` on loopback. Then
+install the remaining tools:
 
 ```bash
 ./scripts/cargo-install-host.sh just

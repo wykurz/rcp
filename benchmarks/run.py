@@ -266,7 +266,7 @@ def _execution_failure(outcome, *, wrapped=False):
                 message=message if wrapped else "command failed or timed out")
 
 
-def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None, command_clocks=False):
+def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None, command_clocks=False, environment=None):
     if resource_time is not None and len(commands) != 1:
         raise ValueError("local resources require exactly one command")
     log_dir = Path(log_dir)
@@ -279,6 +279,9 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
     finished = {}
     condition = threading.Condition()
     child_environment = {**os.environ, "LC_ALL": operations.SUMMARY_LOCALE, "LANG": operations.SUMMARY_LOCALE} if stable_summary_locale or resource_time is not None else None
+    if environment:
+        # variables the caller sets for the commands, such as where they find their helpers
+        child_environment = {**(os.environ if child_environment is None else child_environment), **environment}
     clock_start = clocks.sample() if command_clocks else None
     started = time.monotonic()
     clock_finishes = {}

@@ -30,7 +30,8 @@ REQUIREMENTS = ("infra/aws_benchmark/requirements.txt", "infra/aws_benchmark/pro
 SOURCES = (
     "benchmarks/__init__.py", "benchmarks/capacity.py", "benchmarks/changes.py", "benchmarks/clocks.py",
     "benchmarks/matrix.py",
-    "benchmarks/measurements.py", "benchmarks/operations.py", "benchmarks/pairs.py", "benchmarks/report.py",
+    "benchmarks/measurements.py", "benchmarks/operations.py", "benchmarks/pairs.py",
+    "benchmarks/private_sshd.py", "benchmarks/report.py",
     "benchmarks/cache.py", "benchmarks/run.py", "benchmarks/sanitized.py", "benchmarks/signals.py", "benchmarks/site.py",
     "benchmarks/streaming.py", "benchmarks/strict_json.py", "benchmarks/telemetry.py", "benchmarks/timings.py",
     "benchmarks/transport.py",

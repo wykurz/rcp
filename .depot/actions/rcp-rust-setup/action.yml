@@ -18,6 +18,10 @@ inputs:
     description: Configure passwordless localhost SSH for the workflow user
     required: false
     default: "false"
+  install-openssh:
+    description: Install the OpenSSH server, whose sshd the benchmark harness tests start privately
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -43,7 +47,7 @@ runs:
       if [[ "${{ inputs.install-test-deps }}" == "true" ]]; then
         packages+=(strace)
       fi
-      if [[ "${{ inputs.localhost-ssh }}" == "true" ]]; then
+      if [[ "${{ inputs.localhost-ssh }}" == "true" || "${{ inputs.install-openssh }}" == "true" ]]; then
         packages+=(openssh-server)
       fi
       sudo apt-get update

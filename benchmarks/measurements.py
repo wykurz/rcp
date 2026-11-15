@@ -113,6 +113,9 @@ def collect(path, successful):
                     error="resource metrics withheld because successful command execution was not confirmed")
     try:
         raw = Path(path).read_bytes()
+    except InterruptedError:
+        # a stop signal is not an unreadable file
+        raise
     except OSError as error:
         return dict(status="unavailable", metrics=None, error=str(error))
     fingerprint = hashlib.sha256(raw).hexdigest()
