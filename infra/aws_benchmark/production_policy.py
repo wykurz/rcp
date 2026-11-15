@@ -16,6 +16,8 @@ from . import durable
 MAX_RUN_AGE_SECONDS = 7200
 MAX_PRICE_AGE_SECONDS = 31 * 86400
 SCHEDULE_MAIN_AA = "triggering-main-aa"
+# an explicit, bounded list: every file set that may be started by hand is named in the policy
+MAX_MANUAL_SUITES = 8
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 PRODUCER_FIELDS = ("repository", "repository_id", "repository_owner_id", "ref", "workflow_ref",
@@ -59,6 +61,10 @@ class Policy:
     capacity_seconds: int = durable.CAPACITY_SECONDS
     shutdown_seconds: int = durable.SHUTDOWN_ALLOWANCE_SECONDS
     schedule_delay_seconds: int = 1800
+    # the one file set that scheduled runs may request, and, when its plan needs more than the
+    # ordinary runtime, the separate approval of that runtime. Neither grants manual authority.
+    scheduled_suite: str = "bulk-1g-metadata"
+    scheduled_runtime_seconds: int = 0
 
     def __post_init__(self):
         require(isinstance(self.version, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", self.version),
@@ -70,7 +76,7 @@ class Policy:
                 and len(set(self.manual_actor_ids)) == len(self.manual_actor_ids)
                 and all(isinstance(v, str) and re.fullmatch(r"[1-9][0-9]{0,19}", v)
                         for v in self.manual_actor_ids), "invalid explicit manual maintainer IDs")
-        require(type(self.manual_suites) is tuple and len(self.manual_suites) <= 2
+        require(type(self.manual_suites) is tuple and len(self.manual_suites) <= MAX_MANUAL_SUITES
                 and all(isinstance(suite, str) and suite in DURABLE_SUITES for suite in self.manual_suites)
                 and len(set(self.manual_suites)) == len(self.manual_suites),
                 "invalid explicit manual file-set allowlist")
@@ -108,6 +114,17 @@ class Policy:
                     "extended manual admission expiry must be canonical UTC")
         for suite in self.manual_suites:
             self.execution(suite)
+        require(isinstance(self.scheduled_suite, str) and self.scheduled_suite in DURABLE_SUITES,
+                "invalid scheduled file set")
+        integer(self.scheduled_runtime_seconds, 0, maximum, "invalid extended scheduled runtime")
+        # an approval that applies to nothing is a mistake in the policy, not a harmless extra
+        require(self.scheduled_runtime_seconds == 0 or durable_plan_contract(
+            durable_plan_for_suite(self.scheduled_suite))["max_runtime"] > durable.RUNTIME_SECONDS,
+            "extended scheduled runtime has no approved file set")
+        # checked as soon as either is given: a slot needs a runnable scheduled suite, and an
+        # approved runtime must be the suite's own even before any slot exists
+        if self.schedule_slots or self.scheduled_runtime_seconds:
+            self.execution(self.scheduled_suite, scheduled=True)
         integer(self.shutdown_seconds, durable.SHUTDOWN_ALLOWANCE_SECONDS, 3600,
                 "shutdown allowance is below the reviewed margin")
         integer(self.schedule_delay_seconds, 1, 3600, "invalid schedule lateness allowance")
@@ -116,28 +133,42 @@ class Policy:
         require(isinstance(self.price_evidence, str) and len(self.price_evidence.encode()) <= 2048,
                 "invalid price evidence")
 
-    def execution(self, suite):
-        """Derive one suite-bound runtime/capacity selection for admission and pricing."""
+    def execution(self, suite, *, scheduled=False):
+        """Derive one suite-bound runtime/capacity selection for admission and pricing.
+
+        A manual and a scheduled request are approved separately: neither opt-in to a
+        runtime beyond the ordinary one stands in for the other.
+        """
         contract = durable_plan_contract(durable_plan_for_suite(suite))
         extended = contract["max_runtime"] > durable.RUNTIME_SECONDS
-        if extended:
+        if extended and scheduled:
+            require(suite == self.scheduled_suite and self.scheduled_runtime_seconds > 0,
+                    "extended scheduled run is not explicitly approved")
+        elif extended:
             require(suite in self.manual_suites and self.manual_runtime_seconds > 0,
                     "extended manual qualification is not explicitly approved")
-        runtime = self.manual_runtime_seconds if extended else self.runtime_seconds
+        runtime = (self.scheduled_runtime_seconds if scheduled else self.manual_runtime_seconds) if extended \
+            else self.runtime_seconds
         require(durable.minimum_runtime(contract["plan"]) <= runtime <= contract["max_runtime"],
-                "manual file set does not fit its explicit qualification budget")
+                "file set does not fit its explicit qualification budget")
+        require(runtime == durable.profile_runtime(contract, runtime),
+                "file set needs exactly its recorded runtime profile")
         return runtime, min(self.capacity_seconds, contract["max_provisioning"])
 
-    def check_admission_time(self, now, *, runtime_seconds):
-        """Bound only new extended admissions; existing runs keep their original deadlines."""
-        if runtime_seconds > durable.RUNTIME_SECONDS:
+    def check_admission_time(self, now, *, runtime_seconds, scheduled=False):
+        """Bound only new extended manual admissions; existing runs keep their original deadlines.
+
+        A scheduled extended run recurs by design: it is bounded by its explicit policy
+        fields, the schedule slots and the cost allowances instead of an expiry.
+        """
+        if runtime_seconds > durable.RUNTIME_SECONDS and not scheduled:
             require(bool(self.extended_manual_not_after) and utc(now) < utc(self.extended_manual_not_after),
                     "extended manual admission window is closed")
 
-    def reservation(self, now, *, suite="bulk-1g-metadata"):
-        return self.quote(now, suite=suite)["reserve_microusd"]
+    def reservation(self, now, *, suite="bulk-1g-metadata", scheduled=False):
+        return self.quote(now, suite=suite, scheduled=scheduled)["reserve_microusd"]
 
-    def quote(self, now, *, suite="bulk-1g-metadata"):
+    def quote(self, now, *, suite="bulk-1g-metadata", scheduled=False):
         """Bind the reservation to the same normalized execution parameters."""
         require(self.enabled, "production admission is disabled")
         require(0 <= (utc(now) - utc(self.priced_at)).total_seconds() <= MAX_PRICE_AGE_SECONDS,
@@ -146,7 +177,7 @@ class Policy:
                 "server price and ancillary allowances are not configured")
         require(self.total_cap_microusd > 0 and self.monthly_cap_microusd > 0 and self.daily_run_limit > 0,
                 "server cost and run allowances are not configured")
-        runtime, capacity = self.execution(suite)
+        runtime, capacity = self.execution(suite, scheduled=scheduled)
         seconds = runtime + self.shutdown_seconds
         amount = (self.hourly_microusd * seconds + 3599) // 3600 + self.ancillary_microusd
         fixed = durable_plan_contract(durable_plan_for_suite(suite)).get("reservation_microusd")
@@ -243,11 +274,12 @@ def authorize(policy, identity, run, value, now):
     require(identity.repository_owner_id == policy.owner_id, "policy owner differs from repository owner")
     checked = manifest(value)
     slot = None
+    scheduled = identity.event_name == "schedule"
     if identity.event_name == "workflow_dispatch":
         require(identity.actor_id in (policy.owner_id, *policy.manual_actor_ids), "manual requester is not approved")
         require(checked["suite"] in policy.manual_suites, "manual file set is not explicitly approved")
-    elif identity.event_name == "schedule":
-        require(checked["suite"] == "bulk-1g-metadata", "scheduled file set is not approved")
+    elif scheduled:
+        require(checked["suite"] == policy.scheduled_suite, "scheduled file set is not approved")
         slot = schedule_slot(policy, run.created_at, now)
         require(identity.actor_id == policy.owner_id, "scheduled requester is not the approved owner")
         baseline = identity.sha if policy.scheduled_baseline == SCHEDULE_MAIN_AA else policy.scheduled_baseline
@@ -255,11 +287,11 @@ def authorize(policy, identity, run, value, now):
                 "scheduled revisions differ from approved baseline and main")
     else:
         raise ValueError("only approved manual and scheduled requests may enter admission")
-    quote = policy.quote(now, suite=checked["suite"])
-    policy.check_admission_time(now, runtime_seconds=quote["runtime_seconds"])
+    quote = policy.quote(now, suite=checked["suite"], scheduled=scheduled)
+    policy.check_admission_time(now, runtime_seconds=quote["runtime_seconds"], scheduled=scheduled)
     if quote["runtime_seconds"] > durable.RUNTIME_SECONDS:
-        require(identity.event_name == "workflow_dispatch" and identity.actor_id == policy.owner_id,
-                "extended qualification requires the immutable owner")
+        # a scheduled request reaches here only as the owner and only with the scheduled approval
+        require(identity.actor_id == policy.owner_id, "extended qualification requires the immutable owner")
     producer = producer_identity(identity)
     producer["created_at"] = run.created_at
     run_key = "repo-" + identity.repository_id + "-run-" + identity.run_id

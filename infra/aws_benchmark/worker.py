@@ -35,7 +35,7 @@ from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, 
 from .cache_client import SOCKET
 from .maintenance import check_quiet
 from .guest_security import check_ssm_absent
-from .common import LARGE_SUITES
+from .common import LARGE_SUITES, MATRIX_SUITES, matrix_contract
 from . import large_storage, supervisor_notify
 from .production_mailbox import MailboxPaths
 
@@ -164,8 +164,9 @@ def cache_server(budget, uid, history=None):
 
 
 def command(window, seconds):
-    contract = measurement_contract(window["suite"])
-    large = window["suite"] in LARGE_SUITES
+    matrix = window["suite"] in MATRIX_SUITES
+    contract = matrix_contract(window["suite"]) if matrix else measurement_contract(window["suite"])
+    large = matrix or window["suite"] in LARGE_SUITES
     file_limit, timeout = "536870912", str(max(1, int(seconds)))
     source_storage, destination_storage = "c5d-local-ext4-source", "c5d-local-ext4-destination"
     if large:
@@ -190,19 +191,30 @@ def command(window, seconds):
     argv += ["--setenv=PATH=/opt/rcp-benchmark/bin:/usr/bin:/bin",
              "--setenv=PYTHONPATH=" + str(ROOT), "--setenv=LC_ALL=C", "--setenv=LANG=C",
              "--setenv=" + cache.WORKER_DEADLINE_ENV + "=" + str(time.monotonic_ns() + int(seconds * 1_000_000_000)),
-             "--setenv=RCP_BENCH_BASELINE_COMMIT=" + window["baseline"],
-             "--setenv=GITHUB_REPOSITORY=wykurz/rcp", "/usr/bin/python3", "-m", "benchmarks.run",
+             "--setenv=GITHUB_REPOSITORY=wykurz/rcp"]
+    storage = ["--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
+               "--source-storage-id", source_storage, "--destination-storage-id", destination_storage,
+               "--output", str(DATA / "output" / "results")]
+    if matrix:
+        # one build, a fixed hang-only limit per command and no verification; the allocation
+        # reaches the runner only through the deadline above
+        argv += ["/usr/bin/python3", "-m", "benchmarks.matrix",
+                 "--manifest", str(ROOT / "benchmarks/matrix-cases.json"), "--bin-dir", str(STATE / "candidate"),
+                 "--cache", contract["cache_policy"], "--repetitions", str(contract["repetitions"]),
+                 "--timeout", str(contract["timeout"]), "--resource-time", "/usr/bin/time",
+                 "--check-capacity", "--system-telemetry", "--purpose", contract["purpose"],
+                 "--runner-label", contract["runner_label"], *storage]
+        for case, scenario in contract["cells"]:
+            argv += ["--cell", case + ":" + scenario]
+        return argv
+    argv += ["--setenv=RCP_BENCH_BASELINE_COMMIT=" + window["baseline"], "/usr/bin/python3", "-m", "benchmarks.run",
              "--bin-dir", str(STATE / "candidate"), "--baseline-bin-dir", str(STATE / "baseline"),
              "--mode", "local", "--variant", "rcp-default",
              "--paired-seed", str(contract["paired_seed"]), "--repetitions", str(contract["repetitions"]),
              "--no-timings", "--local-resources", "--resource-time", "/usr/bin/time",
              "--purpose", contract["purpose"], "--cache", contract["cache_policy"],
              "--timeout", timeout,
-             "--runner-label", contract["runner_label"],
-             "--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
-             "--source-storage-id", source_storage,
-             "--destination-storage-id", destination_storage,
-             "--output", str(DATA / "output" / "results")]
+             "--runner-label", contract["runner_label"], *storage]
     if large:
         verification = verification_contract(window["suite"])
         argv += ["--manifest", str(ROOT / "benchmarks/large-cases.json"),
@@ -472,7 +484,8 @@ def supervisor_notifier(budget):
 
 def extend_supervisor_runtime(window, request, identity, budget, notifier):
     """Send one finite extension only after consuming a fully instance-bound assignment."""
-    if window["suite"] != FULL_FILE_SET_SUITE:
+    # the plan, not a suite name, says whether this run needs more than the initial bound
+    if durable_plan_contract(window["plan"]).get("runtime_profile") is None:
         return None
     require(os.geteuid() == 0, "supervisor runtime extension requires root")
     validate_window(window, minimum=0)
@@ -556,8 +569,9 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(data)
             path.chmod(0o555)
-        if window["suite"] in LARGE_SUITES:
-            manifest = load_manifest(ROOT / "benchmarks/large-cases.json")
+        if window["suite"] in LARGE_SUITES or window["suite"] in MATRIX_SUITES:
+            manifest = load_manifest(ROOT / ("benchmarks/matrix-cases.json" if window["suite"] in MATRIX_SUITES
+                                             else "benchmarks/large-cases.json"))
             cases = {case["id"]: case for case in manifest["cases"]}
             case_ids = SUITES[window["suite"]]
             require(all(case_id in cases for case_id in case_ids), "suite case is missing from the large manifest")

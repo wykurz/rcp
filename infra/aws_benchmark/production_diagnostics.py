@@ -12,6 +12,9 @@ from .common import digest, require
 from .json_bytes import encoded
 
 SCHEMA = "rcp-public-resource-diagnostics-v1"
+# the same document for a matrix run: every copy also names its scenario, and one build is measured
+MATRIX_SCHEMA = "rcp-public-resource-diagnostics-v2"
+MATRIX_VARIANT = "rcp-default"
 MAX_DOCUMENT = 512 * 1024
 MAX_TRIALS = 128
 MAX_NUMBER = (1 << 63) - 1
@@ -30,6 +33,16 @@ CASE_SHAPES = {
     "bulk-1m-1024gb": dict(directory_widths=[10, 10, 10], files_per_leaf=1024, file_size_bytes=1000000),
     "tiny-1k-10240k": dict(directory_widths=[10, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
 }
+# matrix runs may also use the small fixtures that exercise a whole run in seconds
+MATRIX_CASE_SHAPES = dict(CASE_SHAPES, **{
+    "commission-64m": dict(directory_widths=[4], files_per_leaf=4, file_size_bytes=4000000),
+    "commission-10k": dict(directory_widths=[10, 10], files_per_leaf=100, file_size_bytes=1000),
+})
+SCENARIO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+# what a setup may say about how copies were checked: the paired rules, and the matrix rule
+# that only a matrix result may claim
+PAIRED_VERIFICATION = frozenset({"metadata-size-tree-v1", "streaming-content-tree-v1"})
+VERIFICATION_POLICIES = PAIRED_VERIFICATION | {"exit-status-summary-v1"}
 SETUP_FIELDS = {"cpu_model", "logical_cpu_count", "effective_cpu_count", "host_memory_total_bytes",
                 "os", "kernel", "architecture", "source", "destination", "cache_policy",
                 "verification_policy", "pairing_policy", "instrumentation"}
@@ -100,7 +113,7 @@ def _side(environment, worker, side):
         member_bytes=[x for x in sizes if number(x, integer=True)][:64] if isinstance(sizes, list) else [])
 
 
-def setup(raw, worker):
+def setup(raw, worker, *, policies=PAIRED_VERIFICATION):
     context = raw.get("context", {}) if isinstance(raw, dict) else {}
     context = context if isinstance(context, dict) else {}
     environment = context.get("environment", {})
@@ -119,7 +132,7 @@ def setup(raw, worker):
             {"linux-drop-caches", "source-warm", "source-verified"} else None,
         verification_policy=context.get("verification", {}).get("policy")
             if isinstance(context.get("verification"), dict) and
-            context["verification"].get("policy") in {"metadata-size-tree-v1", "streaming-content-tree-v1"} else None,
+            context["verification"].get("policy") in policies else None,
         pairing_policy="adjacent-balanced-sha256-v1" if isinstance(context.get("pairing"), dict) and
             context["pairing"].get("policy") == "adjacent-balanced-sha256-v1" else None,
         instrumentation=TELEMETRY_DESCRIPTOR if context.get("system_telemetry") == TELEMETRY_DESCRIPTOR else None)
@@ -155,7 +168,7 @@ def validate_setup(value):
         require(isinstance(item["member_bytes"], list) and len(item["member_bytes"]) <= 64 and
                 all(number(x, integer=True) for x in item["member_bytes"]), "invalid public member size")
     require(value["cache_policy"] in {None, "linux-drop-caches", "source-warm", "source-verified"} and
-            value["verification_policy"] in {None, "metadata-size-tree-v1", "streaming-content-tree-v1"} and
+            (value["verification_policy"] is None or value["verification_policy"] in VERIFICATION_POLICIES) and
             value["pairing_policy"] in {None, "adjacent-balanced-sha256-v1"} and
             value["instrumentation"] in (None, TELEMETRY_DESCRIPTOR), "invalid public setup policy")
     return value
@@ -241,9 +254,19 @@ def _resources(trial):
     return {key: metrics[key] for key in METRICS}
 
 
+def _matrix(record):
+    """A public record that carries cells is a matrix run; its diagnostics name each copy's scenario."""
+    return "cells" in record
+
+
+def _cells(record):
+    return {(cell["case_id"], cell["scenario"]) for cell in record["cells"]}
+
+
 def unavailable(record, reason="not_recorded"):
     require(reason in REASONS, "invalid diagnostic availability reason")
-    value = dict(schema=SCHEMA, run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
+    value = dict(schema=MATRIX_SCHEMA if _matrix(record) else SCHEMA,
+        run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
         archive_sha256=None, status="unavailable", reason=reason, process_scope=PROCESS_SCOPE,
         system_scope=SYSTEM_SCOPE, setup=None, setup_id=None, trials=[], cases=[], system=None,
         limits=dict(allocation_seconds=None, command_timeout_seconds=None))
@@ -260,6 +283,14 @@ def from_archive(record, archive):
     worker = results.json_value(selected["worker.json"])
     return derive(record, archive, raw, worker)
 
+def _definition_status(item, expected):
+    strict_types = (type(item.get("files_per_leaf")) is int and type(item.get("file_size_bytes")) is int
+        and isinstance(item.get("directory_widths"), list)
+        and all(type(width) is int for width in item["directory_widths"]))
+    return ("shape-unavailable" if not set(expected) <= set(item) else
+        "recorded" if strict_types and all(item[field] == value for field, value in expected.items()) else "shape-mismatch")
+
+
 def case_progress(raw, selected):
     """Definitions and recorded activity are diagnostics, never per-case qualification."""
     definitions = raw.get("cases", [])
@@ -270,13 +301,8 @@ def case_progress(raw, selected):
             continue
         key = item["id"]
         order.append(key)
-        expected = CASE_SHAPES[key]
         definition_indexes[key] = original_index
-        strict_types = (type(item.get("files_per_leaf")) is int and type(item.get("file_size_bytes")) is int
-            and isinstance(item.get("directory_widths"), list)
-            and all(type(width) is int for width in item["directory_widths"]))
-        definition_status[key] = ("shape-unavailable" if not set(expected) <= set(item) else
-            "recorded" if strict_types and all(item[field] == value for field, value in expected.items()) else "shape-mismatch")
+        definition_status[key] = _definition_status(item, CASE_SHAPES[key])
     for trial in selected:
         if trial["case_id"] not in order:
             order.append(trial["case_id"])
@@ -303,6 +329,8 @@ def derive(record, archive, raw, worker):
     """Derive supplementary diagnostics after the caller verifies the archive digest."""
     require(isinstance(archive, bytes) and isinstance(raw, dict) and isinstance(worker, dict),
             "invalid diagnostic source")
+    if _matrix(record):
+        return _derive_matrix(record, archive, raw, worker)
     trials = raw.get("trials")
     if not isinstance(trials, list) or len(trials) > MAX_TRIALS:
         return unavailable(record, "invalid_diagnostics")
@@ -331,16 +359,65 @@ def derive(record, archive, raw, worker):
         expected = {(item["case_id"], item["variant_id"]): item["samples"] for item in record["measurements"]}
         if grouped != expected:
             return unavailable(record, "not_matched")
-    observed = setup(raw, worker)
+    return _assemble(record, archive, raw, worker, selected, case_progress(raw, selected), sampled)
+
+
+def _derive_matrix(record, archive, raw, worker):
+    """Report each copy of a matrix run by file set and scenario; unfinished cells keep their copies."""
+    from benchmarks import matrix
+    try:
+        matrix.validate(raw)
+    except matrix.Invalid:
+        return unavailable(record, "invalid_diagnostics")
+    cells, file_sets = raw["cells"], raw["file_sets"]
+    if sum(len(cell["copies"]) for cell in cells) > MAX_TRIALS or len(file_sets) > 4 or \
+            any(item["case"]["id"] not in MATRIX_CASE_SHAPES for item in file_sets):
+        return unavailable(record, "invalid_diagnostics")
+    # copies are published only for the cells the collector reported. A result that failed its
+    # contract has none, so nothing it says about itself, names included, reaches a page.
+    if any(key not in _cells(record) for key in ((cell["case_id"], cell["scenario"]) for cell in cells)):
+        return unavailable(record, "not_matched")
+    sampled = raw["context"].get("system_telemetry") == TELEMETRY_DESCRIPTOR
+    grouped, selected, phases = {}, [], _system(raw.get("system_telemetry") if sampled else None)["phases"]
+    for cell in cells:
+        for item in cell["copies"]:
+            done = item["status"] == "ok"
+            resources = item.get("resources")
+            resource = _resources(dict(status=item["status"], ok=done,
+                                       resources=resources if isinstance(resources, dict) else {}))
+            if done:
+                grouped.setdefault((cell["case_id"], cell["scenario"]), []).append(item["elapsed_seconds"])
+            system = _system(item.get("system_telemetry") if sampled else None)
+            phases += system["phases"]
+            selected.append(dict(case_id=cell["case_id"], variant_id=MATRIX_VARIANT, scenario=cell["scenario"],
+                iteration=item["iteration"], status="complete" if resource is not None else "unavailable",
+                metrics=resource, system=system))
+    # only completed cells are published; their samples must be exactly the copies recorded here
+    if record["benchmark_valid"] and any(
+            grouped.get((item["case_id"], item["scenario"])) != item["samples"] for item in record["measurements"]):
+        return unavailable(record, "not_matched")
+    progress = []
+    for index, file_set in enumerate(file_sets):
+        key = file_set["case"]["id"]
+        copies = [item for cell in cells if cell["case_id"] == key for item in cell["copies"]]
+        progress.append(dict(case_id=key, definition_status=_definition_status(file_set["case"], MATRIX_CASE_SHAPES[key]),
+            copy_trials=len(copies), successful_copies=sum(item["status"] == "ok" for item in copies),
+            phase_boundary_recorded=any(phase["case_index"] == index for phase in phases)))
+    return _assemble(record, archive, raw, worker, selected, progress, sampled)
+
+
+def _assemble(record, archive, raw, worker, selected, cases, sampled):
+    observed = setup(raw, worker, policies=VERIFICATION_POLICIES if _matrix(record) else PAIRED_VERIFICATION)
     window = worker.get("window", {})
     window = window if isinstance(window, dict) else {}
     limits = dict(allocation_seconds=_integer(window.get("runtime_seconds"), 8 * 3600),
                   command_timeout_seconds=_integer(worker.get("command_timeout_seconds"), 2 * 3600))
-    value = dict(schema=SCHEMA, run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
+    value = dict(schema=MATRIX_SCHEMA if _matrix(record) else SCHEMA,
+        run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
         archive_sha256=digest(archive), status="complete" if selected and all(x["metrics"] is not None for x in selected)
             else "partial" if selected else "unavailable",
         reason=None if selected else "not_recorded", process_scope=PROCESS_SCOPE, system_scope=SYSTEM_SCOPE,
-        setup=observed, setup_id=setup_id(observed), trials=selected, cases=case_progress(raw, selected),
+        setup=observed, setup_id=setup_id(observed), trials=selected, cases=cases,
         system=_system(raw.get("system_telemetry") if sampled else None), limits=limits)
     if len(encoded(value)) > MAX_DOCUMENT:
         # Sampled detail is optional; it must not erase already recorded process metrics/setup.
@@ -352,9 +429,11 @@ def derive(record, archive, raw, worker):
 
 
 def validate(value, record):
+    matrix = _matrix(record)
+    shapes = MATRIX_CASE_SHAPES if matrix else CASE_SHAPES
     require(isinstance(value, dict) and set(value) == {"schema", "run_key", "retirement_sha256",
         "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases", "system", "limits"} and
-        value["schema"] == SCHEMA and value["run_key"] == record["run_key"] and
+        value["schema"] == (MATRIX_SCHEMA if matrix else SCHEMA) and value["run_key"] == record["run_key"] and
         value["retirement_sha256"] == record["retirement_sha256"] and value["status"] in STATUSES and
         value["process_scope"] == PROCESS_SCOPE and value["system_scope"] == SYSTEM_SCOPE,
         "invalid public diagnostic identity")
@@ -375,7 +454,7 @@ def validate(value, record):
     case_ids = set()
     for case in value["cases"]:
         require(isinstance(case, dict) and set(case) == {"case_id", "definition_status", "copy_trials",
-            "successful_copies", "phase_boundary_recorded"} and case["case_id"] in CASE_SHAPES and
+            "successful_copies", "phase_boundary_recorded"} and case["case_id"] in shapes and
             case["case_id"] not in case_ids and case["definition_status"] in {
                 "recorded", "shape-unavailable", "shape-mismatch", "observed-only"} and
             number(case["copy_trials"], integer=True, maximum=MAX_TRIALS) and
@@ -385,12 +464,15 @@ def validate(value, record):
     require(isinstance(value["trials"], list) and len(value["trials"]) <= MAX_TRIALS, "too many public resource trials")
     seen = set()
     for trial in value["trials"]:
-        require(isinstance(trial, dict) and set(trial) == {"case_id", "variant_id", "iteration", "status", "metrics", "system"} and
+        require(isinstance(trial, dict) and set(trial) == {"case_id", "variant_id", "iteration", "status", "metrics", "system"} | (
+                    {"scenario"} if matrix else set()) and
                 isinstance(trial["case_id"], str) and trial["case_id"] in case_ids and
-                trial["variant_id"] in {"rcp-default", "rcp-baseline"} and
+                trial["variant_id"] in ({MATRIX_VARIANT} if matrix else {"rcp-default", "rcp-baseline"}) and
+                (not matrix or isinstance(trial["scenario"], str) and SCENARIO.fullmatch(trial["scenario"]) and
+                    (trial["case_id"], trial["scenario"]) in _cells(record)) and
                 number(trial["iteration"], integer=True, maximum=100) and trial["iteration"] > 0 and
                 trial["status"] in {"complete", "unavailable"}, "invalid public resource trial")
-        key = (trial["case_id"], trial["variant_id"], trial["iteration"])
+        key = (trial["case_id"], trial.get("scenario"), trial["variant_id"], trial["iteration"])
         require(key not in seen, "duplicate public resource trial")
         seen.add(key)
         metrics = trial["metrics"]
@@ -450,7 +532,8 @@ def setup_rows(value):
         ("System software", "OS", value["os"], "software"),
         ("System software", "Kernel", value["kernel"], "software"),
         ("Method", "Cache preparation", value["cache_policy"], "software"),
-        ("Method", "Verification", value["verification_policy"], "software"),
+        # named for what it is: one of the recorded rules checks an exit status and a count only
+        ("Method", "Copy check", value["verification_policy"], "software"),
         ("Method", "Pairing", value["pairing_policy"], "software"),
         ("Method", "System sampler",
             None if sampler is None else sampler["policy"] + " (10-second cadence)", "context"),
@@ -560,7 +643,9 @@ def configuration_html(observations):
         "<p>Sizes above are decimal bytes. The 1 KB file set has exactly 100 times less total logical "
         "data than the 1.024 TB sets; it still exercises over ten million files. No file-set "
         "definition establishes a completed AWS qualification. Consult each run's suite, outcome and "
-        "diagnostics.</p></section>"
+        "diagnostics. The <code>matrix-commission-local</code> suite copies two small fixtures instead "
+        "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "
+        "data and have no trend.</p></section>"
         "<section aria-labelledby='method'><h2 id='method'>Method</h2><ul>"
         "<li><strong>Copy.</strong> The copy datapath is local on one host, not a network copy; package and "
         "evidence transfers happen outside copy measurement. RCP uses its version-specific default settings "
@@ -569,10 +654,14 @@ def configuration_html(observations):
         "<code>filegen --leaf-files</code> and a write buffer of min(file size, 1 MiB).</li>"
         "<li><strong>Binaries.</strong> Release x86-64 musl binary source revisions and digests are recorded "
         "for each run.</li>"
-        "<li><strong>Repeats.</strong> Each selected file set uses two balanced adjacent A/A pairs: four "
-        "fresh local copies with identical baseline and candidate binary digests.</li>"
-        "<li><strong>Caches and validation.</strong> Linux cache dropping occurs before copies; validation "
-        "checks paths, types, counts, sizes and metadata, not file contents.</li>"
+        "<li><strong>Repeats.</strong> Runs of a <code>matrix-…</code> suite make three fresh copies of each "
+        "file set with one build, and measure as many file sets as fit their allocation; each run page lists "
+        "what was measured and why anything else was not. Runs of the other suites make four copies of each "
+        "selected file set, as two balanced adjacent pairs of identical baseline and candidate binaries.</li>"
+        "<li><strong>Caches and validation.</strong> Linux cache dropping occurs before every copy. Matrix "
+        "runs do not verify copies: a copy counts when rcp exits cleanly and reports the expected file "
+        "count. Runs of the other suites check paths, types, counts, sizes and metadata, not file contents. "
+        "Each run page says which applies.</li>"
         "<li><strong>What is timed.</strong> Generation, cache preparation, validation and deletion are "
         "outside copy wall-time measurement.</li>"
         "<li><strong>Limits.</strong> Commands run as an unprivileged user in an isolated measurement service "
@@ -641,6 +730,7 @@ def system_html(value):
 def render(value, record):
     """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
+    matrix = _matrix(record)
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged. Measurements "
@@ -660,10 +750,12 @@ def render(value, record):
             fields += [f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
             fields += [f"{metrics[key]:,}" for key in METRICS[2:]]
         rows.append("<tr><td><code>" + escape(trial["case_id"]) + "</code></td><td><code>" +
-                    escape(trial["variant_id"]) + "</code></td>" +
+                    escape(trial["scenario"] if matrix else trial["variant_id"]) + "</code></td>" +
                     "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
     if rows:
-        text += ("<div class='table-scroll'><table class='data'><thead><tr><th>Case</th><th>Variant</th><th>Repeat</th>"
+        text += ("<div class='table-scroll'><table class='data'><thead><tr>" +
+            ("<th>File set</th><th>Scenario</th><th>Copy</th>" if matrix else
+             "<th>Case</th><th>Variant</th><th>Repeat</th>") +
             "<th>Resource status</th><th>User CPU s</th><th>System CPU s</th><th>Peak RSS KiB</th>"
             "<th>Voluntary switches</th><th>Involuntary switches</th><th>Minor faults</th><th>Major faults</th>"
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
@@ -691,7 +783,8 @@ def render(value, record):
         if trial["system"]["status"] == "unavailable":
             continue
         text += ("<details><summary>Sampled phases: " + escape(trial["case_id"]) + " / " +
-            escape(trial["variant_id"]) + " / repeat " + str(trial["iteration"]) + "</summary>" +
+            escape(trial["scenario"] if matrix else trial["variant_id"]) +
+            (" / copy " if matrix else " / repeat ") + str(trial["iteration"]) + "</summary>" +
             system_html(trial["system"]) + "</details>")
     text += ("</details><details><summary>Run limits and source archive</summary><p>Recorded allocation limit: " +
         _display(value["limits"]["allocation_seconds"], " seconds") + "; recorded per-command timeout: " +

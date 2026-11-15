@@ -24,7 +24,7 @@ from pathlib import Path
 import tempfile
 
 from . import durable, durable_client, production_projection as projection, results
-from .common import MAX_RESULT, digest, durable_plan_contract, error_code, require, timestamp, utc
+from .common import MATRIX_SUITES, MAX_RESULT, digest, durable_plan_contract, error_code, require, timestamp, utc
 from .production_store import MAX_STATE_BYTES as MAX_RECEIPT
 from .production_mailbox import MailboxPaths
 from .production_objects import Objects, committed_status
@@ -413,21 +413,34 @@ class Collector:
                     (root / name).write_bytes(payloads[name])
             (root / "controller.json").write_bytes(encoded(controller))
             evidence, result, _ = results.inspect(root, expected, conclusion)
-        valid = False
+        matrix = expected["suite"] in MATRIX_SUITES
+        valid = results.qualify(evidence, result, dict(schema_version=1, identity=expected,
+            archive_sha256=controller["archive_sha256"], ami_id=request["pins"]["ami"],
+            harness_revision=request["pins"]["source"]), producer_role="submission") and availability is None
+        collected = collected_at or timestamp(self.now())
+
+        def frozen(valid):
+            return projection.freeze(record.run_key, expected, request["pins"], valid, evidence, result,
+                outcome="evidence-unavailable" if availability else "passed" if valid else "failed",
+                execution_status=execution["status"], collected_at=collected)
         try:
-            results.validate_qualification(evidence, result, dict(schema_version=1, identity=expected,
-                archive_sha256=controller["archive_sha256"], ami_id=request["pins"]["ami"], harness_revision=request["pins"]["source"]), producer_role="submission")
-            valid = availability is None
-        except (ValueError, KeyError, TypeError) as error:
-            evidence["errors"].append("qualification: " + results.diagnostic(error))
+            public = frozen(valid)
+        except ValueError:
+            if not (matrix and valid):
+                raise
+            # a qualified result that the frozen public format cannot hold fails the run. Leaving
+            # it uncollected would keep the one active owner, and every later run, waiting on it.
+            evidence["cells"] = []
+            evidence["errors"].append("qualification: result does not fit the public record")
+            valid = False
+            public = frozen(valid)
         outcome = "evidence-unavailable" if availability else "passed" if valid else "failed"
+        validation = ("not verified; exit status and reported transfer counts only" if matrix else
+                      "metadata/size only; does not prove content integrity")
         report = dict(schema=SCHEMA, identity=expected, benchmark_valid=valid, cleanup_verified=True,
             qualification_outcome=outcome, evidence_availability=availability,
-            validation="metadata/size only; does not prove content integrity", execution_proof=execution, evidence=evidence,
-            presentation=dict(report="full", summary="full"),
-            public_projection=projection.freeze(record.run_key, expected, request["pins"], valid, evidence, result,
-                                                outcome=outcome, execution_status=execution["status"],
-                                                collected_at=collected_at or timestamp(self.now())))
+            validation=validation, execution_proof=execution, evidence=evidence,
+            presentation=dict(report="full", summary="full"), public_projection=public)
         try:
             if availability:
                 summary = ("<!doctype html><meta charset=utf-8><title>Benchmark evidence unavailable</title>"
@@ -443,8 +456,9 @@ class Collector:
                 "<h1>Benchmark " + escape(expected["run"]) + "</h1><p>Validation: " +
                 ("passed" if valid else "failed") + ". Cleanup verified.</p>"
                 "<p>The detailed display exceeded its bound or could not be rendered. "
-                "The original raw evidence and its versioned manifest are retained.</p>"
-                "<p>Metadata/size checks do not prove content integrity.</p>").encode()
+                "The original raw evidence and its versioned manifest are retained.</p>" +
+                ("<p>Copies are not verified.</p>" if matrix else
+                 "<p>Metadata/size checks do not prove content integrity.</p>")).encode()
         raw_report = encoded(report)
         if len(raw_report) > MAX_REPORT - CHECKPOINT_RESERVE:
             # archive member names and diagnostic strings are attacker-controlled. Retain
@@ -457,6 +471,8 @@ class Collector:
                 errors_total=len(evidence["errors"]), members_total=len(evidence["members"]),
                 diagnostic_projection=True, unabridged_report_sha256=digest(raw_report),
                 unabridged_report_bytes=len(raw_report))
+            if "cells" in evidence:
+                details["cells"] = evidence["cells"]
             report = dict(report, evidence=details,
                           presentation=dict(report="bounded-diagnostic", summary=report["presentation"]["summary"]))
             raw_report = encoded(report)
@@ -525,7 +541,8 @@ class Collector:
                     ("run", "run_url", "suite", "baseline", "candidate", "controller")} and
                 public["comparison"] == projection.comparison_label(expected, controller) and
                 projection.qualification_outcome(public) == outcome and
-                (not manifest["benchmark_valid"] or public["verification"] == evidence.get("expected_verification")),
+                (not manifest["benchmark_valid"] or public["verification"] == evidence.get("expected_verification")) and
+                public.get("cells") == evidence.get("cells"),
                 "retained public projection provenance differs")
         return outcome
 
@@ -533,6 +550,16 @@ class Collector:
     @staticmethod
     def fingerprint(raw):
         return dict(sha256=digest(raw), bytes=len(raw))
+
+    @staticmethod
+    def replayed(public):
+        """What a resumed collection must reproduce of the saved public record.
+
+        Run notes are this collector's wording, not the run's identity: a deployment that
+        rewords one must not hold a collection that was interrupted before it. The saved
+        record, with its original notes, is the one that is kept.
+        """
+        return {key: value for key, value in public.items() if key != "diagnostics"}
 
     def checkpoint_sources(self, record, sources, limits):
         """Recover the frozen input snapshot, preferring already retained copies."""
@@ -605,7 +632,7 @@ class Collector:
         else:
             require(valid == report["benchmark_valid"], "checkpoint qualification verdict differs")
             current_report = results.json_value(derived["report.json"], MAX_REPORT)
-            require(report["public_projection"] == current_report["public_projection"],
+            require(self.replayed(report["public_projection"]) == self.replayed(current_report["public_projection"]),
                     "checkpoint public measurements or qualification identity differ")
             require(isinstance(checkpoint["derived"], dict) and set(checkpoint["derived"]) == {
                 "controller.json", "summary.html"}, "checkpoint derived set differs")

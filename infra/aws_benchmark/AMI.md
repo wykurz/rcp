@@ -119,18 +119,20 @@ operation to finish; it never kills active apt/dpkg work. The separate timer sto
 systemd 255 can reload an active masked timer into `failed/resources` before `mask --now` stops it.
 Stopping timers first avoids this failure without clearing failed states or relaxing the final
 masked-and-inactive checks. It then installs git and CA certificates before running the worker
-installer, which verifies APT remains quiet. It also stops and removes the inherited SSM Agent snap
-with `--purge` (or its Debian package), persistently masks both known agent service names, and
-removes SSM registration/configuration/log data. Snap removal uses `--purge` to avoid saving
-registration data in an automatic snap snapshot. The installer and each worker verify that services
-are masked and inactive and agent packages, executables and state are absent. These checks make no
-SSM API calls from the instance; an unexpected agent causes the worker to fail before storage
-preparation. Rebuild the disposable AMI from a current Canonical image for security updates outside
-benchmark windows. After installation it resets cloud-init, machine identity, SSH keys, shell
-histories and logs. It emits a build-specific readiness marker only after sanitation, then powers
-off. Failure or the service's 30-minute runtime limit also requests poweroff. These guest actions
-are secondary guards; they do not replace CloudFormation rollback. The image installer is pinned by
-SHA; Ubuntu package updates are resolved at build time, so rebuilds are not bit-for-bit
+installer, which verifies APT remains quiet. The installer copies the whole `benchmarks/` package,
+including the matrix runner and its manifest, and proves as the unprivileged benchmark user that the
+paired harness, the matrix runner and the worker import. It also stops and removes the inherited SSM
+Agent snap with `--purge` (or its Debian package), persistently masks both known agent service
+names, and removes SSM registration/configuration/log data. Snap removal uses `--purge` to avoid
+saving registration data in an automatic snap snapshot. The installer and each worker verify that
+services are masked and inactive and agent packages, executables and state are absent. These checks
+make no SSM API calls from the instance; an unexpected agent causes the worker to fail before
+storage preparation. Rebuild the disposable AMI from a current Canonical image for security updates
+outside benchmark windows. After installation it resets cloud-init, machine identity, SSH keys,
+shell histories and logs. It emits a build-specific readiness marker only after sanitation, then
+powers off. Failure or the service's 30-minute runtime limit also requests poweroff. These guest
+actions are secondary guards; they do not replace CloudFormation rollback. The image installer is
+pinned by SHA; Ubuntu package updates are resolved at build time, so rebuilds are not bit-for-bit
 reproducible.
 
 The helper requires both the matching UUID/SHA console marker and EC2's `stopped` state, then

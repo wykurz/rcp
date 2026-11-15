@@ -88,13 +88,15 @@ class Admission:
         identity = self.verifier.verify(token)
         store = self.store(identity)
         checked = manifest(supplied_manifest)
+        # manual and scheduled requests are approved and priced by separate policy fields
+        scheduled = identity.event_name == "schedule"
         existing = store.read()
         if existing is not None:
             # run identity deduplicates across all attempts, independently of policy changes
             if existing.closed or existing.state["phase"] != "awaiting-inputs" or identity.run_attempt !=                     existing.admission["initial_payload"]["producer"]["run_attempt"]:
                 return receipt(existing)
             require(checked == existing.admission["initial_payload"]["manifest"], "existing upload manifest differs")
-            self.policy().reservation(self.now(), suite=checked["suite"])
+            self.policy().reservation(self.now(), suite=checked["suite"], scheduled=scheduled)
             self.run_reader.read(identity)
             store.load()  # require the same active slot before issuing scoped upload capabilities
             return self.upload_urls(identity, existing)
@@ -102,14 +104,14 @@ class Admission:
         policy = self.policy()
         # reject disabled/unfunded assignments before reading an App key for run proof
         checked_at = self.now()
-        quote = policy.quote(checked_at, suite=checked["suite"])
-        policy.check_admission_time(checked_at, runtime_seconds=quote["runtime_seconds"])
+        quote = policy.quote(checked_at, suite=checked["suite"], scheduled=scheduled)
+        policy.check_admission_time(checked_at, runtime_seconds=quote["runtime_seconds"], scheduled=scheduled)
         observed = self.run_reader.read(identity)
         approved = authorize(policy, identity, observed, checked, self.now())
         require((self.now() - utc(observed.created_at)).total_seconds() + UPLOAD_SECONDS < MAX_RUN_AGE_SECONDS,
                 "workflow run has insufficient time for input upload")
         created = self.now()
-        policy.check_admission_time(created, runtime_seconds=approved["runtime_seconds"])
+        policy.check_admission_time(created, runtime_seconds=approved["runtime_seconds"], scheduled=scheduled)
         producer = dict(run=identity.run_id + "-" + identity.run_attempt,
             baseline=checked["baseline"], candidate=checked["candidate"], suite=checked["suite"],
             controller=identity.workflow_sha)

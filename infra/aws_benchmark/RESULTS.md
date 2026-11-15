@@ -265,3 +265,34 @@ readable. Both the frozen record and companion are bound to the current authenti
 cross-job inventory. Public records do not gain service credentials or write permissions, but daily
 backfill can add bounded S3 reads and data transfer; these are operating overhead, not free or an
 AWS-enforced spending cap.
+
+## Matrix records and retained evidence
+
+A [matrix run](PRODUCTION.md#benchmark-matrix) publishes record version 4,
+`rcp-production-public-report-v4`. Earlier versions are unchanged and keep validating as they were
+written. Version 4 adds to version 3:
+
+- `cells`: one entry per file set and scenario, in the suite's order, with `outcome` (`complete`,
+  `failed`, `timed_out`, `interrupted`, `not_run`), the `stage` it happened in and a short
+  `message`. Stage and message are worker-written text reduced to printable ASCII and cut to 32 and
+  256 characters. Cells are present only when the worker's result held the suite's contract.
+- `scenario` on every measurement. Measurements exist exactly for the completed cells, and the run
+  counts exactly when there is at least one.
+- `diagnostics`: at most sixteen run-level notes in the collector's own fixed wording, such as why a
+  run did not qualify or that its command was stopped.
+- `validation` reads "Not verified: a copy counts when rcp exits cleanly and reports the expected
+  file count." and `verification.policy` is `exit-status-summary-v1`.
+
+The diagnostics companion of a matrix record is `rcp-public-resource-diagnostics-v2`: version 1 with
+each copy's `scenario`, one measured build, and the small commissioning fixtures among the known
+file sets. Copies of an unfinished cell are listed with whatever resources they recorded; they are
+never expected among the published samples. Version 1 and version 2 do not stand in for each other.
+
+On the pages, a matrix run continues the trend of its file set: the change of method appears as a
+marked setup change (`Verification`), not as a new line. The run page lists every cell with its
+result and, for anything not measured, what happened. A run that measured only some of its cells is
+shown with an amber badge.
+
+The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
+`just aws-benchmark-evidence`; see
+[Find the evidence of a run](PRODUCTION.md#find-the-evidence-of-a-run).

@@ -18,6 +18,8 @@ WORKFLOW = "wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads
 
 
 REGULAR_CRON = "17 8 * * 1,5"
+# the file set a scheduled run asks for; the server admits it only if its policy names the same one
+SCHEDULED_SUITE = "bulk-1g-metadata"
 
 
 def source(environment):
@@ -55,8 +57,8 @@ def selection(environment):
     revision = source(environment)
     requested = environment.get("RCP_REQUESTED_SUITE", "")
     if environment["GITHUB_EVENT_NAME"] == "schedule":
-        require(requested in ("", "bulk-1g-metadata"), "scheduled requests cannot select another file set")
-        suite = "bulk-1g-metadata"
+        require(requested in ("", SCHEDULED_SUITE), "scheduled requests cannot select another file set")
+        suite = SCHEDULED_SUITE
     else:
         suite = requested or "bulk-1g-metadata"
         require(suite in DURABLE_SUITES, "manual file set is not allowlisted")

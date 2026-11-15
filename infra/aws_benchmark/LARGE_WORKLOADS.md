@@ -307,10 +307,12 @@ state-machine ceiling is sufficient; no broad orchestration-timeout increase is 
 
 The server policy must explicitly allow all-filesets-metadata and set manual_runtime_seconds to
 28800. Exact older 17-field and 18-field policies default this new field to zero and gain no
-extended runtime. Keep the two-suite manual limit, ordinarily 1 GB plus the full-set experiment.
-Even explicitly listed maintainers cannot request the extended profile: it requires the immutable
-owner and a manual event. Runtime, capacity and reservation are derived together from this validated
-policy and immutable suite contract, not workflow-supplied durations or prices.
+extended runtime. The manual allowlist stays explicit: every suite that may be started by hand is
+named in it, at most eight. Even explicitly listed maintainers cannot request the extended profile:
+it requires the immutable owner, and either a manual event with this opt-in or a schedule event with
+the separate scheduled approval (`scheduled_suite` and `scheduled_runtime_seconds`). Runtime,
+capacity and reservation are derived together from this validated policy and immutable suite
+contract, not workflow-supplied durations or prices.
 
 The normal guest supervisor starts with its existing three-hour bound. Only root-owned worker code
 may request a bounded systemd runtime extension after validating and consuming the exact
@@ -351,3 +353,38 @@ not GitHub dispatch time; validation, build and runner queues can consume the ad
 expiry does not terminate accepted work or extend its native deadlines. If admission is late or
 unproven, restore only the exact temporary opt-in with a new policy version and reconcile ownership;
 preserve all counters and independent cleanup guards, and never blindly redispatch.
+
+## Performance-only matrix
+
+The `matrix-*` suites run `python3 -m benchmarks.matrix` on the worker instead of the paired
+harness. They use the same two RAID0 arrays, capacity checks, cache broker, sandbox and resource
+collection as the profiles above, and differ in what they measure and how they end. The
+[production runbook](PRODUCTION.md#benchmark-matrix) covers admission, qualification and rollout.
+
+- **What runs.** One build (the candidate binaries) with rcp's default settings and `--summary`.
+  Each cell is one file set copied three times; caches are dropped before every copy. The fixture of
+  a file set is generated once, its destination is removed after every copy and the fixture after
+  its last cell, so the next file set has the space. Nothing is read back: no initial snapshot, no
+  tree walk, no source re-validation.
+- **Time.** The allocation reaches the runner as one deadline. Each command (generation, cache
+  preparation, a copy) gets the same generous 3600-second limit, which exists to catch hangs. A
+  command that the end of the allocation cuts short is `interrupted`, the cells after it are
+  `not_run`, and neither counts against rcp. The runner keeps two minutes to save its results and
+  removes nothing once the allocation has ended: clearing ten million files could outlast the time
+  left, and instance storage ends with the instance.
+- **Admission floor.** A matrix run uses whatever time it gets, so the worker declines only when
+  less than one hour of the allocation is left (`minimum_worker_seconds=3600`), instead of the
+  10,200 and 28,200 seconds that the paired profiles need to finish. A slow start costs time, not
+  the run. The eight-hour suite still runs for exactly 28,800 seconds: the supervisor extension and
+  the independent expiry tag are bound to that profile.
+- **Stops and errors.** Results are saved after every step. A copy that fails or hangs fails its
+  cell only; so does an error nobody foresaw. A stop signal ends the run and keeps the finished
+  cells, which still qualify. Command logs are cut to their head and tail as each command ends: the
+  worker's output directory is a 128 MiB tmpfs, and one copy that fails for every file must not fill
+  it and stop the results of the other cells from being saved.
+- **Commissioning fixtures.** `matrix-commission-local` uses `commission-64m` (16 files of 4 MB) and
+  `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every step in
+  seconds and are not performance evidence.
+
+The per-copy CPU, memory and sampled phases are published as before. Their scope is still one local
+command; remote scenarios are not part of these suites.

@@ -130,7 +130,10 @@ class BuildContractTests(unittest.TestCase):
 
 
     def test_worker_argv_parses_and_resolves_every_allowlisted_suite(self):
+        # matrix suites run their own runner; test_matrix_contracts covers that command
         for suite, selected in common.SUITES.items():
+            if suite in common.MATRIX_SUITES:
+                continue
             with self.subTest(suite=suite):
                 command = worker.command(dict(suite=suite, baseline="a" * 40), 600)
                 args = harness._arguments(command[command.index("benchmarks.run") + 1:])

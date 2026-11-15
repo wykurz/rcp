@@ -32,7 +32,7 @@ from .production_admission import Admission
 from .production_auth import GitHubIdentityError, GitHubIdentityVerifier, MAX_TOKEN_BYTES
 from .production_github import GitHubRunError, GitHubRateLimitError, GitHubRunReader
 from .production_github_app import GitHubAppConfig, cached_provider
-from .production_policy import Policy, canonical, launch_pins_sha256, manifest
+from .production_policy import MAX_MANUAL_SUITES, Policy, canonical, launch_pins_sha256, manifest
 from .production_errors import transient
 
 
@@ -47,6 +47,7 @@ _LEGACY_POLICY_FIELDS = frozenset({"version", "owner_id", "enabled", "manual_act
     "shutdown_seconds", "schedule_delay_seconds"})
 _FILE_SET_POLICY_FIELDS = _LEGACY_POLICY_FIELDS | {"manual_suites"}
 _EXTENDED_RUNTIME_POLICY_FIELDS = _FILE_SET_POLICY_FIELDS | {"manual_runtime_seconds"}
+_EXPIRING_RUNTIME_POLICY_FIELDS = _EXTENDED_RUNTIME_POLICY_FIELDS | {"extended_manual_not_after"}
 
 
 class InvalidRequest(ValueError):
@@ -77,8 +78,9 @@ def read_policy(dynamodb, table, owner_id, *, launch_pins=None):
     optional launch_pins_sha256:S binding. A bound envelope requires matching
     deployment pins. Readers predating this attribute reject it instead of
     admitting work with obsolete configuration during a deployment cutover.
-    The payload is canonical JSON containing every Policy field, or the exact legacy
-    field set without manual_suites (which retains only the original 1 GB authority). Its version and
+    The payload is canonical JSON containing every Policy field, or exactly one of the earlier
+    recorded field sets. A field that a payload predates keeps its default: no manual_suites means
+    the original 1 GB authority, and no scheduled_suite means the scheduled 1 GB run. Its version and
     enabled values must match the transaction fence attributes without coercion.
     Policy-content changes require a new immutable version. The emergency enabled
     toggle may keep its version but must update both envelope and payload values.
@@ -109,8 +111,8 @@ def read_policy(dynamodb, table, owner_id, *, launch_pins=None):
         text = item["payload"]["S"]
         require(0 < len(text.encode("utf-8")) <= MAX_POLICY_BYTES, "invalid server policy")
         value = parse_json(text)
-        require(isinstance(value, dict) and set(value) in (_POLICY_FIELDS, _EXTENDED_RUNTIME_POLICY_FIELDS,
-                _FILE_SET_POLICY_FIELDS, _LEGACY_POLICY_FIELDS)
+        require(isinstance(value, dict) and set(value) in (_POLICY_FIELDS, _EXPIRING_RUNTIME_POLICY_FIELDS,
+                _EXTENDED_RUNTIME_POLICY_FIELDS, _FILE_SET_POLICY_FIELDS, _LEGACY_POLICY_FIELDS)
                 and canonical(value).decode() == text, "invalid server policy")
         require(type(value["enabled"]) is bool and value["enabled"] == item["enabled"]["BOOL"]
                 and value["version"] == item["version"]["S"] and value["owner_id"] == owner_id,
@@ -122,7 +124,7 @@ def read_policy(dynamodb, table, owner_id, *, launch_pins=None):
                 "invalid server policy")
         # absent in recorded policies: preserve the old 1 GB-only authority
         suites = value.get("manual_suites", ["bulk-1g-metadata"])
-        require(isinstance(suites, list) and len(suites) <= 2, "invalid server policy")
+        require(isinstance(suites, list) and len(suites) <= MAX_MANUAL_SUITES, "invalid server policy")
         value["manual_suites"] = tuple(suites)
         value["manual_actor_ids"] = tuple(value["manual_actor_ids"])
         value["schedule_slots"] = tuple(tuple(slot) for slot in value["schedule_slots"])

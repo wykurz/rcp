@@ -20,7 +20,7 @@ on:
         type: string
         required: false
       suite:
-        description: Manual file-set profile; requires server approval and qualified image (scheduled runs stay 1 GB)
+        description: Manual profile; needs server approval and a qualified image. matrix-* measure one build, three copies per cell
         type: choice
         options:
           - bulk-1g-metadata
@@ -28,10 +28,16 @@ on:
           - bulk-1m-metadata
           - tiny-1k-metadata
           - all-filesets-metadata
+          - matrix-all-local
+          - matrix-1g-local
+          - matrix-100m-local
+          - matrix-1m-local
+          - matrix-1k-local
+          - matrix-commission-local
         default: bulk-1g-metadata
         required: true
       revision:
-        description: Full source SHA for A/A qualification; four copies per file set (blank uses main)
+        description: Full source SHA to build and measure (blank uses main)
         type: string
         required: false
 

@@ -6,7 +6,7 @@ from datetime import timedelta
 import unittest
 from unittest.mock import Mock
 
-from .common import durable_plan_for_suite
+from .common import DURABLE_SUITES, durable_plan_for_suite
 from .production_handler import read_policy, _LEGACY_POLICY_FIELDS
 from .production_policy import WorkflowRun, authorize, canonical, SCHEDULE_MAIN_AA
 from .test_production_admission import Cloud
@@ -93,9 +93,13 @@ class FullFileSetAdmissionTests(unittest.TestCase):
         cloud.api["s3"].generate_presigned_url.assert_not_called()
         self.assertEqual(cloud.ddb.items["budget#total"]["reserved"]["N"], "64000000")
 
-    def test_two_suite_limit_prevents_implicitly_enabling_every_individual_set(self):
-        with self.assertRaises(ValueError):
-            configured(manual_suites=("bulk-1g-metadata", "bulk-1m-metadata", FULL))
+    def test_every_manual_file_set_is_named_in_a_bounded_allowlist(self):
+        # nothing is enabled by default or by a pattern: each manual file set is listed, at most eight
+        self.assertEqual(policy().manual_suites, ("bulk-1g-metadata",))
+        with self.assertRaisesRegex(ValueError, "manual file-set allowlist"):
+            configured(manual_suites=tuple(DURABLE_SUITES[:9]))
+        with self.assertRaisesRegex(ValueError, "manual file set is not explicitly approved"):
+            approve(configured(manual_suites=("bulk-1g-metadata", FULL)), "bulk-1m-metadata")
 
     def test_explicit_policy_envelopes_preserve_both_historical_authorities(self):
         current = asdict(configured())

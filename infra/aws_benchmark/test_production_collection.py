@@ -86,14 +86,15 @@ class S3:
 
 
 class Fixture:
-    def __init__(self, temp_root, *, suite="bulk-1g-metadata"):
+    def __init__(self, temp_root, *, suite="bulk-1g-metadata", record=None, remaining=10410, returncode=0,
+                 **timing):
         expected = dict(binding(suite), candidate="a" * 40,
             workflow="wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads/main")
         pins = dict(region="us-east-1", account="123456789012", namespace="production", bucket="bucket",
             lt_id="lt-" + "1" * 17, lt_version="9", ami="ami-" + "2" * 17, source="f" * 40,
             subnet="subnet-" + "3" * 17, security_group="sg-" + "4" * 17,
             profile_arn="arn:aws:iam::123456789012:instance-profile/worker")
-        request = durable.request(expected, NOW, dict.fromkeys(common.BINARIES, "d" * 64), pins)
+        request = durable.request(expected, NOW, dict.fromkeys(common.BINARIES, "d" * 64), pins, **timing)
         attempt = durable.attempt(request, 1, NOW)
         self.instance = dict(InstanceId=INSTANCE, State=dict(Name="terminated", Code=48),
             LaunchTime=NOW + timedelta(seconds=60), ImageId=pins["ami"], InstanceType="c5d.24xlarge",
@@ -145,14 +146,15 @@ class Fixture:
         self.reader.read.side_effect = lambda producer: copy.deepcopy(self.documents)
         self.collector = collection.Collector(self.service, MACHINE, self.reader, temp_root=temp_root, now=lambda: self.finish)
         self.paths = MailboxPaths.for_instance(pins["account"], pins["region"], INSTANCE)
-        status = common.completed_status(request["run"], True)
+        status = common.completed_status(request["run"], returncode == 0)
         window, command = durable.window(request, bound), durable.worker_command(request, bound)
         worker = dict(window=window, request=command, status=status, harness_revision=pins["source"],
-            admission=dict(accepted=True, required_seconds=common.durable_worker_reserve(request["plan"]), remaining_seconds=10410),
-            guest_instance_id=INSTANCE, service_returncode=0,
+            admission=dict(accepted=True, required_seconds=common.durable_worker_reserve(request["plan"]), remaining_seconds=remaining),
+            guest_instance_id=INSTANCE, service_returncode=returncode,
             timing_basis=common.durable_plan_contract(request["plan"])["timing_basis"],
             runtime_origin="attempt_started_at")
-        raw = archive([("worker.json", results.encoded(worker)), (results.RESULT, results.encoded(measurement(expected)))])
+        raw = archive([("worker.json", results.encoded(worker)),
+                       (results.RESULT, results.encoded(measurement(expected) if record is None else record))])
         self.s3.seed(self.paths.results, raw)
         self.s3.seed(self.paths.status, collection.encoded(dict(status, sha256=common.digest(raw))))
         self.publish()
