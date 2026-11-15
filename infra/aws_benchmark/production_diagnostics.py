@@ -661,11 +661,28 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations):
+def configuration_html(observations, *, remote=False):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
+    Remote copies are described once a run has a remote cell.
     """
+    commissioning = ("The <code>matrix-commission-…</code> suites copy" if remote else
+                     "The <code>matrix-commission-local</code> suite copies")
+    copy = (
+        "<li><strong>Copy.</strong> The copy datapath is local on one host, not a network copy; package and "
+        "evidence transfers happen outside copy measurement. RCP uses its version-specific default settings "
+        "apart from summary output, with no supplied bandwidth or operations throttle.</li>" if not remote else
+        "<li><strong>Copy.</strong> Every copy runs on one host, from one array to the other; package and "
+        "evidence transfers happen outside copy measurement. RCP uses its version-specific default settings "
+        "apart from summary output, with no supplied bandwidth or operations throttle.</li>"
+        "<li><strong>Remote copies.</strong> A matrix run can also copy a file set through rcp's remote path on "
+        "the same host: <code>rcp --force-remote</code> starts a source and a destination <code>rcpd</code> over "
+        "SSH, on a private sshd that the benchmark runs on loopback, and the daemons exchange the data over "
+        "loopback TCP with rcp's default encryption. Every address is 127.0.0.1. No network hardware and no added "
+        "latency are involved, so this measures the remote protocol, not a network. CPU time and peak memory are "
+        "recorded for the <code>rcp</code> command and for each daemon.</li>")
+    repeats = "of each file set under each scenario" if remote else "of each file set"
     text = (
         "<section aria-labelledby='machine'><h2 id='machine'>Machine and storage</h2><ul>"
         "<li><strong>Instance.</strong> The configured AWS worker is a Linux x86-64 <code>c5d.24xlarge</code>. "
@@ -690,19 +707,17 @@ def configuration_html(observations):
         "<p>Sizes above are decimal bytes. The 1 KB file set has exactly 100 times less total logical "
         "data than the 1.024 TB sets; it still exercises over ten million files. No file-set "
         "definition establishes a completed AWS qualification. Consult each run's suite, outcome and "
-        "diagnostics. The <code>matrix-commission-local</code> suite copies two small fixtures instead "
+        "diagnostics. " + commissioning + " two small fixtures instead "
         "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "
         "data and have no trend.</p></section>"
         "<section aria-labelledby='method'><h2 id='method'>Method</h2><ul>"
-        "<li><strong>Copy.</strong> The copy datapath is local on one host, not a network copy; package and "
-        "evidence transfers happen outside copy measurement. RCP uses its version-specific default settings "
-        "apart from summary output, with no supplied bandwidth or operations throttle.</li>"
+        + copy +
         "<li><strong>Fixtures.</strong> Fixtures are random bytes without a fixed seed, generated with "
         "<code>filegen --leaf-files</code> and a write buffer of min(file size, 1 MiB).</li>"
         "<li><strong>Binaries.</strong> Release x86-64 musl binary source revisions and digests are recorded "
         "for each run.</li>"
-        "<li><strong>Repeats.</strong> Runs of a <code>matrix-…</code> suite make three fresh copies of each "
-        "file set with one build, and measure as many file sets as fit their allocation; each run page lists "
+        "<li><strong>Repeats.</strong> Runs of a <code>matrix-…</code> suite make three fresh copies " + repeats +
+        " with one build, and measure as many file sets as fit their allocation; each run page lists "
         "what was measured and why anything else was not. Runs of the other suites make four copies of each "
         "selected file set, as two balanced adjacent pairs of identical baseline and candidate binaries.</li>"
         "<li><strong>Caches and validation.</strong> Linux cache dropping occurs before every copy. Matrix "

@@ -635,18 +635,105 @@ class ReportSiteTests(unittest.TestCase):
         diagnostics = json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000001.json')])
         self.assertEqual(diagnostics['schema'], 'rcp-public-resource-diagnostics-v2')
 
+    def test_remote_copies_get_a_page_of_their_own_once_a_run_has_a_remote_cell(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        def site(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})
+        local = matrix_example('matrix-1g-local')
+        pages = site([local])
+        # until a run has a remote cell no page says anything about remote copies
+        self.assertNotIn(Path('aws-benchmarks/remote.html'), pages)
+        for path, document in pages.items():
+            if path.suffix == '.html':
+                with self.subTest(page=str(path)):
+                    for phrase in ('remote.html', 'Remote copies', 'rcpd', 'page of their own'):
+                        self.assertNotIn(phrase, document)
+        setup = pages[Path('aws-benchmarks/setups.html')]
+        self.assertIn('The copy datapath is local on one host, not a network copy', setup)
+        self.assertIn('The plots show local copies on one host.', setup)
+        self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.',
+                      pages[Path('aws-benchmarks/index.html')])
+        both = matrix_example('matrix-1g-local+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')
+        pages = site([local, both])
+        index, remote = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/remote.html')]
+        self.assertIn('<h1>Remote copies</h1>', remote)
+        self.assertIn("data-history-metric='source_cpu'", remote)
+        self.assertIn('rcpd over loopback, with default settings · 1 run</p>', remote)
+        self.assertIn('copied locally by rcp with default settings · 2 runs</p>', index)
+        self.assertNotIn("data-history-metric='source_cpu'", index)
+        # each page says where the other is, and every page of the section links to both
+        self.assertIn('<a href="remote.html">remote copies over loopback</a>', index)
+        self.assertIn('<a href="index.html#history">Local copies</a>', remote)
+        self.assertIn('<li><a href="remote.html">Remote copies</a></li>', index)
+        self.assertIn('<li><a href="#report-content" aria-current="page">Remote copies</a></li>', remote)
+        self.assertIn('<li><a href="index.html#history">History</a></li>', remote)
+        self.assertIn('<li><a href="remote.html">Remote copies</a></li>', pages[Path('aws-benchmarks/setups.html')])
+        page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000002.html')]
+        self.assertIn('<li><a href="../remote.html">Remote copies</a></li>', page)
+        self.assertIn('<td>Remote copy over loopback</td><td>measured</td>', page)
+        self.assertIn('<td>source rcpd</td><td>complete</td>', page)
+        # run links on the remote page resolve from where that page is
+        self.assertIn("href='runs/repo-655073755-run-43200000002.html'", remote)
+        self.assertEqual(json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000002.json')])
+                         ['schema'], 'rcp-public-resource-diagnostics-v3')
+        setup = pages[Path('aws-benchmarks/setups.html')]
+        self.assertIn('<strong>Remote copies.</strong>', setup)
+        self.assertIn('exchange the data over loopback TCP', setup)
+        self.assertIn('three fresh copies of each file set under each scenario', setup)
+        self.assertIn('Remote copies over loopback have <a href="remote.html">a page of their own</a>', setup)
+        self.assertNotIn('The copy datapath is local on one host', setup)
+        # a file set measured remotely only is not said to have no runs at all
+        self.assertIn('No qualified local runs yet for 100 MB files, 1 MB files and 1 KB files.', index)
+
+    def test_a_site_with_remote_cells_has_no_dangling_link(self):
+        from infra.aws_benchmark.production_publish import inventory
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        runs = [matrix_example('matrix-all-local'),
+                matrix_example('matrix-all-local+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')]
+        directory, revision, _ = self.retained_batch([record for record, _ in runs])
+        index = json.loads((directory / 'index.json').read_text())
+        index.update(schema='rcp-production-retained-reports-v2', diagnostics=[])
+        for record, extra in runs:
+            body = json.dumps(extra, separators=(',', ':')).encode()
+            (directory / (record['run_key'] + '.diagnostics.json')).write_bytes(body)
+            index['diagnostics'].append(dict(run_key=record['run_key'], sha256=hashlib.sha256(body).hexdigest(),
+                                             bytes=len(body)))
+        (directory / 'index.json').write_text(json.dumps(index))
+        result = self.build_retained((directory, revision, inventory(directory)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.output / 'aws-benchmarks/remote.html').is_file())
+        self.assert_site_links_resolve()
+
+    def test_a_remote_cell_that_was_never_measured_still_opens_the_remote_page(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        from infra.aws_benchmark.test_remote_pages import UNREACHABLE
+        record, extra = matrix_example('matrix-1g-local+remote', outcomes={1: UNREACHABLE})
+        pages = report_site.render_aws_benchmarks({record['run_key']: production_export.collection.encoded(record)},
+                                                  diagnostics={record['run_key']: extra})
+        remote = pages[Path('aws-benchmarks/remote.html')]
+        self.assertIn('No qualified remote runs yet for 1 GB files, 100 MB files, 1 MB files and 1 KB files.', remote)
+        self.assertNotIn('<figure', remote)
+
     def test_no_page_carries_a_disclaimer_about_the_honesty_of_its_own_numbers(self):
         import report_site
         from infra.aws_benchmark import production_export
         from infra.aws_benchmark.test_matrix_pages import FAILED, matrix_example
         from infra.aws_benchmark.test_production_history import observed
-        runs = [observed('42458459014', '08'), matrix_example('matrix-all-local', outcomes={1: FAILED})]
+        runs = [observed('42458459014', '08'), matrix_example('matrix-all-local', outcomes={1: FAILED}),
+                matrix_example('matrix-1g-local+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')]
         records = {record['run_key']: production_export.collection.encoded(record) for record, _ in runs}
         for retained in (False, True):
             pages = report_site.render_aws_benchmarks(records, retained=retained, diagnostics={
                 record['run_key']: extra for record, extra in runs})
             documents = {path: text for path, text in pages.items() if path.suffix == '.html'}
-            self.assertGreaterEqual(len(documents), 5)
+            self.assertGreaterEqual(len(documents), 7)
+            self.assertIn(Path('aws-benchmarks/remote.html'), documents)
             for path, document in documents.items():
                 with self.subTest(page=str(path), retained=retained):
                     # the benchmark measures rcp; it does not argue with its own runner

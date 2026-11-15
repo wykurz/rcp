@@ -55,6 +55,7 @@
 /* measurement tables scroll sideways instead of wrapping numbers and identifiers */
 .aws table.data td { white-space: nowrap; }
 .aws table.data td.reason { min-width: 24ch; white-space: normal; }
+.aws table.cells th { white-space: nowrap; }
 /* key and value rows read as a list; only group headings carry the heavy rule */
 .aws tbody th { border-top: 0; border-bottom: 1px solid var(--border); background: none; font-weight: 600; }
 .aws tbody th[colspan] { padding-top: 1.1rem; border-bottom: 2px solid var(--rule); color: var(--muted); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }

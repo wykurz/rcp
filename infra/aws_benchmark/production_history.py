@@ -1,8 +1,9 @@
 """Bounded presentation-only history of rcp performance from frozen public records.
 
 The history follows the build under test with default settings: one trend per
-file set, joined across code versions. Frozen records and series IDs are read,
-never rewritten; every emitted string is escaped and no script is produced.
+file set and scenario, joined across code versions. Each scenario has a page of
+its own. Frozen records and series IDs are read, never rewritten; every emitted
+string is escaped and no script is produced.
 """
 from datetime import datetime, timezone
 from html import escape
@@ -18,9 +19,9 @@ from .results import utc
 MAX_PLOT_RUNS = 32
 # the build under test with default settings, and the same command run with a reference build
 CURRENT, REFERENCE = "rcp-default", "rcp-baseline"
-# what a cell's scenario means to a reader; these trends plot the copy made on one host
-LOCAL = "local"
-SCENARIOS = {LOCAL: "Local copy"}
+# what a cell's scenario means to a reader; each has its own trends
+LOCAL, REMOTE = "local", "remote"
+SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback"}
 CASES = {
     "bulk-1g-1tb": "1 GB files",
     "bulk-100m-1024gb": "100 MB files",
@@ -32,6 +33,22 @@ METRICS = (
     ("cpu", "CPU time", "s"),
     ("memory", "Peak memory", "MiB"),
 )
+# a remote copy is three processes: the daemons do the work and are plotted, each on its own
+REMOTE_METRICS = (
+    ("duration", "Copy duration", "s"),
+    ("source_cpu", "Source rcpd CPU time", "s"),
+    ("destination_cpu", "Destination rcpd CPU time", "s"),
+    ("source_memory", "Source rcpd peak memory", "MiB"),
+    ("destination_memory", "Destination rcpd peak memory", "MiB"),
+)
+# table columns: every plotted metric, then the rcp command's own figures for a remote copy
+COLUMNS = {
+    LOCAL: (("duration", "Duration s: median (range)"), ("cpu", "CPU s"), ("memory", "Peak RSS MiB")),
+    REMOTE: (("duration", "Duration s: median (range)"), ("source_cpu", "Source rcpd CPU s"),
+             ("destination_cpu", "Destination rcpd CPU s"), ("source_memory", "Source rcpd peak RSS MiB"),
+             ("destination_memory", "Destination rcpd peak RSS MiB"), ("cpu", "rcp CPU s"),
+             ("memory", "rcp peak RSS MiB")),
+}
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 DAY = 86400
 # chart geometry in viewBox units; the plot area is 302 by 160
@@ -64,8 +81,18 @@ def time_html(text):
     return "<time datetime='" + escape(text) + "'>" + escape(moment(utc(text))) + "</time>"
 
 
-def _points(value, extra):
-    """Summarize the build under test for each file set of one qualified record."""
+def has_remote(records):
+    """Whether any run has a remote cell, measured or not: then remote copies have their page."""
+    return any(cell["scenario"] == REMOTE for value in records.values() for cell in value.get("cells", ()))
+
+
+def panels(scenario):
+    """The metrics plotted for a scenario, as (key, title, unit)."""
+    return METRICS if scenario == LOCAL else REMOTE_METRICS
+
+
+def _points(value, extra, scenario=LOCAL):
+    """Summarize the build under test for each file set of one qualified record, under one scenario."""
     started, identity = utc(value["timestamp"]), value["identity"]
     # identical binaries make the reference copies further samples of the same build
     roles = (CURRENT, REFERENCE) if value["comparison"] == projection.IDENTICAL_BINARIES else (CURRENT,)
@@ -75,19 +102,24 @@ def _points(value, extra):
         key = (measurement["case_id"], measurement.get("scenario", LOCAL), measurement["variant_id"])
         require(key not in seen, "duplicate history case and variant")
         seen.add(key)
-        if key[0] in CASES and key[1] == LOCAL and key[2] in roles:
-            selected.setdefault(key[0], []).append(measurement)
-        else:
+        if key[1] == scenario:
+            if key[0] in CASES and key[2] in roles:
+                selected.setdefault(key[0], []).append(measurement)
+            else:
+                outside += 1
+        elif key[1] not in SCENARIOS and scenario == LOCAL:
+            # a scenario without a page is reported once, next to the local trends; a measurement
+            # of a scenario that has one is that page's to plot or to count
             outside += 1
     points = {}
     for case, items in selected.items():
         trials = [] if extra is None else [row for row in extra["trials"] if row["case_id"] == case and
-                                           row.get("scenario", LOCAL) == LOCAL and
+                                           row.get("scenario", LOCAL) == scenario and
                                            any(row["variant_id"] == item["variant_id"] for item in items)]
         # resources count only when every plotted copy has them; a subset would cherry-pick repeats
-        complete = all(sum(row["variant_id"] == item["variant_id"] for row in trials) == len(item["samples"])
-                       for item in items) and all(row["status"] == "complete" and row["metrics"] is not None
-                                                  for row in trials)
+        counted = all(sum(row["variant_id"] == item["variant_id"] for row in trials) == len(item["samples"])
+                      for item in items)
+        complete = counted and all(row["status"] == "complete" and row["metrics"] is not None for row in trials)
         points[case] = dict(
             run_key=value["run_key"], run=identity["run"], revision=identity["candidate"],
             timestamp=started.isoformat().replace("+00:00", "Z"), at=started.timestamp(),
@@ -102,6 +134,15 @@ def _points(value, extra):
             cpu=_summary([row["metrics"]["user_seconds"] + row["metrics"]["system_seconds"]
                           for row in trials]) if complete else None,
             memory=_summary([row["metrics"]["max_rss_kib"] / 1024 for row in trials]) if complete else None)
+        if scenario != LOCAL:
+            # each daemon is measured on its own, and has a value only when every plotted copy has it
+            for role in diagnostics.ROLES:
+                figures = [(row.get("roles") or {}).get(role) for row in trials]
+                ready = complete and all(item is not None for item in figures)
+                points[case][role + "_cpu"] = _summary(
+                    [item["user_seconds"] + item["system_seconds"] for item in figures]) if ready else None
+                points[case][role + "_memory"] = _summary(
+                    [item["max_rss_kib"] / 1024 for item in figures]) if ready else None
     return points, outside
 
 
@@ -133,8 +174,8 @@ def _link(points):
         point.update(segment=segment, changes=changes, starts_segment=starts)
 
 
-def model(records, companions):
-    """Summarize each qualified run per file set and link the runs in time order."""
+def model(records, companions, scenario=LOCAL):
+    """Summarize each qualified run per file set under one scenario and link the runs in time order."""
     require(isinstance(records, dict) and len(records) <= projection.MAX_PUBLIC_HISTORY_RUNS and
             isinstance(companions, dict) and set(companions) <= set(records),
             "history input exceeds its bounded record set")
@@ -147,7 +188,7 @@ def model(records, companions):
             diagnostics.validate(extra, value)
         if not value["benchmark_valid"]:
             continue
-        points, skipped = _points(value, extra)
+        points, skipped = _points(value, extra, scenario)
         outside += skipped
         for case, item in points.items():
             cases[case].append(item)
@@ -157,9 +198,9 @@ def model(records, companions):
     return cases, outside
 
 
-def point(value, extra):
+def point(value, extra, scenario=LOCAL):
     """Summarize one record per file set exactly as its history point is plotted."""
-    return _points(value, extra)[0] if value["benchmark_valid"] else {}
+    return _points(value, extra, scenario)[0] if value["benchmark_valid"] else {}
 
 
 def rounded(value):
@@ -341,15 +382,17 @@ def _decimal(size):
     return format(size / unit, "g") + " " + name
 
 
-def _file_set(case, points):
+def _file_set(case, points, scenario):
     shape = diagnostics.CASE_SHAPES[case]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
+    how = ("copied locally by rcp with default settings" if scenario == LOCAL else
+           "copied by rcp through a source and a destination rcpd over loopback, with default settings")
     html = ("<section id='history-" + case + "' aria-labelledby='history-" + case + "-title'>"
         "<h2 id='history-" + case + "-title'>" + CASES[case] + "</h2><p class='dataset'>" +
         f"{files:,} files of {_decimal(shape['file_size_bytes'])} each ({_decimal(files * shape['file_size_bytes'])}), "
-        "copied locally by rcp with default settings · " + plural(len(points), "run", "runs") +
+        + how + " · " + plural(len(points), "run", "runs") +
         "</p><div class='metrics'>" +
-        "".join(_panel(case, points, metric, title, unit) for metric, title, unit in METRICS) +
+        "".join(_panel(case, points, metric, title, unit) for metric, title, unit in panels(scenario)) +
         "</div><p class='reading'>Each point is one run: the median of its copies, with a bar from the fastest "
         "to the slowest copy. <a href='setups.html#reading'>How to read these plots</a>.</p>")
     changed = [item for item in points if item["changes"]]
@@ -364,14 +407,14 @@ def _file_set(case, points):
                 (" The trend starts a new line here." if item["starts_segment"] else "") + "</li>")
         html += "</ul>"
     html += ("<details><summary>Data table</summary><div class='table-scroll'><table class='data'><thead><tr>"
-        "<th>Run start (worker-reported)</th><th>Run</th><th>Commit</th><th>Copies</th>"
-        "<th>Duration s: median (range)</th><th>CPU s</th><th>Peak RSS MiB</th><th>Collected</th>"
+        "<th>Run start (worker-reported)</th><th>Run</th><th>Commit</th><th>Copies</th>" +
+        "".join("<th>" + header + "</th>" for _, header in COLUMNS[scenario]) + "<th>Collected</th>"
         "<th>Plotted copies and frozen series</th><th>Observed setup</th></tr></thead><tbody>")
     for item in reversed(points):
         page = "runs/" + escape(item["run_key"], quote=True) + ".html"
         values = ["unavailable" if item[metric] is None else
                   f"{exact(item[metric]['value'])} ({exact(item[metric]['low'])}–{exact(item[metric]['high'])})"
-                  for metric, _, _ in METRICS]
+                  for metric, _ in COLUMNS[scenario]]
         html += ("<tr><td>" + time_html(item["timestamp"]) + "</td><td><a href='" + page + "'>" +
             escape(item["run"]) + "</a></td><td><code>" + escape(item["revision"][:7]) + "</code></td><td>" +
             str(item["duration"]["samples"]) + "</td>" + "".join("<td>" + escape(v) + "</td>" for v in values) +
@@ -384,17 +427,20 @@ def _file_set(case, points):
     return html + "</tbody></table></div></details></section>"
 
 
-def _render(cases, outside, limit, unmeasured):
+def _render(cases, outside, limit, unmeasured, scenario, several):
     html = "<section id='history' aria-label='Performance history'>"
-    html += "".join(_file_set(case, points) for case, points in cases.items() if points)
+    html += "".join(_file_set(case, points, scenario) for case, points in cases.items() if points)
     empty = [CASES[case] for case in unmeasured]
     if empty:
-        html += ("<p class='empty'>No qualified runs yet for " +
-                 (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
+        # once there are two kinds of run, a file set without this kind may well have the other
+        html += ("<p class='empty'>No qualified " + (scenario + " " if several else "") +
+                 "runs yet for " + (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
     if limit is not None:
+        # the list of runs is on the page of the local trends
         html += ("<p class='window'>The plots show each file set's newest " +
                  plural(limit, "qualified run", "qualified runs") +
-                 ". Older runs are not plotted; every run stays in the list below.</p>")
+                 ". Older runs are not plotted; every run stays in the " +
+                 ("list below" if scenario == LOCAL else "<a href='index.html#runs'>list of runs</a>") + ".</p>")
     if outside:
         html += ("<p class='window'>" + plural(outside, "qualified measurement is", "qualified measurements are") +
                  " outside these trends (reference builds, other variants, scenarios or file sets); "
@@ -402,9 +448,12 @@ def _render(cases, outside, limit, unmeasured):
     return html + "</section>"
 
 
-def render(records, companions):
-    """Plot each file set's newest qualified runs; the inventory and frozen records stay unbounded by this."""
-    cases, outside = model(records, companions)
+def render(records, companions, scenario=LOCAL):
+    """Plot each file set's newest qualified runs under one scenario.
+
+    The inventory and frozen records stay unbounded by this.
+    """
+    cases, outside = model(records, companions, scenario)
     # a file set is unmeasured only when no run ever measured it, whatever the plots show
     unmeasured = [case for case, points in cases.items() if not points]
     limit = MAX_PLOT_RUNS
@@ -416,15 +465,28 @@ def render(records, companions):
             # markers and breaks always relate two plotted runs
             _link(points)
         cut = any(len(points) > limit for points in cases.values())
-        html = _render(window, outside, limit if cut else None, unmeasured)
+        html = _render(window, outside, limit if cut else None, unmeasured, scenario,
+                       scenario != LOCAL or has_remote(records))
         if len(html.encode()) <= projection.MAX_PUBLIC_HTML:
             return html
         require(limit, "AWS history plots exceed public HTML bound")
         limit -= 1
 
 
-def reading_html():
-    """Explain once how points, lines and gaps are derived."""
+def reading_html(remote=False):
+    """Explain once how points, lines and gaps are derived; `remote` when remote copies have a page."""
+    scope = (
+        "<li><strong>Scope.</strong> The plots show local copies on one host. A run counts for every file "
+        "set it measured; a file set it did not finish has no point for that run, and its run page says why. "
+        "Failed and unavailable runs stay in the run list without performance points.</li>" if not remote else
+        "<li><strong>Scope.</strong> The AWS benchmarks page plots local copies on one host. Remote copies "
+        'over loopback have <a href="remote.html">a page of their own</a>, read the same way. A run counts for '
+        "every file set and scenario it measured; one it did not finish has no point for that run, and its run "
+        "page says why. Failed and unavailable runs stay in the run list without performance points.</li>"
+        "<li><strong>Remote copies.</strong> A remote copy is three processes: the <code>rcp</code> command, "
+        "and the source and the destination <code>rcpd</code> that it starts over SSH and that move the data. "
+        "Copy duration is the wall time of the <code>rcp</code> command. CPU time and peak memory are plotted "
+        "for each daemon; the command's own figures are in each data table.</li>")
     return ("<section aria-labelledby='reading'><h2 id='reading'>Reading the plots</h2><ul>"
         "<li><strong>Point.</strong> One qualified run, summarizing the copies of one file set made by the "
         "build under test with rcp's default settings: three copies in a matrix run, four in a paired run. "
@@ -451,7 +513,4 @@ def reading_html():
         "or a recorded hardware value differs from the last recorded one: CPU model or count, architecture, "
         "storage devices, layout or filesystem. Any other recorded change, such as the kernel, is marked on "
         "the line. A field that an older run did not record is not a change.</li>"
-        "<li><strong>Scope.</strong> The plots show local copies on one host. A run counts for every file "
-        "set it measured; a file set it did not finish has no point for that run, and its run page says why. "
-        "Failed and unavailable runs stay in the run list without performance points.</li>"
-        "</ul></section>")
+        + scope + "</ul></section>")

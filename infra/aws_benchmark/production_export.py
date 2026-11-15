@@ -108,7 +108,7 @@ RESULTS = {"complete": "measured", "failed": "failed", "timed_out": "timed out",
            "not_run": "not run"}
 STAGES = {"capacity": "During the free-space check", "generation": "During generation",
           "cache": "During cache preparation", "copy": "During copy", "summary": "In the copy summary",
-          "harness": "In the benchmark harness"}
+          "harness": "In the benchmark harness", "transport": "Setting up the remote copy"}
 
 
 def badge(value):
@@ -148,7 +148,7 @@ def cells_html(value):
         rows.append("<tr><td>" + _name(cell["case_id"], history.CASES) + "</td><td>" +
                     _name(cell["scenario"], history.SCENARIOS) + "</td><td>" + RESULTS[cell["outcome"]] + "</td>" +
                     numbers + "<td class='reason'>" + reason + "</td></tr>")
-    return ("<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Scenario</th>"
+    return ("<div class='table-scroll'><table class='data cells'><thead><tr><th>File set</th><th>Scenario</th>"
             "<th>Result</th><th>Median s</th><th>Range s</th><th>Samples</th><th>What happened</th></tr></thead>"
             "<tbody>" + "".join(rows) + "</tbody></table></div>")
 
@@ -199,11 +199,18 @@ def render(value, *, diagnostics=None):
         html += "<p>This run has no performance measurements.</p>"
     if matrix and value["cells"]:
         html += cells_html(value)
-    for case, item in history.point(value, diagnostics).items():
-        html += ("<h3>" + history.CASES[case] + "</h3><p>This run as one history point: the median of the "
+    # a run that measured more than local copies names the scenario of each summary
+    several = matrix and any(cell["scenario"] != history.LOCAL for cell in value["cells"])
+    points = {scenario: history.point(value, diagnostics, scenario) for scenario in history.SCENARIOS}
+    # in the order the record measured its file sets, a file set's scenarios next to each other
+    measured = list(dict.fromkeys(item["case_id"] for item in value["measurements"]))
+    for scenario, case, item in ((scenario, case, points[scenario][case]) for case in measured
+                                 for scenario in history.SCENARIOS if case in points[scenario]):
+        html += ("<h3>" + history.CASES[case] + (" · " + history.SCENARIOS[scenario] if several else "") +
+            "</h3><p>This run as one history point: the median of the "
             "copies made by the build under test" + (", counting every copy because baseline and candidate "
             "binaries are identical" if item["pooled"] else "") + ".</p><div class='metrics'>")
-        for metric, title, unit in history.METRICS:
+        for metric, title, unit in history.panels(scenario):
             data = item[metric]
             html += "<div class='metric'><h4>" + title + "</h4>" + (
                 "<p class='value'>unavailable</p><p class='delta'>No recorded value for this run.</p>"
