@@ -1180,11 +1180,14 @@ unexpected retained Tokio reference remains a `DataConsumed` error without addin
 metadata failures retain the already-copied counts. All these errors preserve the stream's next-file
 boundary. The cancellation-lifetime residual in §7.8 still applies to destination Tokio payload I/O.
 
-Recoverable file errors are collected while other files continue unless `--fail-early` is set. A
-failed drain corrupts the stream and aborts the session. Corruption or fail-early latches teardown
-before file-completion bookkeeping, preventing new pending-directory finalization or Done. A failed
-copy can therefore leave directories in their temporary restricted mode; held reused-directory
-rollback guards still restore their protected state. Cleanup preserves the original error.
+Recoverable file errors are collected while other files continue unless `--fail-early` is set.
+Fail-early latches teardown and returns the original file failure without draining unread payload or
+advancing file-completion bookkeeping; a slow or stalled sender cannot delay this failure by
+withholding the rejected file's bytes. A failed collect-errors drain corrupts the stream and aborts
+the session. Corruption latches teardown before file-completion bookkeeping. Both paths prevent new
+pending-directory finalization or Done. A failed copy can therefore leave directories in their
+temporary restricted mode; held reused-directory rollback guards still restore their protected
+state. Cleanup preserves the original error.
 
 Directory metadata errors are handled analogously in `DirectoryFinalization::execute`: the error is
 logged, pushed to the `ErrorCollector`, and processing continues (unless `--fail-early`). The
