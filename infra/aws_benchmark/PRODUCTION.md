@@ -898,8 +898,9 @@ References:
 The recurring schedule remains 1 GB-file metadata A/A. Manual 100 MB qualification support is
 prepared separately; it is not enabled by merging the workflow choice. The server's `manual_suites`
 allowlist defaults to 1 GB only, including when reading existing policy payloads that predate that
-field. Scheduled admission independently requires the 1 GB suite. No runtime, budget, credential or
-access setting changes automatically when this code lands.
+field. Scheduled admission independently requires the policy's `scheduled_suite`, which is the 1 GB
+suite unless a policy version names another one (see [Benchmark matrix](#benchmark-matrix)). No
+runtime, budget, credential or access setting changes automatically when this code lands.
 
 See [incremental 100 MB qualification](LARGE_WORKLOADS.md#incremental-100-mb-metadata-qualification)
 for the fixed, explicitly unmeasured qualification budget, image/controller compatibility, live
@@ -942,3 +943,132 @@ Derive the expiry from authenticated recovery coverage before dispatch. The nati
 starts at the retained request creation time, after workflow build/queue delays. Include cleanup and
 mutation margins; fresh credentials at dispatch alone do not guarantee coverage. A queued workflow
 that misses the server expiry must not receive a new reservation, even if the operator disconnects.
+
+## Benchmark matrix
+
+The matrix suites measure the build under test, with rcp's default settings, on several file sets in
+one allocation. A *cell* is one file set under one scenario; the only scenario today is `local`, a
+copy on one host. Each cell is three copies made by one build. There is no baseline build, no
+pairing and no verification of what was copied: a copy counts when rcp exits zero and reports the
+expected file count. [The matrix runner](../../docs/benchmarking.md#performance-only-matrix-runs)
+describes what a run promises, and [the worker profile](LARGE_WORKLOADS.md#performance-only-matrix)
+how it runs on AWS.
+
+| Suite                     | Cells                                          | Allocation | Reservation |
+| ------------------------- | ---------------------------------------------- | ---------- | ----------- |
+| `matrix-all-local`        | 1 GB, 100 MB, 1 MB and 1 KB files              | 8 hours    | fixed $50   |
+| `matrix-1g-local`         | 1 GB files                                     | 3 hours    | computed    |
+| `matrix-100m-local`       | 100 MB files                                   | 3 hours    | computed    |
+| `matrix-1m-local`         | 1 MB files                                     | 3 hours    | computed    |
+| `matrix-1k-local`         | 1 KB files                                     | 3 hours    | computed    |
+| `matrix-commission-local` | two small fixtures (16 files and 10,000 files) | 3 hours    | computed    |
+
+A computed reservation is the ordinary three-hour one: $20 at the current price and ancillary
+allowance. A suite name selects exactly one fixed plan, as before; there is no free-form selection.
+The request keeps its two-sided shape (identical baseline and candidate revisions, six binary keys
+with identical digests), so mailbox, IAM, window and policy-manifest formats are unchanged. The
+baseline copies of the binaries are uploaded and never run.
+
+### Select a run by hand
+
+The workflow's `suite` input offers every matrix suite. The server admits one only when the policy's
+`manual_suites` names it. That list stays explicit and holds at most eight suites; nothing is
+enabled by default or by a pattern. Three-hour suites use the ordinary runtime and the ordinary
+manual requesters. `matrix-all-local` needs what every eight-hour run needs:
+`manual_runtime_seconds=28800`, an unexpired `extended_manual_not_after`, and the immutable owner as
+requester. A plan with a runtime profile runs for exactly that profile's time, so no other extended
+runtime is accepted.
+
+### Schedule it
+
+Two server policy fields decide what a scheduled run may be:
+
+- `scheduled_suite` (default `bulk-1g-metadata`) names the one suite a scheduled request may ask
+  for.
+- `scheduled_runtime_seconds` (default 0) separately approves the eight-hour runtime for a scheduled
+  suite whose plan needs it. It is rejected when the scheduled suite has an ordinary plan.
+
+A policy stored before these fields existed loads unchanged and keeps scheduling the 1 GB run; a
+payload that names only one of the two fields is not a recorded shape and is refused. A scheduled
+eight-hour run is still owner-only, needs a matching schedule slot and is bounded by the daily,
+monthly and total allowances. It has no expiry, because it recurs by design. Neither field lets
+anyone start the suite by hand, and the manual opt-in never stands in for the scheduled one.
+
+On a schedule event the workflow asks for `production_workflow.SCHEDULED_SUITE`. The server refuses
+a request whose suite differs from its policy before any reservation, so the two cannot drift
+silently. Moving the schedule to the matrix therefore takes a reviewed source change (the
+`SCHEDULED_SUITE` constant, the cron line and `REGULAR_CRON`) and a new policy version that names
+the same suite, its slot and its runtime.
+
+### How a run qualifies
+
+The run-level requirements are unchanged: verified cleanup, the approved image and source revision,
+an admitted worker and the exact request. The worker's result must hold the suite's contract: the
+same cells in order, three copies, the 3600-second hang limit, the cache policy, the runner label,
+and measured binaries whose digests are the approved ones. Within that, a matrix run qualifies cell
+by cell:
+
+- It counts (`benchmark_valid`) when at least one cell completed. Every cell's outcome, stage and
+  short reason are in the collection report and in the public record; only completed cells have
+  measurements.
+- A benchmark command that was stopped keeps the cells its saved results show as finished. The
+  record then carries the note `worker: the benchmark command did not exit cleanly`. Paired suites
+  are all or nothing and still require a clean exit.
+- A result that differs from the suite's contract publishes neither cells nor measurements, only the
+  reason.
+
+Public records of matrix runs are version 4 (`rcp-production-public-report-v4`) and their
+diagnostics version 2; [RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes both.
+Commissioning runs qualify like any other, and their small fixtures stay outside the trends.
+
+### Deploy and commission
+
+Nothing here changes a live setting by being merged. The server packages and the worker image must
+change **together**. `worker.py` has a new pinned digest; the coordinator compares the launch
+template's startup data with the reviewed startup that embeds that digest, and it does so for every
+suite. New packages with the old launch template, or the reverse, would admit a run, keep its
+reservation and then refuse to launch it. Existing suites, plans and stored policies are otherwise
+unchanged.
+
+Use the [cutover sequence](#bind-admission-to-a-deployment-during-cutover): between regular slots
+and with no active owner, close admission; switch the server packages, the rebuilt worker image, the
+launch-template version and the pins as one step; verify them; then reopen with a new policy version
+bound to the new pins. That policy version names in `manual_suites` the matrix suites to test, with
+the extended manual window when the full matrix is among them. The scheduled 1 GB run keeps working
+on the new image.
+
+Commission one run at a time. A run holds the single active owner until its whole horizon has
+passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
+minutes, counted from admission; collection follows. With the default twelve-hour capacity window
+that is about 15 h 15 min for a three-hour suite, however briefly it ran, and about 10 h 15 min for
+`matrix-all-local`, whose plan caps the search at two hours. The run's public page appears only
+after that. A dispatch before then is refused before any reservation, and a run admitted within that
+horizon before a scheduled slot displaces the scheduled run. A lower `capacity_seconds` in the
+commissioning policy version shortens the horizon. Size `extended_manual_not_after` for the full run
+and its repeat from these numbers.
+
+1. `matrix-commission-local`: a few minutes of work that exercises every step, including the public
+   pages. Expect two of two measurements and per-copy resources on the run page.
+2. `matrix-all-local` by hand, then once more to see that two runs agree.
+3. The schedule change above.
+
+### Find the evidence of a run
+
+Each run page names, under *Raw data*, where the worker's evidence is retained and until about when:
+`production/runs/<run key>/collection/` in the benchmark bucket, for 90 days. Fetch and verify it
+with operator credentials:
+
+```bash
+just aws-benchmark-evidence repo-655073755-run-43075583972 "$HOME/evidence-43075583972"
+```
+
+Give an absolute path outside the repository: `just` runs from the repository root, and this
+evidence is not public. The directory must not exist yet and its parent must; it is created readable
+by its owner only. It receives `manifest.json` and the files that manifest names (`report.json`,
+`summary.html`, `controller.json`, `durable.json`, and `status.json` and `results.zip` when the
+worker produced them), each read at its retained version and checked against the manifest's size and
+SHA-256. The helper also prints the manifest's own digest, which is the `retirement_sha256` of the
+run's public record. Start with `summary.html` and `report.json`: they hold every check and its
+reason. The worker's own results and logs are in `results.zip` under `benchmark/results/`, with each
+copy's output in `logs/<file set>/<scenario>/<copy>/`. The archive is never unpacked by the helper;
+what a worker wrote is untrusted data, to be listed and read, not run.

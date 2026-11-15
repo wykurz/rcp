@@ -115,7 +115,8 @@ def _frozen_public(record, manifest, report, controller):
                 ("run", "run_url", "suite", "baseline", "candidate", "controller")} and
             value["comparison"] == projection.comparison_label(expected, controller) and
             projection.qualification_outcome(value) == outcome and
-            (not value["benchmark_valid"] or value["verification"] == evidence.get("expected_verification")),
+            (not value["benchmark_valid"] or value["verification"] == evidence.get("expected_verification")) and
+            value.get("cells") == evidence.get("cells"),
             "retained public projection provenance differs")
     if "collection_checkpoint" in report:
         binding = {key: manifest[key] for key in ("schema", "run_key", "epoch", "state_sha256",

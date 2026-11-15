@@ -51,7 +51,7 @@ chmod -R a+rX,go-w /opt/rcp-benchmark/benchmarks /opt/rcp-benchmark/infra
 progress verify-unprivileged
 cd /opt/rcp-benchmark
 runuser -u rcp-benchmark -- /usr/bin/python3 -B -c \
-  'import benchmarks.run; import infra.aws_benchmark.cache_client; import infra.aws_benchmark.worker'
+  'import benchmarks.run; import benchmarks.matrix; import infra.aws_benchmark.cache_client; import infra.aws_benchmark.worker'
 progress supervisor-notify-acceptance
 python3 -B -m infra.aws_benchmark.supervisor_notify --image-self-test > /opt/rcp-benchmark/supervisor-notify-acceptance.json
 chmod 0444 /opt/rcp-benchmark/supervisor-notify-acceptance.json

@@ -128,7 +128,10 @@ class WorkerContractTests(unittest.TestCase):
             self.assertIn("disabled", status["error"]["message"])
 
     def test_real_worker_argv_matches_every_suite_contract(self):
+        # matrix suites run their own runner; test_matrix_contracts covers that command
         for suite, cases in common.SUITES.items():
+            if suite in common.MATRIX_SUITES:
+                continue
             with self.subTest(suite=suite):
                 expected = binding(suite)
                 args, environment = parsed_command(expected)
@@ -246,7 +249,8 @@ class WorkerContractTests(unittest.TestCase):
         return evidence, record, policy
 
     def test_approval_accepts_measurements_built_from_real_worker_arguments(self):
-        for suite in common.SUITES.keys() - {"aa-smoke"} - common.LARGE_SUITES.keys():
+        # matrix suites are qualified per cell from their own result document
+        for suite in common.SUITES.keys() - {"aa-smoke"} - common.LARGE_SUITES.keys() - common.MATRIX_SUITES.keys():
             with self.subTest(suite=suite):
                 evidence, record, policy = self.inspected_measurement(binding(suite))
                 results.approve(evidence, record, policy)

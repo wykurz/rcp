@@ -8,7 +8,7 @@ import time
 from urllib.error import HTTPError, URLError
 from types import MappingProxyType
 
-from benchmarks.verification import FULL_CONTENT_POLICY, METADATA_POLICY
+from benchmarks.verification import FULL_CONTENT_POLICY, METADATA_POLICY, SUMMARY_POLICY
 
 RESERVE = 180
 WORKER_START_RESERVE = RESERVE + 300
@@ -71,12 +71,43 @@ _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"] = MappingPro
     runtime_profile=FULL_RUNTIME_PROFILE, reservation_microusd=50_000_000,
     plan=MappingProxyType(dict(version="all-filesets-qualification-budget-v1",
         minimum_worker_seconds=28200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
+# performance-only matrix suites are an exact catalog: a name still selects one fixed plan.
+# a cell is one file set under one scenario; copies are not verified (benchmarks/matrix.py).
+MATRIX_POLICY = SUMMARY_POLICY
+MATRIX_FILE_SETS = MappingProxyType({"1g": "bulk-1g-1tb", "100m": "bulk-100m-1024gb",
+                                     "1m": "bulk-1m-1024gb", "1k": "tiny-1k-10240k"})
+# small fixtures that exercise every step of a matrix run in seconds
+MATRIX_COMMISSIONING = ("commission-64m", "commission-10k")
+MATRIX_SCENARIO_SETS = (("local",),)
+_MATRIX_SELECTIONS = {"all": tuple(MATRIX_FILE_SETS.values()),
+                      **{name: (case,) for name, case in MATRIX_FILE_SETS.items()},
+                      "commission": MATRIX_COMMISSIONING}
+_MATRIX_PROFILES, _MATRIX_PLAN_VERSIONS = {}, {}
+for _selection, _cases in _MATRIX_SELECTIONS.items():
+    for _scenarios in MATRIX_SCENARIO_SETS:
+        _suite = "matrix-" + _selection + "-" + "+".join(_scenarios)
+        _version = _suite + "-plan-v1"
+        # every file set together needs the eight-hour allocation; one set fits the ordinary one
+        _base = "all-filesets-qualification-budget-v1" if _selection == "all" else "bulk-100m-qualification-budget-v1"
+        # a matrix run uses whatever time it gets, so a slow start must not void the allocation:
+        # the worker only declines when less than an hour, too little for one large cell, is left
+        _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+            _RECORDED_DURABLE_CONTRACTS[_base], suite=_suite,
+            timing_basis="fixed allocation; cells that do not fit are reported as not run",
+            plan=MappingProxyType(dict(_RECORDED_DURABLE_CONTRACTS[_base]["plan"], version=_version,
+                                       minimum_worker_seconds=3600))))
+        _MATRIX_PLAN_VERSIONS[_suite] = _version
+        _MATRIX_PROFILES[_suite] = dict(cases=_cases,
+            cells=tuple((case, scenario) for case in _cases for scenario in _scenarios),
+            repetitions=3, timeout=3600, purpose="commissioning" if _selection == "commission" else "performance",
+            runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
 _CURRENT_PLAN_VERSIONS = MappingProxyType({
     "bulk-1g-metadata": "bulk-metadata-plan-v1",
     "bulk-100m-metadata": "bulk-100m-qualification-budget-v1",
     "bulk-1m-metadata": "bulk-1m-qualification-budget-v1",
     "tiny-1k-metadata": "tiny-1k-qualification-budget-v1",
     FULL_FILE_SET_SUITE: "all-filesets-qualification-budget-v1",
+    **_MATRIX_PLAN_VERSIONS,
 })
 DURABLE_SUITES = tuple(_CURRENT_PLAN_VERSIONS)
 
@@ -126,6 +157,8 @@ for _suite, _cases in (("bulk-1m-metadata", ("bulk-1m-1024gb",)),
                         (FULL_FILE_SET_SUITE, ("bulk-1g-1tb", "bulk-100m-1024gb",
                                                "bulk-1m-1024gb", "tiny-1k-10240k"))):
     SUITE_PROFILES[_suite] = dict(SUITE_PROFILES["bulk-100m-metadata"], cases=_cases)
+SUITE_PROFILES.update(_MATRIX_PROFILES)
+MATRIX_SUITES = {name: profile["cells"] for name, profile in _MATRIX_PROFILES.items()}
 SUITES = {name: profile["cases"] for name, profile in SUITE_PROFILES.items()}
 ACTIVE_SUITES = {name: cases for name, cases in SUITES.items() if SUITE_PROFILES[name].get("active", True)}
 LARGE_SUITES = {name: cases for name, cases in SUITES.items() if "policy" in SUITE_PROFILES[name]}
@@ -139,9 +172,24 @@ def measurement_contract(suite):
     return {key: profile.get(key, value) for key, value in PERFORMANCE_CONTRACT.items()}
 
 
+def matrix_contract(suite):
+    """Exact measurement contract of a matrix suite: its ordered cells, one variant, no pairing.
+
+    How copies are checked is the suite's verification contract, like every other suite's.
+    """
+    profile = SUITE_PROFILES[suite] if suite in MATRIX_SUITES else None
+    require(profile is not None, "suite is not a benchmark matrix")
+    return dict(cells=profile["cells"], repetitions=profile["repetitions"], timeout=profile["timeout"],
+                purpose=profile["purpose"], cache_policy=PERFORMANCE_CONTRACT["cache_policy"],
+                runner_label=profile["runner_label"])
+
+
 def verification_contracts(suite):
     """Frozen recorded identities, oldest first; missing historical fields stay unknown."""
     require(suite in SUITES, "suite is not allowlisted")
+    if suite in MATRIX_SUITES:
+        # matrix copies are not verified; the identity names the rule that makes a copy count
+        return (dict(policy=MATRIX_POLICY),)
     profile = SUITE_PROFILES[suite]
     return tuple(dict(policy=profile["policy"], **version) for version in profile["verification_versions"]) \
         if "policy" in profile else (None,)

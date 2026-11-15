@@ -41,6 +41,13 @@ PIN_KEYS = frozenset(durable_plan_contract(PLAN)["pin_patterns"])
 minimum_runtime = durable_minimum_runtime
 
 
+def profile_runtime(contract, default):
+    """A plan with a runtime profile runs for exactly that profile's time: the worker's
+    supervisor extension and the independent expiry scan are both bound to it."""
+    profile = contract.get("runtime_profile")
+    return default if profile is None else RUNTIME_PROFILES[profile]["runtime_seconds"]
+
+
 def validate(value, *, exact=True):
     require(isinstance(value, dict) and set(value) == {
         "protocol", "run", "baseline", "candidate", "suite", "controller", "created_at",
@@ -56,6 +63,7 @@ def validate(value, *, exact=True):
     seconds = value["runtime_seconds"]
     require(type(seconds) is int and minimum_runtime(value["plan"], exact=exact) <= seconds <= contract["max_runtime"],
             "runtime does not fit the explicit workload/headroom plan or recorded cap")
+    require(seconds == profile_runtime(contract, seconds), "runtime differs from the plan's recorded runtime profile")
     created, expiry, outer = (utc(value[k]) for k in ("created_at", "capacity_deadline", "outer_deadline"))
     require(0 < (expiry - created).total_seconds() <= contract["max_provisioning"], "capacity wait exceeds the recorded policy")
     require(outer == expiry + timedelta(seconds=seconds), "control reconciliation horizon differs")

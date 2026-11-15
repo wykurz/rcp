@@ -133,9 +133,9 @@ class FileSetPlanTests(unittest.TestCase):
 class FileSetAdmissionTests(unittest.TestCase):
     def test_legacy_wire_policy_remains_byte_identical_and_one_gigabyte_only(self):
         value = asdict(policy())
-        value.pop("manual_suites")
-        value.pop("manual_runtime_seconds")
-        value.pop("extended_manual_not_after")
+        for later in ("manual_suites", "manual_runtime_seconds", "extended_manual_not_after",
+                      "scheduled_suite", "scheduled_runtime_seconds"):
+            value.pop(later)
         self.assertEqual(len(value), 17)
         encoded = production_policy.canonical(value).decode()
         item = dict(pk={"S": "policy"}, version={"S": value["version"]},

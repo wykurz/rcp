@@ -12,13 +12,14 @@ import struct
 import tempfile
 import zipfile
 
-from benchmarks import changes, measurements, operations, pairs, report
+from benchmarks import changes, matrix, measurements, operations, pairs, report
 from benchmarks.strict_json import parse_json
 from benchmarks.verification import verification_label
 from . import identity
 from .json_bytes import encoded
-from .common import (BINARY_NAMES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError, archive_name_supported,
-                     digest, measurement_contract, verification_contract, verification_contracts, require, utc,
+from .common import (BINARY_NAMES, MATRIX_SUITES, MAX_RESULT, SUITES, INSTANCE_TYPE, ValidationError,
+                     archive_name_supported, digest, matrix_contract, measurement_contract, verification_contract,
+                     verification_contracts, require, utc,
                      DURABLE_PROTOCOL, DIRECT_PROTOCOL, durable_plan_contract, durable_worker_reserve, validate_durable_hashes, validate_durable_window, validate_request)
 
 
@@ -27,6 +28,12 @@ MAX_JSON = 8 * 1024 * 1024
 MAX_ENTRIES = 1001
 RESULT = "benchmark/results/results.json"
 SERIES_CONTRACT = "aws-local-ext4-v1"
+# publication bounds for text that a worker wrote about one cell, and for run notes. They are
+# part of public record version 4: records already written must keep validating, so these may
+# grow and never shrink.
+MAX_CELL_STAGE = 32
+MAX_CELL_MESSAGE = 256
+MAX_DIAGNOSTICS = 16
 
 
 CONCLUSIONS = ("success", "failure", "cancelled", "skipped")
@@ -39,6 +46,17 @@ SUBMISSION_CONCLUSIONS = frozenset({"success", "failure", "cancelled", "timed_ou
 def diagnostic(error):
     # generic parsers may echo candidate-controlled input; only our constants are safe
     return str(error) if isinstance(error, ValidationError) else type(error).__name__
+
+
+def completion_label(done, total):
+    return f"{done} of {total} measurement{'' if total == 1 else 's'} completed"
+
+
+def display_text(value, limit):
+    """Bound worker-written text for publication: printable ASCII, cut to a fixed length."""
+    if value is None:
+        return None
+    return "".join(char if " " <= char <= "~" else "?" for char in value[:limit]) or None
 
 
 def read_file(path, maximum, *, single_link=True):
@@ -273,10 +291,17 @@ def inspect(source, expected, conclusion):
         stage = "measurement record"
         if RESULT in contents:
             value = json_value(contents[RESULT], MAX_JSON)
-            require(isinstance(value, dict) and all(isinstance(value.get(key), list) and len(value[key]) <= limit
-                    for key, limit in (("cases", 16), ("variants", 16), ("trials", 512), ("summaries", 256))),
-                    "measurement collection exceeds reporting limit")
-            result = report.validate_result(value)
+            if expected["suite"] in MATRIX_SUITES:
+                try:
+                    result = matrix.validate(value)
+                except matrix.Invalid as error:
+                    # the runner's validator names fields and never quotes the document
+                    raise ValidationError(str(error)) from error
+            else:
+                require(isinstance(value, dict) and all(isinstance(value.get(key), list) and len(value[key]) <= limit
+                        for key, limit in (("cases", 16), ("variants", 16), ("trials", 512), ("summaries", 256))),
+                        "measurement collection exceeds reporting limit")
+                result = report.validate_result(value)
             evidence["expected_verification"] = validate_recorded_verification(result["context"], expected["suite"])
             evidence["raw_revision"] = copy.deepcopy(result["revision"])
         else:
@@ -291,6 +316,7 @@ def inspect(source, expected, conclusion):
 def validate_qualification(evidence, result, policy, *, producer_role="execution"):
     """Validate an authenticated attempt contract without authorizing history publication."""
     expected = evidence["identity"]
+    matrix_suite = expected["suite"] in MATRIX_SUITES
     require(isinstance(policy, dict) and set(policy) == {"schema_version", "identity", "archive_sha256",
             "ami_id", "harness_revision"} and type(policy["schema_version"]) is int
             and policy["schema_version"] == 1, "invalid history policy")
@@ -302,14 +328,20 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
     require(producer_role in {"execution", "submission"}, "unknown producer responsibility")
     producer_ok = evidence["producer_conclusion"] == "success" or (producer_role == "submission" and
         evidence["producer_conclusion"] in SUBMISSION_CONCLUSIONS)
-    require(not evidence["errors"] and result is not None and producer_ok
-            and measurement_contract(expected["suite"])["purpose"] == "performance", "diagnostic run cannot enter performance history")
+    intact = not evidence["errors"] and result is not None and producer_ok
+    if matrix_suite:
+        require(intact, "run evidence is incomplete")
+    else:
+        require(intact and measurement_contract(expected["suite"])["purpose"] == "performance",
+                "diagnostic run cannot enter performance history")
     receipt, worker = evidence["controller"], evidence["worker"]
     instance = receipt.get("instance") or {}
-    require(receipt["outcome"] == "success" and receipt["cleanup"] == "verified"
+    # a paired run is all or nothing and needs a clean exit. A matrix result stands cell by
+    # cell, so a command that was stopped keeps the cells its saved document shows as finished.
+    require((matrix_suite or receipt["outcome"] == "success") and receipt["cleanup"] == "verified"
             and instance.get("image_id") == policy["ami_id"] and instance.get("instance_type") == INSTANCE_TYPE
             and worker.get("harness_revision") == policy["harness_revision"], "unverified execution provenance")
-    require(worker["status"]["success"] is True and worker.get("service_returncode") == 0
+    require((matrix_suite or clean_exit(evidence))
             and worker.get("admission", {}).get("accepted") is True
             and worker.get("request") == receipt["request"], "worker did not complete the approved request")
     if receipt["window"].get("protocol") in (DURABLE_PROTOCOL, DIRECT_PROTOCOL):
@@ -328,8 +360,22 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
         require(admission.get("required_seconds") == required and measurements.nonnegative(remaining)
                 and required <= remaining <= window["runtime_seconds"],
                 "durable admission does not prove the disclosed workload headroom")
-    contract = measurement_contract(expected["suite"])
     validate_recorded_verification(result["context"], expected["suite"], exact=True)
+    if matrix_suite:
+        contract, context = matrix_contract(expected["suite"]), result["context"]
+        require(context["purpose"] == contract["purpose"] and context["repository"] == expected["repository"]
+                and context["cache_policy"] == contract["cache_policy"]
+                and context["runner_label"] == contract["runner_label"]
+                and context["repetitions"] == contract["repetitions"]
+                and context["timeout_seconds"] == contract["timeout"]
+                and [(cell["case_id"], cell["scenario"]) for cell in result["cells"]] == list(contract["cells"]),
+                "unexpected matrix measurement contract")
+        # one build is measured; the request's baseline copies of the same bytes are not run
+        for tool in BINARY_NAMES:
+            require(result["tools"].get(tool, {}).get("sha256") == receipt["request"]["sha256"]["candidate/" + tool],
+                    "measured tool does not match approved binary digest")
+        return
+    contract = measurement_contract(expected["suite"])
     require(result["status"] == "complete" and result["context"].get("purpose") == contract["purpose"]
             and result["context"].get("repository") == expected["repository"]
             and result["context"].get("baseline_commit") == expected["baseline"]
@@ -349,6 +395,43 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
                     for trial in result["trials"]), "incomplete paired comparison")
     # approval also validates the current source proof; callers cannot bypass inspection
     report.validate_result(result)
+
+
+def clean_exit(evidence):
+    """Whether the supervisor saw the benchmark command finish with exit status zero."""
+    worker = evidence["worker"]
+    return worker["status"]["success"] is True and worker.get("service_returncode") == 0
+
+
+def qualify(evidence, result, policy, *, producer_role="execution"):
+    """Qualify one attempt, recording every reason in the evidence; return whether it counts.
+
+    A matrix attempt also gets evidence["cells"]: each cell's outcome whenever the
+    document is the approved run's, even if no cell completed, and nothing otherwise.
+    """
+    matrix_suite = evidence["identity"]["suite"] in MATRIX_SUITES
+    if matrix_suite:
+        evidence["cells"] = []
+    try:
+        validate_qualification(evidence, result, policy, producer_role=producer_role)
+        if not matrix_suite:
+            return True
+        clean = clean_exit(evidence)
+        cells = [dict(case_id=cell["case_id"], scenario=cell["scenario"], outcome=cell["outcome"]["status"],
+                      stage=display_text(cell["outcome"]["stage"], MAX_CELL_STAGE),
+                      message=display_text(cell["outcome"]["message"], MAX_CELL_MESSAGE)) for cell in result["cells"]]
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        # a record of the wrong shape is a failed run; an exception that escaped would leave it held
+        evidence["errors"].append("qualification: " + diagnostic(error))
+        return False
+    # the document is the approved run's: its cells are reported even when none completed
+    evidence["cells"] = cells
+    if not clean:
+        evidence["errors"].append("worker: the benchmark command did not exit cleanly")
+    if not any(cell["outcome"] == "complete" for cell in cells):
+        evidence["errors"].append("qualification: no measurement completed")
+        return False
+    return True
 
 
 def approve(evidence, result, policy):
@@ -454,9 +537,13 @@ def summary(evidence, result):
     lines = ['<h1>AWS benchmark result</h1>',
              '<p><a href="' + html.escape(expected['run_url'], quote=True) + '">Workflow attempt</a></p>',
              '<p>History: ' + ("approved for offline staging" if evidence["history_eligible"] else "diagnostic only; not published") + '</p>']
+    matrix_suite = expected["suite"] in MATRIX_SUITES
+    # a matrix run measures one build; the request's second copy of the same bytes is not run
+    revisions = {"Measured revision": expected["candidate"]} if matrix_suite else {
+        "Comparison": comparison_label(expected, controller),
+        "Candidate": expected["candidate"], "Baseline": expected["baseline"]}
     fields = {"Run": expected["run"], "Producer conclusion": evidence["producer_conclusion"],
-        "Suite": expected["suite"], "Comparison": comparison_label(expected, controller),
-        "Candidate": expected["candidate"], "Baseline": expected["baseline"],
+        "Suite": expected["suite"], **revisions,
         "Controller": expected["controller"], "Controller observed AMI": instance.get("image_id", "unknown"),
         "Supervisor reported baked source": worker.get("harness_revision", "unknown"),
         "Raw harness checkout": (evidence["raw_revision"] or {}).get("commit") or "unknown",
@@ -473,8 +560,19 @@ def summary(evidence, result):
         for key in ("error", "collection_error", "fallback_error", "upload_error", "stop_error"):
             if key in status:
                 fields["Worker " + key.replace("_", " ")] = status[key]
+    if result is not None and matrix_suite:
+        cells = result["cells"]
+        done = sum(cell["outcome"]["status"] == "complete" for cell in cells)
+        fields["Measurements"] = completion_label(done, len(cells))
     lines.append(table(("Provenance", "Value"), fields.items()))
-    if result is not None:
+    if result is not None and matrix_suite:
+        lines.append(table(("File set", "Scenario", "Outcome", "Median seconds", "Copies", "Note"), [(
+            cell["case_id"], cell["scenario"], cell["outcome"]["status"],
+            f"{cell['summary']['median']:.6g}" if cell["summary"] else "-",
+            sum(item["status"] == "ok" for item in cell["copies"]),
+            ": ".join(part for part in (cell["outcome"]["stage"], cell["outcome"]["message"]) if part))
+            for cell in cells]))
+    elif result is not None:
         lines.append(table(("Case", "Variant", "Median seconds", "Repeats"),
             [(item['case_id'], item['variant_id'], f"{item['median']:.6g}", len(item['samples'])) for item in result["summaries"]]))
     lines += ['<p>Artifact validation checks bundle integrity and structure; it does not attest that candidate-controlled measurements are honest.</p>',
@@ -509,7 +607,10 @@ def ingest(source, output, expected, conclusion, policy=None, history=None, *, q
             approve(evidence, raw, policy)
         except (ValueError, TypeError, KeyError, AttributeError) as error:
             evidence["errors"].append("history approval: " + diagnostic(error))
-    record = derived_record(evidence, raw) if raw is not None else None
+    # the dashboard and its history read the paired harness format; a matrix result is
+    # reported through the summary only
+    dashboard = raw is not None and expected["suite"] not in MATRIX_SUITES
+    record = derived_record(evidence, raw) if dashboard else None
     if history is not None:
         try:
             require(evidence["history_eligible"] and record is not None, "history staging refused")
@@ -517,7 +618,7 @@ def ingest(source, output, expected, conclusion, policy=None, history=None, *, q
         except (OSError, ValueError) as error:
             evidence["errors"].append("history staging: " + diagnostic(error))
             evidence["history_eligible"] = False
-            record = derived_record(evidence, raw) if raw is not None else None
+            record = derived_record(evidence, raw) if dashboard else None
     (output / "provenance.json").write_bytes(encoded(evidence))
     text = summary(evidence, raw)
     (output / "summary.md").write_text(text, encoding="utf-8")
