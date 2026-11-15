@@ -387,6 +387,10 @@
                 # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
                 # native `just test` runs fail without it; copied bytes cannot prove either.
                 pkgs.strace
+                # `sshd`, `ssh` and `ssh-keygen`: the benchmark harness tests start a private,
+                # unprivileged sshd on loopback and are never skipped, so `just benchmark-test`
+                # and `just lint` fail without them.
+                pkgs.openssh
               ]
               ++ platform.buildTools;
 

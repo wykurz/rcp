@@ -633,15 +633,24 @@ kernel I/O operation can still require the outer process/cgroup timeout.
 ## Performance-only matrix runs
 
 `just benchmark-matrix` (`python3 -m benchmarks.matrix`) measures a list of *cells* and nothing
-else. A cell is one file set copied under one scenario; the only scenario today is `local`, a copy
-on one host. It is the runner behind the AWS matrix suites, and it runs anywhere:
+else. A cell is one file set copied under one scenario. It is the runner behind the AWS matrix
+suites, and it runs anywhere:
 
 ```bash
 just benchmark-matrix --manifest benchmarks/matrix-cases.json \
-    --cell commission-64m:local --cell commission-10k:local \
+    --cell commission-64m:local --cell commission-64m:remote \
     --bin-dir target/release --source-root /scratch/source --destination-root /scratch/destination \
     --cache uncontrolled --output /tmp/matrix-results
 ```
+
+There are two scenarios:
+
+- **`local`** copies between two directories: `rcp --summary SOURCE DESTINATION`.
+- **`remote`** makes the same copy through rcp's remote path on one host:
+  `rcp --summary --force-remote --bind-ip=127.0.0.1 --rcpd-path=WRAPPER 127.0.0.1:SOURCE 127.0.0.1:DESTINATION`.
+  rcp starts a source and a destination `rcpd` over SSH and the daemons exchange the data over
+  loopback TCP, encrypted as by default. No network hardware and no added latency are involved. See
+  [Remote cells](#remote-cells) for what the runner sets up.
 
 It differs from `benchmark-run` in what it promises:
 
@@ -666,7 +675,9 @@ It differs from `benchmark-run` in what it promises:
   and public pages say so wherever they show these numbers.
 - **Resources are optional per copy.** `--resource-time` records CPU time and peak memory for each
   copy with GNU `time`. A copy whose figures cannot be read still counts, with its CPU and memory
-  marked unavailable.
+  marked unavailable. A remote copy records three sets of figures: the `rcp` command (with the `ssh`
+  clients it starts) under `resources`, and each daemon under `role_resources.source` and
+  `role_resources.destination`.
 
 Cell outcomes are `complete`, `failed`, `timed_out`, `interrupted` (cut short by the end of the
 allocation or by a stop signal) and `not_run`. A failed cell is not retried, and its remaining
@@ -686,6 +697,64 @@ in `removal_failures`.
 
 These documents are a separate format: the dashboards and change reports described below read
 `benchmark-run` results only.
+
+### Remote cells
+
+A run that selects a `remote` cell starts one private SSH endpoint (`benchmarks/private_sshd.py`)
+and stops it when the run ends:
+
+- **A private sshd.** An unprivileged `sshd` listens on `127.0.0.1` only, on a free port, and
+  accepts one key made for this run with `ssh-keygen`. Passwords, forwarding and user rc files are
+  off. It needs `sshd`, `ssh` and `ssh-keygen` (`--sshd`, `--ssh`, `--ssh-keygen`; by default the
+  ones on `PATH`, with `sshd` also looked for in `/usr/sbin`). It serves the account that runs the
+  benchmark, which cannot be root.
+- **An account that logs in silently.** `sshd` runs a command through the account's login shell and
+  starts it in the account's home directory. rcp reads the first line an `rcpd` prints as its
+  readiness record, so a login must print nothing of its own: a shell that refuses commands, or a
+  home that `sshd` cannot enter ("Could not chdir to home directory …"), breaks every remote copy.
+  The endpoint checks this when it starts, with one login that must succeed and print nothing.
+- **A launcher named `ssh`.** rcp runs the first `ssh` on its `PATH`. For remote copies that is a
+  launcher that sends every connection to the private sshd with the private key, and keeps host key
+  checking on although rcp asks for it to be off.
+- **An rcpd wrapper.** `--rcpd-path` names a wrapper that runs the daemon from `--bin-dir` under GNU
+  `time`. sshd starts each daemon in a session of its own, outside the copy's process group, so a
+  daemon that hangs would keep working during the next copy. Every session is therefore marked
+  (`RCP_BENCH_ENDPOINT` in its environment). After a remote copy that failed or timed out, the
+  runner ends at once any marked process that is still running. After one that succeeded, a daemon
+  that is still on its way out gets a few seconds to exit by itself first. Whatever had to be ended
+  is counted in `leftover_processes`.
+- **Loopback addresses everywhere.** Both operands and `--bind-ip` name `127.0.0.1`, so rcp never
+  has to detect an address. Its detection enumerates network interfaces, which a sandbox without
+  netlink sockets forbids; with explicit addresses a remote cell needs IPv4 sockets only.
+
+What a remote cell's numbers include:
+
+- **Time.** The wall time of the `rcp` command, as for a local copy. Besides the copy it holds one
+  SSH connection and four short sessions through the login shell (rcp's two checks of `rcpd` and the
+  two daemons), about 0.2 to 0.4 s here. That is a constant: irrelevant for the large file sets, and
+  most of the time of the small commissioning ones.
+- **Environment.** The daemons run in the environment `sshd` gives a session, not the runner's.
+  Variables set for the runner, such as `TOKIO_WORKER_THREADS` or `MALLOC_CONF`, reach the `rcp`
+  command and local copies but not the daemons that do a remote copy's work.
+
+Keys, configuration and the daemons' figures live in a directory of their own under the temporary
+directory, never under `--output`, which the AWS worker archives. The sshd log is kept at
+`logs/sshd.log`. `context.remote` records the profile (`private-sshd-ipv4-loopback-v1`) and the
+identities of `ssh` and `sshd`.
+
+The endpoint is stopped and its directory removed when the run finishes, fails, or is stopped by
+SIGINT or SIGTERM. A runner that is killed outright (SIGKILL, out of memory) cleans up nothing:
+`sshd` then keeps listening on loopback for that run's key until it is stopped by hand, and the
+directory `rcp-bench-ssh-*` stays in the temporary directory. On the AWS worker the unit's control
+group and private `/tmp` contain both.
+
+An endpoint that cannot be started fails every remote cell at stage `transport`, with the reason,
+and leaves the other cells alone; a file set that has only such cells is not generated. An sshd that
+dies between copies is started again (`endpoint_restarted` on the next copy); if that fails, the
+remaining remote cells fail at `transport` as well.
+
+`python3 -m benchmarks.private_sshd` starts the endpoint, logs in once and stops: a quick check that
+a machine can serve remote cells. When it fails it prints the reason and the end of sshd's log.
 
 ## Results and history
 

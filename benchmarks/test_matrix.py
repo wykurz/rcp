@@ -458,7 +458,7 @@ class MatrixTests(unittest.TestCase):
 
     def test_selection_is_validated_before_any_work(self):
         for cells, message in ((("alpha:local", "alpha:local"), "duplicate"), (("delta:local",), "unknown file set"),
-                               (("alpha:remote",), "unknown scenario"), (("alpha",), "CASE:SCENARIO"), ((), "at least one")):
+                               (("alpha:wan",), "unknown scenario"), (("alpha",), "CASE:SCENARIO"), ((), "at least one")):
             with self.subTest(cells=cells), self.assertRaisesRegex(ValueError, message):
                 self.run_matrix(cells=cells)
             self.assertFalse((self.root / "out").exists())
