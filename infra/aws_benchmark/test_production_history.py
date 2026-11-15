@@ -493,8 +493,9 @@ class HistoryRenderTests(unittest.TestCase):
     def test_reading_guide_explains_scope_ranges_and_linking(self):
         text = history.reading_html()
         for phrase in ("id='reading'", "not whole-host totals", "not confidence intervals",
-                       "worker-reported", "starts a new line", "not independently attested"):
+                       "recorded by the worker", "starts a new line"):
             self.assertIn(phrase, text)
+        self.assertNotIn("attested", text)
         self.assertNotIn("<script", text)
         # pending runs are listed under collection status, not in the run list
         self.assertNotIn("pending", text)

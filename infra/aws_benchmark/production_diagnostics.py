@@ -733,8 +733,8 @@ def render(value, record):
     matrix = _matrix(record)
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
-        "canonical qualification record, verdict and measurement series are unchanged. Measurements "
-        "remain worker-reported, not independently attested.</p><p>Process-resource availability: " +
+        "canonical qualification record, verdict and measurement series are unchanged.</p>"
+        "<p>Process-resource availability: " +
         escape(value["status"]) + ". " + escape(PROCESS_SCOPE) + "</p>")
     if value["reason"] == "phase_summary_budget":
         text += ("<p>Optional sampled phase detail exceeded the public document budget and is omitted. "

@@ -380,15 +380,10 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
                     production_export.badge(value) + '</td><td><code>' + html.escape(identity['suite']) +
                     '</code></td><td>' + production_export.commit_html(identity, identity['candidate']) +
                     '</td><td>' + production_export.collected_html(value) + '</td></tr>')
-    # the frozen trust statements travel with every page that shows worker-reported values
-    note = ('<aside class="note" aria-label="About these numbers"><p>' +
-            html.escape(production_export.projection.MEASUREMENT_CAVEAT) + '</p><p>' +
-            html.escape(production_export.VALIDATION) + ' A few copies per run do not establish broad variance.</p>' +
-            retention + '</aside>')
     setup_content = (
         '<h1>Test setup</h1><p class="lede">Every run uses the same machine type and storage layout, the '
         'datasets below and one of two methods, so they are described here once. What an individual run '
-        "observed is in that run's appendix and its diagnostics JSON.</p>" + note +
+        "observed is in that run's appendix and its diagnostics JSON.</p>" +
         production_export.resource_diagnostics.configuration_html(observed[::-1]) + production_history.reading_html())
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
@@ -410,7 +405,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             if rows else '<p>' + html.escape(empty or 'No public records are listed.') + '</p>')
     pages[home] = aws_page(home, 'AWS benchmarks', (
         '<h1>AWS benchmarks</h1><p class="lede">How long rcp takes to copy fixed datasets on one AWS machine type, '
-        'tracked from commit to commit.</p>' + note + production_history.render(normalized, diagnostics) +
+        'tracked from commit to commit.</p>' + production_history.render(normalized, diagnostics) +
         '<section id="runs" aria-labelledby="runs-title"><h2 id="runs-title">Runs</h2>' + runs + '</section>' +
         status), aws_navigation(home, status=status), footer)
     return pages

@@ -227,6 +227,7 @@ class MatrixPublicationSummaryTests(unittest.TestCase):
         self.assertIn('{"case_id":"bulk-1g-1tb","median":600.2,"scenario":"local","variant_id":"rcp-default"}', text)
         self.assertIn('"qualification":"3 of 4 measurements completed"', text)
         self.assertIn("matrix copies are not verified", text)
+        self.assertNotIn("attested", text)
         # one build was measured: there is no comparison or second revision to report
         self.assertIn('"revision":"' + "1" * 40 + '"', text)
         for field in ('"comparison"', '"baseline"', '"candidate"'):

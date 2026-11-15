@@ -240,9 +240,9 @@ point shows the median copy wall time (a single contributing measurement keeps i
 the median of user plus system CPU seconds **computed per copy**, and the median per-copy peak RSS
 converted from KiB to MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are
 command-scope statistics, not total host CPU or simultaneous process-tree memory; repetitions are
-not summed. The x-axis is the worker-reported benchmark start before fixture preparation, not
-collection or retirement time, and it is not independently attested. The value axis is fitted to the
-data and is never narrower than 5% either side of its centre.
+not summed. The x-axis is the benchmark start recorded by the worker before fixture preparation, not
+collection or retirement time. The value axis is fitted to the data and is never narrower than 5%
+either side of its centre.
 
 Runs of a file set are joined in time order across code versions, harness revisions, frozen series
 IDs and machine instances. A new line starts only when the measurement contract changes or a

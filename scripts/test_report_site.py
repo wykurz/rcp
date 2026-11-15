@@ -212,10 +212,10 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('over worker-reported run start', index)
         self.assertIn('Peak memory', index)
         self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.', index)
-        from infra.aws_benchmark.production_projection import MEASUREMENT_CAVEAT, VALIDATION
-        self.assertIn(MEASUREMENT_CAVEAT, index)
-        self.assertIn(VALIDATION, index)
-        self.assertLess(index.index(MEASUREMENT_CAVEAT), index.index('data-history-metric'))
+        # the page goes from its one-line purpose straight to the plots: no disclaimer box
+        self.assertNotIn('class="note"', index)
+        lede = index.index('class="lede"')
+        self.assertEqual(index[lede:index.index('data-history-metric')].count('<p'), 1)
         self.assertNotIn('PRIVATE', index)
         self.assertEqual(index.count('<script'), 1)
         for value in values:
@@ -248,7 +248,6 @@ class ReportSiteTests(unittest.TestCase):
             self.assertEqual(page.count('8275CL'), 1)
 
     def test_aws_pages_share_the_site_shell_and_section_navigation(self):
-        from infra.aws_benchmark.production_projection import MEASUREMENT_CAVEAT, VALIDATION
         value = self.aws_record()
         result = self.build_retained(self.retained_batch([value]))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -273,9 +272,6 @@ class ReportSiteTests(unittest.TestCase):
                 self.assertEqual(page.count('<script'), 1)
                 self.assertIn('<script id="site-theme">', page)
                 self.assertIn('class="theme-toggle"', page)
-                # the trust statements travel with every page that shows worker-reported values
-                self.assertIn(MEASUREMENT_CAVEAT, page)
-                self.assertIn(VALIDATION, page)
         self.assertTrue((self.output / 'assets/aws.css').is_file())
         detail = (self.output / 'aws-benchmarks/runs' / (value['run_key'] + '.html')).read_text()
         self.assertIn('<title>Run 123-1 · AWS benchmarks · RCP Tools</title>', detail)
@@ -313,16 +309,12 @@ class ReportSiteTests(unittest.TestCase):
         result = self.build_retained(batch, env=dict(os.environ, PATH=''))
         self.assertEqual(result.returncode, 0, result.stderr)
         index = (self.output / 'aws-benchmarks/index.html').read_text()
-        self.assertIn('Still-retained records under the 90-day AWS lifecycle; deletion timing can vary.', index)
         self.assertNotIn('Rolling 90-day', index)
-        self.assertIn('not permanent history', index)
         self.assertIn('Reader revision', index)
         self.assertIn(batch[2], index)
         self.assertNotIn('History commit', index)
         self.assertIn('2026-11-06T18:00:00+00:00', index)
         self.assertNotIn('1999-01-01', index)
-        self.assertIn('not independently attested', index)
-        self.assertIn('does not prove content integrity', index)
         self.assertIn('href="aws-benchmarks/index.html">AWS benchmarks', (self.output / 'index.html').read_text())
         copied = self.output / 'aws-benchmarks/records' / (value['run_key'] + '.json')
         self.assertEqual(copied.read_bytes(), (batch[0] / copied.name).read_bytes())
@@ -330,6 +322,9 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('Collected at', detail)
         self.assertIn(value['collected_at'], detail)
         self.assertNotIn('1999-01-01', detail)
+        # how long the raw data is kept is said once, where the raw data is linked
+        self.assertIn('Still-retained records under the 90-day AWS lifecycle; deletion timing can vary.', detail)
+        self.assertNotIn('90-day AWS lifecycle', index)
         # nothing needs attention, so the observation table stays folded away
         self.assertIn('<details><summary>Observations in this snapshot</summary>', index)
         self.assert_site_links_resolve()
@@ -582,7 +577,6 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('href="aws-benchmarks/index.html">AWS benchmarks', landing)
         self.assertNotIn('ci-benchmarks', landing)
         index = (self.output / 'aws-benchmarks/index.html').read_text()
-        self.assertIn('does not prove content integrity', index)
         self.assertIn('failed; excluded from performance history', index)
         self.assertLess(index.index('124-1'), index.index('123-1'))
         for value in (passed, failed):
@@ -641,7 +635,33 @@ class ReportSiteTests(unittest.TestCase):
         diagnostics = json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000001.json')])
         self.assertEqual(diagnostics['schema'], 'rcp-public-resource-diagnostics-v2')
 
-    def test_public_history_explains_unattested_timings_and_hides_legacy_worker_time(self):
+    def test_no_page_carries_a_disclaimer_about_the_honesty_of_its_own_numbers(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import FAILED, matrix_example
+        from infra.aws_benchmark.test_production_history import observed
+        runs = [observed('42458459014', '08'), matrix_example('matrix-all-local', outcomes={1: FAILED})]
+        records = {record['run_key']: production_export.collection.encoded(record) for record, _ in runs}
+        for retained in (False, True):
+            pages = report_site.render_aws_benchmarks(records, retained=retained, diagnostics={
+                record['run_key']: extra for record, extra in runs})
+            documents = {path: text for path, text in pages.items() if path.suffix == '.html'}
+            self.assertGreaterEqual(len(documents), 5)
+            for path, document in documents.items():
+                with self.subTest(page=str(path), retained=retained):
+                    # the benchmark measures rcp; it does not argue with its own runner
+                    for phrase in ('self-reported', 'attested', 'honest', 'Candidate code', 'About these numbers'):
+                        self.assertNotIn(phrase, document)
+            for name in ('index.html', 'setups.html'):
+                page = pages[Path('aws-benchmarks') / name]
+                self.assertNotIn('class="note"', page)
+                self.assertNotIn('broad variance', page)
+                self.assertNotIn('90-day AWS lifecycle', page)
+        # how each run's copies were checked stays a fact of that run
+        page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000001.html')]
+        self.assertIn('Not verified: a copy counts when rcp exits cleanly and reports the expected file count.', page)
+
+    def test_public_history_hides_a_legacy_worker_time_it_cannot_show_safely(self):
         value = self.aws_record()
         value['timestamp'] = '1999-01-01\u202e00:00:00+00:00'
         history = self.aws_history({value['run_key'] + '.json': ('100644', value)})
@@ -650,8 +670,6 @@ class ReportSiteTests(unittest.TestCase):
         for relative in ('aws-benchmarks/index.html', 'aws-benchmarks/runs/' + value['run_key'] + '.html'):
             text = (self.output / relative).read_text()
             self.assertIn('consistency checks passed', text)
-            self.assertIn('not independently attested', text)
-            self.assertIn('self-reported', text)
             self.assertNotIn('1999-01-01', text)
             self.assertNotIn('\u202e', text)
 

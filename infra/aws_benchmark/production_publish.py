@@ -320,8 +320,7 @@ def summary(index, records=()):
                 break
             text += "\n- Exported record: `" + rendered + "`\n"
         text += ("\nThese are observations, not a new teardown proof. Metadata validation does not prove content "
-                 "integrity, and matrix copies are not verified. ")
-        text += public.projection.MEASUREMENT_CAVEAT + "\n"
+                 "integrity, and matrix copies are not verified.\n")
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(text)
 

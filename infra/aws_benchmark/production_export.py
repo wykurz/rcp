@@ -190,8 +190,7 @@ def render(value, *, diagnostics=None):
         ("Workflow", "<a href='" + escape(identity["run_url"]) + "'>Workflow attempt</a>")]
     html = ("<h1>Run " + escape(identity["run"]) + " " + badge(value) + "</h1><dl class='facts'>" +
         "".join("<div><dt>" + name + "</dt><dd>" + item + "</dd></div>" for name, item in facts) +
-        "</dl><aside class='note'><p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" +
-        escape(value["note"]) + "</p></aside>")
+        "</dl><aside class='note'><p>" + escape(value["note"]) + "</p></aside>")
     if matrix and value["diagnostics"]:
         html += ("<section aria-labelledby='run-notes'><h2 id='run-notes'>Run notes</h2><ul>" +
                  "".join("<li>" + escape(item) + "</li>" for item in value["diagnostics"]) + "</ul></section>")
