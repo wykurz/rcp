@@ -178,3 +178,43 @@ fn created_before_rejected_on_musl() {
         "nothing should be removed when the run is rejected up front"
     );
 }
+
+#[test]
+fn json_summary_is_one_object_with_exact_counters_and_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("a"), "aaa").unwrap();
+    std::fs::write(tree.join("sub").join("b"), "bbbb").unwrap();
+    let output = rrm()
+        .args(["--summary", "--output-format", "json"])
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+    assert_eq!(summary["files_removed"], 2);
+    assert_eq!(summary["directories_removed"], 2);
+    assert_eq!(summary["bytes_removed"], 7);
+    for key in [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ] {
+        assert!(summary[key].is_u64(), "missing {key}: {summary}");
+    }
+    assert!(summary["walltime_ms"].is_u64(), "{summary}");
+    assert!(!tree.exists());
+    // text stays the default
+    std::fs::create_dir(&tree).unwrap();
+    let text = rrm().arg("--summary").arg(&tree).output().unwrap();
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("directories removed: 1"), "{text}");
+    assert!(text.contains("page faults : "), "{text}");
+}

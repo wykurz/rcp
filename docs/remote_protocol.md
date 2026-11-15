@@ -57,8 +57,8 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 11 adds receiver copy-buffer retention configuration to daemon startup, following revision
-10's directory discovery, pipelined directory lifetime admission, and preview-only startup. It
+revision 12 adds context switch and page fault counts to the statistics a daemon reports with its
+result, following revision 11's receiver copy-buffer retention configuration at daemon startup. It
 requires exact-version rcp/rcpd binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
@@ -404,6 +404,12 @@ When branch admission is full, `source.directory.scan` also includes sequential 
 - **Variants**:
   - `Success { message, summary, runtime_stats }`
   - `Failure { error, summary, runtime_stats }`
+- **`runtime_stats`**: what the rcpd process used, measured by itself just before it reports: user
+  and kernel CPU time in milliseconds, peak resident set size in bytes, voluntary and involuntary
+  context switches, and minor and major page faults. Every figure covers the whole process. The
+  master prints them per role with `--summary`. The set of fields is not negotiated: master and rcpd
+  are always the same build, and wire revision 12 tells builds with the four counters apart from
+  earlier builds of the same version.
 
 ### 2.2 Source → Destination Messages (Control Stream)
 

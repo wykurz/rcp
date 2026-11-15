@@ -545,6 +545,60 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     output
 }
 
+#[test]
+fn test_remote_json_summary_reports_master_source_and_destination() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src = src_dir.path().join("tree");
+    std::fs::create_dir(&src).unwrap();
+    for index in 0..4 {
+        create_test_file(&src.join(format!("file-{index}")), "payload", 0o644);
+    }
+    let dst = dst_dir.path().join("copy");
+    // the two ends are named differently, so that a role reported under the wrong name shows
+    let src_remote = format!("127.0.0.1:{}", src.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--summary",
+        "--output-format",
+        "json",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // this helper runs rcp with verbose logging: the object is the last line, after the log
+    let last = stdout.lines().last().expect("a summary line");
+    let summary: serde_json::Value = serde_json::from_str(last).unwrap();
+    assert!(
+        !stdout.contains("MASTER + SOURCE + DESTINATION"),
+        "{stdout}"
+    );
+    assert_eq!(summary["files_copied"], 4);
+    assert_eq!(summary["bytes_copied"], 28);
+    let stats = [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ];
+    // the master at the top level, and each daemon under its role with the host it ran on
+    for process in [
+        &summary,
+        &summary["remote"]["source"],
+        &summary["remote"]["destination"],
+    ] {
+        for key in stats {
+            assert!(process[key].is_u64(), "missing {key}: {summary}");
+        }
+        assert!(process["peak_rss_bytes"].as_u64().unwrap() > 1024 * 1024);
+    }
+    assert_eq!(summary["remote"]["source"]["host"], "127.0.0.1");
+    assert_eq!(summary["remote"]["destination"]["host"], "localhost");
+    assert!(dst.join("file-3").exists());
+}
+
 fn run_rcp_and_capture_daemon_logs(args: &[&str]) -> (std::process::Output, String) {
     // synchronous daemon files remain available when forwarded tracing is dropped
     let logs = tempfile::tempdir().unwrap();

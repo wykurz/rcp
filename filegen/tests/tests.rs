@@ -53,3 +53,37 @@ fn legacy_unlimited_file_limit_remains_accepted_with_one_warning() {
             .count();
     assert_eq!(warning_count, 1, "legacy spelling must warn exactly once");
 }
+
+#[test]
+fn json_summary_is_one_object_with_exact_counters_and_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = assert_cmd::Command::cargo_bin("filegen")
+        .unwrap()
+        .args(["--summary", "--output-format", "json"])
+        .arg(dir.path())
+        .args(["2", "3", "10", "--leaf-files"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+    assert_eq!(summary["files_created"], 6);
+    assert_eq!(summary["bytes_written"], 60);
+    for key in [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ] {
+        assert!(summary[key].is_u64(), "missing {key}: {summary}");
+    }
+    assert!(summary["walltime_ms"].is_u64(), "{summary}");
+}

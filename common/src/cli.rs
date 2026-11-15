@@ -257,15 +257,21 @@ impl CommonArgs {
             (Some(_), Some(_)) => unreachable!("clap rejects conflicting file limits"),
         }
     }
-    /// Build a [`crate::OutputConfig`]. `quiet` and `print_summary` are
-    /// supplied by the caller (each binary owns its own `--quiet` and
-    /// `--summary` flags so it can document binary-specific semantics).
+    /// Build a [`crate::OutputConfig`]. `quiet`, `print_summary` and `format` are
+    /// supplied by the caller (each binary owns its own `--quiet`, `--summary` and
+    /// `--output-format` flags so it can document binary-specific semantics).
     #[must_use]
-    pub fn output_config(&self, quiet: bool, print_summary: bool) -> crate::OutputConfig {
+    pub fn output_config(
+        &self,
+        quiet: bool,
+        print_summary: bool,
+        format: crate::OutputFormat,
+    ) -> crate::OutputConfig {
         crate::OutputConfig {
             quiet,
             verbose: self.verbose,
             print_summary,
+            format,
             ..Default::default()
         }
     }

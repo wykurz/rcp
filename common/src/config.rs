@@ -388,6 +388,16 @@ impl ThrottleConfig {
     }
 }
 
+/// How a tool prints what it reports at the end of a run.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable text
+    #[default]
+    Text,
+    /// JSON: exact numbers, one object per line
+    Json,
+}
+
 /// Output and logging configuration
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutputConfig {
@@ -397,9 +407,9 @@ pub struct OutputConfig {
     pub verbose: u8,
     /// Print summary statistics at the end
     pub print_summary: bool,
-    /// When true, `run()` will not print text runtime stats after the summary.
-    /// Used when the summary itself includes runtime stats (e.g. JSON format).
-    pub suppress_runtime_stats: bool,
+    /// Format of the summary. As JSON it is one object that also holds the wall time and the
+    /// process statistics, which the text format prints after the summary.
+    pub format: OutputFormat,
     /// Prefix pre-tracing configuration failures with a machine-readable startup record.
     pub startup_error_prefix: Option<&'static str>,
 }

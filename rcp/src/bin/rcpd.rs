@@ -960,7 +960,9 @@ fn main() -> Result<(), anyhow::Error> {
         filename
     });
     // rcpd never prints a user-facing summary (results stream to master).
-    let mut output = args.common.output_config(args.quiet, false);
+    let mut output = args
+        .common
+        .output_config(args.quiet, false, common::OutputFormat::Text);
     output.startup_error_prefix = Some(remote::RCPD_STARTUP_ERROR_PREFIX);
     let runtime = args.common.runtime_config();
     let throttle = args.throttle_config(files_in_flight, concurrency);

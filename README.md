@@ -614,6 +614,40 @@ For detailed security architecture and threat model, see `docs/security.md`.
 - sent to `stdout`
 - by default disabled
 - enabled using `--summary`
+- as text it lists what was done, then the wall time and the statistics of the process: CPU time,
+  peak memory, context switches and page faults. After a remote copy the statistics are listed for
+  the master and for the source and destination `rcpd`
+- `--output-format json` prints one JSON object on a single line instead, with the same counters as
+  exact numbers and nothing rounded for reading. `rcmp` prints JSON by default; the other tools
+  print text
+
+```json
+{
+  "bytes_copied": 12288,
+  "cpu_time_kernel_ms": 4,
+  "cpu_time_user_ms": 21,
+  "directories_created": 2,
+  "files_copied": 3,
+  "involuntary_context_switches": 0,
+  "major_page_faults": 0,
+  "minor_page_faults": 1610,
+  "peak_rss_bytes": 22618112,
+  "remote": {
+    "destination": { "cpu_time_user_ms": 13, "host": "host2", "peak_rss_bytes": 25157632 },
+    "source": { "cpu_time_user_ms": 16, "host": "host1", "peak_rss_bytes": 22573056 }
+  },
+  "rm_summary": { "files_removed": 0 },
+  "voluntary_context_switches": 196,
+  "walltime_ms": 500
+}
+```
+
+The example is abridged and wrapped for reading; keys are in alphabetical order. The counters are
+those of the tool that ran (`rcp` shown here). The top-level statistics are those of the process
+that prints the summary; `remote` is present only after a remote copy, and each role in it carries
+the same statistics as the top level. With verbose logging on, log lines share `stdout` with the
+object, which is printed last. A run that fails reports in text, as without the option: its error,
+then the statistics.
 
 ## Filtering
 
@@ -941,8 +975,8 @@ scans W and pending work to Q. The source reports its logical file limit and str
 master starts the destination with matching values. Each endpoint installs a joint leaf/directory
 resource plan, then the source intersects their directory lifetime limits. See
 [resource admission](docs/remote_protocol.md#78-backpressure-and-task-ownership) for the bounds.
-Wire revision 11 requires matching binaries, including receiver-buffer retention startup
-configuration.
+Wire revision 12 requires matching binaries, including the statistics each daemon reports with its
+result.
 
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves

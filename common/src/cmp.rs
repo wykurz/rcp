@@ -40,16 +40,6 @@ pub type Mismatch = EnumMap<ObjType, EnumMap<CompareResult, u64>>;
 /// Count of skipped items per object type
 pub type Skipped = EnumMap<ObjType, u64>;
 
-/// Output format for comparison results and summary.
-#[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
-pub enum OutputFormat {
-    /// JSON output (NDJSON for differences, JSON object for summary)
-    #[default]
-    Json,
-    /// Human-readable text output (legacy format)
-    Text,
-}
-
 fn compare_result_name(cr: CompareResult) -> &'static str {
     match cr {
         CompareResult::Same => "same",
@@ -151,56 +141,40 @@ impl std::fmt::Display for Summary {
     }
 }
 
-/// Wraps a [`Summary`] with an [`OutputFormat`] so that [`Display`](std::fmt::Display)
-/// renders either human-readable text or JSON.
-pub struct FormattedSummary {
-    pub summary: Summary,
-    pub format: OutputFormat,
-}
-
-impl std::fmt::Display for FormattedSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.format {
-            OutputFormat::Text => write!(f, "{}", self.summary),
-            OutputFormat::Json => {
-                let mut mismatch = serde_json::Map::new();
-                for (obj_type, &cmp_res_map) in &self.summary.mismatch {
-                    let mut counts = serde_json::Map::new();
-                    for (cmp_res, &count) in &cmp_res_map {
-                        counts.insert(
-                            compare_result_name(cmp_res).to_string(),
-                            serde_json::Value::Number(count.into()),
-                        );
-                    }
-                    mismatch.insert(
-                        obj_type_name(obj_type).to_string(),
-                        serde_json::Value::Object(counts),
-                    );
-                }
-                let mut skipped = serde_json::Map::new();
-                for (obj_type, &count) in &self.summary.skipped {
-                    if count > 0 {
-                        skipped.insert(
-                            obj_type_name(obj_type).to_string(),
-                            serde_json::Value::Number(count.into()),
-                        );
-                    }
-                }
-                let stats = crate::collect_runtime_stats();
-                let walltime = crate::get_progress().get_duration();
-                let obj = serde_json::json!({
-                    "src_bytes": self.summary.src_bytes,
-                    "dst_bytes": self.summary.dst_bytes,
-                    "mismatch": serde_json::Value::Object(mismatch),
-                    "skipped": serde_json::Value::Object(skipped),
-                    "walltime_ms": walltime.as_millis() as u64,
-                    "cpu_time_user_ms": stats.cpu_time_user_ms,
-                    "cpu_time_kernel_ms": stats.cpu_time_kernel_ms,
-                    "peak_rss_bytes": stats.peak_rss_bytes,
-                });
-                write!(f, "{obj}")
+/// The JSON shape of a comparison: byte totals, and counts keyed by object type and result.
+/// Types with nothing skipped are left out of `skipped`.
+impl serde::Serialize for Summary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut mismatch = serde_json::Map::new();
+        for (obj_type, &cmp_res_map) in &self.mismatch {
+            let mut counts = serde_json::Map::new();
+            for (cmp_res, &count) in &cmp_res_map {
+                counts.insert(
+                    compare_result_name(cmp_res).to_string(),
+                    serde_json::Value::Number(count.into()),
+                );
+            }
+            mismatch.insert(
+                obj_type_name(obj_type).to_string(),
+                serde_json::Value::Object(counts),
+            );
+        }
+        let mut skipped = serde_json::Map::new();
+        for (obj_type, &count) in &self.skipped {
+            if count > 0 {
+                skipped.insert(
+                    obj_type_name(obj_type).to_string(),
+                    serde_json::Value::Number(count.into()),
+                );
             }
         }
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("src_bytes", &self.src_bytes)?;
+        map.serialize_entry("dst_bytes", &self.dst_bytes)?;
+        map.serialize_entry("mismatch", &mismatch)?;
+        map.serialize_entry("skipped", &skipped)?;
+        map.end()
     }
 }
 
@@ -208,7 +182,7 @@ impl std::fmt::Display for FormattedSummary {
 pub struct LogWriter {
     file: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>>,
     stdout: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>>,
-    format: OutputFormat,
+    format: crate::OutputFormat,
 }
 
 impl std::fmt::Debug for LogWriter {
@@ -230,7 +204,7 @@ impl LogWriter {
     pub async fn new(
         log_path_opt: Option<&std::path::Path>,
         use_stdout: bool,
-        format: OutputFormat,
+        format: crate::OutputFormat,
     ) -> Result<Self> {
         if let Some(log_path) = log_path_opt {
             let log_file = tokio::fs::OpenOptions::new()
@@ -265,7 +239,7 @@ impl LogWriter {
     /// Creates a silent LogWriter that produces no output, using the default format.
     /// Convenience constructor primarily for tests.
     pub async fn silent() -> Result<Self> {
-        Self::new(None, false, OutputFormat::default()).await
+        Self::new(None, false, crate::OutputFormat::default()).await
     }
 
     pub async fn log_mismatch(
@@ -277,12 +251,12 @@ impl LogWriter {
         dst: &std::path::Path,
     ) -> Result<()> {
         let msg = match self.format {
-            OutputFormat::Text => {
+            crate::OutputFormat::Text => {
                 format!(
                     "[{cmp_result:?}]\n\t[{src_obj_type:?}]\t{src:?}\n\t[{dst_obj_type:?}]\t{dst:?}\n"
                 )
             }
-            OutputFormat::Json => {
+            crate::OutputFormat::Json => {
                 let src_type_val = match src_obj_type {
                     Some(ot) => serde_json::Value::String(obj_type_name(ot).to_string()),
                     None => serde_json::Value::Null,
@@ -950,7 +924,7 @@ mod cmp_tests {
             &LogWriter::new(
                 Some(tmp_dir.join("cmp.log").as_path()),
                 false,
-                OutputFormat::Text,
+                crate::OutputFormat::Text,
             )
             .await?,
             &compare_settings,

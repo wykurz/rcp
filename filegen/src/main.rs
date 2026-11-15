@@ -87,6 +87,20 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
+    /// Format of the summary that --summary prints
+    ///
+    /// "text" is the human-readable summary. "json" prints one JSON object on a single line
+    /// instead: the same counters as exact numbers, the wall time in milliseconds and the
+    /// statistics of the process (CPU time, peak memory, context switches, page faults).
+    /// A run that fails still reports its error as text.
+    #[arg(
+        long,
+        default_value = "text",
+        value_name = "FORMAT",
+        help_heading = "Progress & output"
+    )]
+    output_format: common::OutputFormat,
+
     /// Quiet mode, don't report errors
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
@@ -147,7 +161,9 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         |_admission| async_main(args)
     };
-    let output = args.common.output_config(args.quiet, args.summary);
+    let output = args
+        .common
+        .output_config(args.quiet, args.summary, args.output_format);
     let runtime = args.common.runtime_config();
     let throttle = args
         .common

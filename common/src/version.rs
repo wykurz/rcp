@@ -42,8 +42,8 @@ pub struct ProtocolVersion {
 /// argument change whenever the crate version does not also change. The crate version alone cannot
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
-/// Revision 11 adds the receiver copy-buffer retention limit to daemon startup arguments.
-pub const WIRE_REVISION: u32 = 11;
+/// Revision 12 adds context switch and page fault counts to the statistics in `RcpdResult`.
+pub const WIRE_REVISION: u32 = 12;
 
 impl ProtocolVersion {
     /// Get the current protocol version
