@@ -58,7 +58,8 @@ replace those triggers. No timing threshold blocks a change.
 
 ### rust.yml
 
-Runs on every push and pull request to `main`:
+Runs on pushes to `main` and pull requests targeting any branch, including stacked pull requests
+that target another feature branch:
 
 - **format**: Checks code formatting with `cargo fmt`
 - **lint**: Runs Clippy linter

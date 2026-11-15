@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
 
 # Least-privilege GITHUB_TOKEN; the called validate workflow only reads the repo.
 permissions:
