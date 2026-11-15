@@ -14,9 +14,13 @@ from . import production_projection as projection
 from .common import require
 from .results import utc
 
+# newest qualified runs plotted for each file set
 MAX_PLOT_RUNS = 32
 # the build under test with default settings, and the same command run with a reference build
 CURRENT, REFERENCE = "rcp-default", "rcp-baseline"
+# what a cell's scenario means to a reader; these trends plot the copy made on one host
+LOCAL = "local"
+SCENARIOS = {LOCAL: "Local copy"}
 CASES = {
     "bulk-1g-1tb": "1 GB files",
     "bulk-100m-1024gb": "100 MB files",
@@ -67,16 +71,18 @@ def _points(value, extra):
     roles = (CURRENT, REFERENCE) if value["comparison"] == projection.IDENTICAL_BINARIES else (CURRENT,)
     selected, outside, seen = {}, 0, set()
     for measurement in value["measurements"]:
-        key = (measurement["case_id"], measurement["variant_id"])
+        # a record without scenarios predates the matrix: all of its copies are local
+        key = (measurement["case_id"], measurement.get("scenario", LOCAL), measurement["variant_id"])
         require(key not in seen, "duplicate history case and variant")
         seen.add(key)
-        if key[0] in CASES and key[1] in roles:
+        if key[0] in CASES and key[1] == LOCAL and key[2] in roles:
             selected.setdefault(key[0], []).append(measurement)
         else:
             outside += 1
     points = {}
     for case, items in selected.items():
         trials = [] if extra is None else [row for row in extra["trials"] if row["case_id"] == case and
+                                           row.get("scenario", LOCAL) == LOCAL and
                                            any(row["variant_id"] == item["variant_id"] for item in items)]
         # resources count only when every plotted copy has them; a subset would cherry-pick repeats
         complete = all(sum(row["variant_id"] == item["variant_id"] for row in trials) == len(item["samples"])
@@ -378,48 +384,52 @@ def _file_set(case, points):
     return html + "</tbody></table></div></details></section>"
 
 
-def _render(cases, outside, omitted):
+def _render(cases, outside, limit, unmeasured):
     html = "<section id='history' aria-label='Performance history'>"
     html += "".join(_file_set(case, points) for case, points in cases.items() if points)
-    empty = [CASES[case] for case, points in cases.items() if not points]
+    empty = [CASES[case] for case in unmeasured]
     if empty:
         html += ("<p class='empty'>No qualified runs yet for " +
                  (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
-    if omitted:
-        html += ("<p class='window'>The plots show the newest qualified runs. " +
-                 plural(omitted, "older qualified run is", "older qualified runs are") +
-                 " not plotted; every run stays in the list below.</p>")
+    if limit is not None:
+        html += ("<p class='window'>The plots show each file set's newest " +
+                 plural(limit, "qualified run", "qualified runs") +
+                 ". Older runs are not plotted; every run stays in the list below.</p>")
     if outside:
         html += ("<p class='window'>" + plural(outside, "qualified measurement is", "qualified measurements are") +
-                 " outside these trends (reference builds, other variants or other file sets); "
+                 " outside these trends (reference builds, other variants, scenarios or file sets); "
                  "see the run pages.</p>")
     return html + "</section>"
 
 
 def render(records, companions):
-    """Plot the newest qualified runs; the complete inventory and frozen records stay unbounded by this."""
+    """Plot each file set's newest qualified runs; the inventory and frozen records stay unbounded by this."""
     cases, outside = model(records, companions)
-    started = {item["run_key"]: item["at"] for points in cases.values() for item in points}
-    selected = sorted(started, key=lambda key: (started[key], key), reverse=True)[:MAX_PLOT_RUNS]
+    # a file set is unmeasured only when no run ever measured it, whatever the plots show
+    unmeasured = [case for case, points in cases.items() if not points]
+    limit = MAX_PLOT_RUNS
     while True:
-        chosen = set(selected)
-        window = {case: [item for item in points if item["run_key"] in chosen] for case, points in cases.items()}
+        # each file set keeps its own newest runs: one measured weekly is not pushed off the
+        # page by one measured every few days
+        window = {case: points[max(len(points) - limit, 0):] for case, points in cases.items()}
         for points in window.values():
             # markers and breaks always relate two plotted runs
             _link(points)
-        html = _render(window, outside, len(started) - len(selected))
+        cut = any(len(points) > limit for points in cases.values())
+        html = _render(window, outside, limit if cut else None, unmeasured)
         if len(html.encode()) <= projection.MAX_PUBLIC_HTML:
             return html
-        require(selected, "AWS history plots exceed public HTML bound")
-        selected.pop()
+        require(limit, "AWS history plots exceed public HTML bound")
+        limit -= 1
 
 
 def reading_html():
     """Explain once how points, lines and gaps are derived."""
     return ("<section aria-labelledby='reading'><h2 id='reading'>Reading the plots</h2><ul>"
-        "<li><strong>Point.</strong> One qualified run, summarizing the copies made by the build under test "
-        "with rcp's default settings. When a run's baseline and candidate binaries are identical, all of its "
-        "copies count; otherwise only the candidate's copies do.</li>"
+        "<li><strong>Point.</strong> One qualified run, summarizing the copies of one file set made by the "
+        "build under test with rcp's default settings: three copies in a matrix run, four in a paired run. "
+        "In a paired run all four count when its baseline and candidate binaries are identical; otherwise "
+        "only the candidate's two do.</li>"
         "<li><strong>Value and bar.</strong> The value is the median of those copies. The bar spans the fastest "
         "and slowest copy: repeat minima and maxima, not confidence intervals. A few copies do not establish "
         "a performance change.</li>"
@@ -441,7 +451,7 @@ def reading_html():
         "or a recorded hardware value differs from the last recorded one: CPU model or count, architecture, "
         "storage devices, layout or filesystem. Any other recorded change, such as the kernel, is marked on "
         "the line. A field that an older run did not record is not a change.</li>"
-        "<li><strong>Scope.</strong> Current <code>aws-local-ext4-v1</code> runs are local copies; future "
-        "remote modes require their own validated contract. Only qualified runs are plotted. Failed "
-        "and unavailable runs stay in the run list without performance points.</li>"
+        "<li><strong>Scope.</strong> The plots show local copies on one host. A run counts for every file "
+        "set it measured; a file set it did not finish has no point for that run, and its run page says why. "
+        "Failed and unavailable runs stay in the run list without performance points.</li>"
         "</ul></section>")

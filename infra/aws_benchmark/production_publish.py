@@ -305,17 +305,22 @@ def summary(index, records=()):
                 text += "- " + item.get("run_key", "unnamed") + ": " + item["state"] + " — `" + reason + "`\n"
         for value in records:
             public.validate_public(value)
-            detail = dict(run=value["identity"]["run"], baseline=value["identity"]["baseline"],
-                candidate=value["identity"]["candidate"], comparison=value["comparison"],
+            # a matrix run measures one build: it has a revision, and nothing to compare
+            revisions = dict(revision=value["identity"]["candidate"]) if "cells" in value else dict(
+                baseline=value["identity"]["baseline"], candidate=value["identity"]["candidate"],
+                comparison=value["comparison"])
+            detail = dict(run=value["identity"]["run"], **revisions,
                 collected_at=public.projection.collected_time(value),
                 qualification=public.projection.outcome_label(value),
-                measurements=[{key: item[key] for key in ("case_id", "variant_id", "median")} for item in value["measurements"]])
+                measurements=[{key: item[key] for key in ("case_id", "scenario", "variant_id", "median") if key in item}
+                              for item in value["measurements"]])
             rendered = encoded(detail).decode().strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "&#96;")
             if len(text.encode()) + len(rendered.encode()) > 60000:
                 text += "\nFurther record details are available in the bounded public JSON artifact.\n"
                 break
             text += "\n- Exported record: `" + rendered + "`\n"
-        text += "\nThese are observations, not a new teardown proof. Metadata validation does not prove content integrity. "
+        text += ("\nThese are observations, not a new teardown proof. Metadata validation does not prove content "
+                 "integrity, and matrix copies are not verified. ")
         text += public.projection.MEASUREMENT_CAVEAT + "\n"
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(text)

@@ -366,7 +366,11 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             f'<li><a href="../records/{run_key}.json">Public JSON record</a>: '
             'the frozen record this page is rendered from.</li>'
             f'<li><a href="../diagnostics/{run_key}.json">Resource diagnostics JSON</a>: '
-            'per-copy resources, sampled phases and the observed setup.</li></ul>' + retention + '</section>')
+            'per-copy resources, sampled phases and the observed setup.</li>' +
+            # where the logs and the complete results of a run can still be found, and until when
+            ('' if production_export.evidence_html(value) is None else
+             '<li>Worker evidence (not public): ' + production_export.evidence_html(value) + '.</li>') +
+            '</ul>' + retention + '</section>')
         name = 'Run ' + identity['run']
         pages[report] = aws_page(report, name + ' · AWS benchmarks', body, aws_navigation(report, status=status) + [
             aws_link(name, '#report-content', current=True), aws_link('Results', '#results', nested=True),
@@ -382,9 +386,9 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             html.escape(production_export.VALIDATION) + ' A few copies per run do not establish broad variance.</p>' +
             retention + '</aside>')
     setup_content = (
-        '<h1>Test setup</h1><p class="lede">Every run uses the same machine type, storage layout, datasets and '
-        "method, so they are described here once. What an individual run observed is in that run's appendix and "
-        'its diagnostics JSON.</p>' + note +
+        '<h1>Test setup</h1><p class="lede">Every run uses the same machine type and storage layout, the '
+        'datasets below and one of two methods, so they are described here once. What an individual run '
+        "observed is in that run's appendix and its diagnostics JSON.</p>" + note +
         production_export.resource_diagnostics.configuration_html(observed[::-1]) + production_history.reading_html())
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')

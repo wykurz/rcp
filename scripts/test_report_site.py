@@ -565,7 +565,7 @@ class ReportSiteTests(unittest.TestCase):
         self.assertEqual((directory / oldest).read_text(), records[oldest][1])
         index = (self.output / "aws-benchmarks/index.html").read_text()
         history, runs = index[index.index("id='history'"):index.index('id="runs"')], index[index.index('id="runs"'):]
-        self.assertIn("481 older qualified runs", history)
+        self.assertIn("newest 32 qualified runs. Older runs are not plotted", history)
         self.assertIn("runs/repo-655073755-run-1512.html", history)
         self.assertNotIn("runs/repo-655073755-run-1000.html", history)
         self.assertIn("runs/repo-655073755-run-1000.html", runs)
@@ -608,6 +608,38 @@ class ReportSiteTests(unittest.TestCase):
                 self.assertTrue(target.is_file(), (page, value))
                 if url.fragment and target.suffix == '.html':
                     self.assertIn(unquote(url.fragment), [a.get('id') for _, a in Elements(target.read_text()).tags])
+
+    def test_matrix_runs_are_listed_plotted_and_described_as_unverified(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import FAILED, matrix_example
+        from infra.aws_benchmark.test_production_history import observed
+        runs = [observed('42458459014', '08'), matrix_example('matrix-all-local', outcomes={1: FAILED}),
+                matrix_example('matrix-commission-local', run='43200000002', at='2026-11-21T08:30:00+00:00')]
+        records = {record['run_key']: production_export.collection.encoded(record) for record, _ in runs}
+        pages = report_site.render_aws_benchmarks(records, diagnostics={record['run_key']: extra for record, extra in runs})
+        index = pages[Path('aws-benchmarks/index.html')]
+        self.assertIn("<span class='badge badge-partial'>3 of 4 measurements completed</span>", index)
+        self.assertIn("<span class='badge badge-passed'>2 of 2 measurements completed</span>", index)
+        self.assertIn('<code>matrix-all-local</code>', index)
+        for title in ('1 GB files', '1 MB files', '1 KB files'):
+            self.assertIn('<h2 id=\'history-' + {'1 GB files': 'bulk-1g-1tb', '1 MB files': 'bulk-1m-1024gb',
+                '1 KB files': 'tiny-1k-10240k'}[title] + '-title\'>' + title + '</h2>', index)
+        self.assertIn('No qualified runs yet for 100 MB files.', index)
+        # the small test fixtures of the commissioning run are measured, and not part of any trend
+        self.assertIn('2 qualified measurements are outside these trends', index)
+        page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000001.html')]
+        self.assertIn('<li>Worker evidence (not public): <code>production/runs/repo-655073755-run-43200000001/'
+                      'collection/</code> in the benchmark bucket until about 18 Feb 2027; fetch it with '
+                      '<code>just aws-benchmark-evidence repo-655073755-run-43200000001 DIRECTORY</code>.</li>', page)
+        self.assertIn('What happened', page)
+        self.assertIn('During copy: copy 1 failed with exit codes [3]: &lt;b&gt;bold&lt;/b&gt;', page)
+        self.assertNotIn('<b>bold', page)
+        setup = pages[Path('aws-benchmarks/setups.html')]
+        self.assertIn('three fresh copies of each file set with one build', setup)
+        self.assertIn('differs between runs', setup)
+        diagnostics = json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000001.json')])
+        self.assertEqual(diagnostics['schema'], 'rcp-public-resource-diagnostics-v2')
 
     def test_public_history_explains_unattested_timings_and_hides_legacy_worker_time(self):
         value = self.aws_record()
