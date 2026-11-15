@@ -42,6 +42,13 @@ def matrix_example(suite="matrix-1g-local", run="43200000001", at="2026-11-20T08
     return record, diagnostics.derive(record, b"archive", raw, WORKER)
 
 
+def elsewhere(extra, scenario):
+    """Move every copy of a companion to another scenario, as the companion of such a record is written."""
+    extra.update(schema=diagnostics.REMOTE_SCHEMA, process_scope=diagnostics.REMOTE_PROCESS_SCOPE, status="partial")
+    for trial in extra["trials"]:
+        trial.update(scenario=scenario, roles=dict(source=None, destination=None))
+
+
 class MatrixRunPageTests(unittest.TestCase):
     def test_every_cell_is_listed_with_its_result_and_the_reason_it_was_not_measured(self):
         record, extra = matrix_example("matrix-all-local", outcomes={1: FAILED, 3: NOT_RUN})
@@ -187,8 +194,7 @@ class MatrixHistoryTests(unittest.TestCase):
         self.assertEqual((sum(map(len, cases.values())), outside), (0, 2))
         record, extra = matrix_example()
         record["cells"][0]["scenario"] = record["measurements"][0]["scenario"] = "remote-loopback"
-        for trial in extra["trials"]:
-            trial["scenario"] = "remote-loopback"
+        elsewhere(extra, "remote-loopback")
         cases, outside = history.model(*split([(record, extra)]))
         self.assertEqual((cases[ONE_GIGABYTE], outside), ([], 1))
 
@@ -197,8 +203,7 @@ class MatrixHistoryTests(unittest.TestCase):
         # the same file set measured a second way, whose copies are the only ones with resources
         record["cells"].append(dict(record["cells"][0], scenario="remote-loopback"))
         record["measurements"].append(dict(record["measurements"][0], scenario="remote-loopback"))
-        for trial in extra["trials"]:
-            trial["scenario"] = "remote-loopback"
+        elsewhere(extra, "remote-loopback")
         (point,), outside = history.model(*split([(record, extra)]))[0][ONE_GIGABYTE], \
             history.model(*split([(record, extra)]))[1]
         self.assertEqual((point["duration"]["samples"], point["cpu"], point["memory"], outside), (3, None, None, 1))

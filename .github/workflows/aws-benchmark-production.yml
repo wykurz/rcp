@@ -20,7 +20,7 @@ on:
         type: string
         required: false
       suite:
-        description: Manual profile; needs server approval and a qualified image. matrix-* measure one build, three copies per cell
+        description: Manual profile; needs server approval and a qualified image. matrix-* measure one build, three copies per cell, locally, over loopback rcpd (remote) or both
         type: choice
         options:
           - bulk-1g-metadata
@@ -34,6 +34,18 @@ on:
           - matrix-1m-local
           - matrix-1k-local
           - matrix-commission-local
+          - matrix-all-remote
+          - matrix-1g-remote
+          - matrix-100m-remote
+          - matrix-1m-remote
+          - matrix-1k-remote
+          - matrix-commission-remote
+          - matrix-all-local+remote
+          - matrix-1g-local+remote
+          - matrix-100m-local+remote
+          - matrix-1m-local+remote
+          - matrix-1k-local+remote
+          - matrix-commission-local+remote
         default: bulk-1g-metadata
         required: true
       revision:

@@ -14,12 +14,21 @@ from .json_bytes import encoded
 SCHEMA = "rcp-public-resource-diagnostics-v1"
 # the same document for a matrix run: every copy also names its scenario, and one build is measured
 MATRIX_SCHEMA = "rcp-public-resource-diagnostics-v2"
+# and for a matrix run with remote cells: a remote copy is three processes, so every copy also
+# carries `roles`, the figures of the source and destination daemons (null for a local copy)
+REMOTE_SCHEMA = "rcp-public-resource-diagnostics-v3"
 MATRIX_VARIANT = "rcp-default"
+LOCAL = "local"
+ROLES = ("source", "destination")
 MAX_DOCUMENT = 512 * 1024
 MAX_TRIALS = 128
 MAX_NUMBER = (1 << 63) - 1
 PROCESS_SCOPE = ("One local copy command, its threads and waited descendants. CPU seconds may exceed "
                  "wall time; peak RSS is a per-command peak, not host memory or a sum of processes.")
+REMOTE_PROCESS_SCOPE = ("A local copy is one command with its threads and waited descendants. A remote copy is "
+                        "three processes measured separately: the rcp command with the ssh clients it starts, the "
+                        "source rcpd and the destination rcpd. CPU seconds may exceed wall time; peak RSS is a "
+                        "per-process peak, not host memory or a sum of processes.")
 SYSTEM_SCOPE = ("Sampled host/cgroup diagnostics associated with phase windows, not per-process "
                 "attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.")
 METRICS = ("user_seconds", "system_seconds", "max_rss_kib", "voluntary_switches",
@@ -263,11 +272,28 @@ def _cells(record):
     return {(cell["case_id"], cell["scenario"]) for cell in record["cells"]}
 
 
+def _schema(record):
+    """The document a record gets: fixed by the record, so a stored one never changes version."""
+    if not _matrix(record):
+        return SCHEMA
+    return REMOTE_SCHEMA if any(cell["scenario"] != LOCAL for cell in record["cells"]) else MATRIX_SCHEMA
+
+
+def _process_scope(schema):
+    return REMOTE_PROCESS_SCOPE if schema == REMOTE_SCHEMA else PROCESS_SCOPE
+
+
+def _complete(trials):
+    """Whether every copy has every figure it could have: its command's and, if remote, each daemon's."""
+    return all(trial["metrics"] is not None and
+               all(value is not None for value in (trial.get("roles") or {}).values()) for trial in trials)
+
+
 def unavailable(record, reason="not_recorded"):
     require(reason in REASONS, "invalid diagnostic availability reason")
-    value = dict(schema=MATRIX_SCHEMA if _matrix(record) else SCHEMA,
+    value = dict(schema=_schema(record),
         run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
-        archive_sha256=None, status="unavailable", reason=reason, process_scope=PROCESS_SCOPE,
+        archive_sha256=None, status="unavailable", reason=reason, process_scope=_process_scope(_schema(record)),
         system_scope=SYSTEM_SCOPE, setup=None, setup_id=None, trials=[], cases=[], system=None,
         limits=dict(allocation_seconds=None, command_timeout_seconds=None))
     return validate(value, record)
@@ -379,19 +405,30 @@ def _derive_matrix(record, archive, raw, worker):
         return unavailable(record, "not_matched")
     sampled = raw["context"].get("system_telemetry") == TELEMETRY_DESCRIPTOR
     grouped, selected, phases = {}, [], _system(raw.get("system_telemetry") if sampled else None)["phases"]
+    with_roles = _schema(record) == REMOTE_SCHEMA
     for cell in cells:
         for item in cell["copies"]:
             done = item["status"] == "ok"
-            resources = item.get("resources")
-            resource = _resources(dict(status=item["status"], ok=done,
-                                       resources=resources if isinstance(resources, dict) else {}))
+            def figures(recorded):
+                return _resources(dict(status=item["status"], ok=done,
+                                       resources=recorded if isinstance(recorded, dict) else {}))
+            resource = figures(item.get("resources"))
             if done:
                 grouped.setdefault((cell["case_id"], cell["scenario"]), []).append(item["elapsed_seconds"])
             system = _system(item.get("system_telemetry") if sampled else None)
             phases += system["phases"]
-            selected.append(dict(case_id=cell["case_id"], variant_id=MATRIX_VARIANT, scenario=cell["scenario"],
+            trial = dict(case_id=cell["case_id"], variant_id=MATRIX_VARIANT, scenario=cell["scenario"],
                 iteration=item["iteration"], status="complete" if resource is not None else "unavailable",
-                metrics=resource, system=system))
+                metrics=resource, system=system)
+            if with_roles:
+                trial["roles"] = None
+                if cell["scenario"] != LOCAL:
+                    daemons = item.get("role_resources")
+                    daemons = daemons if isinstance(daemons, dict) else {}
+                    # a copy without its own figures publishes none for its daemons either
+                    trial["roles"] = {role: figures(daemons.get(role)) if resource is not None else None
+                                      for role in ROLES}
+            selected.append(trial)
     # only completed cells are published; their samples must be exactly the copies recorded here
     if record["benchmark_valid"] and any(
             grouped.get((item["case_id"], item["scenario"])) != item["samples"] for item in record["measurements"]):
@@ -412,11 +449,12 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
     window = window if isinstance(window, dict) else {}
     limits = dict(allocation_seconds=_integer(window.get("runtime_seconds"), 8 * 3600),
                   command_timeout_seconds=_integer(worker.get("command_timeout_seconds"), 2 * 3600))
-    value = dict(schema=MATRIX_SCHEMA if _matrix(record) else SCHEMA,
+    value = dict(schema=_schema(record),
         run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
-        archive_sha256=digest(archive), status="complete" if selected and all(x["metrics"] is not None for x in selected)
+        archive_sha256=digest(archive), status="complete" if selected and _complete(selected)
             else "partial" if selected else "unavailable",
-        reason=None if selected else "not_recorded", process_scope=PROCESS_SCOPE, system_scope=SYSTEM_SCOPE,
+        reason=None if selected else "not_recorded", process_scope=_process_scope(_schema(record)),
+        system_scope=SYSTEM_SCOPE,
         setup=observed, setup_id=setup_id(observed), trials=selected, cases=cases,
         system=_system(raw.get("system_telemetry") if sampled else None), limits=limits)
     if len(encoded(value)) > MAX_DOCUMENT:
@@ -430,12 +468,13 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
 
 def validate(value, record):
     matrix = _matrix(record)
+    with_roles = _schema(record) == REMOTE_SCHEMA
     shapes = MATRIX_CASE_SHAPES if matrix else CASE_SHAPES
     require(isinstance(value, dict) and set(value) == {"schema", "run_key", "retirement_sha256",
         "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases", "system", "limits"} and
-        value["schema"] == (MATRIX_SCHEMA if matrix else SCHEMA) and value["run_key"] == record["run_key"] and
+        value["schema"] == _schema(record) and value["run_key"] == record["run_key"] and
         value["retirement_sha256"] == record["retirement_sha256"] and value["status"] in STATUSES and
-        value["process_scope"] == PROCESS_SCOPE and value["system_scope"] == SYSTEM_SCOPE,
+        value["process_scope"] == _process_scope(value["schema"]) and value["system_scope"] == SYSTEM_SCOPE,
         "invalid public diagnostic identity")
     require(value["reason"] is None or value["reason"] in REASONS, "invalid diagnostic reason")
     require(isinstance(value["limits"], dict) and set(value["limits"]) ==
@@ -465,7 +504,7 @@ def validate(value, record):
     seen = set()
     for trial in value["trials"]:
         require(isinstance(trial, dict) and set(trial) == {"case_id", "variant_id", "iteration", "status", "metrics", "system"} | (
-                    {"scenario"} if matrix else set()) and
+                    {"scenario"} if matrix else set()) | ({"roles"} if with_roles else set()) and
                 isinstance(trial["case_id"], str) and trial["case_id"] in case_ids and
                 trial["variant_id"] in ({MATRIX_VARIANT} if matrix else {"rcp-default", "rcp-baseline"}) and
                 (not matrix or isinstance(trial["scenario"], str) and SCENARIO.fullmatch(trial["scenario"]) and
@@ -481,13 +520,21 @@ def validate(value, record):
             require(isinstance(metrics, dict) and set(metrics) == set(METRICS) and
                 all(number(metrics[key], integer=key not in {"user_seconds", "system_seconds"}) for key in METRICS),
                 "invalid public process metrics")
+        if with_roles:
+            roles = trial["roles"]
+            # a local copy has no daemons; a remote copy names both, each with figures or without
+            require((roles is None) if trial["scenario"] == LOCAL else
+                    isinstance(roles, dict) and set(roles) == set(ROLES) and all(
+                        role is None or metrics is not None and isinstance(role, dict) and set(role) == set(METRICS) and
+                        all(number(role[key], integer=key not in {"user_seconds", "system_seconds"}) for key in METRICS)
+                        for role in roles.values()), "invalid public daemon metrics")
         require(_system(trial["system"], public=True) == trial["system"], "invalid public trial system summary")
     for case in value["cases"]:
         matching = [trial for trial in value["trials"] if trial["case_id"] == case["case_id"]]
         require(len(matching) == case["copy_trials"] and
                 sum(trial["status"] == "complete" for trial in matching) <= case["successful_copies"],
                 "case activity differs from resource trials")
-    expected_status = "complete" if value["trials"] and all(x["metrics"] is not None for x in value["trials"]) else (
+    expected_status = "complete" if value["trials"] and _complete(value["trials"]) else (
         "partial" if value["trials"] else "unavailable")
     require(value["status"] == expected_status and
             (not value["trials"] or value["archive_sha256"] is not None and value["setup"] is not None),
@@ -731,31 +778,36 @@ def render(value, record):
     """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
     matrix = _matrix(record)
+    with_roles = value["schema"] == REMOTE_SCHEMA
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged.</p>"
         "<p>Process-resource availability: " +
-        escape(value["status"]) + ". " + escape(PROCESS_SCOPE) + "</p>")
+        escape(value["status"]) + ". " + escape(value["process_scope"]) + "</p>")
     if value["reason"] == "phase_summary_budget":
         text += ("<p>Optional sampled phase detail exceeded the public document budget and is omitted. "
             "Per-copy process metrics and observed setup remain shown; the bounded raw telemetry "
             "journal remains in private retained evidence.</p>")
     rows = []
     for trial in value["trials"]:
-        metrics = trial["metrics"]
-        fields = [str(trial["iteration"]), trial["status"]]
-        if metrics is None:
-            fields += ["unavailable"] * len(METRICS)
-        else:
-            fields += [f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
-            fields += [f"{metrics[key]:,}" for key in METRICS[2:]]
-        rows.append("<tr><td><code>" + escape(trial["case_id"]) + "</code></td><td><code>" +
-                    escape(trial["scenario"] if matrix else trial["variant_id"]) + "</code></td>" +
-                    "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
+        # one row for each measured process: the copy command and, for a remote copy, each daemon
+        processes = [("rcp", trial["metrics"])] if with_roles else [(None, trial["metrics"])]
+        if with_roles and trial["roles"] is not None:
+            processes += [(role + " rcpd", trial["roles"][role]) for role in ROLES]
+        for process, metrics in processes:
+            fields = [str(trial["iteration"])] + ([] if process is None else [process])
+            if metrics is None:
+                fields += ["unavailable"] * (len(METRICS) + 1)
+            else:
+                fields += ["complete", f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
+                fields += [f"{metrics[key]:,}" for key in METRICS[2:]]
+            rows.append("<tr><td><code>" + escape(trial["case_id"]) + "</code></td><td><code>" +
+                        escape(trial["scenario"] if matrix else trial["variant_id"]) + "</code></td>" +
+                        "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
     if rows:
         text += ("<div class='table-scroll'><table class='data'><thead><tr>" +
-            ("<th>File set</th><th>Scenario</th><th>Copy</th>" if matrix else
-             "<th>Case</th><th>Variant</th><th>Repeat</th>") +
+            ("<th>File set</th><th>Scenario</th><th>Copy</th>" + ("<th>Process</th>" if with_roles else "")
+             if matrix else "<th>Case</th><th>Variant</th><th>Repeat</th>") +
             "<th>Resource status</th><th>User CPU s</th><th>System CPU s</th><th>Peak RSS KiB</th>"
             "<th>Voluntary switches</th><th>Involuntary switches</th><th>Minor faults</th><th>Major faults</th>"
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
