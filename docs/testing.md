@@ -104,10 +104,17 @@ sets this cfg and `--test-threads=1`; it does not select tests by name.
 
 The flake passes the same matching `target.'cfg(all())'.rustflags` Cargo configuration to its build
 and check phases. Cargo joins that entry with exact-target flags supplied by the Rust package hooks,
-whereas a matching target entry would suppress `build.rustflags`. Keeping the two phases identical
+whereas a matching target entry would suppress `build.rustflags`. Keeping the rustflags identical
 also prevents a rustflag-only mismatch from invalidating otherwise reusable release units during the
 check. Do not use the `RUSTFLAGS` environment variable for this: it takes precedence over all target
 entries and would replace the packaging flags instead of joining them.
+
+Nix checks use the release profile with a check-command-only `profile.release.lto=false` override.
+This avoids repeating cross-crate LTO for every test executable while retaining release
+optimization, debug information, and local thin LTO. The package build still uses the unchanged
+release profile; the Nix install hook saves its artifacts before checks run, so installed binaries
+retain cross-crate thin LTO. Ordinary `just test-release` CI continues to exercise that LTO
+configuration. Test selection and serial execution are unchanged.
 
 This is a contract of the repository flake, not a claim that every downstream package recipe has
 adopted it. Downstream packagers opt in by carrying the same cfg and build/check configuration.
