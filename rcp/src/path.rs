@@ -8,13 +8,19 @@ pub struct RemotePath {
 }
 
 impl RemotePath {
-    pub fn new(
+    fn new(
         session: remote::SshSession,
         path: std::path::PathBuf,
         needs_remote_home: bool,
     ) -> anyhow::Result<Self> {
         if !needs_remote_home && !path.is_absolute() {
             return Err(anyhow::anyhow!("Path must be absolute: {}", path.display()));
+        }
+        if needs_remote_home && path.is_absolute() {
+            return Err(anyhow::anyhow!(
+                "Remote home suffix must be relative: {}",
+                path.display()
+            ));
         }
         Ok(Self {
             session,
@@ -60,12 +66,11 @@ impl RemotePath {
         }
     }
 
-    /// Returns this path with `name` appended; the session and `needs_remote_home` flag are
-    /// preserved. Joining a name onto an absolute path stays absolute, and a
-    /// `needs_remote_home` path is allowed to be relative, so the [`RemotePath::new`]
-    /// invariant cannot be violated.
+    /// Appends a source basename while preserving the session and `needs_remote_home` flag.
+    /// The caller must supply a single filename component, keeping an absolute path absolute
+    /// and a home-relative suffix relative.
     #[must_use]
-    pub fn joined(&self, name: &std::ffi::OsStr) -> RemotePath {
+    fn joined(&self, name: &std::ffi::OsStr) -> RemotePath {
         RemotePath {
             path: self.path.join(name),
             ..self.clone()
@@ -184,17 +189,24 @@ pub fn expand_local_home(path: &str) -> anyhow::Result<std::path::PathBuf> {
     })
 }
 
+fn home_relative_suffix(path: &str) -> Option<&str> {
+    if path == "~" {
+        return Some("");
+    }
+    // strip only the leading tilde; an absolute suffix would discard HOME when joined
+    path.strip_prefix("~/")
+        .map(|suffix| suffix.trim_start_matches('/'))
+}
+
 fn expand_home_with(
     path: &str,
     home: impl FnOnce() -> anyhow::Result<std::path::PathBuf>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(rest) = path.strip_prefix("~/") {
-        return Ok(home()?.join(rest));
+    match home_relative_suffix(path) {
+        Some("") => home(),
+        Some(suffix) => Ok(home()?.join(suffix)),
+        None => Ok(std::path::PathBuf::from(path)),
     }
-    if path == "~" {
-        return home();
-    }
-    Ok(std::path::PathBuf::from(path))
 }
 
 /// Internal path parsing with configurable localhost handling
@@ -214,20 +226,10 @@ fn parse_path_internal(path: &str, treat_localhost_as_local: bool) -> anyhow::Re
         // if host is localhost (and no user/port), optionally treat as local path
         // this provides an escape hatch for paths with colons: localhost:/tmp/file:with:colons
         if treat_localhost_as_local && is_localhost(&host) && user.is_none() && port.is_none() {
-            // expand tilde for local paths
-            let local_path = if path_part == "~" || path_part == "~/" {
-                expand_local_home("~")?
-            } else if path_part.starts_with("~/") {
-                expand_local_home(path_part)?
-            } else {
-                std::path::PathBuf::from(path_part)
-            };
-            return Ok(PathType::Local(local_path));
+            return Ok(PathType::Local(expand_local_home(path_part)?));
         }
-        let (remote_path, needs_remote_home) = if path_part == "~" || path_part == "~/" {
-            (std::path::PathBuf::new(), true)
-        } else if path_part.starts_with("~/") {
-            let suffix = path_part.trim_start_matches("~/");
+        let (remote_path, needs_remote_home) = if let Some(suffix) = home_relative_suffix(path_part)
+        {
             (std::path::PathBuf::from(suffix), true)
         } else {
             let remote_path = std::path::PathBuf::from(path_part);
@@ -474,8 +476,65 @@ mod tests {
     }
     #[test]
     fn test_expand_home_with_non_tilde_path_does_not_read_home() {
-        let expanded = expand_home_with("/abs/path", || panic!("home should not be read")).unwrap();
-        assert_eq!(expanded, std::path::PathBuf::from("/abs/path"));
+        for operand in ["/abs/path", "~user/file", "./~/file", "file~"] {
+            let expanded = expand_home_with(operand, || panic!("home should not be read")).unwrap();
+            assert_eq!(expanded, std::path::PathBuf::from(operand));
+        }
+    }
+
+    #[test]
+    fn local_home_expansion_preserves_suffix_components() {
+        let home = std::path::PathBuf::from("/tmp/fake-home");
+        for (operand, suffix) in [
+            ("~", ""),
+            ("~/", ""),
+            ("~///", ""),
+            ("~//file.txt", "file.txt"),
+            ("~///docs/file.txt", "docs/file.txt"),
+            ("~/~/file.txt", "~/file.txt"),
+            ("~/~/~/file.txt", "~/~/file.txt"),
+            ("~///~/file.txt", "~/file.txt"),
+            ("~//../file.txt", "../file.txt"),
+        ] {
+            let expanded = expand_home_with(operand, || Ok(home.clone())).unwrap();
+            assert_eq!(expanded, home.join(suffix), "operand: {operand}");
+        }
+    }
+
+    #[test]
+    fn remote_home_expansion_preserves_suffix_components() {
+        let home = std::path::Path::new("/remote/home");
+        for (operand, suffix) in [
+            ("~", ""),
+            ("~/", ""),
+            ("~///", ""),
+            ("~//file.txt", "file.txt"),
+            ("~///docs/file.txt", "docs/file.txt"),
+            ("~/~/file.txt", "~/file.txt"),
+            ("~/~/~/file.txt", "~/~/file.txt"),
+            ("~///~/file.txt", "~/file.txt"),
+            ("~//../file.txt", "../file.txt"),
+        ] {
+            for path in [
+                parse_path(&format!("host:{operand}")),
+                parse_path(&format!("user@localhost:{operand}")),
+                parse_path_force_remote(&format!("localhost:{operand}")),
+            ] {
+                let mut remote = expect_remote(path.unwrap());
+                assert!(remote.needs_remote_home());
+                assert!(remote.path().is_relative(), "operand: {operand}");
+                assert_eq!(
+                    remote.path(),
+                    std::path::Path::new(suffix),
+                    "operand: {operand}"
+                );
+                remote.apply_remote_home(home);
+                assert_eq!(remote.path(), home.join(suffix), "operand: {operand}");
+                assert!(!remote.needs_remote_home());
+                remote.apply_remote_home(std::path::Path::new("/other/home"));
+                assert_eq!(remote.path(), home.join(suffix));
+            }
+        }
     }
 
     #[test]
@@ -547,6 +606,16 @@ mod tests {
                 .to_string()
                 .contains("Relative paths are not supported for remote hosts")
         );
+    }
+
+    #[test]
+    fn remote_home_suffix_rejects_absolute_paths() {
+        let result = RemotePath::new(
+            remote::SshSession::local(),
+            std::path::PathBuf::from("/file.txt"),
+            true,
+        );
+        assert!(result.unwrap_err().to_string().contains("must be relative"));
     }
 
     #[test]
