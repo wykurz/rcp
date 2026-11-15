@@ -2,7 +2,6 @@ use anyhow::Context as _;
 use bytes::Buf;
 use futures::SinkExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::instrument;
 
@@ -205,47 +204,9 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         }
     }
 
-    /// Copies data to a writer using the default buffer size (8 KiB).
-    ///
-    /// For better performance with large files, use [`Self::copy_to_buffered`] instead.
-    #[instrument(level = "trace", skip(self, writer))]
-    pub async fn copy_to<W: tokio::io::AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> anyhow::Result<u64> {
-        let read_buffer = self.framed.read_buffer();
-        let buffer_size = read_buffer.len() as u64;
-        writer.write_all(read_buffer).await?;
-        let data_stream = self.framed.get_mut();
-        let stream_bytes = tokio::io::copy(data_stream, writer).await?;
-        Ok(buffer_size + stream_bytes)
-    }
-
-    /// Copies data to a writer using a custom buffer size.
-    ///
-    /// Uses a buffered reader around the TCP stream with the specified capacity.
-    /// This avoids the default 8 KiB buffer in `tokio::io::copy` and can significantly
-    /// improve throughput on high-bandwidth networks.
-    #[instrument(level = "trace", skip(self, writer))]
-    pub async fn copy_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-        buffer_size: usize,
-    ) -> anyhow::Result<u64> {
-        let read_buffer = self.framed.read_buffer();
-        let buffered_bytes = read_buffer.len() as u64;
-        writer.write_all(read_buffer).await?;
-        let data_stream = self.framed.get_mut();
-        // wrap the TCP recv stream in a BufReader to control the buffer size
-        let mut buffered_stream = tokio::io::BufReader::with_capacity(buffer_size, data_stream);
-        let stream_bytes = tokio::io::copy_buf(&mut buffered_stream, writer).await?;
-        Ok(buffered_bytes + stream_bytes)
-    }
-
     /// Copies exactly `size` bytes to a writer using a custom buffer size.
     ///
-    /// Unlike [`Self::copy_to_buffered`], this does NOT read until EOF. It reads
-    /// exactly the specified number of bytes, leaving the stream open for
+    /// Reads exactly the specified number of bytes, leaving the stream open for
     /// reading subsequent messages. Initialized scratch storage up to the configured
     /// retention limit is allocated lazily and reused by this connection. Larger chunks
     /// use temporary storage without reducing the requested buffer size.
@@ -310,42 +271,6 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
 
     pub async fn close(&mut self) {
         // for TCP, we just let the stream drop - no special cleanup needed
-    }
-}
-
-/// Connection wrapper for control channel (bidirectional TCP connection)
-#[derive(Debug)]
-pub struct ControlConnection {
-    send: SendStream,
-    recv: RecvStream,
-}
-
-impl ControlConnection {
-    /// Create a control connection from a TCP stream
-    pub fn new(stream: TcpStream) -> Self {
-        let (read_half, write_half) = stream.into_split();
-        Self {
-            send: SendStream::new(write_half),
-            recv: RecvStream::new(read_half),
-        }
-    }
-
-    /// Split into send and recv halves for independent use
-    pub fn into_split(self) -> (SharedSendStream, RecvStream) {
-        (
-            std::sync::Arc::new(tokio::sync::Mutex::new(self.send)),
-            self.recv,
-        )
-    }
-
-    /// Get mutable access to send stream
-    pub fn send_mut(&mut self) -> &mut SendStream {
-        &mut self.send
-    }
-
-    /// Get mutable access to recv stream
-    pub fn recv_mut(&mut self) -> &mut RecvStream {
-        &mut self.recv
     }
 }
 
