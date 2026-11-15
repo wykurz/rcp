@@ -771,6 +771,84 @@ fn test_remote_copy_local_to_tilde_home_directory() {
 }
 
 #[test]
+fn remote_home_paths_copy_the_intended_files_in_both_directions() {
+    require_local_ssh();
+    let local_home = make_test_home();
+    let remote_home = tempfile::tempdir().unwrap();
+    let outside_home = tempfile::tempdir().unwrap();
+    let override_home = remote_home.path().to_str().unwrap();
+    let daemon = format!(
+        "--rcpd-path={}",
+        assert_cmd::cargo::cargo_bin("rcpd").display()
+    );
+    // decoys make a wrong expansion observable without touching paths outside these fixtures
+    for (remote_directory, expected_directory, decoy_directory) in [
+        (
+            "localhost:~/~/".to_string(),
+            remote_home.path().join("~"),
+            remote_home.path().to_path_buf(),
+        ),
+        (
+            format!("localhost:~/{}/", outside_home.path().display()),
+            remote_home
+                .path()
+                .join(outside_home.path().strip_prefix("/").unwrap()),
+            outside_home.path().to_path_buf(),
+        ),
+    ] {
+        std::fs::create_dir_all(&expected_directory).unwrap();
+        create_test_file(
+            &expected_directory.join("source.txt"),
+            "intended remote source",
+            0o644,
+        );
+        create_test_file(&decoy_directory.join("source.txt"), "decoy source", 0o644);
+        create_test_file(
+            &decoy_directory.join("destination.txt"),
+            "keep decoy destination",
+            0o644,
+        );
+        let local = tempfile::tempdir().unwrap();
+        let pulled = local.path().join("pulled.txt");
+        let remote_source = format!("{remote_directory}source.txt");
+        let output = run_rcp_with_args_home_and_env(
+            &[&daemon, &remote_source, pulled.to_str().unwrap()],
+            local_home.path(),
+            &[("RCP_REMOTE_HOME_OVERRIDE", override_home)],
+        );
+        print_command_output(&output);
+        assert!(output.status.success());
+        assert_eq!(get_file_content(&pulled), "intended remote source");
+        let outgoing = local.path().join("destination.txt");
+        create_test_file(&outgoing, "intended local source", 0o644);
+        let output = run_rcp_with_args_home_and_env(
+            &[
+                &daemon,
+                "--overwrite",
+                outgoing.to_str().unwrap(),
+                &remote_directory,
+            ],
+            local_home.path(),
+            &[("RCP_REMOTE_HOME_OVERRIDE", override_home)],
+        );
+        print_command_output(&output);
+        assert!(output.status.success());
+        assert_eq!(
+            get_file_content(&expected_directory.join("destination.txt")),
+            "intended local source"
+        );
+        assert_eq!(
+            get_file_content(&decoy_directory.join("source.txt")),
+            "decoy source"
+        );
+        assert_eq!(
+            get_file_content(&decoy_directory.join("destination.txt")),
+            "keep decoy destination"
+        );
+    }
+}
+
+#[test]
 fn test_remote_copy_localhost_to_local() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();

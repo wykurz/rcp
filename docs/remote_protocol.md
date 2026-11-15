@@ -149,7 +149,11 @@ then any remaining receiver tasks share one final drain deadline.
 Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
 skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
 cache do require a usable `HOME`, so those operations fail with a targeted diagnostic instead of
-constructing a path under `/`.
+constructing a path under `/`. Expansion recognizes only a leading `~` by itself or followed by `/`.
+Repeated separators immediately after it remain home-relative, while subsequent `~` path components
+are literal: `host:~//docs` resolves to `HOME/docs`, and `host:~/~/file` to `HOME/~/file`. Local
+quoted operands and the `localhost:` escape hatch use the same suffix rules with the local `HOME`.
+Expansion does not canonicalize `.` or `..` components.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
 create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory
