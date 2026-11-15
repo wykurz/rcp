@@ -517,7 +517,7 @@ class HistoryRenderTests(unittest.TestCase):
             extras[record["run_key"]] = companion(record, raw, worker)
         html = history.render(records, extras)
         self.assertLessEqual(len(html.encode()), projection.MAX_PUBLIC_HTML)
-        self.assertIn("118 older qualified runs", html)
+        self.assertIn("newest 32 qualified runs. Older runs are not plotted", html)
         self.assertIn("run-1149.html", html)
         self.assertNotIn("run-1000.html", html)
         self.assertEqual(html.count("<svg "), 12)
@@ -535,7 +535,7 @@ class HistoryRenderTests(unittest.TestCase):
             html = history.render(records, {})
         self.assertIn("run-1004.html", html)
         self.assertNotIn("run-1000.html", html)
-        self.assertIn("1 older qualified run ", html)
+        self.assertIn("newest 4 qualified runs. Older runs are not plotted", html)
 
     def test_supported_legacy_inventory_limit_keeps_separate_plot_bounds(self):
         from . import production_publish
@@ -551,7 +551,7 @@ class HistoryRenderTests(unittest.TestCase):
             records[value["run_key"]] = value
         html = history.render(records, {})
         self.assertLessEqual(len(html.encode()), projection.MAX_PUBLIC_HTML)
-        self.assertIn("1968 older qualified runs", html)
+        self.assertIn("newest 32 qualified runs. Older runs are not plotted", html)
         self.assertNotIn("run-10000.html", html)
         self.assertIn("run-11999.html", html)
         records["extra"] = record

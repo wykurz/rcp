@@ -7,6 +7,7 @@ storage is trusted prior exporter output: a source digest alone does not attest
 arbitrary saved measurement bytes. Publication must use the protected history path.
 """
 
+from datetime import timedelta
 from html import escape
 import os
 from pathlib import Path
@@ -101,10 +102,55 @@ def diagnostic_companion(bundle):
         return resource_diagnostics.unavailable(record, "invalid_diagnostics")
 
 
+# retention of everything under production/runs/ in the benchmark bucket (production-stack.yaml)
+EVIDENCE_RETENTION_DAYS = 90
+RESULTS = {"complete": "measured", "failed": "failed", "timed_out": "timed out", "interrupted": "cut short",
+           "not_run": "not run"}
+STAGES = {"capacity": "During the free-space check", "generation": "During generation",
+          "cache": "During cache preparation", "copy": "During copy", "summary": "In the copy summary",
+          "harness": "In the benchmark harness"}
+
+
 def badge(value):
     """Show the frozen outcome wording; the class only selects its colour."""
     kind = {"passed": "passed", "failed": "failed"}.get(projection.qualification_outcome(value), "unavailable")
+    if kind == "passed" and any(cell["outcome"] != "complete" for cell in value.get("cells", ())):
+        # a run that measured only some of its cells counts, and is not shown as a clean pass
+        kind = "partial"
     return "<span class='badge badge-" + kind + "'>" + escape(projection.outcome_label(value)) + "</span>"
+
+
+def evidence_html(value):
+    """Say where the retained worker evidence is and until when; None when no trusted time bounds it."""
+    if "collected_at" not in value:
+        return None
+    expiry = results.utc(value["collected_at"]) + timedelta(days=EVIDENCE_RETENTION_DAYS)
+    return ("<code>production/runs/" + escape(value["run_key"]) + "/collection/</code> in the benchmark bucket "
+            "until about " + escape(history.moment(expiry).rsplit(" ", 2)[0]) + "; fetch it with <code>just "
+            "aws-benchmark-evidence " + escape(value["run_key"]) + " DIRECTORY</code>")
+
+
+def _name(value, names):
+    return escape(names[value]) if value in names else "<code>" + escape(value) + "</code>"
+
+
+def cells_html(value):
+    """List every cell of a matrix run: what was measured and why the rest was not."""
+    measured = {(item["case_id"], item["scenario"]): item for item in value["measurements"]}
+    rows = []
+    for cell in value["cells"]:
+        item = measured.get((cell["case_id"], cell["scenario"]))
+        numbers = ("<td>—</td>" * 3 if item is None else
+            "<td>" + history.exact(item["median"]) + "</td><td>" + history.exact(min(item["samples"])) + "–" +
+            history.exact(max(item["samples"])) + "</td><td>" + str(len(item["samples"])) + "</td>")
+        reason = ": ".join(escape(part) for part in (STAGES.get(cell["stage"], cell["stage"]), cell["message"])
+                           if part)
+        rows.append("<tr><td>" + _name(cell["case_id"], history.CASES) + "</td><td>" +
+                    _name(cell["scenario"], history.SCENARIOS) + "</td><td>" + RESULTS[cell["outcome"]] + "</td>" +
+                    numbers + "<td class='reason'>" + reason + "</td></tr>")
+    return ("<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Scenario</th>"
+            "<th>Result</th><th>Median s</th><th>Range s</th><th>Samples</th><th>What happened</th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table></div>")
 
 
 def commit_html(identity, revision):
@@ -130,20 +176,30 @@ def render(value, *, diagnostics=None):
     if diagnostics is not None:
         resource_diagnostics.validate(diagnostics, value)
     identity = value["identity"]
+    # a matrix run measures one build: it has cells, and nothing to compare
+    matrix = "cells" in value
     commit = lambda revision: commit_html(identity, revision)
     facts = ([("Commit", commit(identity["candidate"]))] if identity["baseline"] == identity["candidate"] else
              [("Candidate", commit(identity["candidate"])), ("Baseline", commit(identity["baseline"]))])
     facts += [("Controller", commit(identity["controller"])),
-        ("Suite", "<code>" + escape(identity["suite"]) + "</code>"), ("Comparison", escape(value["comparison"])),
-        ("Collected at", collected_html(value)), ("Cleanup", "resource termination verified"),
+        ("Suite", "<code>" + escape(identity["suite"]) + "</code>")]
+    if not matrix:
+        facts.append(("Comparison", escape(value["comparison"])))
+    facts += [("Collected at", collected_html(value)), ("Cleanup", "resource termination verified"),
         ("Validation", escape(value["validation"])),
         ("Workflow", "<a href='" + escape(identity["run_url"]) + "'>Workflow attempt</a>")]
     html = ("<h1>Run " + escape(identity["run"]) + " " + badge(value) + "</h1><dl class='facts'>" +
         "".join("<div><dt>" + name + "</dt><dd>" + item + "</dd></div>" for name, item in facts) +
         "</dl><aside class='note'><p>" + escape(projection.MEASUREMENT_CAVEAT) + "</p><p>" +
-        escape(value["note"]) + "</p></aside><section aria-labelledby='results'><h2 id='results'>Results</h2>")
+        escape(value["note"]) + "</p></aside>")
+    if matrix and value["diagnostics"]:
+        html += ("<section aria-labelledby='run-notes'><h2 id='run-notes'>Run notes</h2><ul>" +
+                 "".join("<li>" + escape(item) + "</li>" for item in value["diagnostics"]) + "</ul></section>")
+    html += "<section aria-labelledby='results'><h2 id='results'>Results</h2>"
     if not value["measurements"]:
         html += "<p>This run has no performance measurements.</p>"
+    if matrix and value["cells"]:
+        html += cells_html(value)
     for case, item in history.point(value, diagnostics).items():
         html += ("<h3>" + history.CASES[case] + "</h3><p>This run as one history point: the median of the "
             "copies made by the build under test" + (", counting every copy because baseline and candidate "
@@ -159,9 +215,11 @@ def render(value, *, diagnostics=None):
         html += "</div>"
     if value["measurements"]:
         html += ("<h3>Frozen measurements</h3><div class='table-scroll'><table class='data'><thead><tr><th>Case</th>"
-            "<th>Variant</th><th>Copies</th><th>Median s</th><th>Samples s</th><th>Frozen series</th></tr></thead>"
+            "<th>" + ("Scenario" if matrix else "Variant") +
+            "</th><th>Copies</th><th>Median s</th><th>Samples s</th><th>Frozen series</th></tr></thead>"
             "<tbody>" + "".join(
-                "<tr><td><code>" + escape(item["case_id"]) + "</code></td><td><code>" + escape(item["variant_id"]) +
+                "<tr><td><code>" + escape(item["case_id"]) + "</code></td><td><code>" +
+                escape(item["scenario"] if matrix else item["variant_id"]) +
                 "</code></td><td>" + str(len(item["samples"])) + "</td><td>" + history.exact(item["median"]) +
                 "</td><td>" + ", ".join(history.exact(sample) for sample in item["samples"]) +
                 "</td><td><code title='" + escape(item["series_id"]) + "'>" + escape(item["series_id"][:12]) +
