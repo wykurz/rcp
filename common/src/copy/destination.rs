@@ -227,6 +227,14 @@ impl DestinationContext {
         Ok(())
     }
 
+    pub(super) fn real_parent(&self) -> Option<&Arc<Dir>> {
+        match &self.origin {
+            Origin::Root { real_parent, .. } => real_parent.as_ref(),
+            Origin::Prepared(PreparedParent::Real(parent)) => Some(parent),
+            Origin::Prepared(PreparedParent::Preview(_)) => None,
+        }
+    }
+
     pub(crate) fn with_root_parent(mut self, parent: Option<&Arc<Dir>>) -> Self {
         if let Origin::Root { real_parent, .. } = &mut self.origin {
             *real_parent = parent.cloned();
