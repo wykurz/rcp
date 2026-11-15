@@ -64,50 +64,144 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
-/// collects runtime statistics (CPU time, memory) for the current process
+/// Collects the runtime statistics of the current process: CPU time, peak memory, context
+/// switches and page faults, each for every thread, including threads that have ended.
 #[must_use]
 pub fn collect_runtime_stats() -> RuntimeStats {
-    collect_runtime_stats_inner(procfs::process::Process::myself().ok())
-}
-
-fn collect_runtime_stats_inner(process: Option<procfs::process::Process>) -> RuntimeStats {
-    let Some(process) = process else {
+    // getrusage(2) on the calling process fails only for arguments this code never passes; a
+    // zeroed result keeps the summary printing if it ever does
+    let Ok(usage) = resource_usage() else {
         return RuntimeStats::default();
     };
-    collect_runtime_stats_for_process(&process).unwrap_or_default()
+    let count = |value: libc::c_long| u64::try_from(value).unwrap_or(0);
+    let vmhwm_kb = procfs::process::Process::myself()
+        .and_then(|process| process.status())
+        .ok()
+        .and_then(|status| status.vmhwm);
+    RuntimeStats {
+        cpu_time_user_ms: milliseconds(usage.ru_utime),
+        cpu_time_kernel_ms: milliseconds(usage.ru_stime),
+        peak_rss_bytes: peak_rss_bytes(vmhwm_kb, &usage),
+        voluntary_context_switches: count(usage.ru_nvcsw),
+        involuntary_context_switches: count(usage.ru_nivcsw),
+        minor_page_faults: count(usage.ru_minflt),
+        major_page_faults: count(usage.ru_majflt),
+    }
 }
 
-fn collect_runtime_stats_for_process(
-    process: &procfs::process::Process,
-) -> anyhow::Result<RuntimeStats> {
-    let stat = process.stat()?;
-    let clock_ticks = procfs::ticks_per_second() as f64;
-    // vmhwm from /proc/[pid]/status is in kB, convert to bytes
-    let vmhwm_kb = process.status()?.vmhwm.unwrap_or(0);
-    Ok(RuntimeStats {
-        cpu_time_user_ms: ((stat.utime as f64 / clock_ticks) * 1000.0) as u64,
-        cpu_time_kernel_ms: ((stat.stime as f64 / clock_ticks) * 1000.0) as u64,
-        peak_rss_bytes: vmhwm_kb * 1024,
-    })
+/// Whole milliseconds of a CPU time from getrusage(2), which counts in microseconds.
+fn milliseconds(time: libc::timeval) -> u64 {
+    let seconds = u64::try_from(time.tv_sec).unwrap_or(0);
+    let microseconds = u64::try_from(time.tv_usec).unwrap_or(0);
+    seconds
+        .saturating_mul(1000)
+        .saturating_add(microseconds / 1000)
 }
 
-fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
+/// Peak resident set size in bytes, from a value in kB.
+///
+/// `VmHWM` in /proc is the peak of this program's own memory. `ru_maxrss` also covers the image
+/// the process had before `exec` (its parent's, after `vfork`), so it only stands in when /proc
+/// cannot be read.
+fn peak_rss_bytes(vmhwm_kb: Option<u64>, usage: &libc::rusage) -> u64 {
+    vmhwm_kb
+        .unwrap_or_else(|| u64::try_from(usage.ru_maxrss).unwrap_or(0))
+        .saturating_mul(1024)
+}
+
+/// What the calling process used, from getrusage(2).
+///
+/// It covers every thread, unlike the context switch counts in /proc/[pid]/status, which are
+/// those of one thread, and it counts CPU time in microseconds where /proc counts clock ticks.
+fn resource_usage() -> std::io::Result<libc::rusage> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // safety: "usage" points at writable memory of the right size and the result is checked
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // safety: the kernel filled the structure in, and it was zeroed to begin with
+    Ok(unsafe { usage.assume_init() })
+}
+
+/// The lines that report one process, each starting with `prefix` (the role, or nothing).
+fn runtime_stats_text(prefix: &str, stats: &RuntimeStats) -> String {
     let cpu_total =
         std::time::Duration::from_millis(stats.cpu_time_user_ms + stats.cpu_time_kernel_ms);
     let cpu_kernel = std::time::Duration::from_millis(stats.cpu_time_kernel_ms);
     let cpu_user = std::time::Duration::from_millis(stats.cpu_time_user_ms);
-    println!(
-        "{prefix}cpu time : {:.2?} | k: {:.2?} | u: {:.2?}",
-        cpu_total, cpu_kernel, cpu_user
+    format!(
+        "{prefix}cpu time : {cpu_total:.2?} | k: {cpu_kernel:.2?} | u: {cpu_user:.2?}\n\
+         {prefix}peak RSS : {:.2?}\n\
+         {prefix}context switches : {} voluntary | {} involuntary\n\
+         {prefix}page faults : {} minor | {} major",
+        bytesize::ByteSize(stats.peak_rss_bytes),
+        stats.voluntary_context_switches,
+        stats.involuntary_context_switches,
+        stats.minor_page_faults,
+        stats.major_page_faults,
+    )
+}
+
+/// The summary as one JSON object: its own fields, the wall time, the statistics of the process
+/// that prints it and, after a remote copy, those of each daemon under `remote`.
+///
+/// Every value is an exact number; nothing is scaled or rounded for reading.
+fn summary_json(
+    summary: &impl serde::Serialize,
+    walltime: std::time::Duration,
+    stats: &RuntimeStats,
+    remote: Option<&crate::RemoteRuntimeStats>,
+) -> serde_json::Value {
+    let fields = |value: serde_json::Value| match value {
+        serde_json::Value::Object(fields) => fields,
+        // every summary is a struct, so this arm only keeps a foreign shape visible
+        other => serde_json::Map::from_iter([("summary".to_string(), other)]),
+    };
+    let process = |stats: &RuntimeStats| {
+        fields(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null))
+    };
+    let mut object = fields(serde_json::to_value(summary).unwrap_or(serde_json::Value::Null));
+    object.insert(
+        "walltime_ms".to_string(),
+        u64::try_from(walltime.as_millis())
+            .unwrap_or(u64::MAX)
+            .into(),
     );
-    println!(
-        "{prefix}peak RSS : {}",
-        bytesize::ByteSize(stats.peak_rss_bytes)
-    );
+    object.extend(process(stats));
+    if let Some(remote) = remote {
+        let role = |host: &str, stats: &RuntimeStats| {
+            let mut role = process(stats);
+            role.insert("host".to_string(), host.into());
+            serde_json::Value::Object(role)
+        };
+        object.insert(
+            "remote".to_string(),
+            serde_json::json!({
+                "source": role(&remote.source_host, &remote.source_stats),
+                "destination": role(&remote.dest_host, &remote.dest_stats),
+            }),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+/// The JSON summary of the operation this process just finished.
+pub(crate) fn json_summary(summary: &impl serde::Serialize) -> serde_json::Value {
+    let remote = REMOTE_RUNTIME_STATS.lock().unwrap().take();
+    summary_json(
+        summary,
+        PROGRESS.get_duration(),
+        &collect_runtime_stats(),
+        remote.as_ref(),
+    )
+}
+
+fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
+    println!("{}", runtime_stats_text(prefix, stats));
 }
 
 #[rustfmt::skip]
-pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
+pub(crate) fn print_runtime_stats() {
     // check if we have remote runtime stats (from a remote copy operation)
     let remote_stats = REMOTE_RUNTIME_STATS.lock().unwrap().take();
     if let Some(remote) = remote_stats {
@@ -152,22 +246,11 @@ pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
                 print_runtime_stats_for_role("  ", &master_stats);
             }
         }
-        return Ok(());
+        return;
     }
     // local operation - print stats for this process only
-    let process = procfs::process::Process::myself()?;
-    let stat = process.stat()?;
-    // The time is in clock ticks, so we need to convert it to seconds
-    let clock_ticks_per_second = procfs::ticks_per_second();
-    let ticks_to_duration = |ticks: u64| {
-        std::time::Duration::from_secs_f64(ticks as f64 / clock_ticks_per_second as f64)
-    };
-    // vmhwm from /proc/[pid]/status is in kB, convert to bytes
-    let vmhwm_kb = process.status()?.vmhwm.unwrap_or(0);
     println!("walltime : {:.2?}", &PROGRESS.get_duration(),);
-    println!("cpu time : {:.2?} | k: {:.2?} | u: {:.2?}", ticks_to_duration(stat.utime + stat.stime), ticks_to_duration(stat.stime), ticks_to_duration(stat.utime));
-    println!("peak RSS : {:.2?}", bytesize::ByteSize(vmhwm_kb * 1024));
-    Ok(())
+    print_runtime_stats_for_role("", &collect_runtime_stats());
 }
 
 /// Raise the soft descriptor limit to the inherited hard ceiling when permitted.
@@ -2311,44 +2394,186 @@ mod runtime_stats_tests {
     use anyhow::Result;
 
     #[test]
-    fn collect_runtime_stats_matches_procfs_snapshot() -> Result<()> {
+    fn collect_runtime_stats_agrees_with_procfs() -> Result<()> {
+        // two views of the same accounting: getrusage(2) first, then /proc, which can only be later
+        let stats = collect_runtime_stats();
         let process = procfs::process::Process::myself()?;
-        let expected = collect_runtime_stats_for_process(&process)?;
-        let actual = collect_runtime_stats();
+        let stat = process.stat()?;
+        let ticks = procfs::ticks_per_second();
         let cpu_tolerance_ms = 50;
-        let rss_tolerance_bytes = 1_000_000;
+        for (name, reported, ticks_used) in [
+            ("user", stats.cpu_time_user_ms, stat.utime),
+            ("kernel", stats.cpu_time_kernel_ms, stat.stime),
+        ] {
+            let expected = ticks_used * 1000 / ticks;
+            assert!(
+                expected.abs_diff(reported) <= cpu_tolerance_ms,
+                "{name} CPU deviated by more than {cpu_tolerance_ms}ms: /proc says {expected}, got {reported}"
+            );
+        }
+        // the kernel counts resident pages per CPU and sums them only roughly, so two readings a
+        // moment apart can differ by megabytes on a busy machine with many CPUs. This checks that
+        // the figure is this process's peak, in bytes; which source it prefers is pinned below.
+        let expected = process.status()?.vmhwm.expect("a process has a peak RSS") * 1024;
         assert!(
-            expected.cpu_time_user_ms.abs_diff(actual.cpu_time_user_ms) <= cpu_tolerance_ms,
-            "user CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
-            expected.cpu_time_user_ms,
-            actual.cpu_time_user_ms
-        );
-        assert!(
-            expected
-                .cpu_time_kernel_ms
-                .abs_diff(actual.cpu_time_kernel_ms)
-                <= cpu_tolerance_ms,
-            "kernel CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
-            expected.cpu_time_kernel_ms,
-            actual.cpu_time_kernel_ms
-        );
-        assert!(
-            expected.peak_rss_bytes.abs_diff(actual.peak_rss_bytes) <= rss_tolerance_bytes,
-            "peak RSS deviated by more than {rss_tolerance_bytes} bytes: expected {}, got {}",
-            expected.peak_rss_bytes,
-            actual.peak_rss_bytes
+            (expected / 4..=expected * 4).contains(&stats.peak_rss_bytes),
+            "peak RSS is not this process's peak in bytes: /proc says {expected}, got {}",
+            stats.peak_rss_bytes
         );
         Ok(())
     }
 
     #[test]
-    fn collect_runtime_stats_returns_default_on_error() {
-        let stats = collect_runtime_stats_inner(None);
-        assert_eq!(stats, RuntimeStats::default());
+    fn collect_runtime_stats_counts_every_thread_including_ones_that_ended() {
+        let before = collect_runtime_stats();
+        // the work happens on a thread that is gone by the second reading: a sleep gives up the
+        // CPU, and touching fresh memory faults its pages in
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut memory = vec![0u8; 16 * 1024 * 1024];
+            for page in memory.chunks_mut(4096) {
+                page[0] = 1;
+            }
+            std::hint::black_box(&memory);
+        })
+        .join()
+        .unwrap();
+        let after = collect_runtime_stats();
+        assert!(
+            after.voluntary_context_switches > before.voluntary_context_switches,
+            "a sleep must count as a voluntary context switch: {before:?} -> {after:?}"
+        );
+        // at least one: with huge pages a few faults map all of it
+        assert!(
+            after.minor_page_faults > before.minor_page_faults,
+            "touching fresh memory must count as minor page faults: {before:?} -> {after:?}"
+        );
+        // counters of the whole process never go backwards
+        assert!(after.involuntary_context_switches >= before.involuntary_context_switches);
+        assert!(after.major_page_faults >= before.major_page_faults);
+    }
 
-        let nonexistent_process = procfs::process::Process::new(i32::MAX).ok();
-        let stats = collect_runtime_stats_inner(nonexistent_process);
-        assert_eq!(stats, RuntimeStats::default());
+    #[test]
+    fn cpu_time_is_whole_milliseconds_never_rounded_through_floating_point() {
+        let time = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
+        assert_eq!(milliseconds(time(0, 0)), 0);
+        assert_eq!(milliseconds(time(0, 999)), 0);
+        assert_eq!(milliseconds(time(2, 10_000)), 2010);
+        assert_eq!(milliseconds(time(2, 9_999)), 2009);
+        assert_eq!(milliseconds(time(3600, 999_999)), 3_600_999);
+    }
+
+    #[test]
+    fn peak_rss_is_the_program_s_own_and_falls_back_to_getrusage_without_procfs() {
+        // safety: rusage is plain numbers, for which all zero is a valid value
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        usage.ru_maxrss = 300;
+        // VmHWM is in kB, as ru_maxrss is
+        assert_eq!(peak_rss_bytes(Some(200), &usage), 200 * 1024);
+        assert_eq!(peak_rss_bytes(None, &usage), 300 * 1024);
+    }
+
+    #[test]
+    fn runtime_stats_text_lists_cpu_memory_context_switches_and_page_faults() {
+        let stats = RuntimeStats {
+            cpu_time_user_ms: 1500,
+            cpu_time_kernel_ms: 250,
+            peak_rss_bytes: 20 * 1024 * 1024,
+            voluntary_context_switches: 1234,
+            involuntary_context_switches: 56,
+            minor_page_faults: 7890,
+            major_page_faults: 2,
+        };
+        assert_eq!(
+            runtime_stats_text("  source ", &stats),
+            "  source cpu time : 1.75s | k: 250.00ms | u: 1.50s\n\
+             \x20 source peak RSS : 20.0 MiB (20971520 bytes)\n\
+             \x20 source context switches : 1234 voluntary | 56 involuntary\n\
+             \x20 source page faults : 7890 minor | 2 major"
+        );
+        // a process on its own has no role to name
+        assert!(
+            runtime_stats_text("", &stats)
+                .starts_with("cpu time : 1.75s | k: 250.00ms | u: 1.50s\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod summary_json_tests {
+    use super::*;
+
+    fn stats(first: u64) -> RuntimeStats {
+        RuntimeStats {
+            cpu_time_user_ms: first,
+            cpu_time_kernel_ms: first + 1,
+            peak_rss_bytes: first + 2,
+            voluntary_context_switches: first + 3,
+            involuntary_context_switches: first + 4,
+            minor_page_faults: first + 5,
+            major_page_faults: first + 6,
+        }
+    }
+
+    #[test]
+    fn summary_json_is_one_flat_object_of_counters_walltime_and_process_stats() {
+        let summary = crate::copy::Summary {
+            bytes_copied: 4096,
+            files_copied: 3,
+            directories_created: 1,
+            ..Default::default()
+        };
+        let walltime = std::time::Duration::from_millis(1500);
+        let value = summary_json(&summary, walltime, &stats(10), None);
+        let object = value.as_object().expect("the summary is a JSON object");
+        assert_eq!(object["bytes_copied"], 4096);
+        assert_eq!(object["files_copied"], 3);
+        assert_eq!(object["directories_created"], 1);
+        assert_eq!(object["rm_summary"]["files_removed"], 0);
+        assert_eq!(object["walltime_ms"], 1500);
+        for (key, expected) in [
+            ("cpu_time_user_ms", 10),
+            ("cpu_time_kernel_ms", 11),
+            ("peak_rss_bytes", 12),
+            ("voluntary_context_switches", 13),
+            ("involuntary_context_switches", 14),
+            ("minor_page_faults", 15),
+            ("major_page_faults", 16),
+        ] {
+            assert_eq!(object[key], expected, "{key}");
+        }
+        // only a remote copy has other processes to report
+        assert!(!object.contains_key("remote"));
+        // exact numbers throughout: nothing is rounded for reading
+        assert!(
+            object
+                .values()
+                .all(|field| field.is_u64() || field.is_object())
+        );
+    }
+
+    #[test]
+    fn summary_json_reports_each_daemon_of_a_remote_copy_under_its_role() {
+        let remote = crate::RemoteRuntimeStats {
+            source_host: "alpha".to_string(),
+            source_stats: stats(100),
+            dest_host: "beta".to_string(),
+            dest_stats: stats(200),
+        };
+        let value = summary_json(
+            &crate::copy::Summary::default(),
+            std::time::Duration::ZERO,
+            &stats(10),
+            Some(&remote),
+        );
+        // the top level is the process that prints the summary: the master
+        assert_eq!(value["cpu_time_user_ms"], 10);
+        assert_eq!(value["remote"]["source"]["host"], "alpha");
+        assert_eq!(value["remote"]["source"]["cpu_time_user_ms"], 100);
+        assert_eq!(value["remote"]["source"]["peak_rss_bytes"], 102);
+        assert_eq!(value["remote"]["destination"]["host"], "beta");
+        assert_eq!(value["remote"]["destination"]["minor_page_faults"], 205);
+        assert_eq!(value["remote"].as_object().unwrap().len(), 2);
     }
 }
 

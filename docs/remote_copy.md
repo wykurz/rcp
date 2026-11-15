@@ -643,8 +643,8 @@ effective values. The ordinary automatic/default intersection remains quiet. Pro
 Tokio-console artifact announcements likewise use the tracing notice target and reach master output
 only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
 `RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
-errors. Wire revision 11 additionally protects receiver-buffer retention startup configuration and
-requires matching binaries.
+errors. Wire revision 12 additionally protects the statistics a daemon reports with its result,
+which gained context switch and page fault counts, and requires matching binaries.
 
 ### Network Profiles
 

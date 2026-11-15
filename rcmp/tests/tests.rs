@@ -137,6 +137,48 @@ fn json_summary_is_valid_json_without_trailing_text() {
     assert!(summary.get("walltime_ms").is_some());
     assert!(summary.get("src_bytes").is_some());
     assert!(summary.get("mismatch").is_some());
+    // every figure the text summary prints is in the JSON too, as an exact number
+    for key in [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ] {
+        assert!(
+            summary.get(key).is_some_and(serde_json::Value::is_u64),
+            "missing or non-numeric {key}: {summary}"
+        );
+    }
+    assert!(summary["minor_page_faults"].as_u64().unwrap() > 0);
+    // the object has had this shape since rcmp printed JSON: nothing else is in it
+    let mut keys: Vec<&str> = summary
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "cpu_time_kernel_ms",
+            "cpu_time_user_ms",
+            "dst_bytes",
+            "involuntary_context_switches",
+            "major_page_faults",
+            "minor_page_faults",
+            "mismatch",
+            "peak_rss_bytes",
+            "skipped",
+            "src_bytes",
+            "voluntary_context_switches",
+            "walltime_ms",
+        ]
+    );
+    assert_eq!(summary["mismatch"]["file"]["dst_missing"], 1);
 }
 
 #[test]

@@ -89,7 +89,7 @@
 //! let dst = Path::new("/path2");
 //!
 //! // output differences to stdout (use false for quiet mode)
-//! let log = common::cmp::LogWriter::new(None, true, common::cmp::OutputFormat::default()).await?;
+//! let log = common::cmp::LogWriter::new(None, true, common::OutputFormat::Json).await?;
 //! let settings = common::cmp::Settings {
 //!     fail_early: false,
 //!     exit_early: false,
@@ -145,8 +145,8 @@ pub(crate) mod walk_driver;
 
 pub use config::{
     AdmissionPolicy, AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings,
-    FilesInFlightSource, MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, ResolvedFilesInFlight,
-    RuntimeConfig, ThrottleConfig, TracingConfig,
+    FilesInFlightSource, MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, OutputFormat,
+    ResolvedFilesInFlight, RuntimeConfig, ThrottleConfig, TracingConfig,
 };
 // Re-export `Side` from the congestion crate so downstream binaries
 // (rcp, rrm, …) and integration tests can pass `common::Side::Source` /
@@ -185,15 +185,24 @@ impl std::fmt::Display for RcpdType {
 // Type alias for progress snapshots
 pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
 
-/// runtime statistics collected from a process (CPU time, memory usage)
+/// Runtime statistics collected from a process: CPU time, memory usage, context switches and
+/// page faults, each for the whole process (every thread).
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct RuntimeStats {
-    /// user-mode CPU time in milliseconds
+    /// User-mode CPU time in milliseconds.
     pub cpu_time_user_ms: u64,
-    /// kernel-mode CPU time in milliseconds
+    /// Kernel-mode CPU time in milliseconds.
     pub cpu_time_kernel_ms: u64,
-    /// peak resident set size in bytes
+    /// Peak resident set size in bytes.
     pub peak_rss_bytes: u64,
+    /// Times a thread gave up the CPU by itself, typically to wait for I/O.
+    pub voluntary_context_switches: u64,
+    /// Times the scheduler took the CPU away from a thread.
+    pub involuntary_context_switches: u64,
+    /// Page faults served without I/O.
+    pub minor_page_faults: u64,
+    /// Page faults that needed I/O.
+    pub major_page_faults: u64,
 }
 
 /// runtime stats collected from remote rcpd processes for display at the end of a remote copy
@@ -653,7 +662,7 @@ pub fn run<Fut, Summary, Error>(
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function should NOT print the error
 where
-    Summary: std::fmt::Display,
+    Summary: std::fmt::Display + serde::Serialize,
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
@@ -665,7 +674,7 @@ where
         quiet,
         verbose,
         print_summary,
-        suppress_runtime_stats,
+        format,
         startup_error_prefix,
     } = output;
     if let Err(error) = throttle_config.validate() {
@@ -692,7 +701,7 @@ where
     if let Some(warning) = throttle_config.deprecated_max_open_files_warning() {
         tracing::warn!(target: NOTICE_TARGET, "{warning}");
     }
-    let res = {
+    let (res, json_summary) = {
         let (runtime, admission) =
             match runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config) {
                 Ok(runtime) => runtime,
@@ -716,10 +725,19 @@ where
             scope.finish();
             result
         };
+        // one object: the counters, and the statistics that text prints below. It is built
+        // here, where text is printed, and written as the last thing this function does, so
+        // that nothing logged while the run winds down can follow it on stdout.
+        let mut json_summary = None;
         match &res {
             Ok(summary) => {
                 if print_summary || verbose > 0 {
-                    println!("{summary}");
+                    match format {
+                        OutputFormat::Text => println!("{summary}"),
+                        OutputFormat::Json => {
+                            json_summary = Some(runtime_setup::json_summary(summary));
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -728,11 +746,9 @@ where
                 }
             }
         }
-        if (print_summary || verbose > 0)
-            && !suppress_runtime_stats
-            && let Err(err) = runtime_setup::print_runtime_stats()
-        {
-            println!("Failed to print runtime stats: {err:?}");
+        // a run that failed reports in text, statistics included, whatever the format
+        if (print_summary || verbose > 0) && json_summary.is_none() {
+            runtime_setup::print_runtime_stats();
         }
         // Signal the histogram logger to exit cleanly so its final
         // snapshot is written before the runtime drops and aborts it.
@@ -753,7 +769,7 @@ where
         // included) run before the wait begins; only stuck blocking threads are abandoned to
         // process exit once the deadline passes.
         runtime.shutdown_timeout(std::time::Duration::from_secs(10));
-        res
+        (res, json_summary)
     };
     // Clear process-wide state so a second `run()` in the same process
     // starts on a clean slate. Without this, a later run inherits the
@@ -763,6 +779,9 @@ where
     if let Err(error) = tracing_guards.finish() {
         eprintln!("Failed to write scoped timings: {error:#}");
         return None;
+    }
+    if let Some(json_summary) = json_summary {
+        println!("{json_summary}");
     }
     res.ok()
 }

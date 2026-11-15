@@ -781,3 +781,40 @@ fn test_sudo_strict_reuse_restores_foreign_owned_dir_rlink() {
         "reused dir owner uid must be restored to the original, not left as the root copier"
     );
 }
+
+#[test]
+fn json_summary_is_one_object_with_exact_counters_and_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a"), "aaa").unwrap();
+    std::fs::write(src.join("sub").join("b"), "bbbb").unwrap();
+    let output = assert_cmd::Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--summary", "--output-format", "json"])
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+    assert_eq!(summary["hard_links_created"], 2);
+    assert_eq!(summary["copy_summary"]["directories_created"], 2);
+    assert_eq!(summary["copy_summary"]["files_copied"], 0);
+    for key in [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ] {
+        assert!(summary[key].is_u64(), "missing {key}: {summary}");
+    }
+    assert!(summary["walltime_ms"].is_u64(), "{summary}");
+    assert!(dst.join("sub").join("b").exists());
+}

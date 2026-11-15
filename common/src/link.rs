@@ -117,7 +117,7 @@ fn skipped_summary_for(kind: EntryKind) -> Summary {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, serde::Serialize)]
 pub struct Summary {
     pub hard_links_created: usize,
     pub hard_links_unchanged: usize,

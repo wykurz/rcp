@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Report context switches and page faults next to CPU time and peak memory in every tool's
+  `--summary`, for the whole process, and for the source and destination `rcpd` of a remote copy.
+  `rcmp`'s JSON summary carries the same figures. Advance the remote compatibility revision to 12
+  for the daemons' new counters, requiring matching `rcp`/`rcpd` binaries.
+- Add `--output-format <text|json>` to `rcp`, `rrm`, `rlink`, `rchm` and `filegen`. With
+  `--summary`, `json` prints one JSON object with the counters as exact numbers, the wall time and
+  the process statistics; after a remote copy it also holds those of the source and destination
+  `rcpd`. Text remains the default.
+
+### Changed
+
+- Read the summary's CPU time with `getrusage(2)`: it is reported to the millisecond instead of in
+  10 ms clock ticks. Statistics no longer read as zero when `/proc` is unavailable; peak memory then
+  comes from `getrusage(2)` as well.
+
 ## [0.42.0] - 2026-11-11
 
 ### Added

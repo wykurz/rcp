@@ -106,7 +106,7 @@ struct Args {
         value_name = "FORMAT",
         help_heading = "Progress & output"
     )]
-    output_format: common::cmp::OutputFormat,
+    output_format: common::OutputFormat,
 
     /// Chunk size used to calculate number of I/O per file
     ///
@@ -132,7 +132,7 @@ struct Args {
     dst: std::path::PathBuf,
 }
 
-async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
+async fn async_main(args: Args) -> Result<common::cmp::Summary> {
     // build filter settings from CLI arguments
     let filter = common::filter::FilterSettings::from_args(
         args.filter_file.as_deref(),
@@ -157,10 +157,7 @@ async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
     )
     .await?;
     log_handle.flush().await?;
-    Ok(common::cmp::FormattedSummary {
-        summary,
-        format: args.output_format,
-    })
+    Ok(summary)
 }
 
 fn main() -> Result<()> {
@@ -170,10 +167,9 @@ fn main() -> Result<()> {
         let args = args.clone();
         |_admission| async_main(args)
     };
-    let output = common::OutputConfig {
-        suppress_runtime_stats: matches!(args.output_format, common::cmp::OutputFormat::Json),
-        ..args.common.output_config(args.quiet, args.summary)
-    };
+    let output = args
+        .common
+        .output_config(args.quiet, args.summary, args.output_format);
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
@@ -194,12 +190,12 @@ fn main() -> Result<()> {
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
     match res {
-        Some(formatted) => {
+        Some(summary) => {
             if args.no_check {
                 std::process::exit(0)
             } else {
                 // if there are any differences, return error code 1
-                for (_, cmp_result) in &formatted.summary.mismatch {
+                for (_, cmp_result) in &summary.mismatch {
                     let different = cmp_result[common::cmp::CompareResult::Different] > 0
                         || cmp_result[common::cmp::CompareResult::SrcMissing] > 0
                         || cmp_result[common::cmp::CompareResult::DstMissing] > 0;

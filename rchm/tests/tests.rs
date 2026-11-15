@@ -655,3 +655,35 @@ fn sudo_no_setid_does_not_create_root_setid_executable() {
         "root-owned payload must not retain set-ID bits"
     );
 }
+
+#[test]
+fn json_summary_is_one_object_with_exact_counters_and_stats() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f");
+    std::fs::write(&f, "x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = rchm()
+        .args(["--summary", "--output-format", "json", "--mode", "f:g+w"])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+    assert_eq!(summary["files_changed"], 1);
+    assert_eq!(summary["symlinks_changed"], 0);
+    for key in [
+        "cpu_time_user_ms",
+        "cpu_time_kernel_ms",
+        "peak_rss_bytes",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_page_faults",
+        "major_page_faults",
+    ] {
+        assert!(summary[key].is_u64(), "missing {key}: {summary}");
+    }
+    assert!(summary["walltime_ms"].is_u64(), "{summary}");
+    assert_eq!(mode_of(&f), 0o664);
+}
