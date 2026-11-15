@@ -921,7 +921,10 @@ the runtime filesystem-property item (POSIX ACLs) is NOT — `--toctou-check` in
 and flags, not the runtime state of the filesystems involved, so it cannot detect it:
 
 - **`--dereference` / `-L`**: Following symlinks is the requested behavior. A swapped link is
-  followed by design. Do not use `-L` in privileged sudo rules over attacker-writable trees.
+  followed by design. Local dereference handoffs reuse the held destination parent, saving another
+  parent-path open; source referents are still resolved by path. This does not add snapshot
+  consistency or support for changing source/destination file sets. `-L` remains rejected by
+  `--require-toctou-safe`. Do not use `-L` in privileged sudo rules over attacker-writable trees.
 - **Unsupported non-Linux builds**: RCP supports Linux only. The sources rely on Linux-specific
   filesystem APIs, so a non-Linux target receives no compatibility or hardening guarantees.
 - **`rcmp`** (read-only compare): `rcmp` cannot mis-permission or destroy files. A concurrent swap

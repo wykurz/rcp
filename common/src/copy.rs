@@ -488,7 +488,7 @@ impl PreparedCopy {
     }
 }
 
-/// Path-based root setup with transferable leaf admission.
+/// Root setup with transferable leaf admission and an optional held destination parent.
 ///
 /// Normal public calls arrive without a guard and acquire before opening either operand parent or
 /// performing a strict fd-based root filter probe. `--dereference` transfers its spawn-loop guard
@@ -694,12 +694,12 @@ async fn copy_root_admitted(
         };
         // dry-run has no writable destination parent (the parent may not even exist). delete
         // previews open separate read-only directory handles before descent. `dst_parent == None`
-        // suppresses mutation. In a real copy, reuse the strict-validated parent, or open it
-        // following symlinks (default mode; `rcp file symlink_to_dir/out` copies into the real dir).
+        // suppresses mutation. a real copy reuses the strict-validated or inherited held parent.
+        // only an unbound root opens the parent path, following symlinks in default mode.
         let dst_parent = if settings.dry_run.is_some() {
             None
         } else {
-            match strict_dst_parent {
+            match strict_dst_parent.or_else(|| destination.real_parent().cloned()) {
                 Some(parent) => Some(parent),
                 None => {
                     let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
@@ -843,8 +843,8 @@ struct CopyVisitor {
     /// The *source* root needs no field: an entry's source real path is the driver-maintained
     /// `EntryCx::real_path` (seeded with the source root in [`run_copy_root`]).
     dst_root: PathBuf,
-    /// The root's preview authority: the original destination operand for a public copy, or an
-    /// inherited held parent/absence for a delegated copy. Independent of filter coordinates.
+    /// Destination authority: the original root operand, or an inherited held parent/preview state
+    /// for a delegated copy. Independent of filter coordinates.
     destination: DestinationContext,
     settings: Settings,
     preserve: preserve::Settings,
@@ -3918,6 +3918,95 @@ mod copy_tests {
     #[tokio::test]
     async fn dereferenced_preview_retains_opened_destination_across_rename() -> anyhow::Result<()> {
         preview_retains_opened_destination_case(PreviewOperation::Dereference).await
+    }
+
+    async fn dereferenced_copy_retains_destination_parent_case(
+        prepared: bool,
+    ) -> anyhow::Result<()> {
+        for directory_target in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let root = tmp.path();
+            let source = root.join("source");
+            let target = source.join("target");
+            let link = source.join("link");
+            let destination_parent = root.join("destination-parent");
+            let held = root.join("held-parent");
+            let dst = destination_parent.join("output");
+            tokio::fs::create_dir(&source).await?;
+            tokio::fs::create_dir(&destination_parent).await?;
+            if directory_target {
+                tokio::fs::create_dir(&target).await?;
+                tokio::fs::write(target.join("payload"), b"PAYLOAD").await?;
+            } else {
+                tokio::fs::write(&target, b"PAYLOAD").await?;
+            }
+            tokio::fs::symlink(&target, &link).await?;
+            let src_parent =
+                Arc::new(Dir::open_root_dir(&source, false, congestion::Side::Source).await?);
+            let dst_parent = Arc::new(
+                Dir::open_root_dir(&destination_parent, false, congestion::Side::Destination)
+                    .await?,
+            );
+            let destination = if prepared {
+                DestinationContext::parent(Some(Arc::clone(&dst_parent)))
+            } else {
+                DestinationContext::for_operand(&link, None, &dst)
+            };
+            let mut settings = settings_with_delete(None);
+            settings.dereference = true;
+            let visitor = CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: dst.clone(),
+                destination,
+                settings,
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: Some(dst_parent),
+                root_is_fresh: false,
+            };
+            let parent_ctx = visitor.root_dir_context();
+            let name = OsStr::new("link");
+            let leaf = AdmittedLeaf::try_new(src_parent.child(name).await?, None)
+                .unwrap_or_else(|_| panic!("the fixture is a symlink"));
+            let cx = EntryCx::root(src_parent, name.to_owned(), link, &PROGRESS);
+            // distinguish reuse of the held parent from reopening its display path.
+            tokio::fs::rename(&destination_parent, &held).await?;
+            tokio::fs::create_dir(&destination_parent).await?;
+            tokio::fs::write(destination_parent.join("sentinel"), b"UNSELECTED").await?;
+            let summary = visitor
+                .visit_leaf(&cx, &parent_ctx, leaf)
+                .await
+                .map_err(|error| error.source)?;
+            assert_eq!(summary.files_copied, 1);
+            let copied = if directory_target {
+                held.join("output/payload")
+            } else {
+                held.join("output")
+            };
+            assert!(
+                copied.is_file(),
+                "dereference must write through the retained parent"
+            );
+            assert_eq!(tokio::fs::read(copied).await?, b"PAYLOAD");
+            assert!(
+                !dst.exists(),
+                "the replacement parent must remain untouched"
+            );
+            assert_eq!(
+                tokio::fs::read(destination_parent.join("sentinel")).await?,
+                b"UNSELECTED"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dereferenced_copy_retains_bound_root_parent() -> anyhow::Result<()> {
+        dereferenced_copy_retains_destination_parent_case(false).await
+    }
+
+    #[tokio::test]
+    async fn dereferenced_copy_retains_prepared_parent() -> anyhow::Result<()> {
+        dereferenced_copy_retains_destination_parent_case(true).await
     }
 
     async fn prune_error_preserves_partial_counts_and_finalization_case(
