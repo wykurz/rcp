@@ -1292,113 +1292,118 @@ impl WalkVisitor for CopyVisitor {
         parent_ctx: &CopyDirContext,
         leaf: AdmittedLeaf,
     ) -> Result<Summary, Error> {
-        let src_parent = &cx.parent;
-        let dst_parent = parent_ctx.dst_dir.as_ref();
-        let name = cx.name.as_os_str();
-        let src_path = &cx.real_path;
-        let dst_path = self.dst_path_for(cx);
-        let dst_name = self.dst_name_for(cx)?;
-        let is_fresh = parent_ctx.is_fresh;
-        // --dereference: resolve a symlink to its target by path and copy that instead. this is the
-        // path-based payload branch we intentionally keep (hardening -L is out of scope). transfer
-        // provisional admission into the target's root walk; that walk releases it if authoritative
-        // classification proves the target is a directory
-        if self.settings.dereference && leaf.kind() == EntryKind::Symlink {
-            let open_file_guard = match leaf.into_permit() {
-                Some(permit) => permit.into_open_file(),
-                None => throttle::open_file_permit().await,
-            };
-            // canonicalizing a payload target requires explicit dereferencing; read-only
-            // destination preview probes elsewhere do not enter this payload branch
-            debug_assert!(
-                self.settings.dereference,
-                "canonicalize reached with dereference == false; payload target resolution \
-                 requires explicit dereferencing"
-            );
-            let link = crate::walk::run_metadata_probed(
-                congestion::Side::Source,
-                congestion::MetadataOp::Stat,
-                tokio::fs::canonicalize(src_path),
-            )
-            .await
-            .with_context(|| format!("failed reading src symlink {:?}", src_path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-            return copy_root_admitted(
-                self.prog_track,
-                &link,
-                &dst_path,
-                &self.settings,
-                &self.preserve,
-                is_fresh,
-                parent_ctx.destination.clone(),
-                Some(open_file_guard),
-            )
-            .await;
-        }
-        match leaf.kind() {
-            EntryKind::File => {
-                copy_file_fd(
+        // keep leaf-copy state out of every suspended directory dispatcher. allocate only when
+        // the driver polls a leaf, inside its existing fd-admission scope.
+        Box::pin(async move {
+            let src_parent = &cx.parent;
+            let dst_parent = parent_ctx.dst_dir.as_ref();
+            let name = cx.name.as_os_str();
+            let src_path = &cx.real_path;
+            let dst_path = self.dst_path_for(cx);
+            let dst_name = self.dst_name_for(cx)?;
+            let is_fresh = parent_ctx.is_fresh;
+            // --dereference: resolve a symlink to its target by path and copy that instead. this is the
+            // path-based payload branch we intentionally keep (hardening -L is out of scope). transfer
+            // provisional admission into the target's root walk; that walk releases it if authoritative
+            // classification proves the target is a directory
+            if self.settings.dereference && leaf.kind() == EntryKind::Symlink {
+                let open_file_guard = match leaf.into_permit() {
+                    Some(permit) => permit.into_open_file(),
+                    None => throttle::open_file_permit().await,
+                };
+                // canonicalizing a payload target requires explicit dereferencing; read-only
+                // destination preview probes elsewhere do not enter this payload branch
+                debug_assert!(
+                    self.settings.dereference,
+                    "canonicalize reached with dereference == false; payload target resolution \
+                     requires explicit dereferencing"
+                );
+                let link = crate::walk::run_metadata_probed(
+                    congestion::Side::Source,
+                    congestion::MetadataOp::Stat,
+                    tokio::fs::canonicalize(src_path),
+                )
+                .await
+                .with_context(|| format!("failed reading src symlink {:?}", src_path))
+                .map_err(|err| Error::new(err, Default::default()))?;
+                return copy_root_admitted(
                     self.prog_track,
-                    src_parent,
-                    dst_parent,
-                    name,
-                    dst_name,
+                    &link,
                     &dst_path,
-                    src_path,
-                    leaf.handle(),
                     &self.settings,
                     &self.preserve,
                     is_fresh,
-                    &parent_ctx.destination,
+                    parent_ctx.destination.clone(),
+                    Some(open_file_guard),
                 )
-                .await
+                .await;
             }
-            EntryKind::Symlink => {
-                copy_symlink_fd(
-                    self.prog_track,
-                    src_parent,
-                    dst_parent,
-                    dst_name,
-                    src_path,
-                    &dst_path,
-                    leaf.handle(),
-                    &self.settings,
-                    &self.preserve,
-                    is_fresh,
-                    &parent_ctx.destination,
-                )
-                .await
-            }
-            EntryKind::Special => {
-                if self.settings.skip_specials {
-                    tracing::debug!("skipping special file {:?}", src_path);
-                    if let Some(mode) = self.settings.dry_run {
-                        match mode {
-                            DryRunMode::Brief => {}
-                            DryRunMode::All => println!("skip special {:?}", src_path),
-                            DryRunMode::Explain => {
-                                println!("skip special {:?} (unsupported file type)", src_path);
+            match leaf.kind() {
+                EntryKind::File => {
+                    copy_file_fd(
+                        self.prog_track,
+                        src_parent,
+                        dst_parent,
+                        name,
+                        dst_name,
+                        &dst_path,
+                        src_path,
+                        leaf.handle(),
+                        &self.settings,
+                        &self.preserve,
+                        is_fresh,
+                        &parent_ctx.destination,
+                    )
+                    .await
+                }
+                EntryKind::Symlink => {
+                    copy_symlink_fd(
+                        self.prog_track,
+                        src_parent,
+                        dst_parent,
+                        dst_name,
+                        src_path,
+                        &dst_path,
+                        leaf.handle(),
+                        &self.settings,
+                        &self.preserve,
+                        is_fresh,
+                        &parent_ctx.destination,
+                    )
+                    .await
+                }
+                EntryKind::Special => {
+                    if self.settings.skip_specials {
+                        tracing::debug!("skipping special file {:?}", src_path);
+                        if let Some(mode) = self.settings.dry_run {
+                            match mode {
+                                DryRunMode::Brief => {}
+                                DryRunMode::All => println!("skip special {:?}", src_path),
+                                DryRunMode::Explain => {
+                                    println!("skip special {:?} (unsupported file type)", src_path);
+                                }
                             }
                         }
+                        self.prog_track.specials_skipped.inc();
+                        return Ok(Summary {
+                            specials_skipped: 1,
+                            ..Default::default()
+                        });
                     }
-                    self.prog_track.specials_skipped.inc();
-                    return Ok(Summary {
-                        specials_skipped: 1,
-                        ..Default::default()
-                    });
+                    Err(Error::new(
+                        anyhow!(
+                            "copy: {:?} -> {:?} failed, unsupported src file type",
+                            src_path,
+                            dst_path
+                        ),
+                        Default::default(),
+                    ))
                 }
-                Err(Error::new(
-                    anyhow!(
-                        "copy: {:?} -> {:?} failed, unsupported src file type",
-                        src_path,
-                        dst_path
-                    ),
-                    Default::default(),
-                ))
+                // a directory never reaches `visit_leaf`: the driver dispatches it to dir_pre/dir_post.
+                EntryKind::Dir => unreachable!("directory entries are handled by dir_pre/dir_post"),
             }
-            // a directory never reaches `visit_leaf`: the driver dispatches it to dir_pre/dir_post.
-            EntryKind::Dir => unreachable!("directory entries are handled by dir_pre/dir_post"),
-        }
+        })
+        .await
     }
 
     async fn dir_pre(
@@ -2852,6 +2857,39 @@ mod copy_tests {
             dry_run: None,
             delete,
         }
+    }
+
+    #[tokio::test]
+    async fn leaf_copy_state_does_not_inflate_directory_dispatch() -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        let name = OsStr::new("source-link");
+        tokio::fs::symlink("target", root.join(name)).await?;
+        let parent = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
+        let leaf = AdmittedLeaf::try_new(parent.child(name).await?, None)
+            .unwrap_or_else(|_| panic!("the fixture is a symlink"));
+        let cx = EntryCx::root(parent, name.to_owned(), root.join(name), &PROGRESS);
+        let dst = root.join("destination");
+        let visitor = CopyVisitor {
+            prog_track: &PROGRESS,
+            destination: DestinationContext::new(&dst),
+            dst_root: dst,
+            settings: settings_with_delete(None),
+            preserve: *NO_PRESERVE_SETTINGS,
+            dst_parent: None,
+            root_is_fresh: false,
+        };
+        let parent_ctx = visitor.root_dir_context();
+        let visit = visitor.visit_leaf(&cx, &parent_ctx, leaf);
+        let bytes = std::mem::size_of_val(&visit);
+        drop(visit);
+        tokio::fs::remove_dir_all(&root).await?;
+        // the driver embeds this returned future, including when it dispatches a directory.
+        // leave room for bookkeeping without reserving the whole leaf-copy state there.
+        assert!(
+            bytes < 1024,
+            "leaf visitor embeds {bytes} bytes in the driver"
+        );
+        Ok(())
     }
 
     #[tokio::test]
