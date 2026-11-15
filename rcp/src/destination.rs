@@ -708,13 +708,18 @@ async fn handle_file_stream(
         .await;
         // track whether we need to close the stream and exit early
         let mut stream_corrupted = false;
-        let mut fail_early_error: Option<anyhow::Error> = None;
         if let Err(e) = file_result {
             tracing::error!(
                 "Failed to handle file {}: {:#}",
                 file_header.dst.display(),
                 e.source
             );
+            if settings.fail_early {
+                // fatal teardown cannot reuse this stream: do not wait for its payload or
+                // advance terminal bookkeeping before returning the original file failure
+                directory_tracker.begin_close();
+                return Err(e.source);
+            }
             match e.stream_state {
                 StreamState::NeedsDrain => {
                     // no data was read yet, drain the file's data to stay in sync
@@ -737,24 +742,16 @@ async fn handle_file_stream(
                     stream_corrupted = true;
                 }
             }
-            if settings.fail_early {
-                fail_early_error = Some(e.source);
-            } else {
-                error_collector.push(e.source);
-            }
+            error_collector.push(e.source);
         }
-        // ALWAYS update directory tracker, even on error
-        // this prevents hangs waiting for file counts
+        // settle collected file errors so sibling work can still complete
         common::timing_scope!(trace, "destination.file.complete")
             .measure(async {
-                if fail_early_error.is_some() || stream_corrupted {
+                if stream_corrupted {
                     directory_tracker.begin_close();
                 }
                 if file_header.is_root {
-                    tracing::info!(
-                        "Root file processed (success={})",
-                        fail_early_error.is_none() && !stream_corrupted
-                    );
+                    tracing::info!("Root file processed (success={})", !stream_corrupted);
                     directory_tracker.with_state(|state| state.set_root_complete());
                 } else {
                     // get parent directory
@@ -769,18 +766,14 @@ async fn handle_file_stream(
                 anyhow::Ok(())
             })
             .await?;
-        // now handle stream corruption or fail-early after tracking is updated
+        // now handle stream corruption after tracking is updated
         if stream_corrupted {
             file_recv_stream.close().await;
             // always return error for corrupted stream - protocol is out of sync and
             // remaining files on this stream are lost without tracker updates.
-            return Err(fail_early_error.unwrap_or_else(|| {
-                anyhow::anyhow!("stream corrupted, remaining files on this stream lost")
-            }));
-        }
-        if let Some(err) = fail_early_error {
-            file_recv_stream.close().await;
-            return Err(err);
+            return Err(anyhow::anyhow!(
+                "stream corrupted, remaining files on this stream lost"
+            ));
         }
     }
     file_recv_stream.close().await;
@@ -5185,6 +5178,145 @@ mod teardown_tests {
             Box::new(FailingReader(kind)) as remote::streams::BoxedRead,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn fail_early_rejects_file_without_waiting_for_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        std::fs::write(&existing, b"original").unwrap();
+        let missing_parent = temp.path().join("missing/child");
+        for (destination, expected_error) in [
+            (&existing, "already exists"),
+            (
+                &missing_parent,
+                "failed resolving destination parent directory",
+            ),
+        ] {
+            let tracker = tracker_over_sink();
+            tracker
+                .with_state(|state| state.finish_discovery(true))
+                .unwrap();
+            let (mut source, destination_stream) = tokio::io::duplex(4096);
+            let header = remote::protocol::File {
+                src: "/source".into(),
+                dst: destination.to_owned(),
+                size: 1,
+                metadata: remote::protocol::Metadata::from(&std::fs::metadata(&existing).unwrap()),
+                is_root: true,
+            };
+            remote::streams::SendStream::new(&mut source)
+                .send_control_message(&header)
+                .await
+                .unwrap();
+            let mut settings = testutils::copy_settings();
+            settings.fail_early = true;
+            // keep the source open without a payload: a fatal error must not wait to recover framing
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle_file_stream(
+                    settings,
+                    common::preserve::preserve_none(),
+                    remote::streams::RecvStream::new(
+                        Box::new(destination_stream) as remote::streams::BoxedRead
+                    ),
+                    tracker.clone(),
+                    Arc::new(common::error_collector::ErrorCollector::default()),
+                ),
+            )
+            .await
+            .expect("fail-early waited for the rejected file's payload")
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+            assert!(tracker.with_state(|state| state.is_closing()));
+            assert!(!tracker.with_state(|state| state.transfer_complete()));
+            assert!(!tracker.send_destination_done().await.unwrap());
+            assert_eq!(std::fs::read(&existing).unwrap(), b"original");
+            assert!(!missing_parent.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn collected_file_error_drains_payload_before_copying_next_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        let copied = temp.path().join("copied");
+        std::fs::write(&existing, b"original").unwrap();
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let send = remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
+        );
+        let tracker = directory_tracker::SharedDirectoryTracker::new(
+            Arc::new(tokio::sync::Mutex::new(send)),
+            common::preserve::preserve_none(),
+            false,
+            errors.clone(),
+        );
+        let admission = tracker
+            .with_state(|state| state.admit_directory(temp.path(), true))
+            .unwrap();
+        let directory = Arc::new(
+            Dir::open_root_dir(temp.path(), false, common::Side::Destination)
+                .await
+                .unwrap(),
+        );
+        tracker
+            .register_directory(
+                admission,
+                directory,
+                remote::protocol::Metadata::from(&std::fs::metadata(temp.path()).unwrap()),
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+        tracker.mark_announced(temp.path()).await.unwrap();
+        tracker.seal_directory(temp.path(), 2).await.unwrap();
+        tracker
+            .with_state(|state| state.finish_discovery(true))
+            .unwrap();
+        let (mut source, destination) = tokio::io::duplex(4096);
+        for (path, payload) in [
+            (&existing, b"discard".as_slice()),
+            (&copied, b"copied bytes".as_slice()),
+        ] {
+            let header = remote::protocol::File {
+                src: "/source".into(),
+                dst: path.to_owned(),
+                size: payload.len() as u64,
+                metadata: remote::protocol::Metadata::from(&std::fs::metadata(&existing).unwrap()),
+                is_root: false,
+            };
+            remote::streams::SendStream::new(&mut source)
+                .send_control_message(&header)
+                .await
+                .unwrap();
+            source.write_all(payload).await.unwrap();
+        }
+        source.shutdown().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_file_stream(
+                testutils::copy_settings(),
+                common::preserve::preserve_none(),
+                remote::streams::RecvStream::new(
+                    Box::new(destination) as remote::streams::BoxedRead
+                ),
+                tracker.clone(),
+                errors.clone(),
+            ),
+        )
+        .await
+        .expect("recoverable file error prevented the next file from completing")
+        .unwrap();
+        let error = errors
+            .take_error()
+            .expect("destination collision must be reported");
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+        assert!(tracker.with_state(|state| state.is_done()));
+        assert!(!tracker.with_state(|state| state.is_closing()));
+        assert_eq!(std::fs::read(existing).unwrap(), b"original");
+        assert_eq!(std::fs::read(copied).unwrap(), b"copied bytes");
     }
 
     /// A CLEAN framed EOF (an empty reader) before completion must be fatal, exactly like a
