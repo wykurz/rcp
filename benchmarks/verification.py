@@ -9,6 +9,8 @@ LEGACY_VERIFICATION_POLICY = "exact relative directory and regular-file paths, s
 LEGACY_SOURCE_VERIFICATION_POLICY = LEGACY_VERIFICATION_POLICY + "; source tree must match initial scan after all case trials"
 FULL_CONTENT_POLICY = "sha256-tree-stream-v1"
 METADATA_POLICY = "metadata-size-tree-v1"
+# no tree is read: a copy counts when it exits zero and reports the expected transfer counts
+SUMMARY_POLICY = "exit-status-summary-v1"
 DEFAULT_WORKERS = 8
 MAX_WORKERS = 32
 DEFAULT_INLINE_BYTES = 128 * 1024
@@ -71,6 +73,8 @@ def verification_label(context):
         return "Metadata/size only; file content integrity not checked"
     if policy == FULL_CONTENT_POLICY:
         return "Full-content SHA-256"
+    if policy == SUMMARY_POLICY:
+        return "Not verified; exit status and reported transfer counts only"
     if policy is None and context.get("verification_policy") in (
             LEGACY_VERIFICATION_POLICY, LEGACY_SOURCE_VERIFICATION_POLICY):
         return "Full-content SHA-256"
