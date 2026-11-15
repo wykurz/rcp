@@ -198,6 +198,13 @@ aws-benchmark-test:
 aws-benchmark-report *ARGS:
     python3 -m infra.aws_benchmark.results "$@"
 
+# The run key is shown on the run's public page; region and bucket default to the repository variables.
+# Download one run's retained AWS evidence into a new directory and verify it (operator credentials).
+aws-benchmark-evidence RUN_KEY DIRECTORY:
+    python3 -m infra.aws_benchmark.evidence "$1" "$2" \
+        --region "${RCP_AWS_PRODUCTION_REGION:-$(gh variable get RCP_AWS_PRODUCTION_REGION)}" \
+        --bucket "${RCP_AWS_PRODUCTION_BUCKET:-$(gh variable get RCP_AWS_PRODUCTION_BUCKET)}"
+
 # Render a standalone dashboard from a result file or history directory.
 benchmark-report *ARGS:
     python3 -m benchmarks.report "$@"
