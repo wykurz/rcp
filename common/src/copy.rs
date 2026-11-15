@@ -1533,15 +1533,16 @@ impl WalkVisitor for CopyVisitor {
                         &dst_path,
                     )
                 {
-                    match self
-                        .prune_finished_dir(
-                            &mut summary,
-                            &keep_set,
-                            &src_dir,
-                            prune_dir,
-                            &cx.rel_path,
-                        )
-                        .await
+                    // keep pruning state out of every suspended directory dispatcher; allocate
+                    // it only when deletion has both complete child names and a scan directory.
+                    match Box::pin(self.prune_finished_dir(
+                        &mut summary,
+                        &keep_set,
+                        &src_dir,
+                        prune_dir,
+                        &cx.rel_path,
+                    ))
+                    .await
                     {
                         Ok(()) => {}
                         Err(error) if self.settings.fail_early => {
@@ -2888,6 +2889,45 @@ mod copy_tests {
         assert!(
             bytes < 1024,
             "leaf visitor embeds {bytes} bytes in the driver"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pruning_state_does_not_inflate_directory_post_processing() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let name = OsStr::new("source");
+        tokio::fs::create_dir(root.path().join(name)).await?;
+        let parent =
+            Arc::new(Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?);
+        let handle = parent.child(name).await?;
+        let cx = EntryCx::root(parent, name.to_owned(), root.path().join(name), &PROGRESS);
+        let dst = root.path().join("destination");
+        let visitor = CopyVisitor {
+            prog_track: &PROGRESS,
+            destination: DestinationContext::new(&dst),
+            dst_root: dst,
+            settings: settings_with_delete(None),
+            preserve: *NO_PRESERVE_SETTINGS,
+            dst_parent: Some(Arc::new(
+                Dir::open_root_dir(root.path(), false, congestion::Side::Destination).await?,
+            )),
+            root_is_fresh: false,
+        };
+        let parent_ctx = visitor.root_dir_context();
+        let DirAction::Descend { state, .. } = visitor.dir_pre(&cx, &parent_ctx, &handle).await?
+        else {
+            panic!("the empty source directory must be traversed");
+        };
+        let post = visitor.dir_post(&cx, state, Ok(Default::default()));
+        let bytes = std::mem::size_of_val(&post);
+        let summary = post.await?;
+        assert_eq!(summary.directories_created, 1);
+        // every suspended directory dispatcher embeds this future, even without --delete.
+        // leave bookkeeping headroom without reserving the whole pruning state there.
+        assert!(
+            bytes < 4096,
+            "directory post-processing embeds {bytes} bytes"
         );
         Ok(())
     }
