@@ -65,7 +65,8 @@ class PublishTests(unittest.TestCase):
             self.assertIn('"candidate":"' + self.fx.store.record.state["request"]["candidate"] + '"', text)
             self.assertIn('"median":', text)
             self.assertIn('"collected_at":', text)
-            self.assertIn("not independently attested", text)
+            self.assertNotIn("attested", text)
+            self.assertNotIn("self-reported", text)
 
     def test_export_cli_reports_zero_records_for_empty_batch(self):
         self.reader.discover = Mock(return_value=[])

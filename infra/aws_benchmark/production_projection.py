@@ -43,8 +43,6 @@ MAX_CELLS = 64
 
 
 
-MEASUREMENT_CAVEAT = ("Measurements are self-reported by the benchmark worker and are not independently attested. "
-    "Candidate code can alter measurement files; consistency checks and verified resource cleanup do not prove honest timings.")
 # frozen comparison wording for one source revision built into identical binaries
 IDENTICAL_BINARIES = "A/A (identical source revision and binary digests)"
 

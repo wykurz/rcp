@@ -272,10 +272,12 @@ class BenchmarkWorkflowTests(unittest.TestCase):
             self.assertIn('href="aws-benchmarks/index.html"', (site / "index.html").read_text())
             self.assertIn('href="../aws-benchmarks/index.html"', (site / "reports/index.html").read_text())
             self.assertIn('ci-benchmarks/changes.html', (site / "changes.html").read_text())
-            self.assertIn("Still-retained records under the 90-day AWS lifecycle", (site / "aws-benchmarks/index.html").read_text())
             public_path = "aws-benchmarks/records/" + public["run_key"] + ".json"
             self.assertEqual((site / public_path).read_bytes(), raw_public)
-            self.assertTrue((site / "aws-benchmarks/runs" / (public["run_key"] + ".html")).is_file())
+            # how long retained records are kept is said where a run's raw data is linked
+            self.assertIn("Still-retained records under the 90-day AWS lifecycle",
+                          (site / "aws-benchmarks/runs" / (public["run_key"] + ".html")).read_text())
+            self.assertNotIn("90-day AWS lifecycle", (site / "aws-benchmarks/index.html").read_text())
             (site / "linked-index.html").symlink_to("ci-benchmarks/index.html")
             os.link(history_page, site / "hardlinked-index.html")
             expected_files = {path.relative_to(site).as_posix() for path in site.rglob("*") if path.is_file()}

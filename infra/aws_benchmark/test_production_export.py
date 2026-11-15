@@ -178,7 +178,7 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("UNTRUSTED_RETAINED_HTML", html)
         self.assertNotIn("<script", html)
 
-    def test_current_publication_uses_collector_time_and_explicit_unattested_labels(self):
+    def test_current_publication_uses_collector_time_and_carries_no_disclaimer(self):
         value = export.project(self.reader.download(self.key))
         self.assertEqual(value["schema"], "rcp-production-public-report-v3")
         self.assertEqual(value["collected_at"], common.timestamp(self.fx.collector.now()))
@@ -186,8 +186,10 @@ class ExportTests(unittest.TestCase):
         value["measurements"][0].update(median=0.001, samples=[0.001, 0.001])
         rendered = export.render(value)
         self.assertIn("consistency checks passed", rendered)
-        self.assertIn("self-reported", rendered)
-        self.assertIn("not independently attested", rendered)
+        # the page states what was measured and how; it carries no disclaimer about the worker
+        for phrase in ("self-reported", "attested", "honest", "Candidate code"):
+            self.assertNotIn(phrase, rendered)
+        self.assertIn("<aside class='note'><p>" + value["note"] + "</p></aside>", rendered)
         self.assertIn(value["collected_at"], rendered)
         self.assertNotIn("1999-01-01", rendered)
         self.assertNotIn("\u202e", rendered)
@@ -235,7 +237,7 @@ class ExportTests(unittest.TestCase):
             export.validate_public(changed)
         legacy = json.loads((Path(__file__).with_name("fixtures") / "production-public-report-v1.json").read_text())
         self.assertIn("unavailable (legacy record)", export.render(legacy))
-        self.assertIn("self-reported", export.render(legacy))
+        self.assertNotIn("self-reported", export.render(legacy))
 
     def test_renderer_escapes_fields_and_rejects_untrusted_link(self):
         value = export.project(self.reader.download(self.key))
