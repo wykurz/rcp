@@ -261,11 +261,19 @@ def aws_link(label, target, *, nested=False, current=False):
             (' aria-current="page"' if current else '') + '>' + html.escape(label) + '</a></li>')
 
 
-def aws_navigation(route, *, status):
-    """List the AWS section pages; links into the current page stay within the document."""
+def aws_navigation(route, *, status, remote=False):
+    """List the AWS section pages; links into the current page stay within the document.
+
+    The remote-copy trends are listed once a run has a remote cell.
+    """
     home, setup = Path('aws-benchmarks/index.html'), Path('aws-benchmarks/setups.html')
+    far = Path('aws-benchmarks/remote.html')
     index = '' if route == home else relative_url(home, route)
-    items = [aws_link('History', index + '#history'), aws_link('Runs', index + '#runs')]
+    items = [aws_link('History', index + '#history')]
+    if remote:
+        items.append(aws_link('Remote copies', '#report-content' if route == far else relative_url(far, route),
+                              current=route == far))
+    items.append(aws_link('Runs', index + '#runs'))
     if status:
         items.append(aws_link('Collection status', index + '#collection-status'))
     return items + [aws_link('Test setup', '#report-content' if route == setup else relative_url(setup, route),
@@ -340,16 +348,21 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     """
     from infra.aws_benchmark import production_export, production_history
     home, setup = Path('aws-benchmarks/index.html'), Path('aws-benchmarks/setups.html')
+    far = Path('aws-benchmarks/remote.html')
     retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
                  'This view is not permanent history.</p>' if retained else '')
     pages, rows, observed, normalized = {}, [], [], {}
     diagnostics = diagnostics or {}
     if not set(diagnostics) <= set(records):
         raise ValueError('Resource diagnostics have no frozen public record')
-    for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
-        value = production_export.validate_public(production_export.results.json_value(
+    for run_key, raw in records.items():
+        normalized[run_key] = production_export.validate_public(production_export.results.json_value(
             raw, production_export.MAX_PUBLIC_RECORD))
-        normalized[run_key] = value
+    # remote copies get their page, and every page its link there, with the first run that has such a cell
+    remote = production_history.has_remote(normalized)
+    navigation = lambda route: aws_navigation(route, status=status, remote=remote)
+    for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
+        value = normalized[run_key]
         identity = value['identity']
         report = Path('aws-benchmarks/runs') / (run_key + '.html')
         pages[Path('aws-benchmarks/records') / (run_key + '.json')] = raw.decode('utf-8')
@@ -372,7 +385,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
              '<li>Worker evidence (not public): ' + production_export.evidence_html(value) + '.</li>') +
             '</ul>' + retention + '</section>')
         name = 'Run ' + identity['run']
-        pages[report] = aws_page(report, name + ' · AWS benchmarks', body, aws_navigation(report, status=status) + [
+        pages[report] = aws_page(report, name + ' · AWS benchmarks', body, navigation(report) + [
             aws_link(name, '#report-content', current=True), aws_link('Results', '#results', nested=True),
             aws_link('Resource diagnostics', '#resource-diagnostics', nested=True),
             aws_link('Observed setup', '#observed-setup', nested=True), aws_link('Raw data', '#raw-data', nested=True)])
@@ -384,10 +397,11 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         '<h1>Test setup</h1><p class="lede">Every run uses the same machine type and storage layout, the '
         'datasets below and one of two methods, so they are described here once. What an individual run '
         "observed is in that run's appendix and its diagnostics JSON.</p>" +
-        production_export.resource_diagnostics.configuration_html(observed[::-1]) + production_history.reading_html())
+        production_export.resource_diagnostics.configuration_html(observed[::-1], remote=remote) +
+        production_history.reading_html(remote))
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
-    pages[setup] = aws_page(setup, 'Test setup · AWS benchmarks', setup_content, aws_navigation(setup, status=status) + [
+    pages[setup] = aws_page(setup, 'Test setup · AWS benchmarks', setup_content, navigation(setup) + [
         aws_link(label, '#' + fragment, nested=True) for fragment, label in (
             ('machine', 'Machine and storage'), ('datasets', 'Datasets'), ('method', 'Method'),
             ('observed', 'Observed values'), ('reading', 'Reading the plots'))])
@@ -405,9 +419,18 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             if rows else '<p>' + html.escape(empty or 'No public records are listed.') + '</p>')
     pages[home] = aws_page(home, 'AWS benchmarks', (
         '<h1>AWS benchmarks</h1><p class="lede">How long rcp takes to copy fixed datasets on one AWS machine type, '
-        'tracked from commit to commit.</p>' + production_history.render(normalized, diagnostics) +
+        'tracked from commit to commit.' + (
+            ' These plots are local copies; <a href="remote.html">remote copies over loopback</a> have a page '
+            'of their own.' if remote else '') + '</p>' + production_history.render(normalized, diagnostics) +
         '<section id="runs" aria-labelledby="runs-title"><h2 id="runs-title">Runs</h2>' + runs + '</section>' +
-        status), aws_navigation(home, status=status), footer)
+        status), navigation(home), footer)
+    if remote:
+        pages[far] = aws_page(far, 'Remote copies · AWS benchmarks', (
+            '<h1>Remote copies</h1><p class="lede">How long rcp takes to copy the same datasets through its remote '
+            'path on one AWS machine: a source and a destination rcpd, started over SSH, exchange the data over '
+            'loopback. <a href="index.html#history">Local copies</a> and the list of runs are on the AWS '
+            'benchmarks page.</p>' +
+            production_history.render(normalized, diagnostics, production_history.REMOTE)), navigation(far), footer)
     return pages
 
 

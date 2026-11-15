@@ -296,9 +296,17 @@ copy. A copy without figures for its command publishes none for its daemons. The
 version, so a stored companion never changes it, and the versions do not stand in for each other.
 
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
-marked setup change (`Verification`), not as a new line. The run page lists every cell with its
-result and, for anything not measured, what happened. A run that measured only some of its cells is
-shown with an amber badge.
+marked setup change (`Copy check`), not as a new line. The run page lists every cell with its result
+and, for anything not measured, what happened. A run that measured only some of its cells is shown
+with an amber badge.
+
+Each scenario has its own trends. Local copies are plotted on the AWS benchmarks page, as before.
+Remote copies over loopback are plotted on a page of their own, `remote.html`, with one section per
+file set: copy duration, and the CPU time and peak memory of the source and of the destination
+`rcpd`. The `rcp` command's own figures are in each section's data table. That page and its
+navigation entry appear with the first run that has a remote cell. A run page with remote cells
+summarizes each cell under its file set and scenario and lists the resources of every process of a
+remote copy.
 
 The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
 `just aws-benchmark-evidence`; see
