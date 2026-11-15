@@ -286,7 +286,14 @@ written. Version 4 adds to version 3:
 The diagnostics companion of a matrix record is `rcp-public-resource-diagnostics-v2`: version 1 with
 each copy's `scenario`, one measured build, and the small commissioning fixtures among the known
 file sets. Copies of an unfinished cell are listed with whatever resources they recorded; they are
-never expected among the published samples. Version 1 and version 2 do not stand in for each other.
+never expected among the published samples.
+
+A matrix record with a remote cell gets `rcp-public-resource-diagnostics-v3` instead: version 2 with
+`roles` on every copy. A remote copy is three processes, so its `metrics` are the `rcp` command's
+(with the `ssh` clients it starts) and `roles.source` and `roles.destination` hold the same figures
+for each `rcpd`, or `null` where a daemon's figures could not be read. `roles` is `null` for a local
+copy. A copy without figures for its command publishes none for its daemons. The record decides the
+version, so a stored companion never changes it, and the versions do not stand in for each other.
 
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
 marked setup change (`Verification`), not as a new line. The run page lists every cell with its

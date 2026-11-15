@@ -184,7 +184,7 @@ class MatrixWorkflowTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 self.assertEqual(production_workflow.selection(self.environment(RCP_REQUESTED_SUITE=suite)), (SHA, suite))
         with self.assertRaisesRegex(ValueError, "not allowlisted"):
-            production_workflow.selection(self.environment(RCP_REQUESTED_SUITE="matrix-all-remote"))
+            production_workflow.selection(self.environment(RCP_REQUESTED_SUITE="matrix-all-wan"))
 
     def test_a_scheduled_request_asks_for_the_one_scheduled_suite(self):
         scheduled = dict(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true",

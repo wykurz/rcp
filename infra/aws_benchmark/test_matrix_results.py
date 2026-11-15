@@ -13,6 +13,8 @@ from . import common, production_projection as projection, results
 from .test_production_collection import Fixture
 
 ROOT = Path(__file__).resolve().parents[2]
+ROLE_METRICS = dict(source=dict(user_seconds=300.0, system_seconds=450.0, max_rss_kib=50000),
+                    destination=dict(user_seconds=200.0, system_seconds=700.0, max_rss_kib=30000))
 METRICS = dict(user_seconds=2.5, system_seconds=880.0, max_rss_kib=90000, voluntary_switches=10,
                involuntary_switches=5, minor_faults=100, major_faults=0, exit_code=0)
 
@@ -44,6 +46,11 @@ def matrix_record(suite, outcomes=None, **context_changes):
                 command=["rcp", "--summary", "source", "destination"], logs=[],
                 resources=dict(status="complete", metrics=dict(METRICS)) if done else
                     dict(status="unavailable", metrics=None)))
+            if scenario == "remote":
+                # a remote copy also records each daemon, measured on its own
+                copies[-1]["role_resources"] = {role: dict(status="complete", metrics=dict(METRICS, **figures))
+                    if done else dict(status="unavailable", metrics=None, reason="execution_failed")
+                    for role, figures in ROLE_METRICS.items()}
             trial += 1
         if outcome["status"] == "not_run":
             copies = []

@@ -163,33 +163,50 @@ def cache_server(budget, uid, history=None):
     return thread
 
 
-def command(window, seconds):
-    matrix = window["suite"] in MATRIX_SUITES
-    contract = matrix_contract(window["suite"]) if matrix else measurement_contract(window["suite"])
-    large = matrix or window["suite"] in LARGE_SUITES
-    file_limit, timeout = "536870912", str(max(1, int(seconds)))
-    source_storage, destination_storage = "c5d-local-ext4-source", "c5d-local-ext4-destination"
-    if large:
-        file_limit = "1073741824"
-        source_storage, destination_storage = "c5d-raid0-ext4-source-v1", "c5d-raid0-ext4-destination-v1"
-    properties = {
+# what the image provides for remote matrix cells, which run a private sshd on loopback
+OPENSSH = ("--sshd", "/usr/sbin/sshd", "--ssh", "/usr/bin/ssh", "--ssh-keygen", "/usr/bin/ssh-keygen")
+ENVIRONMENT = ("--setenv=PATH=/opt/rcp-benchmark/bin:/usr/bin:/bin", "--setenv=PYTHONPATH=" + str(ROOT),
+               "--setenv=LC_ALL=C", "--setenv=LANG=C")
+
+
+def sandbox(seconds, file_limit, *, loopback=False):
+    """Properties of the unprivileged measurement unit.
+
+    The unit has a network of its own with nothing but a loopback device. A suite with remote
+    cells may open IPv4 sockets on it, for a private sshd and for rcp's daemons; no other suite
+    may open any network socket.
+    """
+    return {
         "User": "rcp-benchmark", "Group": "rcp-benchmark", "Type": "exec",
         "RuntimeMaxSec": str(max(1, int(seconds))), "TimeoutStopSec": "10",
         "KillMode": "control-group", "SendSIGKILL": "yes", "NoNewPrivileges": "yes",
         "CapabilityBoundingSet": "", "PrivateNetwork": "yes", "PrivateDevices": "yes",
         "ProtectSystem": "strict", "ProtectHome": "yes", "ProtectKernelTunables": "yes",
         "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "RestrictSUIDSGID": "yes",
-        "RestrictNamespaces": "yes", "LockPersonality": "yes", "RestrictAddressFamilies": "AF_UNIX",
+        "RestrictNamespaces": "yes", "LockPersonality": "yes",
+        "RestrictAddressFamilies": "AF_UNIX AF_INET" if loopback else "AF_UNIX",
         "MemoryMax": "180G", "TasksMax": "8192", "LimitNOFILE": "1048576",
         "LimitCORE": "0", "LimitFSIZE": file_limit, "UMask": "0077",
         "TemporaryFileSystem": "/tmp:size=64m,mode=1777 /var/tmp:size=64m,mode=1777",
         "ReadWritePaths": str(DATA), "InaccessiblePaths": "/root /home /var/lib/cloud",
         "WorkingDirectory": str(ROOT), "StandardOutput": "null", "StandardError": "null",
     }
+
+
+def command(window, seconds):
+    matrix = window["suite"] in MATRIX_SUITES
+    contract = matrix_contract(window["suite"]) if matrix else measurement_contract(window["suite"])
+    large = matrix or window["suite"] in LARGE_SUITES
+    loopback = matrix and any(scenario == "remote" for _, scenario in contract["cells"])
+    file_limit, timeout = "536870912", str(max(1, int(seconds)))
+    source_storage, destination_storage = "c5d-local-ext4-source", "c5d-local-ext4-destination"
+    if large:
+        file_limit = "1073741824"
+        source_storage, destination_storage = "c5d-raid0-ext4-source-v1", "c5d-raid0-ext4-destination-v1"
     argv = ["systemd-run", "--unit=" + UNIT, "--wait", "--quiet"]
-    argv += ["--property=" + key + "=" + value for key, value in properties.items()]
-    argv += ["--setenv=PATH=/opt/rcp-benchmark/bin:/usr/bin:/bin",
-             "--setenv=PYTHONPATH=" + str(ROOT), "--setenv=LC_ALL=C", "--setenv=LANG=C",
+    argv += ["--property=" + key + "=" + value
+             for key, value in sandbox(seconds, file_limit, loopback=loopback).items()]
+    argv += [*ENVIRONMENT,
              "--setenv=" + cache.WORKER_DEADLINE_ENV + "=" + str(time.monotonic_ns() + int(seconds * 1_000_000_000)),
              "--setenv=GITHUB_REPOSITORY=wykurz/rcp"]
     storage = ["--source-root", str(DATA / "source"), "--destination-root", str(DATA / "destination"),
@@ -204,6 +221,8 @@ def command(window, seconds):
                  "--timeout", str(contract["timeout"]), "--resource-time", "/usr/bin/time",
                  "--check-capacity", "--system-telemetry", "--purpose", contract["purpose"],
                  "--runner-label", contract["runner_label"], *storage]
+        if loopback:
+            argv += OPENSSH
         for case, scenario in contract["cells"]:
             argv += ["--cell", case + ":" + scenario]
         return argv

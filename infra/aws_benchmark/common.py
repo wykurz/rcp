@@ -73,18 +73,20 @@ _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"] = MappingPro
         minimum_worker_seconds=28200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
 # performance-only matrix suites are an exact catalog: a name still selects one fixed plan.
 # a cell is one file set under one scenario; copies are not verified (benchmarks/matrix.py).
+# a suite is a selection of file sets under local copies, remote copies over loopback, or both.
 MATRIX_POLICY = SUMMARY_POLICY
 MATRIX_FILE_SETS = MappingProxyType({"1g": "bulk-1g-1tb", "100m": "bulk-100m-1024gb",
                                      "1m": "bulk-1m-1024gb", "1k": "tiny-1k-10240k"})
 # small fixtures that exercise every step of a matrix run in seconds
 MATRIX_COMMISSIONING = ("commission-64m", "commission-10k")
-MATRIX_SCENARIO_SETS = (("local",),)
+MATRIX_SCENARIO_SETS = (("local",), ("remote",), ("local", "remote"))
 _MATRIX_SELECTIONS = {"all": tuple(MATRIX_FILE_SETS.values()),
                       **{name: (case,) for name, case in MATRIX_FILE_SETS.items()},
                       "commission": MATRIX_COMMISSIONING}
 _MATRIX_PROFILES, _MATRIX_PLAN_VERSIONS = {}, {}
-for _selection, _cases in _MATRIX_SELECTIONS.items():
-    for _scenarios in MATRIX_SCENARIO_SETS:
+# scenario sets outermost: suites added with a later set never move the earlier ones
+for _scenarios in MATRIX_SCENARIO_SETS:
+    for _selection, _cases in _MATRIX_SELECTIONS.items():
         _suite = "matrix-" + _selection + "-" + "+".join(_scenarios)
         _version = _suite + "-plan-v1"
         # every file set together needs the eight-hour allocation; one set fits the ordinary one
@@ -97,6 +99,7 @@ for _selection, _cases in _MATRIX_SELECTIONS.items():
             plan=MappingProxyType(dict(_RECORDED_DURABLE_CONTRACTS[_base]["plan"], version=_version,
                                        minimum_worker_seconds=3600))))
         _MATRIX_PLAN_VERSIONS[_suite] = _version
+        # the scenarios of one file set run next to each other, on the one fixture generated for it
         _MATRIX_PROFILES[_suite] = dict(cases=_cases,
             cells=tuple((case, scenario) for case in _cases for scenario in _scenarios),
             repetitions=3, timeout=3600, purpose="commissioning" if _selection == "commission" else "performance",

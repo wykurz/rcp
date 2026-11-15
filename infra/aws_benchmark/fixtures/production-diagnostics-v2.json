@@ -1,0 +1,419 @@
+{
+ "companion": {
+  "archive_sha256": "0eb3e36bfb24dcd9bb1d1bece1531216b59539a8fde17ee80224af0653c92aa3",
+  "cases": [
+   {
+    "case_id": "commission-64m",
+    "copy_trials": 3,
+    "definition_status": "recorded",
+    "phase_boundary_recorded": true,
+    "successful_copies": 3
+   },
+   {
+    "case_id": "commission-10k",
+    "copy_trials": 1,
+    "definition_status": "recorded",
+    "phase_boundary_recorded": true,
+    "successful_copies": 0
+   }
+  ],
+  "limits": {
+   "allocation_seconds": 10800,
+   "command_timeout_seconds": 3600
+  },
+  "process_scope": "One local copy command, its threads and waited descendants. CPU seconds may exceed wall time; peak RSS is a per-command peak, not host memory or a sum of processes.",
+  "reason": null,
+  "retirement_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "run_key": "repo-655073755-run-42458459014",
+  "schema": "rcp-public-resource-diagnostics-v2",
+  "setup": {
+   "architecture": "x86_64",
+   "cache_policy": "linux-drop-caches",
+   "cpu_model": "Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz",
+   "destination": {
+    "block_bytes": 4096,
+    "chunk_bytes": 524288,
+    "filesystem": "ext4",
+    "layout": "two-disjoint-raid0",
+    "member_bytes": [
+     900000000000,
+     900000000000
+    ],
+    "member_count": 2,
+    "member_models": [
+     "Amazon EC2 NVMe Instance Storage",
+     "Amazon EC2 NVMe Instance Storage"
+    ],
+    "mount_options": [
+     "nodev",
+     "nosuid",
+     "relatime",
+     "rw",
+     "stripe=256"
+    ]
+   },
+   "effective_cpu_count": 96,
+   "host_memory_total_bytes": null,
+   "instrumentation": {
+    "max_bytes": 8388608,
+    "max_phases": 192,
+    "max_samples": 4096,
+    "max_seconds": 28800,
+    "period_seconds": 10,
+    "policy": "linux-bounded-system-sampling-v1",
+    "scope": "host aggregate and current harness cgroup with descendants; logical mount-device IO; not per-process attribution"
+   },
+   "kernel": "7.0.0-1014-aws",
+   "logical_cpu_count": null,
+   "os": null,
+   "pairing_policy": null,
+   "source": {
+    "block_bytes": 4096,
+    "chunk_bytes": 524288,
+    "filesystem": "ext4",
+    "layout": "two-disjoint-raid0",
+    "member_bytes": [
+     900000000000,
+     900000000000
+    ],
+    "member_count": 2,
+    "member_models": [
+     "Amazon EC2 NVMe Instance Storage",
+     "Amazon EC2 NVMe Instance Storage"
+    ],
+    "mount_options": [
+     "nodev",
+     "nosuid",
+     "relatime",
+     "rw",
+     "stripe=256"
+    ]
+   },
+   "verification_policy": "exit-status-summary-v1"
+  },
+  "setup_id": "9ea310699eea7fa6c9c2dfd2a89a2798fea395518717212a5bef49f14394b576",
+  "status": "partial",
+  "system": {
+   "phases": [
+    {
+     "case_index": 1,
+     "elapsed_seconds": 10,
+     "metrics": {
+      "cgroup_run_memory_peak_bytes": {
+       "maximum": 200,
+       "minimum": 200,
+       "status": "available"
+      },
+      "cpu_usage_usec": {
+       "delta": 100,
+       "status": "available"
+      },
+      "host_cpu_idle_ticks": {
+       "delta": 50,
+       "status": "available"
+      },
+      "host_cpu_iowait_ticks": {
+       "delta": 10,
+       "status": "available"
+      },
+      "host_cpu_total_ticks": {
+       "delta": 100,
+       "status": "available"
+      },
+      "memory_current_bytes": {
+       "maximum": 100,
+       "minimum": 20,
+       "status": "available"
+      },
+      "source_read_sectors": {
+       "delta": 2048,
+       "status": "available"
+      }
+     },
+     "phase": "generation",
+     "samples": 3,
+     "status": "observed",
+     "trial_index": null
+    }
+   ],
+   "samples": 3,
+   "status": "complete"
+  },
+  "system_scope": "Sampled host/cgroup diagnostics associated with phase windows, not per-process attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.",
+  "trials": [
+   {
+    "case_id": "commission-64m",
+    "iteration": 1,
+    "metrics": {
+     "involuntary_switches": 5,
+     "major_faults": 0,
+     "max_rss_kib": 90000,
+     "minor_faults": 100,
+     "system_seconds": 880.0,
+     "user_seconds": 2.5,
+     "voluntary_switches": 10
+    },
+    "scenario": "local",
+    "status": "complete",
+    "system": {
+     "phases": [
+      {
+       "case_index": 0,
+       "elapsed_seconds": 10,
+       "metrics": {
+        "cgroup_run_memory_peak_bytes": {
+         "maximum": 200,
+         "minimum": 200,
+         "status": "available"
+        },
+        "cpu_usage_usec": {
+         "delta": 100,
+         "status": "available"
+        },
+        "host_cpu_idle_ticks": {
+         "delta": 50,
+         "status": "available"
+        },
+        "host_cpu_iowait_ticks": {
+         "delta": 10,
+         "status": "available"
+        },
+        "host_cpu_total_ticks": {
+         "delta": 100,
+         "status": "available"
+        },
+        "memory_current_bytes": {
+         "maximum": 100,
+         "minimum": 20,
+         "status": "available"
+        },
+        "source_read_sectors": {
+         "delta": 2048,
+         "status": "available"
+        }
+       },
+       "phase": "command",
+       "samples": 3,
+       "status": "observed",
+       "trial_index": 0
+      }
+     ],
+     "samples": 3,
+     "status": "complete"
+    },
+    "variant_id": "rcp-default"
+   },
+   {
+    "case_id": "commission-64m",
+    "iteration": 2,
+    "metrics": {
+     "involuntary_switches": 5,
+     "major_faults": 0,
+     "max_rss_kib": 90000,
+     "minor_faults": 100,
+     "system_seconds": 880.0,
+     "user_seconds": 2.5,
+     "voluntary_switches": 10
+    },
+    "scenario": "local",
+    "status": "complete",
+    "system": {
+     "phases": [
+      {
+       "case_index": 0,
+       "elapsed_seconds": 10,
+       "metrics": {
+        "cgroup_run_memory_peak_bytes": {
+         "maximum": 200,
+         "minimum": 200,
+         "status": "available"
+        },
+        "cpu_usage_usec": {
+         "delta": 100,
+         "status": "available"
+        },
+        "host_cpu_idle_ticks": {
+         "delta": 50,
+         "status": "available"
+        },
+        "host_cpu_iowait_ticks": {
+         "delta": 10,
+         "status": "available"
+        },
+        "host_cpu_total_ticks": {
+         "delta": 100,
+         "status": "available"
+        },
+        "memory_current_bytes": {
+         "maximum": 100,
+         "minimum": 20,
+         "status": "available"
+        },
+        "source_read_sectors": {
+         "delta": 2048,
+         "status": "available"
+        }
+       },
+       "phase": "command",
+       "samples": 3,
+       "status": "observed",
+       "trial_index": 1
+      }
+     ],
+     "samples": 3,
+     "status": "complete"
+    },
+    "variant_id": "rcp-default"
+   },
+   {
+    "case_id": "commission-64m",
+    "iteration": 3,
+    "metrics": {
+     "involuntary_switches": 5,
+     "major_faults": 0,
+     "max_rss_kib": 90000,
+     "minor_faults": 100,
+     "system_seconds": 880.0,
+     "user_seconds": 2.5,
+     "voluntary_switches": 10
+    },
+    "scenario": "local",
+    "status": "complete",
+    "system": {
+     "phases": [
+      {
+       "case_index": 0,
+       "elapsed_seconds": 10,
+       "metrics": {
+        "cgroup_run_memory_peak_bytes": {
+         "maximum": 200,
+         "minimum": 200,
+         "status": "available"
+        },
+        "cpu_usage_usec": {
+         "delta": 100,
+         "status": "available"
+        },
+        "host_cpu_idle_ticks": {
+         "delta": 50,
+         "status": "available"
+        },
+        "host_cpu_iowait_ticks": {
+         "delta": 10,
+         "status": "available"
+        },
+        "host_cpu_total_ticks": {
+         "delta": 100,
+         "status": "available"
+        },
+        "memory_current_bytes": {
+         "maximum": 100,
+         "minimum": 20,
+         "status": "available"
+        },
+        "source_read_sectors": {
+         "delta": 2048,
+         "status": "available"
+        }
+       },
+       "phase": "command",
+       "samples": 3,
+       "status": "observed",
+       "trial_index": 2
+      }
+     ],
+     "samples": 3,
+     "status": "complete"
+    },
+    "variant_id": "rcp-default"
+   },
+   {
+    "case_id": "commission-10k",
+    "iteration": 1,
+    "metrics": null,
+    "scenario": "local",
+    "status": "unavailable",
+    "system": {
+     "phases": [
+      {
+       "case_index": 0,
+       "elapsed_seconds": 10,
+       "metrics": {
+        "cgroup_run_memory_peak_bytes": {
+         "maximum": 200,
+         "minimum": 200,
+         "status": "available"
+        },
+        "cpu_usage_usec": {
+         "delta": 100,
+         "status": "available"
+        },
+        "host_cpu_idle_ticks": {
+         "delta": 50,
+         "status": "available"
+        },
+        "host_cpu_iowait_ticks": {
+         "delta": 10,
+         "status": "available"
+        },
+        "host_cpu_total_ticks": {
+         "delta": 100,
+         "status": "available"
+        },
+        "memory_current_bytes": {
+         "maximum": 100,
+         "minimum": 20,
+         "status": "available"
+        },
+        "source_read_sectors": {
+         "delta": 2048,
+         "status": "available"
+        }
+       },
+       "phase": "command",
+       "samples": 3,
+       "status": "observed",
+       "trial_index": 3
+      }
+     ],
+     "samples": 3,
+     "status": "complete"
+    },
+    "variant_id": "rcp-default"
+   }
+  ]
+ },
+ "record": {
+  "benchmark_valid": true,
+  "cells": [
+   {
+    "case_id": "commission-64m",
+    "message": null,
+    "outcome": "complete",
+    "scenario": "local",
+    "stage": null
+   },
+   {
+    "case_id": "commission-10k",
+    "message": "copy 1 failed",
+    "outcome": "failed",
+    "scenario": "local",
+    "stage": "copy"
+   }
+  ],
+  "measurements": [
+   {
+    "case_id": "commission-64m",
+    "samples": [
+     600.1,
+     600.2,
+     600.3
+    ],
+    "scenario": "local",
+    "variant_id": "rcp-default"
+   }
+  ],
+  "retirement_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "run_key": "repo-655073755-run-42458459014"
+ }
+}

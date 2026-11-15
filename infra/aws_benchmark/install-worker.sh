@@ -23,7 +23,8 @@ progress remove-ssm
 python3 -m infra.aws_benchmark.guest_security --remove-ssm
 progress packages
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm libsystemd0 systemd
+# openssh: remote benchmark cells run their own unprivileged sshd on a private loopback
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm libsystemd0 systemd openssh-client openssh-server
 # avoid background monitoring/check wakeups; leave md assembly and udev intact
 for unit in mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer \
     mdcheck_start.service mdcheck_continue.service mdmonitor.service mdmonitor-oneshot.service; do
@@ -32,14 +33,17 @@ for unit in mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer \
     systemctl mask "$unit"
   fi
 done
-useradd --system --no-create-home --shell /usr/sbin/nologin rcp-benchmark
-install -d -m 0755 /opt/rcp-benchmark/infra/aws_benchmark /opt/rcp-benchmark/bin
+# sshd runs a command through the account's shell and starts it in the account's home, so the
+# shell must accept a command and the home must exist; the home is empty, root-owned and read-only.
+# The account has no password and no authorized key outside a benchmark's own private directory.
+useradd --system --no-create-home --home-dir /opt/rcp-benchmark/home --shell /bin/sh rcp-benchmark
+install -d -m 0755 /opt/rcp-benchmark/infra/aws_benchmark /opt/rcp-benchmark/bin /opt/rcp-benchmark/home
 progress python-environment
 python3 -m venv /opt/rcp-benchmark/venv
 /opt/rcp-benchmark/venv/bin/pip install --require-hashes -r infra/aws_benchmark/requirements.txt
 progress harness
 cp -r benchmarks /opt/rcp-benchmark/
-cp infra/aws_benchmark/{__init__,common,worker,production_startup,production_mailbox,large_storage,supervisor_notify,cache_client,maintenance,guest_security}.py /opt/rcp-benchmark/infra/aws_benchmark/
+cp infra/aws_benchmark/{__init__,common,worker,production_startup,production_mailbox,large_storage,supervisor_notify,cache_client,maintenance,guest_security,remote_check}.py /opt/rcp-benchmark/infra/aws_benchmark/
 install -m 0755 infra/aws_benchmark/cache_client.py /opt/rcp-benchmark/bin/sudo
 python3 -m infra.aws_benchmark.maintenance
 python3 -m infra.aws_benchmark.guest_security
@@ -52,6 +56,9 @@ progress verify-unprivileged
 cd /opt/rcp-benchmark
 runuser -u rcp-benchmark -- /usr/bin/python3 -B -c \
   'import benchmarks.run; import benchmarks.matrix; import infra.aws_benchmark.cache_client; import infra.aws_benchmark.worker'
+# a login through the private sshd, as the benchmark account, under the sandbox of a remote suite
+progress verify-remote-cells
+python3 -B -m infra.aws_benchmark.remote_check
 progress supervisor-notify-acceptance
 python3 -B -m infra.aws_benchmark.supervisor_notify --image-self-test > /opt/rcp-benchmark/supervisor-notify-acceptance.json
 chmod 0444 /opt/rcp-benchmark/supervisor-notify-acceptance.json

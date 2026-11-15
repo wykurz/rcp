@@ -947,21 +947,39 @@ that misses the server expiry must not receive a new reservation, even if the op
 ## Benchmark matrix
 
 The matrix suites measure the build under test, with rcp's default settings, on several file sets in
-one allocation. A *cell* is one file set under one scenario; the only scenario today is `local`, a
-copy on one host. Each cell is three copies made by one build. There is no baseline build, no
-pairing and no verification of what was copied: a copy counts when rcp exits zero and reports the
-expected file count. [The matrix runner](../../docs/benchmarking.md#performance-only-matrix-runs)
-describes what a run promises, and [the worker profile](LARGE_WORKLOADS.md#performance-only-matrix)
-how it runs on AWS.
+one allocation. A *cell* is one file set under one scenario. Each cell is three copies made by one
+build. There is no baseline build, no pairing and no verification of what was copied: a copy counts
+when rcp exits zero and reports the expected file count.
+[The matrix runner](../../docs/benchmarking.md#performance-only-matrix-runs) describes what a run
+promises, and [the worker profile](LARGE_WORKLOADS.md#performance-only-matrix) how it runs on AWS.
 
-| Suite                     | Cells                                          | Allocation | Reservation |
-| ------------------------- | ---------------------------------------------- | ---------- | ----------- |
-| `matrix-all-local`        | 1 GB, 100 MB, 1 MB and 1 KB files              | 8 hours    | fixed $50   |
-| `matrix-1g-local`         | 1 GB files                                     | 3 hours    | computed    |
-| `matrix-100m-local`       | 100 MB files                                   | 3 hours    | computed    |
-| `matrix-1m-local`         | 1 MB files                                     | 3 hours    | computed    |
-| `matrix-1k-local`         | 1 KB files                                     | 3 hours    | computed    |
-| `matrix-commission-local` | two small fixtures (16 files and 10,000 files) | 3 hours    | computed    |
+There are two scenarios. `local` copies between the two arrays. `remote` makes the same copy through
+rcp's remote path on the one worker: rcp starts a source and a destination `rcpd` over SSH, and the
+daemons exchange the data over loopback TCP with rcp's default encryption. No network hardware and
+no added latency are involved; it measures the remote protocol, not a network.
+
+A suite is named `matrix-<selection>-<scenarios>`:
+
+| Selection    | File sets                                      | Allocation | Reservation |
+| ------------ | ---------------------------------------------- | ---------- | ----------- |
+| `all`        | 1 GB, 100 MB, 1 MB and 1 KB files              | 8 hours    | fixed $50   |
+| `1g`         | 1 GB files                                     | 3 hours    | computed    |
+| `100m`       | 100 MB files                                   | 3 hours    | computed    |
+| `1m`         | 1 MB files                                     | 3 hours    | computed    |
+| `1k`         | 1 KB files                                     | 3 hours    | computed    |
+| `commission` | two small fixtures (16 files and 10,000 files) | 3 hours    | computed    |
+
+| Scenarios      | Cells of each selected file set                            |
+| -------------- | ---------------------------------------------------------- |
+| `local`        | one local cell                                             |
+| `remote`       | one remote cell                                            |
+| `local+remote` | a local cell, then a remote cell, on one generated fixture |
+
+That is eighteen suites, for example `matrix-all-local+remote` (eight cells), `matrix-1m-remote`
+(one cell) and `matrix-commission-local+remote` (four cells on the small fixtures). The allocation
+follows the selection, not the number of cells: whether all eight cells of `matrix-all-local+remote`
+fit eight hours is not known until it has run. Cells that do not fit are reported `not_run` and the
+others count; the 1 KB file set is last.
 
 A computed reservation is the ordinary three-hour one: $20 at the current price and ancillary
 allowance. A suite name selects exactly one fixed plan, as before; there is no free-form selection.
@@ -974,7 +992,7 @@ baseline copies of the binaries are uploaded and never run.
 The workflow's `suite` input offers every matrix suite. The server admits one only when the policy's
 `manual_suites` names it. That list stays explicit and holds at most eight suites; nothing is
 enabled by default or by a pattern. Three-hour suites use the ordinary runtime and the ordinary
-manual requesters. `matrix-all-local` needs what every eight-hour run needs:
+manual requesters. The three `matrix-all-…` suites need what every eight-hour run needs:
 `manual_runtime_seconds=28800`, an unexpired `extended_manual_not_after`, and the immutable owner as
 requester. A plan with a runtime profile runs for exactly that profile's time, so no other extended
 runtime is accepted.
@@ -1017,9 +1035,13 @@ by cell:
 - A result that differs from the suite's contract publishes neither cells nor measurements, only the
   reason.
 
-Public records of matrix runs are version 4 (`rcp-production-public-report-v4`) and their
-diagnostics version 2; [RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes both.
-Commissioning runs qualify like any other, and their small fixtures stay outside the trends.
+Remote cells qualify by the same rules. A remote cell that could not reach its private SSH endpoint
+is `failed` at stage `transport`, with the reason, and the run's other cells still count.
+
+Public records of matrix runs are version 4 (`rcp-production-public-report-v4`). Their diagnostics
+are version 2, or version 3 when the run has a remote cell, which adds each daemon's CPU and memory;
+[RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes them. Commissioning runs
+qualify like any other, and their small fixtures stay outside the trends.
 
 ### Deploy and commission
 
@@ -1029,6 +1051,28 @@ template's startup data with the reviewed startup that embeds that digest, and i
 suite. New packages with the old launch template, or the reverse, would admit a run, keep its
 reservation and then refuse to launch it. Existing suites, plans and stored policies are otherwise
 unchanged.
+
+Remote cells need three things of the image, which a rebuild from this revision provides and checks
+([AMI.md](AMI.md)):
+
+- `sshd`, `ssh` and `ssh-keygen` (`openssh-server`, `openssh-client`). The benchmark starts its own
+  unprivileged `sshd` inside the measurement unit; the system SSH service is not used and is left as
+  the base image has it.
+- A benchmark account that `sshd` can run a command for: login shell `/bin/sh` and an existing home,
+  the empty root-owned `/opt/rcp-benchmark/home`. The account still has no password and no
+  authorized key; the only key that opens it is made per run inside the unit's private `/tmp` and
+  goes away with the unit.
+- A measurement unit that may open IPv4 sockets. A suite with a remote cell runs with
+  `RestrictAddressFamilies=AF_UNIX AF_INET`; every other suite keeps `AF_UNIX`. `PrivateNetwork=yes`
+  is unchanged for all of them, so the only interface is the unit's own loopback and nothing leaves
+  the unit.
+
+The image build proves all three before the image can become ready: it logs in once through the
+private `sshd`, as the benchmark account, in a unit with the sandbox of a remote suite
+(`infra/aws_benchmark/remote_check.py`). The login must succeed and print nothing of its own: rcp
+reads the first line an `rcpd` prints as its readiness record, so a home that `sshd` cannot enter
+would break every remote copy. An image that cannot serve remote cells fails its build with the
+reason on the console.
 
 Use the [cutover sequence](#bind-admission-to-a-deployment-during-cutover): between regular slots
 and with no active owner, close admission; switch the server packages, the rebuilt worker image, the
@@ -1047,10 +1091,16 @@ horizon before a scheduled slot displaces the scheduled run. A lower `capacity_s
 commissioning policy version shortens the horizon. Size `extended_manual_not_after` for the full run
 and its repeat from these numbers.
 
-1. `matrix-commission-local`: a few minutes of work that exercises every step, including the public
-   pages. Expect two of two measurements and per-copy resources on the run page.
-2. `matrix-all-local` by hand, then once more to see that two runs agree.
-3. The schedule change above.
+1. `matrix-commission-local+remote`: a few minutes of work that exercises every step of both
+   scenarios, including the public pages. Expect four of four measurements, and on the run page the
+   resources of `rcp`, the source `rcpd` and the destination `rcpd` for every remote copy.
+2. `matrix-all-local+remote` by hand. This run says how long the remote cells take and whether all
+   eight cells fit eight hours. If they do not, the choice is between a longer allocation, which is
+   a new priced plan, and measuring local and remote cells in separate runs (`matrix-all-local`,
+   `matrix-all-remote`). By hand that works as it is; on a schedule it does not, because a schedule
+   names exactly one suite. Either way it is a further reviewed change.
+3. The same suite once more, to see that two runs agree.
+4. The schedule change above.
 
 ### Find the evidence of a run
 

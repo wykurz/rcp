@@ -362,10 +362,10 @@ collection as the profiles above, and differ in what they measure and how they e
 [production runbook](PRODUCTION.md#benchmark-matrix) covers admission, qualification and rollout.
 
 - **What runs.** One build (the candidate binaries) with rcp's default settings and `--summary`.
-  Each cell is one file set copied three times; caches are dropped before every copy. The fixture of
-  a file set is generated once, its destination is removed after every copy and the fixture after
-  its last cell, so the next file set has the space. Nothing is read back: no initial snapshot, no
-  tree walk, no source re-validation.
+  Each cell is one file set copied three times, locally or through `rcpd` over loopback; caches are
+  dropped before every copy. The fixture of a file set is generated once, its destination is removed
+  after every copy and the fixture after its last cell, so the next file set has the space. Nothing
+  is read back: no initial snapshot, no tree walk, no source re-validation.
 - **Time.** The allocation reaches the runner as one deadline. Each command (generation, cache
   preparation, a copy) gets the same generous 3600-second limit, which exists to catch hangs. A
   command that the end of the allocation cuts short is `interrupted`, the cells after it are
@@ -382,9 +382,21 @@ collection as the profiles above, and differ in what they measure and how they e
   cells, which still qualify. Command logs are cut to their head and tail as each command ends: the
   worker's output directory is a 128 MiB tmpfs, and one copy that fails for every file must not fill
   it and stop the results of the other cells from being saved.
-- **Commissioning fixtures.** `matrix-commission-local` uses `commission-64m` (16 files of 4 MB) and
-  `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every step in
-  seconds and are not performance evidence.
+- **Commissioning fixtures.** The `matrix-commission-…` suites use `commission-64m` (16 files of 4
+  MB) and `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every
+  step in seconds and are not performance evidence.
 
-The per-copy CPU, memory and sampled phases are published as before. Their scope is still one local
-command; remote scenarios are not part of these suites.
+- **Remote cells.** A suite whose name has `remote` runs
+  `rcp --force-remote --bind-ip=127.0.0.1 … 127.0.0.1:SOURCE 127.0.0.1:DESTINATION` for those cells.
+  The runner starts one unprivileged `sshd` on `127.0.0.1` inside the measurement unit and stops it
+  with the run; its keys, made for the run, stay in the unit's private `/tmp` and are never part of
+  the archived output, while `logs/sshd.log` is. Such a suite's unit runs with
+  `RestrictAddressFamilies=AF_UNIX AF_INET`; `PrivateNetwork=yes` is unchanged, so the sockets reach
+  the unit's own loopback and nothing else. The explicit addresses matter: rcp's address detection
+  enumerates interfaces over netlink, which the unit does not allow. After every remote copy the
+  runner ends any daemon still running, since `sshd` starts daemons outside the copy's process
+  group. [Remote cells](../../docs/benchmarking.md#remote-cells) has the details.
+
+The per-copy CPU, memory and sampled phases are published as before. For a local copy their scope is
+the one command. For a remote copy the same GNU `time` figures are recorded three times: for the
+`rcp` command, for the source `rcpd` and for the destination `rcpd`.

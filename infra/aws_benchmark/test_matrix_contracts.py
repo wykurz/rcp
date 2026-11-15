@@ -15,10 +15,24 @@ FILE_SETS = ("bulk-1g-1tb", "bulk-100m-1024gb", "bulk-1m-1024gb", "tiny-1k-10240
 
 class MatrixContractTests(unittest.TestCase):
     def test_the_catalog_covers_every_file_set_alone_all_together_and_commissioning(self):
-        self.assertEqual(sorted(common.MATRIX_SUITES), [
-            "matrix-100m-local", "matrix-1g-local", "matrix-1k-local", "matrix-1m-local",
-            "matrix-all-local", "matrix-commission-local"])
+        self.assertEqual(sorted(common.MATRIX_SUITES), sorted(
+            f"matrix-{selection}-{scenarios}" for selection in ("all", "1g", "100m", "1m", "1k", "commission")
+            for scenarios in ("local", "remote", "local+remote")))
         self.assertEqual(common.MATRIX_SUITES["matrix-all-local"], tuple((case, "local") for case in FILE_SETS))
+        self.assertEqual(common.MATRIX_SUITES["matrix-all-remote"], tuple((case, "remote") for case in FILE_SETS))
+        # both scenarios of a file set run next to each other, on the one fixture generated for it
+        self.assertEqual(common.MATRIX_SUITES["matrix-all-local+remote"],
+                         tuple((case, scenario) for case in FILE_SETS for scenario in ("local", "remote")))
+        self.assertEqual(common.MATRIX_SUITES["matrix-1k-remote"], (("tiny-1k-10240k", "remote"),))
+        self.assertEqual(common.MATRIX_SUITES["matrix-commission-local+remote"], (
+            ("commission-64m", "local"), ("commission-64m", "remote"),
+            ("commission-10k", "local"), ("commission-10k", "remote")))
+        self.assertEqual(common.SUITES["matrix-all-local+remote"], FILE_SETS)
+        # the suites of the first matrix release keep their place and their plans
+        self.assertEqual(common.DURABLE_SUITES[5:11], (
+            "matrix-all-local", "matrix-1g-local", "matrix-100m-local", "matrix-1m-local", "matrix-1k-local",
+            "matrix-commission-local"))
+        self.assertEqual(len(common.DURABLE_SUITES), 23)
         self.assertEqual(common.MATRIX_SUITES["matrix-1m-local"], (("bulk-1m-1024gb", "local"),))
         self.assertEqual(common.MATRIX_SUITES["matrix-commission-local"],
                          (("commission-64m", "local"), ("commission-10k", "local")))
@@ -49,7 +63,13 @@ class MatrixContractTests(unittest.TestCase):
         self.assertEqual((full["max_runtime"], full["max_provisioning"], full["max_attempts"]), (28800, 7200, 120))
         self.assertEqual((full["runtime_profile"], full["reservation_microusd"]), ("all-filesets-8h-v1", 50_000_000))
         self.assertEqual(full["plan"]["minimum_worker_seconds"], 3600)
-        for suite in sorted(set(common.MATRIX_SUITES) - {"matrix-all-local"}):
+        everything = {"matrix-all-local", "matrix-all-remote", "matrix-all-local+remote"}
+        for suite in sorted(everything):
+            contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
+            self.assertEqual({key: contract[key] for key in full if key not in ("suite", "plan")},
+                             {key: full[key] for key in full if key not in ("suite", "plan")})
+            self.assertEqual(contract["plan"], dict(full["plan"], version=suite + "-plan-v1"))
+        for suite in sorted(set(common.MATRIX_SUITES) - everything):
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
                 self.assertEqual((contract["suite"], contract["max_runtime"]), (suite, 10800))
