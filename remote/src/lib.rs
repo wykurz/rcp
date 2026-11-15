@@ -76,7 +76,7 @@
 //!
 //! The [`streams`] module provides high-level abstractions over TCP streams:
 //! - [`streams::SendStream`] / [`streams::RecvStream`] for framed message passing
-//! - [`streams::ControlConnection`] for bidirectional control channels
+//! - Length-bounded file payload transfers that preserve subsequent message boundaries
 //! - Object serialization/deserialization using bitcode
 //!
 //! ## Remote Tracing
