@@ -178,6 +178,10 @@ benchmark *ARGS: build-release
 benchmark-run *ARGS:
     python3 -m benchmarks.run "$@"
 
+# Measure selected file sets with already-built tools: independent cells, no verification (requires --output).
+benchmark-matrix *ARGS:
+    python3 -m benchmarks.matrix "$@"
+
 # Test measurement, reporting, and history publishing behavior.
 benchmark-test:
     python3 -m unittest discover -s benchmarks -p 'test_*.py'

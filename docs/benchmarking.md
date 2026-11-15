@@ -630,6 +630,63 @@ proofs and command exit codes survive later source, summary or metadata failures
 recorded separately. SIGINT retains its interrupt exit behavior after safe cleanup. An unresponsive
 kernel I/O operation can still require the outer process/cgroup timeout.
 
+## Performance-only matrix runs
+
+`just benchmark-matrix` (`python3 -m benchmarks.matrix`) measures a list of *cells* and nothing
+else. A cell is one file set copied under one scenario; the only scenario today is `local`, a copy
+on one host. It is the runner behind the AWS matrix suites, and it runs anywhere:
+
+```bash
+just benchmark-matrix --manifest benchmarks/matrix-cases.json \
+    --cell commission-64m:local --cell commission-10k:local \
+    --bin-dir target/release --source-root /scratch/source --destination-root /scratch/destination \
+    --cache uncontrolled --output /tmp/matrix-results
+```
+
+It differs from `benchmark-run` in what it promises:
+
+- **One build, default settings.** Every cell runs the `rcp-default` variant from `--bin-dir`. There
+  is no baseline build, no pairing and no comparison; `--repetitions` (default 3) is the number of
+  copies per cell and the cell's value is their median.
+- **Cells are independent.** A cell that fails, hangs or hits an error nobody foresaw records its
+  own outcome and the run goes on to the next cell. The run exits zero whenever it worked through
+  its list, whatever the cells' outcomes. Cells of one file set share its generated fixture and run
+  in the order given.
+- **Timeouts catch hangs only.** `--timeout` (default 3600 s) is one generous limit for each
+  command: file-set generation, cache preparation, each copy and each removal. A slow copy is a
+  result, not a failure. On a worker with a fixed allocation (`RCP_BENCH_WORKER_DEADLINE_NS`), a
+  command that the end of the allocation cuts short is `interrupted` and the cells after it are
+  `not_run`; neither is a failure of rcp. The time left is measured again before every command,
+  including between cache preparation and the copy. Nothing is removed once the allocation has
+  ended, because clearing millions of files could outlast the time left and the worker's storage
+  goes away with the machine.
+- **Copies are not verified.** A copy counts when the command exits zero and its own `--summary`
+  reports the expected numbers of files copied and unchanged. No tree is walked or hashed, before or
+  after. Correctness is covered by the test suites; this runner only measures. Records, summaries
+  and public pages say so wherever they show these numbers.
+- **Resources are optional per copy.** `--resource-time` records CPU time and peak memory for each
+  copy with GNU `time`. A copy whose figures cannot be read still counts, with its CPU and memory
+  marked unavailable.
+
+Cell outcomes are `complete`, `failed`, `timed_out`, `interrupted` (cut short by the end of the
+allocation or by a stop signal) and `not_run`. A failed cell is not retried, and its remaining
+copies are skipped. Each outcome carries the stage it happened in and a short reason that names the
+log to read, for example
+`copy 2 failed with exit code 1; see logs/bulk-1m-1024gb/local/2/0.stderr.log`.
+
+The output directory holds `results.json` (schema `rcp-benchmark-matrix-v1`), `summary.md` and the
+logs. `results.json` is rewritten after every step, so a run that is stopped keeps the cells it
+finished; a save that fails, for example on a full output directory, is made up for by the next one.
+Each command log is cut to its first and last half mebibyte once the command has ended, so one copy
+that fails for every file cannot fill a small output directory. `benchmarks.matrix.validate` checks
+a document before anything is concluded from it. `--check-capacity` needs source and destination on
+different filesystems, as on the AWS worker. `--system-telemetry` samples the same bounded host and
+cgroup diagnostics as `benchmark-run`. A fixture or destination that could not be removed is counted
+in `removal_failures`.
+
+These documents are a separate format: the dashboards and change reports described below read
+`benchmark-run` results only.
+
 ## Results and history
 
 Each output directory contains versioned `results.json`, a `summary.md`, and per-process logs.
