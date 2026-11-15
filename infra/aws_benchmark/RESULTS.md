@@ -222,11 +222,16 @@ with resource observations from the exact versioned raw archive referenced by th
 The archive digest and retirement digest remain visible. The exporter does not execute archive
 contents, copy retained HTML, or run today's qualification validator again.
 
-Per-copy GNU-time fields are user CPU seconds, system CPU seconds, peak RSS in **KiB**, voluntary
-and involuntary context switches, and minor and major page faults. The scope is one local command,
-its threads and waited descendants. CPU time can exceed wall time on multiple threads. Peak RSS is
-neither whole-host consumption nor a sum of simultaneous processes. Failed or incomplete command
-resource output stays explicitly unavailable; it is never filled with zero.
+Per-copy process fields are user CPU seconds, system CPU seconds, peak RSS in **KiB**, voluntary and
+involuntary context switches, and minor and major page faults. Paired suites measure one local
+command from outside with GNU `time`: the command, its threads and waited descendants. Matrix suites
+record what rcp reports about itself in its JSON summary (`--output-format=json`): the `rcp` process
+with its threads and, for a remote copy, the source and the destination `rcpd` as two more sets of
+figures. A process counts itself only, so a remote copy's `rcp` figures leave out the `ssh` clients
+it starts. A revision from before rcp could print that summary is timed all the same, and has no
+figures. CPU time can exceed wall time on multiple threads. Peak RSS is neither whole-host
+consumption nor a sum of simultaneous processes. Failed or incomplete resource output stays
+explicitly unavailable; it is never filled with zero.
 
 Optional system-sampling summaries are separate diagnostics. Their fixed instrumentation descriptor,
 cadence and limits identify their measurement contract. Phase elapsed time, sampled cgroup memory,
@@ -289,11 +294,12 @@ file sets. Copies of an unfinished cell are listed with whatever resources they 
 never expected among the published samples.
 
 A matrix record with a remote cell gets `rcp-public-resource-diagnostics-v3` instead: version 2 with
-`roles` on every copy. A remote copy is three processes, so its `metrics` are the `rcp` command's
-(with the `ssh` clients it starts) and `roles.source` and `roles.destination` hold the same figures
-for each `rcpd`, or `null` where a daemon's figures could not be read. `roles` is `null` for a local
-copy. A copy without figures for its command publishes none for its daemons. The record decides the
-version, so a stored companion never changes it, and the versions do not stand in for each other.
+`roles` on every copy. A remote copy is three processes, so its `metrics` are the `rcp` process's
+own (without the `ssh` clients it starts) and `roles.source` and `roles.destination` hold the same
+figures for each `rcpd`, or `null` where a daemon's figures could not be read. `roles` is `null` for
+a local copy. A copy without figures for its command publishes none for its daemons. The record
+decides the version, so a stored companion never changes it, and the versions do not stand in for
+each other.
 
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
 marked setup change (`Copy check`), not as a new line. The run page lists every cell with its result

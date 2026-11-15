@@ -36,11 +36,25 @@ for index in itertools.product(*[range(width) for width in widths]):
         (leaf / f"file{number}").write_bytes(b"x" * size)
 '''
 
+# what the stand-in rcp reports about itself, and what the runner records of it
+REPORTED = dict(walltime_ms=7, cpu_time_user_ms=1250, cpu_time_kernel_ms=500, peak_rss_bytes=2 * 1024 * 1024 + 512,
+                voluntary_context_switches=3, involuntary_context_switches=4, minor_page_faults=5,
+                major_page_faults=6)
+RECORDED = dict(user_seconds=1.25, system_seconds=.5, max_rss_kib=2048, voluntary_switches=3,
+                involuntary_switches=4, minor_faults=5, major_faults=6, exit_code=0)
+
 RCP = r'''#!/usr/bin/env python3
-import os, pathlib, shutil, sys, time
+import json, os, pathlib, shutil, sys, time
+old = os.environ.get("FAKE_RCP_BUILD") == "old"
+if old and any(item.startswith("--output-format") for item in sys.argv[1:]):
+    # a build from before the option existed: its argument parser refuses it, --version or not
+    print("error: unexpected argument '--output-format' found", file=sys.stderr)
+    sys.exit(2)
 if "--version" in sys.argv:
     print("rcp 1")
     sys.exit(0)
+if not old and "--output-format=json" not in sys.argv[1:-2]:
+    sys.exit("the runner reads the JSON summary")
 source, destination = pathlib.Path(sys.argv[-2]), pathlib.Path(sys.argv[-1])
 plan = dict(item.split("=") for item in os.environ.get("FAKE_RCP", "").split(",") if item)
 behaviour = plan.get(source.parent.name, "ok")
@@ -53,10 +67,42 @@ if behaviour.startswith("flood"):
     sys.exit(3)
 shutil.copytree(source, destination)
 files = sum(len(names) for _, _, names in os.walk(destination))
-print(f"files copied: {files - (1 if behaviour == 'miscount' else 0)}")
-print("files unchanged: 0")
+copied = files - (1 if behaviour == "miscount" else 0)
+if old:
+    # the text summary is all such a build has
+    print(f"copy:\n-----\nfiles copied: {copied}\nfiles unchanged: 0\n\nwalltime : 1.00ms")
+    sys.exit(3 if behaviour == "exit" else 0)
+summary = dict(files_copied=copied, files_unchanged=1 if behaviour == "unchanged" else 0, bytes_copied=files * 3)
+if behaviour == "boolean":
+    summary["files_copied"] = True
+if behaviour != "nostats":
+    summary.update(REPORTED)
+if behaviour == "zerorss":
+    summary["peak_rss_bytes"] = 0
+if behaviour == "separator":
+    # characters that some readers take for the end of a line, inside a string
+    summary["note"] = "one two three\x85four"
+if behaviour == "binary":
+    # log lines that are not text, before the summary
+    sys.stdout.buffer.write(bytes([255, 254]) + b"\n")
+    sys.stdout.flush()
+if behaviour == "big":
+    # more log than is kept: its middle is cut, and the summary is at its end
+    for number in range(40000):
+        print("line %07d " % number + "x" * 70)
+if behaviour == "text":
+    # a build from before the option existed would not get this far; one that ignores it prints text
+    print(f"files copied: {files}\nfiles unchanged: 0")
+elif behaviour == "list":
+    print(json.dumps([summary]))
+elif behaviour == "nested":
+    print("[" * 200000)
+else:
+    print("a line of the log")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(json.dumps(summary, ensure_ascii=False).encode() + b"\n")
 sys.exit(3 if behaviour == "exit" else 0)
-'''
+'''.replace("REPORTED", repr(REPORTED))
 
 
 class MatrixTests(unittest.TestCase):
@@ -109,6 +155,17 @@ class MatrixTests(unittest.TestCase):
             # only what rcp's summary was checked for is recorded: its file counts
             self.assertEqual([copy["copy_summary"] for copy in cell["copies"]],
                              [dict(files_copied=4, files_unchanged=0)] * 2)
+            # and what rcp reports about itself, in the units of every other record
+            self.assertEqual([copy["resources"] for copy in cell["copies"]],
+                             [dict(status="complete", metrics=RECORDED)] * 2)
+            for copy in cell["copies"]:
+                # the summary is asked for as JSON; nothing wraps the command
+                self.assertEqual(copy["command"][:3], [str(self.bin / "rcp"), "--summary", "--output-format=json"])
+                self.assertEqual(len(copy["command"]), 5)
+        self.assertEqual(record["context"]["summary_format"], "json")
+        self.assertEqual(record["context"]["resources"], dict(policy="rcp-output-json-v1"))
+        self.assertNotIn("local_resources", record["context"])
+        for cell in record["cells"]:
             samples = [copy["elapsed_seconds"] for copy in cell["copies"]]
             self.assertEqual(cell["summary"]["samples"], samples)
             self.assertEqual(cell["summary"]["minimum"], min(samples))
@@ -126,10 +183,16 @@ class MatrixTests(unittest.TestCase):
         beta = record["cells"][1]
         self.assertEqual(beta["outcome"]["stage"], "copy")
         # the reason says where the command's own words are, since they never leave the evidence
-        self.assertEqual(beta["outcome"]["message"], "copy 1 failed with exit code 3; see logs/beta/local/1/0.stderr.log")
-        self.assertTrue((self.root / "out/logs/beta/local/1/0.stderr.log").is_file())
+        # rcp writes what went wrong to its output; only its argument parser uses the error stream
+        self.assertEqual(beta["outcome"]["message"],
+                         "copy 1 failed with exit code 3; see 0.stdout.log and 0.stderr.log in logs/beta/local/1")
+        for name in ("0.stdout.log", "0.stderr.log"):
+            self.assertTrue((self.root / "out/logs/beta/local/1" / name).is_file())
         # a broken cell is not retried: its remaining copies are skipped
         self.assertEqual([copy["status"] for copy in beta["copies"]], ["failed"])
+        # the stand-in printed a summary before it failed: nothing of it is recorded
+        for key in ("copy_summary", "resources", "role_resources"):
+            self.assertNotIn(key, beta["copies"][0])
         self.assertIsNone(beta["summary"])
         self.assertEqual(list((self.root / "destination").iterdir()), [])
 
@@ -137,7 +200,9 @@ class MatrixTests(unittest.TestCase):
         record = self.run_matrix(environment={"FAKE_RCP": "alpha=miscount"})
         self.assertEqual(self.outcomes(record), [("alpha", "failed"), ("beta", "complete"), ("gamma", "complete")])
         self.assertEqual(record["cells"][0]["outcome"]["stage"], "summary")
-        self.assertIn("files copied", record["cells"][0]["outcome"]["message"])
+        self.assertEqual(record["cells"][0]["outcome"]["message"],
+                         "copy 1 reported an unexpected summary: files_copied is 3; expected 4")
+        self.assertEqual(record["cells"][0]["copies"][0]["copy_summary"], dict(files_copied=3, files_unchanged=0))
 
     def test_a_hung_copy_times_out_and_later_cells_still_run(self):
         started = time.monotonic()
@@ -355,8 +420,8 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(log.rstrip().endswith(b"file 0019999"))
         self.assertRegex(log, rb"\n\[\.\.\. \d+ bytes omitted by the benchmark runner \.\.\.\]\n")
         # a log within the limit is kept as it was written
-        self.assertEqual((self.root / "out/logs/alpha/local/1/0.stdout.log").read_text(),
-                         "files copied: 4\nfiles unchanged: 0\n")
+        self.assertEqual((self.root / "out/logs/alpha/local/1/0.stdout.log").read_text().splitlines()[0],
+                         "a line of the log")
 
     def test_a_save_that_fails_is_retried_at_the_next_step_instead_of_ending_the_run(self):
         calls = []
@@ -472,24 +537,14 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual([item["case"]["id"] for item in record["file_sets"]], ["beta", "alpha"])
         self.assertEqual(record["status"], "complete")
 
-    def test_resources_are_recorded_for_each_copy_when_requested(self):
-        supervisor = shutil.which("time")
-        if supervisor is None:
-            self.skipTest("GNU time is not installed")
-        record = self.run_matrix("--resource-time", supervisor, cells=("alpha:local",))
-        copy = record["cells"][0]["copies"][0]
-        self.assertEqual(copy["resources"]["status"], "complete")
-        self.assertGreater(copy["resources"]["metrics"]["max_rss_kib"], 0)
-        self.assertIn("local_resources", record["context"])
-
     def test_an_unforeseen_error_costs_one_cell_and_the_run_goes_on(self):
         calls = []
-        def proof(*args, original=matrix.operations.summary_proof, **kwargs):
+        def summary(*args, original=matrix._json_summary, **kwargs):
             calls.append(args)
             if len(calls) == 3:
                 raise RuntimeError("no such summary field")
             return original(*args, **kwargs)
-        with mock.patch.object(matrix.operations, "summary_proof", side_effect=proof):
+        with mock.patch.object(matrix, "_json_summary", side_effect=summary):
             record = self.run_matrix()
         self.assertEqual(self.outcomes(record), [("alpha", "complete"), ("beta", "failed"), ("gamma", "complete")])
         self.assertEqual((record["cells"][1]["outcome"]["stage"], record["cells"][1]["outcome"]["message"]),
@@ -513,39 +568,134 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(list((self.root / "source").iterdir()), [])
 
     def test_output_bytes_that_are_not_text_do_not_break_reading_the_summary(self):
-        (self.bin / "rcp").write_text(RCP.replace('print("files unchanged: 0")',
-            'print("files unchanged: 0")\nsys.stdout.flush()\n'
-            'if behaviour == "binary":\n    sys.stdout.buffer.write(bytes([255, 254]))'))
         record = self.run_matrix(environment={"FAKE_RCP": "beta=binary"})
-        # undecodable bytes next to a correct summary are not rcp failing to copy
+        # undecodable bytes in the log before a correct summary are not rcp failing to copy
         self.assertEqual(self.outcomes(record), [("alpha", "complete"), ("beta", "complete"), ("gamma", "complete")])
 
-    def test_a_copy_still_counts_when_only_its_resource_figures_are_unreadable(self):
-        supervisor = self.root / "time"
-        supervisor.write_text("#!/usr/bin/env python3\nimport os, sys\n"
-            "if '--version' in sys.argv:\n    print('time (GNU Time) for tests')\n    sys.exit(0)\n"
-            "arguments = sys.argv[1:]\n"
-            "open(arguments[arguments.index('--output') + 1], 'w').write('not the expected figures')\n"
-            "command = arguments[arguments.index('--') + 1:]\nos.execv(command[0], command)\n")
-        supervisor.chmod(0o755)
-        record = self.run_matrix("--resource-time", str(supervisor), cells=("alpha:local",))
+    def test_a_copy_still_counts_when_its_summary_has_no_statistics(self):
+        record = self.run_matrix(cells=("alpha:local",), environment={"FAKE_RCP": "alpha=nostats"})
         cell, = record["cells"]
-        # a slow or failed copy is a result; a broken measuring aid is not rcp's failure
+        # a slow or failed copy is a result; figures that are missing are not rcp failing to copy
         self.assertEqual((cell["outcome"]["status"], [copy["status"] for copy in cell["copies"]]),
                          ("complete", ["ok", "ok"]))
-        self.assertEqual([(copy["resources"]["status"], copy["resources"]["metrics"]) for copy in cell["copies"]],
-                         [("invalid", None)] * 2)
+        for copy in cell["copies"]:
+            self.assertEqual((copy["resources"]["status"], copy["resources"]["metrics"]), ("unavailable", None))
+            self.assertEqual(copy["resources"]["error"], "the summary has no statistics for this process")
         self.assertEqual(len(cell["summary"]["samples"]), 2)
 
-    def test_a_failed_copy_under_the_resource_wrapper_reports_the_exit_code_once(self):
-        supervisor = shutil.which("time")
-        if supervisor is None:
-            self.skipTest("GNU time is not installed")
-        record = self.run_matrix("--resource-time", supervisor, cells=("alpha:local",), environment={"FAKE_RCP": "alpha=exit"})
+    def test_statistics_that_are_not_counts_are_not_recorded(self):
+        reported = "summary.update(" + repr(REPORTED) + ")"
+        self.assertIn(reported, RCP)
+        for index, value in enumerate((-1, 1.5, "12", True, None, 2 ** 70)):
+            # the stand-in reports this value as its peak memory
+            (self.bin / "rcp").write_text(RCP.replace(reported, reported[:-1] + f", peak_rss_bytes={value!r})"))
+            arguments = ["--manifest", str(self.manifest), "--bin-dir", str(self.bin), "--source-root",
+                         str(self.root / "source"), "--destination-root", str(self.root / "destination"),
+                         "--cache", "uncontrolled", "--repetitions", "1", "--output", str(self.root / f"out-{index}"),
+                         "--cell", "alpha:local"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                record = matrix.main(arguments)
+            copy = record["cells"][0]["copies"][0]
+            with self.subTest(value=value):
+                self.assertEqual((copy["status"], copy["resources"]["status"], copy["resources"]["metrics"]),
+                                 ("ok", "unavailable", None))
+                self.assertEqual(copy["resources"]["error"], "peak_rss_bytes is missing or is not a count")
+
+    def test_a_peak_memory_of_zero_is_not_a_measurement(self):
+        record = self.run_matrix(cells=("alpha:local",), environment={"FAKE_RCP": "alpha=zerorss"})
         cell, = record["cells"]
-        self.assertEqual((cell["outcome"]["status"], cell["outcome"]["message"]),
-                         ("failed", "copy 1 failed with exit code 3; see logs/alpha/local/1/0.stderr.log"))
-        self.assertEqual(cell["copies"][0]["resources"]["status"], "unavailable")
+        self.assertEqual(cell["outcome"]["status"], "complete")
+        for copy in cell["copies"]:
+            # no process has a peak of zero: such figures were not read, and must not be plotted
+            self.assertEqual((copy["status"], copy["resources"]["status"], copy["resources"]["metrics"]),
+                             ("ok", "unavailable", None))
+            self.assertEqual(copy["resources"]["error"], "peak_rss_bytes is zero: the process did not measure itself")
+
+    def test_a_last_line_that_is_not_one_json_object_fails_the_cell_at_its_summary(self):
+        record = self.run_matrix(environment={"FAKE_RCP": "alpha=list,beta=nested"})
+        self.assertEqual(self.outcomes(record), [("alpha", "failed"), ("beta", "failed"), ("gamma", "complete")])
+        for cell in record["cells"][:2]:
+            # brackets nested too deep to parse are a summary that cannot be read, not a harness error
+            self.assertEqual((cell["outcome"]["stage"], cell["outcome"]["message"]), (
+                "summary", "copy 1 printed no JSON summary as its last line of output; "
+                           f"see logs/{cell['case_id']}/local/1/0.stdout.log"))
+            self.assertNotIn("resources", cell["copies"][0])
+
+    def test_counts_that_are_wrong_or_are_not_numbers_fail_the_cell_at_its_summary(self):
+        record = self.run_matrix(environment={"FAKE_RCP": "alpha=unchanged,beta=boolean"})
+        self.assertEqual(self.outcomes(record), [("alpha", "failed"), ("beta", "failed"), ("gamma", "complete")])
+        self.assertEqual([cell["outcome"]["message"] for cell in record["cells"][:2]], [
+            "copy 1 reported an unexpected summary: files_unchanged is 1; expected 0",
+            "copy 1 reported an unexpected summary: files_copied is missing; expected 4"])
+        # true equals one in Python: a count is recorded only when it is a number
+        self.assertEqual(record["cells"][1]["copies"][0]["copy_summary"], dict(files_unchanged=0))
+
+    def test_characters_that_only_look_like_line_ends_do_not_split_the_summary(self):
+        record = self.run_matrix(cells=("alpha:local",), environment={"FAKE_RCP": "alpha=separator"})
+        self.assertEqual(self.outcomes(record), [("alpha", "complete")])
+        self.assertEqual(record["cells"][0]["copies"][0]["resources"], dict(status="complete", metrics=RECORDED))
+
+    def test_the_summary_is_read_from_the_end_of_a_log_that_was_cut(self):
+        record = self.run_matrix(cells=("alpha:local",), environment={"FAKE_RCP": "alpha=big"})
+        self.assertEqual(self.outcomes(record), [("alpha", "complete")])
+        log = self.root / "out/logs/alpha/local/1/0.stdout.log"
+        self.assertLessEqual(log.stat().st_size, matrix.LOG_LIMIT)
+        self.assertIn(b"bytes omitted by the benchmark runner", log.read_bytes())
+        self.assertEqual(record["cells"][0]["copies"][0]["resources"], dict(status="complete", metrics=RECORDED))
+
+    def test_a_stop_signal_while_the_summary_is_read_ends_the_run(self):
+        read_text = Path.read_text
+
+        def interrupted(path, *arguments, **options):
+            if path.name == "0.stdout.log":
+                raise InterruptedError("SIGTERM")
+            return read_text(path, *arguments, **options)
+        with mock.patch.object(Path, "read_text", interrupted), self.assertRaises(InterruptedError):
+            self.run_matrix(cells=("alpha:local", "beta:local"))
+        record = json.loads((self.root / "out/results.json").read_text())
+        # the signal is not taken for a summary that could not be read: nothing more is measured
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual([(cell["case_id"], cell["outcome"]["status"], cell["outcome"]["message"])
+                          for cell in record["cells"]],
+                         [("alpha", "interrupted", "run stopped during copy 1 of 2"),
+                          ("beta", "not_run", "the run stopped before this cell")])
+
+    def test_a_build_without_the_json_summary_is_still_timed_and_has_no_figures(self):
+        record = self.run_matrix(environment={"FAKE_RCP_BUILD": "old"})
+        self.assertEqual((record["status"], self.outcomes(record)),
+                         ("complete", [("alpha", "complete"), ("beta", "complete"), ("gamma", "complete")]))
+        self.assertEqual(record["context"]["summary_format"], "text")
+        # nothing measures such a build from outside either: it has no figures
+        self.assertNotIn("resources", record["context"])
+        for cell in record["cells"]:
+            for copy in cell["copies"]:
+                # the plain command, whose transfer counts are read from the text summary
+                self.assertEqual(copy["command"][:2], [str(self.bin / "rcp"), "--summary"])
+                self.assertEqual(len(copy["command"]), 4)
+                self.assertEqual(copy["copy_summary"], dict(files_copied=4, files_unchanged=0))
+                self.assertNotIn("resources", copy)
+            self.assertEqual(len(cell["summary"]["samples"]), 2)
+
+    def test_a_build_without_the_json_summary_still_fails_a_cell_on_a_wrong_count(self):
+        record = self.run_matrix(environment={"FAKE_RCP_BUILD": "old", "FAKE_RCP": "alpha=miscount"})
+        self.assertEqual(self.outcomes(record), [("alpha", "failed"), ("beta", "complete"), ("gamma", "complete")])
+        self.assertEqual((record["cells"][0]["outcome"]["stage"], record["cells"][0]["outcome"]["message"]),
+                         ("summary", "copy 1 reported an unexpected summary: files_copied is 3; expected 4"))
+
+    def test_a_copy_that_prints_no_json_summary_fails_its_cell_and_says_what_was_expected(self):
+        record = self.run_matrix(environment={"FAKE_RCP": "beta=text"})
+        self.assertEqual(self.outcomes(record), [("alpha", "complete"), ("beta", "failed"), ("gamma", "complete")])
+        beta = record["cells"][1]
+        self.assertEqual((beta["outcome"]["stage"], beta["outcome"]["message"]), (
+            "summary", "copy 1 printed no JSON summary as its last line of output; "
+                       "see logs/beta/local/1/0.stdout.log"))
+        self.assertEqual([copy["status"] for copy in beta["copies"]], ["failed"])
+        self.assertNotIn("resources", beta["copies"][0])
+
+    def test_the_runner_takes_no_resource_supervisor(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.run_matrix("--resource-time", "/usr/bin/time", cells=("alpha:local",))
+        self.assertIn("unrecognized arguments: --resource-time", stderr.getvalue())
 
     def test_validation_rejects_a_complete_cell_without_its_copies(self):
         record = self.run_matrix(cells=("alpha:local",))

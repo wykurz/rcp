@@ -214,11 +214,12 @@ def command(window, seconds):
                "--output", str(DATA / "output" / "results")]
     if matrix:
         # one build, a fixed hang-only limit per command and no verification; the allocation
-        # reaches the runner only through the deadline above
+        # reaches the runner only through the deadline above. CPU and memory are what rcp reports
+        # about itself in its summary, so nothing wraps the copy commands
         argv += ["/usr/bin/python3", "-m", "benchmarks.matrix",
                  "--manifest", str(ROOT / "benchmarks/matrix-cases.json"), "--bin-dir", str(STATE / "candidate"),
                  "--cache", contract["cache_policy"], "--repetitions", str(contract["repetitions"]),
-                 "--timeout", str(contract["timeout"]), "--resource-time", "/usr/bin/time",
+                 "--timeout", str(contract["timeout"]),
                  "--check-capacity", "--system-telemetry", "--purpose", contract["purpose"],
                  "--runner-label", contract["runner_label"], *storage]
         if loopback:

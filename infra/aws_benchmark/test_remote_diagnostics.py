@@ -41,6 +41,33 @@ class RemoteDiagnosticsTests(unittest.TestCase):
         self.assertIn("source rcpd and the destination rcpd", value["process_scope"])
         self.assertEqual(diagnostics.validate(copy.deepcopy(value), record), value)
 
+    def test_the_scope_says_that_each_process_reports_its_own_figures(self):
+        scope = derived()[0]["process_scope"]
+        self.assertIn("what a process reports about itself", scope)
+        # and how it knows: nothing is estimated or sampled
+        self.assertIn("from the kernel's accounting of that process", scope)
+        # rcp counts itself: the ssh clients it starts are processes of their own, and it has no others
+        self.assertIn("without the ssh clients it starts", scope)
+        self.assertNotIn("waited descendants", scope)
+
+    def test_a_build_that_cannot_report_its_figures_publishes_its_copies_without_any(self):
+        def older(raw):
+            # what the runner writes for a revision from before rcp could print its summary as JSON
+            del raw["context"]["resources"]
+            raw["context"]["summary_format"] = "text"
+            for cell in raw["cells"]:
+                for item in cell["copies"]:
+                    del item["resources"]
+                    item.pop("role_resources", None)
+        value, record, _ = derived(change=older)
+        self.assertEqual((value["schema"], value["status"], value["reason"]),
+                         ("rcp-public-resource-diagnostics-v3", "partial", None))
+        self.assertEqual({(trial["status"], trial["metrics"]) for trial in value["trials"]}, {("unavailable", None)})
+        # a remote copy still names both daemons, each without figures
+        local, remote = value["trials"][0], value["trials"][3]
+        self.assertEqual((local["roles"], remote["roles"]), (None, dict(source=None, destination=None)))
+        diagnostics.validate(value, record)
+
     def test_a_run_without_remote_cells_keeps_the_earlier_document(self):
         for suite in ("matrix-commission-local", "matrix-all-local"):
             raw = matrix_record(suite, environment=ENVIRONMENT)

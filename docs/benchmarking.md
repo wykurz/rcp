@@ -645,9 +645,10 @@ just benchmark-matrix --manifest benchmarks/matrix-cases.json \
 
 There are two scenarios:
 
-- **`local`** copies between two directories: `rcp --summary SOURCE DESTINATION`.
+- **`local`** copies between two directories:
+  `rcp --summary --output-format=json SOURCE DESTINATION`.
 - **`remote`** makes the same copy through rcp's remote path on one host:
-  `rcp --summary --force-remote --bind-ip=127.0.0.1 --rcpd-path=WRAPPER 127.0.0.1:SOURCE 127.0.0.1:DESTINATION`.
+  `rcp --summary --output-format=json --force-remote --bind-ip=127.0.0.1 --rcpd-path=BIN_DIR/rcpd 127.0.0.1:SOURCE 127.0.0.1:DESTINATION`.
   rcp starts a source and a destination `rcpd` over SSH and the daemons exchange the data over
   loopback TCP, encrypted as by default. No network hardware and no added latency are involved. See
   [Remote cells](#remote-cells) for what the runner sets up.
@@ -673,17 +674,28 @@ It differs from `benchmark-run` in what it promises:
   reports the expected numbers of files copied and unchanged. No tree is walked or hashed, before or
   after. Correctness is covered by the test suites; this runner only measures. Records, summaries
   and public pages say so wherever they show these numbers.
-- **Resources are optional per copy.** `--resource-time` records CPU time and peak memory for each
-  copy with GNU `time`. A copy whose figures cannot be read still counts, with its CPU and memory
-  marked unavailable. A remote copy records three sets of figures: the `rcp` command (with the `ssh`
-  clients it starts) under `resources`, and each daemon under `role_resources.source` and
-  `role_resources.destination`.
+- **Resources are what rcp reports about itself.** Every copy is asked for its summary as JSON
+  (`--output-format=json`), printed as the last line of its output. The runner takes the transfer
+  counts from it, and CPU time, peak memory, context switches and page faults of the `rcp` process,
+  recorded under `resources`. After a remote copy the same summary carries the figures each daemon
+  sent back, recorded under `role_resources.source` and `role_resources.destination`. No wrapper
+  runs a command and no CPU or memory figure is measured from outside, so none includes a child
+  process: a remote copy's `rcp` figures leave out the `ssh` clients it starts. A copy whose summary
+  lacks a figure still counts, with its resources marked unavailable. The same holds when a process
+  reports a peak memory of zero: a figure that was not read is never recorded as zero. A copy that
+  prints no JSON summary fails its cell at stage `summary`.
+- **A build without `--output-format` is still timed.** Before the first copy the runner tries the
+  option once (`rcp --output-format=json --version`). A build that refuses it, one from before rcp
+  could print its summary as JSON, is run without the option: its transfer counts are read from the
+  text summary and it has no figures. `context.summary_format` says which summary a run read (`json`
+  or `text`).
 
 Cell outcomes are `complete`, `failed`, `timed_out`, `interrupted` (cut short by the end of the
 allocation or by a stop signal) and `not_run`. A failed cell is not retried, and its remaining
 copies are skipped. Each outcome carries the stage it happened in and a short reason that names the
 log to read, for example
-`copy 2 failed with exit code 1; see logs/bulk-1m-1024gb/local/2/0.stderr.log`.
+`copy 2 failed with exit code 1; see 0.stdout.log and 0.stderr.log in logs/bulk-1m-1024gb/local/2`.
+rcp writes what went wrong to its output; only its argument parser uses the error stream.
 
 The output directory holds `results.json` (schema `rcp-benchmark-matrix-v1`), `summary.md` and the
 logs. `results.json` is rewritten after every step, so a run that is stopped keeps the cells it
@@ -716,13 +728,14 @@ and stops it when the run ends:
 - **A launcher named `ssh`.** rcp runs the first `ssh` on its `PATH`. For remote copies that is a
   launcher that sends every connection to the private sshd with the private key, and keeps host key
   checking on although rcp asks for it to be off.
-- **An rcpd wrapper.** `--rcpd-path` names a wrapper that runs the daemon from `--bin-dir` under GNU
-  `time`. sshd starts each daemon in a session of its own, outside the copy's process group, so a
-  daemon that hangs would keep working during the next copy. Every session is therefore marked
-  (`RCP_BENCH_ENDPOINT` in its environment). After a remote copy that failed or timed out, the
-  runner ends at once any marked process that is still running. After one that succeeded, a daemon
-  that is still on its way out gets a few seconds to exit by itself first. Whatever had to be ended
-  is counted in `leftover_processes`.
+- **Marked sessions.** `--rcpd-path` names the daemon in `--bin-dir`; no wrapper stands between
+  `sshd` and `rcpd`, only the account's login shell. sshd starts each daemon in a session of its
+  own, outside the copy's process group, so a daemon that hangs would keep working during the next
+  copy. The private sshd therefore marks every session it starts (`SetEnv RCP_BENCH_ENDPOINT=…`, a
+  value made for the run). After a remote copy that failed or timed out, the runner ends at once any
+  marked process that is still running. After one that succeeded, a daemon that is still on its way
+  out gets a few seconds to exit by itself first. Whatever had to be ended is counted in
+  `leftover_processes`.
 - **Loopback addresses everywhere.** Both operands and `--bind-ip` name `127.0.0.1`, so rcp never
   has to detect an address. Its detection enumerates network interfaces, which a sandbox without
   netlink sockets forbids; with explicit addresses a remote cell needs IPv4 sockets only.
@@ -737,10 +750,9 @@ What a remote cell's numbers include:
   Variables set for the runner, such as `TOKIO_WORKER_THREADS` or `MALLOC_CONF`, reach the `rcp`
   command and local copies but not the daemons that do a remote copy's work.
 
-Keys, configuration and the daemons' figures live in a directory of their own under the temporary
-directory, never under `--output`, which the AWS worker archives. The sshd log is kept at
-`logs/sshd.log`. `context.remote` records the profile (`private-sshd-ipv4-loopback-v1`) and the
-identities of `ssh` and `sshd`.
+Keys and configuration live in a directory of their own under the temporary directory, never under
+`--output`, which the AWS worker archives. The sshd log is kept at `logs/sshd.log`. `context.remote`
+records the profile (`private-sshd-ipv4-loopback-v1`) and the identities of `ssh` and `sshd`.
 
 The endpoint is stopped and its directory removed when the run finishes, fails, or is stopped by
 SIGINT or SIGTERM. A runner that is killed outright (SIGKILL, out of memory) cleans up nothing:

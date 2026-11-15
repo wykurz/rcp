@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from benchmarks import measurements, private_sshd
+from benchmarks import private_sshd
 
 KEYGEN = r'''#!/usr/bin/env python3
 import pathlib, sys
@@ -87,6 +87,11 @@ if behaviour == "nohome":
     # what sshd writes into a session when it cannot enter the account's home directory
     print("Could not chdir to home directory /nonexistent: No such file or directory", file=sys.stderr)
     print("a shell's own complaint about that home", file=sys.stderr)
+# a session gets the variables that the server configuration sets for it
+for line in pathlib.Path(sys.argv[sys.argv.index("-F") + 1]).with_name("sshd_config").read_text().splitlines():
+    if line.startswith("SetEnv "):
+        name, _, value = line[len("SetEnv "):].partition("=")
+        os.environ[name] = value
 arguments, operands = sys.argv[1:], []
 while arguments:
     argument = arguments.pop(0)
@@ -96,23 +101,6 @@ while arguments:
         operands = arguments
         break
 sys.exit(subprocess.run(["/bin/sh", "-c", " ".join(operands)]).returncode if operands else 0)
-'''
-
-# GNU time as the wrapper calls it: runs the command and writes its figures in the given format
-TIME = r'''#!/usr/bin/env python3
-import subprocess, sys
-if "--version" in sys.argv:
-    print("time (GNU Time) for tests")
-    sys.exit(0)
-arguments = sys.argv[1:]
-output, form = arguments[arguments.index("--output") + 1], arguments[arguments.index("--format") + 1]
-code = subprocess.run(arguments[arguments.index("--") + 1:]).returncode
-for key, value in (("%U", "1.25"), ("%S", "0.50"), ("%M", "2048"), ("%w", "3"), ("%c", "4"), ("%R", "5"),
-                   ("%F", "6"), ("%x", str(code))):
-    form = form.replace(key, value)
-with open(output, "w") as stream:
-    stream.write(form + "\n")
-sys.exit(code)
 '''
 
 RCPD = "#!/bin/sh\necho \"rcpd ran: $*\"\n"
@@ -136,15 +124,14 @@ class EndpointTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.state = self.root / "state"
         self.state.mkdir()
-        self.tools = tools(self.root / "tools", sshd=SSHD, ssh=SSH, keygen=KEYGEN, time=TIME, rcpd=RCPD)
+        self.tools = tools(self.root / "tools", sshd=SSHD, ssh=SSH, keygen=KEYGEN, rcpd=RCPD)
         environment = mock.patch.dict(os.environ, {"FAKE_STATE": str(self.state)})
         environment.start()
         self.addCleanup(environment.stop)
 
-    def endpoint(self, **options):
-        options.setdefault("resource_time", self.tools["time"])
-        endpoint = private_sshd.Endpoint(self.tools["rcpd"], sshd=self.tools["sshd"], ssh=self.tools["ssh"],
-                                         keygen=self.tools["keygen"], log=self.root / "sshd.log", **options)
+    def endpoint(self):
+        endpoint = private_sshd.Endpoint(sshd=self.tools["sshd"], ssh=self.tools["ssh"],
+                                         keygen=self.tools["keygen"], log=self.root / "sshd.log")
         self.addCleanup(endpoint.stop)
         return endpoint
 
@@ -182,7 +169,7 @@ class EndpointTests(unittest.TestCase):
             profile="private-sshd-ipv4-loopback-v1", address="127.0.0.1",
             ssh=private_sshd.identity(self.tools["ssh"]), sshd=private_sshd.identity(self.tools["sshd"])))
         self.assertEqual(endpoint.descriptor()["ssh"]["version"], "OpenSSH_fake, for tests")
-        # every session is marked from its first instruction, before the wrapper has run
+        # every session is marked from its first instruction, whatever it goes on to run
         self.assertIn(f"SetEnv RCP_BENCH_ENDPOINT={endpoint.token}", server)
         # the readiness login gives up on a port that something else answers on, quickly
         self.assertIn(["-F", str(directory / "ssh_config"), "-o", "StrictHostKeyChecking=yes",
@@ -305,15 +292,6 @@ class EndpointTests(unittest.TestCase):
         self.assertIsNotNone(process.returncode)
         self.assertFalse(directory.exists())
 
-    def test_a_stop_signal_while_reading_a_daemon_s_figures_is_not_taken_for_a_missing_file(self):
-        endpoint = self.endpoint()
-        endpoint.start()
-        for role in ("source", "destination"):
-            subprocess.run([str(endpoint.directory / "rcpd"), "--role", role], check=True, capture_output=True)
-        with mock.patch.object(Path, "read_bytes", side_effect=InterruptedError("SIGTERM")), \
-                self.assertRaises(InterruptedError):
-            endpoint.roles(True)
-
     def test_a_listener_that_never_answers_fails_setup_within_its_limit(self):
         endpoint = self.endpoint()
         started = time.monotonic()
@@ -336,8 +314,20 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(len(launches), 2)
         self.assertIn("  Port " + launches[1], (endpoint.directory / "ssh_config").read_text().splitlines())
 
+    def test_a_stop_signal_while_marked_processes_are_found_or_ended_is_not_swallowed(self):
+        endpoint = self.endpoint()
+        endpoint.start()
+        # reading a process's environment fails for ordinary reasons all the time; a stop is not one
+        with mock.patch.object(Path, "read_bytes", side_effect=InterruptedError("SIGTERM")), \
+                self.assertRaises(InterruptedError):
+            endpoint.reap()
+        with mock.patch.object(endpoint, "_marked", return_value=[os.getpid()]), \
+                mock.patch.object(private_sshd.os, "kill", side_effect=InterruptedError("SIGTERM")), \
+                self.assertRaises(InterruptedError):
+            endpoint.reap()
+
     def test_a_missing_tool_is_named(self):
-        endpoint = private_sshd.Endpoint(self.tools["rcpd"], sshd=self.root / "absent", ssh=self.tools["ssh"],
+        endpoint = private_sshd.Endpoint(sshd=self.root / "absent", ssh=self.tools["ssh"],
                                          keygen=self.tools["keygen"], log=self.root / "sshd.log")
         with self.assertRaisesRegex(private_sshd.EndpointError, "sshd is not an executable file"):
             endpoint.start()
@@ -363,59 +353,15 @@ class EndpointTests(unittest.TestCase):
     def test_the_command_addresses_both_operands_on_loopback(self):
         endpoint = self.endpoint()
         endpoint.start()
-        self.assertEqual(endpoint.command(["/bin/rcp", "--summary", "/data/source/set", "/data/destination/copy"]),
+        self.assertEqual(endpoint.command(["/bin/rcp", "--summary", "/data/source/set", "/data/destination/copy"],
+                                          self.tools["rcpd"]),
                          ["/bin/rcp", "--summary", "--force-remote", "--bind-ip=127.0.0.1",
-                          f"--rcpd-path={endpoint.directory}/rcpd", "127.0.0.1:/data/source/set",
+                          f"--rcpd-path={self.tools['rcpd']}", "127.0.0.1:/data/source/set",
                           "127.0.0.1:/data/destination/copy"])
-
-    def test_the_wrapper_measures_each_daemon_and_passes_other_calls_through(self):
-        endpoint = self.endpoint()
-        endpoint.start()
-        wrapper = str(endpoint.directory / "rcpd")
-        done = subprocess.run([wrapper, "--role", "source", "--bind-ip", "127.0.0.1"], capture_output=True, text=True)
-        self.assertEqual((done.returncode, done.stdout), (0, "rcpd ran: --role source --bind-ip 127.0.0.1\n"))
-        done = subprocess.run([wrapper, "--role=destination"], capture_output=True, text=True)
-        self.assertEqual(done.stdout, "rcpd ran: --role=destination\n")
-        done = subprocess.run([wrapper, "--protocol-version"], capture_output=True, text=True)
-        self.assertEqual(done.stdout, "rcpd ran: --protocol-version\n")
-        self.assertEqual(sorted(item.name for item in (endpoint.directory / "roles").iterdir()),
-                         ["destination.json", "source.json"])
-        roles = endpoint.roles(True)
-        self.assertEqual(sorted(roles), ["destination", "source"])
-        for role in roles.values():
-            self.assertEqual(role["status"], "complete")
-            self.assertEqual(role["metrics"], dict(user_seconds=1.25, system_seconds=.5, max_rss_kib=2048,
-                voluntary_switches=3, involuntary_switches=4, minor_faults=5, major_faults=6, exit_code=0))
-        # the figures of one copy are never read as the next copy's
-        endpoint.clear()
-        self.assertEqual(list((endpoint.directory / "roles").iterdir()), [])
-
-    def test_a_daemon_without_figures_is_reported_unavailable_after_a_bounded_wait(self):
-        endpoint = self.endpoint()
-        endpoint.start()
-        subprocess.run([str(endpoint.directory / "rcpd"), "--role", "source"], check=True, capture_output=True)
-        started = time.monotonic()
-        with mock.patch.object(private_sshd, "ROLE_WAIT_SECONDS", .3):
-            roles = endpoint.roles(True)
-        self.assertLess(time.monotonic() - started, 5)
-        self.assertEqual(roles["source"]["status"], "complete")
-        self.assertEqual((roles["destination"]["status"], roles["destination"]["metrics"]), ("unavailable", None))
-        # a copy that did not succeed has no figures worth waiting for
-        with mock.patch.object(private_sshd, "ROLE_WAIT_SECONDS", 60):
-            failed = endpoint.roles(False)
-        self.assertEqual({role["status"] for role in failed.values()}, {"unavailable"})
-        self.assertEqual(failed["source"], measurements.collect(self.root / "absent", False))
-
-    def test_without_a_resource_supervisor_the_wrapper_only_marks_its_daemons(self):
-        daemon = tools(self.root / "daemon", rcpd="#!/bin/sh\necho \"rcpd ran: $* as $RCP_BENCH_ENDPOINT\"\n")["rcpd"]
-        endpoint = private_sshd.Endpoint(daemon, sshd=self.tools["sshd"], ssh=self.tools["ssh"],
-                                         keygen=self.tools["keygen"], log=self.root / "sshd.log")
-        self.addCleanup(endpoint.stop)
-        endpoint.start()
-        done = subprocess.run([str(endpoint.directory / "rcpd"), "--role", "source"], capture_output=True, text=True)
-        self.assertEqual(done.stdout, f"rcpd ran: --role source as {endpoint.token}\n")
-        self.assertEqual(list((endpoint.directory / "roles").iterdir()), [])
-        self.assertIsNone(endpoint.roles(True))
+        # the daemon is the one under test itself: nothing stands between rcp and it
+        self.assertEqual(sorted(item.name for item in endpoint.directory.iterdir()), [
+            "authorized_keys", "bin", "host_key", "host_key.pub", "identity", "identity.pub", "known_hosts",
+            "ssh_config", "sshd_config"])
 
     def test_the_self_check_starts_logs_in_and_stops(self):
         output = io.StringIO()
@@ -438,16 +384,13 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int((self.state / "sshd.pid").read_text()), 0)
 
-    def test_reap_ends_only_what_was_started_through_the_wrapper(self):
-        daemon = tools(self.root / "daemon", rcpd="#!/bin/sh\nexec sleep 300\n")["rcpd"]
-        endpoint = private_sshd.Endpoint(daemon, sshd=self.tools["sshd"], ssh=self.tools["ssh"],
-                                         keygen=self.tools["keygen"], log=self.root / "sshd.log",
-                                         resource_time=self.tools["time"])
-        self.addCleanup(endpoint.stop)
+    def test_reap_ends_only_what_a_session_started(self):
+        endpoint = self.endpoint()
         endpoint.start()
         self.assertEqual(endpoint.reap(), 0)
-        # a daemon that outlives its copy, started as rcp starts it: detached from the caller
-        marked = subprocess.Popen([str(endpoint.directory / "rcpd"), "--role", "source"], start_new_session=True)
+        # a daemon that outlives its copy, as sshd starts it: marked, in a session of its own
+        marked = subprocess.Popen(["sleep", "300"], start_new_session=True,
+                                  env={**os.environ, private_sshd.MARKER: endpoint.token})
         other = subprocess.Popen(["sleep", "300"])
         self.addCleanup(other.wait)
         self.addCleanup(other.kill)
@@ -455,11 +398,19 @@ class EndpointTests(unittest.TestCase):
         while time.monotonic() < deadline and endpoint.reap() == 0:
             time.sleep(.05)
         self.assertEqual(marked.wait(timeout=10), -signal.SIGKILL)
-        # the supervisor and the daemon both carried the mark: neither is left
-        while time.monotonic() < deadline and endpoint.reap():
-            time.sleep(.05)
         self.assertEqual(endpoint.reap(), 0)
         self.assertIsNone(other.poll())
+
+    def test_reap_gives_a_process_that_is_leaving_time_to_leave(self):
+        endpoint = self.endpoint()
+        endpoint.start()
+        leaving = subprocess.Popen(["sleep", "0.3"], start_new_session=True,
+                                   env={**os.environ, private_sshd.MARKER: endpoint.token})
+        started = time.monotonic()
+        self.assertEqual(endpoint.reap(grace=10), 0)
+        # it returned as soon as nothing was left, and the process ended by itself
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(leaving.wait(timeout=10), 0)
 
 
 class RealEndpointTests(unittest.TestCase):
@@ -475,9 +426,8 @@ class RealEndpointTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.fakes = tools(self.root / "tools", time=TIME, rcpd=RCPD)
-        self.endpoint = private_sshd.Endpoint(self.fakes["rcpd"], log=self.root / "sshd.log",
-                                              resource_time=self.fakes["time"])
+        self.fakes = tools(self.root / "tools", rcpd=RCPD)
+        self.endpoint = private_sshd.Endpoint(log=self.root / "sshd.log")
         self.addCleanup(self.endpoint.stop)
         self.endpoint.start()
         self.environment = {**os.environ, **self.endpoint.environment()}
@@ -494,7 +444,7 @@ class RealEndpointTests(unittest.TestCase):
         self.assertEqual(done.returncode, 255, done.stderr)
         self.assertIn("Host key verification failed", done.stderr)
 
-    def test_a_session_that_has_not_reached_the_wrapper_is_found_and_ended(self):
+    def test_a_session_is_marked_by_sshd_and_so_found_and_ended(self):
         endpoint = self.endpoint
         session = subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no", "127.0.0.1", "sleep", "300"],
                                    env=self.environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -506,13 +456,12 @@ class RealEndpointTests(unittest.TestCase):
         # the remote command is gone, so its client returns
         self.assertNotEqual(session.wait(timeout=20), 0)
 
-    def test_a_command_runs_through_the_launcher_and_the_wrapper(self):
+    def test_a_command_runs_through_the_launcher_as_rcp_starts_its_daemons(self):
         root, endpoint, environment = self.root, self.endpoint, self.environment
         done = subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "127.0.0.1",
-                               str(endpoint.directory / "rcpd"), "--role", "destination"],
+                               str(self.fakes["rcpd"]), "--role", "destination"],
                               capture_output=True, text=True, env=environment, timeout=60)
-        self.assertEqual((done.returncode, done.stdout), (0, "rcpd ran: --role destination\n"), done.stderr)
-        self.assertEqual(endpoint.roles(True)["destination"]["status"], "complete")
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "rcpd ran: --role destination\n", ""))
         self.assertRegex(endpoint.descriptor()["ssh"]["version"], "OpenSSH")
         directory = endpoint.directory
         endpoint.stop()

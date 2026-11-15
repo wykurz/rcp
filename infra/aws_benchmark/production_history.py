@@ -485,8 +485,9 @@ def reading_html(remote=False):
         "page says why. Failed and unavailable runs stay in the run list without performance points.</li>"
         "<li><strong>Remote copies.</strong> A remote copy is three processes: the <code>rcp</code> command, "
         "and the source and the destination <code>rcpd</code> that it starts over SSH and that move the data. "
-        "Copy duration is the wall time of the <code>rcp</code> command. CPU time and peak memory are plotted "
-        "for each daemon; the command's own figures are in each data table.</li>")
+        "Copy duration is the wall time of the <code>rcp</code> command. Each process reports its own CPU "
+        "time and peak memory: they are plotted for each daemon, and the command's own figures are in each "
+        "data table.</li>")
     return ("<section aria-labelledby='reading'><h2 id='reading'>Reading the plots</h2><ul>"
         "<li><strong>Point.</strong> One qualified run, summarizing the copies of one file set made by the "
         "build under test with rcp's default settings: three copies in a matrix run, four in a paired run. "
@@ -504,8 +505,9 @@ def reading_html(remote=False):
         "<li><strong>CPU time.</strong> User plus system seconds, added for each copy before the median is "
         "taken; not a sum of repetitions.</li>"
         "<li><strong>Peak memory.</strong> Peak command RSS, converted from KiB to MiB. CPU and RSS cover the "
-        "command, its threads and waited descendants; they are not whole-host totals or simultaneous summed "
-        "process memory.</li>"
+        "copy command with all its threads; they are not whole-host totals or simultaneous summed process "
+        "memory. Matrix runs record what rcp reports about itself in its summary, read from the kernel's "
+        "accounting of its own process. Paired runs are measured from outside with GNU <code>time</code>.</li>"
         "<li><strong>Gaps.</strong> A run without complete resource metrics for every plotted copy has no CPU "
         "or memory point. Missing values stay unavailable, never zero, and no line is drawn across them.</li>"
         "<li><strong>Lines.</strong> Runs of a file set are joined in time order across code versions, harness "

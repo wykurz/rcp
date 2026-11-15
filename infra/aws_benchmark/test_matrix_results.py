@@ -30,7 +30,8 @@ def matrix_record(suite, outcomes=None, **context_changes):
         timeout_seconds=float(contract["timeout"]), verification=dict(common.verification_contract(suite)),
         source="/mnt/rcp-benchmark/source", destination="/mnt/rcp-benchmark/destination",
         storage_ids=dict(source="c5d-raid0-ext4-source-v1", destination="c5d-raid0-ext4-destination-v1"),
-        repository="wykurz/rcp", run_url="", environment={})
+        repository="wykurz/rcp", run_url="", environment={},
+        summary_format="json", resources=dict(policy=matrix.RESOURCE_POLICY))
     context.update(context_changes)
     cells, file_sets, trial = [], [], 0
     for index, (case_id, scenario) in enumerate(contract["cells"]):
@@ -43,14 +44,14 @@ def matrix_record(suite, outcomes=None, **context_changes):
             done = outcome["status"] == "complete"
             copies.append(dict(iteration=iteration, trial_index=trial, status="ok" if done else "failed",
                 elapsed_seconds=600.0 + index + iteration / 10, exit_codes=[0] if done else [3], timed_out=False,
-                command=["rcp", "--summary", "source", "destination"], logs=[],
-                resources=dict(status="complete", metrics=dict(METRICS)) if done else
-                    dict(status="unavailable", metrics=None)))
-            if scenario == "remote":
-                # a remote copy also records each daemon, measured on its own
-                copies[-1]["role_resources"] = {role: dict(status="complete", metrics=dict(METRICS, **figures))
-                    if done else dict(status="unavailable", metrics=None, reason="execution_failed")
-                    for role, figures in ROLE_METRICS.items()}
+                command=["rcp", "--summary", matrix.SUMMARY_FORMAT, "source", "destination"], logs=[]))
+            if done:
+                # only a copy that finished has a summary to take figures from
+                copies[-1]["resources"] = dict(status="complete", metrics=dict(METRICS))
+                if scenario == "remote":
+                    # the summary of a remote copy also carries what each daemon reported
+                    copies[-1]["role_resources"] = {role: dict(status="complete", metrics=dict(METRICS, **figures))
+                                                    for role, figures in ROLE_METRICS.items()}
             trial += 1
         if outcome["status"] == "not_run":
             copies = []
@@ -99,6 +100,24 @@ class MatrixCollectionTests(unittest.TestCase):
         self.assertEqual(public["note"], "Each measurement is the median of 3 copies.")
         self.assertEqual(public["diagnostics"], [])
         self.assertEqual(projection.outcome_label(projection.bind(public, "a" * 64)), "1 of 1 measurement completed")
+
+    def test_a_build_that_cannot_report_its_figures_still_qualifies_on_the_same_trend(self):
+        record = matrix_record("matrix-commission-local")
+        # what the runner writes for a revision from before rcp could print its summary as JSON
+        del record["context"]["resources"]
+        record["context"]["summary_format"] = "text"
+        for cell in record["cells"]:
+            for item in cell["copies"]:
+                item["command"].remove(matrix.SUMMARY_FORMAT)
+                del item["resources"]
+        result, report, public = self.collect("matrix-commission-local", record)
+        self.assertEqual((result["state"], report["benchmark_valid"], report["qualification_outcome"]),
+                         ("success", True, "passed"), result)
+        self.assertEqual(len(public["measurements"]), 2)
+        # a cell's trend is its definition: what a build can say about itself does not start a new line
+        usual = self.collect("matrix-commission-local", matrix_record("matrix-commission-local"))[2]
+        self.assertEqual([item["series_id"] for item in public["measurements"]],
+                         [item["series_id"] for item in usual["measurements"]])
 
     def test_a_failed_cell_is_reported_and_the_measured_cell_still_counts(self):
         record = matrix_record("matrix-commission-local", {1: dict(status="failed", stage="copy",
@@ -339,7 +358,8 @@ class MatrixCollectionTests(unittest.TestCase):
         from .test_results import binding, bundle
         expected = binding("matrix-commission-local")
         record = matrix_record("matrix-commission-local", {1: dict(status="failed", stage="copy",
-            message="copy 1 failed with exit code 3; see logs/commission-10k/local/1/0.stderr.log")},
+            message="copy 1 failed with exit code 3; see 0.stdout.log and 0.stderr.log in "
+                    "logs/commission-10k/local/1")},
             repository=expected["repository"])
         with tempfile.TemporaryDirectory() as temporary:
             source, output = Path(temporary) / "input", Path(temporary) / "report"

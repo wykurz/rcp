@@ -11,8 +11,15 @@ The `local` scenario copies between two directories. The `remote` scenario makes
 the same copy through rcp's remote path on one host: rcp starts a source and a
 destination rcpd over SSH, on a private sshd that this runner owns and that
 listens on IPv4 loopback only (benchmarks/private_sshd.py). The time measured is
-the rcp command's, as for a local copy; CPU and memory are recorded for the rcp
-command and for each daemon.
+the rcp command's, as for a local copy.
+
+CPU time, peak memory, context switches and page faults are what rcp reports
+about itself: each copy is asked for its summary as JSON (--output-format=json),
+which carries exact figures for the rcp process and, after a remote copy, for
+the source and the destination rcpd. No wrapper runs the commands, and only the
+copy's duration is measured from outside. A build from before rcp had the option
+is timed all the same: its transfer counts are read from the text summary, and
+it has no figures.
 
 The results are saved after every step, so a run that is stopped keeps the cells
 it finished. Once the allocation has ended nothing more is removed: clearing
@@ -31,7 +38,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import statistics
 import subprocess
@@ -40,7 +46,7 @@ import tempfile
 import time
 import uuid
 
-from benchmarks import cache, capacity, measurements, operations, private_sshd, run, telemetry
+from benchmarks import cache, capacity, measurements, operations, private_sshd, run, strict_json, telemetry
 from benchmarks.signals import SignalCancellation
 from benchmarks.verification import SUMMARY_POLICY
 
@@ -65,6 +71,18 @@ MAX_COPIES = 16
 # bytes kept of each command log, as its head and its tail. A worker archives at most 1 MiB of a
 # log, and its output directory holds 128 MiB for every cell together.
 LOG_LIMIT = 1024 * 1024 - 4096
+# how a copy is asked for its summary, and where its figures come from
+SUMMARY_FORMAT = "--output-format=json"
+RESOURCE_POLICY = "rcp-output-json-v1"
+# seconds a build gets to say whether it knows the option, as it gets to print its version
+PROBE_SECONDS = 10
+ROLES = ("source", "destination")
+# what a process reports about itself: the name it is recorded under, its key in rcp's summary
+# and the divisor that turns the reported unit into the recorded one
+STATISTICS = (("user_seconds", "cpu_time_user_ms", 1000), ("system_seconds", "cpu_time_kernel_ms", 1000),
+              ("max_rss_kib", "peak_rss_bytes", 1024), ("voluntary_switches", "voluntary_context_switches", None),
+              ("involuntary_switches", "involuntary_context_switches", None),
+              ("minor_faults", "minor_page_faults", None), ("major_faults", "major_page_faults", None))
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00:00")
 
 
@@ -105,7 +123,6 @@ def _arguments(argv):
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=3600,
                         help="per-command limit that only catches hangs; a slow copy must still finish")
-    parser.add_argument("--resource-time", type=Path, help="GNU time executable for per-copy CPU and memory")
     parser.add_argument("--check-capacity", action="store_true", help="require free blocks and inodes before generating")
     parser.add_argument("--system-telemetry", action="store_true", help="sample bounded host and cgroup diagnostics")
     parser.add_argument("--sshd", type=Path, help="sshd for remote cells; by default the one on PATH or in /usr/sbin")
@@ -199,28 +216,66 @@ def _remove(path, timeout):
     return "removed" if done.returncode == 0 else "failed"
 
 
-def _settle_daemons(endpoint, item, successful):
-    """Record each daemon's CPU and memory for one remote copy, then end any daemon still running.
+def _end_daemons(endpoint, item, successful):
+    """End any daemon of a remote copy that is still running, and record how many there were.
 
-    These are measuring aids and housekeeping: a failure here is not the copy's.
+    This is housekeeping: a failure here is not the copy's.
     """
     try:
-        roles = endpoint.roles(successful)
-        if roles is not None:
-            item["role_resources"] = roles
-    except InterruptedError:
-        raise
-    except OSError:
-        pass
-    try:
         # daemons of a good copy are on their way out; anything else is ended at once
-        leftover = endpoint.reap(private_sshd.ROLE_WAIT_SECONDS if successful else 0)
+        leftover = endpoint.reap(private_sshd.EXIT_SECONDS if successful else 0)
         if leftover:
             item["leftover_processes"] = leftover
     except InterruptedError:
         raise
     except OSError:
         pass
+
+
+def _reports_json(rcp):
+    """Whether this build of rcp can print its summary as JSON.
+
+    A build that knows the option goes on to print its version; an older one refuses the
+    option. Nothing is read from the command, so a stop signal is not lost in a pipe.
+    """
+    return subprocess.run([rcp, SUMMARY_FORMAT, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=PROBE_SECONDS).returncode == 0
+
+
+def _json_summary(text):
+    """The summary object that is the last line of a copy's output, or None.
+
+    Lines end at a newline only: JSON may carry other characters that look like line ends
+    inside its strings. Duplicate keys and numbers that are not finite are refused, since
+    either would leave it open which figure was meant.
+    """
+    try:
+        value = strict_json.parse_json(text.rstrip().rpartition("\n")[2])
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _figures(process):
+    """What one process reported about itself, in the units of the results.
+
+    Figures are a measuring aid: when one is missing or is not a count, the process has none.
+    Nor does it when its peak memory is zero, which no process that measured itself reports:
+    a figure that was not read is unavailable, never a zero.
+    """
+    if not isinstance(process, dict) or all(key not in process for _, key, _ in STATISTICS):
+        return dict(status="unavailable", metrics=None, error="the summary has no statistics for this process")
+    metrics = {}
+    for name, key, divisor in STATISTICS:
+        value = process.get(key)
+        if type(value) is not int or not 0 <= value < 2 ** 63:
+            return dict(status="unavailable", metrics=None, error=f"{key} is missing or is not a count")
+        metrics[name] = value if divisor is None else value / divisor if divisor == 1000 else value // divisor
+    if process["peak_rss_bytes"] == 0:
+        return dict(status="unavailable", metrics=None,
+                    error="peak_rss_bytes is zero: the process did not measure itself")
+    # the summary is printed by a process that finished its work
+    return dict(status="complete", metrics=dict(metrics, exit_code=0))
 
 
 def _bound_logs(directory):
@@ -300,11 +355,11 @@ def main(argv=None):
         tools = {name: run._tool(args.bin_dir.resolve() / name) for name in ("filegen", "rcp", "rcpd")}
         record["tools"] = tools
         paths = {name: tool["path"] for name, tool in tools.items()}
-        resource_time = None
-        if args.resource_time is not None:
-            supervisor = run._tool(args.resource_time)
-            context["local_resources"] = measurements.policy(supervisor)
-            resource_time = supervisor["path"]
+        # a build from before rcp could print its summary as JSON is timed all the same
+        reports = _reports_json(paths["rcp"])
+        context["summary_format"] = "json" if reports else "text"
+        if reports:
+            context["resources"] = dict(policy=RESOURCE_POLICY)
         context["environment"] = run.environment(args.source_root, args.destination_root)
         if args.system_telemetry:
             context["system_telemetry"] = telemetry.descriptor()
@@ -323,8 +378,8 @@ def main(argv=None):
             if allocation.limit(args.timeout) is None:
                 ended = True
             else:
-                endpoint = private_sshd.Endpoint(paths["rcpd"], log=output / "logs" / "sshd.log", sshd=args.sshd,
-                                                 ssh=args.ssh, keygen=args.ssh_keygen, resource_time=resource_time)
+                endpoint = private_sshd.Endpoint(log=output / "logs" / "sshd.log", sshd=args.sshd, ssh=args.ssh,
+                                                 keygen=args.ssh_keygen)
                 try:
                     endpoint.start()
                     context["remote"] = endpoint.descriptor()
@@ -441,9 +496,12 @@ def main(argv=None):
                 destination = destination_scratch / trial
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 commands = run.plan_commands(variant, source, destination, paths, "local")
+                if reports:
+                    # the option goes before the two operands
+                    commands = [[*command[:-2], SUMMARY_FORMAT, *command[-2:]] for command in commands]
                 restarted = False
                 if loopback:
-                    commands = [endpoint.command(command) for command in commands]
+                    commands = [endpoint.command(command, paths["rcpd"]) for command in commands]
                     try:
                         restarted = endpoint.ensure()
                     except InterruptedError:
@@ -491,23 +549,16 @@ def main(argv=None):
                 settle([cell], "interrupted", "copy", f"run stopped during copy {iteration} of {copies}")
                 save()
                 mark("command", case_index, item["trial_index"])
-                options = dict(resource_time=resource_time) if resource_time is not None else {}
-                if loopback:
-                    options["environment"] = endpoint.environment()
-                    endpoint.clear()
+                options = dict(environment=endpoint.environment()) if loopback else {}
                 try:
                     outcome = run.execute_commands(commands, output / "logs" / trial, limit[0],
                                                    stable_summary_locale=True, **options)
                 finally:
                     _bound_logs(output / "logs" / trial)
                 item.update({key: outcome[key] for key in ("elapsed_seconds", "exit_codes", "timed_out", "logs")})
-                if "resources" in outcome:
-                    item["resources"] = outcome["resources"]
-                # the copy stands on its own exit status: unreadable CPU and memory figures leave
-                # them unavailable for this copy and are not a failure of rcp
-                succeeded = outcome["ok"] or outcome.get("payload_status") == "succeeded"
+                succeeded = outcome["ok"]
                 if loopback:
-                    _settle_daemons(endpoint, item, succeeded and not outcome["timed_out"])
+                    _end_daemons(endpoint, item, succeeded)
                 if outcome["timed_out"]:
                     ended = limit[1]
                     item["status"] = "interrupted" if ended else "timed_out"
@@ -522,21 +573,39 @@ def main(argv=None):
                            if outcome["launch_error"] is not None else
                            f"copy {iteration} failed with exit " +
                            (f"code {codes[0]}" if len(codes) == 1 else f"codes {codes}") +
-                           f"; see logs/{trial}/0.stderr.log")
+                           # rcp reports what went wrong on its output; its argument parser on stderr
+                           f"; see 0.stdout.log and 0.stderr.log in logs/{trial}")
                 else:
                     mark("summary", case_index, item["trial_index"])
-                    # output is read as text with stand-ins for stray bytes: only the summary lines matter
-                    text = "\n".join(run._read(path) for entry in outcome["logs"] for path in entry.values())
-                    reported, proof = operations.summary_proof(variant, text, expected)
-                    # only the counts that the summary was checked for are recorded
-                    item["copy_summary"] = {key: reported[key] for key in ("files_copied", "files_unchanged")
-                                            if key in reported}
-                    if proof["ok"]:
-                        item["status"] = "ok"
-                    else:
+                    # output is read as text with stand-ins for stray bytes: only the summary matters
+                    text = run._read(outcome["logs"][0]["stdout"])
+                    reported = (_json_summary(text) if reports else
+                                operations.summary_proof(variant, text, expected)[0])
+                    if reported is None:
                         item["status"] = "failed"
-                        settle([cell], "failed", "summary",
-                               f"copy {iteration} reported an unexpected summary: {proof['error']}")
+                        settle([cell], "failed", "summary", f"copy {iteration} printed no JSON summary as its "
+                               f"last line of output; see logs/{trial}/0.stdout.log")
+                    else:
+                        # only the counts that the summary was checked for are recorded
+                        counts = {key: reported[key] for key in ("files_copied", "files_unchanged")
+                                  if type(reported.get(key)) is int}
+                        item["copy_summary"] = counts
+                        if reports:
+                            # the copy stands on its exit status and these counts: figures that are
+                            # missing leave CPU and memory unavailable and are not a failure of rcp
+                            item["resources"] = _figures(reported)
+                            if loopback:
+                                daemons = reported.get("remote")
+                                daemons = daemons if isinstance(daemons, dict) else {}
+                                item["role_resources"] = {role: _figures(daemons.get(role)) for role in ROLES}
+                        wrong = [f"{key} is {counts.get(key, 'missing')}; expected {expected[key]}"
+                                 for key in ("files_copied", "files_unchanged") if counts.get(key) != expected[key]]
+                        if wrong:
+                            item["status"] = "failed"
+                            settle([cell], "failed", "summary",
+                                   f"copy {iteration} reported an unexpected summary: " + "; ".join(wrong))
+                        else:
+                            item["status"] = "ok"
                 if item["status"] != "ok":
                     save()
                     free(destination, case_index, item["trial_index"])
@@ -602,7 +671,7 @@ def main(argv=None):
                 except Exception as error:
                     fail([cell], error)
                     if endpoint is not None and remote(cell):
-                        _settle_daemons(endpoint, {}, False)
+                        _end_daemons(endpoint, {}, False)
                     _bound_logs(output / "logs" / case["id"] / cell["scenario"] / str(len(cell["copies"])))
                     free(destination_scratch / case["id"] / cell["scenario"], case_index)
                 save()
