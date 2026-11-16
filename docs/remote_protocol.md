@@ -366,6 +366,10 @@ When branch admission is full, `source.directory.scan` also includes sequential 
 
 ## 2. Protocol Messages
 
+Revision-keyed [wire fixtures](../remote/tests/fixtures/README.md) check representative serialized
+payloads in both directions. They complement the protocol-state and remote integration tests; they
+do not establish semantic or daemon-spawn compatibility.
+
 ### 2.1 Handshake Messages
 
 **`MasterHello`** (Master → rcpd, bidirectional stream)

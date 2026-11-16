@@ -1887,6 +1887,7 @@ dependencies = [
  "rcp-tools-throttle",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
  "socket2",
  "strum",
