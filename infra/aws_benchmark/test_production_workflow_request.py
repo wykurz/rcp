@@ -36,7 +36,7 @@ class RequestTests(unittest.TestCase):
                                RCP_REQUESTED_REVISION="b" * 40))
 
     def test_missing_or_unknown_schedule_context_never_emits_cli_revision(self):
-        for event_schedule in (None, "", "* * * * *", "17 8 * * 2,5"):
+        for event_schedule in (None, "", "* * * * *", "17 8 * * 2,5", "17 8 * * 1,5", "17 8 * * 5"):
             with self.subTest(event_schedule=event_schedule), tempfile.TemporaryDirectory() as directory:
                 env = dict(os.environ, **environment(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true"))
                 if event_schedule is None:
@@ -75,7 +75,10 @@ class RequestTests(unittest.TestCase):
                     cwd=ROOT, env=env, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
                 self.assertEqual(result.stdout, b"")
-                self.assertEqual(output.read_text() if output.exists() else "", "revision=" + SHA + "\nsuite=bulk-1g-metadata\n" if valid else "")
+                # a manual request without a suite keeps its default; the schedule asks for the matrix
+                suite = "matrix-all-local+remote" if event == "schedule" else "bulk-1g-metadata"
+                self.assertEqual(output.read_text() if output.exists() else "",
+                                 "revision=" + SHA + "\nsuite=" + suite + "\n" if valid else "")
 
 
 if __name__ == "__main__":

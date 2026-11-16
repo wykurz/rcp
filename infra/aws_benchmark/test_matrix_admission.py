@@ -189,12 +189,19 @@ class MatrixWorkflowTests(unittest.TestCase):
     def test_a_scheduled_request_asks_for_the_one_scheduled_suite(self):
         scheduled = dict(GITHUB_EVENT_NAME="schedule", RCP_SCHEDULE_ENABLED="true",
                          RCP_EVENT_SCHEDULE=production_workflow.REGULAR_CRON)
-        self.assertEqual(production_workflow.SCHEDULED_SUITE, "bulk-1g-metadata")
+        # the weekly run is the whole matrix: every file set, locally and through rcpd
+        self.assertEqual(production_workflow.SCHEDULED_SUITE, "matrix-all-local+remote")
+        self.assertEqual(production_workflow.REGULAR_CRON, "17 8 * * 1")
         self.assertIn(production_workflow.SCHEDULED_SUITE, common.DURABLE_SUITES)
+        self.assertEqual(len(common.MATRIX_SUITES[production_workflow.SCHEDULED_SUITE]), 8)
         self.assertEqual(production_workflow.selection(self.environment(**scheduled)),
                          (SHA, production_workflow.SCHEDULED_SUITE))
-        with self.assertRaisesRegex(ValueError, "scheduled requests cannot select another file set"):
-            production_workflow.selection(self.environment(**scheduled, RCP_REQUESTED_SUITE="matrix-all-local"))
+        for other in ("matrix-all-local", "bulk-1g-metadata"):
+            with self.assertRaisesRegex(ValueError, "scheduled requests cannot select another file set"):
+                production_workflow.selection(self.environment(**scheduled, RCP_REQUESTED_SUITE=other))
+        # the retired Monday and Friday schedule is not a schedule any more
+        with self.assertRaisesRegex(ValueError, "unknown or missing scheduled event context"):
+            production_workflow.selection(self.environment(**dict(scheduled, RCP_EVENT_SCHEDULE="17 8 * * 1,5")))
 
 
 if __name__ == "__main__":

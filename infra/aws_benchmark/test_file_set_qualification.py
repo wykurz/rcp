@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-from . import common, durable, production_client, production_handler, production_policy, worker
+from . import common, durable, production_client, production_handler, production_policy, production_workflow, worker
 from .test_durable_contracts import NOW as REQUEST_TIME, bound_window, request as one_gigabyte_request
 from .test_durable_worker import direct_window, durable_window, request as worker_request
 from .test_production_admission import Cloud
@@ -221,8 +221,10 @@ class FileSetWorkflowTests(unittest.TestCase):
                  ("workflow_dispatch", "all-filesets-metadata", True, "all-filesets-metadata"),
                  ("workflow_dispatch", "unrecognized-metadata", False, None),
                  ("workflow_dispatch", "bulk-100m-metadata\nsuite=untrusted", False, None),
-                 ("schedule", "", True, OLD_SUITE),
-                 ("schedule", OLD_SUITE, True, OLD_SUITE),
+                 # the schedule asks for the whole matrix and for nothing else, the paired 1 GB run included
+                 ("schedule", "", True, production_workflow.SCHEDULED_SUITE),
+                 ("schedule", production_workflow.SCHEDULED_SUITE, True, production_workflow.SCHEDULED_SUITE),
+                 ("schedule", OLD_SUITE, False, None),
                  ("schedule", SUITE, False, None),
                  ("schedule", "bulk-1m-metadata", False, None),
                  ("schedule", "tiny-1k-metadata", False, None),
@@ -254,7 +256,7 @@ class FileSetWorkflowTests(unittest.TestCase):
         self.assertIn('--suite "$SUITE"', submit["run"])
         self.assertEqual(workflow["jobs"]["build"]["permissions"], {"contents": "read"})
         self.assertEqual(workflow["jobs"]["build"]["cache-mode"], "none")
-        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 8 * * 1,5"}])
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 8 * * 1"}])
 
     def test_client_selects_manual_suite_without_changing_the_identical_binary_pair(self):
         with tempfile.TemporaryDirectory() as directory:

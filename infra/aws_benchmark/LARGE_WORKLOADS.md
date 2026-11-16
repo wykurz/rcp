@@ -229,15 +229,16 @@ records a distinct suite/case identity; these measurements must not be pooled wi
 historical full-content scans. Only the current complete five-field cloud verification contract is
 recognized for this new suite; old 1 GB verification settings are not invented for it.
 
-This is prepared support, not live qualification or permission to spend. The Monday/Friday schedule
-still selects `bulk-1g-metadata` regardless of manual inputs. The 100 MB profile stays disabled in
-legacy 60-minute operator windows. A direct instance-bound attempt must carry its own exact
-`bulk-100m-qualification-budget-v1` plan: at least 10,200 seconds left at worker admission, with
-300-second boot and shutdown reserves. This requires the existing maximum 10,800-second allocation.
-These numbers define an **experimental fixed qualification budget**, not a measured or predicted
-completion time. The plan does not copy or scale the 1 GB-derived 3,104-second projection. Existing
-per-command timeouts, the absolute deadline, reporting reserve, single-allocation rule and cleanup
-horizon remain unchanged; insufficient startup time fails closed and no deadline is extended.
+This is prepared support, not live qualification or permission to spend. The weekly schedule asks
+for its one scheduled suite regardless of manual inputs and never selects this profile. The 100 MB
+profile stays disabled in legacy 60-minute operator windows. A direct instance-bound attempt must
+carry its own exact `bulk-100m-qualification-budget-v1` plan: at least 10,200 seconds left at worker
+admission, with 300-second boot and shutdown reserves. This requires the existing maximum
+10,800-second allocation. These numbers define an **experimental fixed qualification budget**, not a
+measured or predicted completion time. The plan does not copy or scale the 1 GB-derived 3,104-second
+projection. Existing per-command timeouts, the absolute deadline, reporting reserve,
+single-allocation rule and cleanup horizon remain unchanged; insufficient startup time fails closed
+and no deadline is extended.
 
 The production `manual_suites` policy is a separate server-owned opt-in. Its default is exactly
 `["bulk-1g-metadata"]`; an exact legacy policy payload without this field retains that same
@@ -262,9 +263,9 @@ Before a separately approved paid qualification:
    image and launch-pin update, verify exact compatibility, then restore the approved admission
    state. Keep native cleanup guards intact and do not displace a scheduled run.
 3. Approve one manual 100 MB A/A qualification, its exact runtime/budget allowance, narrowly scoped
-   `manual_suites` update and cleanup. Use a day other than Monday or Friday: the existing daily-one
-   and single-owner controls must not be bypassed to squeeze another run beside the regular suite.
-   Keep the live scheduled suite at 1 GB during this stage.
+   `manual_suites` update and cleanup. Use a day other than Monday: the existing daily-one and
+   single-owner controls must not be bypassed to squeeze another run beside the regular suite. Keep
+   the live scheduled suite unchanged during this stage.
 4. Inspect actual generation, four-copy, metadata-walk, cleanup and resource-use evidence. Record
    failures and partial output honestly. Successful completion would qualify this bounded workload;
    it would not establish broad variance, content integrity or small-file scalability.
@@ -283,8 +284,8 @@ The all-filesets-metadata profile prepares the four existing large shapes togeth
 MB and 1 KB files. They run sequentially on one worker, with one generated source and four balanced
 A/A copies per case. Each case is cleaned before the next; array preparation happens once and
 capacity is checked for every selected case. Individual 1 MB and 1 KB metadata profiles are also
-recognized, but recognition is not live authorization. Default and Monday/Friday scheduled requests
-remain 1 GB only.
+recognized, but recognition is not live authorization. A manual request without a suite remains the
+1 GB one, and a scheduled request asks for the scheduled suite only.
 
 Sizes are decimal bytes. The tiny shape is already 10,240,000 files of 1,000 bytes, totaling 10.24
 GB, compared with 1.024 TB for the 100 MB and 1 MB shapes: exactly 100 times less payload. Its
