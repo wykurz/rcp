@@ -37,7 +37,7 @@ _lint-targets:
     fi
 
 # Run all lints (formatting, clippy, policy checks, and helper behavior tests)
-lint: _lint-build _lint-targets
+lint: workflow-lint-test lint-workflows _lint-build _lint-targets
     just aws-benchmark-test
     @echo "🔍 Testing the benchmark harness..."
     just benchmark-test
@@ -90,6 +90,14 @@ lint: _lint-build _lint-targets
     @echo "🔍 Testing Docker target selection..."
     ./scripts/test-docker-target.sh
     @echo "✅ All lints passed!"
+
+# Check GitHub workflow syntax, expressions, and action usage (all workflows by default)
+lint-workflows *FILES:
+    ./scripts/check-workflows.sh "$@"
+
+# Test the workflow lint compatibility exception against the real actionlint binary
+workflow-lint-test:
+    python3 scripts/test-check-workflows.py
 
 # Format code and markdown docs
 fmt:

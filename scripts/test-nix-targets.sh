@@ -145,6 +145,7 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
     ];
 
     checkCommonDevTools = label: inputs: [
+      (isTrue "${label} includes actionlint" (hasPackage "actionlint" inputs))
       (isTrue "${label} includes depot" (hasPackage "depot" inputs))
       (isTrue "${label} includes jq" (hasPackage "jq" inputs))
     ];

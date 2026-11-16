@@ -389,9 +389,26 @@ class WorkflowTests(unittest.TestCase):
         dependencies = [states[n] for n in REFS.ancestors(self.flow["jobs"], name)]
         return REFS.Condition(job.get("if", "true"), self.values(mode, result), dependencies).result()
 
-    def steps(self, mode):
+    def steps(self, mode, event="pull_request", ref=""):
         return [s for s in self.flow["jobs"]["lint-and-docs"]["steps"]
-                if REFS.Condition(s.get("if", "true"), self.values(mode), []).result()]
+                if REFS.Condition(s.get("if", "true"),
+                                  self.values(mode, event=event, ref=ref), []).result()]
+
+    def test_workflow_lint_runs_for_every_unpinned_validation_scope(self):
+        for mode in ("docs", "version", "full"):
+            with self.subTest(mode=mode):
+                steps = self.steps(mode)
+                setup = next(s for s in steps if s.get("name") == "Install actionlint")
+                check = next(s for s in steps if s.get("name") == "Check GitHub workflows")
+                self.assertEqual(setup["uses"], "./.depot/actions/setup-actionlint")
+                self.assertEqual(check["run"], "just workflow-lint-test lint-workflows")
+                self.assertLess(steps.index(setup), steps.index(check))
+
+    def test_pinned_validation_does_not_require_workflow_lint_support(self):
+        names = {s.get("name") for s in self.steps(
+            "full", event="workflow_dispatch", ref="older-release-commit")}
+        self.assertNotIn("Install actionlint", names)
+        self.assertNotIn("Check GitHub workflows", names)
 
     def test_expensive_jobs_skip_for_docs_and_verified_versions(self):
         for name in ("msrv", "test-musl-debug", "test-musl-release", "test-docker", "build-glibc", "nix"):
