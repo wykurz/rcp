@@ -132,6 +132,14 @@ evicted or invalidated by bumping the workflow's cache version prefix. Explicitl
 calls skip cache preparation: release/publish workflows disable cache access, and their selected
 source may predate the cache attribute.
 
+The manual Depot lint job uses the same closure-only approach through Depot's native `actions/cache`
+support, with a separate `depot-nix-nextest-v1` key prefix. It imports before `just lint` and
+`just nix-targets`, and exports after both pass. Cache access, import and export failures are
+nonfatal; all validation still runs. The custom Nix output is unsigned, so this workflow trusts
+shared Depot cache writers and submitted code. The exact store-path key handles invalidation, not
+authentication or branch isolation. An unusable entry falls back to rebuilding until it is evicted
+or the key prefix changes.
+
 ### release.yml
 
 Builds, publishes binary packages, and publishes to crates.io when a tag is pushed. Triggered by

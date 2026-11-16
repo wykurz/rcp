@@ -327,14 +327,14 @@ jobs:
       run: |
         set -o pipefail
         # Run tests with nextest for better output
-        ./scripts/cargo-host.sh nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
+        ./scripts/cargo-host.sh nextest run 2>&1 | tee test_output_musl_debug.log
 
     - name: Test directory operations on Btrfs (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
         set -o pipefail
-        just test-btrfs --no-capture 2>&1 | tee -a test_output_musl_debug.log
+        just test-btrfs 2>&1 | tee -a test_output_musl_debug.log
 
     - name: Test sudo-required and isolated mount tests (musl debug)
       env:
@@ -409,7 +409,7 @@ jobs:
       run: |
         set -o pipefail
         # Run tests with nextest in release mode
-        ./scripts/cargo-host.sh nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
+        ./scripts/cargo-host.sh nextest run --release 2>&1 | tee test_output_musl_release.log
 
     - name: Test sudo-required tests (musl release)
       env:

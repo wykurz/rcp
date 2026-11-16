@@ -46,6 +46,12 @@ Parallel in-process libtest is unsupported for these fixtures. The standard `jus
 `just ci` paths use nextest; the Nix libtest check phase keeps `--test-threads=1` for the same
 contract. Do not add broad serialization for unrelated tests.
 
+Ordinary GitHub and Depot suites use nextest's default output capture, which preserves failure
+diagnostics and allows the concurrency configured in `.config/nextest.toml`. With CI's pinned
+nextest 0.9.85, `--no-capture` forces one test at a time even when `test-threads` is set. Reserve it
+for debugging individual tests or deliberately serial invocations. GitHub's separate privileged test
+invocations keep `--no-capture` and their existing serial execution.
+
 ```bash
 # Default profile (debug tests)
 ./scripts/cargo-host.sh nextest run
