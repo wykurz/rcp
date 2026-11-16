@@ -2,6 +2,26 @@
 
 This directory contains GitHub Actions workflows for the RCP Tools project.
 
+## Workflow lint
+
+`just lint-workflows` runs actionlint over every `.yml` and `.yaml` workflow in this directory,
+including manual and release workflows. It checks syntax, expression types and allowed contexts, job
+dependencies, and known action/reusable workflow inputs. Pass workflow paths to check selected
+files. `just lint` runs the wrapper's regression fixtures and this check before the Rust lints;
+GitHub's existing lint/docs job and Depot lint also run them. Documentation/version-only PRs keep
+this cheap check. Explicitly pinned validation sources skip the new GitHub steps because older
+releases can predate the helper and installer.
+
+`nix develop` supplies actionlint; the shared CI installer pins the same version, currently 1.7.12,
+and verifies its archive checksum. ShellCheck and Pyflakes are disabled so this remains a core
+workflow check independent of optional tools on the host.
+
+Version 1.7.12 does not recognize GitHub's valid workflow/job `cache-mode` key. The wrapper ignores
+only that unknown-key diagnostic; other syntax errors and invalid expression contexts still fail.
+Until upstream supports the key, actionlint cannot validate its values. Existing cache policy tests
+remain in place, and `just workflow-lint-test` checks this exception against the real binary. Remove
+the exception when upgrading to a release with native `cache-mode` support.
+
 ## Security conventions
 
 These rules keep fork PRs unable to reach secrets or the release pipeline. Changing any of them is a

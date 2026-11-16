@@ -356,6 +356,7 @@
                 pkgs.rust-analyzer
 
                 # Development tools from the original default.nix
+                pkgs.actionlint
                 pkgs.binutils
                 pkgs.cargo-bloat
                 pkgs.cargo-deny

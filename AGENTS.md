@@ -29,14 +29,15 @@ nix develop  # automatically includes just and all dev tools
 
 **Without nix:**
 
-Install `jq` and the Python PyYAML package (often named `python3-yaml`) with your system package
-manager, and install the report dependencies from `scripts/report-site-requirements.txt` in your
-Python environment. Offline AWS safety tests additionally require the pinned SDK and
-JWT/cryptography closure in `infra/aws_benchmark/production-requirements.txt` (CPython 3.12 or 3.14,
-Linux x86_64), or the dependencies provided by `nix develop`. These tests do not call AWS. The
-report and AWS dependencies are required by `just lint`, and so is OpenSSH (`sshd`, `ssh` and
-`ssh-keygen`): the benchmark harness tests start a private, unprivileged `sshd` on loopback. Then
-install the remaining tools:
+Install [actionlint 1.7.12](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md), `jq`,
+and the Python PyYAML package (often named `python3-yaml`) with your system package manager, and
+install the report dependencies from `scripts/report-site-requirements.txt` in your Python
+environment. Offline AWS safety tests additionally require the pinned SDK and JWT/cryptography
+closure in `infra/aws_benchmark/production-requirements.txt` (CPython 3.12 or 3.14, Linux x86_64),
+or the dependencies provided by `nix develop`. These tests do not call AWS. The report and AWS
+dependencies are required by `just lint`, and so is OpenSSH (`sshd`, `ssh` and `ssh-keygen`): the
+benchmark harness tests start a private, unprivileged `sshd` on loopback. Then install the remaining
+tools:
 
 ```bash
 ./scripts/cargo-install-host.sh just
@@ -48,6 +49,7 @@ install the remaining tools:
 
 - `just` or `just --list` — list all available commands
 - `just lint` — run lints (fmt, clippy, and the repo's CI check scripts)
+- `just lint-workflows` — check GitHub workflow syntax, expressions, and action usage
 - `just fmt` — format code
 - `just test` — run tests in debug mode
 - `just test-release` — run tests in release mode

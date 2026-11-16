@@ -100,6 +100,15 @@ jobs:
       with:
         tool: just
 
+    # pinned release sources can predate this helper and its local installer
+    - name: Install actionlint
+      if: inputs.ref == ''
+      uses: ./.depot/actions/setup-actionlint
+
+    - name: Check GitHub workflows
+      if: inputs.ref == ''
+      run: just workflow-lint-test lint-workflows
+
     - name: Format
       if: needs.scope.outputs.mode == 'full'
       run: ./scripts/cargo-host.sh fmt --check

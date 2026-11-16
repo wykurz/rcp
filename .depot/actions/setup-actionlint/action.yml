@@ -1,0 +1,21 @@
+name: Install actionlint
+description: Install the pinned GitHub workflow validator on Linux x86_64 CI runners
+
+# shared by GitHub and Depot; Depot remaps local .github action paths to .depot
+runs:
+  using: composite
+  steps:
+  - name: Install actionlint
+    shell: bash
+    run: |
+      if [[ "$RUNNER_OS" != Linux || "$RUNNER_ARCH" != X64 ]]; then
+        echo "actionlint installation requires a Linux x86_64 runner" >&2
+        exit 1
+      fi
+      actionlint_dir=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")
+      curl -fsSL --retry 3 -o "$actionlint_dir/actionlint.tar.gz" \
+        https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+      echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $actionlint_dir/actionlint.tar.gz" | sha256sum -c -
+      tar -xzf "$actionlint_dir/actionlint.tar.gz" -C "$actionlint_dir" actionlint
+      "$actionlint_dir/actionlint" -version
+      echo "$actionlint_dir" >> "$GITHUB_PATH"
