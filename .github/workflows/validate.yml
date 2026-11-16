@@ -491,8 +491,6 @@ jobs:
     needs: scope
     if: needs.scope.outputs.mode == 'full'
     runs-on: ubuntu-latest
-    env:
-      NIX_NEXTEST_CACHE: ${{ runner.temp }}/nix-nextest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -509,6 +507,7 @@ jobs:
         nextest_path=$(nix eval --raw --no-update-lock-file .#devShells.x86_64-linux.default.cargoNextest.outPath)
         echo "path=$nextest_path" >> "$GITHUB_OUTPUT"
         echo "key=nix-nextest-v1-${nextest_path##*/}" >> "$GITHUB_OUTPUT"
+        echo "NIX_NEXTEST_CACHE=$RUNNER_TEMP/nix-nextest" >> "$GITHUB_ENV"
 
     - name: Cache Nix nextest closure
       id: nextest-cache
