@@ -42,6 +42,8 @@ pub struct ProtocolVersion {
 /// argument change whenever the crate version does not also change. The crate version alone cannot
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
+/// Fixed payload tests live in `remote/tests/wire_compatibility.rs`; see the fixture README
+/// there when changing serialized layouts. They do not cover the spawn contract.
 /// Revision 12 adds context switch and page fault counts to the statistics in `RcpdResult`.
 pub const WIRE_REVISION: u32 = 12;
 

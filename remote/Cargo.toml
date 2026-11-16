@@ -51,3 +51,6 @@ tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tokio-rustls = "0.26"
 tokio-util = "0.7"
 tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1.0"
