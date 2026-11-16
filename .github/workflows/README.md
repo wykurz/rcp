@@ -98,6 +98,20 @@ diffs, mixed code/documentation changes and unverified version changes retain fu
 pushes and release/tag or explicitly pinned validation calls also retain full coverage. This
 exemption does not change release publication or its checks.
 
+For full validation, Rust and Nix jobs start as soon as scope classification succeeds, alongside
+lint/docs. This removes the lint wait from the test/build critical path; a lint failure can spend
+extra runner time, but still fails the required check.
+
+The Nix job caches the customized `cargo-nextest` runtime closure in GitHub Actions cache. Its key
+uses the dev shell's actual nextest store path, so tool/input changes invalidate it while ordinary
+source changes reuse it. The archive contains only that closure, not the whole Nix store. Cache
+misses or failed imports fall back to the normal build, and every Nix validation step still runs.
+Successful jobs save the archive; main pushes seed the default-branch cache for other PRs. PR caches
+remain scoped to their own merge ref under GitHub's cache rules. An unusable exact-key entry can be
+evicted or invalidated by bumping the workflow's cache version prefix. Explicitly pinned validation
+calls skip cache preparation: release/publish workflows disable cache access, and their selected
+source may predate the cache attribute.
+
 ### release.yml
 
 Builds, publishes binary packages, and publishes to crates.io when a tag is pushed. Triggered by

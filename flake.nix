@@ -399,7 +399,10 @@
 
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/src";
 
-            passthru.cargoTarget = platform.cargoTarget;
+            passthru = {
+              cargoTarget = platform.cargoTarget;
+              inherit cargoNextest;
+            };
 
             shellHook = platform.cargoTargetShellHook + ''
               echo "RCP development environment"

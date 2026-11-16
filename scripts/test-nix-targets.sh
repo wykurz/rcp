@@ -161,6 +161,10 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
       in
         [
           (equals "${label} Cargo target default" target (shell.cargoTarget or null))
+          (equals "${label} cache exposes the shell nextest output"
+            (toString (singleInputMatching label "cargo-nextest"
+              (input: (input.pname or "") == "cargo-nextest") shell.buildInputs))
+            (toString (shell.cargoNextest or "")))
           (isTrue "${label} does not unconditionally export Cargo target"
             (!(builtins.hasAttr "CARGO_BUILD_TARGET" shell)))
           (equals "${label} target-specific C environment"

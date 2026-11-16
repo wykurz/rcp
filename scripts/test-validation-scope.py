@@ -381,14 +381,11 @@ class WorkflowTests(unittest.TestCase):
         values = REFS.WorkflowContext({"github.event_name": event, "inputs.ref": ref,
                                        "needs.scope.result": result,
                                        "needs.scope.outputs.mode": mode})
-        outputs = self.flow["jobs"]["lint-and-docs"].get("outputs", {})
-        values["needs.lint-and-docs.outputs.mode"] = REFS.expression(
-            outputs.get("mode", ""), values)
         return values
 
-    def job_runs(self, name, mode, result="success"):
+    def job_runs(self, name, mode, result="success", lint_result="success"):
         job = self.flow["jobs"][name]
-        states = {"scope": result, "lint-and-docs": "success"}
+        states = {"scope": result, "lint-and-docs": lint_result}
         dependencies = [states[n] for n in REFS.ancestors(self.flow["jobs"], name)]
         return REFS.Condition(job.get("if", "true"), self.values(mode, result), dependencies).result()
 
@@ -402,6 +399,45 @@ class WorkflowTests(unittest.TestCase):
                 self.assertFalse(self.job_runs(name, "docs"))
                 self.assertFalse(self.job_runs(name, "version"))
                 self.assertTrue(self.job_runs(name, "full"))
+
+    def test_full_validation_starts_without_waiting_for_lint(self):
+        for name in ("msrv", "test-musl-debug", "test-musl-release", "test-docker", "build-glibc", "nix"):
+            for lint_result in ("queued", "in_progress", "failure"):
+                with self.subTest(job=name, lint=lint_result):
+                    self.assertTrue(self.job_runs(name, "full", lint_result=lint_result))
+
+    def test_expensive_jobs_do_not_run_when_scope_fails(self):
+        for name in ("msrv", "test-musl-debug", "test-musl-release", "test-docker", "build-glibc", "nix"):
+            for result in ("failure", "cancelled", "skipped"):
+                with self.subTest(job=name, scope=result):
+                    self.assertFalse(self.job_runs(name, "full", result=result))
+
+    def test_pinned_validation_does_not_require_optional_nix_cache_support(self):
+        values = self.values(event="workflow_dispatch", ref="older-release-commit")
+        steps = [s for s in self.flow["jobs"]["nix"]["steps"]
+                 if REFS.Condition(s.get("if", "true"), values, []).result()]
+        self.assertEqual({s.get("name") for s in steps if "name" in s}, {
+            "Install Nix", "Test Nix target selection",
+            "Flake check (evaluate supported systems)",
+            "Build the full suite with Nix sandbox test selection", "Build the dev shell",
+        })
+
+    def test_nix_cache_hit_imports_and_miss_exports_without_skipping_validation(self):
+        for event in ("pull_request", "push"):
+            for hit in ("true", "false", ""):
+                with self.subTest(event=event, hit=hit):
+                    values = self.values(event=event)
+                    values["steps.nextest.outputs.path"] = "/nix/store/current-nextest"
+                    values["steps.nextest-cache.outputs.cache-hit"] = hit
+                    names = {s.get("name") for s in self.flow["jobs"]["nix"]["steps"]
+                             if REFS.Condition(s.get("if", "true"), values, []).result()}
+                    self.assertEqual("Import cached Nix nextest" in names, hit == "true")
+                    self.assertEqual("Export Nix nextest closure" in names, hit != "true")
+                    self.assertLessEqual({"Identify Nix nextest output", "Cache Nix nextest closure",
+                                          "Test Nix target selection",
+                                          "Flake check (evaluate supported systems)",
+                                          "Build the full suite with Nix sandbox test selection",
+                                          "Build the dev shell"}, names)
 
     def test_lint_keeps_lightweight_checks_and_skips_builds(self):
         steps = self.steps("docs")
