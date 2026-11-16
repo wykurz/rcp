@@ -17,9 +17,11 @@ REPOSITORY_ID = "655073755"
 WORKFLOW = "wykurz/rcp/.github/workflows/aws-benchmark-production.yml@refs/heads/main"
 
 
-REGULAR_CRON = "17 8 * * 1,5"
-# the file set a scheduled run asks for; the server admits it only if its policy names the same one
-SCHEDULED_SUITE = "bulk-1g-metadata"
+# one weekly slot: Monday 08:17 UTC
+REGULAR_CRON = "17 8 * * 1"
+# the suite a scheduled run asks for, the whole matrix: every file set, locally and through rcpd.
+# The server admits it only if its policy names the same suite and approves its eight-hour runtime
+SCHEDULED_SUITE = "matrix-all-local+remote"
 
 
 def source(environment):

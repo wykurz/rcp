@@ -3,8 +3,8 @@ name: AWS production benchmark
 # Initially inert. Proposed cadence is not authority: both repository gates and server slots/budgets must be approved.
 on:
   schedule:
-    # two-slot UTC cadence; no job runs until the separate schedule gate is true
-    - cron: '17 8 * * 1,5'
+    # weekly, Monday 08:17 UTC; no job runs until the separate schedule gate is true
+    - cron: '17 8 * * 1'
   workflow_dispatch:
     inputs:
       mode:

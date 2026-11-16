@@ -626,8 +626,8 @@ References:
 
 ### Recurring orchestration
 
-The benchmark cron is Monday and Friday at 08:17 UTC. It does not select approved operating slots or
-authorize spending by being present in YAML. Scheduled builds need both
+The benchmark cron is Monday at 08:17 UTC, once a week. It does not select approved operating slots
+or authorize spending by being present in YAML. Scheduled builds need both
 `RCP_AWS_PRODUCTION_ENABLED=true` and `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED=true`, owner actor ID
 `483465`, main and attempt 1. The early credential-free CLI rejects other events, actors, refs, runs
 and caller-selected scheduled revisions. A scheduled build uses the triggering main SHA once for
@@ -651,8 +651,8 @@ for a new month or to make an attempt fit. The development ceiling does not esta
 monthly operating allowance. Price evidence still expires after 31 days. No controller or workflow
 gets automatic policy-edit or credential-refresh authority.
 
-The separate keyless reporting workflow declares a daily 09:43 UTC poll and a Tuesday/Saturday 03:43
-UTC post-drain refresh behind `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and the independent
+The separate keyless reporting workflow declares a daily 09:43 UTC poll and a Tuesday 03:43 UTC
+post-drain refresh behind `RCP_AWS_PRODUCTION_PUBLISH_ENABLED` and the independent
 `RCP_AWS_PRODUCTION_PUBLISH_SCHEDULE_ENABLED=true`. It reads retained frozen reports and never
 launches work. Main-only owner identity, exact artifact/inventory bindings and complete-scan
 requirements still apply. Its `reader-test` remains manual-only. Read-only schedule activation and
@@ -661,11 +661,12 @@ recurring benchmarks. No history writer key or per-report environment approval i
 
 A scheduled submission job can finish many hours before the cloud collector retires ownership. The
 reporting scans revisit retained runs rather than treating the submit job conclusion as workload
-completion. The Tuesday/Saturday refresh follows the regular Monday/Friday 08:17 UTC slot, even with
-the maximum one-hour normal-policy lateness, two-hour accepted workflow age, 12-hour capacity
-search, three-hour allocation and 15-minute drain, plus more than an hour for collection. This is a
-reporting opportunity, not a promise that recovery has completed: outages can leave a pending/held
-observation, and the daily poll or an existing manual publish refresh can observe later progress.
+completion. The Tuesday refresh follows the regular Monday 08:17 UTC slot, even with the maximum
+one-hour policy lateness, two-hour accepted workflow age, the two-hour capacity search of the
+eight-hour plan, the eight-hour allocation and 15-minute drain, plus more than an hour for
+collection. This is a reporting opportunity, not a promise that recovery has completed: outages can
+leave a pending/held observation, and the daily poll or an existing manual publish refresh can
+observe later progress.
 
 Before retirement, the snapshot and Actions summary also show an allowlisted controller-recorded
 worker outcome, safe close category, fixed deadlines and cleanup stage. A recorded worker success is
@@ -920,10 +921,10 @@ reservation from the selected immutable contract; a price above that reservation
 Before any live attempt, review the rebuilt worker, startup/hash/launch bindings and exact
 instance-only runtime-profile tag permission. The tag carries a bounded runtime profile, not
 authority to ignore the ledger, one-worker rule or budget. Guest and independent expiry guards
-remain required. Select a non-Monday/Friday day with the full reconciliation and cleanup window
-clear of the next regular slot, authenticate with sufficient recovery coverage, and retain the same
-durable one-shot journal through dispatch, collection and retirement. Restoring the experimental
-opt-in requires an operator write; it has no automatic expiry.
+remain required. Select a day with the full reconciliation and cleanup window clear of the regular
+Monday slot, authenticate with sufficient recovery coverage, and retain the same durable one-shot
+journal through dispatch, collection and retirement. Restoring the experimental opt-in requires an
+operator write; it has no automatic expiry.
 
 The original ASG-era RuntimeRole source is retired with deny-only trust and a single explicit
 DenyAll permission policy. Applying that source is a separate targeted legacy-stack operation: never
@@ -935,9 +936,8 @@ New extended admissions also require a canonical UTC `extended_manual_not_after`
 service rejects missing or expired windows before reading App-backed run proof and rechecks the
 final immutable request creation time. The deadline limits new reservations; it does not cancel an
 already admitted run or move its capacity/runtime deadlines. Expired temporary policy remains
-readable and regular scheduled 1 GB admission is unchanged. Preserve the admitted policy version
-through upload, sealing and retirement; restoring the opt-in with a new version fences stale
-requests.
+readable and regular scheduled admission is unchanged. Preserve the admitted policy version through
+upload, sealing and retirement; restoring the opt-in with a new version fences stale requests.
 
 Derive the expiry from authenticated recovery coverage before dispatch. The native 10h15m horizon
 starts at the retained request creation time, after workflow build/queue delays. Include cleanup and
@@ -999,26 +999,35 @@ manual requesters. The three `matrix-all-…` suites need what every eight-hour 
 requester. A plan with a runtime profile runs for exactly that profile's time, so no other extended
 runtime is accepted.
 
-### Schedule it
+### The weekly schedule
 
-Two server policy fields decide what a scheduled run may be:
+The scheduled run is the whole matrix. On a schedule event, Monday at 08:17 UTC, the workflow asks
+for `production_workflow.SCHEDULED_SUITE`, which is `matrix-all-local+remote`: every file set,
+copied locally and through `rcpd`. The paired 1 GB run is no longer scheduled. The matrix's first
+cell copies the same file set, and its point continues that file set's trend line;
+`bulk-1g-metadata` remains a suite that can be started by hand while the policy lists it.
 
-- `scheduled_suite` (default `bulk-1g-metadata`) names the one suite a scheduled request may ask
-  for.
-- `scheduled_runtime_seconds` (default 0) separately approves the eight-hour runtime for a scheduled
-  suite whose plan needs it. It is rejected when the scheduled suite has an ordinary plan.
+The server admits a scheduled request only when its policy agrees, in three fields:
 
-A policy stored before these fields existed loads unchanged and keeps scheduling the 1 GB run; a
-payload that names only one of the two fields is not a recorded shape and is refused. A scheduled
-eight-hour run is still owner-only, needs a matching schedule slot and is bounded by the daily,
-monthly and total allowances. It has no expiry, because it recurs by design. Neither field lets
-anyone start the suite by hand, and the manual opt-in never stands in for the scheduled one.
+- `scheduled_suite` names the one suite a scheduled request may ask for: `matrix-all-local+remote`.
+  A policy stored before the field existed keeps its default, `bulk-1g-metadata`.
+- `scheduled_runtime_seconds` separately approves the eight-hour runtime that the suite's plan
+  needs: `28800`. It is rejected when the scheduled suite has an ordinary plan.
+- `schedule_slots` holds the slot `[0, 8, 17]`: weekday 0 is Monday.
 
-On a schedule event the workflow asks for `production_workflow.SCHEDULED_SUITE`. The server refuses
-a request whose suite differs from its policy before any reservation, so the two cannot drift
-silently. Moving the schedule to the matrix therefore takes a reviewed source change (the
-`SCHEDULED_SUITE` constant, the cron line and `REGULAR_CRON`) and a new policy version that names
-the same suite, its slot and its runtime.
+A payload that names only one of the first two fields is not a recorded shape and is refused. A
+scheduled eight-hour run is still owner-only, needs its matching slot and is bounded by the daily,
+monthly and total allowances; it reserves the fixed $50. It has no expiry, because it recurs by
+design. Neither field lets anyone start the suite by hand, and the manual opt-in never stands in for
+the scheduled one.
+
+The server refuses a request whose suite differs from its policy before any reservation, so source
+and policy cannot drift silently: under a policy that still names the 1 GB run, a scheduled matrix
+request costs nothing and runs nothing. Changing what is scheduled therefore takes both a reviewed
+source change (the `SCHEDULED_SUITE` constant, the cron line and `REGULAR_CRON`) and a new policy
+version that names the same suite, its slot and its runtime. The policy change needs no image, no
+package and no stack update. Keep `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED` off between the two, so that
+a slot in between is skipped instead of refused.
 
 ### How a run qualifies
 
@@ -1080,8 +1089,9 @@ Use the [cutover sequence](#bind-admission-to-a-deployment-during-cutover): betw
 and with no active owner, close admission; switch the server packages, the rebuilt worker image, the
 launch-template version and the pins as one step; verify them; then reopen with a new policy version
 bound to the new pins. That policy version names in `manual_suites` the matrix suites to test, with
-the extended manual window when the full matrix is among them. The scheduled 1 GB run keeps working
-on the new image.
+the extended manual window when the full matrix is among them. Scheduled requests are admitted once
+the policy also names the scheduled suite, its runtime and its slot
+([The weekly schedule](#the-weekly-schedule)).
 
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
@@ -1101,8 +1111,8 @@ and its repeat from these numbers.
    a new priced plan, and measuring local and remote cells in separate runs (`matrix-all-local`,
    `matrix-all-remote`). By hand that works as it is; on a schedule it does not, because a schedule
    names exactly one suite. Either way it is a further reviewed change.
-3. The same suite once more, to see that two runs agree.
-4. The schedule change above.
+3. The same suite once more, to see that two runs agree. The weekly scheduled run can be that
+   repeat: it is the same suite.
 
 ### Find the evidence of a run
 
