@@ -29,10 +29,39 @@ jobs:
       with:
         aws-benchmark-tests: "true"
     - uses: ./.depot/actions/setup-actionlint
+    - name: Identify Nix nextest output
+      id: nextest
+      run: |
+        nextest_path=$(nix eval --raw --no-update-lock-file .#devShells.x86_64-linux.default.cargoNextest.outPath)
+        echo "path=$nextest_path" >> "$GITHUB_OUTPUT"
+        echo "key=depot-nix-nextest-v1-${nextest_path##*/}" >> "$GITHUB_OUTPUT"
+        echo "NIX_NEXTEST_CACHE=$RUNNER_TEMP/nix-nextest" >> "$GITHUB_ENV"
+    - name: Cache Nix nextest closure
+      id: nextest-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      continue-on-error: true
+      with:
+        path: ${{ env.NIX_NEXTEST_CACHE }}
+        key: ${{ steps.nextest.outputs.key }}
+    - name: Import cached Nix nextest
+      if: steps.nextest-cache.outputs.cache-hit == 'true'
+      env:
+        NEXTEST_PATH: ${{ steps.nextest.outputs.path }}
+      run: |
+        # Unsigned output trusts this manual workflow's shared Depot cache writers.
+        if ! nix copy --no-check-sigs --from "file://$NIX_NEXTEST_CACHE" "$NEXTEST_PATH"; then
+          echo "::warning::Nix nextest cache could not be imported; building normally"
+        fi
     - name: Run lints
       run: just lint
     - name: Verify Nix build targets
       run: just nix-targets
+    - name: Export Nix nextest closure
+      if: steps.nextest-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      env:
+        NEXTEST_PATH: ${{ steps.nextest.outputs.path }}
+      run: nix copy --to "file://$NIX_NEXTEST_CACHE" "$NEXTEST_PATH"
 
   doc:
     name: Documentation

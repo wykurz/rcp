@@ -514,5 +514,56 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(output.read_text(), "mode=full\n")
 
 
+class DepotWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.flow = REFS.workflow(ROOT / ".depot/workflows/ci.yml")
+        self.job = self.flow["jobs"]["lint"]
+
+    def test_shared_cache_stays_in_manual_validation(self):
+        self.assertEqual(set(self.flow["on"]), {"workflow_dispatch"})
+        self.assertEqual(self.flow["permissions"], {"contents": "read"})
+
+    def test_cache_hit_miss_and_restore_failure_keep_all_checks(self):
+        for hit in ("true", "false", ""):
+            with self.subTest(hit=hit):
+                values = REFS.WorkflowContext({"steps.nextest.outputs.path": "/nix/store/current-nextest",
+                                               "steps.nextest-cache.outputs.cache-hit": hit})
+                steps = [s for s in self.job["steps"]
+                         if REFS.Condition(s.get("if", "true"), values, []).result()]
+                names = [s.get("name") for s in steps]
+                self.assertIn("Identify Nix nextest output", names)
+                self.assertIn("Cache Nix nextest closure", names)
+                self.assertIn("Run lints", names)
+                self.assertIn("Verify Nix build targets", names)
+                self.assertEqual("Import cached Nix nextest" in names, hit == "true")
+                self.assertEqual("Export Nix nextest closure" in names, hit != "true")
+                restore = next(s for s in steps if s.get("name") == "Cache Nix nextest closure")
+                self.assertEqual(restore["continue-on-error"], "true")
+                self.assertNotIn("restore-keys", restore["with"])
+                self.assertLess(names.index("Cache Nix nextest closure"), names.index("Run lints"))
+                if hit == "true":
+                    self.assertLess(names.index("Import cached Nix nextest"), names.index("Run lints"))
+                else:
+                    export = next(s for s in steps if s.get("name") == "Export Nix nextest closure")
+                    self.assertEqual(export["continue-on-error"], "true")
+                    for check in ("Run lints", "Verify Nix build targets"):
+                        self.assertLess(names.index(check), names.index("Export Nix nextest closure"))
+
+    def test_damaged_archive_warns_and_allows_normal_build(self):
+        step = next((s for s in self.job["steps"] if s.get("name") == "Import cached Nix nextest"), None)
+        self.assertIsNotNone(step, "Depot needs a best-effort cache import")
+        with tempfile.TemporaryDirectory(prefix="rcp-depot-cache-") as temporary:
+            nix = Path(temporary) / "nix"
+            nix.write_text("#!/bin/sh\necho 'archive unavailable' >&2\nexit 1\n")
+            nix.chmod(0o755)
+            env = dict(os.environ, PATH=temporary + os.pathsep + os.environ["PATH"],
+                       NEXTEST_PATH="/nix/store/current-nextest", NIX_NEXTEST_CACHE=temporary)
+            run = subprocess.run(REFS.shell_command(self.flow, self.job, step), input=step["run"],
+                                 text=True, capture_output=True, env=env)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("archive unavailable", run.stderr)
+            self.assertIn("::warning::", run.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
