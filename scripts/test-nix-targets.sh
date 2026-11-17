@@ -23,8 +23,9 @@ export RCP_NIX_VERSION_TEST_ROOT="$VERSION_ROOT"
 RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
   let
     root = builtins.toPath (builtins.getEnv "RCP_NIX_TEST_ROOT");
+    # source checks need tracked files, not the commit count unavailable in shallow CI checkouts.
     flakeRef = if builtins.pathExists (root + "/.git")
-      then "git+file:${toString root}" else "path:${toString root}";
+      then "git+file:${toString root}?shallow=1" else "path:${toString root}";
     flake = builtins.getFlake flakeRef;
     manifestVersion = (builtins.fromTOML (builtins.readFile (root + "/Cargo.toml")))
       .workspace.package.version;
