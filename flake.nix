@@ -18,12 +18,21 @@
       "aarch64-linux"
     ] (system:
       let
-        workspaceVersion =
-          (builtins.fromTOML (builtins.readFile (self.outPath + "/Cargo.toml")))
-          .workspace.package.version;
+        workspaceManifest = builtins.fromTOML (builtins.readFile (self.outPath + "/Cargo.toml"));
+        workspaceVersion = workspaceManifest.workspace.package.version;
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
+        };
+
+        # keep complete crate trees for build scripts, cross-crate includes and test fixtures.
+        # unrelated repository tooling and documentation should not invalidate packages.
+        packageSource = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions (
+            [ ./Cargo.toml ./Cargo.lock ./.cargo ./README.md ./LICENSE.md ./rust-toolchain.toml ]
+            ++ map (member: ./. + "/${member}") workspaceManifest.workspace.members
+          );
         };
 
         targetPlatform = import ./nix/target-platform.nix {
@@ -322,7 +331,7 @@
           packageRustPlatform.buildRustPackage {
             pname = binaryName;
             version = workspaceVersion;
-            src = ./.;
+            src = packageSource;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -470,7 +479,7 @@
           rcp-all = packageRustPlatform.buildRustPackage {
             pname = "rcp-all";
             version = workspaceVersion;
-            src = ./.;
+            src = packageSource;
 
             cargoLock = {
               lockFile = ./Cargo.lock;

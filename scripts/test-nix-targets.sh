@@ -23,7 +23,9 @@ export RCP_NIX_VERSION_TEST_ROOT="$VERSION_ROOT"
 RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
   let
     root = builtins.toPath (builtins.getEnv "RCP_NIX_TEST_ROOT");
-    flake = builtins.getFlake (builtins.getEnv "RCP_NIX_TEST_ROOT");
+    flakeRef = if builtins.pathExists (root + "/.git")
+      then "git+file:${toString root}" else "path:${toString root}";
+    flake = builtins.getFlake flakeRef;
     manifestVersion = (builtins.fromTOML (builtins.readFile (root + "/Cargo.toml")))
       .workspace.package.version;
     versionedOutputs = (import (root + "/flake.nix")).outputs (flake.inputs // {
@@ -55,6 +57,35 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
     equals = label: expected: actual:
       if actual == expected then true else fail label expected actual;
     isTrue = label: actual: equals label true actual;
+
+    packageSource = flake.packages.x86_64-linux.rcp-all.src;
+    workspaceMembers = (builtins.fromTOML
+      (builtins.readFile (flake.outPath + "/Cargo.toml"))).workspace.members;
+    filesIn = path:
+      let entries = builtins.readDir path;
+      in builtins.concatMap
+        (name:
+          if entries.${name} == "directory" then
+            map (child: "${name}/${child}") (filesIn (path + "/${name}"))
+          else [ name ])
+        (builtins.attrNames entries);
+    requiredSourceFiles = [
+      "Cargo.toml" "Cargo.lock" "README.md" "LICENSE.md" "rust-toolchain.toml"
+    ] ++ builtins.concatMap
+      (directory: map (file: "${directory}/${file}")
+        (filesIn (flake.outPath + "/${directory}")))
+      ([ ".cargo" ] ++ workspaceMembers);
+    sourceChecks =
+      map
+        (path: equals "package source excludes ${path}" false
+          (builtins.pathExists (packageSource + "/${path}")))
+        [ "AGENTS.md" ".depot" ".github" "docs" "scripts" "target" "flake.nix" ]
+      ++ map
+        (path: isTrue "package source preserves ${path}"
+          (builtins.pathExists (packageSource + "/${path}")
+            && builtins.hashFile "sha256" (packageSource + "/${path}")
+              == builtins.hashFile "sha256" (flake.outPath + "/${path}")))
+        requiredSourceFiles;
 
     nameOf = input: input.name or input.pname or "";
     namesOf = inputs: map nameOf inputs;
@@ -191,6 +222,8 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
         compilerProviders = compilerProviderNamesOf package.nativeBuildInputs;
       in
         [
+          (equals "${label} shares the filtered workspace source"
+            (toString packageSource) (toString package.src))
           (equals "${label} follows the workspace version" manifestVersion package.version)
           (equals "${label} follows a changed workspace version" "999.0.0-metadata-test"
             versionedOutputs.packages.${system}.${packageName}.version)
@@ -291,7 +324,8 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
       ++ map checkMappingTarget (builtins.attrNames expectedTargets)
       ++ builtins.concatMap checkPackageAbiSmoke supportedSystems
       ++ builtins.concatMap checkUnsupportedSystem unsupportedSystems
-      ++ legacyChecks;
+      ++ legacyChecks
+      ++ sourceChecks;
   in
     builtins.deepSeq checks "Nix target behavior tests passed\n"
 '

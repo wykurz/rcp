@@ -217,6 +217,7 @@ impl DockerEnv {
     }
 
     /// Read a file from a container
+    #[allow(dead_code, reason = "used by a subset of Docker test binaries")]
     pub fn read_file(&self, container: &str, path: &str) -> Result<Vec<u8>> {
         let container_name = format!("rcp-test-{}", container);
         let output = Command::new("docker")
@@ -233,6 +234,7 @@ impl DockerEnv {
     }
 
     /// Check if a file exists in a container
+    #[allow(dead_code, reason = "used by a subset of Docker test binaries")]
     pub fn file_exists(&self, container: &str, path: &str) -> Result<bool> {
         let container_name = format!("rcp-test-{}", container);
         let output = Command::new("docker")
@@ -242,6 +244,7 @@ impl DockerEnv {
     }
 
     /// Remove a file from a container
+    #[allow(dead_code, reason = "used by a subset of Docker test binaries")]
     pub fn remove_file(&self, container: &str, path: &str) -> Result<()> {
         let container_name = format!("rcp-test-{}", container);
         Command::new("docker")
@@ -868,49 +871,5 @@ impl DockerEnv {
             .into());
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "requires Docker containers to be running"]
-    fn test_docker_env_creation() {
-        let env = DockerEnv::new();
-        assert!(env.is_ok(), "Failed to create Docker environment");
-    }
-
-    #[test]
-    #[ignore = "requires Docker containers to be running"]
-    fn test_file_operations() {
-        let env = DockerEnv::new().expect("Failed to create environment");
-        // use unique filename to avoid collisions with other test binaries
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let test_file = format!("/tmp/test-write-{}.txt", timestamp);
-        // write a file
-        env.write_file("host-a", &test_file, b"test content")
-            .expect("Failed to write file");
-        // check it exists
-        assert!(
-            env.file_exists("host-a", &test_file)
-                .expect("Failed to check file"),
-            "File should exist"
-        );
-        // read it back
-        let content = env
-            .read_file("host-a", &test_file)
-            .expect("Failed to read file");
-        assert!(
-            String::from_utf8_lossy(&content).contains("test content"),
-            "Content mismatch"
-        );
-        // clean up
-        env.remove_file("host-a", &test_file)
-            .expect("Failed to remove file");
     }
 }

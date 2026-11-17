@@ -348,6 +348,7 @@ The Docker environment supports automated integration tests in:
 
 ### `tests/docker_multi_host.rs`
 
+- Docker environment setup and container file helper round trips
 - Basic multi-host file copy
 - Overwrite protection behavior
 - Directory copying (with cleanup before/after to prevent hangs)
