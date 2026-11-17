@@ -74,23 +74,22 @@ jobs:
       run: just doc
 
   test:
-    name: Tests (debug, ${{ matrix.runner }}, shard ${{ matrix.shard }}/2)
+    name: Tests (debug, ${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
         runner:
-        - depot-ubuntu-24.04-16
-        - depot-ubuntu-24.04-arm-16
-        shard: [1, 2]
+        - depot-ubuntu-24.04-8
+        - depot-ubuntu-24.04-arm-8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Install Nix for native Arm package ABI smoke
-      if: runner.arch == 'ARM64' && matrix.shard == 1
+      if: runner.arch == 'ARM64'
       uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
     - name: Verify native Arm Nix package ABI smoke
-      if: runner.arch == 'ARM64' && matrix.shard == 1
+      if: runner.arch == 'ARM64'
       run: nix build --no-update-lock-file .#checks.aarch64-linux.package-abi-smoke
     - uses: ./.depot/actions/rcp-rust-setup
       with:
@@ -100,7 +99,7 @@ jobs:
     - name: Build debug test binaries
       run: just test --no-run
     - name: Run nextest (debug)
-      run: just test --partition count:${{ matrix.shard }}/2
+      run: just test
 
   doctest:
     name: Doctests (debug)
@@ -148,8 +147,8 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-        - depot-ubuntu-24.04-16
-        - depot-ubuntu-24.04-arm-16
+        - depot-ubuntu-24.04-8
+        - depot-ubuntu-24.04-arm-8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

@@ -352,8 +352,7 @@ The Docker environment supports automated integration tests in:
 - Overwrite protection behavior
 - Directory copying (with cleanup before/after to prevent hangs)
 - Error handling for missing files
-
-**Note**: The verbose logging test is disabled because docker exec doesn't capture stderr.
+- Verbose role-assignment logging captured from stderr
 
 ### `tests/docker_multi_host_role_ordering.rs`
 

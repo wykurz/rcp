@@ -672,26 +672,25 @@ def has_run_shell_default(owner):
     return isinstance(run_defaults, dict) and "shell" in run_defaults
 
 
-def contains_value(value, expected):
+def contains_arm_runner(value):
     if isinstance(value, dict):
-        return any(contains_value(child, expected) for child in value.values())
+        return any(contains_arm_runner(child) for child in value.values())
     if isinstance(value, list):
-        return any(contains_value(child, expected) for child in value)
-    return value == expected
+        return any(contains_arm_runner(child) for child in value)
+    return isinstance(value, str) and re.fullmatch(r"depot-ubuntu-24\.04-arm-\d+", value)
 
 
 with open(sys.argv[1], encoding="utf-8") as workflow_file:
     workflow = yaml.safe_load(workflow_file)
 
 jobs = workflow.get("jobs") or {}
-arm_runner = "depot-ubuntu-24.04-arm-16"
 arm_jobs = {"test", "docker-test"}
 for job_name, job in jobs.items():
     if not isinstance(job, dict) or job_name in arm_jobs:
         continue
     strategy = job.get("strategy")
     matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
-    if contains_value(job.get("runs-on"), arm_runner) or contains_value(matrix, arm_runner):
+    if contains_arm_runner(job.get("runs-on")) or contains_arm_runner(matrix):
         reject(
             "Depot Arm64 runner appears outside test and docker-test "
             f"in job {job_name}"
@@ -717,8 +716,8 @@ for matrix_job_name in ("test", "docker-test"):
     if isinstance(matrix, dict) and "exclude" in matrix:
         reject(f"Depot {matrix_job_name} runner matrix must not use exclude")
     expected_runners = [
-        "depot-ubuntu-24.04-16",
-        "depot-ubuntu-24.04-arm-16",
+        "depot-ubuntu-24.04-8",
+        "depot-ubuntu-24.04-arm-8",
     ]
     if not isinstance(matrix, dict) or "runner" not in matrix:
         reject(f"Depot {matrix_job_name} runner matrix must declare a runner axis")
@@ -753,9 +752,9 @@ if not re.fullmatch(
     str(installer.get("uses", "")),
 ):
     reject("Depot test Arm Nix smoke installer is not pinned")
-arm_condition = "runner.arch == 'ARM64' && matrix.shard == 1"
+arm_condition = "runner.arch == 'ARM64'"
 if installer.get("if") != arm_condition:
-    reject("Depot test Arm Nix smoke installer condition must be runner.arch ARM64 on shard 1")
+    reject("Depot test Arm Nix smoke installer condition must be runner.arch ARM64")
 if installer.get("continue-on-error") not in (None, False):
     reject("Depot test Arm Nix smoke installer must gate the job")
 
@@ -776,7 +775,7 @@ if str(smoke.get("run", "")).strip() != expected_command:
 if "shell" in smoke:
     reject("Depot test Arm Nix smoke build must not override its shell")
 if smoke.get("if") != arm_condition:
-    reject("Depot test Arm Nix smoke build condition must be runner.arch ARM64 on shard 1")
+    reject("Depot test Arm Nix smoke build condition must be runner.arch ARM64")
 if smoke.get("continue-on-error") not in (None, False):
     reject("Depot test Arm Nix smoke build must gate the job")
 if installer_index >= smoke_index:
@@ -801,20 +800,21 @@ for job_name in ("test", "test-release"):
     for key in ("include", "exclude"):
         if isinstance(matrix, dict) and key in matrix:
             reject(f"Depot {job_name} runner matrix must not use {key}")
-    shards = matrix.get("shard") if isinstance(matrix, dict) else None
-    if shards != [1, 2] or any(type(shard) is not int for shard in shards):
-        reject(f"Depot {job_name} shard matrix must contain exactly [1, 2]")
-    expected_axes = {"runner", "shard"} if job_name == "test" else {"shard"}
-    if set(matrix) != expected_axes:
-        reject(f"Depot {job_name} shard matrix has unexpected axes")
+    if job_name == "test-release":
+        shards = matrix.get("shard") if isinstance(matrix, dict) else None
+        if shards != [1, 2] or any(type(shard) is not int for shard in shards):
+            reject(f"Depot {job_name} shard matrix must contain exactly [1, 2]")
+    expected_axes = {"runner"} if job_name == "test" else {"shard"}
+    if not isinstance(matrix, dict) or set(matrix) != expected_axes:
+        reject(f"Depot {job_name} matrix has unexpected axes")
     if strategy.get("fail-fast") is not False:
-        reject(f"Depot {job_name} shards must disable fail-fast")
+        reject(f"Depot {job_name} matrix must disable fail-fast")
     if "if" in job:
         reject(f"Depot {job_name} job must not be conditional")
     if job.get("continue-on-error") not in (None, False):
-        reject(f"Depot {job_name} job must gate shard failures")
+        reject(f"Depot {job_name} job must gate test failures")
     if has_run_shell_default(workflow) or has_run_shell_default(job):
-        reject(f"Depot {job_name} shard commands must not inherit a custom shell")
+        reject(f"Depot {job_name} commands must not inherit a custom shell")
     steps = job.get("steps")
     if not isinstance(steps, list):
         steps = []
@@ -827,17 +827,19 @@ for job_name in ("test", "test-release"):
             for line in str(step.get("run", "")).splitlines()
         )
     ]
-    expected_commands = [
-        f"{recipe} --no-run",
-        recipe + " --partition count:${{ matrix.shard }}/" + str(len(shards)),
-    ]
+    run_command = recipe
+    coverage = "complete suite"
+    if job_name == "test-release":
+        run_command += " --partition count:${{ matrix.shard }}/" + str(len(shards))
+        coverage = "assigned count shard"
+    expected_commands = [f"{recipe} --no-run", run_command]
     if [str(step["run"]).strip() for step in just_steps] != expected_commands:
-        reject(f"Depot {job_name} must build then run exactly its assigned count shard")
+        reject(f"Depot {job_name} must build then run exactly its {coverage}")
     for step in just_steps:
         if "if" in step or step.get("continue-on-error") not in (None, False):
-            reject(f"Depot {job_name} shard commands must run unconditionally and gate failures")
+            reject(f"Depot {job_name} commands must run unconditionally and gate failures")
         if "shell" in step:
-            reject(f"Depot {job_name} shard commands must not override their shell")
+            reject(f"Depot {job_name} commands must not override their shell")
 PYTHON
     )
     status=$?

@@ -14,19 +14,41 @@ for required_command in depot git jq; do
     fi
 done
 
-jobs=("$@")
-run_args=(ci run --workflow .depot/workflows/ci.yml)
-for job in "${jobs[@]}"; do
-    if [[ "$job" == -* ]]; then
-        echo "depot-ci: unsupported option: $job; provide CI job names only" >&2
-        exit 2
+temporary_files=()
+trap 'rm -f -- "${temporary_files[@]}"' EXIT
+
+workflow=.depot/workflows/ci.yml
+if [[ "$1" == --test ]]; then
+    shift
+    jobs=(test)
+    workflow=.depot/workflows/test.yml
+    if [[ "$#" -gt 0 ]]; then
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo "depot-ci: focused test arguments require python3 and PyYAML; enter nix develop" >&2
+            exit 127
+        fi
+        # depot discovers the source repository from the workflow's location
+        workflow="$(mktemp .depot/.focused-test.XXXXXX.yml)"
+        temporary_files+=("$workflow")
+        python3 ./scripts/depot-test-workflow.py "$@" >"$workflow"
     fi
+else
+    jobs=("$@")
+    for job in "${jobs[@]}"; do
+        if [[ "$job" == -* ]]; then
+            echo "depot-ci: unsupported option: $job; provide CI job names or --test followed by test arguments" >&2
+            exit 2
+        fi
+    done
+fi
+run_args=(ci run --workflow "$workflow")
+for job in "${jobs[@]}"; do
     run_args+=(--job "$job")
 done
 
 untracked_files=()
 untracked_list="$(mktemp)"
-trap 'rm -f "$untracked_list"' EXIT
+temporary_files+=("$untracked_list")
 set +e
 git ls-files --others --exclude-standard -z >"$untracked_list"
 untracked_status=$?
@@ -41,7 +63,6 @@ while IFS= read -r -d '' path; do
     fi
 done <"$untracked_list"
 rm -f "$untracked_list"
-trap - EXIT
 if [[ "${#untracked_files[@]}" -gt 0 ]]; then
     echo "depot-ci: warning: ordinary untracked files are excluded from Depot's uploaded patch:" >&2
     printf '  %s\n' "${untracked_files[@]}" >&2
