@@ -5,14 +5,12 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-#[path = "support/fixtures.rs"]
-mod fixtures;
-#[path = "support/remote_command.rs"]
+#[path = "../support/remote_command.rs"]
 mod remote_command;
-#[path = "support/remote_log.rs"]
+#[path = "../support/remote_log.rs"]
 mod remote_log;
 
-use fixtures::{create_test_file, get_file_content, setup_test_env};
+use crate::fixtures::{create_test_file, get_file_content, setup_test_env};
 use remote_command::{
     print_command_output, run_rcp_with_args, run_rcp_without_force_remote, shell_quote_for_test,
 };

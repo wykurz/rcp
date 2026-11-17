@@ -1,6 +1,6 @@
 //! Parser contracts do not need SSH and also run in the Nix build sandbox.
 
-#[path = "support/summary.rs"]
+#[path = "../support/summary.rs"]
 mod summary;
 
 fn output(stdout: &str) -> std::process::Output {

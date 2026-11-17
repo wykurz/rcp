@@ -387,8 +387,8 @@
                 # `getfacl`/`setfacl`, for reading a POSIX ACL by hand when debugging the ACL
                 # tests. The fixtures write xattrs directly and do not invoke these tools.
                 pkgs.acl
-                # strace tests in rcp/tests/acls.rs check opt-in ACL probe costs; those in
-                # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
+                # strace tests in rcp/tests/cli/acls.rs check opt-in ACL probe costs; those in
+                # rcp/tests/cli/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
                 # native `just test` runs fail without it; copied bytes cannot prove either.
                 pkgs.strace
                 # `sshd`, `ssh` and `ssh-keygen`: the benchmark harness tests start a private,
