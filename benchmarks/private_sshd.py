@@ -300,6 +300,14 @@ class Endpoint:
         key = " ".join((directory / "host_key.pub").read_text().split()[:2])
         (directory / "known_hosts").write_text(f"[{ADDRESS}]:{self.port} {key}\n")
 
+    def _logged(self, start):
+        """Say what sshd has written to its log since `start`: its last lines, on the one line of an error."""
+        with self.log.open("rb") as log:
+            end = log.seek(0, os.SEEK_END)
+            log.seek(max(start, end - 65536))
+            lines = [line.strip() for line in log.read().decode(errors="replace").splitlines() if line.strip()]
+        return "; sshd logged: " + " | ".join(line[:200] for line in lines[-3:]) if lines else "; sshd logged nothing"
+
     def _launch(self):
         """Start sshd and wait for a login to work; False when its port was taken meanwhile."""
         config = str(self.directory / "sshd_config")
@@ -335,7 +343,9 @@ class Endpoint:
                     # the connection worked and the account refused the command: waiting cannot help
                     raise EndpointError(f"the private sshd accepted a connection but the login failed: {last}")
             if time.monotonic() >= deadline:
-                raise EndpointError(f"the private sshd did not accept a login within {READY_SECONDS:g} s: {last}")
+                # the client can only say that nothing answered: whether sshd saw it come is in sshd's log
+                raise EndpointError(f"the private sshd did not accept a login within {READY_SECONDS:g} s: {last}" +
+                                    self._logged(written))
             time.sleep(.1)
         with self.log.open("rb") as log:
             log.seek(written)

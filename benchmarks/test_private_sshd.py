@@ -48,7 +48,12 @@ if os.environ.get("FAKE_SSHD") == "busy-once" and count == 1:
 (state / "sshd.pid").write_text(str(os.getpid()))
 # a login works only while this file says that something listens on the port
 (state / ("listening-" + port)).write_text(str(os.getpid()))
-print("Server listening on 127.0.0.1 port " + port + ".", file=sys.stderr, flush=True)
+if os.environ.get("FAKE_SSHD") != "silent":
+    print("Server listening on 127.0.0.1 port " + port + ".", file=sys.stderr, flush=True)
+if os.environ.get("FAKE_SSHD") == "chatty":
+    for index in range(1, 6):
+        print("Connection from 127.0.0.1 port " + str(50000 + index) + " on 127.0.0.1 port " + port + " rdomain \"\"",
+              file=sys.stderr, flush=True)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 try:
     while True:
@@ -300,6 +305,34 @@ class EndpointTests(unittest.TestCase):
             endpoint.start()
         self.assertLess(time.monotonic() - started, 10)
         self.assertIsNone(endpoint.directory)
+
+    def test_a_login_that_never_comes_is_reported_with_what_sshd_logged_meanwhile(self):
+        # the client only says that nothing answered; whether sshd saw the connections is in its own log
+        cases = ((None, r"; sshd logged: Server listening on 127\.0\.0\.1 port \d+\.$"),
+                 ("chatty", r"; sshd logged: Connection from 127\.0\.0\.1 port 50003 on 127\.0\.0\.1 port \d+ "
+                            r"rdomain \"\" \| Connection from 127\.0\.0\.1 port 50004 on [^|]+ \| Connection from "
+                            r"127\.0\.0\.1 port 50005 on [^|]+$"),
+                 ("silent", r"Connection refused; sshd logged nothing$"))
+        for behaviour, ending in cases:
+            with self.subTest(sshd=behaviour):
+                endpoint = self.endpoint()
+                environment = {"FAKE_SSH": "refused"} | ({} if behaviour is None else {"FAKE_SSHD": behaviour})
+                with mock.patch.dict(os.environ, environment), mock.patch.object(private_sshd, "READY_SECONDS", .5), \
+                        self.assertRaises(private_sshd.EndpointError) as failed:
+                    endpoint.start()
+                message = str(failed.exception)
+                self.assertTrue(message.startswith("the private sshd did not accept a login within 0.5 s: "), message)
+                self.assertRegex(message, ending)
+                # one line: the reason of a cell that was not measured is a single line too
+                self.assertNotIn("\n", message)
+
+    def test_what_sshd_logged_before_this_start_is_not_reported(self):
+        endpoint = self.endpoint()
+        (self.root / "sshd.log").write_text("an earlier listener's last words\n")
+        with mock.patch.dict(os.environ, {"FAKE_SSH": "refused", "FAKE_SSHD": "silent"}), \
+                mock.patch.object(private_sshd, "READY_SECONDS", .5), \
+                self.assertRaisesRegex(private_sshd.EndpointError, "; sshd logged nothing$"):
+            endpoint.start()
 
     def test_a_configuration_sshd_rejects_fails_setup(self):
         with mock.patch.dict(os.environ, {"FAKE_SSHD": "badconfig"}), \
