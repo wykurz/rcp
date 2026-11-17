@@ -109,9 +109,16 @@ class ProductionPolicyTests(unittest.TestCase):
     def test_future_run_and_price_or_stale_price_fail_closed(self):
         with self.assertRaises(ValueError):
             WorkflowRun.verify(run_json(created_at=(NOW + timedelta(seconds=1)).isoformat()), identity(), NOW)
-        for at in (NOW + timedelta(seconds=1), NOW - timedelta(days=32)):
+        for at in (NOW + timedelta(seconds=1), NOW - timedelta(days=401)):
             with self.subTest(at=at), self.assertRaises(ValueError):
                 self.authorize(policy(priced_at=at.isoformat()))
+
+    def test_price_evidence_is_accepted_for_four_hundred_days_and_no_longer(self):
+        for age in (timedelta(days=32), timedelta(days=400)):
+            with self.subTest(age=age):
+                self.authorize(policy(priced_at=(NOW - age).isoformat()))
+        with self.assertRaisesRegex(ValueError, "price evidence is stale"):
+            self.authorize(policy(priced_at=(NOW - timedelta(days=400, seconds=1)).isoformat()))
 
     def test_caller_quote_and_extra_manifest_fields_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "fields"):

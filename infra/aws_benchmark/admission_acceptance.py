@@ -18,7 +18,7 @@ from .common import BINARIES, ValidationError, error_code, require, timestamp
 from .durable_aws import Configuration
 from .production_admission import Admission, epoch_for, run_key
 from .production_handler import read_policy
-from .production_policy import Policy, WorkflowRun, canonical
+from .production_policy import MAX_PRICE_AGE_SECONDS, Policy, WorkflowRun, canonical
 from .production_store import ReconciliationRequired
 
 FIXTURE_SOURCE = "92829601e1a4d806465a9c393a7411de7309b78b"
@@ -80,7 +80,8 @@ def fixture_items(phase, now):
     elif phase == "disabled-policy":
         items["policy"] = policy_item(replace(policy, enabled=False))
     elif phase == "stale-price":
-        items["policy"] = policy_item(replace(policy, priced_at=timestamp(now - timedelta(days=32))))
+        items["policy"] = policy_item(replace(
+            policy, priced_at=timestamp(now - timedelta(seconds=MAX_PRICE_AGE_SECONDS + 1))))
     elif phase == "policy-fence":
         items["policy"] = policy_item(replace(policy, version="fixture-2"))
     return items
