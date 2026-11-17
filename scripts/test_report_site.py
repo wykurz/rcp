@@ -294,6 +294,33 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('<title>Run 123-1 · AWS benchmarks · RCP Tools</title>', detail)
         self.assert_site_links_resolve()
 
+    def test_a_page_with_side_navigation_is_as_wide_as_its_header_and_benchmark_pages_are_centred(self):
+        import re
+        assets = Path(__file__).with_name('report-site')
+        report, aws = ((assets / name).read_text() for name in ('report.css', 'aws.css'))
+        rule = lambda style, selector: style[style.index(selector + ' {'):].split('}', 1)[0]
+        # one width for the header and for the navigation with the content under it, so that the logo stands
+        # above the navigation; the landing page loads neither stylesheet and keeps its narrower header
+        self.assertIn('--page-width: 1444px', rule(report, ':root'))
+        self.assertIn('width: min(var(--page-width), calc(100% - 2 * var(--site-gutter)))', rule(report, '.site-header'))
+        layout = rule(report, '.page-layout')
+        self.assertIn('max-width: calc(var(--page-width) + 2 * var(--site-gutter))', layout)
+        self.assertIn('grid-template-columns: var(--navigation-width) minmax(0, 1fr)', layout)
+        self.assertIn('gap: var(--navigation-gap)', layout)
+        self.assertNotIn('report.css', (assets / 'landing.html').read_text())
+        # a benchmark page leaves on the right what the navigation takes on the left: its content is centred
+        self.assertIn('max-width: calc(var(--page-width) - 2 * (var(--navigation-width) + var(--navigation-gap)))',
+                      rule(aws, '.page-layout > main'))
+        # only the benchmark pages do: a report keeps the whole width for its tables and figures
+        self.assertNotIn('main {', re.sub(r'^main \{ min-width: 0; \}$', '', report, flags=re.M))
+        result = self.build_retained(self.retained_batch([self.aws_record()]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        styles = lambda page: [Path(attrs['href']).name for tag, attrs in Elements((self.output / page).read_text()).tags
+                               if tag == 'link' and attrs.get('rel') == 'stylesheet']
+        self.assertEqual(styles('aws-benchmarks/index.html'), ['site.css', 'report.css', 'aws.css'])
+        self.assertEqual(styles('reports/index.html'), ['site.css', 'report.css'])
+        self.assertEqual(styles('index.html'), ['site.css', 'landing.css'])
+
     def test_central_setup_page_obeys_the_public_html_bound(self):
         from unittest.mock import patch
         import report_site

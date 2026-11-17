@@ -1,4 +1,7 @@
 /* AWS benchmark pages: report typography plus stat tiles, charts, badges and key facts */
+/* a benchmark page leaves on the right what the navigation and its gap take on the left, so that its text, plots
+   and tables stand in the middle of the window; a narrower window gives up that margin before the content */
+.page-layout > main { max-width: calc(var(--page-width) - 2 * (var(--navigation-width) + var(--navigation-gap))); }
 :root { --series: #cd5969; --chart-grid: #232326; }
 :root[data-theme="light"] { --series: #9b1c31; --chart-grid: #e8e8ec; }
 

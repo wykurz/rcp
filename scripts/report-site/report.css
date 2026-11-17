@@ -1,6 +1,10 @@
 body { line-height: 1.7; }
-/* leave room for wide tables and figures below the shared, narrower header */
-.page-layout { display: grid; grid-template-columns: 215px minmax(0, 1fr); gap: 3rem; max-width: 1540px; margin: 0 auto; padding: 2.8rem var(--site-gutter) 4rem; }
+/* a page with a side navigation leaves room for wide tables and figures, so it is wider than the landing page.
+   Its header is as wide as the page: the logo stands above the navigation and the header's links end where the
+   content can */
+:root { --page-width: 1444px; --navigation-width: 215px; --navigation-gap: 3rem; }
+.site-header { width: min(var(--page-width), calc(100% - 2 * var(--site-gutter))); }
+.page-layout { display: grid; grid-template-columns: var(--navigation-width) minmax(0, 1fr); gap: var(--navigation-gap); max-width: calc(var(--page-width) + 2 * var(--site-gutter)); margin: 0 auto; padding: 2.8rem var(--site-gutter) 4rem; }
 .contents { position: sticky; top: 1.5rem; align-self: start; max-height: calc(100vh - 3rem); overflow-y: auto; font-size: .82rem; line-height: 1.5; padding-right: .7rem; }
 .contents summary { font-weight: 700; cursor: pointer; padding-bottom: .7rem; }
 .contents ul { margin: 0; padding: 0; list-style: none; }
