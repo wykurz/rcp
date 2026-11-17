@@ -25,6 +25,10 @@ jobs:
         install-nextest: "true"
         install-test-deps: "true"
         localhost-ssh: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Run selected debug tests
       run: |
         python3 - <<'PY'

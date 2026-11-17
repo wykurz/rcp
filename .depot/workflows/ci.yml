@@ -25,6 +25,10 @@ jobs:
       with:
         install-dprint: "true"
         install-openssh: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - uses: ./.depot/actions/setup-report-python
       with:
         aws-benchmark-tests: "true"
@@ -70,6 +74,10 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Build documentation
       run: just doc
 
@@ -96,6 +104,10 @@ jobs:
         install-nextest: "true"
         install-test-deps: "true"
         localhost-ssh: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Build debug test binaries
       run: just test --no-run
     - name: Run nextest (debug)
@@ -108,6 +120,10 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Run debug doctests
       run: just doctest
 
@@ -126,6 +142,10 @@ jobs:
         install-nextest: "true"
         install-test-deps: "true"
         localhost-ssh: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Build release test binaries
       run: just test-release --no-run
     - name: Run nextest (release)
@@ -138,6 +158,10 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: ./.depot/actions/rcp-rust-setup
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Run release doctests
       run: just doctest-release
 
@@ -156,6 +180,10 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Build binaries and start Docker containers
       run: just docker-up
     - name: Run Docker integration tests
@@ -176,6 +204,10 @@ jobs:
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
+    - name: Cache Rust build outputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-on-failure: "true"
     - name: Build binaries and start Docker containers
       run: just docker-up
     - name: Run Docker chaos tests

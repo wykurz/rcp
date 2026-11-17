@@ -473,6 +473,7 @@ The wrapper target is for the runnable host-side test binary. The container payl
 
 **Basic multi-host operations** (`docker_multi_host.rs`):
 
+- Docker environment setup and container file helper round trips
 - File copying between separate hosts
 - Directory copying with cleanup
 - Overwrite protection behavior
@@ -597,10 +598,10 @@ The `.github/workflows/validate.yml` workflow runs:
 - Always cleans up containers (even on failure)
 
 Both Docker recipes compile only the `rcp-tools-rcp` package's `docker_*` integration targets. They
-include every Docker target, including the shared helper tests compiled into the chaos binaries.
-Regular tests use `not test(~chaos)`; the separate chaos workflow uses `test(~chaos)`, so these
-selections together cover all Docker cases. Docker tests are ignored in ordinary nextest runs and
-explicitly enabled by the Docker recipes.
+include every Docker target. Shared environment and file helper tests run once in
+`docker_multi_host.rs`. Regular tests use `not test(~chaos)`; the separate chaos workflow uses
+`test(~chaos)`, so these selections together cover all Docker cases. Docker tests are ignored in
+ordinary nextest runs and explicitly enabled by the Docker recipes.
 
 Regular Docker tests run before submission in `just depot-ci` and during GitHub validation. Chaos
 tests run automatically on pushes to `main` in `.github/workflows/chaos-tests.yml`, as well as on

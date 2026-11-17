@@ -35,6 +35,8 @@ runs:
   - name: Setup Rust
     uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
     with:
+      # Depot does not run rust-cache's save hook inside this composite; workflows cache directly.
+      cache: "false"
       components: rustfmt, clippy
       target: ${{ steps.architecture.outputs.rust_target }}
 

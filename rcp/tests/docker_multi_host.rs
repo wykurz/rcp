@@ -20,6 +20,45 @@ mod support;
 
 use support::docker_env::{DockerEnv, Result};
 
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn creates_docker_environment() {
+    let env = DockerEnv::new();
+    assert!(env.is_ok(), "Failed to create Docker environment");
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn round_trips_container_file() {
+    let env = DockerEnv::new().expect("Failed to create environment");
+    // use unique filename to avoid collisions with other test binaries
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_file = format!("/tmp/test-write-{}.txt", timestamp);
+    // write a file
+    env.write_file("host-a", &test_file, b"test content")
+        .expect("Failed to write file");
+    // check it exists
+    assert!(
+        env.file_exists("host-a", &test_file)
+            .expect("Failed to check file"),
+        "File should exist"
+    );
+    // read it back
+    let content = env
+        .read_file("host-a", &test_file)
+        .expect("Failed to read file");
+    assert!(
+        String::from_utf8_lossy(&content).contains("test content"),
+        "Content mismatch"
+    );
+    // clean up
+    env.remove_file("host-a", &test_file)
+        .expect("Failed to remove file");
+}
+
 /// Test basic file copy between two remote hosts
 #[test]
 #[ignore = "requires Docker containers (run: just docker-up)"]
