@@ -21,6 +21,51 @@
 .aws .metric .delta, .aws .metric .gap { margin: .1rem 0 0; color: var(--muted); font-size: .8rem; line-height: 1.5; }
 .aws .metric .gap { margin-top: .5rem; }
 
+/* a remote copy has five tiles: its duration, then CPU time and memory for each rcpd. They stand in a column per
+   measure, the destination under the source, so that the two processes are compared at a glance; a tile is placed
+   by its position among the five */
+.aws .metrics.processes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.aws .metrics.processes > :nth-child(1) { grid-area: 1 / 1; }
+.aws .metrics.processes > :nth-child(2) { grid-area: 1 / 2; }
+.aws .metrics.processes > :nth-child(3) { grid-area: 2 / 2; }
+.aws .metrics.processes > :nth-child(4) { grid-area: 1 / 3; }
+.aws .metrics.processes > :nth-child(5) { grid-area: 2 / 3; }
+@media (max-width: 1230px) {
+  /* room for two columns: duration first, then CPU time beside memory */
+  .aws .metrics.processes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .aws .metrics.processes > :nth-child(2) { grid-area: 2 / 1; }
+  .aws .metrics.processes > :nth-child(3) { grid-area: 3 / 1; }
+  .aws .metrics.processes > :nth-child(4) { grid-area: 2 / 2; }
+  .aws .metrics.processes > :nth-child(5) { grid-area: 3 / 2; }
+}
+@media (max-width: 640px) {
+  .aws .metrics.processes { grid-template-columns: minmax(0, 1fr); }
+  .aws .metrics.processes > :nth-child(n) { grid-area: auto; }
+}
+
+/* the first page: a row of duration tiles for each kind of copy, and a column for each file set;
+   a row's title shares its line with the link to that kind's page, so that both rows fit one screen */
+.aws .overview-title { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .1rem 1.5rem; margin: 1.7rem 0 0; padding-top: 1rem; border-top: 1px solid var(--border); }
+.aws .overview-title h2 { margin: 0; padding: 0; border: 0; font-size: 1.3rem; }
+.aws .overview-title a { font-size: .9rem; }
+.aws .overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .8rem; margin: .7rem 0 .4rem; }
+/* a tile is as tall as the tallest of its row; its plot sits at the bottom, level with its neighbours' */
+.aws .overview .metric { display: flex; flex-direction: column; max-width: none; padding: .8rem .85rem .6rem; }
+.aws .overview .metric .chart { margin-top: auto; padding-top: .7rem; }
+.aws .overview .metric h3 { font-size: .85rem; }
+.aws .overview .metric h3 a { color: var(--text); text-decoration: none; }
+.aws .overview .metric h3 a:hover { color: var(--link); text-decoration: underline; }
+.aws .overview .metric .value { font-size: 1.45rem; }
+/* a plot is drawn for a quarter of a wide page; with fewer columns the row is capped so that it does not grow huge */
+@media (max-width: 1280px) {
+  .aws .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .aws .overview-title, .aws .overview { max-width: 660px; }
+}
+@media (max-width: 470px) {
+  .aws .overview { grid-template-columns: minmax(0, 1fr); }
+  .aws .overview-title, .aws .overview { max-width: 340px; }
+}
+
 .aws .chart { display: block; width: 100%; height: auto; margin-top: .7rem; }
 .chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .chart .grid { stroke: var(--chart-grid); stroke-width: 1; }

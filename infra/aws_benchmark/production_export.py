@@ -209,7 +209,8 @@ def render(value, *, diagnostics=None):
         html += ("<h3>" + history.CASES[case] + (" · " + history.SCENARIOS[scenario] if several else "") +
             "</h3><p>This run as one history point: the median of the "
             "copies made by the build under test" + (", counting every copy because baseline and candidate "
-            "binaries are identical" if item["pooled"] else "") + ".</p><div class='metrics'>")
+            "binaries are identical" if item["pooled"] else "") + ".</p><div class='" +
+            history.layout(scenario) + "'>")
         for metric, title, unit in history.panels(scenario):
             data = item[metric]
             html += "<div class='metric'><h4>" + title + "</h4>" + (

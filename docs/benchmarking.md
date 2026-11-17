@@ -232,17 +232,19 @@ fingerprint of the malformed resource bytes. Failed execution requires `unavaila
 `execution_failed`, regardless of resource-file contents. Both supervisor and child use `LC_ALL=C`
 and `LANG=C`.
 
-The AWS retained-report site opens on the performance history: duration, CPU and memory plots for
-each file set that has qualified runs. The trend follows the build under test with rcp's default
-settings. Each point is one qualified run and summarizes its copies: when the run's baseline and
-candidate binaries are identical every copy counts, otherwise only the candidate's copies do. A
-point shows the median copy wall time (a single contributing measurement keeps its frozen median),
-the median of user plus system CPU seconds **computed per copy**, and the median per-copy peak RSS
-converted from KiB to MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are
-command-scope statistics, not total host CPU or simultaneous process-tree memory; repetitions are
-not summed. The x-axis is the benchmark start recorded by the worker before fixture preparation, not
-collection or retirement time. The value axis is fitted to the data and is never narrower than 5%
-either side of its centre.
+The AWS retained-report site opens on the copy duration of every file set: one small plot each, in a
+row for local copies and, once a run has a remote cell, a row for remote copies over loopback. Each
+row leads to a page with the duration, CPU and memory plots and the data tables of that kind of
+copy. The trend follows the build under test with rcp's default settings. Each point is one
+qualified run and summarizes its copies: when the run's baseline and candidate binaries are
+identical every copy counts, otherwise only the candidate's copies do. A point shows the median copy
+wall time (a single contributing measurement keeps its frozen median), the median of user plus
+system CPU seconds **computed per copy**, and the median per-copy peak RSS converted from KiB to
+MiB. Whiskers are repeat minima/maxima, not confidence intervals. These are command-scope
+statistics, not total host CPU or simultaneous process-tree memory; repetitions are not summed. The
+x-axis is the benchmark start recorded by the worker before fixture preparation, not collection or
+retirement time. The value axis is fitted to the data and is never narrower than 5% either side of
+its centre.
 
 Runs of a file set are joined in time order across code versions, harness revisions, frozen series
 IDs and machine instances. A new line starts only when the measurement contract changes or a
@@ -257,8 +259,8 @@ The plots cover still-retained 90-day records, not permanent history. A bounded 
 newest 32 qualified runs; an oversized page shortens the window further. The omitted count stays
 visible and every run stays in the list. The machine, storage, datasets and method are described
 once on the test setup page, where the values the runs recorded are merged into one table; each run
-page keeps its own observed setup as a collapsed appendix. Local copies and any future loopback
-remote measurements require distinct validated contracts.
+page keeps its own observed setup as a collapsed appendix. Local copies and remote copies over
+loopback are separate scenarios of a run: each has its own measurements, frozen series and trends.
 
 Either option records phase costs: fixture generation and initial verification on the run;
 preparation (including cache preparation but excluding result persistence), verification and

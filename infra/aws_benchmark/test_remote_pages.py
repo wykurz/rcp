@@ -1,5 +1,6 @@
 """Remote copies have a page of their own: one trend per file set, and each daemon's resources."""
 
+import re
 import unittest
 from unittest import mock
 
@@ -98,7 +99,11 @@ class RemoteHistoryTests(unittest.TestCase):
 
     def test_the_reading_notes_describe_remote_copies_only_once_there_is_a_remote_page(self):
         text = history.reading_html(remote=True)
-        self.assertIn('Remote copies over loopback have <a href="remote.html">a page of their own</a>', text)
+        self.assertIn('for local copies on one host and for remote copies over loopback. Each kind has a page of '
+                      'its own with CPU time, peak memory and the data tables: <a href="local.html">local copies</a> '
+                      'and <a href="remote.html">remote copies</a>.', text)
+        # what the second line of a remote tile is measured against
+        self.assertIn("<strong>Against the local copy.</strong>", text)
         self.assertIn("source and the destination <code>rcpd</code>", text)
         self.assertIn("Each process reports its own CPU time and peak memory", text)
         # no word the pages never define
@@ -108,6 +113,8 @@ class RemoteHistoryTests(unittest.TestCase):
         self.assertNotIn("rcpd", earlier)
         self.assertNotIn("remote", earlier.lower())
         self.assertIn("The plots show local copies on one host.", earlier)
+        self.assertIn('<a href="local.html">Local copies</a> adds CPU time, peak memory and the data tables', earlier)
+        self.assertNotIn("Against the local copy", earlier)
 
     def test_the_setup_page_describes_remote_copies_only_once_there_is_a_remote_page(self):
         from . import production_diagnostics as diagnostics
@@ -142,8 +149,38 @@ class RemoteHistoryTests(unittest.TestCase):
             remote, local = (history.render(*split(runs), scenario) for scenario in (history.REMOTE, history.LOCAL))
         self.assertIn("The plots show each file set's newest 2 qualified runs. Older runs are not plotted; every "
                       "run stays in the <a href='index.html#runs'>list of runs</a>.", remote)
-        self.assertIn("Older runs are not plotted; every run stays in the list below.", local)
+        # the list of runs is on the first page, for both kinds of copy
+        self.assertIn("Older runs are not plotted; every run stays in the <a href='index.html#runs'>list of runs</a>.",
+                      local)
         self.assertEqual(remote.count("<circle class='dot'"), 2 * 5)
+
+
+class RemoteLayoutTests(unittest.TestCase):
+    def test_the_tiles_of_a_remote_copy_stand_in_a_column_per_measure_with_the_destination_under_the_source(self):
+        from pathlib import Path
+        runs = split([matrix_example(BOTH)])
+        # only a remote copy has a tile for each process; a local copy keeps its one row
+        self.assertEqual(history.render(*runs, history.REMOTE).count("<div class='metrics processes'>"), 1)
+        local = history.render(*runs)
+        self.assertEqual((local.count("<div class='metrics'>"), local.count("processes")), (1, 0))
+        record, extra = matrix_example(BOTH)
+        page = export.render(record, diagnostics=extra)
+        self.assertEqual((page.count("<div class='metrics'>"), page.count("<div class='metrics processes'>")), (1, 1))
+        # the stylesheet places a tile by its position among the five, so it is tied here to their order
+        self.assertEqual([key for key, _, _ in history.REMOTE_METRICS],
+                         ["duration", "source_cpu", "destination_cpu", "source_memory", "destination_memory"])
+        style = (Path(__file__).resolve().parents[2] / "scripts/report-site/aws.css").read_text()
+        wide, narrow, single = style[style.index(".aws .metrics.processes {"):].split("@media", 3)[:3]
+        place = r"\.aws \.metrics\.processes > :nth-child\((\d)\) \{ grid-area: (\d) / (\d); \}"
+        rows = lambda block: {int(child): (int(row), int(column)) for child, row, column in re.findall(place, block)}
+        self.assertIn("grid-template-columns: repeat(3, ", wide.split("}", 1)[0])
+        # duration, then CPU time and memory: the source in the first row, the destination in the second
+        self.assertEqual(rows(wide), {1: (1, 1), 2: (1, 2), 3: (2, 2), 4: (1, 3), 5: (2, 3)})
+        # with room for two columns only, duration has the first row and the processes the next two
+        self.assertIn("grid-template-columns: repeat(2, ", narrow)
+        self.assertEqual(rows(wide) | rows(narrow), {1: (1, 1), 2: (2, 1), 3: (3, 1), 4: (2, 2), 5: (3, 2)})
+        # in one column they follow each other as they are written
+        self.assertIn(".aws .metrics.processes > :nth-child(n) { grid-area: auto; }", single)
 
 
 class RemoteRunPageTests(unittest.TestCase):

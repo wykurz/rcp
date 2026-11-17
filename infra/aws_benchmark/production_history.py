@@ -1,10 +1,12 @@
 """Bounded presentation-only history of rcp performance from frozen public records.
 
 The history follows the build under test with default settings: one trend per
-file set and scenario, joined across code versions. Each scenario has a page of
-its own. Frozen records and series IDs are read, never rewritten; every emitted
-string is escaped and no script is produced.
+file set and scenario, joined across code versions. The first page shows the
+copy duration of every trend at once; each scenario has a page of its own with
+every metric. Frozen records and series IDs are read, never rewritten; every
+emitted string is escaped and no script is produced.
 """
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
 import math
@@ -49,12 +51,46 @@ COLUMNS = {
              ("destination_memory", "Destination rcpd peak RSS MiB"), ("cpu", "rcp CPU s"),
              ("memory", "rcp peak RSS MiB")),
 }
+# each row of the first page: its title, the page with every metric, and what that page adds
+ROWS = {
+    LOCAL: ("Local copies", "local.html", "CPU time, peak memory and data tables"),
+    REMOTE: ("Remote copies", "remote.html", "CPU time and peak memory of each rcpd, and data tables"),
+}
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 DAY = 86400
-# chart geometry in viewBox units; the plot area is 302 by 160
-WIDTH, HEIGHT, LEFT, RIGHT, TOP, BOTTOM = 360, 200, 46, 12, 14, 26
-PLOT_WIDTH, PLOT_HEIGHT, BASE = WIDTH - LEFT - RIGHT, HEIGHT - TOP - BOTTOM, HEIGHT - BOTTOM
+
+
+@dataclass(frozen=True)
+class Frame:
+    """Chart geometry in viewBox units: the size of the drawing and the margins around its plot area."""
+    width: int
+    height: int
+    left: int
+    right: int
+    top: int
+    bottom: int
+    # a plot with no room for a date a day names the days of its first and last run instead
+    ends: bool = False
+
+    @property
+    def plot_width(self):
+        return self.width - self.left - self.right
+
+    @property
+    def plot_height(self):
+        return self.height - self.top - self.bottom
+
+    @property
+    def base(self):
+        return self.height - self.bottom
+
+
+# a plot on the page of its scenario, and the smaller one that stands four abreast on the first page:
+# drawn small rather than scaled down, so that its labels keep their size
+DETAIL, COMPACT = Frame(360, 200, 46, 12, 14, 26), Frame(232, 150, 42, 8, 14, 24, ends=True)
 TIP_WIDTH, TIP_HEIGHT = 196, 62
+# the width of one character of a date label, to keep a label inside the drawing and off its neighbours
+TICK_CHARACTER = 6.2
 
 
 def _summary(values, *, frozen=None):
@@ -89,6 +125,15 @@ def has_remote(records):
 def panels(scenario):
     """The metrics plotted for a scenario, as (key, title, unit)."""
     return METRICS if scenario == LOCAL else REMOTE_METRICS
+
+
+def layout(scenario):
+    """The class of the grid that holds a scenario's tiles.
+
+    A remote copy has a tile for each process. The stylesheet stands them in a column per measure,
+    the destination under the source, by their position in `REMOTE_METRICS`.
+    """
+    return "metrics" if scenario == LOCAL else "metrics processes"
 
 
 def _points(value, extra, scenario=LOCAL):
@@ -278,36 +323,75 @@ def _describe(item, metric, unit):
              ", ".join(name for name, _, _ in item["changes"])))
 
 
-def _chart(points, metric, title, unit, figure_id):
+def _end_ticks(points):
+    """Name the days of the last and the first run, in that order; one run, or two of one day, has one name."""
+    first, last = points[0], points[-1]
+    # across a new year a date needs its year
+    plain = first["day"].rsplit(" ", 1)[1] == last["day"].rsplit(" ", 1)[1]
+    name = lambda item: item["day"].rsplit(" ", 1)[0] if plain else item["day"]
+    return [(last["at"], name(last))] + ([(first["at"], name(first))] if name(first) != name(last) else [])
+
+
+def _date_labels(ticks, x, frame):
+    """Centre each date on its tick, in order of preference, and return the ones that fit, left to right.
+
+    A label that would cross the right edge is pulled inside the drawing; one that would then run
+    into a label already placed is left out.
+    """
+    placed = []
+    for at, label in ticks:
+        half = len(label) * TICK_CHARACTER / 2
+        centre = min(x(at), frame.width - half - .5)
+        if all(abs(centre - other) >= half + extent for other, extent, _, _ in placed):
+            placed.append((centre, half, at, label))
+    return sorted(placed)
+
+
+def _tip_top(frame, height):
+    """Place the tooltip of a point at `height` above or below it, never over it."""
+    if frame.plot_height >= 2 * (TIP_HEIGHT + 10):
+        # one side of any point has room for it inside the plot
+        return frame.top + 4 if height > frame.top + TIP_HEIGHT + 10 else frame.base - TIP_HEIGHT - 4
+    # a plot lower than two tooltips lends them its margins
+    return 2 if height >= TIP_HEIGHT + 10 else frame.height - TIP_HEIGHT - 2
+
+
+def _chart(points, metric, title, unit, frame=DETAIL):
     """Draw one metric as a script-free line chart with a CSS-only hover layer."""
     available = [item for item in points if item[metric] is not None]
     bottom, top, value_ticks = _value_axis(available, metric)
     start, end, day_ticks = _time_axis(points)
-    x = lambda at: LEFT + (at - start) / (end - start) * PLOT_WIDTH
-    y = lambda value: TOP + PLOT_HEIGHT * (1 - (value - bottom) / (top - bottom))
+    edge, base = frame.width - frame.right, frame.base
+    x = lambda at: frame.left + (at - start) / (end - start) * frame.plot_width
+    y = lambda value: frame.top + frame.plot_height * (1 - (value - bottom) / (top - bottom))
     # the name is an attribute: a title element would also pop up as a native tooltip over the styled one
-    svg = (f"<svg class='chart' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {WIDTH} {HEIGHT}' "
+    svg = (f"<svg class='chart' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {frame.width} {frame.height}' "
            "role='group' aria-label='" + escape(f"{title} over worker-reported run start, in {unit}") + "'>")
     for value, label in value_ticks:
-        svg += (f"<line class='grid' x1='{LEFT}' x2='{WIDTH - RIGHT}' y1='{y(value):.2f}' y2='{y(value):.2f}'/>"
-                f"<text class='ytick' x='{LEFT - 6}' y='{y(value) + 3.5:.2f}' text-anchor='end'>{escape(label)}</text>")
-    svg += f"<line class='axis' x1='{LEFT}' x2='{WIDTH - RIGHT}' y1='{BASE}' y2='{BASE}'/>"
-    for at, label in day_ticks:
-        svg += (f"<line class='axis' x1='{x(at):.2f}' x2='{x(at):.2f}' y1='{BASE}' y2='{BASE + 4}'/>"
-                f"<text class='xtick' x='{x(at):.2f}' y='{HEIGHT - 8}' text-anchor='middle'>{escape(label)}</text>")
-    occupied = LEFT
+        svg += (f"<line class='grid' x1='{frame.left}' x2='{edge}' y1='{y(value):.2f}' y2='{y(value):.2f}'/>"
+                f"<text class='ytick' x='{frame.left - 6}' y='{y(value) + 3.5:.2f}' text-anchor='end'>"
+                f"{escape(label)}</text>")
+    svg += f"<line class='axis' x1='{frame.left}' x2='{edge}' y1='{base}' y2='{base}'/>"
+    labels = _date_labels(_end_ticks(points) if frame.ends else day_ticks, x, frame)
+    # every whole day keeps its tick; a run is ticked where it is named
+    for at in [at for _, _, at, _ in labels] if frame.ends else [at for at, _ in day_ticks]:
+        svg += f"<line class='axis' x1='{x(at):.2f}' x2='{x(at):.2f}' y1='{base}' y2='{base + 4}'/>"
+    for centre, _, _, label in labels:
+        svg += (f"<text class='xtick' x='{centre:.2f}' y='{frame.height - 8}' text-anchor='middle'>"
+                f"{escape(label)}</text>")
+    occupied = frame.left
     for item in points:
         if not item["changes"]:
             continue
         position = x(item["at"])
-        svg += f"<line class='marker' x1='{position:.2f}' x2='{position:.2f}' y1='{TOP}' y2='{BASE}'/>"
+        svg += f"<line class='marker' x1='{position:.2f}' x2='{position:.2f}' y1='{frame.top}' y2='{base}'/>"
         label = "new line" if item["starts_segment"] else "setup change"
         width = len(label) * 5.4
         # the label is centred on its line and pulled inside the plot at either edge
-        left = min(max(position - width / 2, LEFT), WIDTH - RIGHT - width)
+        left = min(max(position - width / 2, frame.left), edge - width)
         if left >= occupied:
             # a label is skipped rather than drawn over the previous one
-            svg += f"<text class='marker-label' x='{left:.2f}' y='{TOP - 4}'>{label}</text>"
+            svg += f"<text class='marker-label' x='{left:.2f}' y='{frame.top - 4}'>{label}</text>"
             occupied = left + width + 6
     joined = []
     for item in [*points, None]:
@@ -326,16 +410,16 @@ def _chart(points, metric, title, unit, figure_id):
     # the hover layer comes last so a revealed tooltip is never painted over by a later mark
     for index, item in enumerate(available):
         data, position, height = item[metric], x(item["at"]), y(item[metric]["value"])
-        left = LEFT if index == 0 else (x(available[index - 1]["at"]) + position) / 2
-        right = WIDTH - RIGHT if index == len(available) - 1 else (position + x(available[index + 1]["at"])) / 2
-        tip_x = min(max(position - TIP_WIDTH / 2, 2), WIDTH - TIP_WIDTH - 2)
-        tip_y = TOP + 4 if height > TOP + TIP_HEIGHT + 10 else BASE - TIP_HEIGHT - 4
+        left = frame.left if index == 0 else (x(available[index - 1]["at"]) + position) / 2
+        right = edge if index == len(available) - 1 else (position + x(available[index + 1]["at"])) / 2
+        tip_x = min(max(position - TIP_WIDTH / 2, 2), frame.width - TIP_WIDTH - 2)
+        tip_y = _tip_top(frame, height)
         svg += ("<a class='pt' href='runs/" + escape(item["run_key"], quote=True) + ".html' aria-label='" +
                 escape(_describe(item, metric, unit), quote=True) + "'>"
-                f"<rect class='hit' x='{left:.2f}' y='{TOP}' width='{max(right - left, 1):.2f}' "
-                f"height='{PLOT_HEIGHT}' fill='none' pointer-events='all'/>"
+                f"<rect class='hit' x='{left:.2f}' y='{frame.top}' width='{max(right - left, 1):.2f}' "
+                f"height='{frame.plot_height}' fill='none' pointer-events='all'/>"
                 "<g class='hover' visibility='hidden' pointer-events='none'>"
-                f"<line class='guide' x1='{position:.2f}' x2='{position:.2f}' y1='{TOP}' y2='{BASE}'/>"
+                f"<line class='guide' x1='{position:.2f}' x2='{position:.2f}' y1='{frame.top}' y2='{base}'/>"
                 f"<circle class='ring' cx='{position:.2f}' cy='{height:.2f}' r='6'/>"
                 f"<g class='tip' transform='translate({tip_x:.2f},{tip_y})'>"
                 f"<rect width='{TIP_WIDTH}' height='{TIP_HEIGHT}' rx='4'/>"
@@ -348,12 +432,26 @@ def _chart(points, metric, title, unit, figure_id):
     return svg + "</svg>"
 
 
-def _panel(case, points, metric, title, unit):
-    """Pair a stat tile (latest value and change) with the metric's chart."""
-    figure_id = "history-" + case + "-" + metric
+def _change(percent):
+    """Format a relative change to two decimals; one that rounds to nothing has no minus sign."""
+    return f"{round(percent, 2) + 0.0:+.2f}%"
+
+
+def _opening(figure_id, attribute, heading, row=None):
+    """Open a stat tile and its caption; the tile is named by its heading, after its row's title if it has one."""
+    return ("<figure class='metric' " + attribute + " aria-labelledby='" + (row + " " if row else "") + figure_id +
+            "'><figcaption><h3 id='" + figure_id + "'>" + heading + "</h3>")
+
+
+def _panel(case, points, metric, title, unit, *, frame=DETAIL, opening=None, notes=()):
+    """Pair a stat tile (latest value and change) with the metric's chart.
+
+    A tile of the first page brings its own `opening`, named after its file set instead of its
+    metric; `notes` are further lines under the change.
+    """
     available = [item for item in points if item[metric] is not None]
-    html = ("<figure class='metric' data-history-metric='" + metric + "' aria-labelledby='" + figure_id +
-            "'><figcaption><h3 id='" + figure_id + "'>" + escape(title) + "</h3>")
+    html = opening or _opening("history-" + case + "-" + metric, "data-history-metric='" + metric + "'",
+                               escape(title))
     if not available:
         return (html + "<p class='value'>unavailable</p><p class='delta'>No recorded value for these runs; "
                 "nothing is filled in.</p></figcaption></figure>")
@@ -364,11 +462,12 @@ def _panel(case, points, metric, title, unit):
     else:
         previous = earlier[-1][metric]["value"]
         percent = (latest[metric]["value"] / previous - 1) * 100 if previous else math.inf
-        change = (f"{percent:+.2f}% vs previous point" if math.isfinite(percent) else
+        change = (_change(percent) + " vs previous point" if math.isfinite(percent) else
                   f"previous point {rounded(previous)} {unit}")
     html += ("<p class='value'>" + escape(rounded(latest[metric]["value"])) + " <span class='unit'>" + unit +
-             "</span></p><p class='delta'>" + escape(latest["day"]) + " · " + escape(change) +
-             "</p></figcaption>" + _chart(points, metric, title, unit, figure_id))
+             "</span></p><p class='delta'>" + escape(latest["day"]) + " · " + escape(change) + "</p>" +
+             "".join("<p class='delta'>" + escape(note) + "</p>" for note in notes) +
+             "</figcaption>" + _chart(points, metric, title, unit, frame))
     missing = len(points) - len(available)
     if missing:
         html += ("<p class='gap'>" + plural(missing, "run has", "runs have") + " no recorded value; " +
@@ -391,7 +490,7 @@ def _file_set(case, points, scenario):
         "<h2 id='history-" + case + "-title'>" + CASES[case] + "</h2><p class='dataset'>" +
         f"{files:,} files of {_decimal(shape['file_size_bytes'])} each ({_decimal(files * shape['file_size_bytes'])}), "
         + how + " · " + plural(len(points), "run", "runs") +
-        "</p><div class='metrics'>" +
+        "</p><div class='" + layout(scenario) + "'>" +
         "".join(_panel(case, points, metric, title, unit) for metric, title, unit in panels(scenario)) +
         "</div><p class='reading'>Each point is one run: the median of its copies, with a bar from the fastest "
         "to the slowest copy. <a href='setups.html#reading'>How to read these plots</a>.</p>")
@@ -436,11 +535,7 @@ def _render(cases, outside, limit, unmeasured, scenario, several):
         html += ("<p class='empty'>No qualified " + (scenario + " " if several else "") +
                  "runs yet for " + (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
     if limit is not None:
-        # the list of runs is on the page of the local trends
-        html += ("<p class='window'>The plots show each file set's newest " +
-                 plural(limit, "qualified run", "qualified runs") +
-                 ". Older runs are not plotted; every run stays in the " +
-                 ("list below" if scenario == LOCAL else "<a href='index.html#runs'>list of runs</a>") + ".</p>")
+        html += _window(limit, "<a href='index.html#runs'>list of runs</a>")
     if outside:
         html += ("<p class='window'>" + plural(outside, "qualified measurement is", "qualified measurements are") +
                  " outside these trends (reference builds, other variants, scenarios or file sets); "
@@ -448,46 +543,137 @@ def _render(cases, outside, limit, unmeasured, scenario, several):
     return html + "</section>"
 
 
-def render(records, companions, scenario=LOCAL):
-    """Plot each file set's newest qualified runs under one scenario.
+def _window(limit, where):
+    """Say that older runs are not plotted, and where every run is still listed."""
+    # the list of runs is on the first page, under the plots of every scenario
+    return ("<p class='window'>The plots show each file set's newest " +
+            plural(limit, "qualified run", "qualified runs") +
+            ". Older runs are not plotted; every run stays in the " + where + ".</p>")
 
-    The inventory and frozen records stay unbounded by this.
+
+def _fit(models, build):
+    """Plot each file set's newest qualified runs, and fewer of them while the page exceeds its bound.
+
+    `models` holds the runs of each scenario by file set; `build` renders their plotted windows.
     """
-    cases, outside = model(records, companions, scenario)
-    # a file set is unmeasured only when no run ever measured it, whatever the plots show
-    unmeasured = [case for case, points in cases.items() if not points]
     limit = MAX_PLOT_RUNS
     while True:
         # each file set keeps its own newest runs: one measured weekly is not pushed off the
         # page by one measured every few days
-        window = {case: points[max(len(points) - limit, 0):] for case, points in cases.items()}
-        for points in window.values():
-            # markers and breaks always relate two plotted runs
-            _link(points)
-        cut = any(len(points) > limit for points in cases.values())
-        html = _render(window, outside, limit if cut else None, unmeasured, scenario,
-                       scenario != LOCAL or has_remote(records))
+        windows = {scenario: {case: points[max(len(points) - limit, 0):] for case, points in cases.items()}
+                   for scenario, cases in models.items()}
+        for cases in windows.values():
+            for points in cases.values():
+                # markers and breaks always relate two plotted runs
+                _link(points)
+        cut = any(len(points) > limit for cases in models.values() for points in cases.values())
+        html = build(windows, limit if cut else None)
         if len(html.encode()) <= projection.MAX_PUBLIC_HTML:
             return html
         require(limit, "AWS history plots exceed public HTML bound")
         limit -= 1
 
 
+def render(records, companions, scenario=LOCAL):
+    """Plot each file set's newest qualified runs under one scenario, with every metric.
+
+    The inventory and frozen records stay unbounded by this.
+    """
+    cases, outside = model(records, companions, scenario)
+    # a file set is unmeasured only when no run ever measured it, whatever the plots show
+    unmeasured = [case for case, points in cases.items() if not points]
+    several = scenario != LOCAL or has_remote(records)
+    return _fit({scenario: cases}, lambda windows, limit: _render(
+        windows[scenario], outside, limit, unmeasured, scenario, several))
+
+
+def _tile(case, points, scenario, page, beside):
+    """One file set's copy duration under one scenario; `beside` holds its local copies, run by run."""
+    name = CASES[case]
+    # both rows have a tile of this name: its link and its plot say which copy they are, for a reader
+    # who meets them in a list instead of in their row
+    link = ("<a href='" + page + "#history-" + case + "' aria-label='" + name + ", " + scenario + " copies'>" +
+            name + "</a>")
+    opening = _opening("overview-" + scenario + "-" + case, "data-overview='" + scenario + "'",
+                       link if points else name, "overview-" + scenario + "-title")
+    if not points:
+        # the tile keeps its place, so that a column is the same file set in every row
+        return opening + "</figcaption><p class='delta'>No qualified run yet.</p></figure>"
+    notes = []
+    if scenario != LOCAL:
+        # how the remote path compares with a local copy is read within one run: same build, same machine
+        latest = points[-1]
+        local = next((item for item in beside if item["run_key"] == latest["run_key"]), None)
+        if local is not None and local["duration"]["value"] > 0:
+            percent = (latest["duration"]["value"] / local["duration"]["value"] - 1) * 100
+            if math.isfinite(percent):
+                notes.append(_change(percent) + " vs local copy")
+    return _panel(case, points, "duration", name + ", " + scenario + " copy duration", "s", frame=COMPACT,
+                  opening=opening, notes=notes)
+
+
+def _overview(windows, limit, several, local):
+    html = "<section id='history' aria-label='Copy duration of every file set'>"
+    for scenario, cases in windows.items():
+        title, page, more = ROWS[scenario]
+        measured = any(cases.values())
+        # one line heads a row, its title and the way to its page: both rows are meant to fit one screen
+        html += ("<section id='overview-" + scenario + "' aria-labelledby='overview-" + scenario + "-title'>"
+                 "<div class='overview-title'><h2 id='overview-" + scenario + "-title'>" + title + "</h2>" +
+                 ("<a href='" + page + "'>" + more + "</a>" if measured else "") + "</div>")
+        if measured:
+            html += ("<div class='overview'>" + "".join(
+                _tile(case, points, scenario, page, local[case]) for case, points in cases.items()) + "</div>")
+        else:
+            # once there are two kinds of run, a row without this kind may well have the other
+            html += "<p class='empty'>No qualified " + (scenario + " " if several else "") + "runs yet.</p>"
+        html += "</section>"
+    if any(points for cases in windows.values() for points in cases.values()):
+        html += ("<p class='reading'>Each point is one run: the median of its copies, with a bar from the fastest "
+                 "to the slowest copy. <a href='setups.html#reading'>How to read these plots</a>.</p>")
+    if limit is not None:
+        html += _window(limit, "list below")
+    return html + "</section>"
+
+
+def overview(records, companions):
+    """Show the copy duration of every file set at once: a row of small plots for each scenario.
+
+    The other metrics and the data tables are on the page of each scenario. A row for remote
+    copies appears with the first run that has a remote cell.
+    """
+    several = has_remote(records)
+    models = {scenario: model(records, companions, scenario)[0]
+              for scenario in ((LOCAL, REMOTE) if several else (LOCAL,))}
+    # a remote plot is compared with the local copy of its own run, whether or not that copy is still plotted
+    return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL]))
+
+
 def reading_html(remote=False):
     """Explain once how points, lines and gaps are derived; `remote` when remote copies have a page."""
     scope = (
-        "<li><strong>Scope.</strong> The plots show local copies on one host. A run counts for every file "
-        "set it measured; a file set it did not finish has no point for that run, and its run page says why. "
-        "Failed and unavailable runs stay in the run list without performance points.</li>" if not remote else
-        "<li><strong>Scope.</strong> The AWS benchmarks page plots local copies on one host. Remote copies "
-        'over loopback have <a href="remote.html">a page of their own</a>, read the same way. A run counts for '
-        "every file set and scenario it measured; one it did not finish has no point for that run, and its run "
-        "page says why. Failed and unavailable runs stay in the run list without performance points.</li>"
+        "<li><strong>Scope.</strong> The plots show local copies on one host. The AWS benchmarks page shows "
+        'the copy duration of every file set; <a href="local.html">Local copies</a> adds CPU time, peak memory '
+        "and the data tables. A run counts for every file set it measured; a file set it did not finish has no "
+        "point for that run, and its run page says why. Failed and unavailable runs stay in the run list "
+        "without performance points.</li>" if not remote else
+        "<li><strong>Scope.</strong> The AWS benchmarks page shows the copy duration of every file set, for "
+        "local copies on one host and for remote copies over loopback. Each kind has a page of its own with CPU "
+        'time, peak memory and the data tables: <a href="local.html">local copies</a> and '
+        '<a href="remote.html">remote copies</a>. A run counts for every file set and scenario it measured; one '
+        "it did not finish has no point for that run, and its run page says why. Failed and unavailable runs "
+        "stay in the run list without performance points.</li>"
         "<li><strong>Remote copies.</strong> A remote copy is three processes: the <code>rcp</code> command, "
         "and the source and the destination <code>rcpd</code> that it starts over SSH and that move the data. "
         "Copy duration is the wall time of the <code>rcp</code> command. Each process reports its own CPU "
         "time and peak memory: they are plotted for each daemon, and the command's own figures are in each "
-        "data table.</li>")
+        "data table.</li>"
+        "<li><strong>Against the local copy.</strong> On the AWS benchmarks page, the plot of a remote copy "
+        "also gives its latest run's median relative to the same run's local copy of that file set: the same "
+        "build on the same machine, copied both ways. The comparison is left out when that run made no local "
+        "copy of the file set.</li>"
+        "<li><strong>Dates.</strong> A plot of the AWS benchmarks page names the days of its first and its "
+        "last run; the plots of the other pages are ticked at whole days.</li>")
     return ("<section aria-labelledby='reading'><h2 id='reading'>Reading the plots</h2><ul>"
         "<li><strong>Point.</strong> One qualified run, summarizing the copies of one file set made by the "
         "build under test with rcp's default settings: three copies in a matrix run, four in a paired run. "
