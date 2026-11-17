@@ -199,23 +199,35 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('not confidence intervals', setup)
         self.assert_site_links_resolve()
 
-    def test_landing_page_leads_with_history_plots_and_preserves_frozen_records(self):
+    def test_landing_page_leads_with_duration_tiles_and_preserves_frozen_records(self):
         batch, values = self.diagnostic_batch(two=True)
         result = self.build_retained(batch)
         self.assertEqual(result.returncode, 0, result.stderr)
         index = (self.output / 'aws-benchmarks/index.html').read_text()
-        for metric in ('duration', 'cpu', 'memory'):
-            self.assertEqual(index.count("data-history-metric='" + metric + "'"), 1)
-        self.assertEqual(index.count('<svg '), 3)
-        self.assertLess(index.index('data-history-metric'), index.index('id="runs"'))
+        # one tile per file set, and a plot for the one that has runs; duration only
+        self.assertEqual(index.count("data-overview='local'"), 4)
+        self.assertEqual(index.count('<svg '), 1)
+        self.assertNotIn('data-history-metric', index)
+        self.assertNotIn('Peak memory', index)
+        self.assertLess(index.index('data-overview'), index.index('id="runs"'))
         self.assertLess(index.index('id="runs"'), index.index('id="collection-status"'))
         self.assertIn('over worker-reported run start', index)
-        self.assertIn('Peak memory', index)
-        self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.', index)
         # the page goes from its one-line purpose straight to the plots: no disclaimer box
         self.assertNotIn('class="note"', index)
         lede = index.index('class="lede"')
-        self.assertEqual(index[lede:index.index('data-history-metric')].count('<p'), 1)
+        self.assertEqual(index[lede:index.index('data-overview')].count('<p'), 0)
+        # every metric and the data tables are on the page of local copies
+        local = (self.output / 'aws-benchmarks/local.html').read_text()
+        self.assertIn('<h1>Local copies</h1>', local)
+        for metric in ('duration', 'cpu', 'memory'):
+            self.assertEqual(local.count("data-history-metric='" + metric + "'"), 1)
+        self.assertEqual(local.count('<svg '), 3)
+        self.assertIn('Peak memory', local)
+        self.assertIn('<summary>Data table</summary>', local)
+        self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.', local)
+        self.assertNotIn('id="runs"', local)
+        self.assertNotIn('class="note"', local)
+        self.assertNotIn('PRIVATE', local)
         self.assertNotIn('PRIVATE', index)
         self.assertEqual(index.count('<script'), 1)
         for value in values:
@@ -251,10 +263,15 @@ class ReportSiteTests(unittest.TestCase):
         value = self.aws_record()
         result = self.build_retained(self.retained_batch([value]))
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = {'aws-benchmarks/index.html': ('#history', '#runs', '#collection-status', 'setups.html'),
-                    'aws-benchmarks/setups.html': ('index.html#history', 'index.html#runs', '#observed', '#reading'),
+        expected = {'aws-benchmarks/index.html': ('#history', 'local.html', '#runs', '#collection-status',
+                                                  'setups.html'),
+                    'aws-benchmarks/local.html': ('index.html#history', '#report-content', 'index.html#runs',
+                                                  'index.html#collection-status', 'setups.html'),
+                    'aws-benchmarks/setups.html': ('index.html#history', 'local.html', 'index.html#runs', '#observed',
+                                                   '#reading'),
                     'aws-benchmarks/runs/' + value['run_key'] + '.html':
-                        ('../index.html#history', '../index.html#runs', '../setups.html', '#results', '#raw-data')}
+                        ('../index.html#history', '../local.html', '../index.html#runs', '../setups.html', '#results',
+                         '#raw-data')}
         for relative, links in expected.items():
             with self.subTest(page=relative):
                 page = (self.output / relative).read_text()
@@ -612,16 +629,22 @@ class ReportSiteTests(unittest.TestCase):
                 matrix_example('matrix-commission-local', run='43200000002', at='2026-11-21T08:30:00+00:00')]
         records = {record['run_key']: production_export.collection.encoded(record) for record, _ in runs}
         pages = report_site.render_aws_benchmarks(records, diagnostics={record['run_key']: extra for record, extra in runs})
-        index = pages[Path('aws-benchmarks/index.html')]
+        index, local = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/local.html')]
         self.assertIn("<span class='badge badge-partial'>3 of 4 measurements completed</span>", index)
         self.assertIn("<span class='badge badge-passed'>2 of 2 measurements completed</span>", index)
         self.assertIn('<code>matrix-all-local</code>', index)
         for title in ('1 GB files', '1 MB files', '1 KB files'):
-            self.assertIn('<h2 id=\'history-' + {'1 GB files': 'bulk-1g-1tb', '1 MB files': 'bulk-1m-1024gb',
-                '1 KB files': 'tiny-1k-10240k'}[title] + '-title\'>' + title + '</h2>', index)
-        self.assertIn('No qualified runs yet for 100 MB files.', index)
+            fragment = {'1 GB files': 'bulk-1g-1tb', '1 MB files': 'bulk-1m-1024gb',
+                        '1 KB files': 'tiny-1k-10240k'}[title]
+            self.assertIn('<h2 id=\'history-' + fragment + '-title\'>' + title + '</h2>', local)
+            # its tile on the first page opens that section
+            self.assertIn("<a href='local.html#history-" + fragment + "' aria-label='" + title +
+                          ", local copies'>" + title + '</a>', index)
+        self.assertIn('No qualified runs yet for 100 MB files.', local)
+        self.assertIn("<h3 id='overview-local-bulk-100m-1024gb'>100 MB files</h3></figcaption>"
+                      "<p class='delta'>No qualified run yet.</p>", index)
         # the small test fixtures of the commissioning run are measured, and not part of any trend
-        self.assertIn('2 qualified measurements are outside these trends', index)
+        self.assertIn('2 qualified measurements are outside these trends', local)
         page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000001.html')]
         self.assertIn('<li>Worker evidence (not public): <code>production/runs/repo-655073755-run-43200000001/'
                       'collection/</code> in the benchmark bucket until about 18 Feb 2027; fetch it with '
@@ -650,30 +673,47 @@ class ReportSiteTests(unittest.TestCase):
         for path, document in pages.items():
             if path.suffix == '.html':
                 with self.subTest(page=str(path)):
-                    for phrase in ('remote.html', 'Remote copies', 'rcpd', 'page of their own'):
-                        self.assertNotIn(phrase, document)
+                    # in any case and any place: an address, a title, a sentence
+                    for phrase in ('remote', 'rcpd', 'page of their own'):
+                        self.assertNotIn(phrase, document.lower())
         setup = pages[Path('aws-benchmarks/setups.html')]
         self.assertIn('The copy datapath is local on one host, not a network copy', setup)
         self.assertIn('The plots show local copies on one host.', setup)
         self.assertIn('No qualified runs yet for 100 MB files, 1 MB files and 1 KB files.',
-                      pages[Path('aws-benchmarks/index.html')])
+                      pages[Path('aws-benchmarks/local.html')])
+        self.assertNotIn("id='overview-remote'", pages[Path('aws-benchmarks/index.html')])
+        # the first page says what is copied where the datasets are described
+        self.assertIn('How long rcp takes to copy <a href="setups.html#datasets">fixed datasets</a> on one AWS '
+                      'machine type, tracked from commit to commit.</p>', pages[Path('aws-benchmarks/index.html')])
         both = matrix_example('matrix-1g-local+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')
         pages = site([local, both])
         index, remote = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/remote.html')]
+        local = pages[Path('aws-benchmarks/local.html')]
         self.assertIn('<h1>Remote copies</h1>', remote)
         self.assertIn("data-history-metric='source_cpu'", remote)
         self.assertIn('rcpd over loopback, with default settings · 1 run</p>', remote)
-        self.assertIn('copied locally by rcp with default settings · 2 runs</p>', index)
-        self.assertNotIn("data-history-metric='source_cpu'", index)
-        # each page says where the other is, and every page of the section links to both
-        self.assertIn('<a href="remote.html">remote copies over loopback</a>', index)
-        self.assertIn('<a href="index.html#history">Local copies</a>', remote)
-        self.assertIn('<li><a href="remote.html">Remote copies</a></li>', index)
+        self.assertIn('copied locally by rcp with default settings · 2 runs</p>', local)
+        self.assertNotIn("data-history-metric='source_cpu'", local)
+        # the first page shows both kinds of copy, the local row first
+        self.assertLess(index.index("id='overview-local'"), index.index("id='overview-remote'"))
+        self.assertEqual((index.count("data-overview='local'"), index.count("data-overview='remote'")), (4, 4))
+        self.assertIn("<a href='remote.html#history-bulk-1g-1tb' aria-label='1 GB files, remote copies'>1 GB files"
+                      "</a>", index)
+        self.assertIn('tracked from commit to commit: locally, and through its remote path over loopback.</p>', index)
+        # each page says where the others are, and every page of the section links to all of them
+        self.assertIn("<a href='remote.html'>CPU time and peak memory of each rcpd, and data tables</a>", index)
+        self.assertIn('<a href="local.html">Local copies</a>', remote)
+        self.assertIn('<a href="remote.html">Remote copies over loopback</a>', local)
+        for page in (index, local, pages[Path('aws-benchmarks/setups.html')]):
+            self.assertIn('<li><a href="remote.html">Remote copies</a></li>', page)
+        for page in (index, remote, pages[Path('aws-benchmarks/setups.html')]):
+            self.assertIn('<li><a href="local.html">Local copies</a></li>', page)
         self.assertIn('<li><a href="#report-content" aria-current="page">Remote copies</a></li>', remote)
+        self.assertIn('<li><a href="#report-content" aria-current="page">Local copies</a></li>', local)
         self.assertIn('<li><a href="index.html#history">History</a></li>', remote)
-        self.assertIn('<li><a href="remote.html">Remote copies</a></li>', pages[Path('aws-benchmarks/setups.html')])
         page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000002.html')]
         self.assertIn('<li><a href="../remote.html">Remote copies</a></li>', page)
+        self.assertIn('<li><a href="../local.html">Local copies</a></li>', page)
         self.assertIn('<td>Remote copy over loopback</td><td>measured</td>', page)
         self.assertIn('<td>source rcpd</td><td>complete</td>', page)
         # run links on the remote page resolve from where that page is
@@ -684,10 +724,10 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('<strong>Remote copies.</strong>', setup)
         self.assertIn('exchange the data over loopback TCP', setup)
         self.assertIn('three fresh copies of each file set under each scenario', setup)
-        self.assertIn('Remote copies over loopback have <a href="remote.html">a page of their own</a>', setup)
+        self.assertIn('<a href="local.html">local copies</a> and <a href="remote.html">remote copies</a>', setup)
         self.assertNotIn('The copy datapath is local on one host', setup)
         # a file set measured remotely only is not said to have no runs at all
-        self.assertIn('No qualified local runs yet for 100 MB files, 1 MB files and 1 KB files.', index)
+        self.assertIn('No qualified local runs yet for 100 MB files, 1 MB files and 1 KB files.', local)
 
     def test_a_site_with_remote_cells_has_no_dangling_link(self):
         from infra.aws_benchmark.production_publish import inventory

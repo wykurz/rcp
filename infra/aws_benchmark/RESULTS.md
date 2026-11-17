@@ -306,13 +306,20 @@ marked setup change (`Copy check`), not as a new line. The run page lists every 
 and, for anything not measured, what happened. A run that measured only some of its cells is shown
 with an amber badge.
 
-Each scenario has its own trends. Local copies are plotted on the AWS benchmarks page, as before.
-Remote copies over loopback are plotted on a page of their own, `remote.html`, with one section per
-file set: copy duration, and the CPU time and peak memory of the source and of the destination
-`rcpd`. The `rcp` command's own figures are in each section's data table. That page and its
-navigation entry appear with the first run that has a remote cell. A run page with remote cells
-summarizes each cell under its file set and scenario and lists the resources of every process of a
-remote copy.
+Each scenario has its own trends, and the AWS benchmarks page shows all of them at once as copy
+duration: a row of small plots for local copies and a row for remote copies over loopback, with one
+column per file set. A file set without a qualified run keeps its place in the row. The plot of a
+remote copy also gives its latest run's median relative to the same run's local copy of that file
+set, when the run made one. The list of runs and the collection status follow the plots.
+
+Every metric and the data tables are on a page for each scenario, with one section per file set.
+`local.html` plots copy duration, CPU time and peak memory. `remote.html` plots copy duration, and
+the CPU time and peak memory of the source and of the destination `rcpd`: a column for each of the
+three, with the destination's plot under the source's. A run page lays out the same five figures of
+a remote copy the same way. The `rcp` command's own figures are in each section's data table. The
+remote row, that page and its navigation entry appear with the first run that has a remote cell. A
+run page with remote cells summarizes each cell under its file set and scenario and lists the
+resources of every process of a remote copy.
 
 The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
 `just aws-benchmark-evidence`; see
