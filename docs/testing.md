@@ -40,6 +40,17 @@ just ci                # Full CI checks (lint + Nix when available + doc + test-
 
 The project uses [cargo-nextest](https://nexte.st/) for faster test execution.
 
+The `rcp/tests/cli/` modules share one `cli` integration-test executable, reducing repeated
+compilation work, especially with release LTO. Run a module with:
+
+```bash
+just test -p rcp-tools-rcp --test cli -E 'test(/^cli_parsing_tests::/)'
+```
+
+Keep tests that require process isolation or binary-based selection in their dedicated targets,
+including the SSH, Docker, directory-overlap, and process-global `common` fixtures. CLI tests use
+the ordinary release profile and source-owned Nix sandbox exclusions.
+
 Fixtures that mutate process-global admission, congestion, hooks, or file-descriptor state are
 supported through nextest's per-test process isolation or through libtest with `--test-threads=1`.
 Parallel in-process libtest is unsupported for these fixtures. The standard `just test` and
@@ -269,7 +280,7 @@ for sudo-required tests also selects the ignored `directory_overlap` fixtures wi
 `test(~sudo) or binary(=directory_overlap)`. CI sets `RCP_TEST_MOUNT_SUDO=1` to use its passwordless
 sudo for private mount namespaces; local runs default to unprivileged user/mount namespaces.
 
-**POSIX ACL tests** (`rcp/tests/acls.rs`, `rlink/tests/acls.rs`, and unit tests in
+**POSIX ACL tests** (`rcp/tests/cli/acls.rs`, `rlink/tests/acls.rs`, and unit tests in
 `common/src/safedir.rs`) need a temp filesystem that can hold `system.posix_acl_*` extended
 attributes. Per the repo's convention they **fail rather than skip** when it cannot, so a lost
 feature cannot pass unnoticed — a failure there means `TMPDIR` is on a filesystem without ACL
@@ -278,9 +289,9 @@ support, not that the code is broken. Fixtures write the xattrs directly rather 
 hand for reading an ACL by eye while debugging, but nothing in the suite uses it. See
 [POSIX ACLs](acls.md).
 
-**Syscall-tracing tests** in `rcp/tests/acls.rs`, `rcp/tests/reflink.rs`,
-`rcp/tests/overlap_cost.rs`, and `rlink/tests/reflink.rs` require `strace(1)`, which is included in
-the dev shell. The ACL tests check opt-in probe costs, and the reflink tests verify that the
+**Syscall-tracing tests** in `rcp/tests/cli/acls.rs`, `rcp/tests/cli/reflink.rs`,
+`rcp/tests/cli/overlap_cost.rs`, and `rlink/tests/reflink.rs` require `strace(1)`, which is included
+in the dev shell. The ACL tests check opt-in probe costs, and the reflink tests verify that the
 selected policy controls `copy_file_range` use, including copies during `rlink --update`. Checking
 copied bytes alone cannot verify either property. The overlap tests independently bound ancestry
 opens, metadata reads, and mount-ID samples along known fixture directories for single and
@@ -313,7 +324,7 @@ real-session tests in `tests::localhost_ssh_tests`. Nextest selects those two st
 for its serial group; test names do not control membership. Launcher fakes and socket-only protocol
 tests stay outside those locations and run in parallel.
 
-`rcp/tests/remote_non_ssh_tests.rs` instead covers localhost-as-local behavior and validation
+`rcp/tests/cli/remote_non_ssh_tests.rs` instead covers localhost-as-local behavior and validation
 failures that must occur before SSH setup, so it runs without that prerequisite.
 
 ### Sudo-Required Tests

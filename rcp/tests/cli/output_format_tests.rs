@@ -1,8 +1,6 @@
 //! `--output-format json` prints the summary as one JSON object; text stays the default.
 
-#[path = "support/fixtures.rs"]
-mod fixtures;
-use fixtures::{create_test_file, setup_test_env};
+use crate::fixtures::{create_test_file, setup_test_env};
 
 const PROCESS_STATS: [&str; 7] = [
     "cpu_time_user_ms",

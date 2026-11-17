@@ -289,8 +289,8 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        # strace tests in rcp/tests/acls.rs check opt-in ACL probe costs; those in
-        # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
+        # strace tests in rcp/tests/cli/acls.rs check opt-in ACL probe costs; those in
+        # rcp/tests/cli/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
         # native test runs fail without it; copied bytes cannot prove either property.
         sudo apt-get install -y musl-tools pkg-config strace btrfs-progs
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
@@ -376,8 +376,8 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        # strace tests in rcp/tests/acls.rs check opt-in ACL probe costs; those in
-        # rcp/tests/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
+        # strace tests in rcp/tests/cli/acls.rs check opt-in ACL probe costs; those in
+        # rcp/tests/cli/reflink.rs and rlink/tests/reflink.rs verify copy_file_range use.
         # native test runs fail without it; copied bytes cannot prove either property.
         sudo apt-get install -y musl-tools pkg-config strace
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc

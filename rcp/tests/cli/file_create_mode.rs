@@ -11,9 +11,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[path = "support/fixtures.rs"]
-mod fixtures;
-use fixtures::{
+use crate::fixtures::{
     create_test_file, describe_samples, get_file_content, get_file_mode, sample_while_running,
     setup_test_env,
 };

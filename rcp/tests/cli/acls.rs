@@ -11,13 +11,11 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-#[path = "support/acl.rs"]
+#[path = "../support/acl.rs"]
 mod acl;
-#[path = "support/fixtures.rs"]
-mod fixtures;
 
+use crate::fixtures::{create_test_file, get_file_content, get_file_mode, setup_test_env};
 use acl::{ACL_ACCESS, ACL_DEFAULT, denying_acl, describe_acl, get_acl, granting_acl, set_acl};
-use fixtures::{create_test_file, get_file_content, get_file_mode, setup_test_env};
 
 fn rcp(args: &[&str]) -> std::process::Output {
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcp"))
