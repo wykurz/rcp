@@ -259,8 +259,16 @@ The plots cover still-retained 90-day records, not permanent history. A bounded 
 newest 32 qualified runs; an oversized page shortens the window further. The omitted count stays
 visible and every run stays in the list. The machine, storage, datasets and method are described
 once on the test setup page, where the values the runs recorded are merged into one table; each run
-page keeps its own observed setup as a collapsed appendix. Local copies and remote copies over
-loopback are separate scenarios of a run: each has its own measurements, frozen series and trends.
+page keeps its own observed setup as a collapsed appendix. The setup page also says what the storage
+allows: the provider's figures for the drives, why a copy of a terabyte file set cannot go faster
+than the destination array takes writes (so local and remote copies that keep up with it take about
+the same time, and CPU time and memory are where a change in rcp shows first), and a table of what
+the arrays and the processors did during the newest run's copies. Each figure of that table is the
+median over the copies of a file set and scenario and is given only when every copy has it. It comes
+from the sampled command phase alone, whose counters run from the phase's first sample to its last:
+a rate or a share is taken over that time, one sampling period less than there are samples, which is
+up to ten seconds less than the copy took. Local copies and remote copies over loopback are separate
+scenarios of a run: each has its own measurements, frozen series and trends.
 
 Either option records phase costs: fixture generation and initial verification on the run;
 preparation (including cache preparation but excluding result persistence), verification and

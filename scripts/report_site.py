@@ -352,7 +352,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     near, far = Path('aws-benchmarks/local.html'), Path('aws-benchmarks/remote.html')
     retention = ('<p>Still-retained records under the 90-day AWS lifecycle; deletion timing can vary. '
                  'This view is not permanent history.</p>' if retained else '')
-    pages, rows, observed, normalized = {}, [], [], {}
+    pages, rows, observed, normalized, storage = {}, [], [], {}, ''
     diagnostics = diagnostics or {}
     if not set(diagnostics) <= set(records):
         raise ValueError('Resource diagnostics have no frozen public record')
@@ -374,6 +374,10 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         production_export.resource_diagnostics.validate(extra, value)
         if extra['setup'] is not None:
             observed.append(dict(run=identity['run'], href='runs/' + run_key + '.html', setup=extra['setup']))
+        # runs come newest first: the first with figures of its arrays is the one the setup page shows
+        storage = storage or production_history.storage_html(
+            identity['run'], 'runs/' + run_key + '.html',
+            production_export.resource_diagnostics.storage_use(extra, value))
         pages[Path('aws-benchmarks/diagnostics') / (run_key + '.json')] = (
             production_export.collection.encoded(extra).decode('utf-8'))
         body = production_export.render(value, diagnostics=extra) + (
@@ -399,13 +403,14 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         '<h1>Test setup</h1><p class="lede">Every run uses the same machine type and storage layout, the '
         'datasets below and one of two methods, so they are described here once. What an individual run '
         "observed is in that run's appendix and its diagnostics JSON.</p>" +
-        production_export.resource_diagnostics.configuration_html(observed[::-1], remote=remote) +
+        production_export.resource_diagnostics.configuration_html(observed[::-1], remote=remote, storage=storage) +
         production_history.reading_html(remote))
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
     pages[setup] = aws_page(setup, 'Test setup · AWS benchmarks', setup_content, navigation(setup) + [
         aws_link(label, '#' + fragment, nested=True) for fragment, label in (
-            ('machine', 'Machine and storage'), ('datasets', 'Datasets'), ('method', 'Method'),
+            ('machine', 'Machine and storage'), ('storage', 'What the storage allows'), ('datasets', 'Datasets'),
+            ('method', 'Method'),
             ('observed', 'Observed values'), ('reading', 'Reading the plots'))])
     # the plots used to live here; keep the address working without a script
     pages[Path('aws-benchmarks/history.html')] = (
