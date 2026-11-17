@@ -329,6 +329,38 @@ class ReportSiteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Central AWS setup'):
                 report_site.render_aws_benchmarks({})
 
+    def test_the_setup_page_shows_what_the_arrays_did_in_the_newest_run_that_recorded_it(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        from infra.aws_benchmark.test_storage_limit import TYPICAL, command, sampled
+        def setup(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})[Path('aws-benchmarks/setups.html')]
+        slow = [command(600.0, 468.0, 300.0, 483.0, 105.0, .5)]
+        older = sampled('matrix-1g-local', copies={index: slow for index in range(3)})
+        newer = sampled('matrix-1g-local+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')
+        unsampled = matrix_example('matrix-1g-local', run='43200000003', at='2026-11-28T08:30:00+00:00')
+        page = setup([older, newer, unsampled])
+        # the newest run recorded nothing, so the one before it is shown; an older run's figures are not mixed in
+        self.assertIn("during the copies of run <a href='runs/repo-655073755-run-43200000002.html'>43200000002-1</a>",
+                      page)
+        self.assertIn('<td>1 GB files</td><td>Remote copy over loopback</td><td>1.56 GB/s</td><td>98%</td>', page)
+        self.assertNotIn('0.78 GB/s', page)
+        self.assertEqual(page.count('<th>Written to the destination</th>'), 1)
+        # the section is reached from the navigation and from the note on copy duration
+        self.assertIn('<li class="level-h3"><a href="#storage">What the storage allows</a></li>', page)
+        self.assertIn("For the terabyte file sets it cannot be shorter than the destination array allows: see "
+                      "<a href='#storage'>What the storage allows</a>", page)
+        self.assertIn('0.78 GB/s', setup([older]))
+        # without any recorded figures the description stands alone
+        page = setup([unsampled])
+        self.assertIn("<h2 id='storage'>What the storage allows</h2>", page)
+        self.assertNotIn('<th>Written to the destination</th>', page)
+        for phrase in ('remote', 'rcpd'):
+            self.assertNotIn(phrase, page.lower())
+
     def test_reinventoried_diagnostic_identity_tampering_fails_before_site_writes(self):
         from infra.aws_benchmark.production_publish import inventory
         batch, values = self.diagnostic_batch()

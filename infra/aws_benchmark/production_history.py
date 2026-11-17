@@ -649,6 +649,35 @@ def overview(records, companions):
     return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL]))
 
 
+def storage_html(run, href, rows):
+    """Tabulate what the arrays and the processors did during one run's copies, in the order of the trends.
+
+    `rows` are those of `diagnostics.storage_use`; file sets without a trend are left out, and so is
+    the whole table when nothing is left.
+    """
+    rows = sorted((row for row in rows if row["case_id"] in CASES and row["scenario"] in SCENARIOS),
+                  key=lambda row: (list(CASES).index(row["case_id"]), list(SCENARIOS).index(row["scenario"])))
+    if not rows:
+        return ""
+    rate = lambda value: "unavailable" if value is None else f"{value / 10 ** 9:.2f} GB/s"
+    share = lambda value: "unavailable" if value is None else f"{value * 100:.0f}%"
+    html = ("<p>What the arrays and the processors did during the copies of run <a href='" +
+            escape(href, quote=True) + "'>" + escape(run) + "</a>, the newest that recorded it. Each figure is the "
+            "median of the copies of that file set.</p>"
+            "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Copy</th>"
+            "<th>Written to the destination</th><th>Destination busy</th><th>Read from the source</th>"
+            "<th>Source busy</th><th>CPU busy</th></tr></thead><tbody>")
+    for row in rows:
+        cells = (CASES[row["case_id"]], SCENARIOS[row["scenario"]], rate(row["written"]),
+                 share(row["destination_busy"]), rate(row["read"]), share(row["source_busy"]), share(row["cpu"]))
+        html += "<tr>" + "".join("<td>" + escape(cell) + "</td>" for cell in cells) + "</tr>"
+    return (html + "</tbody></table></div><p class='reading'>The figures come from the kernel's counters for "
+            "each array as a whole, not its drives. They are read every ten seconds, so they cover each copy from "
+            "its first reading to its last, up to ten seconds less than the whole. Busy is the share of that time "
+            "during which the array had a request in progress. CPU busy is the share of all processors' time that "
+            "was neither idle nor waiting for I/O.</p>")
+
+
 def reading_html(remote=False):
     """Explain once how points, lines and gaps are derived; `remote` when remote copies have a page."""
     scope = (
@@ -687,7 +716,8 @@ def reading_html(remote=False):
         "<li><strong>Value axis.</strong> Fitted to the data and never narrower than 5% either side of its "
         "centre, so it does not start at zero and small run-to-run noise stays flat.</li>"
         "<li><strong>Copy duration.</strong> Copy wall time. Fixture generation, cache preparation, validation "
-        "and cleanup are outside it.</li>"
+        "and cleanup are outside it. For the terabyte file sets it cannot be shorter than the destination array "
+        "allows: see <a href='#storage'>What the storage allows</a>.</li>"
         "<li><strong>CPU time.</strong> User plus system seconds, added for each copy before the median is "
         "taken; not a sum of repetitions.</li>"
         "<li><strong>Peak memory.</strong> Peak command RSS, converted from KiB to MiB. CPU and RSS cover the "

@@ -663,12 +663,16 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations, *, remote=False):
+def configuration_html(observations, *, remote=False, storage=""):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
-    Remote copies are described once a run has a remote cell.
+    Remote copies are described once a run has a remote cell. `storage` is the table of what the
+    arrays did during the newest run's copies, placed under what the drives allow.
     """
+    # what would otherwise surprise a reader: copies of a terabyte take as long as the destination array needs
+    same = ("A local copy and a remote copy of the same file set that both keep up with the array therefore take "
+            "almost the same time. " if remote else "")
     commissioning = ("The <code>matrix-commission-…</code> suites copy" if remote else
                      "The <code>matrix-commission-local</code> suite copies")
     copy = (
@@ -699,6 +703,16 @@ def configuration_html(observations, *, remote=False):
         "tools; it is not the benchmark data disk.</li></ul>"
         "<p>This is the current configured design, not a substitute for observed host evidence; historical "
         "runs may differ. What the workers recorded is under <a href='#observed'>Observed values</a>.</p></section>"
+        "<section aria-labelledby='storage'><h2 id='storage'>What the storage allows</h2>"
+        "<p>AWS specifies the four drives together at 1,400,000 random reads and 680,000 writes of 4 KiB a "
+        "second, at full queue depth. For an array of two that is about 2.9 GB/s read and 1.4 GB/s written in "
+        "requests of that size; larger requests can move somewhat more. This is the provider's specification, "
+        "not a measurement of this machine.</p>"
+        "<p>The 1 GB, 100 MB and 1 MB file sets hold about a terabyte each, several times the machine's memory, "
+        "so a copy of them cannot go faster than the destination array takes writes. " + same + "The copy "
+        "duration of these file sets shows whether rcp keeps up with the storage, not how fast rcp could go: a "
+        "change in rcp shows first in CPU time and memory. The 1 KB file set holds about 10 GB, which fits in "
+        "memory many times over, and is not bound this way.</p>" + storage + "</section>"
         "<section aria-labelledby='datasets'><h2 id='datasets'>Datasets</h2>"
         "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Files</th><th>Bytes per file</th>"
         "<th>Total logical data</th></tr></thead>"
@@ -753,6 +767,61 @@ def _maximum(metrics, key):
     return value.get("maximum") if value.get("status") == "available" and number(value.get("maximum"), integer=True) else None
 
 
+def _cpu_busy(metrics):
+    """The share of all processors' time that was neither idle nor waiting for I/O, or None when not recorded."""
+    total, idle, wait = (_delta(metrics, key) for key in
+                         ("host_cpu_total_ticks", "host_cpu_idle_ticks", "host_cpu_iowait_ticks"))
+    return None if None in (total, idle, wait) or total == 0 or idle + wait > total else (total - idle - wait) / total
+
+
+def _copy_use(trial, period):
+    """What the arrays and the processors did during one copy's command phase; figures it lacks are None.
+
+    A phase's counters run from its first sample to its last, not over the whole phase. Samples are
+    one `period` apart, so the counters span one period less than there are samples: nothing when
+    there is one sample, and up to a period less than the copy took.
+    """
+    phase = next((item for item in trial["system"]["phases"] if item["phase"] == "command"), None)
+    if phase is None or phase["samples"] < 2:
+        return {}
+    seconds, metrics = (phase["samples"] - 1) * period, phase["metrics"]
+    # sector counters are in 512-byte units. Samples are a few milliseconds more than a period apart, so an array
+    # that always had a request in progress would otherwise come out a little above the whole
+    rate = lambda key: None if _delta(metrics, key) is None else _delta(metrics, key) * 512 / seconds
+    share = lambda key: None if _delta(metrics, key) is None else min(_delta(metrics, key) / 1000 / seconds, 1.0)
+    return dict(written=rate("destination_write_sectors"), destination_busy=share("destination_io_milliseconds"),
+                read=rate("source_read_sectors"), source_busy=share("source_io_milliseconds"), cpu=_cpu_busy(metrics))
+
+
+def storage_use(value, record):
+    """Summarize what the arrays and the processors did during the copies of each measured file set and scenario.
+
+    A figure is the median over the copies of its cell and is given only when every copy has it: a
+    median over the copies that happen to have a figure would pick among the repeats. A cell with no
+    figure at all has no row. Rates are bytes a second; the rest are shares of the time they cover.
+    """
+    sampler = None if value["setup"] is None else value["setup"]["instrumentation"]
+    if sampler is None:
+        return []
+    measured = {(item["case_id"], item.get("scenario", LOCAL)) for item in record["measurements"]}
+    cells = {}
+    for trial in value["trials"]:
+        key = (trial["case_id"], trial.get("scenario", LOCAL))
+        if key in measured:
+            cells.setdefault(key, []).append(_copy_use(trial, sampler["period_seconds"]))
+    rows = []
+    for (case_id, scenario), copies in cells.items():
+        figures = {}
+        for name in ("written", "destination_busy", "read", "source_busy", "cpu"):
+            values = sorted(copy[name] for copy in copies if copy.get(name) is not None)
+            middle = len(values) // 2
+            figures[name] = None if len(values) != len(copies) else (
+                values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2)
+        if any(figure is not None for figure in figures.values()):
+            rows.append(dict(case_id=case_id, scenario=scenario, **figures))
+    return rows
+
+
 def _unit(value, unit, divisor=1):
     return "unavailable" if value is None else f"{value / divisor:,.3f} {unit}"
 
@@ -763,9 +832,7 @@ def system_html(value):
     rows = []
     for phase in value["phases"]:
         metrics = phase["metrics"]
-        total, idle, wait = (_delta(metrics, key) for key in
-                            ("host_cpu_total_ticks", "host_cpu_idle_ticks", "host_cpu_iowait_ticks"))
-        busy = None if None in (total, idle, wait) or total == 0 or idle + wait > total else 100 * (total - idle - wait) / total
+        busy = None if _cpu_busy(metrics) is None else 100 * _cpu_busy(metrics)
         available = metrics.get("host_memory_available_bytes", {})
         minimum = available.get("minimum") if available.get("status") == "available" else None
         fields = (

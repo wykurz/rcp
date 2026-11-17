@@ -321,6 +321,16 @@ remote row, that page and its navigation entry appear with the first run that ha
 run page with remote cells summarizes each cell under its file set and scenario and lists the
 resources of every process of a remote copy.
 
+The test setup page says what the storage allows. Each array is two of the machine's four NVMe
+drives, which AWS's instance-store specification for compute optimized instances gives together as
+1,400,000 random reads and 680,000 writes of 4 KiB a second; a terabyte file set is several times
+the machine's memory, so a copy of it cannot go faster than the destination array takes writes. The
+page states that consequence and tabulates, for the newest run that recorded it, what each array and
+the processors did during the copies of every file set and scenario: the rate written and read, the
+share of the time each array was busy and the share of processor time that was busy. The figures
+come from each copy's sampled command phase in the resource diagnostics, over the time from that
+phase's first sample to its last; no record or diagnostics format changes.
+
 The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
 `just aws-benchmark-evidence`; see
 [Find the evidence of a run](PRODUCTION.md#find-the-evidence-of-a-run).
