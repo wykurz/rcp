@@ -1348,6 +1348,11 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// How long a test waits for a discovery run that must end before it reports a hang.
+    ///
+    /// A bound on a hang, never on speed. The suite runs many tests at once on small CI runners,
+    /// where a run that usually takes three or four seconds has taken more than ten.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
     tokio::task_local! { pub(super) static DIRECTORY_LIMITS: remote::protocol::DirectoryLimits; }
     tokio::task_local! { pub(super) static SCAN_CREDIT: Arc<tokio::sync::Semaphore>; }
 
@@ -1694,7 +1699,7 @@ mod tests {
         let (source, send, recv, errors) =
             connection(temp.path(), false, LEAF_CAPACITY, LEAF_CAPACITY, Vec::new());
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            HANG,
             DIRECTORY_LIMITS.scope(
                 remote::protocol::DirectoryLimits {
                     normal: std::num::NonZeroUsize::new(NORMAL).unwrap(),
@@ -1789,7 +1794,7 @@ mod tests {
                         anyhow::Ok(())
                     };
                     let (source, peer, frontier_progress) = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        HANG,
                         SCAN_CREDIT.scope(branches.clone(), DIRECTORY_LIMITS.scope(normal_directory_limit(scans + depth + 2),
                             HOOKS.scope(hooks.clone(), common::task_scope::scope_tasks(async {
                                 tokio::join!(source, acknowledge_directories(send, recv), frontier_progress)
@@ -2070,7 +2075,7 @@ mod tests {
             }
         };
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
         )
         .await?;
@@ -2089,7 +2094,7 @@ mod tests {
         std::os::unix::fs::symlink("missing", &path)?;
         let (source, send, receive, _) = connection(&path, true, 1, 1, Vec::new());
         let (source, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             common::task_scope::scope_tasks(async {
                 tokio::join!(source, acknowledge_directories(send, receive))
             }),
@@ -2133,7 +2138,7 @@ mod tests {
             let (source, send, receive, errors) =
                 connection(temp.path(), dereference, 1, 1, Vec::new());
             let (source, peer) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 HOOKS.scope(
                     hooks,
                     common::task_scope::scope_tasks(async {
@@ -2200,7 +2205,7 @@ mod tests {
                 vec![Box::new(tokio::io::sink())],
             );
             let (source, peer) = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
+                HANG,
                 HOOKS.scope(
                     hooks.clone(),
                     common::task_scope::scope_tasks(async {
@@ -2240,7 +2245,7 @@ mod tests {
         });
         let (source, send, receive, errors) = connection(temp.path(), false, 1, 1, Vec::new());
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             HOOKS.scope(
                 hooks,
                 common::task_scope::scope_tasks(async {
@@ -2296,7 +2301,7 @@ mod tests {
         let (source, send, receive, errors) =
             configured_connection(root, configuration, 1, 1, Vec::new());
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             HOOKS.scope(
                 hooks.clone(),
                 common::task_scope::scope_tasks(async {
@@ -2674,7 +2679,7 @@ mod tests {
             let (source, send, recv, errors) =
                 connection(temp.path(), dereference, 1, 1, Vec::new());
             let (source, messages) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 HOOKS.scope(
                     hooks.clone(),
                     common::task_scope::scope_tasks(async {
@@ -2760,7 +2765,7 @@ mod tests {
         std::fs::write(&path, b"payload")?;
         let (source, send, recv, _) = connection(&path, false, 1, 1, vec![Box::new(FailingWriter)]);
         let (source, _peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             common::task_scope::scope_tasks(async {
                 tokio::join!(source, acknowledge_directories(send, recv))
             }),
@@ -2918,7 +2923,7 @@ mod tests {
                 anyhow::Ok(())
             };
             let (source, peer, observe) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 DIRECTORY_LIMITS.scope(
                     normal_directory_limit(1),
                     HOOKS.scope(
@@ -3017,7 +3022,7 @@ mod tests {
             anyhow::Ok(())
         };
         let (source, peer, disconnected) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             DIRECTORY_LIMITS.scope(
                 remote::protocol::DirectoryLimits {
                     normal: std::num::NonZeroUsize::MIN,
@@ -3104,7 +3109,7 @@ mod tests {
                 anyhow::Ok(())
             };
             let (source, peer, observe) = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                HANG,
                 HOOKS.scope(
                     hooks.clone(),
                     common::task_scope::scope_tasks(async {
@@ -3218,7 +3223,7 @@ mod tests {
                 anyhow::Ok(())
             };
             let (source, peer) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
             )
             .await?;
@@ -3313,7 +3318,7 @@ mod tests {
         let (source, send, recv, _) =
             configured_connection(temp.path(), configuration, 1, 2, Vec::new());
         let (source, _peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             HOOKS.scope(
                 hooks,
                 common::task_scope::scope_tasks(async {
@@ -3503,7 +3508,7 @@ mod tests {
                 release.add_permits(1);
             };
         let (source, peer, ()) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             // isolate classification admission: both sibling directories need independent
             // resource groups while the first classifier deliberately waits for the second Begin.
             DIRECTORY_LIMITS.scope(
@@ -3562,7 +3567,7 @@ mod tests {
             });
             let (source, send, recv, _) = connection(temp.path(), dereference, 1, 1, Vec::new());
             let (source, peer) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 HOOKS.scope(
                     hooks,
                     common::task_scope::scope_tasks(async {
@@ -3604,7 +3609,7 @@ mod tests {
             });
             let (source, send, recv, errors) = connection(temp.path(), false, 1, 1, Vec::new());
             let (source, peer) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                HANG,
                 HOOKS.scope(
                     hooks,
                     common::task_scope::scope_tasks(async {
@@ -3655,7 +3660,7 @@ mod tests {
         let (source, send, recv, errors) =
             connection(temp.path(), false, 1, 1, vec![Box::new(tokio::io::sink())]);
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             HOOKS.scope(
                 hooks,
                 common::task_scope::scope_tasks(async {
@@ -3691,7 +3696,7 @@ mod tests {
         }
         let (source, send, recv, _) = connection(temp.path(), true, 1, 1, Vec::new());
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            HANG,
             common::task_scope::scope_tasks(async {
                 tokio::join!(source, acknowledge_directories(send, recv))
             }),
@@ -3763,7 +3768,7 @@ mod tests {
         };
         let (source, send, recv, _) = connection(&path, false, 1, 1, vec![Box::new(writer)]);
         let (source, peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            HANG,
             HOOKS.scope(
                 hooks.clone(),
                 common::task_scope::scope_tasks(async {
@@ -3871,12 +3876,9 @@ mod tests {
             },
             Default::default(),
         );
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            common::task_scope::scope_tasks(source),
-        )
-        .await?
-        .unwrap_err();
+        let error = tokio::time::timeout(HANG, common::task_scope::scope_tasks(source))
+            .await?
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("original framed reader panic"),
             "{error:#}"
@@ -3991,7 +3993,7 @@ mod tests {
                     anyhow::Ok(())
                 };
                 let (source, peer) = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    HANG,
                     HOOKS.scope(
                         hooks,
                         common::task_scope::scope_tasks(async { tokio::join!(source, peer) }),
