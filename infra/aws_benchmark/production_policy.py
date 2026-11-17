@@ -14,7 +14,9 @@ from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite
 from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
-MAX_PRICE_AGE_SECONDS = 31 * 86400
+# a year plus slack: the price is confirmed yearly, and a recurring allowance needs no monthly
+# visit. A reservation is bounded by its runtime, not by how recent this evidence is.
+MAX_PRICE_AGE_SECONDS = 400 * 86400
 SCHEDULE_MAIN_AA = "triggering-main-aa"
 # an explicit, bounded list: every file set that may be started by hand is named in the policy
 MAX_MANUAL_SUITES = 8

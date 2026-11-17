@@ -41,7 +41,7 @@ initial request needs a new owner-requested workflow run, not an attempt that re
 authority. The table retains closed tombstones and has no TTL.
 
 The server policy is disabled by default, with zero allowances and no schedule slots. All policy
-fields are required in its canonical stored payload. Pricing must have evidence no older than 31
+fields are required in its canonical stored payload. Pricing must have evidence no older than 400
 days. Money is integer micro-USD. The reservation is:
 
 ```text
@@ -648,7 +648,7 @@ Approve exact UTC server slots, initial/total/monthly reservation limits and a d
 before activating either gate. Successful collection still does not refund full reservations.
 Preserve the seeded cumulative ledger, slot tombstones and one active owner; do not zero accounting
 for a new month or to make an attempt fit. The development ceiling does not establish an ongoing
-monthly operating allowance. Price evidence still expires after 31 days. No controller or workflow
+monthly operating allowance. Price evidence still expires, after 400 days. No controller or workflow
 gets automatic policy-edit or credential-refresh authority.
 
 The separate keyless reporting workflow declares a daily 09:43 UTC poll and a Tuesday 03:43 UTC
@@ -1028,6 +1028,33 @@ source change (the `SCHEDULED_SUITE` constant, the cron line and `REGULAR_CRON`)
 version that names the same suite, its slot and its runtime. The policy change needs no image, no
 package and no stack update. Keep `RCP_AWS_PRODUCTION_SCHEDULE_ENABLED` off between the two, so that
 a slot in between is skipped instead of refused.
+
+### What renews and what does not
+
+A weekly run needs no regular visit to the policy, because its limits are of three kinds:
+
+- The monthly allowance renews by itself. `monthly_cap_microusd` bounds the reservations of one UTC
+  calendar month, and every month has its own counter. Nothing carries over.
+- The total allowance never renews. `total_cap_microusd` bounds every reservation since the ledger
+  was seeded, so it is the last stop when everything else is forgotten. Set it as far out as the
+  owner wants to commit, and raise it with a new policy version before it is reached.
+- Price evidence is valid for 400 days, counted from `priced_at`. After that the server refuses
+  every request, manual or scheduled, before any reservation, until a new policy version carries a
+  newly confirmed price.
+
+To confirm the price, read the public on-demand price of the machine and keep the answer:
+
+```text
+aws pricing get-products --region us-east-1 --service-code AmazonEC2 \
+  --filters Type=TERM_MATCH,Field=sku,Value=SKU --format-version aws_v1 --output json
+```
+
+`hourly_microusd` is the price in that answer, `priced_at` is the time it was read, and
+`price_evidence` names the SKU and the SHA-256 of the saved answer. A price that pushes an
+eight-hour reservation over its fixed $50 is refused instead of being absorbed.
+
+`extended_manual_not_after` is separate. It bounds eight-hour runs started by hand, not the
+schedule, and has no effect on how long the schedule keeps running.
 
 ### How a run qualifies
 
