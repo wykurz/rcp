@@ -258,8 +258,12 @@ ci: lint _ci-nix-targets doc test-all-with-docker
 _depot-ci-run *JOBS:
     ./scripts/depot-ci.sh "$@"
 
-# Run debug tests remotely on Depot.
-depot-test: (_depot-ci-run "test")
+# Run selected debug tests on one x86 Depot runner (all ordinary x86 tests without arguments).
+depot-test *ARGS:
+    ./scripts/depot-ci.sh --test "$@"
+
+# Run lints and Nix target checks remotely on Depot.
+depot-lint: (_depot-ci-run "lint")
 
 # Run release tests remotely on Depot.
 depot-test-release: (_depot-ci-run "test-release")
@@ -331,7 +335,7 @@ docker-logs-once:
 # Run Docker tests (requires containers already running)
 docker-test-only *ARGS:
     @echo "🧪 Running Docker multi-host tests..."
-    ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only "$@"
+    ./scripts/cargo-host.sh nextest run -p rcp-tools-rcp --test 'docker_*' --profile docker --run-ignored only "$@"
 
 # Run Docker tests with full lifecycle (setup -> test -> cleanup)
 docker-test:
@@ -367,7 +371,7 @@ docker-verify-caps:
 # Run chaos tests only (requires containers already running)
 docker-chaos-test-only: docker-verify-caps
     @echo "🌪️  Running chaos tests..."
-    ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only -E 'test(~chaos)'
+    ./scripts/cargo-host.sh nextest run -p rcp-tools-rcp --test 'docker_*' --profile docker --run-ignored only -E 'test(~chaos)'
 
 # Run chaos tests with full lifecycle
 docker-chaos-test:

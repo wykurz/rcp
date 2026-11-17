@@ -74,29 +74,59 @@ invocations keep `--no-capture` and their existing serial execution.
 ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only
 ```
 
-### Depot test shards
+### Focused Depot checks
 
-Depot runs debug tests on x86 and Arm and release tests on x86, with two independent runners per
-configuration. Each runner executes one nextest count partition. The partitions together run the
-full suite of non-ignored tests; ignored tests stay ignored in every shard. The serial SSH test
-group remains serial within each runner. The native Arm Nix package ABI smoke check runs only on the
-first Arm shard.
+Use focused checks while developing, and reserve full `just depot-ci` for the final inputs before
+opening or updating a PR. Intermediate commits do not require another full run when the tested
+inputs are unchanged.
 
-`just depot-test` and `just depot-test-release` run all shards of their selected jobs. To reproduce
-one partition locally, pass nextest arguments through the test recipes:
+`just depot-test` runs one 8-vCPU x86 debug job and forwards the same nextest arguments as
+`just test`:
 
 ```bash
-just test --partition count:1/2
+just depot-test -p rcp-tools-rcp --test cli -E 'test(/^cli_parsing_tests::/)'
+just depot-test -p rcp-tools-common --lib
+just depot-lint  # lints plus Nix target checks
+```
+
+Without arguments, `depot-test` runs all ordinary x86 debug tests, including localhost SSH tests. It
+does not replace the architecture, release or Docker coverage in `depot-ci`. The focused command
+requires Python and PyYAML locally when passing arguments; `nix develop` includes both. Arguments
+are passed literally, including filters containing spaces, quotes or shell metacharacters.
+
+Stage any ordinary untracked files needed by a remote check. Depot uploads the current worktree's
+tracked changes, so its result covers the inputs present at launch. Full verification must cover the
+final changes submitted for review.
+
+### Full Depot test configurations
+
+Depot runs the complete debug suite once on x86 and once on Arm, using one 8-vCPU runner per
+architecture. This avoids compiling the same debug binaries on multiple shards. The native Arm
+runner also performs the Nix package ABI smoke check. Regular Docker tests use one 8-vCPU runner per
+architecture and compile only Docker integration targets.
+
+Release tests retain two 16-vCPU x86 runners to keep full-suite turnaround short. Each executes one
+nextest count partition; together they run the full suite of non-ignored release tests. Ignored
+tests stay ignored in ordinary debug and release runs. The serial SSH test group remains serial
+within each runner.
+
+`just depot-test-all` runs the complete debug and release configurations plus doctests.
+`just depot-test-all-with-docker` and `just depot-ci` also run regular Docker tests;
+`just depot-test-release` runs the release shards. To reproduce one release partition locally, pass
+nextest arguments through the test recipe:
+
+```bash
+just test-release --partition count:1/2
 just test-release --partition count:2/2
 ```
 
 CI builds test binaries in a separate named step with `just test --no-run` or
-`just test-release --no-run`, then runs the partition using the same build artifacts. Count
-partitioning alternates tests within each binary and gives a more even split of the measured serial
-SSH workload than hash partitioning with Depot's pinned nextest 0.9.85. Count partition assignments
-can change when tests are added or removed; hash assignments stay stable for a fixed partition
-count. Neither method balances duration automatically. Compare the time spent in each shard when
-changing the suite or partition count.
+`just test-release --no-run`, then runs the tests using the same build artifacts. Count partitioning
+alternates tests within each binary and gives a more even split of the measured serial SSH workload
+than hash partitioning with Depot's pinned nextest 0.9.85. Count partition assignments can change
+when tests are added or removed; hash assignments stay stable for a fixed partition count. Neither
+method balances duration automatically. Compare the time spent in each shard when changing the suite
+or partition count.
 
 Upstream has [deprecated count partitioning](https://nexte.st/docs/ci-features/partitioning/) in
 favor of `slice:`, which requires nextest 0.9.127 or newer. Revisit the partition mode and measured
@@ -566,16 +596,29 @@ The `.github/workflows/validate.yml` workflow runs:
 - Shows finite container logs on failure
 - Always cleans up containers (even on failure)
 
+Both Docker recipes compile only the `rcp-tools-rcp` package's `docker_*` integration targets. They
+include every Docker target, including the shared helper tests compiled into the chaos binaries.
+Regular tests use `not test(~chaos)`; the separate chaos workflow uses `test(~chaos)`, so these
+selections together cover all Docker cases. Docker tests are ignored in ordinary nextest runs and
+explicitly enabled by the Docker recipes.
+
+Regular Docker tests run before submission in `just depot-ci` and during GitHub validation. Chaos
+tests run automatically on pushes to `main` in `.github/workflows/chaos-tests.yml`, as well as on
+manual dispatch. Chaos failures fail that workflow; it is a post-merge check, not a PR merge gate.
+This separation dates from the introduction of timing-sensitive chaos tests and their privileged
+container requirements. The tests were scheduled separately, not dropped.
+
 ### Running CI Locally
 
 ```bash
 just ci  # lint + Nix targets when available + doc + test-all (debug + release + doctests) + Docker
 ```
 
-`just ci` is the primary local "is this ready to push?" gate — it runs the same lint, docs, debug +
-release + doctest + Docker checks CI does, plus full Nix target checks when Nix is available. It is
-the one command to run before pushing. It's a close proxy for the CI matrix rather than a
-byte-for-byte match; a few CI steps live outside it:
+Prefer `just depot-ci` for the final pre-submit verification when Depot is available. `just ci` is
+the local equivalent: it runs lint, docs, debug + release + doctest + Docker checks, plus full Nix
+target checks when Nix is available. Use focused checks during development and run the full gate
+before opening or updating a PR. These commands are close proxies for the CI matrix; a few CI steps
+live outside them:
 
 - **Btrfs directory tests.** The debug job runs `just test-btrfs` on a disposable loop-mounted
   filesystem. This privileged setup is opt-in locally and is not part of `just depot-ci`.
@@ -594,10 +637,10 @@ byte-for-byte match; a few CI steps live outside it:
   fixed x86_64-musl distribution default does not control these wrapped commands. Docker payloads
   independently use `DOCKER_DEFAULT_PLATFORM` first, then the daemon architecture.
 
-- **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including* chaos (the
-  compose containers are privileged, so they actually run), whereas CI excludes chaos from its main
-  Docker job and runs it in a separate `chaos-tests.yml` workflow. So `just ci` does cover chaos
-  locally — CI just schedules it separately.
+- **Chaos tests.** `just depot-ci` includes regular Docker tests on x86_64 and AArch64; chaos runs
+  after merge in the workflow described above. `just ci`'s local Docker step runs the full `docker`
+  profile, including chaos, in privileged Compose containers. Use `just depot-chaos` for an explicit
+  remote chaos check when changing failure handling or the chaos tests themselves.
 
 ## Chaos Testing
 
@@ -666,8 +709,9 @@ Chaos tests run separately from regular Docker tests in CI (see
 - Large file transfer (10MB to test chunking)
 - Combined stress (files + bandwidth + limited connections)
 
-**Note**: Packet loss tests are disabled because `tc netem loss` affects all traffic including SSH,
-causing hangs before the copy starts.
+Packet loss before startup is intentionally avoided because `tc netem loss` also affects SSH and can
+stall bootstrap. The process chaos suite does apply 100% packet loss after startup to verify
+transport liveness timeouts.
 
 ### Implementation Details
 

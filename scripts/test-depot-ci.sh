@@ -4,6 +4,18 @@ set -euo pipefail
 
 invoked_as="${0##*/}"
 
+if [[ "$invoked_as" == "just" ]]; then
+    python3 - "$@" <<'PY'
+import json
+import os
+import sys
+
+with open(os.environ["DEPOT_TEST_ARGV"], "w") as output:
+    json.dump(sys.argv[1:], output)
+PY
+    exit 0
+fi
+
 if [[ "$invoked_as" == "git" ]]; then
     if [[ "$*" == "ls-files --others --exclude-standard -z" ]]; then
         case "$DEPOT_TEST_SCENARIO" in
@@ -33,6 +45,17 @@ if [[ "$invoked_as" == "depot" ]]; then
     } >>"$DEPOT_TEST_LOG"
 
     if [[ "$1 $2" == "ci run" && "${3:-}" != "show" ]]; then
+        case "$(realpath "$4")" in
+            "$DEPOT_TEST_REPO_ROOT"/*) ;;
+            *)
+                echo "no supported repository found for workflow outside the checkout" >&2
+                exit 28
+                ;;
+        esac
+        printf '%s\n' "$4" >"$DEPOT_TEST_WORKFLOW_PATH"
+        if [[ -f "$4" ]]; then
+            cp -- "$4" "$DEPOT_TEST_WORKFLOW"
+        fi
         if [[ "$DEPOT_TEST_SCENARIO" == "launch-failure" ]]; then
             echo "fake launch failed" >&2
             exit 23
@@ -136,9 +159,15 @@ trap 'rm -rf "$test_dir"' EXIT
 mkdir -p "$test_dir/bin"
 ln -s "$repo_root/scripts/test-depot-ci.sh" "$test_dir/bin/depot"
 ln -s "$repo_root/scripts/test-depot-ci.sh" "$test_dir/bin/git"
+ln -s "$repo_root/scripts/test-depot-ci.sh" "$test_dir/bin/just"
 
 export DEPOT_TEST_LOG="$test_dir/depot.log"
+export DEPOT_TEST_REPO_ROOT="$repo_root"
 export DEPOT_TEST_STATE="$test_dir/status-count"
+export DEPOT_TEST_WORKFLOW="$test_dir/workflow.yml"
+export DEPOT_TEST_WORKFLOW_PATH="$test_dir/workflow-path"
+export DEPOT_TEST_ARGV="$test_dir/argv.json"
+export DEPOT_TEST_MARKER="$test_dir/argument-executed"
 export DEPOT_CI_TEST_FAKE=1
 export PATH="$test_dir/bin:$PATH"
 export RCP_DEPOT_CI_POLL_INTERVAL=0
@@ -190,7 +219,7 @@ run_case() {
     local scenario="$1"
     shift
     : >"$DEPOT_TEST_LOG"
-    rm -f "$DEPOT_TEST_STATE"
+    rm -f "$DEPOT_TEST_STATE" "$DEPOT_TEST_WORKFLOW" "$DEPOT_TEST_WORKFLOW_PATH" "$DEPOT_TEST_ARGV"
     set +e
     output="$(DEPOT_TEST_SCENARIO="$scenario" "$script" "$@" 2>&1)"
     status=$?
@@ -203,8 +232,11 @@ run_case() {
 shopt -s nullglob
 workflows=("$repo_root"/.depot/workflows/*.yml "$repo_root"/.depot/workflows/*.yaml)
 shopt -u nullglob
-[[ "${#workflows[@]}" -eq 1 && "${workflows[0]}" == "$repo_root/.depot/workflows/ci.yml" ]] || \
-    fail "only the ordinary Depot ci.yml workflow is allowed"
+for workflow in "${workflows[@]}"; do
+    [[ "$workflow" == "$repo_root/.depot/workflows/ci.yml" || \
+        "$workflow" == "$repo_root/.depot/workflows/test.yml" ]] || \
+        fail "only the full and focused Depot workflows are allowed"
+done
 
 run_case success test "doc job"
 assert_status 0
@@ -327,5 +359,43 @@ fi
 run_case success
 [[ "$status" -ne 0 ]] || fail "empty job list returned success"
 assert_contains "$output" "job"
+
+# the focused command must select a single job, even with no additional test arguments
+run_case finished --test
+assert_status 0
+assert_call $'CALL\tci\trun\t--workflow\t.depot/workflows/test.yml\t--job\ttest'
+assert_call $'CALL\tci\tlogs\ttest-run-id\t--job\ttest\t--follow'
+
+# execute the submitted workflow's real command with a recording just binary: arguments must
+# survive both Actions-expression handling and shell parsing without being evaluated as code
+focused_args=(-p rcp-tools-rcp --test 'cli name' -E "test(~a'b) | test(~with space)"
+    $'line one\nline two' '${{ github.token }}' '$(touch "$DEPOT_TEST_MARKER")'
+    '`touch "$DEPOT_TEST_MARKER"`')
+run_case finished --test "${focused_args[@]}"
+assert_status 0
+[[ ! -e "$(<"$DEPOT_TEST_WORKFLOW_PATH")" ]] || fail "temporary workflow was not removed"
+python3 - "${focused_args[@]}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import yaml
+
+workflow = yaml.safe_load(Path(os.environ["DEPOT_TEST_WORKFLOW"]).read_text())
+assert set(workflow["jobs"]) == {"test"}, workflow["jobs"].keys()
+assert "${{" not in json.dumps(workflow), "arguments reached Actions expression syntax"
+job = workflow["jobs"]["test"]
+environment = {**os.environ, **workflow.get("env", {}), **job.get("env", {})}
+subprocess.run(["bash", "-c", job["steps"][-1]["run"]], env=environment, check=True)
+actual = json.loads(Path(os.environ["DEPOT_TEST_ARGV"]).read_text())
+assert actual == ["test", *sys.argv[1:]], actual
+assert not Path(os.environ["DEPOT_TEST_MARKER"]).exists()
+PY
+
+run_case launch-failure --test -p rcp-tools-rcp
+assert_status 23
+[[ ! -e "$(<"$DEPOT_TEST_WORKFLOW_PATH")" ]] || fail "launch failure leaked the temporary workflow"
 
 echo "depot-ci helper tests passed"

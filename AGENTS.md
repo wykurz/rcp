@@ -67,15 +67,23 @@ tools:
 Prefer Depot for remote verification when it is available. `nix develop` supplies the pinned Depot
 CLI v2.102.7 and jq, and remote `depot-*` recipes require configured Depot access.
 
-Before committing, prefer `just depot-ci` when Depot is available; otherwise run local `just ci`.
+During development, run focused checks for the affected code: prefer `just depot-test` with package,
+target or test filters, `just depot-lint`, or the relevant local recipe. Save full `just depot-ci`
+verification for the final inputs before opening or updating a PR; use local `just ci` if Depot is
+unavailable. Intermediate commits do not require full CI, and committing already-tested inputs does
+not invalidate that verification. Source changes after the full run require fresh verification
+before publication.
+
 Depot runs the current worktree without a commit or push, but its local patch excludes ordinary
-untracked files. Stage any ordinary untracked files needed by the check, and rerun it after later
-changes; a successful run covers only the inputs present when it started.
+untracked files. Stage any ordinary untracked files needed by the check; a successful run covers
+only the inputs present when it started. `depot-test` runs one x86 debug job and accepts the same
+arguments as `just test`; `depot-test-all` and `depot-ci` retain the complete test configurations.
 
 For targeted remote verification, use `just depot-test`, `just depot-test-release`,
 `just depot-doctest`, `just depot-doctest-release`, `just depot-doc`, `just depot-test-all`,
 `just depot-docker-test`, `just depot-docker-chaos-test`, `just depot-chaos`, or
-`just depot-test-all-with-docker`. There is no `depot-lint`; `just depot-ci` includes lint.
+`just depot-test-all-with-docker`. `just depot-lint` includes lint and Nix target checks. Full
+`depot-ci` includes regular Docker coverage; GitHub runs chaos separately after merges to main.
 
 ## Critical Conventions
 
