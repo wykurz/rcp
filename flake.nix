@@ -419,7 +419,8 @@
                 # `sshd`, `ssh` and `ssh-keygen`: the benchmark harness tests start a private,
                 # unprivileged sshd on loopback and are never skipped, so `just benchmark-test`
                 # and `just lint` fail without them.
-                pkgs.openssh
+                # accept GSSAPI settings from host SSH configs (for example Ubuntu).
+                pkgs.openssh_gssapi
               ]
               ++ platform.buildTools;
 
