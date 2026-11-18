@@ -20,6 +20,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reuse transfer buffers in remote copies. The source `rcpd` now keeps its read buffer per data
+  connection between files, as the destination keeps its receive buffer, and
+  `--remote-copy-buffer-retention-limit` applies to both. The destination writes each file from that
+  buffer in whole chunks instead of through a second, per-file buffer. A file within the limit (2
+  MiB by default) no longer costs a memory mapping and its page faults on each side. On one 20-CPU
+  host, remote copies of 64 KiB to 1 MB files took 24% to 56% less time; larger files are unchanged
+  unless the limit is raised or the chunk is lowered to it.
 - Read the summary's CPU time with `getrusage(2)`: it is reported to the millisecond instead of in
   10 ms clock ticks. Statistics no longer read as zero when `/proc` is unavailable; peak memory then
   comes from `getrusage(2)` as well.

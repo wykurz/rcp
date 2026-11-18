@@ -594,29 +594,29 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 
 ### rcp Flags for Remote Operations
 
-| Flag                                        | Description                                                                                 |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `--rcpd-path=PATH`                          | Override rcpd binary path on remote hosts                                                   |
-| `--auto-deploy-rcpd`                        | Automatically deploy rcpd to remote hosts                                                   |
-| `--remote-copy-conn-timeout-sec=N`          | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy) |
-| `--remote-keepalive-sec=N`                  | Dead-peer detection budget, 0 disables (default: 120)                                       |
-| `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999")                                          |
-| `--max-files-in-flight=LIMIT`               | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                            |
-| `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                          |
-| `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                               |
-| `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default) or `internet`                                         |
-| `--remote-copy-buffer-size=SIZE`            | Maximum transfer buffer/file I/O request size (default: 16 MiB datacenter, 2 MiB internet)  |
-| `--remote-copy-buffer-retention-limit=SIZE` | Per-connection receiver scratch retention (default: min(copy chunk, 2 MiB); 0 disables)     |
+| Flag                                        | Description                                                                                       |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `--rcpd-path=PATH`                          | Override rcpd binary path on remote hosts                                                         |
+| `--auto-deploy-rcpd`                        | Automatically deploy rcpd to remote hosts                                                         |
+| `--remote-copy-conn-timeout-sec=N`          | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy)       |
+| `--remote-keepalive-sec=N`                  | Dead-peer detection budget, 0 disables (default: 120)                                             |
+| `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999")                                                |
+| `--max-files-in-flight=LIMIT`               | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                                  |
+| `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                                |
+| `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                                     |
+| `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default) or `internet`                                               |
+| `--remote-copy-buffer-size=SIZE`            | Maximum transfer buffer/file I/O request size (default: 16 MiB datacenter, 2 MiB internet)        |
+| `--remote-copy-buffer-retention-limit=SIZE` | Buffer each side keeps per connection between files (default: min(copy chunk, 2 MiB); 0 disables) |
 
 The configured value must fit `usize` on the master and each daemon; otherwise argument validation
-or daemon startup fails. Accepted values apply to the source's owned read buffer, destination Tokio
-file I/O limit, and receiver scratch requests. These per-file limits are capped to the file size and
-each host's `isize::MAX`, with a one-byte minimum. These bounds ensure representable sizes, not
-available memory: excessively large settings can exhaust memory and abort a daemon. Individual disk
-and network operations can be shorter; the option does not set TCP packet or TLS record sizes.
-Destination internal and outer buffers can coexist, so choose the size with available memory and
-concurrent transfers in mind. Previously retained receiver scratch can be larger than a later file's
-request; retention remains an independent limit.
+or daemon startup fails. Accepted values apply to the source's read buffer and to the destination's
+receive buffer, which is also the size of its file writes. These per-file limits are capped to the
+file size and each host's `isize::MAX`, with a one-byte minimum. These bounds ensure representable
+sizes, not available memory: excessively large settings can exhaust memory and abort a daemon.
+Individual disk and network operations can be shorter; the option does not set TCP packet or TLS
+record sizes. Each active transfer holds one buffer of up to this size on each side, so choose the
+size with available memory and concurrent transfers in mind. A buffer kept from an earlier file can
+be larger than a later file's request; retention remains an independent limit.
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.

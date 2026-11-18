@@ -923,18 +923,17 @@ rcp --max-workers=4 /source /dest
 
 For remote copies, `--remote-copy-buffer-size` sets the maximum transfer buffer and file I/O request
 size (default: 16 MiB for datacenter, 2 MiB for internet). The configured value must fit `usize` on
-the master and each daemon; otherwise argument validation or daemon startup fails. The source's
-owned read buffer, destination Tokio file I/O limit, and receiver scratch requests use the same
-per-file limit, capped to the file size and the host's `isize::MAX`, with a one-byte minimum. The
-source reuses one buffer per nonempty file across reads and network writes; empty payloads need no
-source buffer. Individual disk and network operations can be shorter; this does not set TCP packet
-or TLS record sizes.
+the master and each daemon; otherwise argument validation or daemon startup fails. The source's read
+buffer and the destination's receive buffer use the same per-file limit, capped to the file size and
+the host's `isize::MAX`, with a one-byte minimum. The source reads into one buffer and sends from
+it; the destination fills one buffer from the network and writes it to the file in whole chunks.
+Empty payloads need no buffer. Individual disk and network operations can be shorter; this does not
+set TCP packet or TLS record sizes.
 
 These integer bounds ensure representable sizes, not available memory. There is no practical
-allocation budget check: excessively large settings can exhaust memory and abort a daemon. At the
-destination, Tokio's internal file buffer and outer transfer scratch can coexist, so choose the size
-with available memory and concurrent transfers in mind. The configured size is not a process memory
-bound.
+allocation budget check: excessively large settings can exhaust memory and abort a daemon. Each
+active transfer holds one buffer of up to this size on each side, so choose the size with available
+memory and concurrent transfers in mind. The configured size is not a process memory bound.
 
 ```bash
 # Allow up to 32 MiB per transfer buffer/file I/O request
@@ -944,13 +943,13 @@ rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
 rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
 ```
 
-Receivers lazily reuse initialized scratch per data connection, retaining up to the smaller of the
-copy chunk size and 2 MiB by default. This avoids repeated allocation and initialization for
-eligible files, at the cost of memory held until the connection closes. Retained storage can be
-larger than a later file's scratch request. Use `--remote-copy-buffer-retention-limit=16MiB` to
-retain full datacenter chunks, a smaller limit to reduce idle memory, or `0` to disable reuse.
-Chunks above the limit still use the configured I/O size with temporary storage. At 100 connections
-the default retained-scratch ceiling is 200 MiB for either profile; see
+Both daemons keep their buffer per data connection between files, up to the smaller of the copy
+chunk size and 2 MiB by default. A file whose chunk fits that limit then costs no allocation and no
+initialization on either side, at the cost of memory held until the connection closes. A kept buffer
+can be larger than a later file's request. Use `--remote-copy-buffer-retention-limit=16MiB` to keep
+full datacenter chunks, a smaller limit to reduce idle memory, or `0` to disable reuse. Chunks above
+the limit still use the configured I/O size with temporary storage for each file. At 100 connections
+the default ceiling of kept buffers is 200 MiB in each daemon for either profile; see
 [connection reuse](docs/remote_protocol.md#75-data-connection-pooling) for the full memory
 accounting.
 

@@ -308,11 +308,11 @@ The source scopes have these boundaries in both the hardened and dereferencing w
 | `source.file.open`, `source.file.send`                                      | Detailed data-file opening and sending.                                                                    |
 
 The destination's detailed scopes use the `destination.file` prefix: `wait_open`, `wait_rate`,
-`parent`, `plan`, `wait_iops`, `create`, `receive`, `flush`, `metadata`, `drain`, and `complete`.
-These cover file and rate admission, parent resolution, destination classification, IOPS admission,
-creation, payload reads and writes, flushing, metadata, discarded payloads, and tracker completion
-respectively. Completion includes waiting for the tracker and any resulting directory finalization.
-A creation race can produce a second plan or create sample.
+`parent`, `plan`, `wait_iops`, `create`, `receive`, `metadata`, `drain`, and `complete`. These cover
+file and rate admission, parent resolution, destination classification, IOPS admission, creation,
+payload reads and writes, metadata, discarded payloads, and tracker completion respectively.
+Completion includes waiting for the tracker and any resulting directory finalization. A creation
+race can produce a second plan or create sample.
 
 The destination's coarse per-directory manifest scopes separate build admission, inventory, and
 publication. `destination.manifest.wait_build` measures acquiring the manifest-build semaphore.
@@ -1103,45 +1103,62 @@ a smaller range rejects an oversized `--buffer-size` during argument parsing rat
 it. For accepted values, both source adapters and the destination use the minimum of the configured
 value, the file's header size, and the host's `isize::MAX`, with a one-byte minimum. This
 representability cap is applied before narrowing the header's `u64` size. The source uses that limit
-for its owned payload buffer. The destination uses it for both its Tokio file's `max_buf_size` and
-its maximum copy-scratch request. Tokio's untouched default no longer imposes a separate 2 MiB file
-limit.
+for its payload buffer. The destination uses it for its copy scratch, which is also the size of its
+file writes.
 
 Both source adapters keep the opened standard file whose metadata and ACL describe the header. For a
-nonempty file, the async sender allocates one initialized `Vec` after flushing the header; every
-read reuses it without resizing or reinitializing it. The sender borrows the caller's admission
-guard and passes it explicitly to each blocking read; payload reads need no ambient admission scope.
-The same file and buffer move into each unprobed blocking job and return together. Interrupted reads
-retry; positive short reads are sent immediately. Each read is bounded by the remaining advertised
-bytes. The async writer borrows that buffer until `write_all` completes, before another read can
-overwrite it. There is no source Tokio file buffer or copy from such a buffer into an outer reader.
-Source buffers remain per-file allocations, with no cross-file retention or read-ahead. Empty
-payloads allocate and read nothing. After the header is flushed, payload completion (including empty
-payloads and premature EOF) explicitly flushes the transport before the source checks the byte count
-and returns the stream to the pool. Read, write, flush, and length errors leave the stream poisoned.
+nonempty file, the async sender takes one initialized buffer after flushing the header: the
+connection's kept buffer when the file's chunk fits the retention limit, a new allocation otherwise.
+Every read of the file reuses it without resizing or reinitializing it. The sender borrows the
+caller's admission guard and passes it explicitly to each blocking read; payload reads need no
+ambient admission scope. The same file and buffer move into each unprobed blocking job and return
+together. Interrupted reads retry; positive short reads are sent immediately. Each read is bounded
+by the remaining advertised bytes. The async writer borrows that buffer until `write_all` completes,
+before another read can overwrite it. There is no source Tokio file buffer or copy from such a
+buffer into an outer reader, and no read-ahead. A buffer within the retention limit stays with the
+connection for the next file; a larger one is released with its file. Empty payloads take and read
+nothing. After the header is flushed, payload completion (including empty payloads and premature
+EOF) explicitly flushes the transport before the source checks the byte count and returns the stream
+to the pool. Read, write, flush, and length errors leave the stream poisoned and keep no buffer.
 
-Individual file reads, writes, and network operations can be shorter; this setting does not promise
-TCP packet or TLS record sizes. The receiver forwards each available short read to the file without
-waiting to aggregate a full configured chunk. At the destination, Tokio's internal file buffer and
-outer transfer scratch can coexist. Larger settings allow more working memory per active transfer.
-The setting is not a process RSS bound or a throughput guarantee. Neither the argument checks nor
-the per-file cap check available memory or bound the combined allocation across active transfers.
-Excessively large settings can exhaust memory and abort a daemon; `isize::MAX` prevents
-unrepresentable byte buffer lengths, not allocation failure. RSS, CPU, and throughput effects of the
-source buffer change are unmeasured.
+The destination receives a file into the standard file it created. It collects network reads in its
+copy scratch until a whole chunk, or the rest of the file, is there, and writes that chunk with one
+blocking job, which takes the file and the scratch and returns both. A write is a handoff to another
+thread, so it is issued per chunk and not per network read; bytes that arrived with the header come
+first. The receiver borrows the file's admission guard and passes it to each blocking write, as the
+sender does for reads. There is no Tokio file buffer and no second copy of the payload, and every
+write has returned before the file's metadata is applied. A read or write error, a truncated payload
+and a cancelled transfer leave the stream at an unknown position; a chunk that never filled is not
+written, and no scratch is kept.
 
-The destination lazily retains initialized copy scratch per data connection, growing only to the
-chunk needed for the remaining unbuffered payload. Empty files and payloads already in the framed
-reader need no scratch allocation. The default retention limit is the smaller of
-`--remote-copy-buffer-size` and 2 MiB. Retention does not change the configured I/O maximum.
+Individual file reads and network operations can be shorter; this setting does not promise TCP
+packet or TLS record sizes. Larger settings allow more working memory per active transfer: one
+buffer of up to the chunk size on each side. The setting is not a process RSS bound or a throughput
+guarantee. Neither the argument checks nor the per-file cap check available memory or bound the
+combined allocation across active transfers. Excessively large settings can exhaust memory and abort
+a daemon; `isize::MAX` prevents unrepresentable byte buffer lengths, not allocation failure.
+
+Both sides lazily keep one initialized buffer per data connection: the source its payload buffer,
+the destination its copy scratch. Each grows only to the chunk a file needs. Empty files need no
+buffer, and a skipped file's payload that is already in the framed reader is drained without
+scratch. The default retention limit is the smaller of `--remote-copy-buffer-size` and 2 MiB.
+Retention does not change the configured I/O maximum.
 
 Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
 example, `16MiB` to reuse full datacenter chunks); `0` disables retention. The shared daemon
-configuration forwards `--buffer-retention-limit=BYTES` to both roles, but only the destination uses
-it. It does not configure source reader buffers. The limit does not shrink I/O chunks: chunks
-exceeding it use temporary storage for that file. Smaller files and 8 KiB drains reuse retained
-storage when their required chunk fits the limit; drains above the limit also use temporary storage.
-A limit above the copy chunk does not eagerly allocate that amount.
+configuration forwards `--buffer-retention-limit=BYTES` to both roles, and both use it: the source
+for its payload buffers, the destination for its copy scratch. The limit does not shrink I/O chunks:
+on either side a chunk exceeding it uses temporary storage for that file, so a file larger than the
+limit costs each side one allocation of its chunk. Smaller files and 8 KiB drains reuse kept storage
+when their required chunk fits the limit; drains above the limit also use temporary storage. A limit
+above the copy chunk does not eagerly allocate that amount.
+
+Reuse matters more than the size of a buffer suggests. In the statically linked daemons an
+allocation of this size is a fresh memory mapping, so a buffer per file costs a mapping, a page
+fault for every 4 KiB of the file and an unmapping, on each side. In a daemon with many transfers in
+flight on many cores those operations contend in the kernel: a run on a 96-CPU host spent most of
+its CPU time there while copying 1 MB files, with about one file's worth of page faults per file in
+each daemon.
 
 The 2 MiB default balances observed reuse benefits against idle memory. Measurements reported on
 [one WSL2 host using tmpfs and loopback](https://github.com/wykurz/rcp/pull/332#issuecomment-5975364418)
@@ -1150,18 +1167,20 @@ limit than with 16 MiB retention. This is evidence for the default policy, not a
 guarantee or an optimum for physical high-bandwidth networks; the override allows tuning for those
 workloads.
 
-A boxed slice has no spare capacity, so initialized retained scratch is bounded by the limit times
-the effective connection count, `min(max-files-in-flight, max-connections)`. At 32 connections the
-default ceiling is 64 MiB; at the default 100-connection ceiling it is 200 MiB for either profile.
-An explicit 16 MiB limit raises those ceilings to 512 MiB and 1600 MiB. Automatic file concurrency
-uses the source CPU count (at least four). Descriptor admission can further limit active file
-operations but does not reduce the connection pool: all connections may eventually retain buffers.
-Retention grows only as connections encounter payloads that need scratch, and trades idle memory for
-fewer allocations and repeated initializations. These storage bounds exclude allocator overhead,
-framing, transport, source buffers, active temporary buffers, and transient overlap when growing a
-buffer; they are not process RSS bounds. Dropping a copy future releases temporary storage; retained
-storage lives until the receive connection drops. Interrupted transfers still require discarding the
-stream.
+Kept buffers have no spare capacity (the destination's is a boxed slice, the source's a vector
+allocated at its exact length), so in each daemon they are bounded by the limit times the effective
+connection count, `min(max-files-in-flight, max-connections)`. At 32 connections the default ceiling
+is 64 MiB per daemon; at the default 100-connection ceiling it is 200 MiB per daemon for either
+profile. An explicit 16 MiB limit raises those ceilings to 512 MiB and 1600 MiB. Automatic file
+concurrency uses the source CPU count (at least four). Descriptor admission can further limit active
+file operations but does not reduce the connection pool: all connections may eventually keep
+buffers. Retention grows only as connections encounter payloads that need a buffer, and trades idle
+memory for fewer allocations and repeated initializations. In a file transfer a smaller kept buffer
+is released before a larger one replaces it. These storage bounds exclude allocator overhead,
+framing, transport, active temporary buffers, and transient overlap when a drain grows the scratch;
+they are not process RSS bounds. Dropping a transfer future releases its temporary storage, or the
+buffer it had taken from its connection; kept storage otherwise lives until the connection drops.
+Interrupted transfers still require discarding the stream.
 
 **Connection lifecycle:**
 

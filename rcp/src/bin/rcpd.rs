@@ -193,22 +193,24 @@ struct Args {
 
     /// Maximum transfer buffer and file I/O request size, in bytes.
     ///
-    /// Sets the source buffer size, destination file I/O limit, and receiver scratch request sizes.
+    /// Sets the size of the source's read buffer and of the destination's receive buffer, which
+    /// is also the size of its file writes.
     /// The configured value must fit usize on the master and each daemon; otherwise
     /// argument validation or daemon startup fails. Accepted per-file limits are capped
     /// to the file size and the host's isize::MAX, with a one-byte minimum.
     /// These are representability limits, not available-memory checks; oversized settings
     /// can still exhaust memory and abort a daemon. Individual disk/network operations can be shorter;
     /// this does not set TCP packet or TLS record sizes.
-    /// Destination Tokio file buffers and outer transfer scratch can coexist, so larger
-    /// limits allow more working memory. Receiver scratch retention is controlled separately.
+    /// Each active transfer holds one buffer of up to this size on each side, so larger limits
+    /// allow more working memory. Keeping buffers between files is controlled separately.
     ///
     /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     buffer_size: Option<usize>,
 
-    /// Maximum receiver scratch retained per data connection, in bytes.
+    /// Maximum transfer buffer kept per data connection between files, in bytes.
     ///
+    /// The source keeps its read buffer and the destination its receive buffer.
     /// Defaults to min(effective buffer size, 2 MiB). Allocated lazily; zero disables retention.
     /// Does not change I/O chunk sizes: larger chunks use temporary storage per file.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
