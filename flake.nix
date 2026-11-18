@@ -140,6 +140,9 @@
 
         nativeBuildInputs = [ targetPlatform.packagePkgs.buildPackages.pkg-config ];
 
+        # diagnostic source paths must not keep the build toolchain in installed packages
+        disallowedRequisites = [ rustToolchain ];
+
         # keep a dependency-free package on the exact production package path. Its check output
         # is small enough for every native lint run to realize, while still exercising the real
         # build, check, install, linker, and pinned-toolchain behavior.
@@ -193,6 +196,10 @@
           }
 
           fn main() {
+              // generic std panic locations must not retain the rust-src toolchain path
+              let mut values = std::hint::black_box(vec![4, 2, 3, 1]);
+              values.sort();
+              assert_eq!(values, [1, 2, 3, 4]);
               println!(
                   "rcp-nix-package-abi-smoke:{}:{}",
                   std::env::consts::ARCH,
@@ -227,7 +234,9 @@
           src = abiSmokeSource;
           cargoLock.lockFile = abiSmokeCargoLock;
 
-          inherit nativeBuildInputs;
+          inherit nativeBuildInputs disallowedRequisites;
+          cargoBuildFlags = nixSandboxCargoFlags;
+          cargoTestFlags = nixSandboxCargoFlags;
 
           RCP_NIX_ABI_EXPECTED_ARCH = abiSmokePlatform.rustArch;
           RCP_NIX_ABI_EXPECTED_ENV = abiSmokePlatform.rustEnv;
@@ -320,7 +329,14 @@
         # build.rustflags. A matching cfg target joins these required cfgs with the exact-target
         # flags instead of replacing them. Pass the same config to build and test so rustflags do
         # not invalidate otherwise reusable release units between the two phases.
-        nixSandboxRustflags = ''target.'cfg(all())'.rustflags=["--cfg","tokio_unstable","--cfg","rcp_nix_sandbox"]'';
+        nixSandboxRustflags = "target.'cfg(all())'.rustflags=" + builtins.toJSON [
+          "--cfg"
+          "tokio_unstable"
+          "--cfg"
+          "rcp_nix_sandbox"
+          # rust-src makes generic std panic locations contain the compiler's store path
+          "--remap-path-prefix=${rustToolchain}=/rustc"
+        ];
         nixSandboxCargoFlags = [ "--config" nixSandboxRustflags ];
         # avoid cross-crate LTO for every test executable while retaining release optimization
         # and local thin LTO. The install hook saves the production build before checks run.
@@ -337,7 +353,7 @@
               lockFile = ./Cargo.lock;
             };
 
-            inherit buildInputs nativeBuildInputs;
+            inherit buildInputs nativeBuildInputs disallowedRequisites;
 
             # Build and test only the specific package
             cargoBuildFlags = [ "-p" packageName ] ++ nixSandboxCargoFlags;
@@ -485,7 +501,7 @@
               lockFile = ./Cargo.lock;
             };
 
-            inherit buildInputs nativeBuildInputs;
+            inherit buildInputs nativeBuildInputs disallowedRequisites;
 
             cargoBuildFlags = nixSandboxCargoFlags;
             cargoTestFlags = nixSandboxTestFlags;

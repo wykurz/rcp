@@ -156,6 +156,11 @@ also prevents a rustflag-only mismatch from invalidating otherwise reusable rele
 check. Do not use the `RUSTFLAGS` environment variable for this: it takes precedence over all target
 entries and would replace the packaging flags instead of joining them.
 
+Those flags also remap the build toolchain's store prefix to `/rustc`, preserving readable standard
+library source locations without retaining the compiler as a runtime dependency. All package outputs
+reject that dependency. The native ABI smoke test exercises generic standard library code through
+the same flags and dependency guard while retaining its required musl runtime libraries.
+
 Nix checks use the release profile with a check-command-only `profile.release.lto=false` override.
 This avoids repeating cross-crate LTO for every test executable while retaining release
 optimization, debug information, and local thin LTO. The package build still uses the unchanged

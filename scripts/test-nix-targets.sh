@@ -221,6 +221,10 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
           (input: builtins.match ".*pkg-config-wrapper-.*" (nameOf input) != null)
           package.nativeBuildInputs;
         compilerProviders = compilerProviderNamesOf package.nativeBuildInputs;
+        guardedRequisites =
+          if package.__structuredAttrs or false
+          then package.outputChecks.out.disallowedRequisites or [ ]
+          else package.disallowedRequisites or [ ];
       in
         [
           (equals "${label} shares the filtered workspace source"
@@ -252,6 +256,11 @@ RCP_NIX_TEST_ROOT="$REPO_ROOT" "$NIX_BIN" eval --impure --raw --expr '
           (isTrue "${label} has a pinned Rust provider" (compilerProviders != [ ]))
           (isTrue "${label} uses only the pinned Rust provider"
             (builtins.all isPinnedCompilerProvider compilerProviders))
+          (isTrue "${label} rejects the pinned compiler as a runtime dependency"
+            (builtins.any
+              (input: nameOf input == "rust-default-1.95.0"
+                && builtins.elem (toString input) (map toString guardedRequisites))
+              package.nativeBuildInputs))
           (equals "${label} has no redundant explicit musl toolchain" 0
             (builtins.length (muslToolsOf package.nativeBuildInputs)))
         ]
