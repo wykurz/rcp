@@ -262,6 +262,18 @@ verification, and commit and push that branch. If the branch already has an open
 commits to that same source branch so the existing PR updates; do not create another PR. Keep the
 worktree available for review follow-ups.
 
+RCP permits passing pull requests whose branch is behind the current base. At publication and final
+handoff, fetch the base and check for conflicts or interacting upstream changes, but do not rebase
+solely because the base advanced. Rebase when needed for conflicts, when interacting changes need
+verification together, or at the user's request; rerun required verification if this changes tested
+inputs. This repository policy overrides generic requirements to rebase unconditionally before
+publication or after every base update.
+
+Keep **Rebase and merge** as the only allowed GitHub merge method and preserve required linear
+history. GitHub replays the PR commits onto the current base when it merges the PR; a separate
+branch update is unnecessary for unrelated base changes. Existing required PR checks remain in
+force, and full CI on `main` verifies the combined result after merge.
+
 After creating a PR, check all review comments (including automated ones from Copilot). Evaluate
 each on its merit — address valid suggestions and respond to ones that aren't applicable.
 
