@@ -193,22 +193,27 @@ impl DockerEnv {
     /// Write a file to a container
     pub fn write_file(&self, container: &str, path: &str, content: &[u8]) -> Result<()> {
         let container_name = format!("rcp-test-{}", container);
-        // use printf to write content without adding newlines
-        let content_str = String::from_utf8_lossy(content);
-        // escape single quotes in content for shell
-        let escaped_content = content_str.replace('\'', "'\\''");
-        let mut cmd = Command::new("docker");
-        cmd.args([
-            "exec",
-            &container_name,
-            "sh",
-            "-c",
-            &format!("printf '%s' '{}' > {}", escaped_content, path),
-        ]);
-        let output = cmd.output()?;
+        // a file supplies arbitrary bytes without argument limits or a pipe writer to manage
+        let mut input = tempfile::tempfile()?;
+        std::io::Write::write_all(&mut input, content)?;
+        std::io::Seek::rewind(&mut input)?;
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                &container_name,
+                "sh",
+                "-c",
+                "cat > \"$1\"",
+                "sh",
+                path,
+            ])
+            .stdin(input)
+            .output()?;
         if !output.status.success() {
             return Err(format!(
-                "Failed to write file: {}",
+                "failed to write file {path:?} in {container_name}: {}: {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             )
             .into());
@@ -221,7 +226,15 @@ impl DockerEnv {
     pub fn read_file(&self, container: &str, path: &str) -> Result<Vec<u8>> {
         let container_name = format!("rcp-test-{}", container);
         let output = Command::new("docker")
-            .args(["exec", &container_name, "cat", path])
+            .args([
+                "exec",
+                &container_name,
+                "sh",
+                "-c",
+                "cat < \"$1\"",
+                "sh",
+                path,
+            ])
             .output()?;
         if !output.status.success() {
             return Err(format!(
@@ -237,26 +250,59 @@ impl DockerEnv {
     #[allow(dead_code, reason = "used by a subset of Docker test binaries")]
     pub fn file_exists(&self, container: &str, path: &str) -> Result<bool> {
         let container_name = format!("rcp-test-{}", container);
+        // absence is a successful query; Docker failures must remain errors
         let output = Command::new("docker")
-            .args(["exec", &container_name, "test", "-f", path])
+            .args([
+                "exec",
+                &container_name,
+                "sh",
+                "-c",
+                "if test -f \"$1\"; then printf true; else printf false; fi",
+                "sh",
+                path,
+            ])
             .output()?;
-        Ok(output.status.success())
+        if !output.status.success() {
+            return Err(format!(
+                "failed to check file {path:?} in {container_name}: {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        match output.stdout.as_slice() {
+            b"true" => Ok(true),
+            b"false" => Ok(false),
+            _ => Err(format!(
+                "unexpected file query response for {path:?} in {container_name}: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+            .into()),
+        }
     }
 
     /// Remove a file from a container
     #[allow(dead_code, reason = "used by a subset of Docker test binaries")]
     pub fn remove_file(&self, container: &str, path: &str) -> Result<()> {
         let container_name = format!("rcp-test-{}", container);
-        Command::new("docker")
-            .args(["exec", &container_name, "rm", "-f", path])
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "rm", "-f", "--", path])
             .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to remove file {path:?} in {container_name}: {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
         Ok(())
     }
 
     /// Create a file of specified size filled with a pattern.
     ///
-    /// This uses `dd` to create files, which is more efficient for larger files
-    /// than `write_file` (which uses printf and has shell argument limits).
+    /// This uses `dd` inside the container, avoiding local fixture generation and transfer
+    /// for large files.
     ///
     /// # Arguments
     /// * `container` - Container name (e.g., "host-a")
