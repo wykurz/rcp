@@ -20,6 +20,14 @@ mod support;
 
 use support::docker_env::{DockerEnv, Result};
 
+fn helper_file_path(label: &str) -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_nanos();
+    format!("/tmp/rcp-helper-{timestamp}-{label}")
+}
+
 #[test]
 #[ignore = "requires Docker containers to be running"]
 fn creates_docker_environment() {
@@ -31,12 +39,7 @@ fn creates_docker_environment() {
 #[ignore = "requires Docker containers to be running"]
 fn round_trips_container_file() {
     let env = DockerEnv::new().expect("Failed to create environment");
-    // use unique filename to avoid collisions with other test binaries
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let test_file = format!("/tmp/test-write-{}.txt", timestamp);
+    let test_file = helper_file_path("text");
     // write a file
     env.write_file("host-a", &test_file, b"test content")
         .expect("Failed to write file");
@@ -50,13 +53,117 @@ fn round_trips_container_file() {
     let content = env
         .read_file("host-a", &test_file)
         .expect("Failed to read file");
-    assert!(
-        String::from_utf8_lossy(&content).contains("test content"),
-        "Content mismatch"
-    );
+    assert_eq!(content, b"test content", "Content mismatch");
     // clean up
     env.remove_file("host-a", &test_file)
         .expect("Failed to remove file");
+    assert!(
+        !env.file_exists("host-a", &test_file)
+            .expect("Failed to check removed file"),
+        "Removed file should be absent"
+    );
+    env.remove_file("host-a", &test_file)
+        .expect("Removing an absent file should succeed");
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn round_trips_binary_container_file() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let path = helper_file_path("binary");
+    // include every byte value and exceed Linux's single-argument size limit
+    let content: Vec<u8> = (0..=255).cycle().take(256 * 1024).collect();
+    env.write_file("host-a", &path, &content)?;
+    assert_eq!(env.read_file("host-a", &path)?, content);
+    env.remove_file("host-a", &path)?;
+    assert!(!env.file_exists("host-a", &path)?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn round_trips_non_utf8_container_file() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let path = helper_file_path("non-utf8");
+    let content = b"before\xff\x80after";
+    env.write_file("host-a", &path, content)?;
+    assert_eq!(env.read_file("host-a", &path)?, content);
+    env.remove_file("host-a", &path)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn round_trips_container_file_with_shell_characters() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let path = helper_file_path("space ' \"$;?.txt");
+    let content = b"literal ' \" $ and trailing newline\n";
+    env.write_file("host-a", &path, content)?;
+    assert!(env.file_exists("host-a", &path)?);
+    assert_eq!(env.read_file("host-a", &path)?, content);
+    env.remove_file("host-a", &path)?;
+    assert!(!env.file_exists("host-a", &path)?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn round_trips_dash_named_container_file() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let path = "-";
+    let content = b"a literal dash is a filename";
+    assert!(!env.file_exists("host-a", path)?);
+    env.write_file("host-a", path, content)?;
+    assert!(env.file_exists("host-a", path)?);
+    let actual = env.read_file("host-a", path)?;
+    env.remove_file("host-a", path)?;
+    assert!(!env.file_exists("host-a", path)?);
+    assert_eq!(actual, content);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn file_removal_reports_command_failure() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let error = env
+        .remove_file("host-a", "/tmp")
+        .expect_err("rm must reject a directory");
+    assert!(
+        error.to_string().contains("/tmp"),
+        "Missing path in error: {error:#}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn file_operations_report_unavailable_container() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let error = env
+        .file_exists("missing-helper-container", "/tmp/file")
+        .expect_err("Docker failure must not look like an absent file");
+    assert!(
+        error.to_string().contains("missing-helper-container"),
+        "Missing container in error: {error:#}"
+    );
+    env.remove_file("missing-helper-container", "/tmp/file")
+        .expect_err("Docker failure must not look like successful removal");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Docker containers to be running"]
+fn file_write_reports_command_failure() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let error = env
+        .write_file("host-a", "/tmp", b"cannot overwrite a directory")
+        .expect_err("Writing over a directory must fail");
+    assert!(
+        error.to_string().contains("/tmp"),
+        "Missing path in error: {error:#}"
+    );
+    Ok(())
 }
 
 /// Test basic file copy between two remote hosts

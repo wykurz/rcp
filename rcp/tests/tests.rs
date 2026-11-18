@@ -347,10 +347,7 @@ fn test_relative_symlink() {
     let src_symlink = src_dir.path().join("rel_link.txt");
     let dst_symlink = dst_dir.path().join("rel_link.txt");
     create_test_file(&target, "relative target", 0o644);
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(src_dir.path()).unwrap();
     create_symlink(std::path::Path::new("target.txt"), &src_symlink);
-    std::env::set_current_dir(original_dir).unwrap();
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_symlink.to_str().unwrap(), dst_symlink.to_str().unwrap()])
         .assert()
