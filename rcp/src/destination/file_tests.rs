@@ -1,7 +1,9 @@
-//! Finalization assertions inspect process-global counters and admission state. Each test runs in
-//! its own child process so these checks also remain exact under parallel libtest execution.
+//! Finalization assertions inspect process-global counters and admission state, and one test
+//! lowers the process's file-size limit. Each test runs in its own child process so these checks
+//! also remain exact under parallel libtest execution.
 
 use super::*;
+use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
@@ -126,8 +128,9 @@ impl tokio::io::AsyncRead for GatedPayload {
 }
 
 #[test]
-fn receiver_uses_configured_file_write_limits() {
-    const TEST_NAME: &str = "destination::file_tests::receiver_uses_configured_file_write_limits";
+fn receiver_writes_whole_configured_chunks_and_reads_nothing_ahead() {
+    const TEST_NAME: &str =
+        "destination::file_tests::receiver_writes_whole_configured_chunks_and_reads_nothing_ahead";
     if crate::test_process::run_in_child(TEST_NAME) {
         return;
     }
@@ -162,6 +165,7 @@ fn receiver_uses_configured_file_write_limits() {
                 ..testutils::copy_settings()
             };
             let preservation = common::preserve::preserve_all();
+            let guard = throttle::open_file_permit().await;
             let mut receive = Box::pin(process_single_file(
                 &settings,
                 &preservation,
@@ -169,6 +173,7 @@ fn receiver_uses_configured_file_write_limits() {
                 &header,
                 &parent,
                 OsStr::new("destination"),
+                &guard,
             ));
             tokio::select! {
                 _ = &mut receive => panic!("receiver finished before its first payload read"),
@@ -185,9 +190,10 @@ fn receiver_uses_configured_file_write_limits() {
                 .unwrap()
                 .map_err(|error| error.source)
                 .unwrap();
-            assert!(pending, "the final write must wait for the occupied worker");
-            // a hidden smaller File limit blocks inside the first write_all, before the next read
-            assert_eq!(read_before_write_completed, configured + 1);
+            assert!(pending, "the first write must wait for the occupied worker");
+            // the first write carries one whole configured chunk: a hidden smaller limit would
+            // have submitted it sooner, and nothing is read ahead of a write in flight
+            assert_eq!(read_before_write_completed, configured);
             assert_eq!(
                 std::fs::read(&header.dst).unwrap(),
                 vec![0x5a; configured + 1]
@@ -198,8 +204,8 @@ fn receiver_uses_configured_file_write_limits() {
 }
 
 #[test]
-fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() {
-    const TEST_NAME: &str = "destination::file_tests::receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode";
+fn receiver_finalization_applies_metadata_to_the_created_inode_through_its_descriptor() {
+    const TEST_NAME: &str = "destination::file_tests::receiver_finalization_applies_metadata_to_the_created_inode_through_its_descriptor";
     if crate::test_process::run_in_child(TEST_NAME) {
         return;
     }
@@ -207,18 +213,17 @@ fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
         let held_path = tmp.path().join("held-destination");
-        let file = create_file(&path);
+        let mut file = create_file(&path);
         let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
         let header = file_header(&path);
         let preservation = common::preserve::preserve_all();
         let counts = (progress().files_copied.get(), progress().bytes_copied.get());
-        let mut file = tokio::fs::File::from_std(file);
+        file.write_all(PAYLOAD).unwrap();
         let worker = OccupiedWorker::start().await;
-        file.write_all(PAYLOAD).await.unwrap();
         let mut finalize = Box::pin(finalize_received_file(file, &header, &preservation));
         let pending = futures::poll!(finalize.as_mut()).is_pending();
         let before = std::fs::metadata(&path).unwrap();
-        let uncounted = (progress().files_copied.get(), progress().bytes_copied.get());
+        let counted = (progress().files_copied.get(), progress().bytes_copied.get());
         std::fs::rename(&path, &held_path).unwrap();
         std::fs::write(&path, b"replacement").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -228,13 +233,19 @@ fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() 
             .await
             .unwrap()
             .unwrap();
-        assert!(pending, "finalization must wait for the last Tokio write");
-        assert_eq!(before.len(), 0);
+        assert!(
+            pending,
+            "the metadata job must wait for the occupied worker"
+        );
+        // the payload is on disk and counted before its metadata is applied; until then the file
+        // keeps its private creation mode
+        assert_eq!(before.len(), header.size);
         assert_eq!(
             before.mode() & 0o7777,
             common::safedir::DST_FILE_CREATE_MODE
         );
-        assert_eq!(uncounted, counts);
+        assert_eq!(counted, (counts.0 + 1, counts.1 + header.size));
+        // the name was given to another file meanwhile: the metadata follows the descriptor
         let held = std::fs::metadata(&held_path).unwrap();
         assert_eq!(held.ino(), before.ino());
         assert_eq!(held.mode() & 0o7777, header.metadata.mode);
@@ -263,108 +274,77 @@ fn receiver_finalization_waits_for_delayed_writes_and_keeps_the_created_inode() 
 }
 
 #[test]
-fn receiver_flush_failure_keeps_the_file_private_and_uncounted() {
+fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
     const TEST_NAME: &str =
-        "destination::file_tests::receiver_flush_failure_keeps_the_file_private_and_uncounted";
+        "destination::file_tests::receiver_write_failure_keeps_the_file_private_and_uncounted";
     if crate::test_process::run_in_child(TEST_NAME) {
         return;
     }
     one_worker_runtime().block_on(async {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("destination");
-        drop(create_file(&path));
-        let header = file_header(&path);
-        let before = std::fs::metadata(&path).unwrap();
-        // a real read-only descriptor lets Tokio accept bytes before its queued write fails
-        let file = std::fs::File::open(&path).unwrap();
-        let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
-        let mut file = tokio::fs::File::from_std(file);
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        drop(create_file(&fixture));
+        let mut header = file_header(&fixture);
+        header.dst = temp.path().join("destination");
+        let parent = Arc::new(
+            Dir::open_root_dir(temp.path(), false, common::Side::Destination)
+                .await
+                .unwrap(),
+        );
+        let mut stream = remote::streams::RecvStream::new(Box::new(std::io::Cursor::new(
+            PAYLOAD.to_vec(),
+        )) as remote::streams::BoxedRead);
+        let settings = testutils::copy_settings();
         let preservation = common::preserve::preserve_all();
         let counts = (progress().files_copied.get(), progress().bytes_copied.get());
-        let worker = OccupiedWorker::start().await;
-        file.write_all(PAYLOAD).await.unwrap();
-        let mut finalize = Box::pin(finalize_received_file(file, &header, &preservation));
-        let pending = futures::poll!(finalize.as_mut()).is_pending();
-        worker.finish().await;
-        let error = tokio::time::timeout(std::time::Duration::from_secs(5), finalize)
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(pending);
-        assert_eq!(error.to_string(), format!("failed flushing {:?}", path));
+        let guard = throttle::open_file_permit().await;
+        // from here on the kernel refuses to grow any file of this process past eight bytes. The
+        // test has a process of its own; the signal that comes with the refusal would end it
+        // before the write could report the error.
+        let limit = libc::rlimit {
+            rlim_cur: 8,
+            rlim_max: 8,
+        };
+        // SAFETY: both calls take plain values; the limit outlives the call that reads it.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0);
+        }
+        let error = process_single_file(
+            &settings,
+            &preservation,
+            &mut stream,
+            &header,
+            &parent,
+            OsStr::new("destination"),
+            &guard,
+        )
+        .await
+        .expect_err("a write the kernel refuses must fail the file");
+        // the payload was taken off the wire but never reached the file: the stream cannot go on
+        assert_eq!(error.stream_state, StreamState::Corrupted);
+        assert_eq!(
+            error.source.to_string(),
+            "failed to write destination payload"
+        );
         assert_eq!(
             error
+                .source
                 .downcast_ref::<std::io::Error>()
                 .unwrap()
                 .raw_os_error(),
-            Some(libc::EBADF)
+            Some(libc::EFBIG)
         );
         assert_eq!(
             (progress().files_copied.get(), progress().bytes_copied.get()),
             counts
         );
-        let remaining = std::fs::metadata(&path).unwrap();
-        assert_eq!(remaining.len(), 0);
-        assert_eq!(remaining.mode(), before.mode());
+        let remaining = std::fs::metadata(&header.dst).unwrap();
+        assert_eq!(remaining.len(), 8);
         assert_eq!(
-            (remaining.mtime(), remaining.mtime_nsec()),
-            (before.mtime(), before.mtime_nsec())
-        );
-        assert!(identity.original_is_closed().unwrap());
-    });
-    crate::test_process::completed(TEST_NAME);
-}
-
-#[test]
-fn receiver_conversion_failure_keeps_the_file_private_and_uncounted() {
-    const TEST_NAME: &str =
-        "destination::file_tests::receiver_conversion_failure_keeps_the_file_private_and_uncounted";
-    if crate::test_process::run_in_child(TEST_NAME) {
-        return;
-    }
-    one_worker_runtime().block_on(async {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("destination");
-        let file = create_file(&path);
-        let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
-        let header = file_header(&path);
-        let preservation = common::preserve::preserve_all();
-        let counts = (progress().files_copied.get(), progress().bytes_copied.get());
-        let mut file = tokio::fs::File::from_std(file);
-        file.write_all(PAYLOAD).await.unwrap();
-        file.flush().await.unwrap();
-        let worker = OccupiedWorker::start().await;
-        // inject an extra Tokio reference to exercise defensive conversion failure; the receiver
-        // does not issue this untracked metadata operation in its normal write/flush flow
-        let mut metadata = Box::pin(file.metadata());
-        let pending = futures::poll!(metadata.as_mut()).is_pending();
-        drop(metadata);
-        let result = finalize_received_file(file, &header, &preservation).now_or_never();
-        let retained_before_release = !identity.original_is_closed().unwrap();
-        worker.finish().await;
-        tokio::task::spawn_blocking(|| ()).await.unwrap();
-        assert!(pending);
-        assert!(retained_before_release);
-        let error = result
-            .expect("conversion must fail without waiting")
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "failed converting flushed destination {:?}: Tokio still retains a file reference",
-                path
-            )
-        );
-        assert_eq!(
-            (progress().files_copied.get(), progress().bytes_copied.get()),
-            counts
-        );
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().mode() & 0o7777,
+            remaining.mode() & 0o7777,
             common::safedir::DST_FILE_CREATE_MODE
         );
-        assert_eq!(std::fs::read(path).unwrap(), PAYLOAD);
-        assert!(identity.original_is_closed().unwrap());
     });
     crate::test_process::completed(TEST_NAME);
 }
@@ -378,16 +358,14 @@ fn cancelled_receiver_finalization_closes_the_owner_before_queued_metadata_runs(
     one_worker_runtime().block_on(async {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("destination");
-        let file = create_file(&path);
+        let mut file = create_file(&path);
         let identity = FdIdentityProbe::capture(file.as_raw_fd()).unwrap();
         let header = file_header(&path);
         let preservation = common::preserve::preserve_none();
         let _reset_admission = testutils::ResetAdmission;
         throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
         let guard = throttle::open_file_permit().await;
-        let mut file = tokio::fs::File::from_std(file);
-        file.write_all(PAYLOAD).await.unwrap();
-        file.flush().await.unwrap();
+        file.write_all(PAYLOAD).unwrap();
         let worker = OccupiedWorker::start().await;
         let metrics = tokio::runtime::Handle::current().metrics();
         let queued_before = metrics.blocking_queue_depth();
@@ -449,6 +427,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
     let settings = testutils::copy_settings();
     let preservation = common::preserve::preserve_all();
     let counts = (progress().files_copied.get(), progress().bytes_copied.get());
+    let guard = throttle::open_file_permit().await;
     let error = process_single_file(
         &settings,
         &preservation,
@@ -456,6 +435,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         &header,
         &parent,
         OsStr::new("failed-metadata"),
+        &guard,
     )
     .await
     .expect_err("invalid timestamps must fail finalization");
@@ -489,6 +469,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         &received_next,
         &parent,
         OsStr::new("next"),
+        &guard,
     )
     .await
     .map_err(|error| error.source)

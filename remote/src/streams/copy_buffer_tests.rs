@@ -1,21 +1,21 @@
 use super::*;
 
-const TEST_RETENTION_LIMIT: usize = 256 * 1024;
+pub(super) const TEST_RETENTION_LIMIT: usize = 256 * 1024;
 
-fn recv_stream<R: AsyncRead + Unpin>(reader: R) -> RecvStream<R> {
+pub(super) fn recv_stream<R: AsyncRead + Unpin>(reader: R) -> RecvStream<R> {
     RecvStream::new(reader).with_copy_buffer_retention_limit(TEST_RETENTION_LIMIT)
 }
 
-struct Reader {
+pub(super) struct Reader {
     bytes: Vec<u8>,
     offset: usize,
     max_read: usize,
-    requests: Vec<usize>,
-    fail_at: Option<usize>,
+    pub(super) requests: Vec<usize>,
+    pub(super) fail_at: Option<usize>,
 }
 
 impl Reader {
-    fn new(bytes: Vec<u8>, max_read: usize) -> Self {
+    pub(super) fn new(bytes: Vec<u8>, max_read: usize) -> Self {
         Self {
             bytes,
             offset: 0,
@@ -80,7 +80,7 @@ impl AsyncWrite for Writer {
     }
 }
 
-fn append_frame(wire: &mut Vec<u8>, value: u64) -> anyhow::Result<()> {
+pub(super) fn append_frame(wire: &mut Vec<u8>, value: u64) -> anyhow::Result<()> {
     let bytes = bitcode::serialize(&value)?;
     wire.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     wire.extend_from_slice(&bytes);

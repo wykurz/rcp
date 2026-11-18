@@ -299,23 +299,25 @@ struct Args {
 
     /// Maximum transfer buffer and file I/O request size for remote copies.
     ///
-    /// Sets the source buffer size, destination file I/O limit, and receiver scratch request sizes.
+    /// Sets the size of the source's read buffer and of the destination's receive buffer, which
+    /// is also the size of its file writes.
     /// The configured value must fit usize on the master and each daemon; otherwise
     /// argument validation or daemon startup fails. Accepted per-file limits are capped
     /// to the file size and the host's isize::MAX, with a one-byte minimum.
     /// These are representability limits, not available-memory checks; oversized settings
     /// can still exhaust memory and abort a daemon. Individual disk/network operations can be shorter;
     /// this does not set TCP packet or TLS record sizes.
-    /// Destination Tokio file buffers and outer transfer scratch can coexist, so larger
-    /// limits allow more working memory. Receiver scratch retention is controlled separately.
+    /// Each active transfer holds one buffer of up to this size on each side, so larger limits
+    /// allow more working memory. Keeping buffers between files is controlled separately.
     /// Accepts byte sizes like "256KiB", "1MiB", or plain numbers in bytes.
     ///
     /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
     #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
     remote_copy_buffer_size: Option<bytesize::ByteSize>,
 
-    /// Maximum receiver scratch retained per remote data connection.
+    /// Maximum transfer buffer each side keeps per remote data connection between files.
     ///
+    /// Applies to the source's read buffer and to the destination's receive buffer.
     /// Defaults to the smaller of the remote copy buffer size and 2 MiB.
     /// Allocated lazily, only as needed. Accepts sizes like "256KiB", "1MiB", or bytes.
     /// Zero disables reuse. Smaller limits reduce idle memory without reducing I/O chunks;

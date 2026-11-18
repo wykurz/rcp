@@ -247,13 +247,13 @@ impl AcceptingSendStreamPool {
     ///
     /// The shutdown token should be cancelled to signal the pool to close. It can be
     /// cloned and shared between multiple tasks - any clone can trigger shutdown.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Every accepted stream keeps its payload buffer between files, up to the configured
+    /// retention limit.
     fn new(
         data_listener: tokio::net::TcpListener,
         pool_size: usize,
-        profile: remote::NetworkProfile,
-        keepalive_sec: u64,
-        conn_timeout_sec: u64,
+        tcp_config: &remote::TcpConfig,
         tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
         shutdown_token: PoolShutdownToken,
         fatal: Arc<discovery::Fatal>,
@@ -266,7 +266,9 @@ impl AcceptingSendStreamPool {
         // bound each data-connection TLS accept: this handshake runs INLINE in the accept loop below,
         // so a destination that connects TCP then stalls the handshake would otherwise block ALL
         // further data connections (a hang, not just a lost connection).
-        let accept_tls_timeout = std::time::Duration::from_secs(conn_timeout_sec);
+        let (profile, keepalive_sec) = (tcp_config.network_profile, tcp_config.keepalive_sec);
+        let accept_tls_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
+        let payload_buffer_retention_limit = tcp_config.effective_buffer_retention_limit();
         // spawn task to accept data connections and manage pool
         common::task_scope::spawn_tracked(tasks, async move {
             // retain channels outside the supervised body: panic publication must precede a
@@ -294,7 +296,8 @@ impl AcceptingSendStreamPool {
                                             accept_tls_timeout,
                                             "data",
                                         ).await {
-                                            Ok((send_stream, _recv_stream)) => send_stream,
+                                            Ok((send_stream, _recv_stream)) => send_stream
+                                                .with_payload_buffer_retention_limit(payload_buffer_retention_limit),
                                             Err(e) => {
                                                 tracing::warn!("Dropping data connection: {:#}", &e);
                                                 continue;
@@ -443,9 +446,7 @@ async fn handle_connection(
     let stream_pool = AcceptingSendStreamPool::new(
         data_listener,
         pool_size,
-        tcp_config.network_profile,
-        tcp_config.keepalive_sec,
-        tcp_config.conn_timeout_sec,
+        tcp_config,
         tls_acceptor,
         pool_shutdown.clone(),
         fatal.clone(),

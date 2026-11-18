@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 #[derive(Default)]
 struct Observations {
     reads: Vec<(usize, usize)>,
+    // what each read found in the storage it was given, before filling it
+    found: Vec<Vec<u8>>,
     buffers: Vec<(usize, usize, usize)>,
     writes: Vec<(usize, Vec<u8>)>,
     flushes: usize,
@@ -42,11 +44,13 @@ struct Reader {
 
 impl Read for Reader {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        self.observations
-            .lock()
-            .unwrap()
-            .reads
-            .push((bytes.as_ptr() as usize, bytes.len()));
+        {
+            let mut observations = self.observations.lock().unwrap();
+            observations
+                .reads
+                .push((bytes.as_ptr() as usize, bytes.len()));
+            observations.found.push(bytes.to_vec());
+        }
         if let Some((started, release)) = self.gate.take() {
             let _ = started.send(());
             release
@@ -132,9 +136,9 @@ impl AsyncWrite for Writer {
     }
 }
 
-fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>>) {
-    let observations = Arc::new(Mutex::new(Observations::default()));
-    let reader = Reader {
+/// A further file for a stream whose observations already exist.
+fn reader(observations: &Arc<Mutex<Observations>>, bytes: &[u8]) -> Reader {
+    Reader {
         observations: observations.clone(),
         bytes: std::io::Cursor::new(bytes.to_vec()),
         short: usize::MAX,
@@ -142,7 +146,12 @@ fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>
         fail_at: None,
         panic_on_read: false,
         gate: None,
-    };
+    }
+}
+
+fn fixture(bytes: &[u8]) -> (Reader, SendStream<Writer>, Arc<Mutex<Observations>>) {
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let reader = reader(&observations, bytes);
     let writer = Writer {
         observations: observations.clone(),
         partial: usize::MAX,
@@ -359,7 +368,162 @@ async fn read_write_and_final_flush_errors_preserve_their_causes() {
 }
 
 // these tests change process-wide admission; keep the parent test process untouched.
-fn run_in_child(test: &str) -> anyhow::Result<bool> {
+#[tokio::test]
+async fn a_stream_reuses_its_payload_buffer_for_files_within_the_retention_limit()
+-> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let (first, stream, observed) = fixture(&[0xaa; 8]);
+    let mut stream = stream.with_payload_buffer_retention_limit(8);
+    assert!(stream.payload_buffer.is_empty());
+    assert_eq!(
+        stream
+            .send_message_with_file(&1_u64, first, 8, 8, &admission)
+            .await?,
+        8
+    );
+    let pointer = stream.payload_buffer.as_ptr() as usize;
+    assert_eq!(stream.payload_buffer.len(), 8);
+    assert_eq!(stream.payload_buffer.capacity(), 8);
+    for (bytes, configured) in [(&b"xyz"[..], 8), (&b"pqrstuvw"[..], 64), (&b"k"[..], 1)] {
+        let before = observed.lock().unwrap().reads.len();
+        assert_eq!(
+            stream
+                .send_message_with_file(
+                    &2_u64,
+                    reader(&observed, bytes),
+                    bytes.len() as u64,
+                    configured,
+                    &admission
+                )
+                .await?,
+            bytes.len() as u64
+        );
+        let observed = observed.lock().unwrap();
+        // a read at the same address proves nothing: an allocator hands a freed block out again.
+        // the bytes of the file before, still in the storage, prove it was neither replaced nor
+        // initialized again
+        assert_eq!(observed.reads[before..], [(pointer, bytes.len())]);
+        assert!(observed.found[before].iter().all(|byte| *byte != 0));
+        assert_eq!(stream.payload_buffer.as_ptr() as usize, pointer);
+        assert_eq!(stream.payload_buffer.len(), 8);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_payload_buffer_grows_only_to_the_chunk_a_file_needs() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let (_, stream, observed) = fixture(b"");
+    let mut stream = stream.with_payload_buffer_retention_limit(16);
+    for (size, kept) in [(0, 0), (1, 1), (8, 8), (4, 8), (16, 16), (2, 16)] {
+        let bytes = vec![0x7b; size];
+        stream
+            .send_message_with_file(
+                &1_u64,
+                reader(&observed, &bytes),
+                size as u64,
+                64,
+                &admission,
+            )
+            .await?;
+        // no spare capacity: the retention bound covers the whole allocation
+        assert_eq!(stream.payload_buffer.len(), kept);
+        assert_eq!(stream.payload_buffer.capacity(), kept);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chunk_above_the_limit_uses_temporary_storage_without_shrinking_reads()
+-> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let (first, stream, observed) = fixture(&[0xaa; 8]);
+    let mut stream = stream.with_payload_buffer_retention_limit(8);
+    stream
+        .send_message_with_file(&1_u64, first, 8, 8, &admission)
+        .await?;
+    let pointer = stream.payload_buffer.as_ptr() as usize;
+    stream
+        .send_message_with_file(&2_u64, reader(&observed, &[0x59; 32]), 32, 32, &admission)
+        .await?;
+    {
+        let observed = observed.lock().unwrap();
+        // one read of the whole chunk, into storage that was initialized for this file alone
+        assert_eq!(observed.reads[1].1, 32);
+        assert_eq!(observed.found[1], [0; 32]);
+    }
+    // the kept storage is neither replaced by the larger one nor given up for it
+    assert_eq!(stream.payload_buffer.as_ptr() as usize, pointer);
+    assert_eq!(stream.payload_buffer.len(), 8);
+    stream
+        .send_message_with_file(&3_u64, reader(&observed, b"abc"), 3, 8, &admission)
+        .await?;
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.reads[2], (pointer, 3));
+    assert_eq!(observed.found[2], [0xaa; 3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_a_retention_limit_every_file_reads_into_fresh_storage() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let (first, mut stream, observed) = fixture(&[0xaa; 8]);
+    assert_eq!(stream.payload_buffer_retention_limit(), 0);
+    stream
+        .send_message_with_file(&1_u64, first, 8, 8, &admission)
+        .await?;
+    assert_eq!(stream.payload_buffer.capacity(), 0);
+    stream
+        .send_message_with_file(&2_u64, reader(&observed, b"abc"), 3, 8, &admission)
+        .await?;
+    assert_eq!(stream.payload_buffer.capacity(), 0);
+    assert_eq!(observed.lock().unwrap().found[1], [0; 3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lowering_or_disabling_the_limit_releases_kept_payload_storage() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let (first, stream, observed) = fixture(&[0xaa; 16]);
+    let mut stream = stream.with_payload_buffer_retention_limit(16);
+    stream
+        .send_message_with_file(&1_u64, first, 16, 16, &admission)
+        .await?;
+    assert_eq!(stream.payload_buffer.len(), 16);
+    // a limit the kept storage still fits leaves it alone
+    stream = stream.with_payload_buffer_retention_limit(16);
+    assert_eq!(stream.payload_buffer.len(), 16);
+    stream = stream.with_payload_buffer_retention_limit(8);
+    assert_eq!(stream.payload_buffer.capacity(), 0);
+    stream
+        .send_message_with_file(&2_u64, reader(&observed, &[0x59; 8]), 8, 16, &admission)
+        .await?;
+    assert_eq!(stream.payload_buffer.len(), 8);
+    stream = stream.with_payload_buffer_retention_limit(0);
+    assert_eq!(stream.payload_buffer.capacity(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn debug_formats_metadata_without_writer_or_payload_contents() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let secret = b"private-source-payload";
+    // the writer deliberately has no Debug implementation; its contents must not be formatted
+    let (first, stream, _) = fixture(secret);
+    let mut stream = stream.with_payload_buffer_retention_limit(64);
+    stream
+        .send_message_with_file(&1_u64, first, secret.len() as u64, 64, &admission)
+        .await?;
+    let debug = format!("{stream:?}");
+    assert!(debug.contains(&format!("payload_buffer_len: {}", secret.len())));
+    assert!(debug.contains("payload_buffer_retention_limit: 64"));
+    assert!(!debug.contains(std::str::from_utf8(secret)?));
+    assert!(!debug.contains(&format!("{secret:?}")));
+    assert!(debug.len() < 128);
+    Ok(())
+}
+
+pub(super) fn run_in_child(test: &str) -> anyhow::Result<bool> {
     const ENV: &str = "RCP_REMOTE_SOURCE_ADMISSION_TEST";
     if std::env::var(ENV).as_deref() == Ok(test) {
         return Ok(false);
@@ -379,7 +543,7 @@ fn run_in_child(test: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn completed(test: &str) {
+pub(super) fn completed(test: &str) {
     println!("completed: {test}");
 }
 

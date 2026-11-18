@@ -3,7 +3,6 @@ use common::safedir::{Dir, RemovalSnapshot};
 use futures::{FutureExt, StreamExt};
 use std::ffi::OsStr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tracing::{Instrument, instrument};
 
 use super::directory_tracker;
@@ -230,7 +229,7 @@ struct ProcessFileError {
 /// - `NeedsDrain`: no data was read yet, drain `file_header.size` bytes to recover
 /// - `DataConsumed`: all data consumed, stream at clean boundary, can continue
 /// - `Corrupted`: mid-read error, stream position unknown, must close
-#[instrument(skip(file_recv_stream, dst_parent))]
+#[instrument(skip(file_recv_stream, dst_parent, admission))]
 async fn process_single_file(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
@@ -238,6 +237,7 @@ async fn process_single_file(
     file_header: &remote::protocol::File,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
+    admission: &throttle::OpenFileGuard,
 ) -> Result<(), ProcessFileError> {
     // errors before we start reading data - stream can be recovered by draining
     let err_needs_drain = |e: anyhow::Error| ProcessFileError {
@@ -350,19 +350,17 @@ async fn process_single_file(
             ));
         }
     };
-    // wrap the std file for async writes; the underlying fd is retained so its metadata
-    // can be applied through the held fd (no path re-open).
-    let mut file = tokio::fs::File::from_std(std_file);
-    let buffer_size = crate::configure_remote_file_buffer(
-        &mut file,
-        file_header.size,
-        settings.remote_copy_buffer_size,
-    );
-    // once we start reading from the stream, any error means the stream is corrupted
-    let copied = common::timing_scope!(trace, "destination.file.receive")
+    // the payload goes from the connection's scratch straight into this descriptor, one blocking
+    // write per chunk; the same descriptor then takes the metadata (no path re-open). The source
+    // and the destination share the chunk bound.
+    let buffer_size =
+        remote::streams::file_buffer_size(file_header.size, settings.remote_copy_buffer_size);
+    // once we start reading from the stream, any error means the stream is corrupted. The file
+    // comes back only when every byte of the header's size was written.
+    let file = common::timing_scope!(trace, "destination.file.receive")
         .measure(
             file_recv_stream
-                .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
+                .copy_exact_to_blocking_writer(std_file, file_header.size, buffer_size, admission)
                 .instrument(tracing::trace_span!(
                     "recv_data",
                     size = file_header.size,
@@ -371,39 +369,21 @@ async fn process_single_file(
         )
         .await
         .map_err(err_corrupted)?;
-    if copied != file_header.size {
-        return Err(err_corrupted(anyhow::anyhow!(
-            "File size mismatch: expected {} bytes, copied {} bytes",
-            file_header.size,
-            copied
-        )));
-    }
     finalize_received_file(file, file_header, preserve)
         .await
         .map_err(err_data_consumed)
 }
 
-/// Finish an already-consumed payload before applying metadata and recording copied counts.
+/// Record an already-written payload as copied and apply its metadata.
+///
+/// Every write of the payload has returned before this runs, so the kernel has all the data and
+/// the timestamps set here are not overtaken by a late write.
 async fn finalize_received_file(
-    mut file: tokio::fs::File,
+    file: std::fs::File,
     file_header: &remote::protocol::File,
     preserve: &common::preserve::Settings,
 ) -> anyhow::Result<()> {
     let prog = progress();
-    // flush before metadata to ensure all data reaches the kernel before we set mtime.
-    // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
-    // may complete after we set mtime, causing the file to appear modified.
-    common::timing_scope!(trace, "destination.file.flush")
-        .measure(file.flush())
-        .await
-        .with_context(|| format!("failed flushing {:?}", file_header.dst))?;
-    // conversion preserves the descriptor, but cannot report delayed write errors: flush first
-    let file = file.try_into_std().map_err(|_| {
-        anyhow::anyhow!(
-            "failed converting flushed destination {:?}: Tokio still retains a file reference",
-            file_header.dst
-        )
-    })?;
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
         file_header.src.display(),
@@ -666,7 +646,7 @@ async fn handle_file_stream(
             file_header.dst
         );
         // acquire throttle permits for this file
-        let _open_file_guard = common::timing_scope!(trace, "destination.file.wait_open")
+        let open_file_guard = common::timing_scope!(trace, "destination.file.wait_open")
             .measure(
                 throttle::open_file_permit().instrument(tracing::trace_span!("open_file_permit")),
             )
@@ -679,7 +659,7 @@ async fn handle_file_stream(
         // root file, open the trusted parent via open_parent_dir). all writes for this
         // file are then fd-relative on that pinned parent. a resolution failure is a
         // pre-data error: the stream can be recovered by draining this file's bytes.
-        let file_result = common::safedir::with_fd_admission(_open_file_guard.admission(), async {
+        let file_result = common::safedir::with_fd_admission(open_file_guard.admission(), async {
             match common::timing_scope!(trace, "destination.file.parent")
                 .measure(resolve_parent_dir(
                     &directory_tracker,
@@ -696,6 +676,7 @@ async fn handle_file_stream(
                         &file_header,
                         &dst_parent,
                         &dst_name,
+                        &open_file_guard,
                     )
                     .await
                 }
@@ -2128,6 +2109,7 @@ mod teardown_tests {
     mod resource_tests;
 
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
     async fn control_completion_progresses_while_manifest_lookups_wait_for_ops_tokens() {

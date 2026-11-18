@@ -425,7 +425,6 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                     "wait_iops",
                     "create",
                     "receive",
-                    "flush",
                     "metadata",
                     "complete",
                 ] {

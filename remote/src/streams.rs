@@ -14,9 +14,24 @@ pub fn file_buffer_size(size: u64, configured: usize) -> usize {
 /// Framed send stream for length-delimited messages.
 ///
 /// Generic over the underlying writer type - works with TCP, TLS, or any AsyncWrite.
-#[derive(Debug)]
 pub struct SendStream<W = OwnedWriteHalf> {
     framed: tokio_util::codec::FramedWrite<W, tokio_util::codec::LengthDelimitedCodec>,
+    // initialized payload storage kept between files; its whole capacity fits the retention limit
+    payload_buffer: Vec<u8>,
+    payload_buffer_retention_limit: usize,
+}
+
+impl<W> std::fmt::Debug for SendStream<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // neither the writer nor the framing and payload buffers may expose payload bytes
+        f.debug_struct("SendStream")
+            .field("payload_buffer_len", &self.payload_buffer.len())
+            .field(
+                "payload_buffer_retention_limit",
+                &self.payload_buffer_retention_limit,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<W: AsyncWrite + Unpin> SendStream<W> {
@@ -25,7 +40,28 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
             stream,
             tokio_util::codec::LengthDelimitedCodec::new(),
         );
-        Self { framed }
+        Self {
+            framed,
+            payload_buffer: Vec::new(),
+            payload_buffer_retention_limit: 0,
+        }
+    }
+
+    /// Configure the largest initialized payload buffer this connection keeps between files.
+    ///
+    /// Retention is disabled until configured. Zero disables it; a file whose chunk exceeds the
+    /// limit uses temporary storage without shrinking its reads. No storage is allocated here.
+    pub fn with_payload_buffer_retention_limit(mut self, limit: usize) -> Self {
+        self.payload_buffer_retention_limit = limit;
+        if self.payload_buffer.capacity() > limit {
+            self.payload_buffer = Vec::new();
+        }
+        self
+    }
+
+    /// Return the retention limit configured on this send stream.
+    pub fn payload_buffer_retention_limit(&self) -> usize {
+        self.payload_buffer_retention_limit
     }
 
     pub async fn send_batch_message<T: serde::Serialize>(&mut self, obj: &T) -> anyhow::Result<()> {
@@ -59,9 +95,12 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
     /// Send a header and at most its snapshot byte count from an owned source descriptor.
     ///
     /// After the header flush, one initialized payload allocation moves through admitted blocking
-    /// reads, then stays borrowed until each network write finishes. Borrowing the caller's guard
-    /// retains admission through this future; each read also retains admission for detached work.
-    /// The caller must discard the stream on failure or a returned count below `size`.
+    /// reads, then stays borrowed until each network write finishes. That allocation is the
+    /// connection's kept storage when the file's chunk fits the retention limit, and is kept for
+    /// the next file; a larger chunk gets storage of its own, which is released with the file.
+    /// Borrowing the caller's guard retains admission through this future; each read also retains
+    /// admission for detached work. The caller must discard the stream on failure or a returned
+    /// count below `size`; a failed or cancelled send keeps no storage.
     #[instrument(level = "trace", skip(self, obj, file, admission))]
     pub async fn send_message_with_file<T: serde::Serialize, R: std::io::Read + Send + 'static>(
         &mut self,
@@ -75,9 +114,16 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
             .await
             .context("failed to send source header")?;
         let buffer_size = file_buffer_size(size, configured);
+        let retain = size != 0 && buffer_size <= self.payload_buffer_retention_limit;
         let mut buffer = if size == 0 {
             Vec::new()
+        } else if retain && self.payload_buffer.len() >= buffer_size {
+            std::mem::take(&mut self.payload_buffer)
         } else {
+            if retain {
+                // release smaller kept storage before replacing it, so the two never coexist
+                self.payload_buffer = Vec::new();
+            }
             vec![0; buffer_size]
         };
         let mut sent = 0;
@@ -117,6 +163,9 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
             .flush()
             .await
             .context("failed to flush source payload")?;
+        if retain {
+            self.payload_buffer = buffer;
+        }
         Ok(sent)
     }
 
@@ -269,6 +318,82 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
         Ok(size)
     }
 
+    /// Receive exactly `size` bytes into an owned blocking writer, one write per filled chunk.
+    ///
+    /// Reads accumulate in the scratch until a whole chunk, or the rest of the payload, is there.
+    /// One admitted blocking job then takes the writer and the scratch, writes the chunk and
+    /// returns both. Unlike [`Self::copy_exact_to_buffered`], short reads are not forwarded one by
+    /// one: every blocking write is a handoff to another thread. Scratch is chosen as there: the
+    /// connection's retained storage when the chunk fits the retention limit, temporary storage
+    /// otherwise. Borrowing the caller's guard retains admission through this future; each write
+    /// also retains admission for detached work.
+    ///
+    /// The writer comes back only when all `size` bytes were written. A failed or cancelled copy
+    /// drops it, keeps no scratch, and leaves the stream at an unknown position: a chunk that
+    /// never filled is not written.
+    #[instrument(level = "trace", skip(self, writer, admission))]
+    pub async fn copy_exact_to_blocking_writer<W: std::io::Write + Send + 'static>(
+        &mut self,
+        mut writer: W,
+        size: u64,
+        buffer_size: usize,
+        admission: &throttle::OpenFileGuard,
+    ) -> anyhow::Result<W> {
+        if size == 0 {
+            return Ok(writer);
+        }
+        let chunk = file_buffer_size(size, buffer_size);
+        let retain = chunk <= self.copy_buffer_retention_limit;
+        let mut scratch = if retain && self.copy_buffer.len() >= chunk {
+            std::mem::take(&mut self.copy_buffer)
+        } else {
+            if retain {
+                // release smaller kept storage before replacing it, so the two never coexist
+                self.copy_buffer = Box::default();
+            }
+            vec![0; chunk].into_boxed_slice()
+        };
+        let mut copied = 0;
+        while copied < size {
+            let wanted = (size - copied).min(chunk as u64) as usize;
+            // bytes that arrived with the header are in the framed reader: they come first
+            let read_buffer = self.framed.read_buffer_mut();
+            let mut filled = read_buffer.len().min(wanted);
+            scratch[..filled].copy_from_slice(&read_buffer[..filled]);
+            read_buffer.advance(filled);
+            while filled < wanted {
+                let count = self
+                    .framed
+                    .get_mut()
+                    .read(&mut scratch[filled..wanted])
+                    .await?;
+                if count == 0 {
+                    anyhow::bail!(
+                        "unexpected EOF: expected {} bytes, got {}",
+                        size,
+                        copied + filled as u64
+                    );
+                }
+                filled += count;
+            }
+            let (write_result, returned_writer, returned_scratch) =
+                common::safedir::run_fd_admitted_blocking_with(admission, move || {
+                    let result = writer.write_all(&scratch[..filled]);
+                    Ok((result, writer, scratch))
+                })
+                .await
+                .context("failed to write destination payload")?;
+            writer = returned_writer;
+            scratch = returned_scratch;
+            write_result.context("failed to write destination payload")?;
+            copied += filled as u64;
+        }
+        if retain {
+            self.copy_buffer = scratch;
+        }
+        Ok(writer)
+    }
+
     pub async fn close(&mut self) {
         // for TCP, we just let the stream drop - no special cleanup needed
     }
@@ -279,6 +404,9 @@ mod coalescing_tests;
 
 #[cfg(test)]
 mod copy_buffer_tests;
+
+#[cfg(test)]
+mod file_copy_tests;
 
 #[cfg(test)]
 mod owned_source_tests;
