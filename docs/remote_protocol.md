@@ -845,7 +845,7 @@ fail-early is active. A new traversal-only empty directory is pruned only after 
 roots, explicit matches, reused directories, and ordinary unfiltered empty directories remain.
 
 Destination files are created at `0o600` through their pinned parent and receive final mode only
-after all bytes are written and flushed. The root is terminal after its own file, symlink, or
+after every payload write has returned. The root is terminal after its own file, symlink, or
 directory outcome. `DestinationDone` is sent once only when discovery is valid, the root is
 terminal, no accepted directory is pending or finalizing, and all lifetime releases have flushed.
 Structural validation detects count and ordering errors but still relies on version-matched peers to
@@ -1211,12 +1211,18 @@ receiving more files:
 | **DataConsumed** | Error after reading all data (e.g., metadata failure) | Stream at clean boundary, continue immediately |
 | **Corrupted**    | Error during data transfer                            | Discard the stream and abort the session       |
 
-**Regular-file finalization.** The receiver explicitly flushes its Tokio file and checks the result
-before converting it back to the same standard-file owner with `try_into_std` and consuming that
-owner in the metadata applier. Conversion does not replace flush-error handling. A flush failure or
-unexpected retained Tokio reference remains a `DataConsumed` error without adding copied counts;
-metadata failures retain the already-copied counts. All these errors preserve the stream's next-file
-boundary. The cancellation-lifetime residual in §7.8 still applies to destination Tokio payload I/O.
+**Regular-file finalization.** Each payload write returns before the receiver transfers the same
+standard-file owner to the metadata applier. No Tokio file conversion or additional payload flush is
+needed. A payload read/write failure is `Corrupted`; a metadata failure is `DataConsumed`, retains
+the already-copied counts, and preserves the next-file boundary. Completion means the kernel
+accepted the writes; it does not imply an `fsync` or durable storage.
+
+Ownership and timestamp preservation may share one blocking worker submission when ACL preservation
+is off and timestamp admission is immediately available. Each operation still acquires its own rate
+token and concurrency permit and records its own congestion sample. A pending admission returns to
+async code with the same file owner and the exact pending future, preserving any paid token and
+queue position. Cancellation prevents an unclaimed timestamp operation. Final permission widening
+remains a separate operation after the earlier metadata work succeeds.
 
 Recoverable file errors are collected while other files continue unless `--fail-early` is set.
 Fail-early latches teardown and returns the original file failure without draining unread payload or
@@ -1368,11 +1374,12 @@ blocking runner. Queued cancellation destroys the file and buffer before releasi
 admission; started reads and abandoned returned outputs retain admission until their owned resources
 are dropped. The outer OpenFile guard remains held through network writes and final flush.
 
-**Cancellation-lifetime residual:** destination payload streaming still uses `tokio::fs::File`. A
-private Tokio blocking write can retain the regular-file fd after its high-level future drops its
-OpenFile guard. This does not change the fd-relative containment or the wire protocol, but the
-OpenFile pool does not cover that private job's full lifetime. The destination owned-file payload
-I/O follow-up is tracked in [#349](https://github.com/wykurz/rcp/issues/349).
+Destination payload writes use that same explicit-admission boundary. Each chunk transfers the
+standard file and scratch buffer to the blocking job; queued cancellation or an abandoned result
+drops those resources before releasing admission. A started write retains admission until it
+returns. Metadata then consumes the same file owner through individually admitted operations. This
+statement covers these source reads, destination writes, and metadata jobs; it does not extend to
+every Tokio filesystem operation elsewhere in the program or require a wire change.
 
 ### 7.9 Skipping Identical Files
 

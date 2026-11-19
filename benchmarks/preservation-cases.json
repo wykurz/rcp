@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "tiny-100k", "directory_widths": [10, 10], "files_per_leaf": 1000, "file_size_bytes": 1024},
+    {"id": "small-16k", "directory_widths": [10, 1], "files_per_leaf": 1600, "file_size_bytes": 65536}
+  ],
+  "variants": [
+    {"id": "rcp-preserve", "tool": "rcp", "args": ["--summary", "--preserve-settings=all"], "processes": 1}
+  ]
+}

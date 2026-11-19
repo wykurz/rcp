@@ -795,10 +795,12 @@ so the security-relevant invariants each live in exactly one place:
   mutation, and queued, started, or abandoned work retains the same descriptor-before-admission drop
   rules. Local and remote regular-file finalization transfer the created destination descriptor
   through each individually gated metadata operation; neither duplicates nor reopens the file. The
-  remote receiver first explicitly flushes its Tokio file and checks for delayed write errors, then
-  converts that same owner for metadata application. The Tokio payload cancellation residual remains
-  as described in the remote protocol. Ownership changes do not combine operation gates or move the
-  final permission-widening step.
+  remote receiver waits for each synchronous payload write before applying metadata to that same
+  standard-file owner. Ownership and timestamp updates can share a blocking submission if the
+  timestamp's independent admission is immediately available. Otherwise the exact pending admission
+  future returns to async code with the file, preserving its token payment and queue position. The
+  inline timestamp requires a live waiter at its start/cancel claim. Operation gates remain
+  separate, and final permission widening still follows successful earlier metadata operations.
 - **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
@@ -855,12 +857,11 @@ so the security-relevant invariants each live in exactly one place:
   filesystem calls, leaving the runtime's bounded shutdown able to abandon work stuck indefinitely
   on dead storage. With no live ambient admission, the internal entry point adds no lease. Local
   copy's synchronous data move, filegen's one-buffer synchronous chunks, and remote source payload
-  reads use this boundary. A weak scope alone is passive: remote destination payload streaming still
-  uses `tokio::fs::File`, whose private blocking writes can retain an `Arc<StdFile>` owning the same
-  fd after high-level cancellation without inheriting admission. The fd is retained, not cloned or
-  duplicated. That destination payload-lifetime residual is tracked in
-  [#349](https://github.com/wykurz/rcp/issues/349); the guarantee does not cover every Tokio
-  filesystem operation. This boundary is local to endpoint I/O and requires no wire state.
+  reads use this boundary. Remote destination payload writes also pass their OpenFile guard
+  explicitly, transferring the standard file and scratch buffer through each blocking chunk write. A
+  weak scope alone remains passive: this guarantee applies to the jobs routed through this boundary,
+  not every Tokio filesystem operation. This boundary is local to endpoint I/O and requires no wire
+  state.
 - **Local create-to-payload handoff**: with the experimental `--local-copy-handoff=fresh` policy, a
   regular file's first vacant-slot create and data copy may share one canonical blocking job. The
   default `never` retains separate jobs. Creation remains exclusive and owner-only, including strict

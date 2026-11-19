@@ -59,6 +59,47 @@ results made before scoped timing collection remain readable and are labeled as 
 
 ## Run a benchmark
 
+### Weekly full-preservation coverage
+
+After a successful weekly AWS submission, a separate GitHub Actions job reuses the already-built
+`rcp`, `rcpd`, and `filegen` binaries to measure `--preserve-settings=all`. It runs on
+`ubuntu-24.04` with read-only repository access. It makes no AWS calls and adds no EC2 work.
+Disabling or rejecting the scheduled submission also skips this job; manual submissions do not run
+it.
+
+The [preservation manifest](../benchmarks/preservation-cases.json) has 100,000 1 KiB files and
+16,000 64 KiB files. Each case runs three times locally and three times as an encrypted localhost
+pull, using a private SSH endpoint and the matching daemon. The source is warmed, detailed timings
+are disabled, and the ordinary harness checks every payload outside the command timer. A separate
+untimed one-file probe checks mode, uid, gid, and nanosecond atime/mtime before reading the
+destination payload. That probe does not certify metadata on every measured file or foreign-owner
+preservation.
+
+Twelve timed copies create 696,000 destination files and transfer about 6.43 GiB in total. Commands
+have a 120-second timeout and the entire job has a 15-minute limit, including fixture generation,
+verification and cleanup. Actual hosted runtime still depends on the runner. This coverage reuses
+the build; it does not add a Depot benchmark run.
+
+The workflow summary shows each topology's medians and repeat ranges. Its `preservation-*` artifact
+retains `results.json`, `summary.md`, and the separate `metadata.json` probe results for 90 days.
+Records use the explicit `rcp-preserve` variant and `actions-ubuntu24-preserve-v1` runner label,
+retaining binary hashes, revision, environment and exact commands. These shared-runner measurements
+are informational and separate from the EC2 matrix and its durable history. Failures of the
+commands, verification or harness fail the job; timing regressions alone do not.
+
+To exercise the same launcher locally with prepared release binaries:
+
+```bash
+python3 -m benchmarks.weekly_preserve --bin-dir target/x86_64-unknown-linux-musl/release \
+  --scratch-root /tmp/rcp-preserve-scratch --output /tmp/rcp-preserve-results
+```
+
+The output directory must be new. `--manifest` can select a smaller fixture for a launcher smoke
+test while retaining the `rcp-preserve` variant. The launcher needs OpenSSH server/client tools and
+an account the private unprivileged `sshd` can serve; it does not use the user's authorized keys.
+
+### Manual measurements
+
 The harness requires Python 3, GNU cp for local comparisons, rsync, and release builds of the
 repository tools. `just benchmark` builds the tools first; `just benchmark-run` uses prepared
 binaries. The output directory must be new. Generation, verification, and cleanup are outside the

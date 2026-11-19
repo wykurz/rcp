@@ -1954,7 +1954,7 @@ impl Dir {
                 .map(std::fs::File::from)
                 .map_err(nix_to_io)?;
             #[cfg(test)]
-            let _visit = tests::gate_file_create_stage(file.as_raw_fd(), "before-sanitation");
+            let _visit = tests::gate_file_stage(file.as_raw_fd(), "before-sanitation");
             if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
                 // same-closure for the same reason as `make_dir`: queued work creates nothing,
                 // while work that starts runs to completion, so cancellation cannot abandon a
@@ -3184,17 +3184,25 @@ async fn fchown_owned(
     gid: Option<u32>,
 ) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
-        #[cfg(test)]
-        let _visit = resource_tests::gate_opened_descriptor(owned.as_raw_fd())?;
-        fchown(
-            owned.as_fd(),
-            uid.map(Uid::from_raw),
-            gid.map(Gid::from_raw),
-        )
-        .map_err(nix_to_io)?;
-        Ok(owned)
+        fchown_owned_sync(owned, uid, gid)
     })
     .await
+}
+
+fn fchown_owned_sync(
+    owned: OwnedFd,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> std::io::Result<OwnedFd> {
+    #[cfg(test)]
+    let _visit = resource_tests::gate_opened_descriptor(owned.as_raw_fd())?;
+    fchown(
+        owned.as_fd(),
+        uid.map(Uid::from_raw),
+        gid.map(Gid::from_raw),
+    )
+    .map_err(nix_to_io)?;
+    Ok(owned)
 }
 
 /// `fchmod` on a real file descriptor. `mode` is masked to the permission bits
@@ -3252,12 +3260,85 @@ async fn futimens_owned(
     mtime_nsec: i64,
 ) -> std::io::Result<OwnedFd> {
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
-        let atime_spec = TimeSpec::new(atime, atime_nsec);
-        let mtime_spec = TimeSpec::new(mtime, mtime_nsec);
-        futimens(owned.as_fd(), &atime_spec, &mtime_spec).map_err(nix_to_io)?;
-        Ok(owned)
+        futimens_owned_sync(
+            owned,
+            [
+                TimeSpec::new(atime, atime_nsec),
+                TimeSpec::new(mtime, mtime_nsec),
+            ],
+        )
     })
     .await
+}
+
+fn futimens_owned_sync(owned: OwnedFd, times: [TimeSpec; 2]) -> std::io::Result<OwnedFd> {
+    futimens(owned.as_fd(), &times[0], &times[1]).map_err(nix_to_io)?;
+    Ok(owned)
+}
+
+async fn fchown_and_futimens_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    times: [TimeSpec; 2],
+) -> std::io::Result<OwnedFd> {
+    use futures::FutureExt as _;
+
+    let operation = prepare_metadata_operation(side, congestion::MetadataOp::Chmod, move || {
+        fchown_owned_sync(owned, uid, gid)
+    })
+    .await;
+    let timing = operation.timing.clone();
+    let operation = operation.into_blocking();
+    // only the async waiter owns a strong reference. An upgrade is the timestamp syscall's
+    // start/cancel claim; the first job still owns its descriptor and admission if cancelled.
+    let waiter = Arc::new(());
+    let live_waiter = Arc::downgrade(&waiter);
+    let next = run_fd_admitted_blocking(move || {
+        let owned = operation()?;
+        if live_waiter.upgrade().is_none() {
+            return Ok(MetadataHandoff::Cancelled);
+        }
+        #[cfg(test)]
+        let fd = owned.as_raw_fd();
+        // chown has released its probe and concurrency permit. Poll timestamp admission once;
+        // never wait for a permit on the blocking worker that another admitted job may need.
+        let mut admission = Box::pin(prepare_metadata_operation_with_timing(timing, move || {
+            futimens_owned_sync(owned, times)
+        }));
+        if let Some(operation) = admission.as_mut().now_or_never() {
+            #[cfg(test)]
+            let _visit = tests::gate_file_stage(fd, "before-timestamp");
+            if live_waiter.upgrade().is_none() {
+                return Ok(MetadataHandoff::Cancelled);
+            }
+            operation.run().map(MetadataHandoff::Complete)
+        } else {
+            // return this exact future: it may already have paid a rate token and joined a
+            // concurrency queue. Recreating admission would charge twice and lose queue order.
+            #[cfg(test)]
+            let _visit = tests::gate_file_stage(fd, "pending-timestamp");
+            Ok(MetadataHandoff::AwaitAdmission(admission))
+        }
+    })
+    .await?;
+    drop(waiter);
+    match next {
+        MetadataHandoff::Complete(owned) => Ok(owned),
+        MetadataHandoff::AwaitAdmission(admission) => {
+            run_fd_admitted_blocking(admission.await.into_blocking()).await
+        }
+        MetadataHandoff::Cancelled => {
+            unreachable!("timestamp continuation cancelled while its waiter was alive")
+        }
+    }
+}
+
+enum MetadataHandoff<A> {
+    Complete(OwnedFd),
+    AwaitAdmission(A),
+    Cancelled,
 }
 
 /// Inode-exact `fchownat` on any [`Handle`]'s `O_PATH` fd, operating on the entry
@@ -3504,25 +3585,39 @@ pub async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
     side: congestion::Side,
 ) -> std::io::Result<()> {
     let ut = &settings.file.user_and_time;
-    let fd = if ut.uid || ut.gid {
-        let uid = if ut.uid { Some(meta.uid()) } else { None };
-        let gid = if ut.gid { Some(meta.gid()) } else { None };
-        fchown_owned(fd, side, uid, gid).await?
-    } else {
-        fd
-    };
-    let fd = if ut.time {
-        futimens_owned(
+    let fd = if (ut.uid || ut.gid) && ut.time && !settings.file.acl {
+        fchown_and_futimens_owned(
             fd,
             side,
-            meta.atime(),
-            meta.atime_nsec(),
-            meta.mtime(),
-            meta.mtime_nsec(),
+            ut.uid.then(|| meta.uid()),
+            ut.gid.then(|| meta.gid()),
+            [
+                TimeSpec::new(meta.atime(), meta.atime_nsec()),
+                TimeSpec::new(meta.mtime(), meta.mtime_nsec()),
+            ],
         )
         .await?
     } else {
-        fd
+        let fd = if ut.uid || ut.gid {
+            let uid = if ut.uid { Some(meta.uid()) } else { None };
+            let gid = if ut.gid { Some(meta.gid()) } else { None };
+            fchown_owned(fd, side, uid, gid).await?
+        } else {
+            fd
+        };
+        if ut.time {
+            futimens_owned(
+                fd,
+                side,
+                meta.atime(),
+                meta.atime_nsec(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            )
+            .await?
+        } else {
+            fd
+        }
     };
     let acls = acls_to_apply(settings.file.acl, acls)?;
     let mode = crate::preserve::masked_mode(settings.file.mode_mask, meta);
@@ -4040,8 +4135,9 @@ where
     C: FnOnce(std::io::Result<std::fs::File>) -> T + Send + 'static,
     T: Send + 'static,
 {
-    let operation =
-        prepare_metadata_operation(side, congestion::MetadataOp::OpenCreate, operation).await;
+    let operation = prepare_metadata_operation(side, congestion::MetadataOp::OpenCreate, operation)
+        .await
+        .into_blocking();
     let pending = Arc::new(std::sync::Mutex::new(Some(continuation)));
     // the worker owns a second cancellation guard so a panic during creation destroys unclaimed
     // captures before the canonical job unwinds and releases its descriptor-admission lease.
@@ -4049,9 +4145,10 @@ where
     let future = run_fd_admitted_blocking(move || {
         let created = operation();
         #[cfg(test)]
-        let _visit = created.as_ref().ok().and_then(|file| {
-            tests::gate_file_create_stage(file.as_raw_fd(), "before-continuation")
-        });
+        let _visit = created
+            .as_ref()
+            .ok()
+            .and_then(|file| tests::gate_file_stage(file.as_raw_fd(), "before-continuation"));
         // the operation's probe, permit, and execution timing have all finished before this claim
         Ok(worker_continuation
             .claim()
@@ -4083,22 +4180,113 @@ where
     T: Send + 'static,
 {
     let operation = prepare_metadata_operation(side, op, f).await;
-    run_fd_admitted_blocking(operation).await
+    run_fd_admitted_blocking(operation.into_blocking()).await
+}
+
+/// Caller-owned attribution for metadata scopes, including work continued on another thread.
+#[derive(Clone)]
+struct MetadataOperationTiming {
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    dispatch: Option<tracing::Dispatch>,
+}
+
+impl MetadataOperationTiming {
+    fn capture(side: congestion::Side, op: congestion::MetadataOp) -> Self {
+        Self {
+            side,
+            op,
+            dispatch: tracing::enabled!(target: "rcp::timing", tracing::Level::TRACE)
+                .then(|| tracing::dispatcher::get_default(Clone::clone)),
+        }
+    }
+
+    fn scope(&self, phase: MetadataTimingPhase) -> Option<crate::timing::Scope> {
+        self.dispatch.as_ref().map(|dispatch| {
+            tracing::dispatcher::with_default(dispatch, || {
+                metadata_timing_scope(self.side, self.op, phase)
+            })
+        })
+    }
+}
+
+/// One admitted syscall whose owned descriptors precede its operation guards on destruction.
+struct PreparedMetadataOperation<F> {
+    work: F,
+    probe: congestion::Probe,
+    ops_permit: throttle::OpsInFlightGuard,
+    timing: MetadataOperationTiming,
+}
+
+impl<F> PreparedMetadataOperation<F> {
+    fn run<T>(self) -> std::io::Result<T>
+    where
+        F: FnOnce() -> std::io::Result<T>,
+    {
+        let Self {
+            work,
+            probe,
+            ops_permit,
+            timing,
+        } = self;
+        let execution = timing.scope(MetadataTimingPhase::Execute);
+        let result = work();
+        match &result {
+            Ok(_) => probe.complete_ok(0),
+            Err(_) => probe.discard(),
+        }
+        // the operation permit measures syscall concurrency, while the canonical blocking job
+        // retains descriptor admission until any abandoned fd-bearing result has been destroyed.
+        drop(ops_permit);
+        if let Some(execution) = execution {
+            execution.finish();
+        }
+        result
+    }
+
+    fn into_blocking<T>(self) -> impl FnOnce() -> std::io::Result<T> + Send + 'static
+    where
+        F: FnOnce() -> std::io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // create this before submission. Inline continuations call run directly and have no
+        // worker queue scope; cancellation of a queued job interrupts this scope on drop.
+        let queue = self.timing.scope(MetadataTimingPhase::Queue);
+        move || {
+            if let Some(queue) = queue {
+                queue.finish();
+            }
+            self.run()
+        }
+    }
 }
 
 async fn prepare_metadata_operation<F, T>(
     side: congestion::Side,
     op: congestion::MetadataOp,
     f: F,
-) -> impl FnOnce() -> std::io::Result<T> + Send + 'static
+) -> PreparedMetadataOperation<F>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let rate = metadata_timing_scope(side, op, MetadataTimingPhase::Rate);
+    prepare_metadata_operation_with_timing(MetadataOperationTiming::capture(side, op), f).await
+}
+
+async fn prepare_metadata_operation_with_timing<F, T>(
+    timing: MetadataOperationTiming,
+    f: F,
+) -> PreparedMetadataOperation<F>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let rate = timing.scope(MetadataTimingPhase::Rate);
     throttle::get_ops_token().await;
-    rate.finish();
-    prepare_metadata_operation_no_rate(side, op, f).await
+    if let Some(rate) = rate {
+        rate.finish();
+    }
+    admit_metadata_operation(timing, f).await
 }
 
 /// Variant of [`run_metadata_probed_blocking`] for a caller that already consumed the static
@@ -4113,48 +4301,41 @@ where
     T: Send + 'static,
 {
     let operation = prepare_metadata_operation_no_rate(side, op, f).await;
-    run_fd_admitted_blocking(operation).await
+    run_fd_admitted_blocking(operation.into_blocking()).await
 }
 
 async fn prepare_metadata_operation_no_rate<F, T>(
     side: congestion::Side,
     op: congestion::MetadataOp,
     f: F,
-) -> impl FnOnce() -> std::io::Result<T> + Send + 'static
+) -> PreparedMetadataOperation<F>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let admission = metadata_timing_scope(side, op, MetadataTimingPhase::Admission);
-    let ops_permit = throttle::ops_in_flight_permit(crate::walk::meta_resource(side, op)).await;
-    admission.finish();
-    let probe = congestion::Probe::start_metadata(side, op);
-    // worker threads do not inherit a task-local subscriber. Retain it only for constructing the
-    // execution scope; rooted metadata spans own their dispatcher without retaining contextual
-    // parents whose release would otherwise depend on the worker's ambient subscriber.
-    let timing_dispatch = tracing::enabled!(target: "rcp::timing", tracing::Level::TRACE)
-        .then(|| tracing::dispatcher::get_default(Clone::clone));
-    let queue = metadata_timing_scope(side, op, MetadataTimingPhase::Queue);
-    move || {
-        queue.finish();
-        let execution = timing_dispatch.as_ref().map(|dispatch| {
-            tracing::dispatcher::with_default(dispatch, || {
-                metadata_timing_scope(side, op, MetadataTimingPhase::Execute)
-            })
-        });
-        let result = f();
-        match &result {
-            Ok(_) => probe.complete_ok(0),
-            Err(_) => probe.discard(),
-        }
-        // the cwnd models syscall concurrency, so release it when `f` finishes. The shared blocking
-        // boundary keeps admission in the task output because `f` can return an fd that an
-        // abandoned waiter never receives.
-        drop(ops_permit);
-        if let Some(execution) = execution {
-            execution.finish();
-        }
-        result
+    admit_metadata_operation(MetadataOperationTiming::capture(side, op), f).await
+}
+
+async fn admit_metadata_operation<F, T>(
+    timing: MetadataOperationTiming,
+    f: F,
+) -> PreparedMetadataOperation<F>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let admission = timing.scope(MetadataTimingPhase::Admission);
+    let ops_permit =
+        throttle::ops_in_flight_permit(crate::walk::meta_resource(timing.side, timing.op)).await;
+    if let Some(admission) = admission {
+        admission.finish();
+    }
+    let probe = congestion::Probe::start_metadata(timing.side, timing.op);
+    PreparedMetadataOperation {
+        work: f,
+        probe,
+        ops_permit,
+        timing,
     }
 }
 
@@ -4872,7 +5053,7 @@ mod tests {
         EntryKind::Special,
     ];
 
-    pub(super) fn gate_file_create_stage(
+    pub(super) fn gate_file_stage(
         fd: RawFd,
         stage: &str,
     ) -> Option<testutils::BlockingPathGateVisit> {
@@ -7183,37 +7364,245 @@ mod tests {
     async fn cancelled_owned_metadata_retains_the_file_and_permits_until_started_work_finishes()
     -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir()?;
-        let source = tmp.path().join("source");
-        std::fs::write(&source, b"source")?;
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))?;
-        let source_meta = std::fs::metadata(&source)?;
-        let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
-        let path = tmp.path().join("destination");
-        let file = root.create_file(OsStr::new("destination")).await?;
-        let mode_while_gated = assert_cancelled_owned_operation_keeps_resources(
-            file,
-            &path,
-            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod),
-            |file| async move {
-                set_file_metadata_owned(
-                    &crate::preserve::preserve_all(),
-                    &source_meta,
-                    None,
-                    file.into(),
-                    congestion::Side::Destination,
-                )
-                .await
-            },
-            || std::fs::metadata(&path).map(|meta| meta.permissions().mode() & 0o7777),
-        )
-        .await?;
-        assert_eq!(mode_while_gated?, DST_FILE_CREATE_MODE);
-        assert_eq!(
-            std::fs::metadata(path)?.permissions().mode() & 0o7777,
-            DST_FILE_CREATE_MODE
-        );
+        for stage in [None, Some("before-timestamp")] {
+            let tmp = tempfile::tempdir()?;
+            let source = tmp.path().join("source");
+            std::fs::write(&source, b"source")?;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))?;
+            filetime::set_file_mtime(
+                &source,
+                filetime::FileTime::from_unix_time(1_000_000_000, 123),
+            )?;
+            let source_meta = std::fs::metadata(&source)?;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let path = tmp.path().join("destination");
+            let file = root.create_file(OsStr::new("destination")).await?;
+            let before = filetime::FileTime::from_last_modification_time(&file.metadata()?);
+            assert_ne!(
+                before,
+                filetime::FileTime::from_last_modification_time(&source_meta)
+            );
+            let gate_path = stage.map_or_else(|| path.clone(), |stage| path.join(stage));
+            let mode_while_gated = assert_cancelled_owned_operation_keeps_resources(
+                file,
+                &gate_path,
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod),
+                |file| async move {
+                    set_file_metadata_owned(
+                        &crate::preserve::preserve_all(),
+                        &source_meta,
+                        None,
+                        file.into(),
+                        congestion::Side::Destination,
+                    )
+                    .await
+                },
+                || std::fs::metadata(&path).map(|meta| meta.permissions().mode() & 0o7777),
+            )
+            .await?;
+            assert_eq!(mode_while_gated?, DST_FILE_CREATE_MODE);
+            let after = std::fs::metadata(&path)?;
+            assert_eq!(after.permissions().mode() & 0o7777, DST_FILE_CREATE_MODE);
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&after),
+                before
+            );
+        }
         Ok(())
+    }
+
+    #[test]
+    fn preserved_metadata_yields_to_admitted_work_without_charging_rate_twice() -> anyhow::Result<()>
+    {
+        use futures::FutureExt as _;
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let tmp = tempfile::tempdir()?;
+                let root =
+                    Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+                let file = root.create_file(OsStr::new("destination")).await?;
+                let meta = file.metadata()?;
+                let mut gate = testutils::BlockingPathGate::install(tmp.path().join("destination"));
+                let limits = testutils::AdmissionLimit::new().await;
+                limits.set_max_ops_in_flight(
+                    throttle::Resource::meta(
+                        throttle::Side::Destination,
+                        throttle::MetadataOp::Chmod,
+                    ),
+                    1,
+                );
+                // exactly four tokens: three preserved metadata syscalls and one competing job.
+                throttle::init_ops_tokens(4);
+                let samples = Arc::new(congestion::testing::CollectingSink::new());
+                congestion::install_sample_sink(samples.clone());
+                let submissions = testutils::BlockingSubmissions::start();
+                let task = tokio::spawn(async move {
+                    set_file_metadata_owned(
+                        &crate::preserve::preserve_all(),
+                        &meta,
+                        None,
+                        file.into(),
+                        congestion::Side::Destination,
+                    )
+                    .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+                    .await??;
+                let mut competitor = Box::pin(run_metadata_probed_blocking(
+                    congestion::Side::Destination,
+                    congestion::MetadataOp::Chmod,
+                    || Ok(()),
+                ));
+                let waiting = futures::poll!(competitor.as_mut()).is_pending();
+                gate.release_all();
+                let joined = async { tokio::join!(task, competitor) };
+                tokio::pin!(joined);
+                let outcome =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), joined.as_mut()).await;
+                if outcome.is_err() {
+                    // disabling the rate flag alone does not wake an already parked consumer.
+                    // replace its epoch before quiescing, so a double-charge fails instead of hangs.
+                    throttle::init_ops_tokens(0);
+                    limits.quiesce(joined).await;
+                }
+                let (copy, other) = outcome?;
+                copy??;
+                other?;
+                assert!(
+                    waiting,
+                    "competing operation must join the concurrency queue first"
+                );
+                assert_eq!(samples.metadata_count(), 4);
+                assert_eq!(
+                    submissions.count(),
+                    4,
+                    "a pending timestamp must yield the only worker"
+                );
+                assert!(
+                    throttle::get_ops_token().now_or_never().is_none(),
+                    "each operation must consume exactly one token"
+                );
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn cancelled_pending_timestamp_closes_its_file_before_releasing_admission() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?
+            .block_on(async {
+                for rate_limited in [true, false] {
+                    for cancel_on_worker in [true, false] {
+                        let tmp = tempfile::tempdir()?;
+                        let source = tmp.path().join("source");
+                        std::fs::write(&source, b"source")?;
+                        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751))?;
+                        filetime::set_file_mtime(
+                            &source,
+                            filetime::FileTime::from_unix_time(1_000_000_000, 123),
+                        )?;
+                        let source_meta = std::fs::metadata(&source)?;
+                        let root =
+                            Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination)
+                                .await?;
+                        let path = tmp.path().join("destination");
+                        let file = root.create_file(OsStr::new("destination")).await?;
+                        let before =
+                            filetime::FileTime::from_last_modification_time(&file.metadata()?);
+                        let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+                        let mut chown = testutils::BlockingPathGate::install(&path);
+                        let mut timestamp =
+                            testutils::BlockingPathGate::install(path.join("pending-timestamp"));
+                        let limits = testutils::AdmissionLimit::new().await;
+                        limits.set_files_in_flight(1);
+                        let resource = throttle::Resource::meta(
+                            throttle::Side::Destination,
+                            throttle::MetadataOp::Chmod,
+                        );
+                        limits.set_max_ops_in_flight(resource, 1);
+                        if rate_limited {
+                            throttle::init_ops_tokens(1);
+                        }
+                        let guard = throttle::open_file_permit().await;
+                        let mut task = Box::pin(with_fd_admission(guard.admission(), async move {
+                            let _guard = guard;
+                            set_file_metadata_owned(
+                                &crate::preserve::preserve_all(),
+                                &source_meta,
+                                None,
+                                file.into(),
+                                congestion::Side::Destination,
+                            )
+                            .await
+                        }));
+                        assert!(futures::poll!(task.as_mut()).is_pending());
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            chown.wait_started(),
+                        )
+                        .await??;
+                        let mut competitor = Box::pin(throttle::ops_in_flight_permit(resource));
+                        if !rate_limited {
+                            assert!(futures::poll!(competitor.as_mut()).is_pending());
+                        }
+                        chown.release_all();
+                        let occupied = if rate_limited {
+                            None
+                        } else {
+                            Some(competitor.await)
+                        };
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            timestamp.wait_started(),
+                        )
+                        .await??;
+                        if !cancel_on_worker {
+                            timestamp.release_all();
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                timestamp.wait_completed(),
+                            )
+                            .await??;
+                            // the sole worker's barrier proves the pending admission was returned;
+                            // poll the caller again so cancellation now drops its async gate wait.
+                            tokio::task::spawn_blocking(|| ()).await?;
+                            assert!(futures::poll!(task.as_mut()).is_pending());
+                        }
+                        let mut next_file = Box::pin(throttle::open_file_permit());
+                        assert!(futures::poll!(next_file.as_mut()).is_pending());
+                        assert!(!identity.original_is_closed()?);
+                        drop(task);
+                        if cancel_on_worker {
+                            assert!(!identity.original_is_closed()?);
+                            assert!(futures::poll!(next_file.as_mut()).is_pending());
+                        }
+                        timestamp.release_all();
+                        let next =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), next_file)
+                                .await?;
+                        assert!(
+                            identity.original_is_closed()?,
+                            "capacity returned before the pending fd closed"
+                        );
+                        drop(next);
+                        drop(occupied);
+                        let after = std::fs::metadata(&path)?;
+                        assert_eq!(after.permissions().mode() & 0o7777, DST_FILE_CREATE_MODE);
+                        assert_eq!(
+                            filetime::FileTime::from_last_modification_time(&after),
+                            before
+                        );
+                    }
+                }
+                anyhow::Ok(())
+            })
     }
 
     // set_file_metadata_owned: applying owner/mode/time from a source FileMeta to an
@@ -7248,6 +7637,14 @@ mod tests {
 
         // apply source metadata to the already-open dst fd; preserve everything
         let settings = crate::preserve::preserve_all();
+        let limits = testutils::AdmissionLimit::new().await;
+        limits.set_max_ops_in_flight(
+            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod),
+            1,
+        );
+        let submissions = testutils::BlockingSubmissions::start();
+        let samples = Arc::new(congestion::testing::CollectingSink::new());
+        congestion::install_sample_sink(samples.clone());
         set_file_metadata_owned(
             &settings,
             &src_meta,
@@ -7279,6 +7676,16 @@ mod tests {
         // uid/gid: chown to source's uid/gid (same as current user here) must hold
         assert_eq!(MetadataExt::uid(&dst_md), src_meta.uid(), "uid mismatch");
         assert_eq!(MetadataExt::gid(&dst_md), src_meta.gid(), "gid mismatch");
+        assert_eq!(
+            samples.metadata_count(),
+            3,
+            "each syscall needs its own probe"
+        );
+        assert_eq!(
+            submissions.count(),
+            2,
+            "ownership and timestamps can share a worker"
+        );
         Ok(())
     }
 

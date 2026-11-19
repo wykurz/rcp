@@ -24,7 +24,7 @@ import time
 import uuid
 
 from benchmarks.strict_json import parse_json
-from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming, telemetry, cache
+from benchmarks import timings, operations, transport, pairs, measurements, clocks, capacity, streaming, telemetry, cache, private_sshd
 from benchmarks.operations import expected_counts
 from benchmarks.verification import (DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, verification_label,
     DEFAULT_READ_SIZE, DEFAULT_BATCH_MULTIPLIER, MismatchError, failure_proof, observed_error,
@@ -165,7 +165,12 @@ def _validate_variant_mode(variant, mode):
         raise ValueError("custom --rsync-path is reserved in loopback mode")
 
 
-def plan_commands(variant, source, destination, tools, mode, operation="fresh", *, source_endpoint=None):
+def plan_commands(variant, source, destination, tools, mode, operation="fresh", *, source_endpoint=None, private_loopback=False):
+    if private_loopback:
+        if mode != "loopback" or variant["tool"] != "rcp" or source_endpoint is not None:
+            raise ValueError("private loopback requires rcp loopback without an owned RTT endpoint")
+        local = plan_commands(variant, source, destination, tools, "local", operation)
+        return [private_sshd.Endpoint.command(command, tools["rcpd"]) for command in local]
     _validate_variant_mode(variant, mode)
     operations.validate_variant(variant, operation)
     if source_endpoint is not None:
@@ -739,8 +744,14 @@ def _fixture_policy(all_directory_files=False, metadata_only=False):
     return f"filegen {layout}{separator}--bufsize=min(file_size_bytes,1048576); random bytes without fixed seed; {proof}"
 
 
-def main(argv=None):
+def main(argv=None, *, private_loopback=False):
     args = _arguments(argv)
+    if private_loopback:
+        if args.mode != "loopback" or args.rtt_ms is not None:
+            raise ValueError("private loopback requires loopback mode without owned RTT")
+        # keep existing series identities unchanged; this path binds both daemon listeners to lo
+        args.ssh_transport_profile = json.dumps({"binding": "ipv4-loopback-both-v1",
+                                                 "ssh": args.ssh_transport_profile}, sort_keys=True)
     run_started = time.monotonic()
     collect_costs = args.paired_seed is not None or args.local_resources
     sampler = None
@@ -793,6 +804,8 @@ def main(argv=None):
         variants = _select(manifest["variants"], args.variants or default_variants, "variant")
         for variant in variants:
             _validate_variant_mode(variant, args.mode)
+            if private_loopback and variant["tool"] != "rcp":
+                raise ValueError("private loopback requires rcp variants")
         if all_directory_files:
             if any(variant["processes"] > 1 for variant in variants):
                 raise ValueError("partitioned variants cannot copy files_per_directory cases with root files")
@@ -975,7 +988,7 @@ def main(argv=None):
                             selected_tools["rcp"] = tools["rcp-baseline"]
                             if args.mode == "loopback":
                                 selected_tools["rcpd"] = tools["rcpd-baseline"]
-                        commands = [] if args.rtt_ms is not None else plan_commands(variant, source, destination, selected_tools, args.mode, operation)
+                        commands = [] if args.rtt_ms is not None else plan_commands(variant, source, destination, selected_tools, args.mode, operation, private_loopback=private_loopback)
                         timing_prefix = output / "timings" / trial_path / "trace"
                         if timing_policy == "coarse":
                             timing_prefix.parent.mkdir(parents=True, exist_ok=False)

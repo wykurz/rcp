@@ -907,6 +907,12 @@ sudo sysctl -w net.core.netdev_budget=600
 
 ## Application-Level Tuning
 
+`rcp` and `rcpd` use mimalloc for heap allocation. In measured remote small-file workloads this
+reduced allocation overhead and improved throughput, with higher peak resident memory than the
+previous system allocator. Account for both daemons when sizing a machine. File concurrency,
+connection counts and buffer-retention controls remain useful limits on the work held in memory;
+none is a hard limit on total process RSS.
+
 ### Worker Threads
 
 Control parallelism with `--max-workers`:
@@ -1098,6 +1104,11 @@ Both metadata helpers record rate and concurrency admission. Calls that already 
 token omit `wait_rate`. Async execution includes suspension and any worker scheduling inside the
 awaited API; it has no separate `wait_worker` sample. Admission samples are recorded even when the
 operation can proceed immediately, so their counts represent visits to that stage.
+
+Regular-file ownership and timestamp preservation can share a worker submission when the timestamp
+operation is immediately admitted. Both retain separate rate, admission, and execution samples; the
+inline timestamp has no `wait_worker` sample. If admission waits, the timestamp returns to async
+code and records its own worker wait when submitted. Enabling detailed timings keeps this same path.
 
 Cancellation while waiting for a worker interrupts `wait_worker` and produces no `execute` sample.
 Once work starts, `execute` follows the worker through completion even if its async waiter is
