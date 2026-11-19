@@ -1127,9 +1127,11 @@ blocking job, which takes the file and the scratch and returns both. A write is 
 thread, so it is issued per chunk and not per network read; bytes that arrived with the header come
 first. The receiver borrows the file's admission guard and passes it to each blocking write, as the
 sender does for reads. There is no Tokio file buffer and no second copy of the payload, and every
-write has returned before the file's metadata is applied. A read or write error, a truncated payload
-and a cancelled transfer leave the stream at an unknown position; a chunk that never filled is not
-written, and no scratch is kept.
+write has returned before the file's metadata is applied. An ordinary write error on the final chunk
+leaves the declared payload fully consumed and the next frame intact: the file still fails, but
+default error collection can continue (§7.6). Read errors, truncated payloads, nonfinal write
+errors, blocking-worker failures, and cancelled transfers require discarding the stream. A chunk
+that never filled is not written; failed transfers keep no scratch taken for the copy.
 
 Individual file reads and network operations can be shorter; this setting does not promise TCP
 packet or TLS record sizes. Larger settings allow more working memory per active transfer: one
@@ -1155,12 +1157,11 @@ file larger than the limit costs each side one allocation of its chunk. Smaller 
 drains reuse kept storage when their required chunk fits the limit; drains above the limit also use
 temporary storage. A limit above the copy chunk does not eagerly allocate that amount.
 
-Reuse matters more than the size of a buffer suggests. In the statically linked daemons an
-allocation of this size is a fresh memory mapping, so a buffer per file costs a mapping, a page
-fault for every 4 KiB of the file and an unmapping, on each side. In a daemon with many transfers in
-flight on many cores those operations contend in the kernel: a run on a 96-CPU host spent most of
-its CPU time there while copying 1 MB files, with about one file's worth of page faults per file in
-each daemon.
+Reuse matters more than the size of a buffer suggests. Before the copy binaries adopted mimalloc,
+the statically linked daemons' allocator used fresh memory mappings for these buffers. A run on a
+96-CPU host spent most of its CPU time in mapping, page faults, and unmapping while copying 1 MB
+files, with about one file's worth of page faults per file in each daemon. This is historical
+pre-mimalloc evidence, not a measurement of the current allocator.
 
 The default keeps a profile's whole copy buffer, so that no file costs an allocation of its chunk on
 either side. With the earlier default of 2 MiB for both profiles, a datacenter file between 2 MiB
@@ -1184,8 +1185,8 @@ initializations. In a file transfer a smaller kept buffer is released before a l
 it. These storage bounds exclude allocator overhead, framing, transport, active temporary buffers,
 and transient overlap when a drain grows the scratch; they are not process RSS bounds. Dropping a
 transfer future releases its temporary storage, or the buffer it had taken from its connection; kept
-storage otherwise lives until the connection drops. Interrupted transfers still require discarding
-the stream.
+storage otherwise lives until the connection drops. Cancelled transfers require discarding the
+stream; ordinary final-chunk write errors follow the recovery rule in §7.6.
 
 **Connection lifecycle:**
 
@@ -1205,17 +1206,23 @@ the stream.
 When processing a file fails, the destination must determine if the connection can continue
 receiving more files:
 
-| State            | Cause                                                 | Recovery                                       |
-| ---------------- | ----------------------------------------------------- | ---------------------------------------------- |
-| **NeedsDrain**   | Error before reading data (e.g., can't create file)   | Drain `size` bytes, continue with next file    |
-| **DataConsumed** | Error after reading all data (e.g., metadata failure) | Stream at clean boundary, continue immediately |
-| **Corrupted**    | Error during data transfer                            | Discard the stream and abort the session       |
+| State            | Cause                                                                             | Recovery                                               |
+| ---------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| **NeedsDrain**   | Error before reading data (e.g., can't create file)                               | Drain `size` bytes, continue with next file            |
+| **DataConsumed** | Ordinary final-chunk write error after consuming all payload, or metadata failure | Next frame intact; collect the file error and continue |
+| **Corrupted**    | Incomplete payload, read error, nonfinal write error, or blocking-worker failure  | Discard the stream and abort the session               |
 
 **Regular-file finalization.** Each payload write returns before the receiver transfers the same
 standard-file owner to the metadata applier. No Tokio file conversion or additional payload flush is
-needed. A payload read/write failure is `Corrupted`; a metadata failure is `DataConsumed`, retains
-the already-copied counts, and preserves the next-file boundary. Completion means the kernel
-accepted the writes; it does not imply an `fsync` or durable storage.
+needed. An ordinary final-chunk write failure is `DataConsumed`: the receiver has consumed every
+declared payload byte, but the file still fails. Its descriptor and scratch are dropped, no metadata
+is applied, and no copied-file or copied-byte counts are added; any partial destination remains in
+its private creation mode. Default error collection records the original I/O error, settles the
+file's completion obligation, and reads the next frame without draining. A metadata failure is also
+`DataConsumed`, but retains the copied counts already added after successful payload writes.
+Incomplete payloads, read errors, nonfinal write failures, and blocking-worker failures remain
+`Corrupted`. Successful payload completion means the kernel accepted the writes; it does not imply
+an `fsync` or durable storage.
 
 Ownership and timestamp preservation may share one blocking worker submission when ACL preservation
 is off and timestamp admission is immediately available. Each operation still acquires its own rate
