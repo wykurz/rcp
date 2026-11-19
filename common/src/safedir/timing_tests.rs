@@ -108,6 +108,129 @@ fn assert_sample(report: &serde_json::Value, name: &str, finished: u64, interrup
 }
 
 #[test]
+fn preserved_metadata_handoff_uses_caller_timings_without_an_inline_worker_queue()
+-> anyhow::Result<()> {
+    thread_local! {
+        static WORKER_DISPATCH: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    for (caller_detail, worker_detail) in [(true, false), (false, true), (true, true)] {
+        let caller = Capture::new(caller_detail)?;
+        let worker = Capture::new(worker_detail)?;
+        let dispatch = worker.dispatch.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .on_thread_start(move || {
+                WORKER_DISPATCH.with(|guard| {
+                    *guard.borrow_mut() = Some(tracing::dispatcher::set_default(&dispatch));
+                });
+            })
+            .on_thread_stop(|| {
+                WORKER_DISPATCH.with(|guard| drop(guard.borrow_mut().take()));
+            })
+            .build()?;
+        runtime.block_on(async {
+            let limits = crate::testutils::AdmissionLimit::new().await;
+            limits.set_max_ops_in_flight(
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod),
+                1,
+            );
+            let file = tempfile::tempfile()?;
+            let metadata = file.metadata()?;
+            let submissions = crate::testutils::BlockingSubmissions::start();
+            let samples = Arc::new(congestion::testing::CollectingSink::new());
+            congestion::install_sample_sink(samples.clone());
+            set_file_metadata_owned(
+                &crate::preserve::preserve_all(),
+                &metadata,
+                None,
+                file.into(),
+                congestion::Side::Destination,
+            )
+            .with_subscriber(caller.dispatch.clone())
+            .await?;
+            assert_eq!(samples.metadata_count(), 3);
+            assert_eq!(
+                submissions.count(),
+                2,
+                "detailed timing must retain the handoff"
+            );
+            anyhow::Ok(())
+        })?;
+        drop(runtime);
+        let report = caller.report()?;
+        if caller_detail {
+            for phase in ["wait_rate", "wait_admission", "execute"] {
+                assert_sample(
+                    &report,
+                    &format!("destination.metadata.chmod.{phase}"),
+                    3,
+                    0,
+                );
+            }
+            assert_sample(&report, "destination.metadata.chmod.wait_worker", 2, 0);
+        } else {
+            assert!(report["scopes"].as_array().unwrap().is_empty());
+        }
+        assert!(worker.report()?["scopes"].as_array().unwrap().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_timestamp_keeps_caller_timings_when_resubmitted() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let limits = crate::testutils::AdmissionLimit::new().await;
+        limits.set_max_ops_in_flight(
+            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Chmod),
+            1,
+        );
+        throttle::init_ops_tokens(1);
+        let capture = Capture::new(true)?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("destination");
+        let file = std::fs::File::create(&path)?;
+        let metadata = file.metadata()?;
+        let mut gate = crate::testutils::BlockingPathGate::install(path.join("pending-timestamp"));
+        let submissions = crate::testutils::BlockingSubmissions::start();
+        let task = tokio::spawn(
+            async move {
+                set_file_metadata_owned(
+                    &crate::preserve::preserve_all(),
+                    &metadata,
+                    None,
+                    file.into(),
+                    congestion::Side::Destination,
+                )
+                .await
+            }
+            .with_subscriber(capture.dispatch.clone()),
+        );
+        let waiting =
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started()).await;
+        // closing the old rate epoch wakes the pending timestamp; the two new tokens cover it
+        // and the final chmod without changing the already-started admission future.
+        throttle::init_ops_tokens(2);
+        gate.release_all();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        waiting??;
+        result???;
+        assert_eq!(submissions.count(), 3);
+        let report = capture.report()?;
+        for phase in ["wait_rate", "wait_admission", "wait_worker", "execute"] {
+            assert_sample(
+                &report,
+                &format!("destination.metadata.chmod.{phase}"),
+                3,
+                0,
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn metadata_timings_distinguish_side_operation_and_phase() -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let capture = Capture::new(true)?;

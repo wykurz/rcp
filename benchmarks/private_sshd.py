@@ -268,8 +268,10 @@ class Endpoint:
         (directory / "authorized_keys").chmod(0o600)
         (directory / "bin").mkdir(mode=0o700)
         # rcp passes StrictHostKeyChecking=no; the first value given wins, so the key stays checked
+        # keep launcher bytes stable across runs; the harness fingerprints its executable
         self._script(directory / "bin" / "ssh",
-                     f"exec {self.tools['ssh']} -F {directory}/ssh_config -o StrictHostKeyChecking=yes \"$@\"\n")
+                     'directory=${0%/*}\n'
+                     f'exec {self.tools["ssh"]} -F "${{directory%/*}}/ssh_config" -o StrictHostKeyChecking=yes "$@"\n')
 
     @staticmethod
     def _script(path, body):

@@ -169,6 +169,55 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+  preservation:
+    if: github.event_name == 'schedule'
+    needs: [validate, build, submit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: production-aa-binaries
+          path: ${{ runner.temp }}/binaries
+      - name: Measure full preservation locally and over encrypted loopback
+        env:
+          BENCHMARK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client
+          chmod +x "$RUNNER_TEMP/binaries/rcp" "$RUNNER_TEMP/binaries/rcpd" "$RUNNER_TEMP/binaries/filegen"
+          python3 -m benchmarks.weekly_preserve --bin-dir "$RUNNER_TEMP/binaries" \
+            --scratch-root "$RUNNER_TEMP/preservation-scratch" --output "$RUNNER_TEMP/preservation" \
+            --runner-label actions-ubuntu24-preserve-v1
+      - name: Summarize preservation measurements
+        if: always()
+        run: |
+          for mode in local loopback; do
+            summary="$RUNNER_TEMP/preservation/$mode/summary.md"
+            if test -f "$summary"; then
+              printf '\n### Actions preservation: %s\n\n' "$mode" >> "$GITHUB_STEP_SUMMARY"
+              cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: preservation-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/preservation/local/results.json
+            ${{ runner.temp }}/preservation/local/summary.md
+            ${{ runner.temp }}/preservation/loopback/results.json
+            ${{ runner.temp }}/preservation/loopback/summary.md
+            ${{ runner.temp }}/preservation/metadata.json
+          retention-days: 90
+          if-no-files-found: warn
+
   identity-test:
     if: inputs.mode == 'identity-test' && github.repository == 'wykurz/rcp' && github.repository_id == '655073755' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.actor_id == '483465' && github.run_attempt == 1 && (vars.RCP_AWS_PRODUCTION_ENABLED == '' || vars.RCP_AWS_PRODUCTION_ENABLED == 'false')
     runs-on: ubuntu-24.04

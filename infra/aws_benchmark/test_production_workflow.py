@@ -105,6 +105,31 @@ class ProductionWorkflowTests(unittest.TestCase):
         self.assertEqual(uploads[0]["with"]["retention-days"], "90")
         self.assertNotIn("overwrite", uploads[0]["with"])
 
+    def test_weekly_preservation_reuses_binaries_without_cloud_capabilities(self):
+        job = self.workflow["jobs"]["preservation"]
+        self.assertEqual(job["if"], "github.event_name == 'schedule'")
+        self.assertEqual(job["needs"], ["validate", "build", "submit"])
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["timeout-minutes"], "15")
+        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        self.assertNotIn("environment", job)
+        for forbidden in ("id-token", "secrets.", "configure-aws-credentials", "needs.submit.outputs"):
+            self.assertNotIn(forbidden, str(job))
+        self.assertEqual(job["steps"][0]["with"], {
+            "ref": "${{ needs.validate.outputs.revision }}", "persist-credentials": "false"})
+        self.assertEqual(job["steps"][1]["with"], {
+            "name": "production-aa-binaries", "path": "${{ runner.temp }}/binaries"})
+        upload = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["if"], "always()")
+        self.assertEqual(upload["with"]["retention-days"], "90")
+        self.assertEqual(set(upload["with"]["path"].splitlines()), {
+            "${{ runner.temp }}/preservation/local/results.json",
+            "${{ runner.temp }}/preservation/local/summary.md",
+            "${{ runner.temp }}/preservation/loopback/results.json",
+            "${{ runner.temp }}/preservation/loopback/summary.md",
+            "${{ runner.temp }}/preservation/metadata.json",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -379,7 +379,7 @@ class WorkflowModeTests(unittest.TestCase):
             for scheduled in ("", "false", "true"):
                 selected = self.enabled_jobs("", enabled=enabled, **{
                     "github.event_name": "schedule", "vars.RCP_AWS_PRODUCTION_SCHEDULE_ENABLED": scheduled})
-                expected = {"validate", "build", "submit"} if enabled == scheduled == "true" else set()
+                expected = {"validate", "build", "submit", "preservation"} if enabled == scheduled == "true" else set()
                 self.assertEqual(selected, expected)
                 self.assertNotIn("identity-test", selected)
         for field, value in (("github.actor_id", "1"), ("github.ref", "refs/heads/debug"),

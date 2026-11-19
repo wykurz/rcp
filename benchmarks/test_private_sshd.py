@@ -208,6 +208,20 @@ class EndpointTests(unittest.TestCase):
         endpoint.stop()
         self.endpoint().stop()
 
+    def test_launchers_have_stable_bytes_but_use_their_own_private_endpoints(self):
+        first, second = self.endpoint(), self.endpoint()
+        first.start()
+        second.start()
+        self.assertNotEqual(first.directory, second.directory)
+        self.assertEqual((first.directory / "bin/ssh").read_bytes(),
+                         (second.directory / "bin/ssh").read_bytes())
+        for endpoint in (first, second):
+            (self.state / "ssh.calls").unlink()
+            subprocess.run(["ssh", "127.0.0.1", "true"], check=True,
+                           env={**os.environ, **endpoint.environment()})
+            call = json.loads((self.state / "ssh.calls").read_text())
+            self.assertEqual(Path(call[call.index("-F") + 1]).resolve(), endpoint.directory / "ssh_config")
+
     def test_a_login_the_account_refuses_fails_setup_with_its_reason(self):
         endpoint = self.endpoint()
         made, mkdtemp = [], tempfile.mkdtemp

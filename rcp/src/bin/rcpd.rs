@@ -5,6 +5,9 @@ use tracing::instrument;
 
 use rcp_tools_rcp::{destination, source};
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "rcpd",

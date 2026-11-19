@@ -1007,6 +1007,13 @@ copied locally and through `rcpd`. The paired 1 GB run is no longer scheduled. T
 cell copies the same file set, and its point continues that file set's trend line;
 `bulk-1g-metadata` remains a suite that can be started by hand while the policy lists it.
 
+After submission succeeds, a separate 15-minute GitHub Actions job reuses the build for a bounded
+local and encrypted-loopback `--preserve-settings=all` benchmark. It receives no cloud credentials
+and adds no EC2 work. Its 90-day Actions artifacts are separate from the matrix's published history;
+see
+[weekly full-preservation coverage](../../docs/benchmarking.md#weekly-full-preservation-coverage)
+for fixtures, verification and interpretation.
+
 The server admits a scheduled request only when its policy agrees, in three fields:
 
 - `scheduled_suite` names the one suite a scheduled request may ask for: `matrix-all-local+remote`.
