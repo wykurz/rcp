@@ -5,6 +5,10 @@ and rcpd — what problem it solves, how it decides how hard to push, and how th
 together. The scope here is conceptual; specific flag names are covered in `--help-all` on each
 binary.
 
+Start with the [operator flag guide](../README.md#adaptive-metadata-throttling---auto-meta-throttle)
+for local versus remote behavior, or the [component design](../congestion/DESIGN.md) for code
+ownership. This detailed reference retains the control law and V2 log schema.
+
 ## Table of Contents
 
 - [Motivation](#motivation)
@@ -68,37 +72,8 @@ percentiles to differ to encode the inter-quantile spread directly.
 
 Three concentric layers. Each is independently testable and replaceable.
 
-```
-┌───────────────────────────┐
-│         Algorithm         │
-│ (controller trait + impl) │
-│   sample in → decision    │
-└─────────^─────────┬───────┘
-          │         │
-  samples │         │ decisions
-          │         v
-┌─────────┴─────────────────┐
-│       Control Loop        │
-│  sample routing + tick +  │
-│      decision broadcast   │
-└─────────^─────────┬───────┘
-          │         │
-  probes  │         │ limits
-          │         v
-┌─────────┴─────────────────┐
-│        Enforcement        │
-│  concurrency semaphores + │
-│     rate token buckets    │
-└─────────^─────────────────┘
-          │
-          │ acquire / release
-          │
-┌─────────┴─────────────────┐
-│       Filesystem Ops      │
-│  getdents, stat, open,    │
-│      read, write, …       │
-└───────────────────────────┘
-```
+For the control-loop diagram and implementation map, see
+[the congestion component design](../congestion/DESIGN.md#control-loop).
 
 **Algorithm.** A pure state machine. It consumes latency samples and emits absolute limits —
 concurrency, rate, or both. No I/O, no clocks except time values passed in. This purity lets a

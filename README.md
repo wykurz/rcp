@@ -450,9 +450,22 @@ the job takes all day, too high and the filesystem suffers.
 > rcp --auto-meta-throttle --ops-throttle=5000 src/ dst/
 ```
 
-**Remote copies** propagate `--auto-meta-*` flags to both `rcpd` processes (source and destination)
-automatically, so each side runs its own controller against the local part of the filesystem it
-actually observes.
+The histogram switches differ between local and remote copies. Each row describes the flag used
+alone; adding a panel flag to a logging run also requests the progress display.
+
+| Flag                             | Local copy                                                           | Remote copy                                                                                          |
+| -------------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--auto-meta-throttle`           | Enable adaptive metadata throttling.                                 | Enable independent throttling in both `rcpd` processes.                                              |
+| `--auto-meta-histogram`          | Enable throttling and the live distribution panel; implies progress. | Request progress, but the histogram panel is empty. Does not enable remote throttling.               |
+| `--auto-meta-histogram-log PATH` | Enable throttling and write a binary log; does not imply progress.   | Enable throttling in both `rcpd` processes and write one log per host/role; does not imply progress. |
+
+For remote diagnostics, use the log flag. With `PATH=run.hdr`, the endpoint files are
+`run.rcpd-source.hdr` and `run.rcpd-destination.hdr`. The parent directory must be usable on each
+endpoint host; existing log files are truncated. No master log is created, and remote histograms are
+not shown in the progress display. `--auto-meta-histogram-interval` sets the snapshot cadence
+(default `1s`, range `100ms`–`60s`), but does not enable collection by itself. See the
+[histogram reference](docs/congestion_control.md#per-side-op-latency-histograms) for the V2 format
+and remote scoping details.
 
 **Tuning knobs** (all listed under `--help-all` on each binary): the initial / minimum / maximum
 `cwnd`, the grow/shrink ratio thresholds (`alpha`, `beta`), the baseline / current percentiles used
@@ -461,9 +474,10 @@ the control-loop tick cadence. The defaults ship a cross-percentile signal (base
 `p50`) with `alpha = 1.3` and `beta = 1.8` bracketing the typical inter-quantile spread of metadata
 syscalls, and are a good starting point.
 
-For the design rationale (why concurrency is the lever, what `cwnd` is, the exact control law
-including worked ratio→action examples, and how the controller stays robust to load it generates
-itself), see [docs/congestion_control.md](docs/congestion_control.md).
+For component ownership, see [congestion/DESIGN.md](congestion/DESIGN.md). For the design rationale
+(why concurrency is the lever, what `cwnd` is, the exact control law including worked ratio→action
+examples, and how the controller stays robust to load it generates itself), see
+[docs/congestion_control.md](docs/congestion_control.md).
 
 ## Error handling
 
