@@ -47,13 +47,6 @@ impl std::io::Write for ProgWriter {
     }
 }
 
-fn get_hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|os_str| os_str.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(val) => match val.parse() {
@@ -312,7 +305,7 @@ pub fn generate_debug_log_filename(prefix: &str) -> String {
 /// `identifier` should be "rcp", "rcpd-source", or "rcpd-destination"
 #[must_use]
 pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) -> String {
-    let hostname = get_hostname();
+    let hostname = crate::host::current().name_or_unknown();
     let pid = std::process::id();
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
     format!("{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.{extension}")
@@ -1865,7 +1858,7 @@ fn build_histogram_header(
     snapshot_interval: std::time::Duration,
 ) -> congestion::format::LogHeader {
     use congestion::format::{AutoMetaSnapshot, HdrSnapshot, LogHeader, UnitLabel};
-    let hostname = get_hostname();
+    let hostname = crate::host::current().name_or_unknown().to_string();
     let mut unit_labels = Vec::with_capacity(congestion::N_META_RESOURCES);
     for &side in &congestion::Side::ALL {
         for &op in &congestion::MetadataOp::ALL {

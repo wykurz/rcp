@@ -53,7 +53,7 @@ fn default_files_in_flight_from(available: Option<NonZeroUsize>) -> NonZeroUsize
 }
 
 fn default_files_in_flight() -> NonZeroUsize {
-    default_files_in_flight_from(std::thread::available_parallelism().ok())
+    default_files_in_flight_from(crate::host::current().cpus)
 }
 
 impl ResolvedFilesInFlight {
@@ -587,6 +587,17 @@ mod files_in_flight_policy_tests {
             default_files_in_flight_from(NonZeroUsize::new(12)).get(),
             12
         );
+    }
+
+    #[test]
+    fn automatic_files_in_flight_follows_this_hosts_parallelism() {
+        let cpus = std::thread::available_parallelism().unwrap().get();
+        let limit = ResolvedFilesInFlight::automatic();
+        assert_eq!(
+            limit.limit(),
+            ConcurrencyLimit::Limited(NonZeroUsize::new(cpus.max(4)).unwrap())
+        );
+        assert_eq!(limit.source(), FilesInFlightSource::Automatic);
     }
 
     #[test]

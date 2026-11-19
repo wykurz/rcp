@@ -123,6 +123,7 @@ pub mod filegen;
 pub mod filter;
 pub mod histogram_logger;
 pub mod histogram_panel;
+pub mod host;
 mod input_protection;
 pub mod link;
 pub mod observability;
@@ -221,18 +222,7 @@ pub fn is_localhost(host: &str) -> bool {
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
         return true;
     }
-    // check against actual hostname using gethostname
-    let mut buf = [0u8; 256];
-    // Safety: gethostname writes to buf and returns 0 on success
-    let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if result == 0
-        && let Ok(hostname_cstr) = std::ffi::CStr::from_bytes_until_nul(&buf)
-        && let Ok(hostname) = hostname_cstr.to_str()
-        && host == hostname
-    {
-        return true;
-    }
-    false
+    host::current().name.as_deref() == Some(host)
 }
 
 pub(crate) static PROGRESS: std::sync::LazyLock<progress::Progress> =
