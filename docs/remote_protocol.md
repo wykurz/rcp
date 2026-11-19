@@ -1,5 +1,10 @@
 # Remote Copy Protocol Design Document
 
+This is the detailed implementation reference. Start with the
+[remote component design](../remote/DESIGN.md) for the ownership and source map, or
+[remote copy operations](remote_copy.md) for user-facing setup and troubleshooting. Test and
+measurement procedures belong in [testing](testing.md) and [benchmarking](benchmarking.md).
+
 ## 1. Architecture Overview
 
 ### 1.1 Three-Component Architecture
