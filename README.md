@@ -922,13 +922,14 @@ rcp --max-workers=4 /source /dest
 ### Remote Copy Buffer Size
 
 For remote copies, `--remote-copy-buffer-size` sets the maximum transfer buffer and file I/O request
-size (default: 16 MiB for datacenter, 2 MiB for internet). The configured value must fit `usize` on
-the master and each daemon; otherwise argument validation or daemon startup fails. The source's read
-buffer and the destination's receive buffer use the same per-file limit, capped to the file size and
-the host's `isize::MAX`, with a one-byte minimum. The source reads into one buffer and sends from
-it; the destination fills one buffer from the network and writes it to the file in whole chunks.
-Empty payloads need no buffer. Individual disk and network operations can be shorter; this does not
-set TCP packet or TLS record sizes.
+size (default: the [network profile](#network-profile)'s buffer size, 16 MiB for datacenter and 2
+MiB for internet). The configured value must fit `usize` on the master and each daemon; otherwise
+argument validation or daemon startup fails. The source's read buffer and the destination's receive
+buffer use the same per-file limit, capped to the file size and the host's `isize::MAX`, with a
+one-byte minimum. The source reads into one buffer and sends from it; the destination fills one
+buffer from the network and writes it to the file in whole chunks. Empty payloads need no buffer.
+Individual disk and network operations can be shorter; this does not set TCP packet or TLS record
+sizes.
 
 These integer bounds ensure representable sizes, not available memory. There is no practical
 allocation budget check: excessively large settings can exhaust memory and abort a daemon. Each
@@ -943,13 +944,17 @@ rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
 rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
 ```
 
-Both daemons keep their buffer per data connection between files, up to the smaller of the copy
-chunk size and 2 MiB by default. A file whose chunk fits that limit then costs no allocation and no
-initialization on either side, at the cost of memory held until the connection closes. A kept buffer
-can be larger than a later file's request. Use `--remote-copy-buffer-retention-limit=16MiB` to keep
-full datacenter chunks, a smaller limit to reduce idle memory, or `0` to disable reuse. Chunks above
-the limit still use the configured I/O size with temporary storage for each file. At 100 connections
-the default ceiling of kept buffers is 200 MiB in each daemon for either profile; see
+Both daemons keep their buffer per data connection between files. By default they keep up to the
+smaller of the copy chunk size and the network profile's buffer size, so a profile's own copy buffer
+is kept whole: 16 MiB for datacenter, 2 MiB for internet. A file whose chunk fits that limit then
+costs no allocation and no initialization on either side, at the cost of memory held until the
+connection closes. A kept buffer can be larger than a later file's request. Use
+`--remote-copy-buffer-retention-limit` with a smaller size to reduce idle memory (`2MiB` restores
+the limit of earlier releases), with a larger one to keep a copy buffer raised above the profile's
+size, or with `0` to disable reuse. Chunks above the limit still use the configured I/O size with
+temporary storage for each file. At 100 connections the default ceiling of kept buffers in each
+daemon is 1600 MiB for the datacenter profile and 200 MiB for the internet profile, reached only
+once every connection has carried a file that large; see
 [connection reuse](docs/remote_protocol.md#75-data-connection-pooling) for the full memory
 accounting.
 
@@ -964,6 +969,13 @@ rcp --network-profile=datacenter host1:/data host2:/data
 # For internet transfers (conservative settings)
 rcp --network-profile=internet host1:/data host2:/data
 ```
+
+A profile selects one buffer size: 16 MiB for `datacenter` and 2 MiB for `internet`. `rcp` requests
+it for the send and receive buffer of every TCP connection, and it is the default for the
+[remote copy buffer](#remote-copy-buffer-size) and for how much of that buffer each daemon keeps per
+connection between files. The kernel grants a socket at most `net.core.rmem_max` / `wmem_max`, which
+is often less than requested (see [TCP Socket Buffers](#tcp-socket-buffers)); the copy buffer keeps
+the profile's size either way.
 
 ### Concurrent Connections
 

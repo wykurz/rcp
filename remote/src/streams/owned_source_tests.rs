@@ -411,6 +411,52 @@ async fn a_stream_reuses_its_payload_buffer_for_files_within_the_retention_limit
 }
 
 #[tokio::test]
+async fn a_default_configuration_keeps_a_whole_profile_sized_payload_buffer() -> anyhow::Result<()>
+{
+    let admission = throttle::open_file_permit().await;
+    for profile in [
+        crate::NetworkProfile::Internet,
+        crate::NetworkProfile::Datacenter,
+    ] {
+        let config = crate::TcpConfig {
+            network_profile: profile,
+            ..Default::default()
+        };
+        let chunk = config.effective_buffer_size();
+        let payload = vec![0xaa; chunk];
+        let (first, stream, observed) = fixture(&payload);
+        let mut stream =
+            stream.with_payload_buffer_retention_limit(config.effective_buffer_retention_limit());
+        assert_eq!(
+            stream
+                .send_message_with_file(&1_u64, first, chunk as u64, chunk, &admission)
+                .await?,
+            chunk as u64
+        );
+        assert_eq!(stream.payload_buffer.len(), chunk, "{profile:?}");
+        let before = observed.lock().unwrap().reads.len();
+        assert_eq!(
+            stream
+                .send_message_with_file(
+                    &2_u64,
+                    reader(&observed, &payload),
+                    chunk as u64,
+                    chunk,
+                    &admission
+                )
+                .await?,
+            chunk as u64
+        );
+        let observed = observed.lock().unwrap();
+        // the file before, still in the storage, proves the buffer was kept and not replaced
+        assert_eq!(observed.reads[before].1, chunk);
+        assert!(observed.found[before].iter().all(|byte| *byte == 0xaa));
+        assert_eq!(stream.payload_buffer.len(), chunk);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_payload_buffer_grows_only_to_the_chunk_a_file_needs() -> anyhow::Result<()> {
     let admission = throttle::open_file_permit().await;
     let (_, stream, observed) = fixture(b"");

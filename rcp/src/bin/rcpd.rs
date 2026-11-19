@@ -183,6 +183,10 @@ struct Args {
     remote_keepalive_sec: u64,
 
     /// Network profile for TCP tuning
+    ///
+    /// A profile selects one buffer size (16 MiB for datacenter, 2 MiB for internet): requested
+    /// for each TCP socket buffer, and the default for the copy buffer and for the buffer kept
+    /// between files.
     #[arg(
         long,
         default_value = "datacenter",
@@ -204,14 +208,15 @@ struct Args {
     /// Each active transfer holds one buffer of up to this size on each side, so larger limits
     /// allow more working memory. Keeping buffers between files is controlled separately.
     ///
-    /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
+    /// Default: the network profile's buffer size, 16 MiB for datacenter and 2 MiB for internet.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     buffer_size: Option<usize>,
 
     /// Maximum transfer buffer kept per data connection between files, in bytes.
     ///
     /// The source keeps its read buffer and the destination its receive buffer.
-    /// Defaults to min(effective buffer size, 2 MiB). Allocated lazily; zero disables retention.
+    /// Defaults to min(effective buffer size, the network profile's buffer size). Allocated
+    /// lazily; zero disables retention.
     /// Does not change I/O chunk sizes: larger chunks use temporary storage per file.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     buffer_retention_limit: Option<usize>,
@@ -1207,7 +1212,7 @@ mod tests {
     fn daemon_resolves_buffer_retention_without_changing_copy_chunks() {
         for role in ["--role=source", "--role=destination"] {
             for (extra, chunk, limit) in [
-                (vec![], 16 * 1024 * 1024, 2 * 1024 * 1024),
+                (vec![], 16 * 1024 * 1024, 16 * 1024 * 1024),
                 (
                     vec!["--network-profile=internet"],
                     2 * 1024 * 1024,
@@ -1217,12 +1222,17 @@ mod tests {
                 (
                     vec!["--buffer-size=33554432"],
                     32 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                ),
+                (
+                    vec!["--network-profile=internet", "--buffer-size=16777216"],
+                    16 * 1024 * 1024,
                     2 * 1024 * 1024,
                 ),
                 (
-                    vec!["--buffer-retention-limit=16777216"],
+                    vec!["--buffer-retention-limit=2097152"],
                     16 * 1024 * 1024,
-                    16 * 1024 * 1024,
+                    2 * 1024 * 1024,
                 ),
                 (
                     vec!["--buffer-size=12345", "--buffer-retention-limit=8192"],

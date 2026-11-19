@@ -173,15 +173,13 @@ async fn scratch_grows_only_to_needed_payload_and_retention_limit() -> anyhow::R
 }
 
 #[tokio::test]
-async fn profile_sized_chunks_reuse_initialized_storage_with_explicit_limit() -> anyhow::Result<()>
-{
+async fn profile_sized_chunks_reuse_initialized_storage_by_default() -> anyhow::Result<()> {
     for profile in [
         crate::NetworkProfile::Internet,
         crate::NetworkProfile::Datacenter,
     ] {
         let config = crate::TcpConfig {
             network_profile: profile,
-            buffer_retention_limit: Some(profile.default_remote_copy_buffer_size()),
             ..Default::default()
         };
         let chunk = config.effective_buffer_size();
@@ -204,30 +202,32 @@ async fn profile_sized_chunks_reuse_initialized_storage_with_explicit_limit() ->
 }
 
 #[tokio::test]
-async fn default_retention_caps_storage_without_shrinking_profile_chunks() -> anyhow::Result<()> {
-    for profile in [
-        crate::NetworkProfile::Internet,
-        crate::NetworkProfile::Datacenter,
+async fn default_retention_stops_at_the_profile_size_without_shrinking_larger_chunks()
+-> anyhow::Result<()> {
+    for (profile, kept) in [
+        (crate::NetworkProfile::Internet, 2 * 1024 * 1024),
+        (crate::NetworkProfile::Datacenter, 16 * 1024 * 1024),
     ] {
+        // a copy buffer raised above the profile's size is still read whole, but not kept
+        let chunk = 2 * kept;
         let config = crate::TcpConfig {
             network_profile: profile,
+            buffer_size: Some(chunk),
             ..Default::default()
         };
-        let chunk = config.effective_buffer_size();
+        assert_eq!(config.effective_buffer_size(), chunk);
         let limit = config.effective_buffer_retention_limit();
-        let mut recv = RecvStream::new(Reader::new(vec![0x59; chunk + limit], usize::MAX))
+        let mut recv = RecvStream::new(Reader::new(vec![0x59; chunk + kept], usize::MAX))
             .with_copy_buffer_retention_limit(limit);
         let mut sink = tokio::io::sink();
         recv.copy_exact_to_buffered(&mut sink, chunk as u64, chunk)
             .await?;
         assert_eq!(recv.framed.get_ref().requests, [chunk]);
-        assert_eq!(
-            recv.copy_buffer.len(),
-            if chunk <= limit { chunk } else { 0 }
-        );
-        recv.copy_exact_to_buffered(&mut sink, limit as u64, chunk)
+        assert!(recv.copy_buffer.is_empty());
+        // a file that fits the profile's size is kept in full
+        recv.copy_exact_to_buffered(&mut sink, kept as u64, chunk)
             .await?;
-        assert_eq!(recv.copy_buffer.len(), 2 * 1024 * 1024);
+        assert_eq!(recv.copy_buffer.len(), kept);
     }
     Ok(())
 }
@@ -271,8 +271,8 @@ async fn lowering_or_disabling_retention_releases_existing_storage() -> anyhow::
 async fn oversized_chunks_stay_temporary_without_shrinking_reads() -> anyhow::Result<()> {
     for size in [
         TEST_RETENTION_LIMIT + 1,
-        crate::INTERNET_REMOTE_COPY_BUFFER_SIZE,
-        crate::DATACENTER_REMOTE_COPY_BUFFER_SIZE,
+        crate::NetworkProfile::Internet.socket_buffer_size(),
+        crate::NetworkProfile::Datacenter.socket_buffer_size(),
     ] {
         let mut recv = recv_stream(Reader::new(vec![0x59; size + 16], usize::MAX));
         let mut sink = tokio::io::sink();

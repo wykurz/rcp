@@ -285,10 +285,13 @@ struct Args {
 
     /// Network profile for TCP tuning
     ///
+    /// A profile selects one buffer size. It is requested for each TCP socket buffer (the kernel
+    /// may grant less) and is the default for the remote copy buffer and for the buffer kept
+    /// between files.
     /// 'datacenter' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
-    /// Uses larger buffer sizes for high-bandwidth links.
+    /// Uses 16 MiB buffers for high-bandwidth links.
     /// 'internet': Conservative settings for internet connections.
-    /// Uses smaller buffer sizes suitable for shared networks.
+    /// Uses 2 MiB buffers suitable for shared networks.
     #[arg(
         long,
         default_value = "datacenter",
@@ -311,14 +314,15 @@ struct Args {
     /// allow more working memory. Keeping buffers between files is controlled separately.
     /// Accepts byte sizes like "256KiB", "1MiB", or plain numbers in bytes.
     ///
-    /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
+    /// Default: the network profile's buffer size, 16 MiB for datacenter and 2 MiB for internet.
     #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
     remote_copy_buffer_size: Option<bytesize::ByteSize>,
 
     /// Maximum transfer buffer each side keeps per remote data connection between files.
     ///
     /// Applies to the source's read buffer and to the destination's receive buffer.
-    /// Defaults to the smaller of the remote copy buffer size and 2 MiB.
+    /// Defaults to the smaller of the remote copy buffer size and the network profile's buffer
+    /// size (16 MiB for datacenter, 2 MiB for internet), so a profile's own buffer is kept whole.
     /// Allocated lazily, only as needed. Accepts sizes like "256KiB", "1MiB", or bytes.
     /// Zero disables reuse. Smaller limits reduce idle memory without reducing I/O chunks;
     /// chunks exceeding the limit allocate temporary storage for each file.
@@ -2298,19 +2302,41 @@ mod tests {
 
     #[test]
     fn master_forwards_buffer_configuration_to_both_daemon_roles() {
-        for (options, chunk, limit) in [
-            (vec![], 16 * 1024 * 1024, None),
-            (vec!["--network-profile=internet"], 2 * 1024 * 1024, None),
-            (vec!["--remote-copy-buffer-size=1MiB"], 1024 * 1024, None),
+        // options, copy buffer, explicit kept-buffer limit, kept-buffer limit in effect
+        for (options, chunk, limit, kept) in [
+            (vec![], 16 * 1024 * 1024, None, 16 * 1024 * 1024),
+            (
+                vec!["--network-profile=internet"],
+                2 * 1024 * 1024,
+                None,
+                2 * 1024 * 1024,
+            ),
+            (
+                vec!["--remote-copy-buffer-size=1MiB"],
+                1024 * 1024,
+                None,
+                1024 * 1024,
+            ),
             (
                 vec!["--remote-copy-buffer-size=32MiB"],
                 32 * 1024 * 1024,
                 None,
+                16 * 1024 * 1024,
             ),
             (
-                vec!["--remote-copy-buffer-retention-limit=16MiB"],
+                vec![
+                    "--network-profile=internet",
+                    "--remote-copy-buffer-size=16MiB",
+                ],
                 16 * 1024 * 1024,
-                Some(16 * 1024 * 1024),
+                None,
+                2 * 1024 * 1024,
+            ),
+            (
+                vec!["--remote-copy-buffer-retention-limit=2MiB"],
+                16 * 1024 * 1024,
+                Some(2 * 1024 * 1024),
+                2 * 1024 * 1024,
             ),
             (
                 vec![
@@ -2319,11 +2345,13 @@ mod tests {
                 ],
                 1024 * 1024,
                 Some(256 * 1024),
+                256 * 1024,
             ),
             (
                 vec!["--remote-copy-buffer-retention-limit=0"],
                 16 * 1024 * 1024,
                 Some(0),
+                0,
             ),
             (
                 vec![
@@ -2332,6 +2360,7 @@ mod tests {
                 ],
                 1024,
                 Some(2 * 1024 * 1024),
+                2 * 1024 * 1024,
             ),
         ] {
             let args = master_args(&options);
@@ -2359,10 +2388,7 @@ mod tests {
                         .into_iter()
                         .collect::<Vec<_>>()
                 );
-                assert_eq!(
-                    config.tcp.effective_buffer_retention_limit(),
-                    limit.unwrap_or(chunk.min(2 * 1024 * 1024))
-                );
+                assert_eq!(config.tcp.effective_buffer_retention_limit(), kept);
                 assert_eq!(config.rcpd.buffer_retention_limit, limit);
                 let retained_args: Vec<_> = config
                     .rcpd
