@@ -285,9 +285,10 @@ struct Args {
 
     /// Network profile for TCP tuning
     ///
-    /// A profile selects one buffer size. It is requested for each TCP socket buffer (the kernel
-    /// may grant less) and is the default for the remote copy buffer and for the buffer kept
-    /// between files.
+    /// A profile selects one buffer size. It is the TCP socket buffer size wanted on data
+    /// connections, which each daemon requests from its kernel only where the request yields more
+    /// than the kernel's own sizing, and the default for the remote copy buffer and for the
+    /// buffer kept between files.
     /// 'datacenter' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
     /// Uses 16 MiB buffers for high-bandwidth links.
     /// 'internet': Conservative settings for internet connections.
