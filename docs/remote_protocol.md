@@ -1451,11 +1451,38 @@ connection timeout is rejected.
 
 ### 8.2 Network Profiles
 
-A profile selects one buffer size. Each endpoint requests it for the send and receive buffer of
-every TCP connection (`SO_SNDBUF`, `SO_RCVBUF`), and it is the default for
-`--remote-copy-buffer-size` and for the retention limit of §7.5. The kernel grants a socket at most
-`net.core.wmem_max` / `rmem_max`, which may be less than requested; the copy buffer and the
-retention limit keep the profile's size regardless.
+A profile selects one buffer size. It is the TCP socket buffer size wanted on data connections, and
+the default for `--remote-copy-buffer-size` and for the retention limit of §7.5; those two keep the
+profile's size whatever the sockets end up with.
+
+Whether a socket buffer is requested (`SO_SNDBUF`, `SO_RCVBUF`) is decided by each process for its
+own host. A request is not harmless: the kernel cuts it to `net.core.wmem_max` / `rmem_max` without
+reporting it and then never changes that buffer, while a buffer nobody asked for is grown by the
+kernel up to the last value of `net.ipv4.tcp_wmem` / `tcp_rmem` (for receive buffers only while
+`net.ipv4.tcp_moderate_rcvbuf` is on; otherwise they stay at the middle value). A process therefore
+requests a buffer only where twice the size the kernel would grant, which is how the kernel accounts
+a granted request, exceeds what the kernel would reach by itself. When the limits cannot be found
+out or the two are equal, it requests nothing. The growth limits are read from the kernel's
+settings. The request limits are found by asking a socket that never connects, because the settings
+that state them are not visible inside a network namespace on kernels before 6.12, where they bind a
+container all the same.
+
+- The source requests its send buffer on each accepted data connection.
+- The destination requests its receive buffer on each data connection BEFORE it connects. A receive
+  buffer requested on an established connection no longer widens the window the socket may advertise
+  on kernels before 6.11, where the window then stays at its initial 64 KiB however large the buffer
+  is.
+- The destination then takes the kernel's "fixed" mark off that buffer again (`SO_BUF_LOCK`, kernel
+  5.15 and later), still before connecting. The buffer keeps its size. A buffer that is marked fixed
+  when the socket connects makes the kernel choose the connection's window scale for half of that
+  buffer, and the scale cannot change later: of the 416 KiB that a stock request limit grants, such
+  a connection can never advertise more than 0.25 MiB, where kernels from 6.6 on would otherwise use
+  0.30 MiB.
+- Control connections, and the directions no file data flows in, request nothing.
+
+The two ends decide independently and nothing about it is exchanged: a source may request while its
+destination does not. The source and the destination each log their decision once at info level. The
+master makes no data connection and decides nothing.
 
 **Datacenter Profile (default):**
 
@@ -1479,15 +1506,17 @@ retention limit keep the profile's size regardless.
 ### 8.4 Connection Liveness
 
 Every rcp TCP connection — master↔rcpd (control and tracing), source↔destination control, and each
-pooled data connection — is configured through one entry point (`remote::configure_tcp_socket`) that
-applies `TCP_NODELAY`, the profile's buffer sizes, and dead-peer detection. A peer whose HOST
-vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`, so without
-detection a read on it never completes: the master awaits `RcpdResult` with no timeout of its own,
-and the source↔destination control reads behave the same way, so all three processes hang.
+pooled data connection — is configured through one function (`configure_tcp_socket` in the `remote`
+crate) that applies `TCP_NODELAY`, the buffer requests of §8.2, and dead-peer detection. A peer
+whose HOST vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`, so
+without detection a read on it never completes: the master awaits `RcpdResult` with no timeout of
+its own, and the source↔destination control reads behave the same way, so all three processes hang.
 
 `--remote-keepalive-sec=N` is the budget for noticing this. It arms two options, and **which ones
-apply depends on what the connection carries** — the entry point takes a `ConnectionKind` (`Control`
-or `Data`) precisely so each call site declares that:
+apply depends on what the connection carries** — the function takes a `ConnectionKind` (`Control` or
+`Data`), and it is reached only through one typed entry point for each kind of socket (a control
+connection, an accepted data connection, a data socket about to connect), so no call site can leave
+that open:
 
 This is not an overall operation deadline. A live host whose userspace `rcpd` is stopped or wedged
 can still have its kernel acknowledge TCP keepalives and zero-window probes, so neither keepalive

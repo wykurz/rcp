@@ -18,6 +18,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the process statistics; after a remote copy it also holds those of the source and destination
   `rcpd`. Text remains the default.
 
+### Fixed
+
+- Stop remote copies from holding back their own TCP window. `rcp` asked the kernel for socket
+  buffer sizes on every connection, after the connection was established. On kernels before 6.11
+  such a late request leaves the receive window at its initial 64 KiB however large the buffer, on
+  any host, tuned or not. And on hosts with a small request limit (`net.core.rmem_max` / `wmem_max`,
+  208 KiB on stock kernels before 6.18) the request was cut to less than the kernel would have grown
+  the buffer to by itself. Each `rcpd` now finds out the limits of its own host, also where a
+  container hides the kernel's settings, and requests a buffer only where that yields more than the
+  kernel's own sizing: the destination for its receive buffer, before it connects, and the source
+  for its send buffer. Control connections request nothing. On kernel 6.1, a 64 MiB copy over a 20
+  ms round trip took 24 s before, whatever the host's limits, and 2 to 5 s after (9 to 11 s where
+  the kernel's growth of receive buffers is switched off); on kernel 6.12 with stock limits it took
+  8 s before and 3.3 to 3.8 s after. One case can be slower than before: where that growth is
+  switched off (`net.ipv4.tcp_moderate_rcvbuf=0`) and receive buffers are left at their small
+  starting size, encrypted copies took 4% to 12% longer on kernels 6.6 and later. The README's "TCP
+  Socket Buffers" section explains both limits, now recommends raising either, and says how to give
+  such a host larger buffers.
+
 ### Changed
 
 - Reuse transfer buffers in remote copies. The source `rcpd` now keeps its read buffer per data
@@ -27,13 +46,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer costs a memory mapping and its page faults on each side. On one 20-CPU host, remote copies
   of 64 KiB to 1 MB files took 24% to 56% less time.
 - Keep whole transfer buffers between the files of a remote copy by default. One size per network
-  profile, 16 MiB for datacenter and 2 MiB for internet, now sets the TCP socket buffer request, the
-  default of `--remote-copy-buffer-size` and the default of `--remote-copy-buffer-retention-limit`;
-  the last was 2 MiB for both profiles. Under the datacenter profile a file of 2 MiB to 16 MiB no
-  longer costs each daemon an allocation: on one 20-CPU host, remote copies of 8 GiB took 12% less
-  time for 4 MiB files and 7% less for 16 MiB files. A data connection that has carried such a file
-  now holds up to 16 MiB in each daemon until it closes, 1600 MiB at 100 connections;
-  `--remote-copy-buffer-retention-limit=2MiB` restores the previous limit.
+  profile, 16 MiB for datacenter and 2 MiB for internet, now sets the wanted TCP socket buffer size,
+  the default of `--remote-copy-buffer-size` and the default of
+  `--remote-copy-buffer-retention-limit`; the last was 2 MiB for both profiles. Under the datacenter
+  profile a file of 2 MiB to 16 MiB no longer costs each daemon an allocation: on one 20-CPU host,
+  remote copies of 8 GiB took 12% less time for 4 MiB files and 7% less for 16 MiB files. A data
+  connection that has carried such a file now holds up to 16 MiB in each daemon until it closes,
+  1600 MiB at 100 connections; `--remote-copy-buffer-retention-limit=2MiB` restores the previous
+  limit.
 - Read the summary's CPU time with `getrusage(2)`: it is reported to the millisecond instead of in
   10 ms clock ticks. Statistics no longer read as zero when `/proc` is unavailable; peak memory then
   comes from `getrusage(2)` as well.

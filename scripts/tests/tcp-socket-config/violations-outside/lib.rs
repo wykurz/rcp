@@ -2,9 +2,9 @@
 //! present) so the vacuity check stays quiet — the marked violations live in user.rs.
 //! Not compiled — read only by the linter.
 
-pub fn configure_tcp_socket(stream: &tokio::net::TcpStream) {
-    stream.set_nodelay(true).ok();
-    let sock_ref = socket2::SockRef::from(stream);
+fn configure_tcp_socket(socket: &impl std::os::fd::AsFd) {
+    let sock_ref = socket2::SockRef::from(socket);
+    sock_ref.set_tcp_nodelay(true).ok();
     sock_ref.set_send_buffer_size(1).ok();
     sock_ref.set_recv_buffer_size(1).ok();
     let keepalive = socket2::TcpKeepalive::new();

@@ -1,30 +1,50 @@
 #!/bin/bash
 # TCP Socket Configuration Linter
 # Ensures every rcp TCP connection is configured through the single funnel
-# `remote::configure_tcp_socket` (remote/src/lib.rs). Two rules, because either one alone
-# leaves a hole:
+# `configure_tcp_socket` in remote/src/lib.rs, which is reached through one typed entry point
+# for each kind of socket rcp has: `configure_control_connection`,
+# `configure_accepted_data_connection` and `configure_data_socket_before_connect`. Two rules,
+# because either one alone leaves a hole:
 #
 #   1. NO HAND-SET OPTION. TCP_NODELAY, keepalive, TCP_USER_TIMEOUT and the socket buffer
-#      sizes may not be set outside the funnel's body.
+#      sizes may not be set outside the funnel's body. The funnel sets them through socket2, so
+#      that it can configure a socket that is not connected yet; tokio's own `set_nodelay` and
+#      the bare `set_keepalive` are second spellings of an owned option and are allowed nowhere.
+#      The funnel is the function of that name in the funnel FILE: a function of the same name
+#      anywhere else is as much outside as any other code.
 #   2. NO UNCONFIGURED CONNECTION. Establishing or accepting a TCP connection is confined to
 #      the funnel FILE's configured helpers, in two parts:
-#        2a. Outside the funnel file, `TcpStream::connect(` / `.accept()` are forbidden
-#            entirely — callers use the configured helpers (`connect_tcp_control`,
-#            `connect_tcp_data`, `accept_tcp_control`, `accept_tcp_data`).
+#        2a. Outside the funnel file, `TcpStream::connect(` / `.accept()`, their
+#            `connect_timeout(` / `.poll_accept(` variants, and the creation of a socket to
+#            connect later (`Socket::new(`, `Socket::new_raw(`, `TcpSocket::new_v4(`,
+#            `TcpSocket::new_v6(`) are forbidden entirely — callers use the configured helpers
+#            (`connect_tcp_control`, `connect_tcp_data`, `accept_tcp_control`,
+#            `accept_tcp_data`).
 #        2b. Inside the funnel file, every top-level production `fn` that opens a connection
 #            must configure THAT connection: each `let <ident> = ...connect/accept` needs a
-#            `configure_tcp_socket(&<ident>...)` naming the same binding, and the fn needs at
-#            least as many configure calls as opens — a helper opening two sockets but
-#            configuring one, or configuring an unrelated stream, fails. `#[cfg(test)]` modules are skipped
-#            (their sockets are throwaway fixtures, same rationale as the tls.rs exemption).
-#            A connect/accept outside any recognized top-level fn — including inside an
-#            `impl` block — fails CLOSED: the helpers are free functions precisely so this
-#            scoping stays trivial to verify.
+#            call of one of the typed entry points naming the same binding (for a socket
+#            created to connect later, that binding is the socket), and the fn needs at least
+#            as many such calls as opens — a helper opening two sockets but configuring one, or
+#            configuring an unrelated stream, fails. A call of the funnel itself does not
+#            count: the entry points are what decides which buffer may be asked for at which
+#            moment, and an opening fn has to go through them. `#[cfg(test)]` modules are
+#            skipped (their sockets are throwaway fixtures, same rationale as the tls.rs
+#            exemption). A connect/accept outside any recognized top-level fn — including
+#            inside an `impl` block — fails CLOSED: the helpers are free functions precisely so
+#            this scoping stays trivial to verify.
+#      This script does not check the ORDER of configuring and connecting. The types do: a
+#      receive buffer can only be handed to `configure_data_socket_before_connect`, which takes
+#      the socket2 socket that exists before the connection and is consumed to make it.
 #      Rule 1 cannot see an unconfigured connection at all: it sets no option, so it passes
 #      rule 1 while silently having no liveness detection. An earlier form of rule 2 compared
 #      per-FILE counts of connect/accept sites vs `configure_tcp_socket(` mentions; in the
 #      funnel file itself the declaration and its tests inflate that count, leaving room for
 #      several unconfigured connections to land without failing CI.
+#
+# Not covered, on purpose: a connection made on a socket that came from somewhere else (a
+# `TcpSocket` handed in as a parameter, or wrapped around a raw descriptor), and options set
+# through raw `setsockopt`. A bare `.connect(` is too common a name to forbid (the TLS connector
+# and the data pool have one), and no rcp connection is made or configured through raw calls.
 #
 # Why: these options used to be hand-paired at each connection — `set_nodelay` at 7 sites,
 # buffer sizing at 4, and two sites got no buffer sizing at all. Adding keepalive and
@@ -34,8 +54,8 @@
 # reviewer verify the set once instead of seven times.
 #
 # Exemptions:
-#   * the body of `configure_tcp_socket` itself (rule 1) — where the options are legitimately
-#     set. The rest of the funnel file is NOT exempt from rule 1.
+#   * the body of `configure_tcp_socket` in the funnel file (rule 1) — where the options are
+#     legitimately set. The rest of the funnel file is NOT exempt from rule 1.
 #   * remote/src/tls.rs (rule 2 only) — its connects/accepts are all inside #[cfg(test)]
 #     handshake fixtures, which exercise TLS over a throwaway socket and carry no copy.
 #
@@ -75,11 +95,19 @@ else
 fi
 FUNNEL_FILE="${TCP_CHECK_FUNNEL_FILE:-remote/src/lib.rs}"
 FUNNEL_FN="configure_tcp_socket"
-# the socket options the funnel owns; getters (`nodelay()`, `send_buffer_size()`) are reads and
-# do not match
-PATTERNS="set_nodelay set_tcp_keepalive set_tcp_user_timeout set_send_buffer_size set_recv_buffer_size"
-# rule 2: establishing or accepting a connection is confined to the funnel file's helpers
-CONNECT_PATTERNS="TcpStream::connect( .accept()"
+# the funnel's typed entry points, one for each kind of socket: what a fn that opens a
+# connection has to call on what it opened
+CONFIGURE_CALLS="configure_control_connection configure_accepted_data_connection configure_data_socket_before_connect"
+# the socket options the funnel owns; getters (`tcp_nodelay()`, `send_buffer_size()`) are reads
+# and do not match
+PATTERNS="set_tcp_nodelay set_tcp_keepalive set_tcp_user_timeout set_send_buffer_size set_recv_buffer_size"
+# other spellings of an owned option: allowed nowhere, the funnel included (the open paren keeps
+# `set_nodelay(` from matching inside `set_tcp_nodelay(`, and `set_keepalive(` inside
+# `set_tcp_keepalive(`)
+ALIASES="set_nodelay( set_keepalive("
+# rule 2: establishing or accepting a connection, or creating a socket to connect later, is
+# confined to the funnel file's helpers
+CONNECT_PATTERNS="TcpStream::connect( TcpStream::connect_timeout( .accept() .poll_accept( Socket::new( Socket::new_raw( TcpSocket::new_v4( TcpSocket::new_v6("
 CONNECT_EXEMPT="${TCP_CHECK_CONNECT_EXEMPT:-remote/src/tls.rs}"
 
 VIOLATIONS_FOUND=0
@@ -95,14 +123,15 @@ for dir in $SEARCH_DIRS; do
 done
 
 # ── Rule 1 ──────────────────────────────────────────────────────────────────────────────────────
-# Report every option-setter match outside the funnel's body, and every pattern the funnel no
-# longer contains. The body runs from the `pub fn <name>(` line to the next `}` in column 0. Line
-# comments are stripped first so prose naming an option — including this funnel's own doc
-# comment — is fine.
-report=$(awk -v fn="$FUNNEL_FN" -v patterns="$PATTERNS" '
-BEGIN { n = split(patterns, pat, " ") }
+# Report every option-setter match outside the funnel's body, every alias spelling anywhere, and
+# every pattern the funnel no longer contains. The body runs from the `fn <name>(` line (with or
+# without a visibility) IN THE FUNNEL FILE to the next `}` in column 0. Line comments are stripped
+# first so prose naming an option — including this funnel's own doc comment — is fine.
+report=$(awk -v fn="$FUNNEL_FN" -v funnel="$FUNNEL_FILE" -v patterns="$PATTERNS" -v aliases="$ALIASES" '
+BEGIN { n = split(patterns, pat, " "); m = split(aliases, alias, " ") }
+FNR == 1 { inside = 0 }
 {
-    if ($0 ~ ("^pub fn " fn "\\(")) inside = 1
+    if (FILENAME == funnel && $0 ~ ("^(pub(\\([a-z]+\\))? )?fn " fn "\\(")) inside = 1
     code = $0
     sub(/\/\/.*/, "", code)
     for (i = 1; i <= n; i++) {
@@ -111,6 +140,8 @@ BEGIN { n = split(patterns, pat, " ") }
             else printf "outside:%d:%s:%s\n", FNR, FILENAME, $0
         }
     }
+    for (i = 1; i <= m; i++)
+        if (index(code, alias[i]) > 0) printf "outside:%d:%s:%s\n", FNR, FILENAME, $0
     if (inside && $0 ~ /^}/) inside = 0
 }
 END {
@@ -162,11 +193,11 @@ while IFS= read -r file; do
 done < <(find $EXISTING_DIRS -name "*.rs" -type f | sort)
 
 # ── Rule 2b ─────────────────────────────────────────────────────────────────────────────────────
-# Inside the funnel file, every top-level production fn containing a connect/accept must call
-# configure_tcp_socket( in its own body. #[cfg(test)] modules are skipped; a connect outside any
-# recognized top-level fn fails closed as "stray".
-report2=$(awk -v patterns="$CONNECT_PATTERNS" -v cfgfn="$FUNNEL_FN" '
-BEGIN { n = split(patterns, pat, " ") }
+# Inside the funnel file, every top-level production fn containing a connect/accept must call one
+# of the typed entry points in its own body. #[cfg(test)] modules are skipped; a connect outside
+# any recognized top-level fn fails closed as "stray".
+report2=$(awk -v patterns="$CONNECT_PATTERNS" -v cfgfns="$CONFIGURE_CALLS" '
+BEGIN { n = split(patterns, pat, " "); c = split(cfgfns, cfg, " ") }
 {
     # test-module skipping: `#[cfg(test)]` immediately above a column-0 `mod`; the module ends
     # at the next `}` in column 0 (its items are indented)
@@ -219,11 +250,18 @@ BEGIN { n = split(patterns, pat, " ") }
             cfgs_by[arg]++
         }
     }
-    if (in_fn && index(code, cfgfn "(") > 0 && $0 !~ /^(pub )?fn /) {
+    # a call of one of the entry points (their own declarations, which start a line, are not)
+    cfg_at = 0
+    if (in_fn && $0 !~ /^(pub(\([a-z]+\))? )?fn /)
+        for (k = 1; k <= c && cfg_at == 0; k++) {
+            at = index(code, cfg[k] "(")
+            if (at > 0) cfg_at = at + length(cfg[k]) + 1
+        }
+    if (cfg_at > 0) {
         # record which identifier this configure names: the first argument, `&ident` or `ident`,
         # on this line or (rustfmt multi-line call) the next. counted PER IDENT so shadowed
         # same-name opens cannot share one configure.
-        rest = substr(code, index(code, cfgfn "(") + length(cfgfn) + 1)
+        rest = substr(code, cfg_at)
         if (match(rest, /^[ \t]*&?[A-Za-z_][A-Za-z0-9_]*/)) {
             arg = substr(rest, RSTART, RLENGTH)
             gsub(/[ \t&]/, "", arg)
@@ -259,7 +297,7 @@ END {
 }
 
 if [ -n "$report2" ]; then
-    echo -e "${RED}Unconfigured TCP connection(s) inside $FUNNEL_FILE${NC} (each connecting/accepting fn must call $FUNNEL_FN on what it opened; 'stray' = outside any top-level fn):"
+    echo -e "${RED}Unconfigured TCP connection(s) inside $FUNNEL_FILE${NC} (each connecting/accepting fn must call one of the funnel's entry points on what it opened: $CONFIGURE_CALLS; 'stray' = outside any top-level fn):"
     while IFS=: read -r kind line_num content; do
         [ -z "$line_num" ] && continue
         echo -e "  Line $line_num: ${YELLOW}$content${NC}"
@@ -275,12 +313,12 @@ if [ $VIOLATIONS_FOUND -eq 1 ]; then
     echo -e "${RED}without keepalive/TCP_USER_TIMEOUT hangs forever on a vanished host.${NC}"
     echo ""
     echo "Instead of setting an option by hand — or of opening a connection directly:"
-    echo -e "  ${RED}stream.set_nodelay(true)?;   TcpStream::connect(addr)   listener.accept()${NC}"
+    echo -e "  ${RED}stream.set_nodelay(true)?;   TcpStream::connect(addr)   listener.accept()   Socket::new(..)${NC}"
     echo ""
     echo "Establish or accept through the configured helpers in remote/src/lib.rs:"
     echo -e "  ${GREEN}remote::connect_tcp_control(addr, tcp_config)  /  remote::connect_tcp_data(addr, profile, keepalive)${NC}"
     echo -e "  ${GREEN}remote::accept_tcp_control(&listener, tcp_config)  /  remote::accept_tcp_data(&listener, profile, keepalive)${NC}"
-    echo -e "  ${GREEN}(a NEW helper belongs beside them, calling configure_tcp_socket on what it opens)${NC}"
+    echo -e "  ${GREEN}(a NEW helper belongs beside them, calling the funnel's entry point for its kind of socket)${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     exit 1
 fi

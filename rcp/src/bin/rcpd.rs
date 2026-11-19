@@ -187,9 +187,10 @@ struct Args {
 
     /// Network profile for TCP tuning
     ///
-    /// A profile selects one buffer size (16 MiB for datacenter, 2 MiB for internet): requested
-    /// for each TCP socket buffer, and the default for the copy buffer and for the buffer kept
-    /// between files.
+    /// A profile selects one buffer size (16 MiB for datacenter, 2 MiB for internet): the TCP
+    /// socket buffer size wanted on data connections, requested from the kernel only where that
+    /// yields more than its own sizing, and the default for the copy buffer and for the buffer
+    /// kept between files.
     #[arg(
         long,
         default_value = "datacenter",

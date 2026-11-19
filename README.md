@@ -861,23 +861,49 @@ optimizations.
 
 ### TCP Socket Buffers
 
-`rcp` automatically requests larger TCP socket buffers for high-throughput transfers, but the kernel
-caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
+A TCP stream can have about one socket buffer's worth of data under way per round trip, so over a
+link with latency its buffers bound its speed. A Linux socket buffer gets its size in one of two
+ways, and each has its own limit:
+
+- **A program asks for a size.** The kernel grants at most `net.core.rmem_max` / `net.core.wmem_max`
+  (208 KiB on stock kernels before 6.18, 4 MiB since), does not report the cut, and never changes
+  that buffer again.
+- **A program asks for nothing.** The kernel starts the buffer small and grows it as the connection
+  needs, up to the last value of `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem` (usually 6 MiB and 4 MiB;
+  receive buffers grow to 32 MiB on recent kernels).
+
+Asking can therefore leave a connection with less than saying nothing. For its data connections
+`rcp` wants buffers of the [network profile](#network-profile)'s size, and each `rcpd` asks its
+kernel for that size only where the request yields more than the kernel would reach by itself: the
+source for its send buffer, the destination for its receive buffer, each from the settings of its
+own host. Elsewhere the kernel sizes the buffer. Control connections never ask.
+
+To let `rcp` use larger buffers on a host, raise either limit. Raising the kernel's own growth helps
+every program on the host:
 
 ```bash
 # Check current limits
-sysctl net.core.rmem_max net.core.wmem_max
+sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
 
-# Increase to 16 MiB (requires root, temporary until reboot)
+# Either let the kernel grow buffers to 32 MiB by itself (requires root, temporary until reboot)
+sudo sysctl -w net.ipv4.tcp_rmem="4096 131072 33554432"
+sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 33554432"
+
+# or let programs ask for more. rcp then asks wherever that gives it a larger buffer than the
+# kernel's own growth would (the kernel counts a granted request double: 16 MiB here is 32 MiB)
 sudo sysctl -w net.core.rmem_max=16777216
 sudo sysctl -w net.core.wmem_max=16777216
 
-# Make permanent (add to /etc/sysctl.d/99-rcp-perf.conf)
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+# Make permanent (add the chosen lines to /etc/sysctl.d/99-rcp-perf.conf)
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
 ```
 
-The default is often insufficient for 10+ Gbps links.
+The stock limits are often insufficient for 10+ Gbps links or for links with more than a few
+milliseconds of latency. If `net.ipv4.tcp_moderate_rcvbuf` is `0`, the kernel does not grow receive
+buffers at all; `rcp` then asks for one whenever that yields more than the starting size. With the
+stock request limit that is only 416 KiB, so on such a host raise `net.core.rmem_max`, or the middle
+value of `net.ipv4.tcp_rmem`, which is the size every receive buffer then keeps.
 
 ### Open File Limits
 
@@ -990,12 +1016,12 @@ rcp --network-profile=datacenter host1:/data host2:/data
 rcp --network-profile=internet host1:/data host2:/data
 ```
 
-A profile selects one buffer size: 16 MiB for `datacenter` and 2 MiB for `internet`. `rcp` requests
-it for the send and receive buffer of every TCP connection, and it is the default for the
+A profile selects one buffer size: 16 MiB for `datacenter` and 2 MiB for `internet`. It is the TCP
+socket buffer size `rcp` wants on its data connections, which each `rcpd` requests from its kernel
+only where that yields more than the kernel's own sizing (see
+[TCP Socket Buffers](#tcp-socket-buffers)). It is also the default for the
 [remote copy buffer](#remote-copy-buffer-size) and for how much of that buffer each daemon keeps per
-connection between files. The kernel grants a socket at most `net.core.rmem_max` / `wmem_max`, which
-is often less than requested (see [TCP Socket Buffers](#tcp-socket-buffers)); the copy buffer keeps
-the profile's size either way.
+connection between files; those keep the profile's size whatever the sockets end up with.
 
 ### Concurrent Connections
 
@@ -1031,8 +1057,21 @@ rcp --max-files-in-flight=16 --max-connections=16 host1:/data host2:/dest
 
 ### Check TCP Buffer Sizes
 
-When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`). If the actual sizes
-are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
+With `-v`, each `rcpd` logs once what it decided for its end of the data connections and the figures
+behind it: the source about its send buffers, the destination about its receive buffers. For
+example, on a stock kernel 6.18:
+
+```text
+TCP send buffers of data connections: requested at 16.0 MiB, which the kernel grants as 8.0 MiB,
+more than the 4.0 MiB it grows them to by itself
+
+TCP receive buffers of data connections: left to the kernel, which grows them to 32.0 MiB; a
+request for 16.0 MiB would be held at 8.0 MiB
+```
+
+The sizes are as the kernel accounts them, which is twice what it grants. If both figures of a line
+are far below the network profile's size, raise that host's limits as described under
+[TCP Socket Buffers](#tcp-socket-buffers).
 
 ### Check for Network Issues
 
@@ -1048,7 +1087,8 @@ ss -ti | grep retrans
 
 For optimal performance on high-speed networks:
 
-1. ☐ Increase `rmem_max`/`wmem_max` to 16+ MiB
+1. ☐ Raise the kernel's TCP buffer limits on both hosts (see
+   [TCP Socket Buffers](#tcp-socket-buffers))
 2. ☐ Check the hard descriptor limit on each host if copying many files
 3. ☐ Use `--network-profile=datacenter` for local/datacenter networks
 4. ☐ Use `--progress` to monitor throughput in real-time

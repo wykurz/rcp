@@ -109,13 +109,7 @@ async fn test_remote_tcp_connect_with_timeout() -> Result<()> {
     let server_addr = listener.local_addr()?;
     // spawn a task to accept the connection
     let accept_handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await?;
-        remote::configure_tcp_socket(
-            &stream,
-            config.network_profile,
-            config.keepalive_sec,
-            remote::ConnectionKind::Control,
-        );
+        remote::accept_tcp_control(&listener, &config).await?;
         Ok::<_, std::io::Error>(())
     });
     // connect to the server

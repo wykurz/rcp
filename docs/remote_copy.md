@@ -654,10 +654,16 @@ which gained context switch and page fault counts, and requires matching binarie
 
 ### Network Profiles
 
-A profile selects one buffer size. It is requested for the send and receive buffer of every TCP
-connection, and it is the default for the remote copy buffer and for the buffer each side keeps per
-data connection between files. The kernel may grant a socket less than requested; the copy buffer
-does not follow that.
+A profile selects one buffer size. It is the TCP socket buffer size wanted on data connections, and
+the default for the remote copy buffer and for the buffer each side keeps per data connection
+between files.
+
+Each `rcpd` requests the socket buffer size from its kernel only where the request yields more than
+the kernel would reach by itself, judged from the settings of its own host: the source for its send
+buffer, the destination for its receive buffer, which it requests before it connects. Elsewhere, and
+on control connections, the kernel sizes the buffers. The README's
+[TCP Socket Buffers](../README.md#tcp-socket-buffers) section explains the two limits involved and
+how to raise them.
 
 **Datacenter (default)**:
 

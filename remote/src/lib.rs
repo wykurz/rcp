@@ -48,7 +48,7 @@
 //! - [`create_tcp_data_listener`] - Create TCP listener for data connections
 //! - [`connect_tcp_control`] - Connect to a TCP control server
 //! - [`get_tcp_listener_addr`] - Get externally-routable address of a listener
-//! - [`configure_tcp_socket`] - Apply the standard socket options to every established connection
+//! - `configure_tcp_socket` - The one place the standard socket options are set
 //!
 //! ## Port Range Configuration
 //!
@@ -1426,6 +1426,8 @@ impl BootstrapDeadline {
 mod deploy;
 pub mod port_ranges;
 pub mod protocol;
+mod socket_buffers;
+use socket_buffers::{ReceiveBufferRequest, SendBufferRequest};
 pub mod streams;
 pub mod tls;
 pub mod tracelog;
@@ -1470,14 +1472,16 @@ impl std::str::FromStr for NetworkProfile {
 }
 
 impl NetworkProfile {
-    /// Returns the size this profile requests for each TCP socket buffer: 16 MiB for datacenter
-    /// and 2 MiB for internet.
+    /// Returns the TCP socket buffer size this profile wants on data connections: 16 MiB for
+    /// datacenter and 2 MiB for internet.
     ///
-    /// This is the one size a profile selects. [`configure_tcp_socket`] requests it for the send
-    /// and receive buffers of every connection, and it is the default for the remote copy buffer
-    /// ([`TcpConfig::effective_buffer_size`]) and for how much of that buffer each side keeps per
-    /// data connection between files ([`TcpConfig::effective_buffer_retention_limit`]). The
-    /// kernel may grant a socket less than requested; the copy buffer does not follow that.
+    /// This is the one size a profile selects. Each end of a data connection asks its kernel for
+    /// it only where that yields more than the kernel's own sizing would (see
+    /// [`connect_tcp_data`] and [`accept_tcp_data`]). It is also the default for the remote copy
+    /// buffer ([`TcpConfig::effective_buffer_size`]) and for how much of that buffer each side
+    /// keeps per data connection between files
+    /// ([`TcpConfig::effective_buffer_retention_limit`]); those do not follow what the socket ends
+    /// up with.
     pub fn socket_buffer_size(&self) -> usize {
         match self {
             Self::Datacenter => 16 * 1024 * 1024,
@@ -1505,7 +1509,7 @@ pub struct TcpConfig {
     /// without changing I/O chunk sizes.
     pub buffer_retention_limit: Option<usize>,
     /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
-    /// See [`configure_tcp_socket`].
+    /// See [`ConnectionKind`].
     pub keepalive_sec: u64,
 }
 
@@ -1518,7 +1522,7 @@ pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
 /// Default liveness budget for an rcp TCP connection (seconds).
 ///
 /// Detects a vanished peer host in about two minutes while surviving any stall shorter than that.
-/// Exposed as `--remote-keepalive-sec`; see [`configure_tcp_socket`].
+/// Exposed as `--remote-keepalive-sec`; see [`ConnectionKind`].
 pub const DEFAULT_REMOTE_KEEPALIVE_SEC: u64 = 120;
 
 /// Validated capacities used by the remote file-transfer pipeline.
@@ -3350,33 +3354,55 @@ pub async fn connect_tcp_control(
     .await
     .with_context(|| format!("connection to {} timed out after {}s", addr, timeout_sec))?
     .with_context(|| format!("failed to connect to {}", addr))?;
-    configure_tcp_socket(
-        &stream,
-        config.network_profile,
-        config.keepalive_sec,
-        ConnectionKind::Control,
-    );
+    configure_control_connection(&stream, config.keepalive_sec);
     tracing::debug!("connected to TCP control server at {}", addr);
     Ok(stream)
 }
 
 /// Connect a TCP data connection, applying the standard socket options.
 ///
+/// This is the end that receives file data (the destination). Its socket is configured BEFORE it
+/// connects, because that is the only moment a receive buffer request takes effect on every
+/// kernel: on kernels before 6.11 a request made on an established connection no longer widens
+/// the window the socket may advertise. Whether a request is made is decided from the limits of
+/// this process's own host and `profile`, and only where it yields more than the kernel's own
+/// sizing of the buffer would.
+///
 /// Deliberately NOT bounded here: the data pool bounds TCP connect + TLS handshake under ONE
 /// caller-side deadline, and an inner timeout would double-count it. Takes the profile and
 /// keepalive budget rather than a whole [`TcpConfig`] because that is what the pool carries.
 ///
 /// These helpers exist so no connection can be established without its socket options:
-/// `scripts/check-tcp-socket-config.sh` forbids raw `TcpStream::connect`/`.accept()` outside this
-/// file, and inside it requires every connecting/accepting function to configure what it opened.
+/// `scripts/check-tcp-socket-config.sh` forbids raw `TcpStream::connect`/`.accept()` and the
+/// creation of sockets to connect later outside this file, and inside it requires every
+/// connecting/accepting function to configure what it opened.
 pub async fn connect_tcp_data(
     addr: std::net::SocketAddr,
     profile: NetworkProfile,
     keepalive_sec: u64,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let stream = tokio::net::TcpStream::connect(addr).await?;
-    configure_tcp_socket(&stream, profile, keepalive_sec, ConnectionKind::Data);
-    Ok(stream)
+    let receive_buffer = ReceiveBufferRequest::for_this_host(profile);
+    connect_tcp_data_requesting(addr, receive_buffer, keepalive_sec).await
+}
+
+/// What [`connect_tcp_data`] does once the request is decided. Separate so that a test can hand
+/// in a request of its own choosing.
+async fn connect_tcp_data_requesting(
+    addr: std::net::SocketAddr,
+    receive_buffer: ReceiveBufferRequest,
+    keepalive_sec: u64,
+) -> std::io::Result<tokio::net::TcpStream> {
+    // a socket that is not connected yet, so that every option is in place when the connection is
+    // made. the call below only takes such a socket: once this one has been turned into a tokio
+    // socket, which is what can connect, a receive buffer can no longer be asked for
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM.nonblocking(),
+        Some(socket2::Protocol::TCP),
+    )?;
+    configure_data_socket_before_connect(&socket, keepalive_sec, receive_buffer);
+    let socket = tokio::net::TcpSocket::from_std_stream(socket.into());
+    socket.connect(addr).await
 }
 
 /// Accept one TCP control connection, applying the standard socket options before returning it.
@@ -3390,20 +3416,19 @@ pub async fn accept_tcp_control(
     config: &TcpConfig,
 ) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
     let (stream, addr) = listener.accept().await?;
-    configure_tcp_socket(
-        &stream,
-        config.network_profile,
-        config.keepalive_sec,
-        ConnectionKind::Control,
-    );
+    configure_control_connection(&stream, config.keepalive_sec);
     Ok((stream, addr))
 }
 
 /// Accept one TCP data connection, applying the standard socket options before returning it.
 ///
+/// This is the end that sends file data (the source). It asks for a send buffer where the limits
+/// of this process's own host make that yield more than the kernel's own sizing would for
+/// `profile`; a send buffer can be asked for once the connection exists.
+///
 /// Data connections get no `TCP_USER_TIMEOUT` — a throttled receiver legitimately stops reading
 /// mid-file, and aborting that sender would fail a copy that used to just run slow (see
-/// [`configure_tcp_socket`]). Unbounded like [`connect_tcp_data`]: the source's accept loop runs
+/// [`ConnectionKind`]). Unbounded like [`connect_tcp_data`]: the source's accept loop runs
 /// for the life of the pool. Cancel-safe as `TcpListener::accept` is (see
 /// [`accept_tcp_control`]), so it can sit in a `select!` arm.
 pub async fn accept_tcp_data(
@@ -3411,8 +3436,19 @@ pub async fn accept_tcp_data(
     profile: NetworkProfile,
     keepalive_sec: u64,
 ) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let send_buffer = SendBufferRequest::for_this_host(profile);
+    accept_tcp_data_requesting(listener, send_buffer, keepalive_sec).await
+}
+
+/// What [`accept_tcp_data`] does once the request is decided. Separate so that a test can hand
+/// in a request of its own choosing.
+async fn accept_tcp_data_requesting(
+    listener: &tokio::net::TcpListener,
+    send_buffer: SendBufferRequest,
+    keepalive_sec: u64,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
     let (stream, addr) = listener.accept().await?;
-    configure_tcp_socket(&stream, profile, keepalive_sec, ConnectionKind::Data);
+    configure_accepted_data_connection(&stream, keepalive_sec, send_buffer);
     Ok((stream, addr))
 }
 
@@ -3447,14 +3483,121 @@ impl std::fmt::Display for ConnectionKind {
     }
 }
 
-/// Configure an rcp TCP connection: no-delay, buffer sizes, and dead-peer detection.
+/// Configure a control connection, at either end, once it is established.
 ///
-/// This is the ONE place these options are set — call it at every site that establishes or accepts
-/// an rcp TCP connection. They used to be hand-paired per connection (`set_nodelay` at 7 sites,
-/// buffer sizing at 4, so two sites got no buffer sizing at all), which is the missed-exit-path
-/// smell: a new option has to be copied into every site and eventually is not.
-/// `scripts/check-tcp-socket-config.sh` enforces that no other site sets any of these options
-/// itself, and that every file opening or accepting a TCP connection routes through here.
+/// Control connections carry little data and ask the kernel for no buffer size.
+fn configure_control_connection(stream: &tokio::net::TcpStream, keepalive_sec: u64) {
+    configure_tcp_socket(
+        socket2::SockRef::from(stream),
+        keepalive_sec,
+        ConnectionKind::Control,
+        None,
+        None,
+    );
+}
+
+/// Configure a data connection the source has accepted. This end sends the file data.
+///
+/// A send buffer can still be asked for on an established connection. A receive buffer cannot,
+/// and this function cannot be handed one: see [`configure_data_socket_before_connect`].
+fn configure_accepted_data_connection(
+    stream: &tokio::net::TcpStream,
+    keepalive_sec: u64,
+    send_buffer: SendBufferRequest,
+) {
+    configure_tcp_socket(
+        socket2::SockRef::from(stream),
+        keepalive_sec,
+        ConnectionKind::Data,
+        send_buffer.size(),
+        None,
+    );
+}
+
+/// Configure the socket of a data connection the destination is about to make. This end
+/// receives the file data.
+///
+/// This is the only place a receive buffer is asked for, and the parameter type keeps it so: a
+/// `socket2::Socket` is what [`connect_tcp_data`] holds before it connects, and neither the tokio
+/// socket it turns into nor the connected stream can be passed here. Asked for on an established
+/// connection, a receive buffer no longer widens the window the socket may advertise on kernels
+/// before 6.11. The buffer keeps the size asked for but does not stay marked as fixed, which
+/// would narrow the connection's window scale (see `unmark_receive_buffer`).
+fn configure_data_socket_before_connect(
+    socket: &socket2::Socket,
+    keepalive_sec: u64,
+    receive_buffer: ReceiveBufferRequest,
+) {
+    configure_tcp_socket(
+        socket2::SockRef::from(socket),
+        keepalive_sec,
+        ConnectionKind::Data,
+        None,
+        receive_buffer.size(),
+    );
+}
+
+/// Take the kernel's "fixed by a request" mark off a socket's receive buffer, keeping its size.
+///
+/// A receive buffer that is still marked when the socket connects makes the kernel choose the
+/// connection's window scale for half of that buffer and no more. The scale cannot change later,
+/// and unless that half is a power of two it leaves the socket unable to advertise the rest of
+/// its buffer: 0.25 MiB of the 416 KiB that a stock request limit grants, of which kernels from
+/// 6.6 on would otherwise use 0.30. Without the mark the scale is chosen as for any other socket.
+/// The size stays, because the kernel only ever grows an unmarked buffer, and a request is made
+/// only for more than it grows them to.
+///
+/// Kernels before 5.15 cannot do this (they do not know `SO_BUF_LOCK`). They never use more than
+/// half of a buffer for the window, which the narrower scale covers.
+fn unmark_receive_buffer(socket: &socket2::SockRef<'_>) {
+    use std::os::fd::AsRawFd;
+    const SO_BUF_LOCK: libc::c_int = 72;
+    const RECEIVE_BUFFER_MARK: libc::c_int = 2;
+    let mut marks: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // safety: both calls pass pointers to a live integer of the stated size
+    let failed = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_BUF_LOCK,
+            (&raw mut marks).cast(),
+            &raw mut length,
+        ) != 0
+            || {
+                marks &= !RECEIVE_BUFFER_MARK;
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    SO_BUF_LOCK,
+                    (&raw const marks).cast(),
+                    length,
+                ) != 0
+            }
+    };
+    if failed {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOPROTOOPT) {
+            tracing::debug!("this kernel keeps a requested TCP receive buffer marked as fixed");
+        } else {
+            tracing::warn!("failed to take the fixed mark off the TCP receive buffer: {error:#}");
+        }
+    }
+}
+
+/// Set the options of an rcp TCP socket: no-delay, buffer sizes, and dead-peer detection.
+///
+/// This is the ONE place these options are set. They used to be hand-paired per connection
+/// (`set_nodelay` at 7 sites, buffer sizing at 4, so two sites got no buffer sizing at all), which
+/// is the missed-exit-path smell: a new option has to be copied into every site and eventually is
+/// not. `scripts/check-tcp-socket-config.sh` enforces that no other site sets any of these
+/// options itself, and that every function opening or accepting a TCP connection configures it.
+///
+/// Nothing calls this but the three functions above, one for each kind of socket rcp has. Their
+/// signatures decide what may be asked of the kernel, and when: a control connection asks for no
+/// buffer size, an accepted data connection may ask for a send buffer, and only a data socket
+/// that has not connected yet may ask for a receive buffer, because that is the only moment such
+/// a request takes effect on every kernel. A buffer nobody asks for is sized by the kernel.
 ///
 /// `keepalive_sec` is the budget for noticing that the peer's HOST has vanished (power loss,
 /// severed link, destroyed VM). Such a peer sends neither FIN nor RST, so an await on it never
@@ -3488,33 +3631,47 @@ impl std::fmt::Display for ConnectionKind {
 /// The keepalive sub-values are derived from the single budget rather than exposed individually, so
 /// their relationship stays correct by construction: idle at half the budget, probes every twelfth
 /// of it, [`TCP_KEEPALIVE_RETRIES`] of them. `keepalive_sec == 0` disables both mechanisms and
-/// leaves only no-delay and buffer sizing.
+/// leaves only no-delay and the buffer requests.
 ///
 /// Every option is best effort: a failure is logged and tolerated, because a socket option that a
 /// platform or a container policy refuses is not a reason to fail a copy.
-pub fn configure_tcp_socket(
-    stream: &tokio::net::TcpStream,
-    profile: NetworkProfile,
+fn configure_tcp_socket(
+    sock_ref: socket2::SockRef<'_>,
     keepalive_sec: u64,
     kind: ConnectionKind,
+    send_buffer: Option<usize>,
+    receive_buffer: Option<usize>,
 ) {
-    if let Err(err) = stream.set_nodelay(true) {
+    if let Err(err) = sock_ref.set_tcp_nodelay(true) {
         tracing::warn!("failed to set TCP_NODELAY: {err:#}");
     }
-    // one size per profile for both directions; the copy buffer defaults to the same size
-    let buffer_size = profile.socket_buffer_size();
-    let sock_ref = socket2::SockRef::from(stream);
-    if let Err(err) = sock_ref.set_send_buffer_size(buffer_size) {
+    if let Some(size) = send_buffer
+        && let Err(err) = sock_ref.set_send_buffer_size(size)
+    {
         tracing::warn!("failed to set TCP send buffer size: {err:#}");
     }
-    if let Err(err) = sock_ref.set_recv_buffer_size(buffer_size) {
-        tracing::warn!("failed to set TCP receive buffer size: {err:#}");
+    if let Some(size) = receive_buffer {
+        match sock_ref.set_recv_buffer_size(size) {
+            Ok(()) => unmark_receive_buffer(&sock_ref),
+            Err(err) => tracing::warn!("failed to set TCP receive buffer size: {err:#}"),
+        }
     }
     if let (Ok(send), Ok(recv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
+        // a buffer nobody asked for is shown at its starting size; the kernel grows it later
         tracing::debug!(
-            "TCP socket buffer sizes: send={} recv={}",
+            "TCP socket buffer sizes on {kind} connection: send={}{} recv={}{}",
             bytesize::ByteSize(send as u64),
+            if send_buffer.is_some() {
+                " (requested)"
+            } else {
+                ""
+            },
             bytesize::ByteSize(recv as u64),
+            if receive_buffer.is_some() {
+                " (requested)"
+            } else {
+                ""
+            },
         );
     }
     if keepalive_sec == 0 {
@@ -6227,12 +6384,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_socket_applies_every_option() {
         let (stream, _accepted) = connected_pair().await;
-        configure_tcp_socket(
-            &stream,
-            NetworkProfile::Datacenter,
-            120,
-            ConnectionKind::Control,
-        );
+        configure_control_connection(&stream, 120);
         let sock = socket2::SockRef::from(&stream);
         assert!(stream.nodelay().unwrap(), "TCP_NODELAY must be set");
         assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
@@ -6262,12 +6414,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_socket_derives_keepalive_from_the_budget() {
         let (stream, _accepted) = connected_pair().await;
-        configure_tcp_socket(
-            &stream,
-            NetworkProfile::Internet,
-            60,
-            ConnectionKind::Control,
-        );
+        configure_control_connection(&stream, 60);
         let sock = socket2::SockRef::from(&stream);
         assert_eq!(
             sock.tcp_keepalive_time().unwrap(),
@@ -6289,12 +6436,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_socket_clamps_sub_second_derivations() {
         let (stream, _accepted) = connected_pair().await;
-        configure_tcp_socket(
-            &stream,
-            NetworkProfile::Datacenter,
-            1,
-            ConnectionKind::Control,
-        );
+        configure_control_connection(&stream, 1);
         let sock = socket2::SockRef::from(&stream);
         assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must still be on");
         assert_eq!(
@@ -6310,12 +6452,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_socket_leaves_keepalive_off_when_disabled() {
         let (stream, _accepted) = connected_pair().await;
-        configure_tcp_socket(
-            &stream,
-            NetworkProfile::Datacenter,
-            0,
-            ConnectionKind::Control,
-        );
+        configure_control_connection(&stream, 0);
         let sock = socket2::SockRef::from(&stream);
         assert!(
             !sock.keepalive().unwrap(),
@@ -6340,12 +6477,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_socket_omits_user_timeout_on_data_connections() {
         let (stream, _accepted) = connected_pair().await;
-        configure_tcp_socket(
-            &stream,
-            NetworkProfile::Datacenter,
-            120,
-            ConnectionKind::Data,
-        );
+        configure_accepted_data_connection(&stream, 120, SendBufferRequest::NONE);
         let sock = socket2::SockRef::from(&stream);
         #[cfg(target_os = "linux")]
         assert_eq!(
@@ -6423,45 +6555,387 @@ mod tests {
         }
     }
 
-    // absolute sizes are not assertable — the kernel doubles the request and clamps it to
-    // net.core.{r,w}mem_max — but a THIRD, untouched socket from the same host pins the baseline,
-    // so the comparison fails if the sizing calls are removed. Comparing the two profiles to each
-    // other cannot: they collapse to equality whenever both clamp to the same maximum.
+    /// The limit for the window this socket may advertise to its peer (`TCP_WINDOW_CLAMP`).
+    fn window_limit(socket: &impl std::os::fd::AsRawFd) -> u32 {
+        socket_option(socket, libc::IPPROTO_TCP, libc::TCP_WINDOW_CLAMP).unwrap()
+    }
+
+    const SEND_BUFFER_FIXED: u32 = 1;
+
+    /// The scale the kernel multiplies this socket's 16-bit window field by on the wire, as a power
+    /// of two. It is settled when the connection is made: whatever its buffer, the socket can
+    /// never advertise more than `65535 << scale` bytes.
+    fn receive_window_scale(socket: &impl std::os::fd::AsRawFd) -> u8 {
+        // the start of `struct tcp_info`: byte 6 holds both scales, the receive one in its high half
+        let mut info = [0u8; 8];
+        let mut length = info.len() as libc::socklen_t;
+        // safety: `info` and `length` are valid for writes of the sizes passed
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                info.as_mut_ptr().cast(),
+                &raw mut length,
+            )
+        };
+        assert_eq!(result, 0, "{:#}", std::io::Error::last_os_error());
+        info[6] >> 4
+    }
+
+    /// Which of this socket's buffers the kernel treats as fixed by a request, as a set of the two
+    /// flags above (`SO_BUF_LOCK`, read back). A kernel before 5.15 cannot say, so every test that
+    /// asserts this also compares the buffer sizes, which tell on any kernel.
+    fn fixed_buffers(socket: &impl std::os::fd::AsRawFd) -> Option<u32> {
+        const SO_BUF_LOCK: libc::c_int = 72;
+        match socket_option(socket, libc::SOL_SOCKET, SO_BUF_LOCK) {
+            Ok(flags) => Some(flags),
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => None,
+            Err(error) => panic!("reading which buffers are fixed failed: {error:#}"),
+        }
+    }
+
+    /// Assert which buffers are fixed, where the kernel can tell.
+    #[track_caller]
+    fn assert_fixed_buffers(socket: &impl std::os::fd::AsRawFd, expected: u32, context: &str) {
+        if let Some(fixed) = fixed_buffers(socket) {
+            assert_eq!(fixed, expected, "{context}");
+        }
+    }
+
+    fn socket_option(
+        socket: &impl std::os::fd::AsRawFd,
+        level: libc::c_int,
+        name: libc::c_int,
+    ) -> std::io::Result<u32> {
+        let mut value: u32 = 0;
+        let mut length = std::mem::size_of::<u32>() as libc::socklen_t;
+        // safety: `value` and `length` are valid for writes of the sizes passed
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        };
+        if result == 0 {
+            Ok(value)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// The sizes of a socket's send and receive buffers, as the kernel accounts them.
+    fn buffer_sizes(socket: &impl std::os::fd::AsRawFd) -> (u32, u32) {
+        (
+            socket_option(socket, libc::SOL_SOCKET, libc::SO_SNDBUF).unwrap(),
+            socket_option(socket, libc::SOL_SOCKET, libc::SO_RCVBUF).unwrap(),
+        )
+    }
+
+    /// The buffer size the kernel accounts on this host when a socket asks for `size` bytes with
+    /// `option` (`SO_SNDBUF` or `SO_RCVBUF`). Asked of a socket that never connects, and not
+    /// through the code under test.
+    fn granted(option: libc::c_int, size: usize) -> u32 {
+        use std::os::fd::AsRawFd;
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let size = libc::c_int::try_from(size).unwrap();
+        // safety: `size` is a live integer of the length passed
+        let result = unsafe {
+            libc::setsockopt(
+                probe.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "{:#}", std::io::Error::last_os_error());
+        socket_option(&probe, libc::SOL_SOCKET, option).unwrap()
+    }
+
+    /// A request that visibly changes a buffer which starts at `initial` bytes on this host,
+    /// with the size the kernel accounts for it.
+    ///
+    /// A large one, as a real request is, where the host's request limit lets it at least double
+    /// the buffer. Otherwise a small one that at least halves it: that is what a host needs whose
+    /// buffers start out larger than its request limit allows, such as one with the starting size
+    /// raised, or a kernel before 4.20, which enlarges a loopback socket's buffer when it
+    /// connects.
+    fn telling_request(option: libc::c_int, initial: u32) -> (usize, u32) {
+        for size in [4 << 20, 16 << 10] {
+            let granted = granted(option, size);
+            if granted >= 2 * initial || 2 * granted <= initial {
+                return (size, granted);
+            }
+        }
+        panic!("no buffer request changes a socket that starts at {initial} bytes on this host");
+    }
+
+    // a receive buffer asked for once the connection exists no longer widens the window on kernels
+    // before 6.11: the limit below is set when the connection is established and, for a buffer the
+    // kernel treats as fixed, never again. so the request has to be in place before connecting,
+    // and this limit, read before any data flows, shows whether it was, on every kernel
     #[tokio::test]
-    async fn configure_tcp_socket_sizes_buffers_by_profile() {
-        let (datacenter, _a) = connected_pair().await;
-        let (internet, _b) = connected_pair().await;
-        let (untouched, _c) = connected_pair().await;
-        configure_tcp_socket(
-            &datacenter,
-            NetworkProfile::Datacenter,
+    async fn a_requested_receive_buffer_is_in_place_when_the_connection_is_made() {
+        let (untouched, _peer) = connected_pair().await;
+        let (_, initial) = buffer_sizes(&untouched);
+        let (request, granted) = telling_request(libc::SO_RCVBUF, initial);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requested, accepted) = tokio::join!(
+            connect_tcp_data_requesting(addr, ReceiveBufferRequest::of(request), 0),
+            listener.accept()
+        );
+        let (requested, _accepted) = (requested.unwrap(), accepted.unwrap());
+        assert_eq!(
+            buffer_sizes(&requested),
+            (buffer_sizes(&untouched).0, granted),
+            "the receive buffer is the one asked for, the send buffer the kernel's own"
+        );
+        assert_fixed_buffers(
+            &requested,
             0,
-            ConnectionKind::Data,
+            "the receive buffer keeps the size asked for without staying marked as fixed",
         );
-        configure_tcp_socket(&internet, NetworkProfile::Internet, 0, ConnectionKind::Data);
-        let (dc, net, base) = (
-            socket2::SockRef::from(&datacenter),
-            socket2::SockRef::from(&internet),
-            socket2::SockRef::from(&untouched),
+        // the limit follows the buffer the socket had when it connected: wider than an untouched
+        // socket's for a larger buffer, narrower for a smaller one, and the same if the request
+        // came too late
+        assert_eq!(
+            window_limit(&requested).cmp(&window_limit(&untouched)),
+            granted.cmp(&initial),
+            "asked too late: with a buffer of {granted} bytes the socket may advertise {}, an \
+             untouched one {} with {initial}",
+            window_limit(&requested),
+            window_limit(&untouched)
         );
-        // what is (and is not) assertable across kernels: an explicit SO_SNDBUF/SO_RCVBUF is
-        // clamped to `wmem_max`/`rmem_max`, and on hosts whose sysctls leave those at the default
-        // (~208 KiB) while TCP auto-tuning grows untouched sockets into megabytes — GitHub's
-        // runners measure 425984 configured vs 2626560 untouched — the configured size sits BELOW
-        // the untouched default no matter what this code does. So "configured > default" is a
-        // property of the host, not of configure_tcp_socket, and is deliberately NOT asserted.
-        // what the code does guarantee: both profiles issue a set (asserted as ordering below —
-        // datacenter requests 8x Internet, so wherever the clamp permits any distinction the
-        // ordering holds, and equality is exactly the fully-clamped case), and the sizes are sane.
-        for (name, sock) in [("datacenter", &dc), ("internet", &net)] {
+        assert!(requested.nodelay().unwrap(), "TCP_NODELAY must be set");
+    }
+
+    // a receive buffer that is still marked as fixed when the socket connects makes the kernel
+    // choose the connection's window scale for half of that buffer and no more. the scale cannot
+    // change later, so the socket could never advertise the rest of its buffer: 0.25 MiB of the
+    // 416 KiB a stock request limit grants, where kernels from 6.6 on would use 0.30. a small
+    // request shows it on any host: marked, it gets no scale at all
+    #[tokio::test]
+    async fn a_requested_receive_buffer_does_not_narrow_the_window_scale() {
+        let (untouched, _peer) = connected_pair().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requested, accepted) = tokio::join!(
+            connect_tcp_data_requesting(addr, ReceiveBufferRequest::of(32 * 1024), 0),
+            listener.accept()
+        );
+        let (requested, _accepted) = (requested.unwrap(), accepted.unwrap());
+        assert_eq!(
+            buffer_sizes(&requested).1,
+            granted(libc::SO_RCVBUF, 32 * 1024),
+            "the request must reach the socket"
+        );
+        // a kernel before 5.15 cannot take the mark off again. it never uses more than half of a
+        // buffer for the window either, which is what the narrower scale still covers
+        if fixed_buffers(&requested).is_some() {
             assert!(
-                sock.send_buffer_size().unwrap() > 0 && sock.recv_buffer_size().unwrap() > 0,
-                "{name} buffer sizes must be readable and non-zero"
+                receive_window_scale(&requested) >= receive_window_scale(&untouched),
+                "the connection can only ever advertise {} bytes, an untouched one {}",
+                65535u64 << receive_window_scale(&requested),
+                65535u64 << receive_window_scale(&untouched)
             );
         }
-        // the untouched socket is read (not asserted against) so a debugging run shows all three
-        let _ = (base.send_buffer_size(), base.recv_buffer_size());
-        assert!(dc.send_buffer_size().unwrap() >= net.send_buffer_size().unwrap());
-        assert!(dc.recv_buffer_size().unwrap() >= net.recv_buffer_size().unwrap());
+    }
+
+    // only the receive buffer loses its mark. a send buffer that stops being marked is cut by the
+    // kernel to the limit of its own growth, which a request is made to get past
+    #[test]
+    fn only_the_receive_buffer_loses_its_fixed_mark() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        configure_tcp_socket(
+            socket2::SockRef::from(&socket),
+            0,
+            ConnectionKind::Data,
+            Some(32 * 1024),
+            Some(32 * 1024),
+        );
+        assert_eq!(
+            buffer_sizes(&socket),
+            (
+                granted(libc::SO_SNDBUF, 32 * 1024),
+                granted(libc::SO_RCVBUF, 32 * 1024)
+            )
+        );
+        assert_fixed_buffers(&socket, SEND_BUFFER_FIXED, "the send buffer stays marked");
+    }
+
+    #[tokio::test]
+    async fn a_data_connection_made_without_a_request_keeps_the_kernels_own_buffers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            connect_tcp_data_requesting(addr, ReceiveBufferRequest::NONE, 0),
+            listener.accept()
+        );
+        let (connected, _accepted) = (connected.unwrap(), accepted.unwrap());
+        let (untouched, _peer) = connected_pair().await;
+        assert_fixed_buffers(&connected, 0, "nothing was requested");
+        assert_eq!(buffer_sizes(&connected), buffer_sizes(&untouched));
+        assert_eq!(window_limit(&connected), window_limit(&untouched));
+        assert!(connected.nodelay().unwrap(), "TCP_NODELAY must be set");
+    }
+
+    // the options of the connecting end of a data connection are set on a socket that has not
+    // connected yet. the liveness options must survive that as well as the buffer request does
+    #[tokio::test]
+    async fn a_data_connection_keeps_the_liveness_options_set_before_it_connected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            connect_tcp_data_requesting(addr, ReceiveBufferRequest::NONE, 120),
+            listener.accept()
+        );
+        let (connected, _accepted) = (connected.unwrap(), accepted.unwrap());
+        let sock = socket2::SockRef::from(&connected);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), TCP_KEEPALIVE_RETRIES);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "a data connection must be left at the system retransmission limit"
+        );
+        assert!(connected.nodelay().unwrap(), "TCP_NODELAY must be set");
+    }
+
+    #[tokio::test]
+    async fn a_requested_send_buffer_is_fixed_on_the_accepted_data_connection() {
+        // the accepted half of a pair nobody configured: what the accepting end starts with
+        let (_peer, untouched) = connected_pair().await;
+        let (initial, _) = buffer_sizes(&untouched);
+        let (request, granted) = telling_request(libc::SO_SNDBUF, initial);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            accept_tcp_data_requesting(&listener, SendBufferRequest::of(request), 0)
+        );
+        let (_connected, (accepted, _)) = (connected.unwrap(), accepted.unwrap());
+        assert_eq!(
+            buffer_sizes(&accepted),
+            (granted, buffer_sizes(&untouched).1),
+            "the send buffer is the one asked for, the receive buffer the kernel's own"
+        );
+        assert_fixed_buffers(&accepted, SEND_BUFFER_FIXED, "the requested send buffer");
+        assert_eq!(window_limit(&accepted), window_limit(&untouched));
+        assert!(accepted.nodelay().unwrap(), "TCP_NODELAY must be set");
+    }
+
+    #[tokio::test]
+    async fn a_data_connection_accepted_without_a_request_keeps_the_kernels_own_buffers() {
+        let (_peer, untouched) = connected_pair().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(addr),
+            accept_tcp_data_requesting(&listener, SendBufferRequest::NONE, 0)
+        );
+        let (_connected, (accepted, _)) = (connected.unwrap(), accepted.unwrap());
+        assert_fixed_buffers(&accepted, 0, "nothing was requested");
+        assert_eq!(buffer_sizes(&accepted), buffer_sizes(&untouched));
+        assert_eq!(window_limit(&accepted), window_limit(&untouched));
+        assert!(accepted.nodelay().unwrap(), "TCP_NODELAY must be set");
+    }
+
+    #[tokio::test]
+    async fn control_connections_ask_for_no_buffers_at_either_end() {
+        let config = TcpConfig::default();
+        let listener = create_tcp_control_listener(&config, Some("127.0.0.1"))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, accepted) = tokio::join!(
+            connect_tcp_control(addr, &config),
+            accept_tcp_control(&listener, &config)
+        );
+        let (connected, (accepted, _)) = (connected.unwrap(), accepted.unwrap());
+        let (untouched_connected, untouched_accepted) = connected_pair().await;
+        assert_fixed_buffers(&connected, 0, "the connecting end");
+        assert_fixed_buffers(&accepted, 0, "the accepting end");
+        assert_eq!(
+            buffer_sizes(&connected),
+            buffer_sizes(&untouched_connected),
+            "the connecting end"
+        );
+        assert_eq!(
+            buffer_sizes(&accepted),
+            buffer_sizes(&untouched_accepted),
+            "the accepting end"
+        );
+    }
+
+    // each end asks only for the buffer its data passes through, and only if this host's limits
+    // make the request worth it: whatever they are here, the sockets must match the plan for them
+    #[tokio::test]
+    async fn data_connections_ask_for_what_this_hosts_limits_call_for() {
+        for profile in [NetworkProfile::Datacenter, NetworkProfile::Internet] {
+            let config = TcpConfig::default();
+            let listener = create_tcp_data_listener(&config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (receiver, sender) = tokio::join!(
+                connect_tcp_data(addr, profile, 0),
+                accept_tcp_data(&listener, profile, 0)
+            );
+            let (receiver, (sender, _)) = (receiver.unwrap(), sender.unwrap());
+            let (untouched_connected, untouched_accepted) = connected_pair().await;
+            let limits = common::host::current().tcp_buffers().ok();
+            let size = profile.socket_buffer_size();
+            let send = SendBufferRequest::plan(size, limits).size();
+            let receive = ReceiveBufferRequest::plan(size, limits).size();
+            assert_eq!(
+                buffer_sizes(&sender),
+                (
+                    send.map_or(buffer_sizes(&untouched_accepted).0, |size| granted(
+                        libc::SO_SNDBUF,
+                        size
+                    )),
+                    buffer_sizes(&untouched_accepted).1
+                ),
+                "{profile:?}: the sending end asks for a send buffer of {send:?} and no other"
+            );
+            assert_eq!(
+                buffer_sizes(&receiver),
+                (
+                    buffer_sizes(&untouched_connected).0,
+                    receive.map_or(buffer_sizes(&untouched_connected).1, |size| granted(
+                        libc::SO_RCVBUF,
+                        size
+                    ))
+                ),
+                "{profile:?}: the receiving end asks for a receive buffer of {receive:?} and no \
+                 other"
+            );
+            assert_fixed_buffers(
+                &sender,
+                if send.is_some() { SEND_BUFFER_FIXED } else { 0 },
+                "the sending end",
+            );
+            // a requested receive buffer keeps its size but does not stay marked as fixed
+            assert_fixed_buffers(&receiver, 0, "the receiving end");
+        }
     }
 }
