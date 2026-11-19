@@ -87,9 +87,8 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
         &mut self,
         obj: &T,
     ) -> anyhow::Result<()> {
-        self.send_batch_message(obj).await?;
-        SinkExt::<bytes::Bytes>::flush(&mut self.framed).await?;
-        Ok(())
+        // send_batch_message uses SinkExt::send, which already flushes the frame
+        self.send_batch_message(obj).await
     }
 
     /// Sends individual control frames with a shared final flush.
