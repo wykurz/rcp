@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 struct Written {
     bytes: Vec<u8>,
     flushes: usize,
+    fail_flush: bool,
     events: Vec<&'static str>,
     max_write: usize,
     blocked: bool,
@@ -35,6 +36,9 @@ impl AsyncWrite for Writer {
         let mut state = self.0.lock().unwrap();
         state.flushes += 1;
         state.events.push("flush");
+        if state.fail_flush {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+        }
         std::task::Poll::Ready(Ok(()))
     }
     fn poll_shutdown(
@@ -67,7 +71,7 @@ async fn grouped_control_frames_share_one_flush() -> anyhow::Result<()> {
         let bytes = grouped.lock().unwrap().bytes.clone();
         assert_eq!(bytes, separate.lock().unwrap().bytes);
         assert_eq!(grouped.lock().unwrap().flushes, 1);
-        assert!(separate.lock().unwrap().flushes >= count);
+        assert_eq!(separate.lock().unwrap().flushes, count);
         let mut recv = RecvStream::new(bytes.as_slice());
         for expected in &messages {
             let actual = recv
@@ -152,4 +156,23 @@ async fn close_flushes_buffered_frames_before_shutdown() -> anyhow::Result<()> {
     }
     assert!(recv.recv_object::<String>().await?.is_none());
     Ok(())
+}
+
+#[tokio::test]
+async fn individual_control_frame_reports_its_flush_error() {
+    let state = Arc::new(Mutex::new(Written {
+        fail_flush: true,
+        ..Default::default()
+    }));
+    let error = SendStream::new(Writer(state.clone()))
+        .send_control_message(&42u64)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::ConnectionReset
+    );
+    let written = state.lock().unwrap();
+    assert_eq!(written.flushes, 1);
+    assert!(!written.bytes.is_empty());
 }
