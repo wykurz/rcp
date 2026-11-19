@@ -23,10 +23,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Reuse transfer buffers in remote copies. The source `rcpd` now keeps its read buffer per data
   connection between files, as the destination keeps its receive buffer, and
   `--remote-copy-buffer-retention-limit` applies to both. The destination writes each file from that
-  buffer in whole chunks instead of through a second, per-file buffer. A file within the limit (2
-  MiB by default) no longer costs a memory mapping and its page faults on each side. On one 20-CPU
-  host, remote copies of 64 KiB to 1 MB files took 24% to 56% less time; larger files are unchanged
-  unless the limit is raised or the chunk is lowered to it.
+  buffer in whole chunks instead of through a second, per-file buffer. A file within the limit no
+  longer costs a memory mapping and its page faults on each side. On one 20-CPU host, remote copies
+  of 64 KiB to 1 MB files took 24% to 56% less time.
+- Keep whole transfer buffers between the files of a remote copy by default. One size per network
+  profile, 16 MiB for datacenter and 2 MiB for internet, now sets the TCP socket buffer request, the
+  default of `--remote-copy-buffer-size` and the default of `--remote-copy-buffer-retention-limit`;
+  the last was 2 MiB for both profiles. Under the datacenter profile a file of 2 MiB to 16 MiB no
+  longer costs each daemon an allocation: on one 20-CPU host, remote copies of 8 GiB took 12% less
+  time for 4 MiB files and 7% less for 16 MiB files. A data connection that has carried such a file
+  now holds up to 16 MiB in each daemon until it closes, 1600 MiB at 100 connections;
+  `--remote-copy-buffer-retention-limit=2MiB` restores the previous limit.
 - Read the summary's CPU time with `getrusage(2)`: it is reported to the millisecond instead of in
   10 ms clock ticks. Statistics no longer read as zero when `/proc` is unavailable; peak memory then
   comes from `getrusage(2)` as well.

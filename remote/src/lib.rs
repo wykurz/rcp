@@ -1469,21 +1469,19 @@ impl std::str::FromStr for NetworkProfile {
     }
 }
 
-/// Datacenter profile: buffer size for remote copy operations (16 MiB)
-pub const DATACENTER_REMOTE_COPY_BUFFER_SIZE: usize = 16 * 1024 * 1024;
-
-/// Internet profile: buffer size for remote copy operations (2 MiB)
-pub const INTERNET_REMOTE_COPY_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-
 impl NetworkProfile {
-    /// Returns the default maximum transfer buffer and file I/O request size for this profile.
+    /// Returns the size this profile requests for each TCP socket buffer: 16 MiB for datacenter
+    /// and 2 MiB for internet.
     ///
-    /// Datacenter uses 16 MiB and internet uses 2 MiB. Per-file I/O limits are capped for
-    /// small files; individual disk and network operations can be shorter.
-    pub fn default_remote_copy_buffer_size(&self) -> usize {
+    /// This is the one size a profile selects. [`configure_tcp_socket`] requests it for the send
+    /// and receive buffers of every connection, and it is the default for the remote copy buffer
+    /// ([`TcpConfig::effective_buffer_size`]) and for how much of that buffer each side keeps per
+    /// data connection between files ([`TcpConfig::effective_buffer_retention_limit`]). The
+    /// kernel may grant a socket less than requested; the copy buffer does not follow that.
+    pub fn socket_buffer_size(&self) -> usize {
         match self {
-            Self::Datacenter => DATACENTER_REMOTE_COPY_BUFFER_SIZE,
-            Self::Internet => INTERNET_REMOTE_COPY_BUFFER_SIZE,
+            Self::Datacenter => 16 * 1024 * 1024,
+            Self::Internet => 2 * 1024 * 1024,
         }
     }
 }
@@ -1499,19 +1497,17 @@ pub struct TcpConfig {
     pub conn_timeout_sec: u64,
     /// Network profile for tuning (default: Datacenter)
     pub network_profile: NetworkProfile,
-    /// Maximum transfer buffer and file I/O request size (defaults to profile-specific value).
+    /// Maximum transfer buffer and file I/O request size; defaults to the profile's socket buffer
+    /// size.
     pub buffer_size: Option<usize>,
-    /// Maximum retained receiver scratch per data connection; defaults to min(chunk, 2 MiB).
-    /// Zero disables retention without changing I/O chunk sizes.
+    /// Maximum transfer buffer each side keeps per data connection between files; defaults to the
+    /// smaller of the copy buffer and the profile's socket buffer size. Zero disables retention
+    /// without changing I/O chunk sizes.
     pub buffer_retention_limit: Option<usize>,
     /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
     /// See [`configure_tcp_socket`].
     pub keepalive_sec: u64,
 }
-
-/// Default ceiling for retained receiver scratch per data connection.
-/// The effective default also respects smaller configured I/O chunks.
-pub const DEFAULT_COPY_BUFFER_RETENTION_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Default ceiling for concurrent remote data connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
@@ -1611,17 +1607,21 @@ impl Default for TcpConfig {
 }
 
 impl TcpConfig {
-    /// Get the effective buffer size (explicit or profile default)
+    /// Get the effective copy buffer size: the explicit one, or the profile's socket buffer size.
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
-            .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
+            .unwrap_or_else(|| self.network_profile.socket_buffer_size())
     }
-    /// Get the explicit receiver retention limit, or min(effective I/O chunk, 2 MiB).
+    /// Get the limit for the buffer each side keeps per data connection between files: the
+    /// explicit one, or the smaller of the copy buffer and the profile's socket buffer size.
+    ///
+    /// By default a profile's own copy buffer is therefore kept whole, while a copy buffer raised
+    /// above the profile's size is not: keeping that much per connection takes an explicit limit.
     /// This does not change the I/O chunk size.
     pub fn effective_buffer_retention_limit(&self) -> usize {
         self.buffer_retention_limit.unwrap_or_else(|| {
             self.effective_buffer_size()
-                .min(DEFAULT_COPY_BUFFER_RETENTION_LIMIT)
+                .min(self.network_profile.socket_buffer_size())
         })
     }
 }
@@ -3501,15 +3501,13 @@ pub fn configure_tcp_socket(
     if let Err(err) = stream.set_nodelay(true) {
         tracing::warn!("failed to set TCP_NODELAY: {err:#}");
     }
-    let (send_buf, recv_buf) = match profile {
-        NetworkProfile::Datacenter => (16 * 1024 * 1024, 16 * 1024 * 1024),
-        NetworkProfile::Internet => (2 * 1024 * 1024, 2 * 1024 * 1024),
-    };
+    // one size per profile for both directions; the copy buffer defaults to the same size
+    let buffer_size = profile.socket_buffer_size();
     let sock_ref = socket2::SockRef::from(stream);
-    if let Err(err) = sock_ref.set_send_buffer_size(send_buf) {
+    if let Err(err) = sock_ref.set_send_buffer_size(buffer_size) {
         tracing::warn!("failed to set TCP send buffer size: {err:#}");
     }
-    if let Err(err) = sock_ref.set_recv_buffer_size(recv_buf) {
+    if let Err(err) = sock_ref.set_recv_buffer_size(buffer_size) {
         tracing::warn!("failed to set TCP receive buffer size: {err:#}");
     }
     if let (Ok(send), Ok(recv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
@@ -6369,6 +6367,60 @@ mod tests {
             "with no user timeout to override it, TCP_KEEPCNT is what ends a dead data connection"
         );
         assert!(stream.nodelay().unwrap());
+    }
+
+    #[test]
+    fn copy_buffer_and_kept_buffer_default_to_the_profile_size() {
+        for (profile, size) in [
+            (NetworkProfile::Datacenter, 16 * 1024 * 1024),
+            (NetworkProfile::Internet, 2 * 1024 * 1024),
+        ] {
+            let config = TcpConfig {
+                network_profile: profile,
+                ..Default::default()
+            };
+            assert_eq!(config.effective_buffer_size(), size, "{profile:?}");
+            assert_eq!(
+                config.effective_buffer_retention_limit(),
+                size,
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kept_buffer_default_follows_a_smaller_copy_buffer_but_not_a_larger_one() {
+        let megabyte = 1024 * 1024;
+        for (profile, copy_buffer, kept) in [
+            (NetworkProfile::Datacenter, megabyte, megabyte),
+            (NetworkProfile::Datacenter, 64 * megabyte, 16 * megabyte),
+            (NetworkProfile::Internet, megabyte, megabyte),
+            (NetworkProfile::Internet, 16 * megabyte, 2 * megabyte),
+        ] {
+            let config = TcpConfig {
+                network_profile: profile,
+                buffer_size: Some(copy_buffer),
+                ..Default::default()
+            };
+            assert_eq!(config.effective_buffer_size(), copy_buffer);
+            assert_eq!(
+                config.effective_buffer_retention_limit(),
+                kept,
+                "{profile:?} with a {copy_buffer}-byte copy buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_kept_buffer_limit_overrides_the_profile_size() {
+        for limit in [0, 8192, 64 * 1024 * 1024] {
+            let config = TcpConfig {
+                buffer_retention_limit: Some(limit),
+                ..Default::default()
+            };
+            assert_eq!(config.effective_buffer_retention_limit(), limit);
+            assert_eq!(config.effective_buffer_size(), 16 * 1024 * 1024);
+        }
     }
 
     // absolute sizes are not assertable — the kernel doubles the request and clamps it to

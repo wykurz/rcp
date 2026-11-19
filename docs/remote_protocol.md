@@ -1096,15 +1096,15 @@ ignored; premature EOF fails the transfer and discards the stream. The stream be
 after exactly that size is sent and message completion succeeds. The size is a snapshot of the
 opened file, not a consistent snapshot of its contents.
 
-`--remote-copy-buffer-size` is the maximum transfer buffer and file I/O request size: 16 MiB by
-default for datacenter and 2 MiB for internet. The configured value must first fit `usize` on the
-master and each daemon. The master rejects values outside its range before connecting; a daemon with
-a smaller range rejects an oversized `--buffer-size` during argument parsing rather than clamping
-it. For accepted values, both source adapters and the destination use the minimum of the configured
-value, the file's header size, and the host's `isize::MAX`, with a one-byte minimum. This
-representability cap is applied before narrowing the header's `u64` size. The source uses that limit
-for its payload buffer. The destination uses it for its copy scratch, which is also the size of its
-file writes.
+`--remote-copy-buffer-size` is the maximum transfer buffer and file I/O request size. Its default is
+the network profile's buffer size (§8.2): 16 MiB for datacenter and 2 MiB for internet. The
+configured value must first fit `usize` on the master and each daemon. The master rejects values
+outside its range before connecting; a daemon with a smaller range rejects an oversized
+`--buffer-size` during argument parsing rather than clamping it. For accepted values, both source
+adapters and the destination use the minimum of the configured value, the file's header size, and
+the host's `isize::MAX`, with a one-byte minimum. This representability cap is applied before
+narrowing the header's `u64` size. The source uses that limit for its payload buffer. The
+destination uses it for its copy scratch, which is also the size of its file writes.
 
 Both source adapters keep the opened standard file whose metadata and ACL describe the header. For a
 nonempty file, the async sender takes one initialized buffer after flushing the header: the
@@ -1141,17 +1141,19 @@ a daemon; `isize::MAX` prevents unrepresentable byte buffer lengths, not allocat
 Both sides lazily keep one initialized buffer per data connection: the source its payload buffer,
 the destination its copy scratch. Each grows only to the chunk a file needs. Empty files need no
 buffer, and a skipped file's payload that is already in the framed reader is drained without
-scratch. The default retention limit is the smaller of `--remote-copy-buffer-size` and 2 MiB.
-Retention does not change the configured I/O maximum.
+scratch. The default retention limit is the smaller of `--remote-copy-buffer-size` and the network
+profile's buffer size, so a profile's own copy buffer is kept whole, and a copy buffer raised above
+the profile's size is not kept without an explicit limit. Retention does not change the configured
+I/O maximum.
 
 Use `--remote-copy-buffer-retention-limit=SIZE` to set an independent per-connection limit (for
-example, `16MiB` to reuse full datacenter chunks); `0` disables retention. The shared daemon
-configuration forwards `--buffer-retention-limit=BYTES` to both roles, and both use it: the source
-for its payload buffers, the destination for its copy scratch. The limit does not shrink I/O chunks:
-on either side a chunk exceeding it uses temporary storage for that file, so a file larger than the
-limit costs each side one allocation of its chunk. Smaller files and 8 KiB drains reuse kept storage
-when their required chunk fits the limit; drains above the limit also use temporary storage. A limit
-above the copy chunk does not eagerly allocate that amount.
+example, `2MiB` to hold less idle memory under the datacenter profile); `0` disables retention. The
+shared daemon configuration forwards `--buffer-retention-limit=BYTES` to both roles, and both use
+it: the source for its payload buffers, the destination for its copy scratch. The limit does not
+shrink I/O chunks: on either side a chunk exceeding it uses temporary storage for that file, so a
+file larger than the limit costs each side one allocation of its chunk. Smaller files and 8 KiB
+drains reuse kept storage when their required chunk fits the limit; drains above the limit also use
+temporary storage. A limit above the copy chunk does not eagerly allocate that amount.
 
 Reuse matters more than the size of a buffer suggests. In the statically linked daemons an
 allocation of this size is a fresh memory mapping, so a buffer per file costs a mapping, a page
@@ -1160,27 +1162,30 @@ flight on many cores those operations contend in the kernel: a run on a 96-CPU h
 its CPU time there while copying 1 MB files, with about one file's worth of page faults per file in
 each daemon.
 
-The 2 MiB default balances observed reuse benefits against idle memory. Measurements reported on
-[one WSL2 host using tmpfs and loopback](https://github.com/wykurz/rcp/pull/332#issuecomment-5975364418)
-found useful savings through roughly 2 MiB files and lower mixed-tree destination RSS with a 2 MiB
-limit than with 16 MiB retention. This is evidence for the default policy, not a throughput
-guarantee or an optimum for physical high-bandwidth networks; the override allows tuning for those
-workloads.
+The default keeps a profile's whole copy buffer, so that no file costs an allocation of its chunk on
+either side. With the earlier default of 2 MiB for both profiles, a datacenter file between 2 MiB
+and 16 MiB cost each daemon one. On one 20-CPU WSL2 host using tmpfs and a loopback with 0.35 ms of
+added round-trip delay, remote copies of 8 GiB took 12% less time for 4 MiB files and 7% less for 16
+MiB files with whole buffers kept (11% and 5% without encryption). The price is idle memory, counted
+below. This is evidence for the default policy, not a throughput guarantee or an optimum for
+physical high-bandwidth networks; the override allows tuning for those workloads and for hosts where
+idle memory matters more.
 
 Kept buffers have no spare capacity (the destination's is a boxed slice, the source's a vector
 allocated at its exact length), so in each daemon they are bounded by the limit times the effective
 connection count, `min(max-files-in-flight, max-connections)`. At 32 connections the default ceiling
-is 64 MiB per daemon; at the default 100-connection ceiling it is 200 MiB per daemon for either
-profile. An explicit 16 MiB limit raises those ceilings to 512 MiB and 1600 MiB. Automatic file
-concurrency uses the source CPU count (at least four). Descriptor admission can further limit active
-file operations but does not reduce the connection pool: all connections may eventually keep
-buffers. Retention grows only as connections encounter payloads that need a buffer, and trades idle
-memory for fewer allocations and repeated initializations. In a file transfer a smaller kept buffer
-is released before a larger one replaces it. These storage bounds exclude allocator overhead,
-framing, transport, active temporary buffers, and transient overlap when a drain grows the scratch;
-they are not process RSS bounds. Dropping a transfer future releases its temporary storage, or the
-buffer it had taken from its connection; kept storage otherwise lives until the connection drops.
-Interrupted transfers still require discarding the stream.
+is 512 MiB per daemon for the datacenter profile and 64 MiB for the internet profile; at the default
+100-connection ceiling it is 1600 MiB and 200 MiB. An explicit 2 MiB limit gives the datacenter
+profile the internet profile's ceilings. Automatic file concurrency uses the source CPU count (at
+least four). Descriptor admission can further limit active file operations but does not reduce the
+connection pool: all connections may eventually keep buffers. Retention grows only as connections
+encounter payloads that need a buffer, and trades idle memory for fewer allocations and repeated
+initializations. In a file transfer a smaller kept buffer is released before a larger one replaces
+it. These storage bounds exclude allocator overhead, framing, transport, active temporary buffers,
+and transient overlap when a drain grows the scratch; they are not process RSS bounds. Dropping a
+transfer future releases its temporary storage, or the buffer it had taken from its connection; kept
+storage otherwise lives until the connection drops. Interrupted transfers still require discarding
+the stream.
 
 **Connection lifecycle:**
 
@@ -1427,14 +1432,20 @@ connection timeout is rejected.
 
 ### 8.2 Network Profiles
 
+A profile selects one buffer size. Each endpoint requests it for the send and receive buffer of
+every TCP connection (`SO_SNDBUF`, `SO_RCVBUF`), and it is the default for
+`--remote-copy-buffer-size` and for the retention limit of §7.5. The kernel grants a socket at most
+`net.core.wmem_max` / `rmem_max`, which may be less than requested; the copy buffer and the
+retention limit keep the profile's size regardless.
+
 **Datacenter Profile (default):**
 
-- Larger TCP buffer sizes (16 MiB)
+- 16 MiB buffers
 - Optimized for low-latency, high-bandwidth networks
 
 **Internet Profile:**
 
-- Smaller TCP buffer sizes (2 MiB)
+- 2 MiB buffers
 - More conservative settings for higher-latency networks
 
 ### 8.3 Tuning Guidelines

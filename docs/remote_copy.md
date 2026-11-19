@@ -604,9 +604,9 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 | `--max-files-in-flight=LIMIT`               | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                                  |
 | `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                                |
 | `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                                     |
-| `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default) or `internet`                                               |
-| `--remote-copy-buffer-size=SIZE`            | Maximum transfer buffer/file I/O request size (default: 16 MiB datacenter, 2 MiB internet)        |
-| `--remote-copy-buffer-retention-limit=SIZE` | Buffer each side keeps per connection between files (default: min(copy chunk, 2 MiB); 0 disables) |
+| `--network-profile=PROFILE`                 | Buffer sizing: `datacenter` (default, 16 MiB) or `internet` (2 MiB)                               |
+| `--remote-copy-buffer-size=SIZE`            | Maximum transfer buffer/file I/O request size (default: the profile's buffer size)                |
+| `--remote-copy-buffer-retention-limit=SIZE` | Buffer each side keeps per connection between files (default: profile buffer size; zero disables) |
 
 The configured value must fit `usize` on the master and each daemon; otherwise argument validation
 or daemon startup fails. Accepted values apply to the source's read buffer and to the destination's
@@ -616,7 +616,9 @@ sizes, not available memory: excessively large settings can exhaust memory and a
 Individual disk and network operations can be shorter; the option does not set TCP packet or TLS
 record sizes. Each active transfer holds one buffer of up to this size on each side, so choose the
 size with available memory and concurrent transfers in mind. A buffer kept from an earlier file can
-be larger than a later file's request; retention remains an independent limit.
+be larger than a later file's request; retention remains an independent limit. By default it is the
+profile's buffer size, so a profile's own copy buffer is kept whole, and a copy buffer raised above
+that size is kept only with an explicit limit.
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.
@@ -648,14 +650,19 @@ which gained context switch and page fault counts, and requires matching binarie
 
 ### Network Profiles
 
+A profile selects one buffer size. It is requested for the send and receive buffer of every TCP
+connection, and it is the default for the remote copy buffer and for the buffer each side keeps per
+data connection between files. The kernel may grant a socket less than requested; the copy buffer
+does not follow that.
+
 **Datacenter (default)**:
 
-- Larger TCP buffers (16 MiB)
+- 16 MiB buffers
 - Optimized for low-latency, high-bandwidth networks
 
 **Internet**:
 
-- Smaller TCP buffers (2 MiB)
+- 2 MiB buffers
 - Better for higher-latency networks
 
 ## Security Considerations

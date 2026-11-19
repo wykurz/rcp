@@ -4410,11 +4410,12 @@ mod teardown_tests {
     #[tokio::test]
     async fn data_pool_applies_buffer_retention_to_connected_receiver() {
         for (chunk, limit, expected) in [
-            (None, None, 2 * 1024 * 1024),
+            (None, None, 16 * 1024 * 1024),
             (Some(4096), None, 4096),
+            (Some(32 * 1024 * 1024), None, 16 * 1024 * 1024),
             (None, Some(0), 0),
             (None, Some(262144), 262144),
-            (None, Some(16 * 1024 * 1024), 16 * 1024 * 1024),
+            (None, Some(64 * 1024 * 1024), 64 * 1024 * 1024),
         ] {
             let tcp = remote::TcpConfig {
                 buffer_size: chunk,

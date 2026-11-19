@@ -457,9 +457,10 @@ pub struct RcpdConfig {
     pub remote_keepalive_sec: u64,
     /// Network profile for buffer sizing
     pub network_profile: crate::NetworkProfile,
-    /// Buffer size for file transfers (defaults to profile-specific value)
+    /// Buffer size for file transfers (defaults to the profile's socket buffer size)
     pub buffer_size: Option<usize>,
-    /// Maximum retained receiver scratch per data connection; defaults to min(chunk, 2 MiB).
+    /// Maximum transfer buffer each side keeps per data connection between files; defaults to
+    /// the smaller of the copy buffer and the profile's socket buffer size.
     /// Zero disables retention without changing I/O chunk sizes.
     pub buffer_retention_limit: Option<usize>,
     /// Connection ceiling passed to this daemon. The automatic source receives configured `M`;
