@@ -3,8 +3,11 @@
 This document covers the operational aspects of rcp's remote copy functionality: binary discovery,
 version checking, automatic deployment, and network connectivity.
 
-For the detailed protocol specification (message types, flows, invariants), see
-**[remote_protocol.md](remote_protocol.md)**.
+Start with [network connectivity](#network-connectivity) for connection failures, or the
+[CLI reference](#cli-reference) for configuration. For implementation work, use the
+[remote component design](../remote/DESIGN.md) as a reader map and the
+[protocol reference](remote_protocol.md) for message types, flows, and invariants. Repository-wide
+[testing](testing.md) and [benchmarking](benchmarking.md) guidance lives separately.
 
 ## Overview
 
@@ -64,8 +67,9 @@ For performance on fully trusted networks, encryption can be disabled:
 rcp --no-encryption source:/path dest:/path
 ```
 
-**WARNING**: This exposes all data in plain text over the network. Only use on trusted, isolated
-networks.
+**WARNING**: This disables both encryption and certificate authentication on all rcp TCP
+connections, including control and tracing, not just file data. SSH does not protect these direct
+TCP connections. Only use on trusted, isolated networks.
 
 For more details on the security model, see [security.md](security.md).
 
@@ -675,7 +679,8 @@ does not follow that.
 
 ### Trust Model
 
-- SSH is the security perimeter for initial authentication
+- SSH supplies the initial peer identity and fingerprints; see the
+  [host-verification limitation](security.md#ssh-host-verification-limitation)
 - All operations require SSH authentication first
 - Data transfers are encrypted with TLS 1.3 by default (certificate fingerprint pinning)
 - Use `--no-encryption` only on trusted networks where encryption overhead is undesirable

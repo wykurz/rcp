@@ -155,8 +155,8 @@ User
   │
   ├─── trusts ──→ SSH infrastructure
   │                   │
-  │                   ├─ authenticates remote hosts
-  │                   └─ securely distributes cert fingerprints
+  │                   ├─ supplies peer identity
+  │                   └─ distributes cert fingerprints
   │
   └─── trusts ──→ TLS certificate pinning
                       │
@@ -170,6 +170,15 @@ User
 2. **SSH infrastructure**: SSH keys, known_hosts, and SSH daemon security
 3. **Remote hosts**: Hosts accessible via SSH are trusted to run rcpd
 
+### SSH Host Verification Limitation
+
+The current SSH launcher in [`remote/src/lib.rs`](../remote/src/lib.rs) explicitly passes
+`StrictHostKeyChecking=no`. It does not enforce strict known-host verification, even if the user's
+SSH configuration requests it. TLS pinning checks the fingerprint supplied through that SSH session;
+it cannot independently establish that the bootstrap peer is the intended host. An attacker who can
+impersonate the SSH bootstrap peer can therefore supply the fingerprints that subsequent TLS
+connections trust. Do not treat TLS pinning as protection against that bootstrap attack.
+
 ### Local Deployment Candidates
 
 When `--auto-deploy-rcpd` needs a local binary, rcp runs `--protocol-version` on candidates beside
@@ -180,6 +189,8 @@ candidate, not a sandbox or a mitigation for candidate side effects. Environment
 local execution controls should use a trusted installation location or deploy rcpd manually.
 
 ### What We Protect Against
+
+With TLS enabled and fingerprints obtained from the intended SSH peers:
 
 - **Network eavesdropping**: All data encrypted
 - **Man-in-the-middle**: Certificate fingerprint verification prevents unauthorized parties
@@ -222,6 +233,9 @@ shares the same substrate. See [TOCTTOU Vulnerabilities](tocttou.md) for the ful
 ## Threat Model
 
 ### Threats Mitigated
+
+These TLS guarantees assume trustworthy fingerprint distribution; the
+[SSH host-verification limitation](#ssh-host-verification-limitation) still applies.
 
 | Threat                    | Mitigation                                           |
 | ------------------------- | ---------------------------------------------------- |
