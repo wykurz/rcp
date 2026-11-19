@@ -291,9 +291,18 @@ fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
                 .await
                 .unwrap(),
         );
-        let mut stream = remote::streams::RecvStream::new(Box::new(std::io::Cursor::new(
-            PAYLOAD.to_vec(),
-        )) as remote::streams::BoxedRead);
+        let mut next = file_header(&fixture);
+        next.dst = temp.path().join("next");
+        next.size = 4;
+        let mut wire = PAYLOAD.to_vec();
+        remote::streams::SendStream::new(&mut wire)
+            .send_control_message(&next)
+            .await
+            .unwrap();
+        wire.extend_from_slice(b"next");
+        let mut stream = remote::streams::RecvStream::new(
+            Box::new(std::io::Cursor::new(wire)) as remote::streams::BoxedRead
+        );
         let settings = testutils::copy_settings();
         let preservation = common::preserve::preserve_all();
         let counts = (progress().files_copied.get(), progress().bytes_copied.get());
@@ -321,8 +330,8 @@ fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
         )
         .await
         .expect_err("a write the kernel refuses must fail the file");
-        // the payload was taken off the wire but never reached the file: the stream cannot go on
-        assert_eq!(error.stream_state, StreamState::Corrupted);
+        // the failed file is not copied, but all of its payload was taken off the wire
+        assert_eq!(error.stream_state, StreamState::DataConsumed);
         assert_eq!(
             error.source.to_string(),
             "failed to write destination payload"
@@ -344,6 +353,34 @@ fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
         assert_eq!(
             remaining.mode() & 0o7777,
             common::safedir::DST_FILE_CREATE_MODE
+        );
+        let received_next = stream
+            .recv_object::<remote::protocol::File>()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received_next.dst, next.dst);
+        process_single_file(
+            &settings,
+            &preservation,
+            &mut stream,
+            &received_next,
+            &parent,
+            OsStr::new("next"),
+            &guard,
+        )
+        .await
+        .map_err(|error| error.source)
+        .unwrap();
+        assert_eq!(std::fs::read(&next.dst).unwrap(), b"next");
+        assert_eq!(progress().files_copied.get(), counts.0 + 1);
+        assert_eq!(progress().bytes_copied.get(), counts.1 + 4);
+        assert!(
+            stream
+                .recv_object::<remote::protocol::File>()
+                .await
+                .unwrap()
+                .is_none()
         );
     });
     crate::test_process::completed(TEST_NAME);
@@ -484,5 +521,134 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         progress().bytes_copied.get(),
         counts.1 + header.size + next.size
     );
+    crate::test_process::completed(TEST_NAME);
+}
+
+#[test]
+fn final_write_failure_collects_and_continues_but_fail_early_stops() {
+    const TEST_NAME: &str =
+        "destination::file_tests::final_write_failure_collects_and_continues_but_fail_early_stops";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
+    one_worker_runtime().block_on(async {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        drop(create_file(&fixture));
+        let metadata = remote::protocol::Metadata::from(&std::fs::metadata(&fixture).unwrap());
+        let limit = libc::rlimit {
+            rlim_cur: 8,
+            rlim_max: 8,
+        };
+        // SAFETY: this isolated child owns the limit and ignores its associated signal.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0);
+        }
+        for fail_early in [false, true] {
+            let root = temp
+                .path()
+                .join(if fail_early { "early" } else { "collect" });
+            std::fs::create_dir(&root).unwrap();
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let send = remote::streams::SendStream::new(
+                Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
+            );
+            let tracker = directory_tracker::SharedDirectoryTracker::new(
+                Arc::new(tokio::sync::Mutex::new(send)),
+                common::preserve::preserve_none(),
+                fail_early,
+                errors.clone(),
+            );
+            let admission = tracker
+                .with_state(|state| state.admit_directory(&root, true))
+                .unwrap();
+            let directory = Arc::new(
+                Dir::open_root_dir(&root, false, common::Side::Destination)
+                    .await
+                    .unwrap(),
+            );
+            tracker
+                .register_directory(
+                    admission,
+                    directory,
+                    remote::protocol::Metadata::from(&std::fs::metadata(&root).unwrap()),
+                    false,
+                    true,
+                    None,
+                )
+                .unwrap();
+            tracker.mark_announced(&root).await.unwrap();
+            tracker.seal_directory(&root, 2).await.unwrap();
+            tracker
+                .with_state(|state| state.finish_discovery(true))
+                .unwrap();
+            let mut wire = Vec::new();
+            for (name, payload) in [("failed", PAYLOAD), ("next", b"next".as_slice())] {
+                let header = remote::protocol::File {
+                    src: "/source".into(),
+                    dst: root.join(name),
+                    size: payload.len() as u64,
+                    metadata: metadata.clone(),
+                    is_root: false,
+                };
+                remote::streams::SendStream::new(&mut wire)
+                    .send_control_message(&header)
+                    .await
+                    .unwrap();
+                wire.extend_from_slice(payload);
+            }
+            let mut settings = testutils::copy_settings();
+            settings.fail_early = fail_early;
+            let counts = (progress().files_copied.get(), progress().bytes_copied.get());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle_file_stream(
+                    settings,
+                    common::preserve::preserve_none(),
+                    remote::streams::RecvStream::new(
+                        Box::new(std::io::Cursor::new(wire)) as remote::streams::BoxedRead
+                    ),
+                    tracker.clone(),
+                    errors.clone(),
+                ),
+            )
+            .await
+            .expect("file error stalled the session");
+            let error = if fail_early {
+                assert!(tracker.with_state(|state| state.is_closing()));
+                assert!(!tracker.with_state(|state| state.is_done()));
+                assert!(!root.join("next").exists());
+                assert!(errors.take_error().is_none());
+                assert_eq!(
+                    (progress().files_copied.get(), progress().bytes_copied.get()),
+                    counts
+                );
+                result.expect_err("fail-early must return the original write error")
+            } else {
+                result.unwrap();
+                assert!(tracker.with_state(|state| state.is_done()));
+                assert!(!tracker.with_state(|state| state.is_closing()));
+                assert_eq!(std::fs::read(root.join("next")).unwrap(), b"next");
+                assert_eq!(progress().files_copied.get(), counts.0 + 1);
+                assert_eq!(progress().bytes_copied.get(), counts.1 + 4);
+                errors.take_error().expect("failed file must be collected")
+            };
+            assert!(format!("{error:#}").contains("failed to write destination payload"));
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EFBIG)
+            );
+            let failed = std::fs::metadata(root.join("failed")).unwrap();
+            assert_eq!(failed.len(), 8);
+            assert_eq!(
+                failed.mode() & 0o7777,
+                common::safedir::DST_FILE_CREATE_MODE
+            );
+        }
+    });
     crate::test_process::completed(TEST_NAME);
 }

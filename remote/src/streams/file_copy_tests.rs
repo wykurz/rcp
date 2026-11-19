@@ -212,6 +212,11 @@ async fn a_truncated_payload_reports_the_shortfall_and_no_partial_chunk_is_writt
         .await
         .err()
         .unwrap();
+    assert!(
+        error
+            .downcast_ref::<super::PayloadConsumedOnWriteError>()
+            .is_none()
+    );
     assert_eq!(error.to_string(), "unexpected EOF: expected 7 bytes, got 6");
     // the chunk that never filled is not written: the copy has failed either way
     assert_eq!(*writes.0.lock().unwrap(), [b"abcd".to_vec()]);
@@ -245,6 +250,11 @@ async fn read_and_write_errors_keep_their_io_cause() {
                 .kind(),
             expected
         );
+        assert!(
+            error
+                .downcast_ref::<super::PayloadConsumedOnWriteError>()
+                .is_none()
+        );
         // one whole chunk reached the writer before either failure
         assert_eq!(writes.sizes(), [8]);
     }
@@ -261,6 +271,11 @@ async fn a_panicking_writer_fails_the_copy_with_its_cause() {
         .await
         .err()
         .unwrap();
+    assert!(
+        error
+            .downcast_ref::<super::PayloadConsumedOnWriteError>()
+            .is_none()
+    );
     assert_eq!(error.to_string(), "failed to write destination payload");
     assert!(
         error
@@ -387,4 +402,46 @@ fn the_chunk_bound_caps_sizes_before_narrowing() {
     ] {
         assert_eq!(file_buffer_size(size, configured), expected);
     }
+}
+
+#[tokio::test]
+async fn final_write_errors_preserve_the_following_frame() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    for size in [7u64, 8, 20, 24] {
+        for max_read in [1, usize::MAX] {
+            let mut wire = Vec::new();
+            append_frame(&mut wire, size)?;
+            wire.extend(vec![1; size as usize]);
+            append_frame(&mut wire, 3u64)?;
+            wire.extend_from_slice(b"end");
+            let mut recv =
+                recv_stream(Reader::new(wire, max_read)).with_copy_buffer_retention_limit(8);
+            assert_eq!(recv.recv_object::<u64>().await?, Some(size));
+            let writes = Writes::default();
+            let mut writer = Writer::new(&writes);
+            writer.fail_at = Some(((size - 1) / 8 * 8) as usize);
+            let error = recv
+                .copy_exact_to_blocking_writer(writer, size, 8, &admission)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .downcast_ref::<super::PayloadConsumedOnWriteError>()
+                    .is_some()
+            );
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                ErrorKind::StorageFull
+            );
+            assert!(recv.copy_buffer.is_empty());
+            assert_eq!(recv.recv_object::<u64>().await?, Some(3));
+            let next = Writes::default();
+            recv.copy_exact_to_blocking_writer(Writer::new(&next), 3, 8, &admission)
+                .await?;
+            assert_eq!(next.bytes(), b"end");
+            assert_eq!(recv.recv_object::<u64>().await?, None);
+        }
+    }
+    Ok(())
 }

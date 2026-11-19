@@ -11,6 +11,19 @@ pub fn file_buffer_size(size: u64, configured: usize) -> usize {
     configured.min(size.min(isize::MAX as u64) as usize).max(1)
 }
 
+/// An ordinary destination write failed after the entire declared payload was consumed.
+///
+/// This error context marks a reusable frame boundary, not a successful file copy. Read errors,
+/// truncated payloads, and blocking worker failures never carry this marker.
+#[derive(Debug)]
+pub struct PayloadConsumedOnWriteError;
+
+impl std::fmt::Display for PayloadConsumedOnWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to write destination payload")
+    }
+}
+
 /// Framed send stream for length-delimited messages.
 ///
 /// Generic over the underlying writer type - works with TCP, TLS, or any AsyncWrite.
@@ -329,8 +342,9 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     /// also retains admission for detached work.
     ///
     /// The writer comes back only when all `size` bytes were written. A failed or cancelled copy
-    /// drops it, keeps no scratch, and leaves the stream at an unknown position: a chunk that
-    /// never filled is not written.
+    /// drops it and keeps no scratch. Only an ordinary final-chunk write error carries
+    /// [`PayloadConsumedOnWriteError`], allowing the next frame to be read; other errors require
+    /// discarding the stream. A chunk that never filled is not written.
     #[instrument(level = "trace", skip(self, writer, admission))]
     pub async fn copy_exact_to_blocking_writer<W: std::io::Write + Send + 'static>(
         &mut self,
@@ -385,7 +399,11 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
                 .context("failed to write destination payload")?;
             writer = returned_writer;
             scratch = returned_scratch;
-            write_result.context("failed to write destination payload")?;
+            if copied + filled as u64 == size {
+                write_result.context(PayloadConsumedOnWriteError)?;
+            } else {
+                write_result.context("failed to write destination payload")?;
+            }
             copied += filled as u64;
         }
         if retain {

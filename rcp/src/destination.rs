@@ -355,8 +355,8 @@ async fn process_single_file(
     // and the destination share the chunk bound.
     let buffer_size =
         remote::streams::file_buffer_size(file_header.size, settings.remote_copy_buffer_size);
-    // once we start reading from the stream, any error means the stream is corrupted. The file
-    // comes back only when every byte of the header's size was written.
+    // an ordinary final-chunk write error leaves the next frame intact, but the file still fails.
+    // read failures and blocking worker failures remain fatal to this stream.
     let file = common::timing_scope!(trace, "destination.file.receive")
         .measure(
             file_recv_stream
@@ -368,7 +368,16 @@ async fn process_single_file(
                 )),
         )
         .await
-        .map_err(err_corrupted)?;
+        .map_err(|error| {
+            if error
+                .downcast_ref::<remote::streams::PayloadConsumedOnWriteError>()
+                .is_some()
+            {
+                err_data_consumed(error)
+            } else {
+                err_corrupted(error)
+            }
+        })?;
     finalize_received_file(file, file_header, preserve)
         .await
         .map_err(err_data_consumed)
