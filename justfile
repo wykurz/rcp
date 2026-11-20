@@ -58,6 +58,7 @@ lint: workflow-lint-test lint-workflows _lint-build _lint-targets
     ./scripts/check-anyhow-error-msg.sh
     @echo "🔍 Checking rust version consistency..."
     ./scripts/check-rust-version.sh
+    just build-metadata-test
     @echo "🔍 Testing build entrypoint inventory..."
     ./scripts/test-check-build-entrypoints.sh
     @echo "🔍 Checking build entrypoint inventory..."
@@ -143,6 +144,10 @@ test-all: test doctest test-release doctest-release
 # Quick compilation check (faster than full build)
 check:
     ./scripts/cargo-host.sh check --workspace
+
+# Test Git version metadata and unchanged-build caching with offline Cargo fixtures
+build-metadata-test:
+    python3 scripts/test-build-metadata.py -v
 
 # Verify the workspace builds on the minimum supported Rust version (MSRV), for
 # both shipped targets (gnu + musl). Separate from `just ci`: needs the nix

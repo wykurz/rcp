@@ -410,6 +410,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("Install actionlint", names)
         self.assertNotIn("Check GitHub workflows", names)
 
+    def test_build_metadata_only_runs_with_full_current_sources(self):
+        for mode, ref, expected in (("full", "", True), ("docs", "", False),
+                                    ("version", "", False),
+                                    ("full", "older-release-commit", False)):
+            with self.subTest(mode=mode, ref=ref):
+                steps = self.steps(mode, ref=ref)
+                checks = [step for step in steps
+                          if step.get("name") == "Test Git build metadata and caching"]
+                self.assertEqual(bool(checks), expected)
+                if expected:
+                    self.assertEqual(checks[0]["run"], "just build-metadata-test")
+
     def test_expensive_jobs_skip_for_docs_and_verified_versions(self):
         for name in ("msrv", "test-musl-debug", "test-musl-release", "test-docker", "build-glibc", "nix"):
             with self.subTest(job=name):

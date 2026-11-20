@@ -149,6 +149,10 @@ jobs:
     - name: Check rust version consistency
       run: ./scripts/check-rust-version.sh
 
+    - name: Test Git build metadata and caching
+      if: needs.scope.outputs.mode == 'full' && inputs.ref == ''
+      run: just build-metadata-test
+
     - name: Check build target consistency
       if: needs.scope.outputs.mode == 'full'
       run: |
