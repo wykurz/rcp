@@ -662,8 +662,9 @@ Each `rcpd` requests the socket buffer size from its kernel only where the reque
 the kernel would reach by itself, judged from the settings of its own host: the source for its send
 buffer, the destination for its receive buffer, which it requests before it connects. Elsewhere, and
 on control connections, the kernel sizes the buffers. The README's
-[TCP Socket Buffers](../README.md#tcp-socket-buffers) section explains the two limits involved and
-how to raise them.
+[TCP Socket Buffers](../README.md#tcp-socket-buffers) section gives the recommended kernel settings
+and explains the two limits involved. A destination whose kernel does not grow receive buffers and
+leaves a data connection with less than the profile's size logs a warning (visible with `-v`).
 
 **Datacenter (default)**:
 
