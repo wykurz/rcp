@@ -112,13 +112,16 @@ impl ReceiveBufferRequest {
 }
 
 /// Log what the destination decided for its receive buffers, and warn where its host starves them.
+///
+/// The decision is detail, shown with `-v`. The warning is a notice: the master prints it at its
+/// default verbosity, because the user it is for does not know there is anything to ask about.
 fn announce_receive(requested: Option<usize>, size: usize, limits: Result<&TcpBufferLimits, &str>) {
     tracing::info!("{}", Direction::Receive.describe(requested, size, limits));
     if let Some(warning) = limits
         .ok()
         .and_then(|limits| starved_receive_warning(size, limits))
     {
-        tracing::warn!("{warning}");
+        tracing::warn!(target: common::NOTICE_TARGET, "{warning}");
     }
 }
 
@@ -587,44 +590,87 @@ mod tests {
         );
     }
 
-    #[tracing_test::traced_test]
-    #[test]
-    fn the_destination_logs_its_decision_and_warns_only_where_it_is_starved() {
-        let starved = without_receive_growth(212_992, 131_072);
-        announce_receive(Some(DATACENTER), DATACENTER, Ok(&starved));
-        logs_assert(|lines: &[&str]| {
-            let decisions = lines.iter().filter(|line| line.contains("INFO")).count();
-            let warnings: Vec<_> = lines.iter().filter(|line| line.contains("WARN")).collect();
-            match (decisions, warnings.as_slice()) {
-                (1, [warning]) if warning.contains("do not grow on this host") => Ok(()),
-                _ => Err(format!(
-                    "expected one decision and one warning, got {lines:?}"
-                )),
+    /// A log event as a test sees it: its level, its target and its message.
+    type Logged = (tracing::Level, String, String);
+
+    /// Every log event `body` emits, with no filter in the way.
+    fn events_of(body: impl FnOnce()) -> Vec<Logged> {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<Logged>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
             }
-        });
+        }
+        impl tracing::Subscriber for Recorder {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                let metadata = event.metadata();
+                self.0.lock().unwrap().push((
+                    *metadata.level(),
+                    metadata.target().to_owned(),
+                    message.0,
+                ));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let recorder = std::sync::Arc::new(Recorder::default());
+        tracing::subscriber::with_default(recorder.clone(), body);
+        recorder.0.lock().unwrap().clone()
     }
 
-    #[tracing_test::traced_test]
+    // rcp shows errors and notices unless it is asked for more with -v. the decision is detail for
+    // those who ask; the warning is for the user who does not know there is anything to ask about
+    #[test]
+    fn the_destination_warns_a_starved_host_on_the_channel_shown_without_verbosity() {
+        let starved = without_receive_growth(212_992, 131_072);
+        let events = events_of(|| announce_receive(Some(DATACENTER), DATACENTER, Ok(&starved)));
+        let [decision, warning] = events.as_slice() else {
+            panic!("expected one decision and one warning, got {events:?}");
+        };
+        assert_eq!(decision.0, tracing::Level::INFO);
+        assert_ne!(decision.1, common::NOTICE_TARGET, "{decision:?}");
+        assert!(
+            decision.2.starts_with("TCP receive buffers"),
+            "{decision:?}"
+        );
+        assert_eq!(warning.0, tracing::Level::WARN);
+        assert_eq!(warning.1, common::NOTICE_TARGET, "{warning:?}");
+        assert!(
+            warning.2.contains("do not grow on this host"),
+            "{warning:?}"
+        );
+    }
+
     #[test]
     fn the_destination_does_not_warn_on_a_host_with_stock_settings() {
         let (_, stock) = hosts()[0];
-        announce_receive(None, DATACENTER, Ok(&stock));
-        announce_receive(
-            None,
-            DATACENTER,
-            Err("kernel setting ipv4/tcp_rmem: unreadable"),
-        );
-        logs_assert(|lines: &[&str]| {
-            match (
-                lines.iter().filter(|line| line.contains("INFO")).count(),
-                lines.iter().filter(|line| line.contains("WARN")).count(),
-            ) {
-                (2, 0) => Ok(()),
-                _ => Err(format!(
-                    "expected two decisions and no warning, got {lines:?}"
-                )),
-            }
+        let events = events_of(|| {
+            announce_receive(None, DATACENTER, Ok(&stock));
+            announce_receive(
+                None,
+                DATACENTER,
+                Err("kernel setting ipv4/tcp_rmem: unreadable"),
+            );
         });
+        assert_eq!(events.len(), 2, "expected two decisions, got {events:?}");
+        for (level, target, _) in &events {
+            assert_eq!(*level, tracing::Level::INFO, "{events:?}");
+            assert_ne!(target, common::NOTICE_TARGET, "{events:?}");
+        }
     }
 
     #[test]

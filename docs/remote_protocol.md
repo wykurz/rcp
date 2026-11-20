@@ -1488,6 +1488,7 @@ destination does not. The source and the destination each log their decision onc
 master makes no data connection and decides nothing. The destination also logs a warning, once,
 where its kernel does not grow receive buffers (`net.ipv4.tcp_moderate_rcvbuf=0`) and a data
 connection is left with less than the profile's size: no request gets such a host past its limits.
+The warning goes out on the `rcp::notice` target, so the master prints it at its default verbosity.
 
 **Datacenter Profile (default):**
 
