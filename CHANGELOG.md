@@ -31,6 +31,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Avoid rebuilding the shared library and its dependents on every Cargo invocation in a linked Git
+  worktree. Resolve version-metadata watch paths through Git, track packed refs, and avoid
+  invalidating builds when unrelated branches change while the current branch has a loose ref.
+  Source archives no longer borrow the identity of an enclosing repository.
 - Stop remote copies from holding back their own TCP window. `rcp` asked the kernel for socket
   buffer sizes on every connection, after the connection was established. On older kernels without
   the TCP receive-window clamp fix, a late receive-buffer request can leave the advertised window

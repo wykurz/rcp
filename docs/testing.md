@@ -36,6 +36,21 @@ just ci                # Full CI checks (lint + Nix when available + doc + test-
 ./scripts/cargo-host.sh test --doc
 ```
 
+### Build metadata regression tests
+
+`just build-metadata-test` exercises the real `common/build.rs` in small, dependency-free Cargo
+workspaces. It checks compiled Git identity and verifies that unchanged builds reuse both the shared
+library and a dependent executable. Fixtures cover ordinary checkouts, linked worktrees, detached
+HEAD, loose and packed refs, shallow history, missing Git, and source archives, including an archive
+inside an unrelated repository. A linked reftable case also runs when the installed Git supports
+that storage format. The fixtures build offline for the compiler's native host, outside the
+repository's distribution-target configuration. This suite runs in local/Depot lint and full GitHub
+validation of current sources; pinned older releases can predate its helper.
+
+Git diagnostics remain a best-effort snapshot when the build script runs: revision/tag changes and
+changes to the build script refresh it. The `-dirty` suffix does not track every worktree edit; it
+must not be used as proof that a binary was built from clean sources.
+
 ### Test Profiles
 
 The project uses [cargo-nextest](https://nexte.st/) for faster test execution.
