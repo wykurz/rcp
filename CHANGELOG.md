@@ -23,6 +23,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the buffer decision it follows). The README's "TCP Socket Buffers" section now leads with
   recommended kernel settings, and "Check TCP Buffer Sizes" says what each line of that output means
   and what to do about it.
+- Add `--local-copy-buffer-retention-limit=SIZE` to `rcp` and `rlink`: the largest read/write buffer
+  a copying thread keeps between local files (see "Changed"). The default `1MiB` keeps the whole
+  buffer; a larger buffer is freed when its file is done, so `0` keeps nothing and every file
+  allocates its own, as before. The limit bounds idle memory without changing how many files are
+  copied at a time or how much is read at once.
 
 ### Fixed
 
@@ -51,6 +56,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   buffer in whole chunks instead of through a second, per-file buffer. A file within the limit no
   longer costs a memory mapping and its page faults on each side. On one 20-CPU host, remote copies
   of 64 KiB to 1 MB files took 24% to 56% less time.
+- Keep the buffer of the local read/write copy path per thread instead of allocating one per file.
+  This is the path that copies between different filesystems usually take, and every copy with
+  `--reflink=never`. A fresh buffer per file was zero-filled each time and, with the system
+  allocator of the static (musl) builds, cost a memory mapping and its page faults per file. On one
+  20-CPU host, copies between two memory-backed filesystems with that allocator took 63% less time
+  for 64 KiB files, 55% less for 256 KiB and 29% less for 1 MiB. Each copying thread keeps at most 1
+  MiB for as long as it lives, and `--local-copy-buffer-retention-limit` (see "Added") lowers that.
 - Keep whole transfer buffers between the files of a remote copy by default. One size per network
   profile, 16 MiB for datacenter and 2 MiB for internet, now sets the wanted TCP socket buffer size,
   the default of `--remote-copy-buffer-size` and the default of

@@ -73,6 +73,21 @@ struct Args {
     )]
     local_copy_handoff: common::copy::LocalCopyHandoff,
 
+    /// Largest read/write buffer each copying thread keeps between local files
+    ///
+    /// Local copies that cannot use copy_file_range, such as those between different filesystems
+    /// or with --reflink=never, go through a buffer of up to 1 MiB. A thread keeps that buffer for
+    /// its next file unless it is larger than this limit. Zero keeps nothing: every file then
+    /// allocates its own buffer. This bounds idle memory only, not how much is read at a time.
+    /// Accepts sizes like "256KiB", "1MiB", or bytes. Remote transfers are unaffected.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        default_value_t,
+        help_heading = "Copy options"
+    )]
+    local_copy_buffer_retention_limit: common::copy_data::BufferRetentionLimit,
+
     /// File attributes to compare when deciding if files are identical (used with --overwrite)
     ///
     /// Comma-separated list. Available: uid, gid, mode, size, mtime, ctime
@@ -1801,6 +1816,7 @@ async fn async_main(
     let settings = common::copy::Settings {
         reflink: args.reflink,
         local_copy_handoff: args.local_copy_handoff,
+        local_copy_buffer_retention_limit: args.local_copy_buffer_retention_limit,
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite || args.delete,

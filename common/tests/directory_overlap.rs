@@ -41,6 +41,7 @@ fn copy_settings(preview: bool) -> copy::Settings {
     copy::Settings {
         reflink: Default::default(),
         local_copy_handoff: Default::default(),
+        local_copy_buffer_retention_limit: Default::default(),
         dereference: false,
         fail_early: false,
         overwrite: true,

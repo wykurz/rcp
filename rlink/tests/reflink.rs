@@ -153,3 +153,58 @@ async fn local_copy_handoff_rejects_unknown_policy_before_updating() {
     .stderr(predicates::str::contains("possible values: never, fresh"));
     assert!(!dst.exists());
 }
+
+#[tokio::test]
+async fn copies_updates_with_the_buffer_retention_limit_of_the_command_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, update) = update_tree(tmp.path()).await;
+    for (index, (limit, bytes)) in [
+        (None, 1024 * 1024),
+        (Some("0"), 0),
+        (Some("4KiB"), 4096),
+        (Some("16MiB"), 16 * 1024 * 1024),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dst = tmp.path().join(format!("kept-{index}"));
+        let mut cmd = update_command(&src, &update, &dst, Some("--reflink=never"));
+        if let Some(limit) = limit {
+            cmd.arg(format!("--local-copy-buffer-retention-limit={limit}"));
+        }
+        let output = cmd.arg("-vv").output().unwrap();
+        assert!(output.status.success(), "{limit:?}: {output:?}");
+        // the settings the update runs with are logged at debug level; only that line counts
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let settings = stdout
+            .lines()
+            .find(|line| line.contains("link settings: Settings {"))
+            .expect("the link settings must be logged at debug level");
+        assert!(
+            settings.contains(&format!(
+                "local_copy_buffer_retention_limit: BufferRetentionLimit({bytes})"
+            )),
+            "{limit:?}: {settings}"
+        );
+        assert_updated_tree(&src, &update, &dst);
+    }
+}
+
+#[tokio::test]
+async fn rejects_a_buffer_retention_limit_that_is_not_a_size_before_updating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, update) = update_tree(tmp.path()).await;
+    let dst = tmp.path().join("destination");
+    Command::from_std(update_command(
+        &src,
+        &update,
+        &dst,
+        Some("--local-copy-buffer-retention-limit=plenty"),
+    ))
+    .assert()
+    .code(2)
+    .stderr(predicates::str::contains(
+        "--local-copy-buffer-retention-limit",
+    ));
+    assert!(!dst.exists());
+}
