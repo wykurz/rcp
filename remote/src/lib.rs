@@ -2383,12 +2383,14 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
         \n\
         Options:\n\
         - Use automatic deployment: rcp --auto-deploy-rcpd ...\n\
-        - Install rcpd manually: cargo install rcp-tools-rcp --version {}\n\
+        - Install a matching build of rcpd on the remote host: {RCPD_INSTALL_GUIDE}\n\
         - Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...",
-        searched.join("\n"),
-        local_version.crate_version()
+        searched.join("\n")
     ))
 }
+
+const RCPD_INSTALL_GUIDE: &str =
+    "https://github.com/wykurz/rcp/blob/main/docs/remote_copy.md#version-mismatch-error";
 
 /// Try to discover rcpd and check version compatibility
 ///
@@ -2455,11 +2457,9 @@ async fn check_rcpd_version<S: SshSessionOwner>(
             stderr: {}\n\
             \n\
             This may indicate an old version of rcpd that does not support --protocol-version.\n\
-            Please install a matching version of rcpd on the remote host:\n\
-            - cargo install rcp-tools-rcp --version {}",
+            Install a matching build of rcpd on the remote host: {RCPD_INSTALL_GUIDE}",
             remote_host,
-            stderr,
-            local_version.crate_version()
+            stderr
         ));
     }
 
@@ -2474,29 +2474,45 @@ async fn check_rcpd_version<S: SshSessionOwner>(
     );
 
     if !local_version.is_compatible_with(&remote_version) {
-        return Err(anyhow::anyhow!(
-            "rcpd version mismatch\n\
-            \n\
-            Local:  rcp {}\n\
-            Remote: rcpd {} on host '{}'\n\
-            \n\
-            The rcpd version on the remote host must exactly match the rcp version,\n\
-            including the +w compatibility revision — two builds of the same release can\n\
-            differ when the development remote protocol or rcpd spawn contract moved\n\
-            between them (then\n\
-            reinstall/redeploy the remote build rather than pinning a version).\n\
-            \n\
-            To fix this, install the matching version on the remote host:\n\
-            - ssh {} 'cargo install rcp-tools-rcp --version {}'",
-            local_version,
-            remote_version,
+        return Err(rcpd_version_mismatch_error(
+            &local_version,
+            &remote_version,
             remote_host,
-            shell_escape(remote_host),
-            local_version.crate_version()
         ));
     }
 
     Ok(())
+}
+
+fn rcpd_version_mismatch_error(
+    local_version: &version::ProtocolVersion,
+    remote_version: &version::ProtocolVersion,
+    remote_host: &str,
+) -> anyhow::Error {
+    let local_release = local_version.crate_version();
+    let remedy = if local_release == remote_version.crate_version() {
+        "The package release is already the same. Install an rcpd from a matching build, or use \
+         --auto-deploy-rcpd with a compatible local daemon."
+            .to_string()
+    } else {
+        format!(
+            "If the local rcp was installed from crates.io, run on the remote host:\n\
+             RUSTFLAGS='--cfg tokio_unstable' cargo install --locked rcp-tools-rcp --version {}\n\
+             Otherwise install an rcpd from a matching build, or use --auto-deploy-rcpd \
+             with a compatible local daemon.",
+            shell_escape(local_release)
+        )
+    };
+    anyhow::anyhow!(
+        "rcpd version mismatch\n\
+         \n\
+         Local:  rcp {local_version}\n\
+         Remote: rcpd {remote_version} on host '{remote_host}'\n\
+         \n\
+         The full protocol versions must match, including the +w compatibility revision.\n\
+         {remedy}\n\
+         Verify the selected rcpd with --protocol-version. See {RCPD_INSTALL_GUIDE}"
+    )
 }
 
 /// Connection info received from rcpd after it starts listening.
@@ -3721,6 +3737,40 @@ mod tests {
 
     fn nonzero(value: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(value).unwrap()
+    }
+
+    fn test_protocol_version(semantic: &str) -> version::ProtocolVersion {
+        version::ProtocolVersion {
+            semantic: semantic.into(),
+            git_describe: None,
+            git_hash: None,
+        }
+    }
+
+    #[test]
+    fn version_mismatch_same_release_recommends_matching_build() {
+        let local = test_protocol_version("0.42.0+w11");
+        for semantic in ["0.42.0+w10", "0.42.0"] {
+            let remote = test_protocol_version(semantic);
+            let error = rcpd_version_mismatch_error(&local, &remote, "example").to_string();
+            assert!(error.contains("Local:  rcp 0.42.0+w11"));
+            assert!(error.contains(&format!("Remote: rcpd {semantic} on host 'example'")));
+            assert!(error.contains("matching build"));
+            assert!(error.contains("--auto-deploy-rcpd"));
+            assert!(!error.contains("cargo install"));
+        }
+    }
+
+    #[test]
+    fn version_mismatch_different_release_shows_conditional_registry_command() {
+        let local = test_protocol_version("0.42.0+w11");
+        let remote = test_protocol_version("0.41.0+w10");
+        let error = rcpd_version_mismatch_error(&local, &remote, "user@host").to_string();
+        assert!(error.contains("Remote: rcpd 0.41.0+w10 on host 'user@host'"));
+        assert!(error.contains("If the local rcp was installed from crates.io"));
+        assert!(error.lines().any(|line| line
+            == "RUSTFLAGS='--cfg tokio_unstable' cargo install --locked rcp-tools-rcp --version '0.42.0'"));
+        assert!(error.contains("--protocol-version"));
     }
 
     mod localhost_ssh_tests {

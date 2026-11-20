@@ -367,14 +367,14 @@ fn final_local_candidate_failure(
         {}\n\
         \n\
         To use auto-deployment, ensure rcpd is available:\n\
-        - cargo install rcp-tools-rcp (installs to ~/.cargo/bin)\n\
-        - or add rcpd to PATH\n\
+        - Install a matching build and put its rcpd on PATH: {}\n\
         - or build for this host with: ./scripts/cargo-host.sh build --release --bin rcpd",
         searched_paths
             .iter()
             .map(|p| format!("- {}", p))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        crate::RCPD_INSTALL_GUIDE
     )
 }
 
