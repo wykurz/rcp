@@ -969,11 +969,11 @@ sudo sysctl -w net.core.netdev_budget=600
 
 ## Application-Level Tuning
 
-`rcp` and `rcpd` use mimalloc for heap allocation. In measured remote small-file workloads this
-reduced allocation overhead and improved throughput, with higher peak resident memory than the
-previous system allocator. Account for both daemons when sizing a machine. File concurrency,
-connection counts and buffer-retention controls remain useful limits on the work held in memory;
-none is a hard limit on total process RSS.
+`rcp` uses the system allocator. Each `rcpd` uses mimalloc for heap allocation. In measured remote
+small-file workloads mimalloc reduced allocation overhead and improved throughput, with higher peak
+resident memory than the system allocator. Account for both daemons when sizing a machine. File
+concurrency, connection counts and buffer-retention controls remain useful limits on the work held
+in memory; none is a hard limit on total process RSS.
 
 ### Worker Threads
 
