@@ -76,7 +76,7 @@ impl ProtocolVersion {
     /// # Examples
     ///
     /// ```
-    /// use common::version::ProtocolVersion;
+    /// use remote::version::ProtocolVersion;
     ///
     /// let v1 = ProtocolVersion {
     ///     semantic: "0.22.0".to_string(),
@@ -120,7 +120,7 @@ impl ProtocolVersion {
     /// # Examples
     ///
     /// ```
-    /// use common::version::ProtocolVersion;
+    /// use remote::version::ProtocolVersion;
     ///
     /// let v = ProtocolVersion {
     ///     semantic: "0.22.0".to_string(),

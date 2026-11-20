@@ -1,7 +1,7 @@
 # Remote wire fixtures
 
 `wire-v12.txt` records named, fixed bitcode payloads (hexadecimal, one message per line) for
-`common::version::WIRE_REVISION = 12`. `wire_compatibility.rs` selects the fixture set by revision;
+`remote::version::WIRE_REVISION = 12`. `wire_compatibility.rs` selects the fixture set by revision;
 an unrecognized revision fails even if its bytes have not changed. The tests encode deterministic
 values to those bytes and separately decode the stored bytes to named field values, compared through
 Serde JSON values. They never regenerate fixtures while testing.
@@ -24,7 +24,7 @@ statistics, filesystem metadata, clocks, or production defaults.
 
 When a fixture fails, identify the wire-visible change, including changes in nested common types or
 the serializer dependency. Do not simply replace the expected bytes. Apply the compatibility policy
-at `common/src/version.rs`: an incompatible change must change the crate version or `WIRE_REVISION`
+at `remote/src/version.rs`: an incompatible change must change the crate version or `WIRE_REVISION`
 so same-version stale daemons are rejected. For a revision bump, rename the fixture file to that
 revision, update the explicit selection in the test, and review each changed payload and test value
 together. If only the crate version changes, explain that compatibility boundary in the PR. If a

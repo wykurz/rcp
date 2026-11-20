@@ -10,7 +10,6 @@ readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-common"
 keywords = ["internal", "library", "file-operations"]
 categories = ["development-tools"]
-build = "build.rs"
 
 [lints]
 workspace = true

@@ -674,11 +674,11 @@ fn test_protocol_version_has_git_info() {
     // verify git info is populated (this catches build.rs not being activated)
     assert!(
         version["git_describe"].is_string(),
-        "git_describe should be present when building from git repo (check that build.rs is activated in common/Cargo.toml)"
+        "git_describe should be present when building from git repo (check that build.rs is activated in remote/Cargo.toml)"
     );
     assert!(
         version["git_hash"].is_string(),
-        "git_hash should be present when building from git repo (check that build.rs is activated in common/Cargo.toml)"
+        "git_hash should be present when building from git repo (check that build.rs is activated in remote/Cargo.toml)"
     );
 }
 
@@ -702,11 +702,11 @@ fn test_rcpd_protocol_version_has_git_info() {
     // verify git info is populated for rcpd too
     assert!(
         version["git_describe"].is_string(),
-        "rcpd git_describe should be present (check that build.rs is activated in common/Cargo.toml)"
+        "rcpd git_describe should be present (check that build.rs is activated in remote/Cargo.toml)"
     );
     assert!(
         version["git_hash"].is_string(),
-        "rcpd git_hash should be present (check that build.rs is activated in common/Cargo.toml)"
+        "rcpd git_hash should be present (check that build.rs is activated in remote/Cargo.toml)"
     );
 }
 

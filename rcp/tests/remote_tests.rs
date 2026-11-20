@@ -4101,7 +4101,7 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     let current_version_path = cache_dir.join(format!(
         "rcpd-{}-w{}",
         current_version,
-        common::version::WIRE_REVISION
+        remote::version::WIRE_REVISION
     ));
     // check which versions remain
     let oldest_exists = oldest_version.exists();

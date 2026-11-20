@@ -734,4 +734,4 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 - **Protocol specification**: [remote_protocol.md](remote_protocol.md)
 - **Security model**: [security.md](security.md)
 - **Implementation**: `remote/src/lib.rs`, `remote/src/deploy.rs`
-- **Version module**: `common/src/version.rs`
+- **Version module**: `remote/src/version.rs`

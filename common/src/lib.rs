@@ -135,7 +135,6 @@ pub mod safedir;
 mod settings_parse;
 pub mod task_scope;
 pub mod timing;
-pub mod version;
 
 pub mod filecmp;
 pub mod progress;

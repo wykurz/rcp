@@ -31,7 +31,7 @@ class BuildMetadataTests(unittest.TestCase):
         self.write("README.md", "fixture\n")
         self.write("common/Cargo.toml", '[package]\nname = "metadata-common"\n'
                    'version = "0.1.0"\nedition = "2024"\n')
-        self.write("common/build.rs", (ROOT / "common/build.rs").read_text())
+        self.write("common/build.rs", (ROOT / "remote/build.rs").read_text())
         self.write("common/src/lib.rs", 'pub fn identity() -> (&\'static str, &\'static str) {\n'
                    '    (option_env!("RCP_GIT_HASH").unwrap_or("unknown"),\n'
                    '     option_env!("RCP_GIT_DESCRIBE").unwrap_or("unknown"))\n}\n')
