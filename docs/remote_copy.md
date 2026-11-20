@@ -95,6 +95,7 @@ Discovery checks locations in this order:
    - Indicates intentional installation (e.g., `cargo install`)
 
 4. **Deployed cache** (`~/.cache/rcp/bin/rcpd-{version}`)
+   - The cache tag replaces `+` in the protocol version with `-` (for example, `0.38.0-w1`)
    - Last resort for auto-deployed binaries
    - Only checked if not found elsewhere
 
@@ -108,11 +109,11 @@ rcpd binary not found on remote host
 Searched in:
 - Same directory as local rcp binary
 - PATH (via 'command -v rcpd')
-- Deployed cache: ~/.cache/rcp/bin/rcpd-0.36.0
+- Deployed cache: ~/.cache/rcp/bin/rcpd-0.38.0-w1
 
 Options:
 - Use automatic deployment: rcp --auto-deploy-rcpd ...
-- Install rcpd manually: cargo install rcp-tools-rcp --version 0.36.0
+- Install rcpd manually: cargo install rcp-tools-rcp --version 0.38.0
 - Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...
 ```
 
@@ -130,64 +131,55 @@ proceed if those checks do not find a compatible daemon.
 
 ## Version Checking
 
-rcp requires exact version match between local rcp and remote rcpd.
+The local `rcp` and the selected remote `rcpd` must report the same full protocol version.
 
 ### Version Information
 
-Each binary embeds version information at build time:
+`--protocol-version` returns JSON. For example:
 
-```rust
-pub struct ProtocolVersion {
-    pub semantic: String,              // e.g., "0.22.0"
-    pub git_describe: Option<String>,  // e.g., "v0.21.1-7-g644da27"
-    pub git_hash: Option<String>,      // Full commit hash
-}
+```json
+{"semantic":"0.38.0+w1"}
 ```
+
+The `semantic` field includes the package release and the `+wN` wire and daemon startup
+compatibility revision. Optional `git_describe` and `git_hash` fields are for diagnostics only.
 
 ### Verification Process
 
-1. **Execute version command** on remote:
-   ```bash
-   rcpd --protocol-version
-   ```
-   Returns JSON with version information. Remote probes use the `--remote-copy-conn-timeout-sec`
-   deadline; timeout errors retain the affected host in their error chain, and auto-deployment may
-   recover by publishing a compatible local candidate.
-
-2. **Compare versions**:
-   - Policy: Exact semantic version match required
-   - `rcp 0.22.0` requires `rcpd 0.22.0` exactly
-   - Git info used for debugging only
-
-3. **On mismatch**, return error with:
-   - Local and remote versions
-   - Remote hostname for context
-   - Installation command with correct version
+1. **Probe the selected remote `rcpd`** with `--protocol-version`. Remote probes use the
+   `--remote-copy-conn-timeout-sec` deadline; timeout errors retain the affected host in their error
+   chain, and auto-deployment may recover by publishing a compatible local candidate.
+2. **Compare the full `semantic` strings**. Both the release and the revision must match exactly.
+   For example, `0.38.0+w1` does not match `0.38.0+w2` or a legacy `0.38.0` without the suffix.
+3. **On mismatch**, the error reports the local and remote versions, the remote host, and a package
+   installation suggestion.
 
 ### Version Mismatch Error
 
+If you see `rcpd version mismatch`, compare the `semantic` fields using the commands below. Probe
+the daemon path that [binary discovery](#rcpd-binary-discovery) selected, not necessarily the first
+`rcpd` in the remote shell's `PATH`.
+
+For a packaged installation, use the plain package release with `cargo install`, not the `+wN`
+suffix. For example, for release `0.38.0`:
+
+```bash
+ssh prod-server 'cargo install rcp-tools-rcp --version 0.38.0'
 ```
-rcpd version mismatch
 
-Local:  rcp 0.22.0 (v0.21.1-7-g644da27)
-Remote: rcpd 0.21.0 (v0.20.5-12-gf8a1b3c) on host 'prod-server'
-
-The rcpd version on the remote host must exactly match the rcp version.
-
-To fix this, install the matching version on the remote host:
-- ssh prod-server 'cargo install rcp-tools-rcp --version 0.22.0'
-```
+If the release numbers already agree but the revisions differ, reinstall from a matching build or
+use `--auto-deploy-rcpd` with a compatible local `rcpd`. Verify the full `semantic` value again
+before retrying the copy.
 
 ### CLI Flags
 
 ```bash
-# Human-readable version
+# Human-readable package version
 rcp --version
-# Output: rcp 0.36.0
 
-# Machine-readable protocol version (JSON)
+# Protocol version of the local rcp and the selected remote daemon (JSON)
 rcp --protocol-version
-# Output: {"semantic":"0.36.0","git_describe":"v0.35.0-7-g644da27",...}
+ssh prod-server '/path/to/rcpd --protocol-version'
 ```
 
 ## Automatic Deployment
@@ -698,7 +690,7 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 
 ### Exact Version Matching
 
-**Decision**: Require exact semantic version match
+**Decision**: Require an exact match of the full protocol `semantic` field
 
 **Rationale**:
 
