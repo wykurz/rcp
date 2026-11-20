@@ -17,6 +17,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--summary`, `json` prints one JSON object with the counters as exact numbers, the wall time and
   the process statistics; after a remote copy it also holds those of the source and destination
   `rcpd`. Text remains the default.
+- Warn when a destination cannot grow its TCP receive buffers. Where `net.ipv4.tcp_moderate_rcvbuf`
+  is `0` and a data connection is left with a receive buffer smaller than the network profile's
+  size, the destination `rcpd` logs a warning that names the three ways out (shown with `-v`, like
+  the buffer decision it follows). The README's "TCP Socket Buffers" section now leads with
+  recommended kernel settings, and "Check TCP Buffer Sizes" says what each line of that output means
+  and what to do about it.
 
 ### Fixed
 
@@ -34,8 +40,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   8 s before and 3.3 to 3.8 s after. One case can be slower than before: where that growth is
   switched off (`net.ipv4.tcp_moderate_rcvbuf=0`) and receive buffers are left at their small
   starting size, encrypted copies took 4% to 12% longer on kernels 6.6 and later. The README's "TCP
-  Socket Buffers" section explains both limits, now recommends raising either, and says how to give
-  such a host larger buffers.
+  Socket Buffers" section explains both limits and says how to give such a host larger buffers.
 
 ### Changed
 

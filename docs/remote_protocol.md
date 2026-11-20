@@ -1482,7 +1482,9 @@ container all the same.
 
 The two ends decide independently and nothing about it is exchanged: a source may request while its
 destination does not. The source and the destination each log their decision once at info level. The
-master makes no data connection and decides nothing.
+master makes no data connection and decides nothing. The destination also logs a warning, once,
+where its kernel does not grow receive buffers (`net.ipv4.tcp_moderate_rcvbuf=0`) and a data
+connection is left with less than the profile's size: no request gets such a host past its limits.
 
 **Datacenter Profile (default):**
 

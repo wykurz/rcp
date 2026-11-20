@@ -878,32 +878,40 @@ kernel for that size only where the request yields more than the kernel would re
 source for its send buffer, the destination for its receive buffer, each from the settings of its
 own host. Elsewhere the kernel sizes the buffer. Control connections never ask.
 
-To let `rcp` use larger buffers on a host, raise either limit. Raising the kernel's own growth helps
-every program on the host:
+**Recommended settings**, on both hosts of a remote copy: leave the kernel's own sizing switched on
+and let it grow buffers to 32 MiB.
 
 ```bash
-# Check current limits
-sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
-
-# Either let the kernel grow buffers to 32 MiB by itself (requires root, temporary until reboot)
-sudo sysctl -w net.ipv4.tcp_rmem="4096 131072 33554432"
-sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 33554432"
-
-# or let programs ask for more. rcp then asks wherever that gives it a larger buffer than the
-# kernel's own growth would (the kernel counts a granted request double: 16 MiB here is 32 MiB)
-sudo sysctl -w net.core.rmem_max=16777216
-sudo sysctl -w net.core.wmem_max=16777216
-
-# Make permanent (add the chosen lines to /etc/sysctl.d/99-rcp-perf.conf)
+# /etc/sysctl.d/99-rcp-perf.conf (apply with: sudo sysctl --system)
+net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_rmem = 4096 131072 33554432
 net.ipv4.tcp_wmem = 4096 16384 33554432
 ```
 
-The stock limits are often insufficient for 10+ Gbps links or for links with more than a few
-milliseconds of latency. If `net.ipv4.tcp_moderate_rcvbuf` is `0`, the kernel does not grow receive
-buffers at all; `rcp` then asks for one whenever that yields more than the starting size. With the
-stock request limit that is only 416 KiB, so on such a host raise `net.core.rmem_max`, or the middle
-value of `net.ipv4.tcp_rmem`, which is the size every receive buffer then keeps.
+Buffers still start small and grow only as far as a connection needs, for every program on the host,
+and `rcp` then asks for nothing. 32 MiB is what the `datacenter` profile wants, counted the kernel's
+way; for the `internet` profile the stock limits are enough. Kernels from 6.18 on already ship the
+receive line. The stock limits of older kernels are often insufficient for 10+ Gbps links or for
+links with more than a few milliseconds of latency.
+
+The other way is to raise what programs may ask for. `rcp` then asks wherever that gives it a larger
+buffer than the kernel's own growth would:
+
+```bash
+# Check current limits
+sysctl net.core.rmem_max net.core.wmem_max \
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_moderate_rcvbuf
+
+# Let programs ask for up to 16 MiB (the kernel counts a granted request double: 32 MiB buffers)
+sudo sysctl -w net.core.rmem_max=16777216
+sudo sysctl -w net.core.wmem_max=16777216
+```
+
+Do not switch the kernel's receive buffer growth off (`net.ipv4.tcp_moderate_rcvbuf=0`) on a host
+that receives copies, unless the middle value of `net.ipv4.tcp_rmem` is large as well: that is the
+size every receive buffer then keeps. With the stock values of kernels before 6.18 the kernel holds
+them at 128 KiB and `rcp`'s own request gets 416 KiB, which is slow over any link with latency. The
+destination `rcpd` warns about this (see [Check TCP Buffer Sizes](#check-tcp-buffer-sizes)).
 
 ### Open File Limits
 
@@ -1069,9 +1077,27 @@ TCP receive buffers of data connections: left to the kernel, which grows them to
 request for 16.0 MiB would be held at 8.0 MiB
 ```
 
-The sizes are as the kernel accounts them, which is twice what it grants. If both figures of a line
-are far below the network profile's size, raise that host's limits as described under
-[TCP Socket Buffers](#tcp-socket-buffers).
+The sizes are as the kernel accounts them, which is twice what it grants. What a line means and what
+to do about it:
+
+| The line says                                                           | Meaning                                                  | What to do                                                   |
+| ----------------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
+| `left to the kernel, which grows them to 32.0 MiB`                      | The kernel reaches what the profile wants                | Nothing                                                      |
+| `left to the kernel, which grows them to 6.0 MiB`                       | Both limits are small; the kernel's growth is the larger | Apply the [recommended settings](#tcp-socket-buffers)        |
+| `requested at 16.0 MiB, which the kernel grants as 8.0 MiB`             | A request gets more than growth would, but not all of it | Apply the [recommended settings](#tcp-socket-buffers)        |
+| `left to the kernel, which keeps them at ...` or `it keeps them at ...` | The kernel does not grow receive buffers on this host    | Check the size it keeps; see the warning below               |
+| `whose limits could not be found out: ...`                              | The limits are unknown, so nothing is requested          | Fix what the reason names, such as an unreadable `/proc/sys` |
+
+Where the kernel does not grow receive buffers (`net.ipv4.tcp_moderate_rcvbuf=0`) and a data
+connection is left with less than the network profile's size, the destination `rcpd` also logs a
+warning, at the same verbosity:
+
+```text
+TCP receive buffers of data connections do not grow on this host (net.ipv4.tcp_moderate_rcvbuf is
+0) and stay at 416.0 KiB, where this network profile asks for 16.0 MiB: copies over links with
+latency will be slow. Raise net.core.rmem_max, raise the middle value of net.ipv4.tcp_rmem, or set
+net.ipv4.tcp_moderate_rcvbuf to 1
+```
 
 ### Check for Network Issues
 
@@ -1087,7 +1113,7 @@ ss -ti | grep retrans
 
 For optimal performance on high-speed networks:
 
-1. ☐ Raise the kernel's TCP buffer limits on both hosts (see
+1. ☐ Apply the recommended kernel TCP buffer settings on both hosts (see
    [TCP Socket Buffers](#tcp-socket-buffers))
 2. ☐ Check the hard descriptor limit on each host if copying many files
 3. ☐ Use `--network-profile=datacenter` for local/datacenter networks

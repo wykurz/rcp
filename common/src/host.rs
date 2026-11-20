@@ -56,6 +56,9 @@ pub struct TcpBufferLimits {
     /// `net.ipv4.tcp_rmem`, or its middle value, the size every buffer starts with, when
     /// `net.ipv4.tcp_moderate_rcvbuf` switches the growth off.
     pub receive_growth: u64,
+    /// Whether the kernel grows a receive buffer nobody asked for (`net.ipv4.tcp_moderate_rcvbuf`).
+    /// Where it does not, such a buffer keeps its starting size for good.
+    pub receive_buffers_grow: bool,
 }
 
 impl TcpBufferLimits {
@@ -67,43 +70,14 @@ impl TcpBufferLimits {
     /// with, or when a growth setting is missing, unreadable or not a number.
     fn detect() -> std::io::Result<Self> {
         let probe = RequestProbe::open()?;
-        let (send_growth, receive_growth) =
-            Self::read_growth_from(std::path::Path::new(Self::KERNEL_SETTINGS))?;
+        let own = OwnSizing::read_from(std::path::Path::new(Self::KERNEL_SETTINGS))?;
         Ok(Self {
             send_request: probe.limit(libc::SO_SNDBUF)?,
             receive_request: probe.limit(libc::SO_RCVBUF)?,
-            send_growth,
-            receive_growth,
+            send_growth: own.send_growth,
+            receive_growth: own.receive_growth,
+            receive_buffers_grow: own.receive_buffers_grow,
         })
-    }
-
-    /// Read the growth limits, for sending and for receiving, from the settings under `root`.
-    /// Fails when a setting is missing, unreadable or not a number.
-    fn read_growth_from(root: &std::path::Path) -> std::io::Result<(u64, u64)> {
-        // one whitespace-separated value of one setting
-        let value = |setting: &str, index: usize| -> std::io::Result<u64> {
-            let invalid = |problem: String| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("kernel setting {setting}: {problem}"),
-                )
-            };
-            let text = std::fs::read_to_string(root.join(setting)).map_err(|error| {
-                std::io::Error::new(error.kind(), format!("kernel setting {setting}: {error}"))
-            })?;
-            let field = text
-                .split_whitespace()
-                .nth(index)
-                .ok_or_else(|| invalid(format!("no value {} in {text:?}", index + 1)))?;
-            field
-                .parse()
-                .map_err(|error| invalid(format!("{field:?} is not a size: {error}")))
-        };
-        let receive_buffers_grow = value("ipv4/tcp_moderate_rcvbuf", 0)? != 0;
-        Ok((
-            value("ipv4/tcp_wmem", 2)?,
-            value("ipv4/tcp_rmem", if receive_buffers_grow { 2 } else { 1 })?,
-        ))
     }
 
     /// The send buffer a request for `size` bytes yields, as the kernel accounts it: twice the
@@ -124,6 +98,45 @@ impl TcpBufferLimits {
             .unwrap_or(u64::MAX)
             .min(limit)
             .saturating_mul(2)
+    }
+}
+
+/// How the kernel sizes a buffer nobody asked for, as its settings state it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnSizing {
+    send_growth: u64,
+    receive_growth: u64,
+    receive_buffers_grow: bool,
+}
+
+impl OwnSizing {
+    /// Read the settings under `root`. Fails when one is missing, unreadable or not a number.
+    fn read_from(root: &std::path::Path) -> std::io::Result<Self> {
+        // one whitespace-separated value of one setting
+        let value = |setting: &str, index: usize| -> std::io::Result<u64> {
+            let invalid = |problem: String| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("kernel setting {setting}: {problem}"),
+                )
+            };
+            let text = std::fs::read_to_string(root.join(setting)).map_err(|error| {
+                std::io::Error::new(error.kind(), format!("kernel setting {setting}: {error}"))
+            })?;
+            let field = text
+                .split_whitespace()
+                .nth(index)
+                .ok_or_else(|| invalid(format!("no value {} in {text:?}", index + 1)))?;
+            field
+                .parse()
+                .map_err(|error| invalid(format!("{field:?} is not a size: {error}")))
+        };
+        let receive_buffers_grow = value("ipv4/tcp_moderate_rcvbuf", 0)? != 0;
+        Ok(Self {
+            send_growth: value("ipv4/tcp_wmem", 2)?,
+            receive_growth: value("ipv4/tcp_rmem", if receive_buffers_grow { 2 } else { 1 })?,
+            receive_buffers_grow,
+        })
     }
 }
 
@@ -316,8 +329,12 @@ mod tests {
     fn growth_limits_are_the_last_values_of_the_kernels_settings() {
         let root = settings(&STOCK);
         assert_eq!(
-            TcpBufferLimits::read_growth_from(root.path()).unwrap(),
-            (4_194_304, 6_291_456)
+            OwnSizing::read_from(root.path()).unwrap(),
+            OwnSizing {
+                send_growth: 4_194_304,
+                receive_growth: 6_291_456,
+                receive_buffers_grow: true,
+            }
         );
     }
 
@@ -327,8 +344,12 @@ mod tests {
         values[2] = ("ipv4/tcp_moderate_rcvbuf", "0\n");
         let root = settings(&values);
         assert_eq!(
-            TcpBufferLimits::read_growth_from(root.path()).unwrap(),
-            (4_194_304, 131_072),
+            OwnSizing::read_from(root.path()).unwrap(),
+            OwnSizing {
+                send_growth: 4_194_304,
+                receive_growth: 131_072,
+                receive_buffers_grow: false,
+            },
             "send buffers grow regardless"
         );
     }
@@ -344,13 +365,13 @@ mod tests {
             let mut values = STOCK.to_vec();
             values.remove(index);
             let root = settings(&values);
-            let error = TcpBufferLimits::read_growth_from(root.path()).unwrap_err();
+            let error = OwnSizing::read_from(root.path()).unwrap_err();
             assert!(format!("{error:#}").contains(broken), "{error:#}");
             // not a number
             let mut values = STOCK;
             values[index] = (broken, "many\n");
             let root = settings(&values);
-            let error = TcpBufferLimits::read_growth_from(root.path()).unwrap_err();
+            let error = OwnSizing::read_from(root.path()).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert!(format!("{error:#}").contains(broken), "{error:#}");
         }
@@ -358,7 +379,7 @@ mod tests {
         let mut values = STOCK;
         values[1] = ("ipv4/tcp_rmem", "4096 131072\n");
         let root = settings(&values);
-        let error = TcpBufferLimits::read_growth_from(root.path()).unwrap_err();
+        let error = OwnSizing::read_from(root.path()).unwrap_err();
         assert!(format!("{error:#}").contains("ipv4/tcp_rmem"), "{error:#}");
     }
 
@@ -407,6 +428,7 @@ mod tests {
             receive_request: 212_992,
             send_growth: 0,
             receive_growth: 0,
+            receive_buffers_grow: true,
         };
         // within the limit: all of it, twice
         assert_eq!(limits.send_buffer_for_request(2 << 20), 4 << 20);
@@ -431,6 +453,7 @@ mod tests {
             (Some(send_growth), Some(receive_growth), Some(grows)) => {
                 let limits = found.expect("readable settings must be found");
                 assert_eq!(limits.send_growth, send_growth);
+                assert_eq!(limits.receive_buffers_grow, grows != 0);
                 if grows != 0 {
                     assert_eq!(limits.receive_growth, receive_growth);
                 } else {

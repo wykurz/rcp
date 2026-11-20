@@ -22,6 +22,10 @@
 //! Outside tests, a request for a size only comes out of [`SendBufferRequest::for_this_host`] and
 //! [`ReceiveBufferRequest::for_this_host`], so a size that the limits of this host do not call for
 //! cannot reach a socket.
+//!
+//! Each end logs its decision once at info level. The destination also warns, once, where its
+//! kernel does not grow receive buffers and leaves it with less than the profile's size: nothing
+//! this module can ask for gets such a host past its limits, only its administrator can.
 
 use common::host::TcpBufferLimits;
 
@@ -85,13 +89,13 @@ impl ReceiveBufferRequest {
     }
 
     /// What the destination asks for on its data connections under `profile`, on the host it
-    /// runs on. The decision and the figures behind it are logged once.
+    /// runs on. The decision and the figures behind it are logged once, with a warning where the
+    /// host starves these buffers (see `starved_receive_warning`).
     pub(crate) fn for_this_host(profile: crate::NetworkProfile) -> Self {
         static ANNOUNCED: std::sync::Once = std::sync::Once::new();
         let (size, limits) = this_host(profile);
         let request = Self::plan(size, limits.ok());
-        ANNOUNCED
-            .call_once(|| tracing::info!("{}", Self::DIRECTION.describe(request.0, size, limits)));
+        ANNOUNCED.call_once(|| announce_receive(request.0, size, limits));
         request
     }
 
@@ -105,6 +109,40 @@ impl ReceiveBufferRequest {
     pub(crate) fn of(size: usize) -> Self {
         Self(Some(size))
     }
+}
+
+/// Log what the destination decided for its receive buffers, and warn where its host starves them.
+fn announce_receive(requested: Option<usize>, size: usize, limits: Result<&TcpBufferLimits, &str>) {
+    tracing::info!("{}", Direction::Receive.describe(requested, size, limits));
+    if let Some(warning) = limits
+        .ok()
+        .and_then(|limits| starved_receive_warning(size, limits))
+    {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// The warning for a host whose kernel does not grow receive buffers and leaves a data connection
+/// with one smaller than `size`, the size its network profile asks for. `None` for any other host.
+///
+/// What a data connection ends up with on such a host is the larger of what a request is granted
+/// and what every buffer keeps. A host that keeps its buffers at the profile's size or more is
+/// left alone: that is a deliberate setting, not a starved one. So is a host whose buffers grow,
+/// however little: how far they get is in the decision line.
+fn starved_receive_warning(size: usize, limits: &TcpBufferLimits) -> Option<String> {
+    let (granted, kept) = Direction::Receive.figures(size, limits);
+    let buffer = granted.max(kept);
+    let wanted = u64::try_from(size).unwrap_or(u64::MAX);
+    (!limits.receive_buffers_grow && buffer < wanted).then(|| {
+        format!(
+            "TCP receive buffers of data connections do not grow on this host \
+             (net.ipv4.tcp_moderate_rcvbuf is 0) and stay at {}, where this network profile asks \
+             for {}: copies over links with latency will be slow. Raise net.core.rmem_max, raise \
+             the middle value of net.ipv4.tcp_rmem, or set net.ipv4.tcp_moderate_rcvbuf to 1",
+            bytesize::ByteSize(buffer),
+            bytesize::ByteSize(wanted)
+        )
+    })
 }
 
 /// The size `profile` wants, and the limits of the host this process runs on.
@@ -170,15 +208,20 @@ impl Direction {
         };
         let (granted, growth) = self.figures(size, limits);
         let (granted, growth) = (bytesize::ByteSize(granted), bytesize::ByteSize(growth));
+        // only receive buffers can be kept from growing (`net.ipv4.tcp_moderate_rcvbuf`)
+        let own = match self {
+            Self::Receive if !limits.receive_buffers_grow => "keeps them at",
+            Self::Send | Self::Receive => "grows them to",
+        };
         if requested.is_some() {
             format!(
                 "TCP {direction} buffers of data connections: requested at {wanted}, which the \
-                 kernel grants as {granted}, more than the {growth} it grows them to by itself"
+                 kernel grants as {granted}, more than the {growth} it {own} by itself"
             )
         } else {
             format!(
-                "TCP {direction} buffers of data connections: left to the kernel, which grows \
-                 them to {growth}; a request for {wanted} would be held at {granted}"
+                "TCP {direction} buffers of data connections: left to the kernel, which {own} \
+                 {growth}; a request for {wanted} would be held at {granted}"
             )
         }
     }
@@ -200,6 +243,7 @@ mod tests {
             receive_request: request,
             send_growth,
             receive_growth,
+            receive_buffers_grow: true,
         };
         [
             (
@@ -221,7 +265,10 @@ mod tests {
             // with tcp_moderate_rcvbuf off a receive buffer stays at its starting 128 KiB
             (
                 "stock, receive growth off",
-                limits(212_992, 4 * MIB, 131_072),
+                TcpBufferLimits {
+                    receive_buffers_grow: false,
+                    ..limits(212_992, 4 * MIB, 131_072)
+                },
             ),
             (
                 "stock, kernel 6.18 and later",
@@ -300,6 +347,7 @@ mod tests {
             receive_request: 212_992,
             send_growth: 4 * MIB,
             receive_growth: 6 * MIB,
+            receive_buffers_grow: true,
         };
         assert_eq!(
             plan(DATACENTER, Some(&limits)),
@@ -310,6 +358,7 @@ mod tests {
             receive_request: 16 * MIB,
             send_growth: 4 * MIB,
             receive_growth: 6 * MIB,
+            receive_buffers_grow: true,
         };
         assert_eq!(
             plan(DATACENTER, Some(&limits)),
@@ -321,6 +370,7 @@ mod tests {
             receive_request: 16 * MIB,
             send_growth: 64 * MIB,
             receive_growth: 6 * MIB,
+            receive_buffers_grow: true,
         };
         assert_eq!(
             plan(DATACENTER, Some(&limits)),
@@ -335,6 +385,7 @@ mod tests {
             receive_request: 16 * MIB,
             send_growth: growth,
             receive_growth: growth,
+            receive_buffers_grow: true,
         };
         // a full grant of 16 MiB is accounted as 32 MiB
         assert_eq!(
@@ -355,6 +406,7 @@ mod tests {
             receive_request: 64 * MIB,
             send_growth: 0,
             receive_growth: 0,
+            receive_buffers_grow: true,
         };
         assert_eq!(plan(0, Some(&generous)), requests(None, None));
     }
@@ -370,6 +422,7 @@ mod tests {
             receive_request: 64 * MIB,
             send_growth: 0,
             receive_growth: 0,
+            receive_buffers_grow: true,
         };
         assert_eq!(
             SendBufferRequest::plan(DATACENTER, Some(&generous)).size(),
@@ -389,6 +442,7 @@ mod tests {
             receive_request: 4 * MIB,
             send_growth: 4 * MIB,
             receive_growth: 32 * MIB,
+            receive_buffers_grow: true,
         };
         assert_eq!(
             Direction::Send.describe(Some(DATACENTER), DATACENTER, Ok(&limits)),
@@ -409,6 +463,168 @@ mod tests {
             "TCP receive buffers of data connections: left to the kernel, whose limits could not \
              be found out: kernel setting ipv4/tcp_rmem: No such file or directory"
         );
+    }
+
+    /// A host whose kernel does not grow receive buffers: they keep `fixed` bytes, and a request
+    /// is granted `request_limit` at most.
+    fn without_receive_growth(request_limit: u64, fixed: u64) -> TcpBufferLimits {
+        TcpBufferLimits {
+            send_request: request_limit,
+            receive_request: request_limit,
+            send_growth: 4 * MIB,
+            receive_growth: fixed,
+            receive_buffers_grow: false,
+        }
+    }
+
+    #[test]
+    fn a_host_that_cannot_grow_small_receive_buffers_is_warned_about() {
+        // what a data connection ends up with is the larger of what a request is granted and
+        // what every buffer keeps; the warning is for less than the profile's size
+        let cases = [
+            // the stock request limit grants 416 KiB, more than the 128 KiB buffers start with
+            (
+                without_receive_growth(212_992, 131_072),
+                DATACENTER,
+                Some("416.0 KiB"),
+            ),
+            (
+                without_receive_growth(212_992, 131_072),
+                INTERNET,
+                Some("416.0 KiB"),
+            ),
+            // buffers fixed at 1 MiB, more than a request would get
+            (
+                without_receive_growth(212_992, MIB),
+                DATACENTER,
+                Some("1.0 MiB"),
+            ),
+            (
+                without_receive_growth(212_992, MIB),
+                INTERNET,
+                Some("1.0 MiB"),
+            ),
+            // buffers fixed at 2 MiB: enough for the internet profile, not for the datacenter one
+            (without_receive_growth(212_992, 2 * MIB), INTERNET, None),
+            (
+                without_receive_growth(212_992, 2 * MIB),
+                DATACENTER,
+                Some("2.0 MiB"),
+            ),
+            // buffers fixed at the profile's size, as an administrator who wants fixed buffers
+            // sets them: nothing to warn about
+            (without_receive_growth(212_992, 16 * MIB), DATACENTER, None),
+            (without_receive_growth(212_992, 16 * MIB), INTERNET, None),
+            // small fixed buffers, but a request is granted in full
+            (without_receive_growth(16 * MIB, 131_072), DATACENTER, None),
+        ];
+        for (limits, size, held_at) in cases {
+            let warning = starved_receive_warning(size, &limits);
+            match held_at {
+                Some(held_at) => {
+                    let warning = warning.unwrap_or_else(|| panic!("no warning: {limits:?}"));
+                    assert!(warning.contains(held_at), "{warning}");
+                }
+                None => assert_eq!(warning, None, "{limits:?} wanting {size}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_that_grows_its_receive_buffers_is_not_warned_about() {
+        // however far below the profile's size they stop: that is what the decision line is for
+        for (name, limits) in hosts() {
+            if limits.receive_buffers_grow {
+                for size in [DATACENTER, INTERNET] {
+                    assert_eq!(starved_receive_warning(size, &limits), None, "{name}");
+                }
+            }
+        }
+        let grows_little = TcpBufferLimits {
+            send_request: 212_992,
+            receive_request: 212_992,
+            send_growth: 4 * MIB,
+            receive_growth: MIB,
+            receive_buffers_grow: true,
+        };
+        assert_eq!(starved_receive_warning(DATACENTER, &grows_little), None);
+    }
+
+    #[test]
+    fn the_warning_names_the_cause_the_sizes_and_the_three_ways_out() {
+        assert_eq!(
+            starved_receive_warning(DATACENTER, &without_receive_growth(212_992, 131_072))
+                .as_deref(),
+            Some(
+                "TCP receive buffers of data connections do not grow on this host \
+                 (net.ipv4.tcp_moderate_rcvbuf is 0) and stay at 416.0 KiB, where this network \
+                 profile asks for 16.0 MiB: copies over links with latency will be slow. Raise \
+                 net.core.rmem_max, raise the middle value of net.ipv4.tcp_rmem, or set \
+                 net.ipv4.tcp_moderate_rcvbuf to 1"
+            )
+        );
+    }
+
+    #[test]
+    fn a_decision_says_keeps_where_receive_buffers_do_not_grow() {
+        let limits = without_receive_growth(212_992, 131_072);
+        assert_eq!(
+            Direction::Receive.describe(Some(DATACENTER), DATACENTER, Ok(&limits)),
+            "TCP receive buffers of data connections: requested at 16.0 MiB, which the kernel \
+             grants as 416.0 KiB, more than the 128.0 KiB it keeps them at by itself"
+        );
+        let limits = without_receive_growth(212_992, 16 * MIB);
+        assert_eq!(
+            Direction::Receive.describe(None, DATACENTER, Ok(&limits)),
+            "TCP receive buffers of data connections: left to the kernel, which keeps them at \
+             16.0 MiB; a request for 16.0 MiB would be held at 416.0 KiB"
+        );
+        // send buffers always grow, whatever that setting says
+        assert_eq!(
+            Direction::Send.describe(None, DATACENTER, Ok(&limits)),
+            "TCP send buffers of data connections: left to the kernel, which grows them to \
+             4.0 MiB; a request for 16.0 MiB would be held at 416.0 KiB"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_destination_logs_its_decision_and_warns_only_where_it_is_starved() {
+        let starved = without_receive_growth(212_992, 131_072);
+        announce_receive(Some(DATACENTER), DATACENTER, Ok(&starved));
+        logs_assert(|lines: &[&str]| {
+            let decisions = lines.iter().filter(|line| line.contains("INFO")).count();
+            let warnings: Vec<_> = lines.iter().filter(|line| line.contains("WARN")).collect();
+            match (decisions, warnings.as_slice()) {
+                (1, [warning]) if warning.contains("do not grow on this host") => Ok(()),
+                _ => Err(format!(
+                    "expected one decision and one warning, got {lines:?}"
+                )),
+            }
+        });
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_destination_does_not_warn_on_a_host_with_stock_settings() {
+        let (_, stock) = hosts()[0];
+        announce_receive(None, DATACENTER, Ok(&stock));
+        announce_receive(
+            None,
+            DATACENTER,
+            Err("kernel setting ipv4/tcp_rmem: unreadable"),
+        );
+        logs_assert(|lines: &[&str]| {
+            match (
+                lines.iter().filter(|line| line.contains("INFO")).count(),
+                lines.iter().filter(|line| line.contains("WARN")).count(),
+            ) {
+                (2, 0) => Ok(()),
+                _ => Err(format!(
+                    "expected two decisions and no warning, got {lines:?}"
+                )),
+            }
+        });
     }
 
     #[test]
