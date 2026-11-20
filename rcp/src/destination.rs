@@ -18,63 +18,78 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
-/// Resolve the open `Dir` of `dst`'s parent for a fd-relative destination write.
-///
-/// The destination tracks every created directory's `Dir` in the fd-map, top-down
-/// (a parent's Begin precedes any message for its children), so for a
-/// non-root entry the parent is always already tracked. For the root entry — whose
-/// parent is the trusted user-specified destination parent and is itself never a
-/// tracked directory — the parent is opened once via `open_parent_dir` and cached in
-/// the tracker as `root_parent_dir` (so a root *directory* and its later empty-dir
-/// cleanup share the same pinned parent fd).
-///
-/// Returns the parent `Dir` plus the entry's final-component name (validated to be a
-/// single component by the fd-relative `Dir` methods). Fails closed if a non-root
-/// parent is not tracked (it should always be) — never falls back to a path-based
-/// open that a concurrent symlink swap could redirect.
-async fn resolve_parent_dir(
-    directory_tracker: &directory_tracker::SharedDirectoryTracker,
-    dst: &std::path::Path,
-    is_root: bool,
-) -> anyhow::Result<(Arc<Dir>, std::ffi::OsString)> {
-    let parent_path = dst
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("destination {:?} has no parent directory", dst))?;
-    let name = dst
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("destination {:?} has no file name", dst))?
-        .to_owned();
-    if is_root {
-        // the root's parent is the trusted user-specified destination parent. Open it
-        // once and cache it; reuse on a subsequent call (root dir create + cleanup).
-        if let Some(parent) = directory_tracker.with_state(|state| state.root_parent_dir()) {
-            return Ok((parent, name));
+struct FileDestination<'a> {
+    parent: Arc<Dir>,
+    name: &'a OsStr,
+    parent_was_created: bool,
+}
+
+impl<'a> FileDestination<'a> {
+    fn in_existing_parent(parent: Arc<Dir>, name: &'a OsStr) -> Self {
+        Self {
+            parent,
+            name,
+            parent_was_created: false,
         }
-        // the root's parent is the TRUSTED user-specified destination parent prefix; resolve it
-        // following symlinks normally (a symlinked destination container must be followed into the
-        // real dir). Only entries strictly below the named root are O_NOFOLLOW-hardened.
-        let parent = Dir::open_parent_dir(parent_path, common::Side::Destination)
-            .await
-            .with_context(|| {
-                format!("failed opening destination root parent directory {parent_path:?}")
-            })?;
-        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-        let parent = Arc::new(parent.into_tree());
-        directory_tracker.with_state(|state| state.set_root_parent_dir(parent.clone()));
-        Ok((parent, name))
-    } else {
-        // non-root: the parent must already be tracked (top-down creation guarantees
-        // it). Fail closed if it is missing rather than re-resolving the path.
-        let parent = directory_tracker.with_state(|state| state.get_dir(parent_path));
-        let parent = parent.ok_or_else(|| {
-            anyhow::anyhow!(
-                "parent directory {:?} of {:?} is not tracked (fd-map miss)",
-                parent_path,
-                dst
-            )
-        })?;
-        Ok((parent, name))
     }
+}
+
+fn destination_child_name(dst: &std::path::Path) -> anyhow::Result<&OsStr> {
+    dst.file_name()
+        .with_context(|| format!("destination {dst:?} has no file name"))
+}
+
+fn destination_parent_and_name(
+    dst: &std::path::Path,
+) -> anyhow::Result<(&std::path::Path, &OsStr)> {
+    let parent = dst
+        .parent()
+        .with_context(|| format!("destination {dst:?} has no parent directory"))?;
+    Ok((parent, destination_child_name(dst)?))
+}
+
+/// Open the trusted parent of the user-specified root and retain it for root directory cleanup.
+async fn resolve_root_destination<'a>(
+    tracker: &directory_tracker::SharedDirectoryTracker,
+    dst: &'a std::path::Path,
+) -> anyhow::Result<(Arc<Dir>, &'a OsStr)> {
+    let (parent_path, name) = destination_parent_and_name(dst)?;
+    if let Some(parent) = tracker.with_state(|state| state.root_parent_dir()) {
+        return Ok((parent, name));
+    }
+    // the trusted parent prefix may contain symlinks. Below it, each named entry is resolved
+    // relative to a held directory with O_NOFOLLOW.
+    let parent = Dir::open_parent_dir(parent_path, common::Side::Destination)
+        .await
+        .with_context(|| {
+            format!("failed opening destination root parent directory {parent_path:?}")
+        })?;
+    let parent = Arc::new(parent.into_tree());
+    tracker.with_state(|state| state.set_root_parent_dir(parent.clone()));
+    Ok((parent, name))
+}
+
+/// Resolve a file through its registered parent. Only a root file opens its parent by path.
+async fn resolve_file_destination<'a>(
+    tracker: &directory_tracker::SharedDirectoryTracker,
+    file: &'a remote::protocol::File,
+) -> anyhow::Result<FileDestination<'a>> {
+    let dst = &file.dst;
+    if file.is_root {
+        let (parent, name) = resolve_root_destination(tracker, dst).await?;
+        return Ok(FileDestination::in_existing_parent(parent, name));
+    }
+    let (parent_path, name) = destination_parent_and_name(dst)?;
+    let (parent, parent_was_created) = tracker
+        .with_state(|state| state.get_dir_with_creation(parent_path))
+        .with_context(|| {
+            format!("parent directory {parent_path:?} of {dst:?} is not tracked (fd-map miss)")
+        })?;
+    Ok(FileDestination {
+        parent,
+        name,
+        parent_was_created,
+    })
 }
 
 /// Pool of outbound TCP connections to source's data port.
@@ -229,16 +244,17 @@ struct ProcessFileError {
 /// - `NeedsDrain`: no data was read yet, drain `file_header.size` bytes to recover
 /// - `DataConsumed`: all data consumed, stream at clean boundary, can continue
 /// - `Corrupted`: mid-read error, stream position unknown, must close
-#[instrument(skip(file_recv_stream, dst_parent, admission))]
+#[instrument(skip(file_recv_stream, slot, admission), fields(dst_name = ?slot.name))]
 async fn process_single_file(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
     file_recv_stream: &mut remote::streams::BoxedRecvStream,
     file_header: &remote::protocol::File,
-    dst_parent: &Arc<Dir>,
-    dst_name: &OsStr,
+    slot: FileDestination<'_>,
     admission: &throttle::OpenFileGuard,
 ) -> Result<(), ProcessFileError> {
+    let dst_parent = &slot.parent;
+    let dst_name = slot.name;
     // errors before we start reading data - stream can be recovered by draining
     let err_needs_drain = |e: anyhow::Error| ProcessFileError {
         source: e,
@@ -261,10 +277,15 @@ async fn process_single_file(
     // cancellation safety — `create_file` waits on the ops-throttle internally, so a cancelled
     // transfer can still land between the removal and the create — and it does not try to be; see
     // `common::copy::copy_file_fd` for why rcp accepts that instead of staging and renaming.
-    let plan = common::timing_scope!(trace, "destination.file.plan")
-        .measure(plan_dst_file(settings, file_header, dst_parent, dst_name))
-        .await
-        .map_err(err_needs_drain)?;
+    // in a directory we created, let the exclusive create detect any occupied name
+    let plan = if slot.parent_was_created {
+        DstFilePlan::Vacant
+    } else {
+        common::timing_scope!(trace, "destination.file.plan")
+            .measure(plan_dst_file(settings, file_header, dst_parent, dst_name))
+            .await
+            .map_err(err_needs_drain)?
+    };
     // a skipped file's bytes are already on the wire and must come off it before the next header.
     if matches!(plan, DstFilePlan::Skip) {
         drain_file_data(file_recv_stream, file_header.size)
@@ -272,10 +293,6 @@ async fn process_single_file(
             .map_err(err_corrupted)?;
         return Ok(());
     }
-    // logged between deciding and waiting, so it marks the point where this side has committed to a
-    // plan but has not yet acted on it — the interval a competing writer can still slip into, and the
-    // one a throttle-bound transfer spends all its time in.
-    tracing::debug!("destination slot classified, reserving iops budget");
     common::timing_scope!(trace, "destination.file.wait_iops")
         .measure(
             throttle::get_file_iops_tokens(settings.chunk_size, file_header.size).instrument(
@@ -305,15 +322,14 @@ async fn process_single_file(
         .await
     {
         Ok(std_file) => std_file,
-        // the slot is occupied: a writer filled it between the classification above — or during the
-        // `--iops-throttle` wait after it, which can be seconds — and now. `create_file`'s `O_EXCL`
-        // is the only way this side finds out. Resolve it here and honor --overwrite /
+        // a name can be occupied even in a directory we created, or filled after classification
+        // during an IOPS wait. Exclusive creation detects the collision. Honor --overwrite /
         // --ignore-existing rather than failing the file on EEXIST regardless of either, exactly as
         // the local copy does (common/src/copy.rs). Planning and executing are back-to-back on this
         // route, unlike the one above: the reservation is already held, so nothing is left to wait
         // for between the removal and the retry.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            tracing::debug!("destination appeared after classification, re-planning");
+            tracing::debug!("exclusive destination create found a conflict, re-planning");
             let plan = common::timing_scope!(trace, "destination.file.plan")
                 .measure(plan_dst_file(settings, file_header, dst_parent, dst_name))
                 .await
@@ -433,7 +449,7 @@ async fn finalize_received_file(
 /// What to do about whatever occupies the destination's slot — the destination counterpart of
 /// `common::copy::FilePlan`.
 enum DstFilePlan {
-    /// Nothing occupies the slot; create the file directly.
+    /// Attempt exclusive creation without first removing an entry.
     Vacant,
     /// An entry must be removed before the create (`--overwrite`).
     Replace(RemovalSnapshot),
@@ -452,9 +468,9 @@ enum DstFilePlan {
 /// goes through the parent's pinned fd (`O_NOFOLLOW`) rather than re-resolving `file_header.dst` by
 /// path, and only `NotFound` is taken to mean the slot is empty.
 ///
-/// [`process_single_file`] calls this from both of its routes: up front, and again when `create_file`
-/// reports `EEXIST` because a writer filled the slot after the first look. A skip decision counts
-/// itself here; draining the skipped file's bytes is the caller's job, since only it holds the stream.
+/// [`process_single_file`] calls this when it needs an initial plan or when exclusive creation
+/// reports `EEXIST`. A skip decision counts itself here; the caller owns the stream and drains
+/// the skipped file's bytes.
 async fn plan_dst_file(
     settings: &common::copy::Settings,
     file_header: &remote::protocol::File,
@@ -470,6 +486,7 @@ async fn plan_dst_file(
         // the create's error stand in for the real one, and `--ignore-existing` fail rather than
         // skip.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("destination lookup found a vacant name");
             return Ok(DstFilePlan::Vacant);
         }
         Err(error) => {
@@ -670,21 +687,16 @@ async fn handle_file_stream(
         // pre-data error: the stream can be recovered by draining this file's bytes.
         let file_result = common::safedir::with_fd_admission(open_file_guard.admission(), async {
             match common::timing_scope!(trace, "destination.file.parent")
-                .measure(resolve_parent_dir(
-                    &directory_tracker,
-                    &file_header.dst,
-                    file_header.is_root,
-                ))
+                .measure(resolve_file_destination(&directory_tracker, &file_header))
                 .await
             {
-                Ok((dst_parent, dst_name)) => {
+                Ok(slot) => {
                     process_single_file(
                         &settings,
                         &preserve,
                         &mut file_recv_stream,
                         &file_header,
-                        &dst_parent,
-                        &dst_name,
+                        slot,
                         &open_file_guard,
                     )
                     .await
@@ -1260,12 +1272,6 @@ async fn announce_directory_ready(
     Ok(())
 }
 
-fn destination_child_name(dst: &std::path::Path) -> anyhow::Result<std::ffi::OsString> {
-    dst.file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .ok_or_else(|| anyhow::anyhow!("destination {dst:?} has no file name"))
-}
-
 async fn wait_for_directory_parent(
     tracker: &directory_tracker::SharedDirectoryTracker,
     pool: &DataConnectionPool,
@@ -1337,11 +1343,11 @@ async fn prepare_and_announce_directory(
         .measure(async {
             let (parent, name) = match parent {
                 Some(parent) => (parent, destination_child_name(dst)?),
-                None => resolve_parent_dir(tracker, dst, is_root)
+                None => resolve_root_destination(tracker, dst)
                     .await
                     .context("failed resolving destination parent directory")?,
             };
-            create_directory_admitted(settings, &parent, &name, dst, credit.clone()).await
+            create_directory_admitted(settings, &parent, name, dst, credit.clone()).await
         })
         .await;
     let result = match result {
@@ -1692,7 +1698,7 @@ async fn process_control_stream(
                                 Some(parent) => {
                                     destination_child_name(dst).map(|name| (parent, name))
                                 }
-                                None => resolve_parent_dir(&directory_tracker, dst, is_root).await,
+                                None => resolve_root_destination(&directory_tracker, dst).await,
                             };
                             let result = match resolved {
                                 Ok((dst_parent, dst_name)) => {
@@ -1700,7 +1706,7 @@ async fn process_control_stream(
                                         settings,
                                         preserve,
                                         &dst_parent,
-                                        &dst_name,
+                                        dst_name,
                                         dst,
                                         target,
                                         metadata,
@@ -5257,7 +5263,7 @@ mod teardown_tests {
                 admission,
                 directory,
                 remote::protocol::Metadata::from(&std::fs::metadata(temp.path()).unwrap()),
-                false,
+                true, // let exclusive creation discover the occupied first name
                 true,
                 None,
             )

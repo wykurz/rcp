@@ -171,8 +171,7 @@ fn receiver_writes_whole_configured_chunks_and_reads_nothing_ahead() {
                 &preservation,
                 &mut stream,
                 &header,
-                &parent,
-                OsStr::new("destination"),
+                FileDestination::in_existing_parent(parent.clone(), OsStr::new("destination")),
                 &guard,
             ));
             tokio::select! {
@@ -324,8 +323,7 @@ fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
             &preservation,
             &mut stream,
             &header,
-            &parent,
-            OsStr::new("destination"),
+            FileDestination::in_existing_parent(parent.clone(), OsStr::new("destination")),
             &guard,
         )
         .await
@@ -365,8 +363,7 @@ fn receiver_write_failure_keeps_the_file_private_and_uncounted() {
             &preservation,
             &mut stream,
             &received_next,
-            &parent,
-            OsStr::new("next"),
+            FileDestination::in_existing_parent(parent.clone(), OsStr::new("next")),
             &guard,
         )
         .await
@@ -470,8 +467,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         &preservation,
         &mut stream,
         &header,
-        &parent,
-        OsStr::new("failed-metadata"),
+        FileDestination::in_existing_parent(parent.clone(), OsStr::new("failed-metadata")),
         &guard,
     )
     .await
@@ -504,8 +500,7 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
         &preservation,
         &mut stream,
         &received_next,
-        &parent,
-        OsStr::new("next"),
+        FileDestination::in_existing_parent(parent.clone(), OsStr::new("next")),
         &guard,
     )
     .await
