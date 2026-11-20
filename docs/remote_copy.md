@@ -95,7 +95,7 @@ Discovery checks locations in this order:
    - Indicates intentional installation (e.g., `cargo install`)
 
 4. **Deployed cache** (`~/.cache/rcp/bin/rcpd-{version}`)
-   - The cache tag replaces `+` in the protocol version with `-` (for example, `0.38.0-w1`)
+   - The cache tag replaces `+` in the protocol version with `-` (for example, `0.42.0-w11`)
    - Last resort for auto-deployed binaries
    - Only checked if not found elsewhere
 
@@ -109,13 +109,15 @@ rcpd binary not found on remote host
 Searched in:
 - Same directory as local rcp binary
 - PATH (via 'command -v rcpd')
-- Deployed cache: ~/.cache/rcp/bin/rcpd-0.38.0-w1
+- Deployed cache: ~/.cache/rcp/bin/rcpd-0.42.0-w11
 
 Options:
 - Use automatic deployment: rcp --auto-deploy-rcpd ...
-- Install rcpd manually: cargo install rcp-tools-rcp --version 0.38.0
+- Install a matching build manually
 - Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...
 ```
+
+For manual installation, see [Version Mismatch Error](#version-mismatch-error).
 
 ### Graceful Degradation
 
@@ -138,7 +140,7 @@ The local `rcp` and the selected remote `rcpd` must report the same full protoco
 `--protocol-version` returns JSON. For example:
 
 ```json
-{"semantic":"0.38.0+w1"}
+{"semantic":"0.42.0+w11"}
 ```
 
 The `semantic` field includes the package release and the `+wN` wire and daemon startup
@@ -150,7 +152,7 @@ compatibility revision. Optional `git_describe` and `git_hash` fields are for di
    `--remote-copy-conn-timeout-sec` deadline; timeout errors retain the affected host in their error
    chain, and auto-deployment may recover by publishing a compatible local candidate.
 2. **Compare the full `semantic` strings**. Both the release and the revision must match exactly.
-   For example, `0.38.0+w1` does not match `0.38.0+w2` or a legacy `0.38.0` without the suffix.
+   For example, `0.42.0+w11` does not match `0.42.0+w10` or a value of `0.42.0` without the suffix.
 3. **On mismatch**, the error reports the local and remote versions, the remote host, and a package
    installation suggestion.
 
@@ -160,11 +162,12 @@ If you see `rcpd version mismatch`, compare the `semantic` fields using the comm
 the daemon path that [binary discovery](#rcpd-binary-discovery) selected, not necessarily the first
 `rcpd` in the remote shell's `PATH`.
 
-For a packaged installation, use the plain package release with `cargo install`, not the `+wN`
-suffix. For example, for release `0.38.0`:
+When installing from crates.io, use the plain package release with `cargo install`, not the `+wN`
+suffix. Set `RUSTFLAGS` for the remote Cargo command so it sees the required `tokio_unstable`
+configuration. For example, for release `0.42.0`:
 
 ```bash
-ssh prod-server 'cargo install rcp-tools-rcp --version 0.38.0'
+ssh prod-server "RUSTFLAGS='--cfg tokio_unstable' cargo install --locked rcp-tools-rcp --version 0.42.0"
 ```
 
 If the release numbers already agree but the revisions differ, reinstall from a matching build or
@@ -353,10 +356,13 @@ Searched in:
 - PATH (via 'command -v rcpd'): not found
 
 To use auto-deployment, ensure rcpd is available:
-- cargo install rcp-tools-rcp (installs to ~/.cargo/bin)
+- Install a matching build from crates.io
 - or add rcpd to PATH
 - or build for this host with: ./scripts/cargo-host.sh build --release --bin rcpd
 ```
+
+For the Cargo command, see [Version Mismatch Error](#version-mismatch-error). A registry install
+normally places the binaries in `~/.cargo/bin`.
 
 (A successful `command -v rcpd` adds the resolved `PATH:` candidate. An incompatible candidate
 remains in the list with its rejection reason; a compatible one is deployed. An ordinary PATH miss

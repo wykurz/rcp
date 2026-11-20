@@ -273,11 +273,12 @@ The following command will install all the tools on your system:
 
 ## crates.io
 
-All tools are available on [crates.io](https://crates.io/search?q=rcp-tools). Individual tools can
-be installed using `cargo install`:
+All tools are available on [crates.io](https://crates.io/search?q=rcp-tools). To install `rcp` and
+`rcpd` from crates.io, pass the `tokio_unstable` compiler configuration explicitly because Cargo
+does not load the repository's local configuration for a registry install:
 
-```fish
-> cargo install rcp-tools-rcp
+```bash
+RUSTFLAGS='--cfg tokio_unstable' cargo install --locked rcp-tools-rcp
 ```
 
 ## debian / rhel

@@ -91,8 +91,8 @@
     </section>
     <section id="get-started" class="get-started" aria-labelledby="start-heading">
       <div><div class="section-number">04 / GET STARTED</div><h2 id="start-heading">Put the tools to work.</h2><p>Install on Linux with Cargo or Nix, or get a Debian or RPM package from the releases.</p><a class="button" href="$repository#installation">Installation guide <span aria-hidden="true">→</span></a></div>
-      <div class="install-block"><div class="install-label">Install the three core tools with Cargo</div><pre><code><span class="prompt">$$</span> cargo install rcp-tools-rcp \
-    rcp-tools-rrm rcp-tools-rchm</code></pre><div class="install-label">Make your first local copy</div><pre><code><span class="prompt">$$</span> rcp ./dataset ./dataset-copy --progress</code></pre><a href="$repository#copy-semantics">Read the destination-path and overwrite rules ↗</a></div>
+      <div class="install-block"><div class="install-label">Install the three core tools with Cargo</div><pre><code><span class="prompt">$$</span> RUSTFLAGS='--cfg tokio_unstable' cargo install --locked \
+    rcp-tools-rcp rcp-tools-rrm rcp-tools-rchm</code></pre><div class="install-label">Make your first local copy</div><pre><code><span class="prompt">$$</span> rcp ./dataset ./dataset-copy --progress</code></pre><a href="$repository#copy-semantics">Read the destination-path and overwrite rules ↗</a></div>
     </section>
   </main>
   <footer class="site-footer wrap"><span>RCP Tools · Open source under the MIT license</span><nav aria-label="Footer navigation"><a href="$repository">GitHub</a><a href="$reports">Reports</a><a href="$repository#documentation">Documentation</a></nav></footer>
