@@ -379,21 +379,17 @@ same effect for remote copies. The option does not change the remote wire protoc
 
 ### Local copy scheduling (`--local-copy-handoff`)
 
-`--local-copy-handoff=never|fresh` controls destination-create to payload-copy scheduling in `rcp`
-and files copied by `rlink --update`. The default is `never`: creation and payload copying remain
-separate blocking jobs, retaining the queue boundary between them.
+Local copies in `rcp` and files copied by `rlink --update` default to `fresh`. When the destination
+name is vacant and the first attempt to create the file succeeds, the same worker copies its data.
+This saves one blocking job submission per new file. Planned replacements and retries after a name
+collision use separate jobs.
 
-`fresh` is experimental. After a successful first vacant-slot create, the same blocking worker can
-continue into the payload, saving one submission per fresh file. Large copies can occupy workers
-that would otherwise return to queued metadata work. Throughput and CPU benefits remain unverified;
-compare representative workloads before enabling it. Creation's operation gates and probe still
-finish before the cancellable payload claim, and EEXIST retries retain the separate-job path.
-
-This policy is independent of `--reflink`, worker counts, and logical concurrency. It does not
-affect remote transfers or which files `rlink` hard-links. For example:
+Use `--local-copy-handoff=never` to queue the data copy separately after creation. This gives
+waiting metadata operations a chance to run before a worker starts a long copy. Both policies work
+with either `--reflink` setting and the same concurrency controls.
 
 ```sh
-rcp --local-copy-handoff=fresh --reflink=never SOURCE DESTINATION
+rcp --local-copy-handoff=never SOURCE DESTINATION
 ```
 
 ## Path handling (tilde `~` support)
