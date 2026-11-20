@@ -1275,9 +1275,9 @@ Chrome tracing also writes `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.s
 elapsed timing scopes above. The existing `.json` file records span enter/exit intervals, which can
 split an async operation across polls; the `.scopes.json` file records its logical elapsed lifetime,
 including waits. Concurrent elapsed scopes use separate lanes, reused after completion. Use
-`--timings-detail` for file, metadata, and tracker elapsed scopes. `--profile-level` controls the
-existing poll trace only; elapsed scopes use their own coarse/detail selection. Chrome output is
-disabled by `--quiet`. Summaries and both trace files can safely use the same prefix.
+`--timings-detail` for file, metadata, and tracker elapsed scopes. `--profile-level` does not filter
+elapsed scopes; they use their own coarse/detail selection. Chrome output is disabled by `--quiet`.
+Summaries and both trace files can safely use the same prefix.
 
 ## Flamegraph
 
@@ -1294,22 +1294,28 @@ rcp --flamegraph=/tmp/flame /source /dest
 # Convert to SVG
 cat /tmp/flame-*.folded | inferno-flamegraph > flamegraph.svg
 
-# Or use inferno-flamechart to preserve chronological order
-cat /tmp/flame-*.folded | inferno-flamechart > flamechart.svg
+# Or preserve input order from one folded file (replace with an actual output path)
+inferno-flamegraph --flamechart /tmp/flame-rcp-master-myhost-12345-2025-01-15T10-30-45Z.folded > flamechart.svg
 ```
 
 Output files are named: `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.folded`
 
+`--flamechart` preserves the order emitted into the selected file instead of sorting and merging
+stacks. Render each process file separately: concatenating files does not create a synchronized
+cross-process timeline.
+
 ## Profile Level
 
-Control which spans are captured with `--profile-level` (default: `trace`):
+Control which spans are captured in the Chrome poll trace and folded flamegraph output with
+`--profile-level` (default: `trace`):
 
 ```bash
 # Capture only info-level and above spans
 rcp --chrome-trace=/tmp/trace --profile-level=info /source /dest
 ```
 
-Only spans from rcp crates are captured (not tokio internals).
+Noisy tracing targets such as Tokio are excluded. This filter does not affect elapsed timing scopes,
+which use their own coarse/detail selection.
 
 ## Tokio Console
 
