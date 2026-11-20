@@ -1431,6 +1431,7 @@ use socket_buffers::{ReceiveBufferRequest, SendBufferRequest};
 pub mod streams;
 pub mod tls;
 pub mod tracelog;
+pub mod version;
 
 /// Network profile for TCP configuration tuning
 ///
@@ -2314,7 +2315,7 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
     explicit_path: Option<&str>,
     current_exe_override: Option<std::path::PathBuf>,
 ) -> anyhow::Result<String> {
-    let local_version = common::version::ProtocolVersion::current();
+    let local_version = crate::version::ProtocolVersion::current();
     // try explicit path first
     if let Some(path) = explicit_path {
         tracing::debug!("Trying explicit rcpd path: {}", path);
@@ -2430,7 +2431,7 @@ async fn check_rcpd_version<S: SshSessionOwner>(
     preparation: &PreparationContext,
     version_probe_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let local_version = common::version::ProtocolVersion::current();
+    let local_version = crate::version::ProtocolVersion::current();
 
     tracing::debug!("Checking rcpd version on remote host: {}", remote_host);
 
@@ -2463,7 +2464,7 @@ async fn check_rcpd_version<S: SshSessionOwner>(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let remote_version = common::version::ProtocolVersion::from_json(stdout.trim())
+    let remote_version = crate::version::ProtocolVersion::from_json(stdout.trim())
         .context("Failed to parse rcpd version JSON from remote host")?;
 
     tracing::info!(
@@ -2868,7 +2869,7 @@ async fn prepare_rcpd_with_context(
                 .await
                 .context("failed to find local rcpd binary for deployment")?;
             tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
-            let local_version = common::version::ProtocolVersion::current();
+            let local_version = crate::version::ProtocolVersion::current();
             let deployed_path = deploy::deploy_rcpd_with_context(
                 &ssh_session,
                 &local_rcpd,
@@ -4124,7 +4125,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let script = directory.path().join("rcpd");
             let daemon_exit = directory.path().join("daemon-exit");
-            let version = common::version::ProtocolVersion::current()
+            let version = crate::version::ProtocolVersion::current()
                 .to_json()
                 .unwrap();
             let contents = format!(
@@ -4173,7 +4174,7 @@ mod tests {
 
             let directory = tempfile::tempdir().unwrap();
             let script = directory.path().join("rcpd");
-            let version = common::version::ProtocolVersion::current()
+            let version = crate::version::ProtocolVersion::current()
                 .to_json()
                 .unwrap();
             let contents = format!(
@@ -4228,7 +4229,7 @@ mod tests {
             std::fs::create_dir(&directory).unwrap();
             let script = directory.join("rcpd");
             let marker = directory.join("version-probes");
-            let version = common::version::ProtocolVersion::current()
+            let version = crate::version::ProtocolVersion::current()
                 .to_json()
                 .unwrap();
             let contents = format!(
@@ -4280,7 +4281,7 @@ mod tests {
             ));
             std::fs::create_dir(&directory).unwrap();
             let script = directory.join("rcpd");
-            let version = common::version::ProtocolVersion::current()
+            let version = crate::version::ProtocolVersion::current()
                 .to_json()
                 .unwrap();
             let contents = format!(
@@ -4336,7 +4337,7 @@ mod tests {
             let script = directory.join("rcpd");
             let source_exit = directory.join("source-exit");
             let destination_exit = directory.join("destination-exit");
-            let version = common::version::ProtocolVersion::current()
+            let version = crate::version::ProtocolVersion::current()
                 .to_json()
                 .unwrap();
             let contents = format!(
@@ -6155,7 +6156,7 @@ mod tests {
             .with_home(Some("/home/rcp"))
             .with_path(None);
         session.set_test_response("/custom/bin/rcpd", false);
-        let local_version = common::version::ProtocolVersion::current();
+        let local_version = crate::version::ProtocolVersion::current();
         let cache_path = format!(
             "/home/rcp/.cache/rcp/bin/rcpd-{}",
             local_version.cache_tag()

@@ -1966,7 +1966,7 @@ fn main() -> Result<(), anyhow::Error> {
         &args[..]
     };
     if args_to_check.iter().any(|arg| arg == "--protocol-version") {
-        let version = common::version::ProtocolVersion::current();
+        let version = remote::version::ProtocolVersion::current();
         let json = version.to_json()?;
         println!("{}", json);
         return Ok(());

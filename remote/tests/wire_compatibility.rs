@@ -15,7 +15,7 @@ struct Fixtures {
 
 impl Fixtures {
     fn new(direction: Direction) -> Self {
-        let text = match common::version::WIRE_REVISION {
+        let text = match remote::version::WIRE_REVISION {
             12 => include_str!("fixtures/wire-v12.txt"),
             revision => panic!(
                 "wire revision {revision} needs reviewed fixtures; see remote/tests/fixtures/README.md"

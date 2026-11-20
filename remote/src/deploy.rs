@@ -252,7 +252,7 @@ async fn find_local_rcpd_binary_with_context_from_current_exe(
 ) -> anyhow::Result<PathBuf> {
     preparation.ensure_active()?;
     let mut searched_paths = Vec::new();
-    let local_version = common::version::ProtocolVersion::current();
+    let local_version = crate::version::ProtocolVersion::current();
 
     // try same directory as current executable first
     // this normally finds the same build (debug/release) as the running rcp and covers development
@@ -382,7 +382,7 @@ fn final_local_candidate_failure(
 async fn check_local_rcpd_version(
     preparation: &crate::PreparationContext,
     path: &Path,
-    local_version: &common::version::ProtocolVersion,
+    local_version: &crate::version::ProtocolVersion,
     probe_timeout: Duration,
 ) -> anyhow::Result<()> {
     let output = run_local_version_probe(preparation, path, probe_timeout).await?;
@@ -395,7 +395,7 @@ async fn check_local_rcpd_version(
         );
     }
     let candidate_version =
-        common::version::ProtocolVersion::from_json(String::from_utf8_lossy(&output.stdout).trim())
+        crate::version::ProtocolVersion::from_json(String::from_utf8_lossy(&output.stdout).trim())
             .with_context(|| {
                 format!(
                     "failed to parse --protocol-version output from local rcpd candidate {}",
@@ -1306,7 +1306,7 @@ mod tests {
     async fn version_probe_timeout_falls_back_after_descendant_keeps_pipes_open() {
         let test_dir = TestDirectory::new();
         let hanging = test_dir.script("hanging-rcpd", "#!/bin/sh\n(sleep 2) &\nexit 0\n");
-        let local_version = common::version::ProtocolVersion::current();
+        let local_version = crate::version::ProtocolVersion::current();
         let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
         let compatible = test_dir.script(
@@ -1364,7 +1364,7 @@ mod tests {
             "failing-rcpd",
             "#!/bin/sh\nprintf '%s\\n' 'candidate refused version probe' >&2\nexit 7\n",
         );
-        let local_version = common::version::ProtocolVersion::current();
+        let local_version = crate::version::ProtocolVersion::current();
         let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
         let error = check_local_rcpd_version(

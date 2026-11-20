@@ -51,6 +51,7 @@ Keep these boundaries intact when changing the component:
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | SSH sessions, readiness, cleanup ownership, socket configuration | [`src/lib.rs`](src/lib.rs)                                                |
 | Binary deployment                                                | [`src/deploy.rs`](src/deploy.rs)                                          |
+| Protocol compatibility and build identity                        | [`src/version.rs`](src/version.rs), [`build.rs`](build.rs)                |
 | Serialized messages and daemon configuration                     | [`src/protocol`](src/protocol)                                            |
 | Framing and TLS                                                  | [`src/streams.rs`](src/streams.rs), [`src/tls.rs`](src/tls.rs)            |
 | Master orchestration and daemon entry point                      | [`rcp`](../rcp/src/bin/rcp.rs), [`rcpd`](../rcp/src/bin/rcpd.rs)          |
