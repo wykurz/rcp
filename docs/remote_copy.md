@@ -153,8 +153,8 @@ compatibility revision. Optional `git_describe` and `git_hash` fields are for di
    chain, and auto-deployment may recover by publishing a compatible local candidate.
 2. **Compare the full `semantic` strings**. Both the release and the revision must match exactly.
    For example, `0.42.0+w11` does not match `0.42.0+w10` or a value of `0.42.0` without the suffix.
-3. **On mismatch**, the error reports the local and remote versions, the remote host, and a package
-   installation suggestion.
+3. **On mismatch**, the error reports the local and remote versions, the remote host, and how to
+   obtain a matching build.
 
 ### Version Mismatch Error
 
