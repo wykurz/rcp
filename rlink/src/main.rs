@@ -87,12 +87,7 @@ struct Args {
     )]
     reflink: common::copy_data::ReflinkMode,
 
-    /// Control local destination-create to payload-copy handoff (experimental)
-    ///
-    /// Never (default) uses separate blocking jobs. Fresh reuses the worker after the first
-    /// vacant-slot create, saving one submission per fresh file but removing a queue boundary.
-    /// Large copies may delay queued metadata work; throughput and CPU benefits are unverified.
-    /// Only files copied during --update are affected; hard-link selection is unchanged.
+    /// Control worker reuse for files copied during --update
     #[arg(
         long,
         value_enum,

@@ -99,10 +99,10 @@ pub use crate::delete::DeleteSettings;
 /// Scheduling policy for the first vacant-slot creation of a local regular file.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LocalCopyHandoff {
-    /// Submit creation and payload copying as separate blocking jobs.
-    #[default]
+    /// Queue the data copy separately so waiting metadata work can run after creation.
     Never,
-    /// Let a successful first vacant-slot create hand the worker to its payload.
+    /// Copy data on the same worker when the destination is vacant and the first create succeeds.
+    #[default]
     Fresh,
 }
 
@@ -119,7 +119,7 @@ impl std::fmt::Display for LocalCopyHandoff {
 pub struct Settings {
     /// Reflink policy for local file data copies.
     pub reflink: crate::copy_data::ReflinkMode,
-    /// Local create-to-copy scheduling policy; defaults to separate jobs.
+    /// Scheduling policy for local regular-file creation and data copying.
     pub local_copy_handoff: LocalCopyHandoff,
     /// The largest read/write buffer a copying thread keeps between local files; defaults to
     /// the whole 1 MiB chunk.
@@ -9996,9 +9996,10 @@ mod copy_tests {
                             }
                         }
                     }
-                    assert_eq!(counts[0], counts[1], "the default retains separate jobs");
-                    assert_eq!(counts[1] - counts[2], 128, "one saved submission per copied file");
-                    println!("handoff submission fixture: files=128 bytes_per_file=1000 workers=4 blocking=32 concurrency={concurrency} default={} never={} fresh={}", counts[0], counts[1], counts[2]);
+                    let [default, never, fresh] = counts;
+                    assert_eq!(default, fresh, "the default joins creation and copying");
+                    assert_eq!(never - fresh, 128, "one saved submission per copied file");
+                    println!("handoff submission fixture: files=128 bytes_per_file=1000 workers=4 blocking=32 concurrency={concurrency} default={default} never={never} fresh={fresh}");
                 }
                 anyhow::Ok(())
             })
