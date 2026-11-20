@@ -19,10 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `rcpd`. Text remains the default.
 - Warn when a destination cannot grow its TCP receive buffers. Where `net.ipv4.tcp_moderate_rcvbuf`
   is `0` and a data connection is left with a receive buffer smaller than the network profile's
-  size, the destination `rcpd` logs a warning that names the three ways out (shown with `-v`, like
-  the buffer decision it follows). The README's "TCP Socket Buffers" section now leads with
-  recommended kernel settings, and "Check TCP Buffer Sizes" says what each line of that output means
-  and what to do about it.
+  size, the destination `rcpd` warns and names the three ways out. `rcp` prints that warning at its
+  default verbosity, without `-v`; `--quiet` hides it. The README's "TCP Socket Buffers" section now
+  leads with recommended kernel settings, and "Check TCP Buffer Sizes" says what each line of that
+  output means and what to do about it.
 - Add `--local-copy-buffer-retention-limit=SIZE` to `rcp` and `rlink`: the largest read/write buffer
   a copying thread keeps between local files (see "Changed"). The default `1MiB` keeps the whole
   buffer; a larger buffer is freed when its file is done, so `0` keeps nothing and every file

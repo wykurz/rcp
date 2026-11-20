@@ -926,7 +926,8 @@ Do not switch the kernel's receive buffer growth off (`net.ipv4.tcp_moderate_rcv
 that receives copies, unless the middle value of `net.ipv4.tcp_rmem` is large as well: that is the
 size every receive buffer then keeps. With the stock values of kernels before 6.18 the kernel holds
 them at 128 KiB and `rcp`'s own request gets 416 KiB, which is slow over any link with latency. The
-destination `rcpd` warns about this (see [Check TCP Buffer Sizes](#check-tcp-buffer-sizes)).
+destination `rcpd` warns about this, and `rcp` shows the warning without `-v` (see
+[Check TCP Buffer Sizes](#check-tcp-buffer-sizes)).
 
 ### Open File Limits
 
@@ -1104,8 +1105,8 @@ to do about it:
 | `whose limits could not be found out: ...`                              | The limits are unknown, so nothing is requested          | Fix what the reason names, such as an unreadable `/proc/sys` |
 
 Where the kernel does not grow receive buffers (`net.ipv4.tcp_moderate_rcvbuf=0`) and a data
-connection is left with less than the network profile's size, the destination `rcpd` also logs a
-warning, at the same verbosity:
+connection is left with less than the network profile's size, the destination `rcpd` also warns.
+That warning needs no `-v`: `rcp` prints it at its default verbosity, and `--quiet` hides it:
 
 ```text
 TCP receive buffers of data connections do not grow on this host (net.ipv4.tcp_moderate_rcvbuf is

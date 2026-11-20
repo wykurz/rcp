@@ -320,11 +320,12 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 /// global default to `warn` instead would also expose per-entry warnings, so one failed subtree
 /// could print thousands of lines.
 ///
-/// **The bar for putting an event here** is that it is advice about the INVOCATION — constant in
-/// volume however large the tree, and actionable by changing the command line. A per-entry event
-/// does not qualify, however important it looks. Current notices cover source-root ACL heuristics,
-/// deprecated options, explicit concurrency clamps, profiling artifacts, and startup safety
-/// fallbacks.
+/// **The bar for putting an event here** is that it is advice about the INVOCATION or the host it
+/// runs on — constant in volume however large the tree, and actionable by changing the command
+/// line or a host setting. A per-entry event does not qualify, however important it looks. Current
+/// notices cover source-root ACL heuristics, deprecated options, explicit concurrency clamps,
+/// profiling artifacts, startup safety fallbacks, and a destination host whose TCP receive buffers
+/// cannot grow.
 ///
 /// Three things hold, deliberately:
 ///
