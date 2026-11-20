@@ -1469,9 +1469,11 @@ container all the same.
 
 - The source requests its send buffer on each accepted data connection.
 - The destination requests its receive buffer on each data connection BEFORE it connects. A receive
-  buffer requested on an established connection no longer widens the window the socket may advertise
-  on kernels before 6.11, where the window then stays at its initial 64 KiB however large the buffer
-  is.
+  buffer requested on an established connection does not update the receive-window clamp on older
+  kernels without the fix (introduced in Linux 6.11 and backported to some stable kernels). The
+  advertised window can remain limited by the initial receive-buffer sizing despite the later,
+  larger buffer. With the tested initial buffers it stayed around 64 KiB during transfer. That is an
+  observed effective window, not the unscaled SYN window field or a fixed cap across hosts.
 - The destination then takes the kernel's "fixed" mark off that buffer again (`SO_BUF_LOCK`, kernel
   5.15 and later), still before connecting. The buffer keeps its size. A buffer that is marked fixed
   when the socket connects makes the kernel choose the connection's window scale for half of that

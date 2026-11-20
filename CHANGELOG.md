@@ -27,9 +27,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Stop remote copies from holding back their own TCP window. `rcp` asked the kernel for socket
-  buffer sizes on every connection, after the connection was established. On kernels before 6.11
-  such a late request leaves the receive window at its initial 64 KiB however large the buffer, on
-  any host, tuned or not. And on hosts with a small request limit (`net.core.rmem_max` / `wmem_max`,
+  buffer sizes on every connection, after the connection was established. On older kernels without
+  the TCP receive-window clamp fix, a late receive-buffer request can leave the advertised window
+  limited by the small initial receive buffer. In the tested setups that meant about 64 KiB; it is
+  not a fixed TCP limit. And on hosts with a small request limit (`net.core.rmem_max` / `wmem_max`,
   208 KiB on stock kernels before 6.18) the request was cut to less than the kernel would have grown
   the buffer to by itself. Each `rcpd` now finds out the limits of its own host, also where a
   container hides the kernel's settings, and requests a buffer only where that yields more than the

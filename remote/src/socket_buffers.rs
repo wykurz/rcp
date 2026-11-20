@@ -12,9 +12,9 @@
 //!
 //! The two requests are different types because they obey different rules. A send buffer can be
 //! asked for on a connection that already exists. A receive buffer has to be asked for before the
-//! socket connects: on kernels before 6.11 a later request no longer widens the window the socket
-//! may advertise, which then stays at its initial 64 KiB however large the buffer is. Only the
-//! function that configures a socket before it connects accepts a [`ReceiveBufferRequest`]. That
+//! socket connects: on older kernels without the receive-window clamp fix, a later request does not
+//! update the clamp, so the advertised window can remain limited by the initial buffer sizing.
+//! Only the function that configures a socket before it connects accepts a [`ReceiveBufferRequest`]. That
 //! function also takes the kernel's "fixed" mark off the buffer again before the socket connects:
 //! the size stays, but a buffer still marked at that moment would narrow the connection's window
 //! scale to half the buffer.
