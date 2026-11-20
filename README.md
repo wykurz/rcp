@@ -355,6 +355,20 @@ kernel copies and NFS offload. The fallback preserves sparse regions by walking
 copy. Thus `never` still may produce a sparse destination: the option controls the data path, not
 physical disk usage, and reported bytes are logical file bytes rather than allocated disk bytes.
 
+Copies between different filesystems usually take the userspace path as well: current kernels allow
+`copy_file_range` across filesystems only where a filesystem implements that itself, as NFS does.
+The path copies through a buffer of up to 1 MiB, which each copying thread keeps between files
+rather than allocating one per file. A thread therefore holds at most 1 MiB for this, for as long as
+it lives, and `--max-blocking-threads` bounds how many such threads there can be.
+
+`--local-copy-buffer-retention-limit=SIZE` lowers what each thread may keep, without touching how
+many files are copied at a time. The default is `1MiB`, the whole buffer. A buffer larger than the
+limit is freed when its file is done, so `0` keeps nothing and every file allocates its own again.
+That is what the kept buffer saves: with the system allocator of the static (musl) builds, a buffer
+per file costs a memory mapping and its page faults each time. The limit bounds idle memory only; it
+does not change how much is read or written at a time. It applies to `rcp` and to files copied by
+`rlink --update`, and not to remote transfers, which have `--remote-copy-buffer-retention-limit`.
+
 An `always` mode is intentionally deferred. There is no demonstrated use case for requiring a clone
 to succeed, and adding it now would introduce clone-specific failure semantics without a user need.
 It can be revisited when a concrete requirement exists.

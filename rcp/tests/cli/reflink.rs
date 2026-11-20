@@ -186,3 +186,77 @@ async fn local_copy_handoff_rejects_unknown_policy_before_copying() {
         .stderr(predicates::str::contains("possible values: never, fresh"));
     assert!(!dst.exists());
 }
+
+/// The limits the tests ask for, with the bytes each must come to.
+const RETENTION_LIMITS: [(Option<&str>, usize); 5] = [
+    (None, 1024 * 1024),
+    (Some("0"), 0),
+    (Some("4KiB"), 4096),
+    (Some("1MiB"), 1024 * 1024),
+    (Some("16MiB"), 16 * 1024 * 1024),
+];
+
+#[tokio::test]
+async fn copies_with_the_buffer_retention_limit_of_the_command_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    // several files, so that a kept buffer is reused and a limit below the file size is exceeded
+    let src = tmp.path().join("tree");
+    std::fs::create_dir(&src).unwrap();
+    let file = source_file(tmp.path()).await;
+    for name in ["a", "b", "c"] {
+        std::fs::copy(&file, src.join(name)).unwrap();
+    }
+    let expected = std::fs::read(&file).unwrap();
+    for (index, (limit, bytes)) in RETENTION_LIMITS.into_iter().enumerate() {
+        let dst = tmp.path().join(format!("kept-{index}"));
+        let mut cmd = Command::cargo_bin("rcp").unwrap();
+        if let Some(limit) = limit {
+            cmd.arg(format!("--local-copy-buffer-retention-limit={limit}"));
+        }
+        let output = cmd
+            .args(["-vv", "--reflink=never"])
+            .arg(&src)
+            .arg(&dst)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{limit:?}: {output:?}");
+        // the settings the copy runs with are logged at debug level. the command line is logged
+        // as well, with the same field in it, so only the settings line counts
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let settings = stdout
+            .lines()
+            .find(|line| line.contains("copy settings: Settings {"))
+            .expect("the copy settings must be logged at debug level");
+        assert!(
+            settings.contains(&format!(
+                "local_copy_buffer_retention_limit: BufferRetentionLimit({bytes})"
+            )),
+            "{limit:?}: {settings}"
+        );
+        for name in ["a", "b", "c"] {
+            assert_eq!(
+                std::fs::read(dst.join(name)).unwrap(),
+                expected,
+                "{limit:?} {name}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejects_a_buffer_retention_limit_that_is_not_a_size_before_copying() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = source_file(tmp.path()).await;
+    let dst = tmp.path().join("destination");
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--local-copy-buffer-retention-limit=plenty")
+        .arg(&src)
+        .arg(&dst)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "--local-copy-buffer-retention-limit",
+        ));
+    assert!(!dst.exists());
+}

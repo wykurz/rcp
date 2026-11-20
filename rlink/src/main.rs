@@ -102,6 +102,22 @@ struct Args {
     )]
     local_copy_handoff: common::copy::LocalCopyHandoff,
 
+    /// Largest read/write buffer each copying thread keeps between local files
+    ///
+    /// Local copies that cannot use copy_file_range, such as those between different filesystems
+    /// or with --reflink=never, go through a buffer of up to 1 MiB. A thread keeps that buffer for
+    /// its next file unless it is larger than this limit. Zero keeps nothing: every file then
+    /// allocates its own buffer. This bounds idle memory only, not how much is read at a time.
+    /// Accepts sizes like "256KiB", "1MiB", or bytes. Only files copied during --update are
+    /// affected.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        default_value_t,
+        help_heading = "Linking options"
+    )]
+    local_copy_buffer_retention_limit: common::copy_data::BufferRetentionLimit,
+
     /// Allow --update even when --preserve-settings does not cover all attributes
     /// used by --update-compare
     ///
@@ -309,6 +325,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         copy_settings: common::copy::Settings {
             reflink: args.reflink,
             local_copy_handoff: args.local_copy_handoff,
+            local_copy_buffer_retention_limit: args.local_copy_buffer_retention_limit,
             dereference: false, // currently not supported
             fail_early: args.fail_early,
             overwrite: args.overwrite || args.delete,
@@ -328,6 +345,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         dry_run: args.dry_run,
         preserve,
     };
+    tracing::debug!("link settings: {:?}", &settings);
     let result = common::link(&args.src, &dst, &args.update, &settings).await;
     match result {
         Ok(summary) => Ok(summary),

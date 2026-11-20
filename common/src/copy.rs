@@ -121,6 +121,9 @@ pub struct Settings {
     pub reflink: crate::copy_data::ReflinkMode,
     /// Local create-to-copy scheduling policy; defaults to separate jobs.
     pub local_copy_handoff: LocalCopyHandoff,
+    /// The largest read/write buffer a copying thread keeps between local files; defaults to
+    /// the whole 1 MiB chunk.
+    pub local_copy_buffer_retention_limit: crate::copy_data::BufferRetentionLimit,
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
@@ -1756,6 +1759,7 @@ fn copy_file_payload(
     destination: std::fs::File,
     len: u64,
     reflink: crate::copy_data::ReflinkMode,
+    retention: crate::copy_data::BufferRetentionLimit,
     #[cfg(test)] data_gate_path: &std::path::Path,
 ) -> FileDataOutput {
     #[cfg(test)]
@@ -1766,7 +1770,7 @@ fn copy_file_payload(
             destination.as_fd().as_raw_fd(),
         )
     };
-    let result = copy_file_data(&source, &destination, len, reflink);
+    let result = copy_file_data(&source, &destination, len, reflink, retention);
     FileDataOutput {
         result,
         destination,
@@ -1838,6 +1842,7 @@ async fn copy_current_regular(
         settings.local_copy_handoff == LocalCopyHandoff::Fresh && matches!(&plan, FilePlan::Vacant);
     let len = src_meta.size();
     let reflink = settings.reflink;
+    let retention = settings.local_copy_buffer_retention_limit;
     #[cfg(test)]
     let data_gate_path = dst_path.to_path_buf();
     execute_dst_plan(
@@ -1864,6 +1869,7 @@ async fn copy_current_regular(
                     destination,
                     len,
                     reflink,
+                    retention,
                     #[cfg(test)]
                     &data_gate_path,
                 )),
@@ -1961,6 +1967,7 @@ async fn copy_current_regular(
                     dst_file,
                     len,
                     reflink,
+                    retention,
                     #[cfg(test)]
                     &data_gate_path,
                 ))
@@ -2841,6 +2848,7 @@ mod copy_tests {
         Settings {
             reflink: Default::default(),
             local_copy_handoff: Default::default(),
+            local_copy_buffer_retention_limit: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: delete.is_some(), // --delete implies --overwrite
@@ -4395,6 +4403,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4448,6 +4457,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4532,6 +4542,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4604,6 +4615,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4656,6 +4668,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -4756,6 +4769,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4787,6 +4801,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4818,6 +4833,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -4849,6 +4865,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -4882,6 +4899,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -4958,6 +4976,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -5046,6 +5065,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -5133,6 +5153,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -5223,6 +5244,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -5274,6 +5296,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -5325,6 +5348,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -5398,6 +5422,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -5473,6 +5498,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -5541,6 +5567,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -5565,6 +5592,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -5621,6 +5649,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -5682,6 +5711,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -5729,6 +5759,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -5782,6 +5813,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: false,
@@ -5836,6 +5868,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: true,
                     overwrite: true,
@@ -5981,6 +6014,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -6045,6 +6079,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -6109,6 +6144,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: true,
                 overwrite: false,
@@ -6169,6 +6205,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6270,6 +6307,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6333,6 +6371,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6373,6 +6412,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6419,6 +6459,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6800,6 +6841,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6850,6 +6892,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6911,6 +6954,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -6973,6 +7017,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7041,6 +7086,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7106,6 +7152,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7171,6 +7218,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: true, // enable overwrite mode
@@ -7238,6 +7286,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7288,6 +7337,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7336,6 +7386,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7389,6 +7440,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7461,6 +7513,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7518,6 +7571,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -7570,6 +7624,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -8018,6 +8073,7 @@ mod copy_tests {
                         &Settings {
                             reflink: Default::default(),
                             local_copy_handoff: Default::default(),
+                            local_copy_buffer_retention_limit: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -8083,6 +8139,7 @@ mod copy_tests {
                         &Settings {
                             reflink: Default::default(),
                             local_copy_handoff: Default::default(),
+                            local_copy_buffer_retention_limit: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: false,
@@ -8161,6 +8218,7 @@ mod copy_tests {
                         &Settings {
                             reflink: Default::default(),
                             local_copy_handoff: Default::default(),
+                            local_copy_buffer_retention_limit: Default::default(),
                             dereference: false,
                             fail_early: true,
                             overwrite: true,
@@ -8216,6 +8274,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -8261,6 +8320,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -8302,6 +8362,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -8344,6 +8405,7 @@ mod copy_tests {
                 &Settings {
                     reflink: Default::default(),
                     local_copy_handoff: Default::default(),
+                    local_copy_buffer_retention_limit: Default::default(),
                     dereference: false,
                     fail_early: false,
                     overwrite: false,
@@ -8593,6 +8655,7 @@ mod copy_tests {
             &Settings {
                 reflink: Default::default(),
                 local_copy_handoff: Default::default(),
+                local_copy_buffer_retention_limit: Default::default(),
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- exercises the overwrite removal path
@@ -9032,6 +9095,7 @@ mod copy_tests {
         Settings {
             reflink: Default::default(),
             local_copy_handoff: Default::default(),
+            local_copy_buffer_retention_limit: Default::default(),
             dereference: false,
             fail_early: false,
             overwrite: true,
@@ -9938,6 +10002,58 @@ mod copy_tests {
                 }
                 anyhow::Ok(())
             })
+    }
+
+    // the option works only if the limit in the settings is the one the copying thread applies.
+    // one blocking thread that never retires, so the thread asked afterwards is the one that copied
+    #[test]
+    fn the_buffer_retention_limit_of_the_settings_reaches_the_copying_thread() -> anyhow::Result<()>
+    {
+        use crate::copy_data::BufferRetentionLimit;
+        const LEN: usize = 64 * 1024;
+        for handoff in [LocalCopyHandoff::Never, LocalCopyHandoff::Fresh] {
+            for (limit, kept) in [
+                (BufferRetentionLimit::default(), LEN),
+                (BufferRetentionLimit(LEN), LEN),
+                (BufferRetentionLimit(LEN - 1), 0),
+                (BufferRetentionLimit(0), 0),
+            ] {
+                tokio::runtime::Builder::new_current_thread()
+                    .max_blocking_threads(1)
+                    .thread_keep_alive(std::time::Duration::from_secs(3600))
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let tmp = tempfile::tempdir()?;
+                        let source = tmp.path().join("source");
+                        let destination = tmp.path().join("destination");
+                        std::fs::write(&source, vec![7; LEN])?;
+                        let settings = Settings {
+                            reflink: crate::copy_data::ReflinkMode::Never,
+                            local_copy_handoff: handoff,
+                            local_copy_buffer_retention_limit: limit,
+                            ..settings_with_delete(None)
+                        };
+                        let summary = copy(
+                            &PROGRESS,
+                            &source,
+                            &destination,
+                            &settings,
+                            &NO_PRESERVE_SETTINGS,
+                            false,
+                        )
+                        .await?;
+                        assert_eq!(summary.files_copied, 1);
+                        assert_eq!(std::fs::read(&destination)?, vec![7; LEN]);
+                        let kept_by_the_thread =
+                            tokio::task::spawn_blocking(|| crate::copy_data::kept_buffer().1)
+                                .await?;
+                        assert_eq!(kept_by_the_thread, kept, "{handoff:?} {limit:?}");
+                        anyhow::Ok(())
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     async fn assert_conflict_retry_keeps_the_original_source(acl: bool) -> anyhow::Result<()> {

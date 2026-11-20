@@ -369,6 +369,7 @@ impl Args {
         Ok(common::copy::Settings {
             reflink: Default::default(),
             local_copy_handoff: Default::default(),
+            local_copy_buffer_retention_limit: Default::default(),
             dereference: self.dereference,
             fail_early: self.fail_early,
             overwrite: self.overwrite,

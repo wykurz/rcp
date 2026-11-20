@@ -20,6 +20,11 @@
 //! of its acceleration. It still preserves holes when the filesystem supports
 //! `SEEK_DATA`/`SEEK_HOLE`.
 //!
+//! Tiers 2 and 3 are also what a copy between two different filesystems usually
+//! takes: current kernels refuse `copy_file_range` across filesystems unless the
+//! filesystem implements it itself. Both tiers copy through a buffer of up to
+//! 1 MiB that each thread keeps between files (see `KeptBuffer`).
+//!
 //! # Snapshot-size semantics
 //!
 //! Callers pass `len`, the size captured when the source was classified. Both
@@ -53,6 +58,107 @@ use std::os::unix::fs::FileExt;
 /// Maximum userspace copy buffer size (1 MiB), bounded further by each extent.
 const FALLBACK_BUF_SIZE: usize = 1024 * 1024;
 
+thread_local! {
+    /// The buffer of the userspace read/write path, kept by each thread between the files it copies.
+    static KEPT_BUFFER: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// A thread's read/write buffer, taken for one copy and given back when that copy ends, however
+/// it ends.
+///
+/// A buffer made anew for every file costs more than its size suggests. It is zero-filled each
+/// time, and an allocator that hands large blocks straight back to the kernel, as the one in the
+/// static musl builds does, turns every file into a memory mapping, its page faults and an
+/// unmapping. Measured on one 20-CPU host between two memory-backed filesystems, that was 2 to 3
+/// times the copy time for 64 KiB to 256 KiB files.
+///
+/// So each thread keeps the buffer it copied with. It never holds more than
+/// [`FALLBACK_BUF_SIZE`], and only as much as the largest extent it has copied; the memory goes
+/// when the thread does, which for the runtime's blocking threads is after a few idle seconds.
+/// [`BufferRetentionLimit`] (`--local-copy-buffer-retention-limit`) lowers what a thread may keep,
+/// down to nothing, without changing how much is read or written at a time.
+struct KeptBuffer(Vec<u8>);
+
+impl KeptBuffer {
+    fn take() -> Self {
+        // a thread that is being torn down has nothing to lend: start empty
+        Self(
+            KEPT_BUFFER
+                .try_with(std::cell::Cell::take)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The first `len` bytes, growing the buffer to exactly that if it is smaller. Ordinary
+    /// growth could leave a thread holding almost twice the chunk size.
+    fn first(&mut self, len: usize) -> &mut [u8] {
+        if self.0.len() < len {
+            self.0.reserve_exact(len - self.0.len());
+            self.0.resize(len, 0);
+        }
+        &mut self.0[..len]
+    }
+
+    /// Free what the current thread keeps if it is more than `limit` allows.
+    fn free_if_larger_than(limit: BufferRetentionLimit) {
+        let _ = KEPT_BUFFER.try_with(|kept| {
+            let buffer = kept.take();
+            if buffer.capacity() <= limit.0 {
+                kept.set(buffer);
+            }
+        });
+    }
+}
+
+impl Drop for KeptBuffer {
+    fn drop(&mut self) {
+        let buffer = std::mem::take(&mut self.0);
+        // ignore a thread that is being torn down: the buffer is simply freed
+        let _ = KEPT_BUFFER.try_with(|kept| kept.set(buffer));
+    }
+}
+
+/// What the current thread keeps for its next read/write copy: where the allocation is and how
+/// large it is.
+#[cfg(test)]
+pub(crate) fn kept_buffer() -> (*const u8, usize) {
+    let buffer = KEPT_BUFFER.take();
+    let identity = (buffer.as_ptr(), buffer.capacity());
+    KEPT_BUFFER.set(buffer);
+    identity
+}
+
+/// The largest read/write buffer a thread may keep between the files it copies.
+///
+/// The default is the whole chunk of the read/write path (1 MiB). A buffer larger than the limit
+/// is freed when its copy ends, so zero keeps nothing and every file then gets a fresh buffer.
+/// This bounds idle memory only; it does not change how much is read or written at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferRetentionLimit(pub usize);
+
+impl Default for BufferRetentionLimit {
+    fn default() -> Self {
+        Self(FALLBACK_BUF_SIZE)
+    }
+}
+
+impl std::str::FromStr for BufferRetentionLimit {
+    type Err = String;
+
+    /// A size as written on a command line: "256KiB", "1MiB", or a number of bytes. One that does
+    /// not fit this platform's addresses is as good as no limit.
+    fn from_str(size: &str) -> Result<Self, Self::Err> {
+        let size: bytesize::ByteSize = size.parse()?;
+        Ok(Self(usize::try_from(size.as_u64()).unwrap_or(usize::MAX)))
+    }
+}
+
+impl std::fmt::Display for BufferRetentionLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", bytesize::ByteSize::b(self.0 as u64))
+    }
+}
+
 /// Whether local file copies may use reflink-capable acceleration.
 ///
 /// A clone-required `always` mode is intentionally deferred until there is a
@@ -75,16 +181,24 @@ pub enum ReflinkMode {
 /// The destination must be empty and exclusively owned by this copy operation.
 /// `Never` bypasses all `copy_file_range` acceleration, including non-reflink
 /// kernel and server-side copying. See the module docs for size and durability semantics.
+///
+/// The userspace path copies through a buffer that the calling thread keeps for its next file
+/// unless it is larger than `retention` allows.
 pub fn copy_file_data(
     src: &File,
     dst: &File,
     len: u64,
     reflink: ReflinkMode,
+    retention: BufferRetentionLimit,
 ) -> std::io::Result<u64> {
-    match reflink {
+    let result = match reflink {
         ReflinkMode::Auto => copy_file_range_all(src, dst, len),
         ReflinkMode::Never => copy_sparse_fallback(src, dst, 0, len),
-    }
+    };
+    // the one place the limit is applied: every copy ends here, and has given its buffer back by
+    // now, whether it succeeded or not
+    KeptBuffer::free_if_larger_than(retention);
+    result
 }
 
 /// Copy up to `len` bytes from `src` to `dst` using the in-kernel
@@ -241,19 +355,17 @@ fn copy_sparse_fallback_with_seek(
     let mut off = start;
     let mut written_end = start;
     let mut read_eof = None;
-    let mut buf = Vec::new();
+    let mut buf = KeptBuffer::take();
     while off < len {
         let extent = match next_copy_extent(&mut seek, off, len)? {
             CopyExtent::Sparse(extent) => extent,
             CopyExtent::Dense => off..len,
             CopyExtent::End => break,
         };
-        // allocate only for data, cap small extents, and reuse the buffer across the walk.
+        // allocate only for data, cap small extents, and reuse the buffer across the walk and,
+        // through this thread, across files.
         let capacity = (extent.end - extent.start).min(FALLBACK_BUF_SIZE as u64) as usize;
-        if buf.len() < capacity {
-            buf.resize(capacity, 0);
-        }
-        let end = copy_data_extent(src, dst, extent.start, extent.end, &mut buf[..capacity])?;
+        let end = copy_data_extent(src, dst, extent.start, extent.end, buf.first(capacity))?;
         if end > extent.start {
             written_end = end;
         }
@@ -447,6 +559,244 @@ mod tests {
             });
         assert!(steps.next().is_none());
         copied
+    }
+
+    /// A source file of `len` bytes that are not all the same.
+    fn source_of(dir: &std::path::Path, name: &str, len: usize) -> File {
+        let mut file = make_file(dir, name);
+        let contents: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        file.write_all(&contents).unwrap();
+        file
+    }
+
+    /// Copy `len` bytes of `src` through the read/write path into a new file and check them.
+    fn read_write_copy(dir: &std::path::Path, src: &File, name: &str, len: usize) {
+        read_write_copy_keeping(dir, src, name, len, BufferRetentionLimit::default());
+    }
+
+    /// The same, with the largest buffer the thread may keep afterwards.
+    fn read_write_copy_keeping(
+        dir: &std::path::Path,
+        src: &File,
+        name: &str,
+        len: usize,
+        limit: BufferRetentionLimit,
+    ) {
+        let dst = make_file(dir, name);
+        assert_eq!(
+            copy_file_data(src, &dst, len as u64, ReflinkMode::Never, limit).unwrap(),
+            len as u64
+        );
+        let mut expected = vec![0; len];
+        src.read_exact_at(&mut expected, 0).unwrap();
+        assert!(
+            std::fs::read(dir.join(name)).unwrap() == expected,
+            "{name} differs"
+        );
+    }
+
+    // what a thread keeps is the subject of these tests, so each runs on a thread of its own
+    fn on_a_fresh_thread(body: impl FnOnce() + Send + 'static) {
+        std::thread::spawn(body).join().unwrap();
+    }
+
+    // a fresh buffer per file is zero-filled, and with an allocator that hands large blocks
+    // straight back to the kernel (the static musl builds' one) it costs a memory mapping, its
+    // page faults and an unmapping per file: 2 to 3 times the copy time for 64 KiB to 256 KiB files
+    #[test]
+    fn a_thread_keeps_its_read_write_buffer_between_files() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 64 * 1024);
+            assert_eq!(kept_buffer().1, 0, "nothing is kept before the first copy");
+            read_write_copy(tmp.path(), &src, "first", 64 * 1024);
+            let after_first = kept_buffer();
+            assert_eq!(after_first.1, 64 * 1024);
+            read_write_copy(tmp.path(), &src, "second", 64 * 1024);
+            assert_eq!(
+                kept_buffer(),
+                after_first,
+                "the second file must be copied through the first one's buffer"
+            );
+        });
+    }
+
+    #[test]
+    fn the_kept_buffer_grows_to_the_chunk_size_and_no_further() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 3 * FALLBACK_BUF_SIZE);
+            // 600 KiB first: growing by doubling from there would overshoot the chunk size
+            read_write_copy(tmp.path(), &src, "smaller", 600 * 1024);
+            assert_eq!(kept_buffer().1, 600 * 1024);
+            read_write_copy(tmp.path(), &src, "larger", 3 * FALLBACK_BUF_SIZE);
+            let full = kept_buffer();
+            assert_eq!(full.1, FALLBACK_BUF_SIZE);
+            read_write_copy(tmp.path(), &src, "again", 3 * FALLBACK_BUF_SIZE);
+            read_write_copy(tmp.path(), &src, "small", 1024);
+            assert_eq!(kept_buffer(), full, "a full-size buffer is kept as it is");
+        });
+    }
+
+    #[test]
+    fn a_small_file_does_not_make_a_thread_keep_a_whole_chunk() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 1024);
+            read_write_copy(tmp.path(), &src, "copy", 1024);
+            assert_eq!(kept_buffer().1, 1024);
+        });
+    }
+
+    #[test]
+    fn a_thread_keeps_no_buffer_larger_than_the_limit() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 256 * 1024);
+            let limit = BufferRetentionLimit(64 * 1024);
+            read_write_copy_keeping(tmp.path(), &src, "within", 16 * 1024, limit);
+            assert_eq!(
+                kept_buffer().1,
+                16 * 1024,
+                "a buffer within the limit is kept"
+            );
+            read_write_copy_keeping(tmp.path(), &src, "at", 64 * 1024, limit);
+            assert_eq!(
+                kept_buffer().1,
+                64 * 1024,
+                "a buffer of exactly the limit is kept"
+            );
+            read_write_copy_keeping(tmp.path(), &src, "beyond", 256 * 1024, limit);
+            assert_eq!(
+                kept_buffer().1,
+                0,
+                "a larger buffer is freed when its copy ends"
+            );
+            read_write_copy_keeping(tmp.path(), &src, "after", 16 * 1024, limit);
+            assert_eq!(kept_buffer().1, 16 * 1024);
+        });
+    }
+
+    #[test]
+    fn a_limit_of_zero_keeps_nothing() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 64 * 1024);
+            for name in ["first", "second"] {
+                read_write_copy_keeping(tmp.path(), &src, name, 64 * 1024, BufferRetentionLimit(0));
+                assert_eq!(kept_buffer().1, 0);
+            }
+            // an empty file needs no buffer at all, whatever the limit
+            read_write_copy_keeping(tmp.path(), &src, "empty", 0, BufferRetentionLimit(0));
+            assert_eq!(kept_buffer().1, 0);
+        });
+    }
+
+    #[test]
+    fn a_size_from_the_command_line_becomes_the_limit() {
+        for (size, limit) in [
+            ("0", 0),
+            ("4096", 4096),
+            ("64KiB", 64 * 1024),
+            ("1MiB", FALLBACK_BUF_SIZE),
+            ("1.0 MiB", FALLBACK_BUF_SIZE),
+            ("16MiB", 16 * FALLBACK_BUF_SIZE),
+        ] {
+            assert_eq!(size.parse(), Ok(BufferRetentionLimit(limit)), "{size}");
+        }
+        for not_a_size in ["", "plenty", "-1", "1 mile"] {
+            assert!(
+                not_a_size.parse::<BufferRetentionLimit>().is_err(),
+                "{not_a_size:?}"
+            );
+        }
+    }
+
+    // a command line parser shows the default and reads it back
+    #[test]
+    fn the_default_limit_reads_back_from_what_it_is_shown_as() {
+        let default = BufferRetentionLimit::default();
+        assert_eq!(default.to_string().parse(), Ok(default));
+    }
+
+    #[test]
+    fn the_default_limit_is_the_whole_chunk() {
+        assert_eq!(
+            BufferRetentionLimit::default(),
+            BufferRetentionLimit(FALLBACK_BUF_SIZE)
+        );
+    }
+
+    // the kernel's own copy needs no buffer, but the limit applies to whatever the thread holds
+    #[test]
+    fn the_limit_applies_after_a_kernel_copy_as_well() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 64 * 1024);
+            read_write_copy(tmp.path(), &src, "kept", 64 * 1024);
+            assert_eq!(kept_buffer().1, 64 * 1024);
+            let dst = make_file(tmp.path(), "kernel");
+            copy_file_data(
+                &src,
+                &dst,
+                64 * 1024,
+                ReflinkMode::Auto,
+                BufferRetentionLimit(0),
+            )
+            .unwrap();
+            assert_eq!(kept_buffer().1, 0);
+        });
+    }
+
+    #[test]
+    fn a_failed_copy_gives_the_buffer_back_to_its_thread() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 64 * 1024);
+            read_write_copy(tmp.path(), &src, "first", 64 * 1024);
+            let kept = kept_buffer();
+            assert_eq!(kept.1, 64 * 1024);
+            // the first extent is copied, then looking for the next one fails
+            let dst = make_file(tmp.path(), "failed");
+            let error =
+                copy_sparse_fallback_with_seek(&src, &dst, 0, 64 * 1024, |offset, whence| {
+                    match (whence, offset) {
+                        (nix::unistd::Whence::SeekData, 0) => Ok(0),
+                        (nix::unistd::Whence::SeekHole, _) => Ok(4096),
+                        _ => Err(nix::errno::Errno::EIO),
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(
+                std::fs::metadata(tmp.path().join("failed")).unwrap().len(),
+                4096
+            );
+            assert_eq!(kept_buffer(), kept, "the buffer must survive a failed copy");
+            read_write_copy(tmp.path(), &src, "next", 64 * 1024);
+            assert_eq!(kept_buffer(), kept);
+        });
+    }
+
+    // a copy that fails has grown the buffer like any other
+    #[test]
+    fn the_limit_applies_after_a_failed_copy_as_well() {
+        on_a_fresh_thread(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = source_of(tmp.path(), "src", 64 * 1024);
+            // a destination that is not open for writing
+            drop(make_file(tmp.path(), "read-only"));
+            let dst = File::open(tmp.path().join("read-only")).unwrap();
+            for (limit, kept) in [
+                (BufferRetentionLimit::default(), 64 * 1024),
+                (BufferRetentionLimit(0), 0),
+            ] {
+                let error =
+                    copy_file_data(&src, &dst, 64 * 1024, ReflinkMode::Never, limit).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+                assert_eq!(kept_buffer().1, kept, "{limit:?}");
+            }
+        });
     }
 
     #[test]
@@ -765,7 +1115,8 @@ mod tests {
         for len in [0, 7, contents.len() as u64, contents.len() as u64 + 100] {
             let dst = make_file(tmp.path(), "never");
             let calls_before = crate::testutils::copy_file_range_calls();
-            let copied = copy_file_data(&src, &dst, len, ReflinkMode::Never).unwrap();
+            let copied =
+                copy_file_data(&src, &dst, len, ReflinkMode::Never, Default::default()).unwrap();
             let expected_len = len.min(contents.len() as u64);
             assert_eq!(copied, expected_len);
             assert_eq!(
@@ -777,7 +1128,14 @@ mod tests {
         // prove that the counter observes an attempted syscall, even without reflink support.
         let dst = make_file(tmp.path(), "auto");
         let calls_before = crate::testutils::copy_file_range_calls();
-        copy_file_data(&src, &dst, contents.len() as u64, ReflinkMode::Auto).unwrap();
+        copy_file_data(
+            &src,
+            &dst,
+            contents.len() as u64,
+            ReflinkMode::Auto,
+            Default::default(),
+        )
+        .unwrap();
         assert!(crate::testutils::copy_file_range_calls() > calls_before);
         assert_eq!(std::fs::read(tmp.path().join("auto")).unwrap(), contents);
     }
@@ -796,7 +1154,7 @@ mod tests {
             let dst = make_file(tmp.path(), "dst");
             nix::unistd::lseek(src.as_fd(), 3, nix::unistd::Whence::SeekSet).unwrap();
             nix::unistd::lseek(dst.as_fd(), 11, nix::unistd::Whence::SeekSet).unwrap();
-            let copied = copy_file_data(&src, &dst, len, policy).unwrap();
+            let copied = copy_file_data(&src, &dst, len, policy, Default::default()).unwrap();
             let expected_len = len.min(contents.len() as u64);
             assert_eq!(copied, expected_len);
             assert_eq!(
@@ -855,7 +1213,8 @@ mod tests {
         src.write_all_at(b"head", 0).unwrap();
         src.write_all_at(b"middle", logical / 2).unwrap();
         let dst = make_file(tmp.path(), "dst");
-        let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Auto).unwrap();
+        let copied =
+            copy_file_data(&src, &dst, logical, ReflinkMode::Auto, Default::default()).unwrap();
         assert_eq!(copied, logical);
         assert_eq!(dst.metadata().unwrap().len(), logical);
         assert_eq!(
@@ -900,7 +1259,8 @@ mod tests {
         src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
         // never must preserve holes without relying on copy_file_range support.
-        let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Never).unwrap();
+        let copied =
+            copy_file_data(&src, &dst, logical, ReflinkMode::Never, Default::default()).unwrap();
         assert_eq!(copied, logical);
         // (a) content byte-equal to src across the whole logical range.
         let got = std::fs::read(tmp.path().join("dst")).unwrap();
@@ -1050,7 +1410,8 @@ mod tests {
         nix::unistd::ftruncate(src.as_fd(), to_off_t(logical).unwrap()).unwrap();
         src.sync_all().unwrap();
         let dst = make_file(tmp.path(), "dst");
-        let copied = copy_file_data(&src, &dst, logical, ReflinkMode::Never).unwrap();
+        let copied =
+            copy_file_data(&src, &dst, logical, ReflinkMode::Never, Default::default()).unwrap();
         assert_eq!(copied, logical);
         let got = std::fs::read(tmp.path().join("dst")).unwrap();
         assert_eq!(got.len() as u64, logical);
