@@ -602,14 +602,30 @@ For more troubleshooting, see `tests/docker/README.md`.
 
 ### GitHub Actions Workflow
 
-The `.github/workflows/validate.yml` workflow runs:
+The [Rust workflow](../.github/workflows/rust.yml) starts for pull requests and pushes to `main`
+without path filters. Its reusable [validation workflow](../.github/workflows/validate.yml) selects
+coverage after it starts:
 
-1. **Lint, documentation, and policy checks** through the host wrapper and repository scripts
-2. **Debug and release tests plus doctests** against the x86_64-musl CI target. The debug job also
-   reruns the common library and remote discovery regression on Btrfs.
-3. **Sudo-gated debug and release tests** in their corresponding test jobs
-4. **Non-chaos Docker tests** in a separate multi-host job
-5. **MSRV, glibc release, and Nix shell/package checks** in dedicated jobs
+| Trigger or change                                                      | Hosted validation                                                                                                       | Separate Chaos Tests                            |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| PR with a qualifying docs-only diff or verified workspace version bump | Markdown, report, workflow lint, and lightweight policy/helper checks. No Rust builds/tests, Docker, or Nix validation. | No automatic PR run.                            |
+| Other PR, including a mixed or empty diff                              | Full validation.                                                                                                        | No automatic PR run.                            |
+| Push to `main`                                                         | Full validation.                                                                                                        | Runs automatically, even for docs-only changes. |
+| Validation called with an explicit source ref, such as a release tag   | Full validation, with compatibility exceptions for pinned sources.                                                      | Not part of the reusable validation call.       |
+
+The classifier examines the complete PR diff from the merge base, not PR labels or a workflow path
+filter. Qualifying changes are regular non-executable prose files, supported assets under `docs/` or
+`assets/`, or a verified workspace version-only change in `Cargo.toml` and `Cargo.lock` with
+optional documentation. A scope-classification error fails the required lint/docs check rather than
+silently skipping validation.
+
+Full validation adds Rust formatting, Clippy and rustdoc, x86_64-musl debug/release tests and
+doctests, sudo-gated tests, regular multi-host Docker tests, and MSRV, glibc release, and Nix
+checks. The debug job also reruns the common library and remote discovery regression on Btrfs.
+Pinned source calls skip workflow lint and the Git build-metadata regression because older sources
+may predate those helpers; Nix cache preparation is skipped, not Nix validation. See the
+[workflow README](../.github/workflows/README.md#rustyml) for exact eligibility and workflow
+details.
 
 **Docker job details**:
 
@@ -626,11 +642,10 @@ include every Docker target. Shared environment and file helper tests run once i
 `test(~chaos)`, so these selections together cover all Docker cases. Docker tests are ignored in
 ordinary nextest runs and explicitly enabled by the Docker recipes.
 
-Regular Docker tests run before submission in `just depot-ci` and during GitHub validation. Chaos
-tests run automatically on pushes to `main` in `.github/workflows/chaos-tests.yml`, as well as on
-manual dispatch. Chaos failures fail that workflow; it is a post-merge check, not a PR merge gate.
-This separation dates from the introduction of timing-sensitive chaos tests and their privileged
-container requirements. The tests were scheduled separately, not dropped.
+Regular Docker tests run before submission in `just depot-ci` and during full GitHub validation. The
+[Chaos Tests workflow](../.github/workflows/chaos-tests.yml) also accepts manual dispatch. Chaos
+failures fail that workflow; it is a post-merge check, not a PR merge gate. This separation keeps
+timing-sensitive tests with privileged container requirements out of PR validation.
 
 ### Running CI Locally
 
@@ -641,8 +656,8 @@ just ci  # lint + Nix targets when available + doc + test-all (debug + release +
 Prefer `just depot-ci` for the final pre-submit verification when Depot is available. `just ci` is
 the local equivalent: it runs lint, docs, debug + release + doctest + Docker checks, plus full Nix
 target checks when Nix is available. Use focused checks during development and run the full gate
-before opening or updating a PR. These commands are close proxies for the CI matrix; a few CI steps
-live outside them:
+before opening or updating a PR, even when GitHub will select lightweight validation. These commands
+are close proxies for the full hosted matrix; a few CI steps live outside them:
 
 - **Btrfs directory tests.** The debug job runs `just test-btrfs` on a disposable loop-mounted
   filesystem. This privileged setup is opt-in locally and is not part of `just depot-ci`.
