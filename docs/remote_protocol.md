@@ -683,8 +683,9 @@ or not `capture` asked the source for anything. See [acls.md](acls.md) and [toct
 `--overwrite-compare` (default `size,mtime`) is not transferred and keeps its old destination ACL.
 This is the same shape as `mode`, which the default comparison also ignores.
 
-The whole ACL model — both widening directions, the measured costs, the apply ordering and the
-strict-mode invariant — lives in [acls.md](acls.md); this section covers only what crosses the wire.
+See the [ACL user guide](acls.md) for permission hazards, options, and measured costs, and the
+[ACL component design](../common/DESIGN.md#posix-acls) for application ordering and containment.
+This section is the reference for wire fields and failure accounting.
 
 ## 3. Error Communication
 
