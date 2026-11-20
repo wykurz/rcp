@@ -205,11 +205,15 @@ impl DirectoryTracker {
     /// lock is never held across a syscall and the fd stays alive for the operation
     /// even if the directory completes and is dropped from the map meanwhile.
     pub fn get_dir(&self, dst: &std::path::Path) -> Option<Arc<Dir>> {
+        self.get_dir_with_creation(dst).map(|(dir, _)| dir)
+    }
+    /// Return the held directory and whether this receiver created it in this transfer.
+    pub fn get_dir_with_creation(&self, dst: &std::path::Path) -> Option<(Arc<Dir>, bool)> {
         let state = self.directories.get(dst)?.pending()?;
         match &state.phase {
             DirectoryPhase::Preparing => None,
             DirectoryPhase::Secured(registration) | DirectoryPhase::Announced(registration) => {
-                Some(registration.dir.clone())
+                Some((registration.dir.clone(), registration.was_created))
             }
         }
     }

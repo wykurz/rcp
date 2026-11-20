@@ -316,8 +316,10 @@ The destination's detailed scopes use the `destination.file` prefix: `wait_open`
 `parent`, `plan`, `wait_iops`, `create`, `receive`, `metadata`, `drain`, and `complete`. These cover
 file and rate admission, parent resolution, destination classification, IOPS admission, creation,
 payload reads and writes, metadata, discarded payloads, and tracker completion respectively.
-Completion includes waiting for the tracker and any resulting directory finalization. A creation
-race can produce a second plan or create sample.
+Completion includes waiting for the tracker and any resulting directory finalization. Under a
+directory it created, the receiver reserves the file's IOPS budget and attempts exclusive creation
+directly. Root files and files in reused directories run `plan` first. An occupied name can add a
+`plan` sample and one create retry.
 
 The destination's coarse per-directory manifest scopes separate build admission, inventory, and
 publication. `destination.manifest.wait_build` measures acquiring the manifest-build semaphore.

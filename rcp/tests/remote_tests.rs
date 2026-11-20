@@ -249,7 +249,8 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
     let src = fixture.path().join("source");
     std::fs::create_dir_all(src.join("nested")).unwrap();
     std::fs::create_dir(src.join("empty")).unwrap();
-    for name in ["root-file", "nested/child-file"] {
+    let files = ["root-file", "nested/first-child", "nested/second-child"];
+    for name in files {
         common::filegen::write_file(&PROGRESS, src.join(name), 1024, 1024, 0)
             .await
             .unwrap();
@@ -261,6 +262,8 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
     ] {
         let artifacts = tempfile::tempdir().unwrap();
         let dst = fixture.path().join(destination);
+        // one file lands in the reused root and two in a directory the receiver creates
+        std::fs::create_dir(&dst).unwrap();
         let src_remote = format!("localhost:{}", src.display());
         let dst_remote = format!("localhost:{}", dst.display());
         let daemon = format!(
@@ -270,9 +273,10 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
         let prefix = artifacts.path().join("profile");
         let timings = format!("--timings={}", prefix.display());
         let chrome = format!("--chrome-trace={}", prefix.display());
-        let mut args = vec![daemon.as_str(), timings.as_str()];
+        let mut args = vec![daemon.as_str(), timings.as_str(), "--overwrite"];
         if dereference {
-            args.push("-L");
+            // exercise the same file planning with a payload IOPS reservation on this run
+            args.extend(["-L", "--iops-throttle=1000", "--chunk-size=1MiB"]);
         }
         if detail {
             args.extend(["--timings-detail", chrome.as_str()]);
@@ -281,7 +285,7 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
         let output = run_rcp_with_args_at_default_verbosity(&args);
         print_command_output(&output);
         assert!(output.status.success());
-        for name in ["root-file", "nested/child-file"] {
+        for name in files {
             assert_eq!(
                 std::fs::read(src.join(name)).unwrap(),
                 std::fs::read(dst.join(name)).unwrap()
@@ -341,14 +345,14 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                         "only blocking work has a worker scope"
                     );
                     let async_stats = if role == "rcpd-source" && dereference {
-                        5
+                        3 + files.len() as u64
                     } else {
                         0
                     };
                     assert_eq!(
                         counts[3] - counts[2],
                         async_stats,
-                        "-L classifies the root, two directories, and two files through async stat"
+                        "-L classifies the root, two directories, and each file through async stat"
                     );
                 }
             }
@@ -432,8 +436,9 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                     let scope = scopes.iter().find(|scope| scope["name"] == name);
                     assert_eq!(scope.is_some(), detail, "{name}");
                     if let Some(scope) = scope {
-                        assert_eq!(scope["count"], 2, "{name}");
-                        assert_eq!(scope["finished"], 2, "{name}");
+                        let expected = if stage == "plan" { 1 } else { files.len() };
+                        assert_eq!(scope["count"], expected, "{name}");
+                        assert_eq!(scope["finished"], expected, "{name}");
                         assert_eq!(scope["interrupted"], 0, "{name}");
                     }
                 }
@@ -3596,9 +3601,8 @@ fn test_remote_overwrite_recovers_when_destination_appears_after_classification(
     );
     let spawn_start = std::time::Instant::now();
     let mut child = cmd.spawn().expect("Failed to spawn rcp");
-    // logged by rcp::destination::process_single_file between classifying the slot and reserving its
-    // I/O budget, so seeing it means classification is done and the destination is now parked.
-    let classified_marker = "destination slot classified, reserving iops budget";
+    // the receiver observed the standalone file's name as absent before reserving its IOPS budget
+    let classified_marker = "destination lookup found a vacant name";
     let mut classified = false;
     while spawn_start.elapsed().as_secs() < 40 {
         if rcpd_logs_contain(rcpd_log_dir.path(), classified_marker) {
@@ -3647,7 +3651,7 @@ fn test_remote_overwrite_recovers_when_destination_appears_after_classification(
     assert!(
         rcpd_logs_contain(
             rcpd_log_dir.path(),
-            "destination appeared after classification"
+            "exclusive destination create found a conflict"
         ),
         "expected the destination to report recovering from a post-classification EEXIST; without it \
          the plant raced classification and the ordinary overwrite path ran instead"
