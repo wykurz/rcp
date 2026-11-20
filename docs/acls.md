@@ -1,9 +1,11 @@
 # POSIX ACLs in the RCP tools
 
-This document is the single home for how the RCP tools handle POSIX.1e access control lists: what
+This guide explains how to use POSIX.1e access control lists with the RCP tools: what
 `--preserve-settings=all+acl` does, why ACLs are opt-in rather than part of `all`, the two
 independent ways a copy can end up **more permissive than its source**, and what
 `--require-toctou-safe` does and does not fix. It covers `rcp` (local and remote) and `rlink`.
+
+For implementation details, see the [ACL component design](../common/DESIGN.md#posix-acls).
 
 If you only read one thing: **`--preserve-settings=all` does not preserve ACLs**, and on a
 destination tree that has default ACLs a copy can gain permissions its source never granted. Use
@@ -331,50 +333,14 @@ not deliver it. Here they did not ask.
 
 ## How ACLs are applied, and why the order matters
 
-A destination file is created owner-only (`0o600`) and a destination directory at `0o700`, and
-widened to the final mode only once it is complete — for a **file**, after the last byte and every
-other metadata step, so the widening step is the **last fallible one** (see
-[tocttou.md](tocttou.md#scope-of-toctou-safety) for why). Applying an access ACL *is* a
-mode-changing operation, because `fsetxattr` drives the mode's rwx bits from the ACL's `USER_OBJ`,
-`MASK` and `OTHER` entries. So the ACL and the `chmod` want the same slot, and a `chmod` after the
-ACL would rewrite `MASK` and destroy the ACL's fidelity.
+An access ACL sets the ordinary permission bits, so it must not be followed by a mode change that
+rewrites its mask. Files are created owner-only and widen only at their last fallible metadata step.
+Directories are finalized after their children; requested timestamps are applied after the mode and
+ACL steps.
 
-The resolution, verified against the kernel:
-
-```
-fchmod(0o4600)          -> mode=0o4600  acl=(none)
-fsetxattr(access_acl)   -> mode=0o4755  acl=u::rwx u:65534:--- g::--- m::r-x o::r-x
-```
-
-`fsetxattr` sets the rwx bits exactly and **preserves the special bits**, so it can be the single
-widening step. The invariant the file applier holds, and which both branches are tested for:
-
-> Exactly one step widens the destination FILE from its owner-only create mode, and it is the last
-> fallible step in the applier. Without an access ACL that step is the `fchmod`; with one it is the
-> `fsetxattr`, and the preceding `fchmod` is narrowed to `(mode & 0o7000) | 0o600` so that it cannot
-> widen.
-
-Two facts make the other branch safe. Clearing an inherited ACL can only narrow, so it may run
-*before* the widening `chmod`. And removing an access ACL is mode-neutral (a `0o600` file stays
-`0o600` across `removexattr`), so the clear does not disturb the mode the `chmod` is about to set.
-The **default** ACL is mode-neutral in both directions, so it rides along without constraining the
-order.
-
-**Directories take the same two-branch shape but not the "last fallible step" half**, and the
-difference is deliberate. The mode step stays in the directory applier's existing chmod slot, with
-`futimens` after it: a directory's mtime is bumped by every child created inside it, so its
-timestamps can only be applied once its children exist, which makes the directory applier post-order
-and puts `futimens` last by necessity. There is no exposure in that ordering — `futimens` does not
-touch permissions — but the invariant above is a statement about files, and
-[tocttou.md](tocttou.md#scope-of-toctou-safety) is careful to scope it that way too.
-
-One asymmetry follows. A destination file is always freshly created, so the ACL branch's narrowed
-`fchmod` only ever holds it at the mode it already had. A destination **directory** may be reused,
-and there that same `fchmod` actively narrows it to `0o700` plus its special bits for the moment
-between the chmod and the `fsetxattr`. If the `fsetxattr` fails, the copy is reported failed and a
-pre-existing directory is left at `0o700` — not the mode it started at. That is fail-closed on
-purpose (the alternative publishes the source's mode on a directory whose ACL never landed), but it
-is why a destination directory can come back owner-only after a failed `d:acl` copy.
+If applying ACLs fails after narrowing a reused directory, the copy fails and the directory can be
+left owner-only; do not assume its original mode was restored. See the
+[application order](../common/DESIGN.md#application-order) for each path.
 
 ## Failure rules
 
@@ -393,11 +359,9 @@ information", they are an instruction to **CLEAR**. A transient `EMFILE` would t
 destination's existing ACLs, including a directory's **default** ACL, which then governs everything
 created beneath it afterwards. That is worse than the original bug.
 
-**Failing must be accounted, or a remote copy hangs.** A source-side entry that fails before its
-message is sent leaves the destination waiting for an entry that never arrives, so it never sends
-`DestinationDone` and both peers stay alive forever — no timeout ends that. Every ACL failure path
-therefore sends the matching compensation (a `FileSkipped` for a nested entry) or fails the copy
-outright (for a root). See [remote_protocol.md §2.5](remote_protocol.md) and §3.3 there.
+On remote copies, a failed source ACL read still fails the entry. The
+[protocol reference](remote_protocol.md#25-entry-metadata-and-posix-acls) explains how the peers
+account for it without waiting for a missing entry.
 
 ## Carry the bytes verbatim
 
@@ -413,20 +377,10 @@ or it will fail at `fsetxattr`.
 
 ## Remote copies
 
-The wire carries the same opaque bytes: `protocol::Metadata` gained an `acls: WireAcls` field — an
-enum distinguishing `Captured { access, default }` (authoritative, including the "has none" case)
-from `Unknown` (no ACL information at all: capture off, or the source could not read them) — and
-`MasterHello::Source` gained a
-`capture: ExtendedMetadataCapture { file_acl, dir_acl,
-root_acl_notice }` field so the source knows
-whether to probe at all. Without it the source — which is told `preserve` by nobody — would have to
-probe unconditionally, landing the per-entry cost on every remote copy including ones that do not
-want ACLs. The first two flags drive the per-entry reads; `root_acl_notice` only arms the
-one-per-run [source-root notice](#the-source-root-warning) and never populates a `Metadata`.
-
-[remote_protocol.md §2.5](remote_protocol.md) is the authority: which messages carry which ACL, why
-a `Captured` `None` means CLEAR while `Unknown` means the destination's ACLs are left untouched, and
-how a failed read is accounted. Do not duplicate it here.
+Remote copies offer the same preservation flags. The source reads ACLs for the requested kinds and
+the destination writes or clears them locally. See
+[protocol §2.5](remote_protocol.md#25-entry-metadata-and-posix-acls) for wire fields, capture rules,
+and failure accounting.
 
 ## `--require-toctou-safe` containment
 
@@ -437,76 +391,19 @@ The invariant:
 > passing an inherited ACL on — and in the one directory rcp writes into without creating or reusing
 > it (the ambient parent of a direct operand), the created entry itself is scrubbed instead.
 
-The "that rcp creates" is load-bearing, not throat-clearing. A **reused** directory is one that was
-already there, and rcp was not asked to change it: it keeps its own access ACL throughout, and the
-default ACL it had before the copy is put back at the end. The invariant is about what the copy
-*writes*, not about scrubbing a destination tree.
+The invariant applies to entries the copy creates; it does not scrub an existing destination tree.
+For a **reused** directory, lockdown removes only the default ACL. Restricting the directory's mode
+can still change its access ACL mask, and `d:acl` may replace or clear its access ACL at finalize.
 
-One directory kind is left: the **ambient operand parent** — the pre-existing directory a *direct*
-operand is written into (`rcp file.txt existing-dir/`), which rcp neither creates nor reuses as a
-copy destination. rcp does write there — exactly one entry — so containment needs three sites:
+For a direct file operand written into an existing ambient parent (`rcp file.txt existing-dir/`),
+rcp strips the new file's inherited access ACL rather than changing the parent. A reused directory's
+default ACL is restored on success unless `d:acl` asks to reproduce the source's default ACL
+instead. A failed finalize reports an error; abort-path restoration is best effort and does not
+restore the directory's entire prior metadata state. If the abort cannot restore the original
+default ACL, the per-directory warning (shown with `-v`) identifies what may need repair.
 
-**Freshly created directories.** The `mkdirat`, the re-open, and the removal of both
-`system.posix_acl_access` and `system.posix_acl_default` all run inside **one blocking closure**,
-which either is reclaimed before it starts or runs to completion after it wins the start/cancel
-race. No cancellation (a `--fail-early` sibling abort dropping the future) can therefore abandon a
-created-but-unsanitized directory, and a directory whose open or strip fails is removed
-(best-effort, it is empty) rather than left carrying inherited ACLs an indistinguishable rerun would
-then faithfully "restore". Two syscalls per directory and **none per file** beneath one: stripping
-the default ACL stops the inheritance chain for the whole subtree.
-
-**Reused directories.** The lockdown that restricts a reused destination directory to `0o700` for
-the copy's duration already neuters its *access* ACL (the `chmod` rewrites `MASK`), but a `chmod`
-does not touch a **default** ACL, so children created during the copy would still inherit it. The
-lockdown therefore also **snapshots and removes the default ACL** for the copy's duration and puts
-it back at finalize. Its access ACL is deliberately left alone: rcp was not asked to change a
-directory that already existed.
-
-**Direct files in the ambient parent.** A file created there has no sanitized directory above it, so
-`create_file` removes the inherited access ACL **inside the creation closure** (files carry no
-default ACL, so one attribute suffices). Without it the inherited entries sit inert under the
-owner-only create mode — and the final chmod to the source mode re-derives `ACL_MASK` from the group
-bits and activates them: a strict copy of a plain `0640` file would grant a named user effective
-read access its source never did. Files created beneath rcp-created or locked directories skip this
-(the chain was already broken above them), so the cost is per direct operand, not per file.
-
-At finalize a locked directory's default ACL is resolved through the lockdown guard, one of two
-ways: with `d:acl` on, the **source's** default ACL is installed (nothing to write when the source
-has none — the lockdown already left the directory bare, which is the correct end state); otherwise
-the snapshot is restored (nothing to do when there was none). The guard stays **armed** through
-every remaining fallible step — including the final re-stat verification and every cancellation
-point up to the successful return, so a cancelled or verify-rejected finalize rolls back rather than
-keeping the source's ACL — and armed even when the directory originally had no default ACL, because
-the rollback then means *removing* whatever a partial finalize installed, not leaving it. Every
-finalize write to the guarded attribute is **serialized against the guard's rollback**. A write
-still queued when its waiter is dropped is reclaimed before it starts, but one already taken by a
-blocking worker cannot be cancelled; without serialization, that write could land *after* the `Drop`
-rollback and silently undo it. A write that finds the guard already disarmed is skipped instead.
-
-Restoring a snapshot runs **first**, unwinding the lockdown in the reverse of the order it was
-applied — ACL removed last, so restored first; then the owner; then the mode. Two reasons, neither
-of them about the mode:
-
-- **It runs while the copier still owns the directory**, before the owner is handed back. Only an
-  owner or a `CAP_FOWNER` copier may write these attributes at all.
-- **It fails toward *unchanged*.** If a later step fails, the directory still holds the ACL it had
-  before the copy. Deferring the restore past the chmod would fail toward *damaged* instead — a
-  directory permanently stripped of an ACL it owned before rcp ran, which is the one outcome this
-  path is required to treat as an error rather than produce.
-
-The restore does not compete with the finalize `chmod` for the widening slot, because only a
-**default** ACL is ever restored and a default ACL is mode-neutral. That is a consequence of the
-lockdown having narrowed to the default ACL alone; it was not always true. While the lockdown also
-stripped the *access* ACL, the restore had to precede the chmod for a third reason — the snapshot's
-`USER_OBJ`/`MASK`/`OTHER` agree with the directory's *original* mode, not the source's, so a late
-restore would install the wrong rwx bits and the finalize re-stat would reject the copy. Anything
-that reintroduces an access-ACL restore here inherits that constraint.
-
-Failing to *strip* at lockdown time with `EOPNOTSUPP` is tolerated (a filesystem without ACL support
-cannot have had one). Failing to *restore* at finalize is an error: the directory would permanently
-lose an ACL it had before the copy. The restore also runs from a `Drop` guard, so a copy that is
-aborted between lockdown and finalize — by `--fail-early`, or by any per-directory error — does not
-destroy the snapshot it is holding the only copy of.
+See [containment and rollback](../common/DESIGN.md#containment-and-rollback) for creation,
+cancellation, and guard ordering.
 
 ### A consequence, not an oversight
 
@@ -535,9 +432,9 @@ direction 1 is a fidelity gap present in every copy rather than a race.
 
 **So pair `--require-toctou-safe` with `--preserve-settings=all+acl`** when the source's ACLs
 matter. The pairing also buys something neither gives alone: with `acl` only, direction 2 is
-repaired at finalize, so a child transiently carries inherited entries during the copy (inert,
-because the create mode leaves the mask empty — but present); under strict mode they never exist at
-all.
+repaired at finalize, so a child can carry inherited entries until then. Strict mode breaks the
+inheritance chain before copying children and strips any ACL inherited from an unsanitized parent as
+part of creation, before the entry proceeds to later copy stages.
 
 This is deliberately **not** implemented as an implication. The flags are orthogonal — containment
 against races versus fidelity to the source — and auto-enabling `acl` would impose the per-entry
