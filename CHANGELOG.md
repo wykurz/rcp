@@ -39,6 +39,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Use the system allocator in `rcp` to reduce local-copy peak memory; keep mimalloc in the source
+  and destination `rcpd` processes.
 - Reuse transfer buffers in remote copies. The source `rcpd` now keeps its read buffer per data
   connection between files, as the destination keeps its receive buffer, and
   `--remote-copy-buffer-retention-limit` applies to both. The destination writes each file from that
