@@ -176,9 +176,15 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/candidate/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/input/request.json'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/${!ec2:SourceInstanceArn}/control/window.json'}
             Condition:
@@ -386,9 +392,15 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rrm'}
           - Effect: Allow
             Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
             Resource: {'Fn::Sub': 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-coordinator:log-stream:*'}
@@ -463,18 +475,30 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rrm'}
           - Effect: Allow
             Action: s3:GetObject
             Resource:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/request.json'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/control/window.json'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/output/status.json'}
@@ -491,9 +515,15 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/candidate/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/input/request.json'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/instances/arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*/control/window.json'}
             Condition:
@@ -821,9 +851,15 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rrm'}
             Condition:
               StringEquals: {'s3:if-none-match': '*', 's3:x-amz-server-side-encryption': AES256}
           - Effect: Allow
@@ -832,9 +868,15 @@ Resources:
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/baseline/rrm'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcp'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcpd'}
             - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/filegen'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rcmp'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rlink'}
+            - {'Fn::Sub': 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/production/staging/repo-655073755-run-*/candidate/rrm'}
           - Effect: Allow
             Action: ['states:DescribeStateMachine', 'states:StartExecution']
             Resource: {Ref: CoordinatorStateMachine}

@@ -20,7 +20,7 @@ import time
 from benchmarks.strict_json import parse_json
 
 from . import durable
-from .common import (BINARIES, MAX_BINARY, RevisionConflict, digest, durable_plan_contract, error_code, get_bytes,
+from .common import (MAX_BINARY, RevisionConflict, digest, durable_plan_contract, error_code, get_bytes,
                      pending_status, require, timestamp, utc)
 from .durable_aws import AllocationDeferred, Configuration, Service, clients, transient
 from .production_mailbox import MailboxPaths
@@ -119,7 +119,9 @@ class ProductionService(Service):
 
     def sealed_inputs(self, state):
         sealed = state.get("sealed_inputs")
-        require(isinstance(sealed, dict) and set(sealed) == set(BINARIES), "production input seal is missing")
+        # every binary of the admitted plan, which for a suite that times the other tools includes them
+        expected = durable_plan_contract(state["request"]["plan"])["binaries"]
+        require(isinstance(sealed, dict) and set(sealed) == set(expected), "production input seal is missing")
         require(self.record is not None, "production admission record has not been loaded")
         manifest = self.record.admission["initial_payload"]["manifest"]["binaries"]
         for binary, entry in sealed.items():

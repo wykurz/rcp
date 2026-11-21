@@ -21,7 +21,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from benchmarks.strict_json import parse_json
-from .common import BINARIES, DURABLE_SUITES, Budget, require, utc
+from .common import DURABLE_SUITES, Budget, durable_plan_contract, durable_plan_for_suite, require, utc
 from .controller import oidc_session, read_binary
 from .production_transport import retryable_transport
 
@@ -100,7 +100,8 @@ def prepare(binary_root, revision, *, suite="bulk-1g-metadata"):
     require(suite in DURABLE_SUITES, "production file set is not allowlisted")
     root = Path(binary_root)
     binaries = {}
-    for name in ("rcp", "rcpd", "filegen"):
+    # what the suite's plan sends to the worker: the tools as well for a suite that times them
+    for name in durable_plan_contract(durable_plan_for_suite(suite))["binary_names"]:
         data = read_binary(root / name)
         for side in ("baseline", "candidate"):
             binaries[side + "/" + name] = data
@@ -237,9 +238,9 @@ def submit(api, function, manifest, binaries, receipt_path, *, audience, bucket,
         require(admitted.get("state") in ACTIVE_SUBMISSION_STATES, "admission is held or closed; retain receipt")
     else:
         require(admitted.get("state") == "awaiting-inputs" and isinstance(capabilities, dict)
-                and set(capabilities) == set(BINARIES), "upload set differs")
+                and set(capabilities) == set(binaries), "upload set differs")
         deadline = min(deadline, clock() + utc(admitted["upload_deadline"]).timestamp() - wall_clock())
-        for name in BINARIES:
+        for name in binaries:
             reconcile(lambda: uploader(capabilities[name], binaries[name], bucket=bucket, region=region),
                       deadline=deadline, reserve=30, clock=clock, sleep=sleep)
     sealed = reconcile(lambda: call("seal"), deadline=deadline, reserve=INVOKE_RESERVE_SECONDS,

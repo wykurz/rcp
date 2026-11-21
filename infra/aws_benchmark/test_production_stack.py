@@ -32,7 +32,7 @@ OTHER_INSTANCE = INSTANCE[:-1] + "2"
 RUN = "repo-655073755-run-1234"
 RUN_PK = "run#" + RUN
 BINARY_NAMES = [variant + "/" + name for variant in ("baseline", "candidate")
-                for name in ("rcp", "rcpd", "filegen")]
+                for name in ("rcp", "rcpd", "filegen", "rcmp", "rlink", "rrm")]
 APP_CONFIG = {
     "GitHubAppClientId": "Iv23.example-client",
     "GitHubAppInstallationId": "123456789",

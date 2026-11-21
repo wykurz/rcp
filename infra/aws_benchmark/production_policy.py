@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 
-from .common import BINARIES, MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, durable_plan_contract, require, timestamp, utc, validate_durable_pins
+from .common import MAX_BINARY, DURABLE_SUITES, durable_plan_for_suite, durable_plan_contract, require, timestamp, utc, validate_durable_pins
 from . import durable
 
 MAX_RUN_AGE_SECONDS = 7200
@@ -241,14 +241,16 @@ def manifest(value):
     # contract and must not reinterpret historical A/A proof.
     require(value["baseline"] == value["candidate"], "initial production acceptance requires A/A")
     binaries = value["binaries"]
-    require(isinstance(binaries, dict) and set(binaries) == set(BINARIES), "unexpected binary manifest")
+    # exactly what the suite's plan sends to the worker: its tools too, and never a spare binary
+    contract = durable_plan_contract(durable_plan_for_suite(value["suite"]))
+    require(isinstance(binaries, dict) and set(binaries) == set(contract["binaries"]), "unexpected binary manifest")
     for item in binaries.values():
         require(isinstance(item, dict) and set(item) == {"sha256", "bytes"}
                 and isinstance(item["sha256"], str) and DIGEST.fullmatch(item["sha256"]),
                 "invalid binary manifest entry")
         integer(item["bytes"], 1, MAX_BINARY, "binary exceeds size bound")
     require(all(binaries["baseline/" + name] == binaries["candidate/" + name]
-                for name in ("rcp", "rcpd", "filegen")), "A/A executable bytes differ")
+                for name in contract["binary_names"]), "A/A executable bytes differ")
     return json.loads(canonical(value))
 
 
