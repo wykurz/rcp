@@ -472,7 +472,7 @@ class RemoteCellTests(unittest.TestCase):
         self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
 
     def test_only_known_scenarios_are_selected(self):
-        self.assertEqual(matrix.SCENARIOS, ("local", "remote"))
+        self.assertEqual(matrix.SCENARIOS, ("local", "remote", "rcmp", "rlink", "rrm"))
         with self.assertRaisesRegex(ValueError, "unknown scenario: wan"):
             self.run_matrix(cells=("alpha:wan",))
         self.assertFalse((self.root / "out").exists())

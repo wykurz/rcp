@@ -684,8 +684,8 @@ kernel I/O operation can still require the outer process/cgroup timeout.
 ## Performance-only matrix runs
 
 `just benchmark-matrix` (`python3 -m benchmarks.matrix`) measures a list of *cells* and nothing
-else. A cell is one file set copied under one scenario. It is the runner behind the AWS matrix
-suites, and it runs anywhere:
+else. A cell is one file set under one scenario: a copy, or another tool run on a copy. It is the
+runner behind the AWS matrix suites, and it runs anywhere:
 
 ```bash
 just benchmark-matrix --manifest benchmarks/matrix-cases.json \
@@ -694,7 +694,7 @@ just benchmark-matrix --manifest benchmarks/matrix-cases.json \
     --cache uncontrolled --output /tmp/matrix-results
 ```
 
-There are two scenarios:
+Two scenarios copy a file set, and three time another tool on a copy:
 
 - **`local`** copies between two directories:
   `rcp --summary --output-format=json SOURCE DESTINATION`.
@@ -703,12 +703,15 @@ There are two scenarios:
   rcp starts a source and a destination `rcpd` over SSH and the daemons exchange the data over
   loopback TCP, encrypted as by default. No network hardware and no added latency are involved. See
   [Remote cells](#remote-cells) for what the runner sets up.
+- **`rcmp`**, **`rlink`** and **`rrm`** compare, hard-link and remove the tree that a `local` copy
+  has just written. See [Tool cells](#tool-cells).
 
 It differs from `benchmark-run` in what it promises:
 
-- **One build, default settings.** Every cell runs the `rcp-default` variant from `--bin-dir`. There
-  is no baseline build, no pairing and no comparison; `--repetitions` (default 3) is the number of
-  copies per cell and the cell's value is their median.
+- **One build, default settings.** Every copy runs the `rcp-default` variant from `--bin-dir`, and
+  every tool cell its own fixed command from the same directory. There is no baseline build, no
+  pairing and no comparison; `--repetitions` (default 3) is the number of copies, or of tool runs,
+  per cell and the cell's value is their median.
 - **Cells are independent.** A cell that fails, hangs or hits an error nobody foresaw records its
   own outcome and the run goes on to the next cell. The run exits zero whenever it worked through
   its list, whatever the cells' outcomes. Cells of one file set share its generated fixture and run
@@ -724,7 +727,8 @@ It differs from `benchmark-run` in what it promises:
 - **Copies are not verified.** A copy counts when the command exits zero and its own `--summary`
   reports the expected numbers of files copied and unchanged. No tree is walked or hashed, before or
   after. Correctness is covered by the test suites; this runner only measures. Records, summaries
-  and public pages say so wherever they show these numbers.
+  and public pages say so wherever they show these numbers. A tool run counts the same way, on its
+  exit status and the counts of its own summary.
 - **Resources are what rcp reports about itself.** Every copy is asked for its summary as JSON
   (`--output-format=json`), printed as the last line of its output. The runner takes the transfer
   counts from it, and CPU time, peak memory, context switches and page faults of the `rcp` process,
@@ -743,8 +747,8 @@ It differs from `benchmark-run` in what it promises:
 
 Cell outcomes are `complete`, `failed`, `timed_out`, `interrupted` (cut short by the end of the
 allocation or by a stop signal) and `not_run`. A failed cell is not retried, and its remaining
-copies are skipped. Each outcome carries the stage it happened in and a short reason that names the
-log to read, for example
+copies or runs are skipped. Each outcome carries the stage it happened in and a short reason that
+names the log to read, for example
 `copy 2 failed with exit code 1; see 0.stdout.log and 0.stderr.log in logs/bulk-1m-1024gb/local/2`.
 rcp writes what went wrong to its output; only its argument parser uses the error stream.
 
@@ -755,11 +759,62 @@ Each command log is cut to its first and last half mebibyte once the command has
 that fails for every file cannot fill a small output directory. `benchmarks.matrix.validate` checks
 a document before anything is concluded from it. `--check-capacity` needs source and destination on
 different filesystems, as on the AWS worker. `--system-telemetry` samples the same bounded host and
-cgroup diagnostics as `benchmark-run`. A fixture or destination that could not be removed is counted
-in `removal_failures`.
+cgroup diagnostics as `benchmark-run`. A fixture, destination or linked tree that `rm -rf` could not
+remove is counted in `removal_failures`.
 
 These documents are a separate format: the dashboards and change reports described below read
 `benchmark-run` results only.
+
+### Tool cells
+
+The `rcmp`, `rlink` and `rrm` scenarios time the other tools on real trees without generating
+anything for them. A tool cell makes no copies of its own. Each of its runs follows one copy of the
+same file set's `local` cell, so that cell has to be selected too:
+
+```bash
+just benchmark-matrix --manifest benchmarks/matrix-cases.json \
+    --cell commission-10k:local --cell commission-10k:rcmp --cell commission-10k:rlink \
+    --cell commission-10k:rrm \
+    --bin-dir target/release --source-root /scratch/source --destination-root /scratch/destination \
+    --cache uncontrolled --output /tmp/matrix-results
+```
+
+After each local copy the selected tools run in this order, whatever the order of the selection:
+
+1. **`rcmp`** compares the source with the copy by file size:
+   `rcmp --summary --quiet --metadata-compare=f:size --output-format=json SOURCE COPY`. A default
+   rcp copy does not keep modification times, so the default comparison would report every file. The
+   run counts when rcmp exits zero, which means no difference, and reports every file and directory
+   as the same.
+2. **`rlink`** hard-links the copy into a new tree beside it:
+   `rlink --summary --output-format=json COPY TREE`. The run counts when it reports a hard link for
+   every file and a directory for every directory. `rm -rf` then removes the new tree, outside the
+   measurement.
+3. **`rrm`** removes the copy: `rrm --summary --output-format=json COPY`. The run counts when it
+   reports every file and directory removed. This run takes the place of the `rm -rf` that otherwise
+   frees a copy.
+
+What a tool cell's numbers mean:
+
+- **Time and resources.** The wall time of the tool's command, measured as a copy's is, and what the
+  tool reports about itself in its JSON summary, recorded under `resources`. The counts that were
+  checked are recorded under `tool_summary`.
+- **Cache.** No cache is dropped for a tool. It finds what the copy before it left in memory:
+  usually the metadata of both trees, and as much file data as fits. `--cache` applies to the copies
+  only. A tool on a cold tree is a different measurement, which this runner does not make.
+- **Order.** `follows_trial_index` names the copy a run followed. The three tools see slightly
+  different trees: rcmp runs first, and rrm removes a tree whose files have been linked and unlinked
+  once.
+
+A tool that fails, hangs or reports the wrong counts ends its own cell and nothing else. The copies
+go on, and so do the other tools. Its outcome names the stage (`command` or `summary`) and the log,
+as `run 1 failed with exit code 2; see 0.stdout.log and 0.stderr.log in logs/tiny-1k-10240k/rrm/1`.
+A copy that rrm did not remove is removed with `rm -rf`, and so is whatever rlink left behind. When
+a local copy fails, the tool cells that still waited for it take its outcome at stage `copy`. Only
+the tools of the selected cells have to be in `--bin-dir`.
+
+Every removal other than rrm's measured run stays `rm -rf`: fixtures, copies of the other scenarios
+and linked trees. That keeps what rrm removes the same in every run.
 
 ### Remote cells
 
