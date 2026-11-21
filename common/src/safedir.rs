@@ -1904,12 +1904,12 @@ impl Dir {
 
     /// Create a file and claim an unprobed continuation on the same blocking worker.
     ///
-    /// Creation errors are passed to `continuation`, which can return any held source descriptor
-    /// for conflict recovery. Invalid names invoke it inline without submitting blocking work.
+    /// Creation errors are passed to `continuation`, which can return its inputs for conflict
+    /// recovery. Invalid names invoke it inline without submitting blocking work.
     /// The outer error reports a blocking-worker failure. Cancelling before
     /// the continuation claim destroys its captures without running it; a claimed continuation
     /// retains the canonical blocking job's descriptor admission through completion and output drop.
-    pub(crate) async fn create_file_and_then<C, T>(
+    pub async fn create_file_and_then<C, T>(
         &self,
         name: &OsStr,
         continuation: C,

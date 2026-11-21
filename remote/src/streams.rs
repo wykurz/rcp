@@ -200,6 +200,47 @@ pub type BoxedRecvStream = RecvStream<BoxedRead>;
 /// Shared send stream over boxed writer
 pub type BoxedSharedSendStream = SharedSendStream<BoxedWrite>;
 
+/// A complete, single-chunk payload in this reader's framing buffer.
+pub struct BufferedFile<'a> {
+    buffer: &'a mut bytes::BytesMut,
+    len: usize,
+}
+
+impl BufferedFile<'_> {
+    /// Create the file and write the buffered bytes on the same admitted worker.
+    ///
+    /// An inner creation error leaves the payload available for draining or retry. An outer
+    /// transfer error either marks an ordinary final write failure with [`PayloadConsumedOnWriteError`]
+    /// or reports a worker failure that requires discarding the stream. Cancellation abandons
+    /// the transfer. Only the current file's bytes leave the decoder.
+    pub async fn create_at(
+        self,
+        parent: &common::safedir::Dir,
+        name: &std::ffi::OsStr,
+        admission: &throttle::OpenFileGuard,
+    ) -> anyhow::Result<std::io::Result<std::fs::File>> {
+        use std::io::Write as _;
+
+        let payload = self.buffer.split_to(self.len);
+        let create = parent.create_file_and_then(name, move |created| match created {
+            Ok(mut file) => Ok(file.write_all(&payload).map(|()| file)),
+            Err(error) => Err((error, payload)),
+        });
+        match common::safedir::with_fd_admission(admission.admission(), create)
+            .await
+            .context("blocking worker failed creating or writing destination file")?
+        {
+            Ok(written) => Ok(Ok(written.context(PayloadConsumedOnWriteError)?)),
+            Err((error, mut payload)) => {
+                // these are still adjacent halves of the same allocation
+                payload.unsplit(std::mem::take(self.buffer));
+                *self.buffer = payload;
+                Ok(Err(error))
+            }
+        }
+    }
+}
+
 /// Framed receive stream for length-delimited messages.
 ///
 /// Generic over the underlying reader type - works with TCP, TLS, or any AsyncRead.
@@ -251,6 +292,13 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     /// Return the retention limit configured on this receive stream.
     pub fn copy_buffer_retention_limit(&self) -> usize {
         self.copy_buffer_retention_limit
+    }
+
+    /// Borrow a whole nonempty file already in the decoder if it fits a single write.
+    pub fn buffered_file(&mut self, size: u64, chunk: usize) -> Option<BufferedFile<'_>> {
+        let len = usize::try_from(size).ok()?;
+        let buffer = self.framed.read_buffer_mut();
+        (len != 0 && len <= chunk && len <= buffer.len()).then_some(BufferedFile { buffer, len })
     }
 
     pub async fn recv_object<T: serde::de::DeserializeOwned>(
