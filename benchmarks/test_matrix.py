@@ -518,8 +518,9 @@ class MatrixTests(unittest.TestCase):
         phases = [phase["phase"] for phase in record["system_telemetry"]["phases"]]
         self.assertIn("generation", phases)
         for item in record["cells"][0]["copies"]:
+            # the command's window lasts until the next step starts: reading its summary has none of its own
             self.assertEqual([phase["phase"] for phase in item["system_telemetry"]["phases"]],
-                             ["cache", "command", "summary", "cleanup"])
+                             ["cache", "command", "cleanup"])
 
     def test_selection_is_validated_before_any_work(self):
         for cells, message in ((("alpha:local", "alpha:local"), "duplicate"), (("delta:local",), "unknown file set"),
