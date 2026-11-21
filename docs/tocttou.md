@@ -166,10 +166,10 @@ On the default (non-`-L`) path, on Linux, given the operand paths as written:
 tree the tool traverses — can redirect a read, write, chmod, chown, or delete to an object **outside
 that root's subtree.** This is the property that matters when a privileged process operates on a
 tree a less-privileged actor can write *into* (the classic "root copies, chmods, or removes over an
-attacker-controlled directory" hazard). It is delivered by the fd-based safe walk described below:
-the named root and every entry beneath it are opened `O_NOFOLLOW`, classified by `fstat` of the held
-fd, and operated on via fd-relative syscalls — and for chmod/chown/hard-link, via the entry's pinned
-`O_PATH` fd through `/proc/self/fd` — so a swapped-in symlink is never followed out of the subtree.
+attacker-controlled directory" hazard). The walk opens the named root and directories beneath it
+with `O_NOFOLLOW`, classifies held descriptors with `fstat`, and issues fd-relative syscalls. Chmod,
+chown, and hard-link operations use the entry's pinned `O_PATH` fd through `/proc/self/fd`.
+Standalone `rrm` can also remove a nondirectory through its pinned parent as described below.
 
 **2. Permission and ownership fidelity.** The permissions and ownership the destination
 (`rcp`/`rlink`) or the modified entry (`rchm`) ends up with are those of the source object that was
@@ -500,6 +500,12 @@ Specific invariants enforced:
   never follows a symlink. It removes the final component present at the name when the syscall runs;
   it does not recheck `(dev, ino)` identity, so exact final-name identity across separate syscalls
   is outside the guarantee. The mutation remains contained to the pinned parent directory.
+- For an unfiltered removal, standalone `rrm` can account for a child with a nondirectory hint using
+  `fstatat(AT_SYMLINK_NOFOLLOW)` through its pinned parent. If the snapshot is a nondirectory,
+  `unlinkat` through the same parent removes the current nondirectory at that name. A directory
+  snapshot or an unknown hint goes through normal pinned classification. A worker continuing
+  directly from stat checks for cancellation immediately before starting the unlink. Roots and
+  `--require-toctou-safe` retain their descriptor-based classification.
 - Before recursively removing a directory, `rrm` verifies that the opened descent handle is still
   the walked inode, and all descendant work uses that verified fd. Final `rmdir` is a single by-name
   syscall relative to the pinned parent: it cannot follow a symlink or remove a non-empty directory,

@@ -72,6 +72,71 @@ pub(super) fn gate_directory_stat(
 }
 
 #[tokio::test]
+async fn removes_a_leaf_in_one_job_and_leaves_a_directory_for_the_walk() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let directory = root.path().join("child");
+    std::fs::create_dir(&directory)?;
+    std::fs::write(root.path().join("file"), b"abc")?;
+    let parent = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+    let submissions = crate::testutils::BlockingSubmissions::start();
+    let removed = parent
+        .unlink_if_nondirectory(OsStr::new("file"))
+        .await?
+        .context("expected a nondirectory")??;
+    assert_eq!(submissions.count(), 1);
+    assert_eq!(removed.kind(), EntryKind::File);
+    assert_eq!(removed.size(), 3);
+    assert!(!root.path().join("file").exists());
+    assert!(
+        parent
+            .unlink_if_nondirectory(OsStr::new("child"))
+            .await?
+            .is_none()
+    );
+    assert!(directory.is_dir());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_after_a_leaf_snapshot_keeps_the_file() -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("file");
+    std::fs::write(&path, b"still here")?;
+    let limits = crate::testutils::AdmissionLimit::new().await;
+    limits.set_files_in_flight(1);
+    let parent = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+    let mut gate =
+        crate::testutils::BlockingPathGate::install(root.path().join(".rcp-before-hinted-unlink"));
+    let held = throttle::pending_meta_permit().await;
+    let task = tokio::spawn(with_fd_admission(held.admission(), async move {
+        let _held = held;
+        parent.unlink_if_nondirectory(OsStr::new("file")).await
+    }));
+
+    let timeout = std::time::Duration::from_secs(10);
+    let entered = tokio::time::timeout(timeout, gate.wait_started()).await;
+    task.abort();
+    let cancelled = matches!(task.await, Err(error) if error.is_cancelled());
+    let mut next = Box::pin(throttle::pending_meta_permit());
+    let retained = next.as_mut().now_or_never().is_none();
+    gate.release_all();
+    entered.context("unlink never reached its post-classification cancellation point")??;
+    tokio::time::timeout(timeout, gate.wait_completed()).await??;
+    if retained {
+        drop(tokio::time::timeout(timeout, next).await?);
+    }
+    assert!(cancelled);
+    assert!(
+        retained,
+        "detached worker released descriptor admission before it exited"
+    );
+    assert_eq!(std::fs::read(path)?, b"still here");
+    Ok(())
+}
+
+#[tokio::test]
 async fn preview_metadata_failure_is_not_unavailable_open_evidence() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let child = root.path().join("child");
@@ -473,4 +538,62 @@ async fn cancelled_directory_create_keeps_guard_until_abandoned_descriptor_close
     );
     drop(permit);
     Ok(())
+}
+
+#[test]
+fn pending_unlink_admission_frees_the_only_blocking_worker() -> anyhow::Result<()> {
+    let timeout = std::time::Duration::from_secs(5);
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("file");
+            std::fs::write(&path, b"remove me")?;
+            let limits = crate::testutils::AdmissionLimit::new().await;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?;
+            let unlink =
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Unlink);
+            limits.set_max_ops_in_flight(unlink, 1);
+            let occupied = throttle::ops_in_flight_permit(unlink).await;
+            let samples = Arc::new(congestion::testing::CollectingSink::new());
+            congestion::install_sample_sink(samples.clone());
+            let submissions = crate::testutils::BlockingSubmissions::start();
+            let mut removal = Box::pin(root.unlink_if_nondirectory(OsStr::new("file")));
+            assert!(futures::poll!(removal.as_mut()).is_pending());
+
+            // wait for the actual stat before submitting a competing job to the sole worker
+            let marker = path.clone();
+            let witness = tokio::time::timeout(timeout, async {
+                while samples.metadata_count_for(congestion::Side::Source) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::task::spawn_blocking(move || std::fs::read(marker)).await
+            })
+            .await;
+            let before_release = submissions.count();
+            drop(occupied);
+            // releasing the held permit before examining a timeout also unblocks a regressed worker
+            assert_eq!(
+                witness.context("waiting unlink monopolized the blocking worker")???,
+                b"remove me"
+            );
+            assert_eq!(before_release, 1, "unlink submitted a job before admission");
+            let snapshot = limits
+                .run_with_timeout(timeout, removal)
+                .await??
+                .context("file snapshot requested directory classification")??;
+            assert_eq!(snapshot.kind(), EntryKind::File);
+            assert_eq!(snapshot.size(), 9);
+            assert!(!path.try_exists()?);
+            assert_eq!(samples.metadata_count_for(congestion::Side::Source), 1);
+            assert_eq!(samples.metadata_count_for(congestion::Side::Destination), 1);
+            assert_eq!(
+                submissions.count(),
+                2,
+                "the admitted unlink must be submitted exactly once"
+            );
+            Ok(())
+        })
 }

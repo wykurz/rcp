@@ -257,6 +257,10 @@ pub async fn rm(
     // the root is processed like a nested child via `process_admitted_entry`, transferring
     // classification and admission acquired during setup
     let visitor = Arc::new(RmVisitor {
+        use_leaf_snapshot: settings.dry_run.is_none()
+            && settings.time_filter.is_none()
+            && settings.filter.is_none()
+            && !safedir::strict_operand_resolution(),
         protection: None,
         prog_track,
         settings: settings.clone(),
@@ -378,6 +382,7 @@ async fn rm_child_with_source(
     // pruning passes a mirror-relative seed; unfiltered overwrite passes a full display path
     // both coordinates start from this one seed and are never used to open a removal target
     let visitor = Arc::new(RmVisitor {
+        use_leaf_snapshot: false,
         protection,
         prog_track,
         settings: settings.clone(),
@@ -401,9 +406,32 @@ async fn rm_child_with_source(
 /// snapshot in [`WalkVisitor::dir_pre`], and the post-order `rmdir` decision in
 /// [`WalkVisitor::dir_post`]). rm has no second tree, so [`Self::DirContext`] is `()`.
 struct RmVisitor {
+    // only standalone, unfiltered removal may use a snapshot to account for a by-name unlink
+    use_leaf_snapshot: bool,
     protection: Option<Arc<crate::input_protection::InputProtection>>,
     prog_track: &'static progress::Progress,
     settings: Settings,
+}
+
+fn account_removed_leaf(
+    prog_track: &progress::Progress,
+    kind: EntryKind,
+    file_size: u64,
+) -> Summary {
+    if kind == EntryKind::Symlink {
+        prog_track.symlinks_removed.inc();
+        return Summary {
+            symlinks_removed: 1,
+            ..Default::default()
+        };
+    }
+    prog_track.files_removed.inc();
+    prog_track.bytes_removed.add(file_size);
+    Summary {
+        bytes_removed: file_size,
+        files_removed: 1,
+        ..Default::default()
+    }
 }
 
 /// State threaded from [`WalkVisitor::dir_pre`] to [`WalkVisitor::dir_post`] (same task) — what the
@@ -429,6 +457,31 @@ impl WalkVisitor for RmVisitor {
     type DirState = RmDirState;
 
     fn root_dir_context(&self) {}
+
+    fn hinted_leaf<'a>(
+        &'a self,
+        cx: &'a EntryCx,
+    ) -> Option<
+        impl std::future::Future<Output = crate::walk_driver::HintedLeafResult<Summary>> + Send + 'a,
+    > {
+        // the ordinary visit emits the per-leaf decision on the caller's tracing subscriber before unlink
+        if !self.use_leaf_snapshot || tracing::enabled!(tracing::Level::DEBUG) {
+            return None;
+        }
+        Some(async move {
+            let removed = cx
+                .parent
+                .unlink_if_nondirectory(&cx.name)
+                .await
+                .with_context(|| format!("failed reading metadata from {:?}", &cx.real_path))
+                .map_err(|err| Error::new(err, Summary::default()))?
+                .transpose()
+                .with_context(|| format!("failed removing {:?}", &cx.real_path))
+                .map_err(|err| Error::new(err, Summary::default()))?;
+            Ok(removed
+                .map(|entry| account_removed_leaf(self.prog_track, entry.kind(), entry.size())))
+        })
+    }
 
     fn permit_kind(&self) -> PermitKind {
         // use PendingMeta because copy/link overwrite leaf work can invoke rm while retaining
@@ -608,20 +661,7 @@ impl WalkVisitor for RmVisitor {
         {
             return Err(Error::new(err, Default::default()));
         }
-        if is_symlink {
-            prog_track.symlinks_removed.inc();
-            return Ok(Summary {
-                symlinks_removed: 1,
-                ..Default::default()
-            });
-        }
-        prog_track.files_removed.inc();
-        prog_track.bytes_removed.add(file_size);
-        Ok(Summary {
-            bytes_removed: file_size,
-            files_removed: 1,
-            ..Default::default()
-        })
+        Ok(account_removed_leaf(prog_track, kind, file_size))
     }
 
     async fn dir_pre(&self, cx: &EntryCx, _parent_ctx: &(), handle: &Handle) -> DirPreResult<Self> {
@@ -1498,6 +1538,7 @@ mod tests {
             let target_dir =
                 Arc::new(Dir::open_root_dir(&target, false, congestion::Side::Source).await?);
             let visitor = Arc::new(RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &PROGRESS,
                 settings,
@@ -2244,6 +2285,58 @@ mod tests {
             Ok(())
         }
 
+        #[tokio::test(flavor = "current_thread")]
+        async fn descends_a_directory_under_a_file_hint_with_one_leaf_permit() -> anyhow::Result<()>
+        {
+            // exercise the snapshot path even when another test has installed a debug subscriber
+            let _dispatch = tracing::dispatcher::set_default(&tracing::Dispatch::none());
+            let tmp = tempfile::tempdir()?;
+            let branch = tmp.path().join("branch");
+            std::fs::create_dir(&branch)?;
+            std::fs::write(branch.join("child"), b"123")?;
+            let limits = testutils::AdmissionLimit::new().await;
+            limits.set_files_in_flight(1);
+            let parent =
+                Arc::new(Dir::open_root_dir(tmp.path(), false, congestion::Side::Source).await?);
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                "root".into(),
+                tmp.path().to_owned(),
+                &PROGRESS,
+            );
+            let visitor = Arc::new(RmVisitor {
+                use_leaf_snapshot: true,
+                protection: None,
+                prog_track: &PROGRESS,
+                settings: Settings {
+                    fail_early: true,
+                    filter: None,
+                    time_filter: None,
+                    dry_run: None,
+                },
+            });
+            let walk = crate::walk_driver::walk_dir_entries(
+                visitor,
+                parent,
+                &cx,
+                &(),
+                vec![("branch".into(), Some(EntryKind::File))],
+            );
+            let (summary, _) = limits
+                .run_with_timeout(std::time::Duration::from_secs(5), walk)
+                .await??;
+            assert_eq!(
+                (
+                    summary.directories_removed,
+                    summary.files_removed,
+                    summary.bytes_removed
+                ),
+                (1, 1, 3)
+            );
+            assert!(!branch.try_exists()?);
+            Ok(())
+        }
+
         /// Regression for the hold-and-wait deadlock when a getdents leaf-hint entry is actually a
         /// directory (the DT_UNKNOWN edge, or a swap between `getdents` and the authoritative
         /// `child()`). The walk pre-acquires a `pending_meta` permit for every possible leaf; if such
@@ -2291,6 +2384,7 @@ mod tests {
                 time_filter: None,
             };
             let visitor = Arc::new(RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &PROGRESS,
                 settings: settings.clone(),
@@ -2353,6 +2447,7 @@ mod tests {
             tokio::fs::create_dir(&entry).await?;
             tokio::fs::write(entry.join("replacement-child"), b"replacement").await?;
             let visitor = RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
@@ -2399,6 +2494,7 @@ mod tests {
             tokio::fs::create_dir(&entry).await?;
             tokio::fs::write(entry.join("replacement-child"), b"replacement").await?;
             let visitor = RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
@@ -2441,6 +2537,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
@@ -2489,6 +2586,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {
@@ -2581,6 +2679,7 @@ mod tests {
             );
             let handle = parent.child(OsStr::new("entry")).await?;
             let visitor = RmVisitor {
+                use_leaf_snapshot: false,
                 protection: None,
                 prog_track: &RACE_PROGRESS,
                 settings: Settings {

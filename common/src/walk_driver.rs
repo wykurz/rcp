@@ -388,6 +388,9 @@ pub type DirPostInput<V> = Result<
     OperationError<<V as WalkVisitor>::Summary>,
 >;
 
+/// A completed hinted leaf, a request for ordinary classification, or an operation error.
+pub type HintedLeafResult<S> = Result<Option<S>, OperationError<S>>;
+
 /// A tool's policy for a single-tree safe walk.
 ///
 /// The driver calls these to make the per-entry decisions it cannot know itself;
@@ -418,6 +421,16 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// chmod/rm return `()`. (The root entry itself is processed with this same
     /// context as its "parent" context.)
     fn root_dir_context(&self) -> Self::DirContext;
+
+    /// Optionally handle an admitted child with a reliable nondirectory hint and no filter.
+    /// Returning no summary requests ordinary pinned classification, including for stale hints.
+    fn hinted_leaf<'a>(
+        &'a self,
+        _cx: &'a EntryCx,
+    ) -> Option<impl std::future::Future<Output = HintedLeafResult<Self::Summary>> + Send + 'a>
+    {
+        None::<std::future::Ready<HintedLeafResult<Self::Summary>>>
+    }
 
     /// Which backpressure pool a leaf permit comes from for this tool.
     fn permit_kind(&self) -> PermitKind;
@@ -925,6 +938,7 @@ async fn process_scheduled_entry<V>(
     parent_ctx: V::DirContext,
     ordinal: usize,
     scheduled: ScheduledEntry,
+    hinted_nondirectory: bool,
 ) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
 where
     V: WalkVisitor,
@@ -934,6 +948,17 @@ where
         ScheduledEntry::Unclassified(admission) => (admission, false),
         ScheduledEntry::Authoritative(admission) => (admission, true),
     };
+    let handled = if hinted_nondirectory && let Some(visit) = visitor.hinted_leaf(&cx) {
+        crate::safedir::with_optional_fd_admission(admission.admission(), visit).await?
+    } else {
+        None
+    };
+    if let Some(summary) = handled {
+        return Ok(WalkEntryResult {
+            summary,
+            processed: Some((ordinal, cx.name)),
+        });
+    }
     let classified =
         classify_for_dispatch(visitor.as_ref(), &cx, EntrySource::Unclassified(admission)).await?;
     if authoritative
@@ -1026,6 +1051,7 @@ where
     let fail_early = visitor.fail_early();
     let collection = visitor.name_collection();
     let delete_names = matches!(collection, NameCollection::Delete);
+    let unfiltered = !delete_names && visitor.filter().is_none();
     let mut fold = WalkEntryFold::new(V::Summary::default(), collection);
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
@@ -1081,9 +1107,17 @@ where
                 return Err(fold.fail(error));
             }
         };
+        let hinted_nondirectory = unfiltered && hint.is_some_and(|kind| kind != EntryKind::Dir);
         spawn_tracked(
             &mut join_set,
-            process_scheduled_entry(task_visitor, child_cx, task_ctx, ordinal, scheduled),
+            process_scheduled_entry(
+                task_visitor,
+                child_cx,
+                task_ctx,
+                ordinal,
+                scheduled,
+                hinted_nondirectory,
+            ),
         );
     }
     join_walk_entries(join_set, fail_early, fold).await
