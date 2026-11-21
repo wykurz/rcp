@@ -385,6 +385,11 @@ qualification and rollout.
   cells, which still qualify. Command logs are cut to their head and tail as each command ends: the
   worker's output directory is a 128 MiB tmpfs, and one copy that fails for every file must not fill
   it and stop the results of the other cells from being saved.
+- **Other tools.** A suite whose name has `tools` also times `rcmp`, `rlink` and `rrm` on each local
+  copy, in that order, before the copy goes: `rrm`'s run is what removes it. The worker fetches
+  those three binaries as well, because the suite's plan names them. A tool finds what the copy left
+  in memory, since no cache is dropped for it. The tree that `rlink` makes is on the destination
+  array beside the copy and is removed with `rm -rf` before `rrm` runs.
 - **Commissioning fixtures.** The `matrix-commission-…` suites use `commission-64m` (16 files of 4
   MB) and `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every
   step in seconds and are not performance evidence.

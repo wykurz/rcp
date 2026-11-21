@@ -17,8 +17,14 @@ MATRIX_SCHEMA = "rcp-public-resource-diagnostics-v2"
 # and for a matrix run with remote cells: a remote copy is three processes, so every copy also
 # carries `roles`, the figures of the source and destination daemons (null for a local copy)
 REMOTE_SCHEMA = "rcp-public-resource-diagnostics-v3"
+# and for a matrix run that also times the other tools: every trial names what its own cell ran, and
+# only a remote copy carries `roles` (a tool run is one process, as a local copy is)
+TOOLS_SCHEMA = "rcp-public-resource-diagnostics-v4"
 MATRIX_VARIANT = "rcp-default"
+# what each tool cell ran, as the public record of such a run names it
+TOOL_VARIANTS = {"rcmp": "rcmp-size", "rlink": "rlink-default", "rrm": "rrm-default"}
 LOCAL = "local"
+REMOTE = "remote"
 ROLES = ("source", "destination")
 MAX_DOCUMENT = 512 * 1024
 MAX_TRIALS = 128
@@ -31,6 +37,9 @@ REMOTE_PROCESS_SCOPE = ("Each figure is what a process reports about itself as i
                         "copy is three processes: the rcp command, without the ssh clients it starts, the source "
                         "rcpd and the destination rcpd. CPU seconds may exceed wall time; peak RSS is a "
                         "per-process peak, not host memory or a sum of processes.")
+TOOLS_PROCESS_SCOPE = REMOTE_PROCESS_SCOPE.replace(
+    "A local copy is one rcp process with its threads. ",
+    "A local copy is one rcp process with its threads. A tool run is one process of that tool with its threads. ")
 SYSTEM_SCOPE = ("Sampled host/cgroup diagnostics associated with phase windows, not per-process "
                 "attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.")
 METRICS = ("user_seconds", "system_seconds", "max_rss_kib", "voluntary_switches",
@@ -278,11 +287,27 @@ def _schema(record):
     """The document a record gets: fixed by the record, so a stored one never changes version."""
     if not _matrix(record):
         return SCHEMA
-    return REMOTE_SCHEMA if any(cell["scenario"] != LOCAL for cell in record["cells"]) else MATRIX_SCHEMA
+    scenarios = {cell["scenario"] for cell in record["cells"]}
+    if scenarios & set(TOOL_VARIANTS):
+        return TOOLS_SCHEMA
+    return REMOTE_SCHEMA if scenarios - {LOCAL} else MATRIX_SCHEMA
 
 
 def _process_scope(schema):
-    return REMOTE_PROCESS_SCOPE if schema == REMOTE_SCHEMA else PROCESS_SCOPE
+    return {REMOTE_SCHEMA: REMOTE_PROCESS_SCOPE, TOOLS_SCHEMA: TOOLS_PROCESS_SCOPE}.get(schema, PROCESS_SCOPE)
+
+
+def _variant(schema, scenario):
+    """What a trial of this scenario ran: the one copy variant, or in a run with tool cells its tool's."""
+    return TOOL_VARIANTS.get(scenario, MATRIX_VARIANT) if schema == TOOLS_SCHEMA else MATRIX_VARIANT
+
+
+def _daemons(schema, scenario):
+    """Whether a trial of this scenario names the two daemons of a remote copy.
+
+    Before there were tool cells every scenario but the local one was a remote copy.
+    """
+    return scenario == REMOTE if schema == TOOLS_SCHEMA else scenario != LOCAL
 
 
 def _complete(trials):
@@ -407,7 +432,8 @@ def _derive_matrix(record, archive, raw, worker):
         return unavailable(record, "not_matched")
     sampled = raw["context"].get("system_telemetry") == TELEMETRY_DESCRIPTOR
     grouped, selected, phases = {}, [], _system(raw.get("system_telemetry") if sampled else None)["phases"]
-    with_roles = _schema(record) == REMOTE_SCHEMA
+    schema = _schema(record)
+    with_roles = schema in (REMOTE_SCHEMA, TOOLS_SCHEMA)
     for cell in cells:
         for item in cell["copies"]:
             done = item["status"] == "ok"
@@ -419,12 +445,12 @@ def _derive_matrix(record, archive, raw, worker):
                 grouped.setdefault((cell["case_id"], cell["scenario"]), []).append(item["elapsed_seconds"])
             system = _system(item.get("system_telemetry") if sampled else None)
             phases += system["phases"]
-            trial = dict(case_id=cell["case_id"], variant_id=MATRIX_VARIANT, scenario=cell["scenario"],
-                iteration=item["iteration"], status="complete" if resource is not None else "unavailable",
-                metrics=resource, system=system)
+            trial = dict(case_id=cell["case_id"], variant_id=_variant(schema, cell["scenario"]),
+                scenario=cell["scenario"], iteration=item["iteration"],
+                status="complete" if resource is not None else "unavailable", metrics=resource, system=system)
             if with_roles:
                 trial["roles"] = None
-                if cell["scenario"] != LOCAL:
+                if _daemons(schema, cell["scenario"]):
                     daemons = item.get("role_resources")
                     daemons = daemons if isinstance(daemons, dict) else {}
                     # a copy without its own figures publishes none for its daemons either
@@ -470,7 +496,8 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
 
 def validate(value, record):
     matrix = _matrix(record)
-    with_roles = _schema(record) == REMOTE_SCHEMA
+    schema = _schema(record)
+    with_roles = schema in (REMOTE_SCHEMA, TOOLS_SCHEMA)
     shapes = MATRIX_CASE_SHAPES if matrix else CASE_SHAPES
     require(isinstance(value, dict) and set(value) == {"schema", "run_key", "retirement_sha256",
         "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases", "system", "limits"} and
@@ -508,9 +535,10 @@ def validate(value, record):
         require(isinstance(trial, dict) and set(trial) == {"case_id", "variant_id", "iteration", "status", "metrics", "system"} | (
                     {"scenario"} if matrix else set()) | ({"roles"} if with_roles else set()) and
                 isinstance(trial["case_id"], str) and trial["case_id"] in case_ids and
-                trial["variant_id"] in ({MATRIX_VARIANT} if matrix else {"rcp-default", "rcp-baseline"}) and
                 (not matrix or isinstance(trial["scenario"], str) and SCENARIO.fullmatch(trial["scenario"]) and
                     (trial["case_id"], trial["scenario"]) in _cells(record)) and
+                trial["variant_id"] in ({_variant(schema, trial["scenario"])} if matrix else
+                                        {"rcp-default", "rcp-baseline"}) and
                 number(trial["iteration"], integer=True, maximum=100) and trial["iteration"] > 0 and
                 trial["status"] in {"complete", "unavailable"}, "invalid public resource trial")
         key = (trial["case_id"], trial.get("scenario"), trial["variant_id"], trial["iteration"])
@@ -524,8 +552,8 @@ def validate(value, record):
                 "invalid public process metrics")
         if with_roles:
             roles = trial["roles"]
-            # a local copy has no daemons; a remote copy names both, each with figures or without
-            require((roles is None) if trial["scenario"] == LOCAL else
+            # a local copy and a tool run have no daemons; a remote copy names both, each with figures or without
+            require((roles is None) if not _daemons(schema, trial["scenario"]) else
                     isinstance(roles, dict) and set(roles) == set(ROLES) and all(
                         role is None or metrics is not None and isinstance(role, dict) and set(role) == set(METRICS) and
                         all(number(role[key], integer=key not in {"user_seconds", "system_seconds"}) for key in METRICS)
@@ -663,13 +691,21 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations, *, remote=False, storage=""):
+def configuration_html(observations, *, remote=False, tools=False, storage=""):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
-    Remote copies are described once a run has a remote cell. `storage` is the table of what the
-    arrays did during the newest run's copies, placed under what the drives allow.
+    Remote copies are described once a run has a remote cell, and the other tools once a run has a
+    cell of one. `storage` is the table of what the arrays did during the newest run's copies,
+    placed under what the drives allow.
     """
+    other = ("" if not tools else
+        "<li><strong>Other tools.</strong> A matrix run can also time the other tools on each local copy, in "
+        "this order: <code>rcmp --metadata-compare=f:size</code> compares the copy with its source by file size, "
+        "<code>rlink</code> hard-links it into a new tree beside it, and <code>rrm</code> removes it. No cache is "
+        "dropped for a tool: it finds what the copy left in memory. A run of a tool counts when it exits cleanly "
+        "and reports the expected counts, and reports its own CPU time and peak memory. Every other removal uses "
+        "<code>rm -rf</code> and is not measured.</li>")
     # what would otherwise surprise a reader: copies of a terabyte take as long as the destination array needs
     same = ("A local copy and a remote copy of the same file set that both keep up with the array therefore take "
             "almost the same time. " if remote else "")
@@ -727,7 +763,7 @@ def configuration_html(observations, *, remote=False, storage=""):
         "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "
         "data and have no trend.</p></section>"
         "<section aria-labelledby='method'><h2 id='method'>Method</h2><ul>"
-        + copy +
+        + copy + other +
         "<li><strong>Fixtures.</strong> Fixtures are random bytes without a fixed seed, generated with "
         "<code>filegen --leaf-files</code> and a write buffer of min(file size, 1 MiB).</li>"
         "<li><strong>Binaries.</strong> Release x86-64 musl binary source revisions and digests are recorded "
@@ -862,7 +898,8 @@ def render(value, record):
     """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
     matrix = _matrix(record)
-    with_roles = value["schema"] == REMOTE_SCHEMA
+    with_roles = value["schema"] in (REMOTE_SCHEMA, TOOLS_SCHEMA)
+    tools = value["schema"] == TOOLS_SCHEMA
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged.</p>"
@@ -874,8 +911,9 @@ def render(value, record):
             "journal remains in private retained evidence.</p>")
     rows = []
     for trial in value["trials"]:
-        # one row for each measured process: the copy command and, for a remote copy, each daemon
-        processes = [("rcp", trial["metrics"])] if with_roles else [(None, trial["metrics"])]
+        # one row for each measured process: the copy command or the tool and, for a remote copy, each daemon
+        command = trial["scenario"] if matrix and trial["scenario"] in TOOL_VARIANTS and tools else "rcp"
+        processes = [(command, trial["metrics"])] if with_roles else [(None, trial["metrics"])]
         if with_roles and trial["roles"] is not None:
             processes += [(role + " rcpd", trial["roles"][role]) for role in ROLES]
         for process, metrics in processes:
@@ -890,7 +928,8 @@ def render(value, record):
                         "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
     if rows:
         text += ("<div class='table-scroll'><table class='data'><thead><tr>" +
-            ("<th>File set</th><th>Scenario</th><th>Copy</th>" + ("<th>Process</th>" if with_roles else "")
+            ("<th>File set</th><th>Scenario</th><th>" + ("Copy or run" if tools else "Copy") + "</th>" +
+             ("<th>Process</th>" if with_roles else "")
              if matrix else "<th>Case</th><th>Variant</th><th>Repeat</th>") +
             "<th>Resource status</th><th>User CPU s</th><th>System CPU s</th><th>Peak RSS KiB</th>"
             "<th>Voluntary switches</th><th>Involuntary switches</th><th>Minor faults</th><th>Major faults</th>"
@@ -920,7 +959,8 @@ def render(value, record):
             continue
         text += ("<details><summary>Sampled phases: " + escape(trial["case_id"]) + " / " +
             escape(trial["scenario"] if matrix else trial["variant_id"]) +
-            (" / copy " if matrix else " / repeat ") + str(trial["iteration"]) + "</summary>" +
+            (" / run " if tools and trial["scenario"] in TOOL_VARIANTS else " / copy " if matrix else " / repeat ") +
+            str(trial["iteration"]) + "</summary>" +
             system_html(trial["system"]) + "</details>")
     text += ("</details><details><summary>Run limits and source archive</summary><p>Recorded allocation limit: " +
         _display(value["limits"]["allocation_seconds"], " seconds") + "; recorded per-command timeout: " +

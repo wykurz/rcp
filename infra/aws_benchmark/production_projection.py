@@ -35,9 +35,21 @@ PUBLIC_CONTRACTS = {
         "verification": {"policy": "exit-status-summary-v1"},
         "variant": "rcp-default",
     },
+    # a matrix run that also times the other tools on its local copies: version 4, where the
+    # measurement of a tool cell names what the tool ran instead of the copy's variant
+    "rcp-production-public-report-v5": {
+        "validation": "Not verified: a copy or a tool run counts when its command exits cleanly and reports the "
+                      "expected counts.",
+        "series_contract": "aws-local-ext4-v1",
+        "verification": {"policy": "exit-status-summary-v1"},
+        "variant": "rcp-default",
+        "tool_variants": {"rcmp": "rcmp-size", "rlink": "rlink-default", "rrm": "rrm-default"},
+    },
 }
 VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 MATRIX_SCHEMA = "rcp-production-public-report-v4"
+TOOLS_SCHEMA = "rcp-production-public-report-v5"
+MATRIX_SCHEMAS = (MATRIX_SCHEMA, TOOLS_SCHEMA)
 CELL_OUTCOMES = ("complete", "failed", "timed_out", "interrupted", "not_run")
 MAX_CELLS = 64
 
@@ -67,6 +79,11 @@ def comparison_label(identity, controller):
     return "Same source revision; different binary digests (not A/A)"
 
 
+def matrix_schema(scenarios):
+    """The version of a matrix run's record: fixed by the scenarios of its suite, never by its outcome."""
+    return TOOLS_SCHEMA if set(scenarios) & set(PUBLIC_CONTRACTS[TOOLS_SCHEMA]["tool_variants"]) else MATRIX_SCHEMA
+
+
 def qualification_outcome(value):
     return value.get("qualification_outcome", "passed" if value["benchmark_valid"] else "failed")
 
@@ -87,7 +104,8 @@ def collected_time(value):
 def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execution_status=None, collected_at=None):
     """Create a public projection at qualification time, before validators can drift."""
     matrix = identity["suite"] in MATRIX_SUITES
-    schema = MATRIX_SCHEMA if matrix else "rcp-production-public-report-v3" if collected_at is not None else (
+    schema = matrix_schema(scenario for _, scenario in MATRIX_SUITES[identity["suite"]]) if matrix else (
+        "rcp-production-public-report-v3" if collected_at is not None else
         "rcp-production-public-report-v2" if outcome == "evidence-unavailable" else SCHEMA)
     contract = PUBLIC_CONTRACTS[schema]
     value = dict(schema=schema, run_key=run_key, retirement_sha256="0" * 64,
@@ -116,7 +134,8 @@ def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execu
             for cell in raw["cells"] if cell["outcome"]["status"] == "complete"]
         value["verification"] = evidence["expected_verification"]
         value["timestamp"] = raw["timestamp"]
-        value["note"] = f"Each measurement is the median of {raw['context']['repetitions']} copies."
+        value["note"] = (f"Each measurement is the median of {raw['context']['repetitions']} copies" +
+                         (" or tool runs." if schema == TOOLS_SCHEMA else "."))
     elif valid:
         require(raw is not None and raw["status"] == "complete", "successful projection requires complete measurements")
         value["measurements"] = [{
@@ -166,7 +185,7 @@ def validate_public(value):
         require(value.get("qualification_outcome") in {"passed", "failed", "evidence-unavailable"} and
                 (value["qualification_outcome"] == "passed") == value["benchmark_valid"],
                 "invalid public qualification outcome")
-    matrix = value["schema"] == MATRIX_SCHEMA
+    matrix = value["schema"] in MATRIX_SCHEMAS
     if matrix:
         fields.update({"qualification_outcome", "cells", "diagnostics"})
         require(value.get("qualification_outcome") in {"passed", "failed", "evidence-unavailable"} and
@@ -230,7 +249,9 @@ def validate_public(value):
         require(isinstance(item, dict) and set(item) == {"case_id", "variant_id", "series_id", "median", "samples"} | (
                 {"scenario"} if matrix else set()) and
                 all(isinstance(item[key], str) and 0 < len(item[key]) <= 256 for key in ("case_id", "variant_id", "series_id")) and
-                (not matrix or item["variant_id"] == contract["variant"]) and
+                # a copy is the one copy variant; in a record with tool cells, a tool cell is its tool's
+                (not matrix or item["variant_id"] == contract.get("tool_variants", {}).get(
+                    item["scenario"], contract["variant"])) and
                 results.measurements.nonnegative(item["median"]) and
                 isinstance(item["samples"], list) and 0 < len(item["samples"]) <= 100 and
                 all(results.measurements.nonnegative(sample) for sample in item["samples"]),

@@ -11,6 +11,7 @@ from botocore.exceptions import ClientError, ReadTimeoutError
 import urllib.error
 
 from . import production_client as client
+from .common import BINARIES
 
 
 FUNCTION = "arn:aws:lambda:us-east-1:123456789012:function:admission"
@@ -83,8 +84,8 @@ class ProductionClientTests(unittest.TestCase):
 
     def test_exhausted_same_capability_upload_retries_retain_receipt_without_seal(self):
         api, uploader, token = Mock(), Mock(side_effect=TimeoutError("sensitive URL")), Mock(return_value="sensitive JWT")
-        inputs = {name: b"bytes" for name in client.BINARIES}
-        value = receipt(uploads={name: {} for name in client.BINARIES})
+        inputs = {name: b"bytes" for name in BINARIES}
+        value = receipt(uploads={name: {} for name in BINARIES})
         api.invoke.return_value = response(value)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipt.json"
@@ -112,10 +113,10 @@ class ProductionClientTests(unittest.TestCase):
 
     def test_uploads_all_six_then_seals_using_a_fresh_signed_token(self):
         api, uploader, token = Mock(), Mock(), Mock(side_effect=["begin-token", "seal-token"])
-        api.invoke.side_effect = [response(receipt(uploads={name: {} for name in client.BINARIES})),
+        api.invoke.side_effect = [response(receipt(uploads={name: {} for name in BINARIES})),
                                   response(receipt(state="armed", execution_arn=EXECUTION, execution_status="submitted"))]
         with tempfile.TemporaryDirectory() as directory:
-            result = self.submit(api, FUNCTION, {}, {name: b"x" for name in client.BINARIES},
+            result = self.submit(api, FUNCTION, {}, {name: b"x" for name in BINARIES},
                 Path(directory) / "receipt.json", audience="admission", bucket="bucket", region="region",
                 token_reader=token, uploader=uploader)
         self.assertEqual(result["execution_status"], "submitted")
@@ -128,12 +129,12 @@ class ProductionClientTests(unittest.TestCase):
     def test_lost_begin_and_seal_responses_reconcile_same_attempt_with_fresh_tokens(self):
         api, uploader = Mock(), Mock()
         transient = ReadTimeoutError(endpoint_url="https://private.invalid")
-        api.invoke.side_effect = [transient, response(receipt(uploads={name: {} for name in client.BINARIES})),
+        api.invoke.side_effect = [transient, response(receipt(uploads={name: {} for name in BINARIES})),
             transient, response(receipt(state="armed", execution_arn=EXECUTION, execution_status="RUNNING"))]
         tokens = Mock(side_effect=["begin-one", "begin-two", "seal-one", "seal-two"])
         sleeps = Mock()
         with tempfile.TemporaryDirectory() as directory:
-            result = self.submit(api, FUNCTION, {"pinned": True}, {name: b"x" for name in client.BINARIES},
+            result = self.submit(api, FUNCTION, {"pinned": True}, {name: b"x" for name in BINARIES},
                 Path(directory) / "receipt.json", audience="admission", bucket="bucket", region="us-east-1",
                 token_reader=tokens, uploader=uploader, sleep=sleeps)
         self.assertEqual(result["execution_status"], "RUNNING")
@@ -159,10 +160,10 @@ class ProductionClientTests(unittest.TestCase):
     def test_immediate_coordinator_progress_after_seal_is_verified_submission(self):
         for phase in ("launching", "uncertain", "requested"):
             api = Mock()
-            api.invoke.side_effect = [response(receipt(uploads={name: {} for name in client.BINARIES})),
+            api.invoke.side_effect = [response(receipt(uploads={name: {} for name in BINARIES})),
                 response(receipt(state=phase, execution_arn=EXECUTION, execution_status="submitted"))]
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
-                result = self.submit(api, FUNCTION, {}, {name: b"x" for name in client.BINARIES},
+                result = self.submit(api, FUNCTION, {}, {name: b"x" for name in BINARIES},
                     Path(directory) / "receipt.json", audience="admission", bucket="bucket", region="us-east-1",
                     token_reader=lambda _: "token", uploader=Mock())
             self.assertEqual(result["state"], phase)
@@ -221,11 +222,13 @@ class ProductionClientTests(unittest.TestCase):
         self.assertEqual(operation.call_count, 1)
         sleep.assert_not_called()
         api, uploader = Mock(), Mock()
-        api.invoke.return_value = response(receipt(uploads={name: {} for name in client.BINARIES},
+        api.invoke.return_value = response(receipt(uploads={name: {} for name in BINARIES},
             upload_deadline=datetime.fromtimestamp(NOW + 20, timezone.utc).isoformat()))
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "window exhausted"):
-            self.submit(api, FUNCTION, {}, {}, Path(directory) / "receipt.json", audience="admission",
-                bucket="bucket", region="us-east-1", token_reader=lambda _: "token", uploader=uploader)
+            # the uploads are the binaries the client holds, so it holds them here too
+            self.submit(api, FUNCTION, {}, {name: b"x" for name in BINARIES}, Path(directory) / "receipt.json",
+                audience="admission", bucket="bucket", region="us-east-1", token_reader=lambda _: "token",
+                uploader=uploader)
         uploader.assert_not_called()
         self.assertEqual(api.invoke.call_count, 1)
 

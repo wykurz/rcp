@@ -94,7 +94,8 @@ class Fixture:
             lt_id="lt-" + "1" * 17, lt_version="9", ami="ami-" + "2" * 17, source="f" * 40,
             subnet="subnet-" + "3" * 17, security_group="sg-" + "4" * 17,
             profile_arn="arn:aws:iam::123456789012:instance-profile/worker")
-        request = durable.request(expected, NOW, dict.fromkeys(common.BINARIES, "d" * 64), pins, **timing)
+        request = durable.request(expected, NOW, dict.fromkeys(common.suite_binaries(suite), "d" * 64), pins,
+                                  **timing)
         attempt = durable.attempt(request, 1, NOW)
         self.instance = dict(InstanceId=INSTANCE, State=dict(Name="terminated", Code=48),
             LaunchTime=NOW + timedelta(seconds=60), ImageId=pins["ami"], InstanceType="c5d.24xlarge",
