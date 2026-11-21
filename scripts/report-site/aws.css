@@ -51,6 +51,8 @@
 .aws .overview-title { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .1rem 1.5rem; margin: 1.7rem 0 0; padding-top: 1rem; border-top: 1px solid var(--border); }
 .aws .overview-title h2 { margin: 0; padding: 0; border: 0; font-size: 1.3rem; }
 .aws .overview-title a { font-size: .9rem; }
+/* a row that leads to several pages says in words what its tiles have in common */
+.aws .overview-title span { color: var(--muted); font-size: .9rem; }
 .aws .overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .8rem; margin: .7rem 0 .4rem; }
 /* a tile is as tall as the tallest of its row; its plot sits at the bottom, level with its neighbours' */
 .aws .overview .metric { display: flex; flex-direction: column; max-width: none; padding: .8rem .85rem .6rem; }
