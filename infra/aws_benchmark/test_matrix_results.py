@@ -39,15 +39,20 @@ def matrix_record(suite, outcomes=None, **context_changes):
             file_sets.append(dict(case=cases[case_id], expected_counts=matrix.operations.expected_counts(cases[case_id]),
                                   generation=dict(status="ok", elapsed_seconds=10.0, exit_code=0, message=None)))
         outcome = dict(status="complete", stage=None, message=None) | (outcomes or {}).get(index, {})
+        # a tool cell runs its tool on the copies of the local cell; every other cell copies
+        tool = matrix.TOOLS.get(scenario)
+        ran = variant if tool is None else copy.deepcopy(tool["variant"])
         copies = []
         for iteration in range(1, (context["repetitions"] if outcome["status"] == "complete" else 1) + 1):
             done = outcome["status"] == "complete"
             copies.append(dict(iteration=iteration, trial_index=trial, status="ok" if done else "failed",
                 elapsed_seconds=600.0 + index + iteration / 10, exit_codes=[0] if done else [3], timed_out=False,
-                command=["rcp", "--summary", matrix.SUMMARY_FORMAT, "source", "destination"], logs=[]))
+                command=[ran["tool"], *ran["args"], matrix.SUMMARY_FORMAT, "source", "destination"], logs=[]))
             if done:
                 # only a copy that finished has a summary to take figures from
                 copies[-1]["resources"] = dict(status="complete", metrics=dict(METRICS))
+                if tool is not None:
+                    copies[-1]["tool_summary"] = dict.fromkeys(tool["counts"], 1)
                 if scenario == "remote":
                     # the summary of a remote copy also carries what each daemon reported
                     copies[-1]["role_resources"] = {role: dict(status="complete", metrics=dict(METRICS, **figures))
@@ -56,8 +61,8 @@ def matrix_record(suite, outcomes=None, **context_changes):
         if outcome["status"] == "not_run":
             copies = []
         samples = [item["elapsed_seconds"] for item in copies]
-        cells.append(dict(case_id=case_id, scenario=scenario, variant=variant,
-            cell_id=matrix.cell_id(cases[case_id], scenario, variant, context), outcome=outcome, copies=copies,
+        cells.append(dict(case_id=case_id, scenario=scenario, variant=ran,
+            cell_id=matrix.cell_id(cases[case_id], scenario, ran, context), outcome=outcome, copies=copies,
             summary=dict(unit="seconds", median=statistics.median(samples), minimum=min(samples),
                          maximum=max(samples), samples=samples) if outcome["status"] == "complete" else None))
     complete = sum(cell["outcome"]["status"] == "complete" for cell in cells)
@@ -65,7 +70,8 @@ def matrix_record(suite, outcomes=None, **context_changes):
         status="complete" if complete == len(cells) else "partial" if complete else "failed",
         revision=dict(commit=None, branch=None, dirty=None), context=context,
         tools={name: dict(path="/run/rcp-benchmark/candidate/" + name, version=name + " 1", sha256="d" * 64)
-               for name in ("filegen", "rcp", "rcpd")},
+               for name in ("filegen", "rcp", "rcpd", *(name for name in matrix.TOOLS if any(
+                   scenario == name for _, scenario in contract["cells"])))},
         file_sets=file_sets, cells=cells, phase_seconds=dict(total=1.0))
     return matrix.validate(record)
 

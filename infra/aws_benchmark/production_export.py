@@ -207,8 +207,9 @@ def render(value, *, diagnostics=None):
     for scenario, case, item in ((scenario, case, points[scenario][case]) for case in measured
                                  for scenario in history.SCENARIOS if case in points[scenario]):
         html += ("<h3>" + history.CASES[case] + (" · " + history.SCENARIOS[scenario] if several else "") +
-            "</h3><p>This run as one history point: the median of the "
-            "copies made by the build under test" + (", counting every copy because baseline and candidate "
+            "</h3><p>This run as one history point: the median of the " +
+            ("runs of the tool by the build under test" if scenario in history.TOOLS else
+             "copies made by the build under test") + (", counting every copy because baseline and candidate "
             "binaries are identical" if item["pooled"] else "") + ".</p><div class='" +
             history.layout(scenario) + "'>")
         for metric, title, unit in history.panels(scenario):
@@ -218,12 +219,15 @@ def render(value, *, diagnostics=None):
                 if data is None else
                 "<p class='value'>" + history.rounded(data["value"]) + " <span class='unit'>" + unit +
                 "</span></p><p class='delta'>" + history.rounded(data["low"]) + "–" + history.rounded(data["high"]) +
-                " " + unit + " over " + history.plural(data["samples"], "copy", "copies") + "</p>") + "</div>"
+                " " + unit + " over " + history.plural(data["samples"], *item["noun"]) + "</p>") + "</div>"
         html += "</div>"
     if value["measurements"]:
+        # a run that timed the other tools has samples that are not copies
+        counted = "Copies or runs" if matrix and any(
+            cell["scenario"] in history.TOOLS for cell in value["cells"]) else "Copies"
         html += ("<h3>Frozen measurements</h3><div class='table-scroll'><table class='data'><thead><tr><th>Case</th>"
             "<th>" + ("Scenario" if matrix else "Variant") +
-            "</th><th>Copies</th><th>Median s</th><th>Samples s</th><th>Frozen series</th></tr></thead>"
+            "</th><th>" + counted + "</th><th>Median s</th><th>Samples s</th><th>Frozen series</th></tr></thead>"
             "<tbody>" + "".join(
                 "<tr><td><code>" + escape(item["case_id"]) + "</code></td><td><code>" +
                 escape(item["scenario"] if matrix else item["variant_id"]) +

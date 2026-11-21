@@ -301,6 +301,21 @@ a local copy. A copy without figures for its command publishes none for its daem
 decides the version, so a stored companion never changes it, and the versions do not stand in for
 each other.
 
+A run of a suite that also times the other tools (`+tools` in its name) publishes record version 5,
+`rcp-production-public-report-v5`. It is version 4 with two differences. The measurement of a tool
+cell names what the tool ran in `variant_id` (`rcmp-size`, `rlink-default`, `rrm-default`) where a
+copy's is `rcp-default`, and `validation` reads "Not verified: a copy or a tool run counts when its
+command exits cleanly and reports the expected counts." A tool cell is a cell like any other: its
+`scenario` is `rcmp`, `rlink` or `rrm`, its samples are the durations of the tool's three runs, and
+it has a series of its own. The suite decides the version, so a suite without tool cells keeps
+publishing version 4, and the copies of a version 5 record continue the series of the same cells in
+version 4 records.
+
+The diagnostics companion of a version 5 record is `rcp-public-resource-diagnostics-v4`: version 3
+where every trial carries the `variant_id` of its own cell, and only a remote copy has `roles`. A
+tool run is one process, so its `metrics` are the tool's own and its `roles` is `null`, as for a
+local copy.
+
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
 marked setup change (`Copy check`), not as a new line. The run page lists every cell with its result
 and, for anything not measured, what happened. A run that measured only some of its cells is shown
@@ -320,6 +335,14 @@ a remote copy the same way. The `rcp` command's own figures are in each section'
 remote row, that page and its navigation entry appear with the first run that has a remote cell. A
 run page with remote cells summarizes each cell under its file set and scenario and lists the
 resources of every process of a remote copy.
+
+Each of the other tools has a page as well, with the first run that has a cell of it: `rcmp.html`,
+`rlink.html` and `rrm.html` plot the tool's duration, CPU time and peak memory, one section per file
+set. A tool's page leaves out the file sets on which it takes milliseconds, and says so: `rcmp` and
+`rlink` are plotted for the 1 MB and 1 KB file sets, which hold a million and ten million files, and
+`rrm` for all four, since removing a terabyte takes time whatever the number of files. The AWS
+benchmarks page gains one row for the tools, each on the 1 KB file set. The copies' rows, pages and
+trends are unchanged by tool cells.
 
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe
 drives, which AWS's instance-store specification for compute optimized instances gives together as

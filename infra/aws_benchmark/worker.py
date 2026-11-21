@@ -582,7 +582,8 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
         metadata["apt_units"] = check_quiet(lambda argv, *, timeout: subprocess.run(
             argv, check=True, text=True, capture_output=True,
             timeout=min(timeout, budget.left(RESERVE))).stdout)
-        for key in BINARIES:
+        # a plan names what its suite runs; a window from before plans has the first three tools
+        for key in durable_plan_contract(window["plan"])["binaries"] if bounded else BINARIES:
             data = retry_io(lambda: get_bytes(s3, bucket, paths.binary(key), MAX_BINARY), budget, reserve=RESERVE)
             require(digest(data) == request["sha256"][key], "binary digest mismatch")
             path = STATE / key

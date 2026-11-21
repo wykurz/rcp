@@ -2,9 +2,10 @@
 
 The history follows the build under test with default settings: one trend per
 file set and scenario, joined across code versions. The first page shows the
-copy duration of every trend at once; each scenario has a page of its own with
-every metric. Frozen records and series IDs are read, never rewritten; every
-emitted string is escaped and no script is produced.
+duration of the copies of every file set at once, and of the other tools on the
+file set with the most files; each scenario has a page of its own with every
+metric. Frozen records and series IDs are read, never rewritten; every emitted
+string is escaped and no script is produced.
 """
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,7 +24,13 @@ MAX_PLOT_RUNS = 32
 CURRENT, REFERENCE = "rcp-default", "rcp-baseline"
 # what a cell's scenario means to a reader; each has its own trends
 LOCAL, REMOTE = "local", "remote"
-SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback"}
+# the other tools, each timed on every local copy, in the order they run
+TOOLS = ("rcmp", "rlink", "rrm")
+SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback", "rcmp": "Compare with rcmp",
+             "rlink": "Hard-link with rlink", "rrm": "Remove with rrm"}
+# what a tool does with a file set, after "files of … each"
+ACTIONS = {"rcmp": "compared with their source by rcmp, by file size,", "rlink": "hard-linked into a new tree by rlink",
+           "rrm": "removed by rrm"}
 CASES = {
     "bulk-1g-1tb": "1 GB files",
     "bulk-100m-1024gb": "100 MB files",
@@ -32,6 +39,12 @@ CASES = {
 }
 METRICS = (
     ("duration", "Copy duration", "s"),
+    ("cpu", "CPU time", "s"),
+    ("memory", "Peak memory", "MiB"),
+)
+# a tool run is one process, like a local copy
+TOOL_METRICS = (
+    ("duration", "Duration", "s"),
     ("cpu", "CPU time", "s"),
     ("memory", "Peak memory", "MiB"),
 )
@@ -51,11 +64,19 @@ COLUMNS = {
              ("destination_memory", "Destination rcpd peak RSS MiB"), ("cpu", "rcp CPU s"),
              ("memory", "rcp peak RSS MiB")),
 }
-# each row of the first page: its title, the page with every metric, and what that page adds
+COLUMNS.update({tool: COLUMNS[LOCAL] for tool in TOOLS})
+# each scenario's title where its trends are listed, the page with every metric, and what that page adds
 ROWS = {
     LOCAL: ("Local copies", "local.html", "CPU time, peak memory and data tables"),
     REMOTE: ("Remote copies", "remote.html", "CPU time and peak memory of each rcpd, and data tables"),
 }
+ROWS.update({tool: (SCENARIOS[tool], tool + ".html", "CPU time, peak memory and data tables") for tool in TOOLS})
+# the file sets a tool's page plots. What a tool does with a thousand files takes milliseconds:
+# that is noise, not a trend, so only the sets where a tool takes real time are plotted
+PLOTTED = {"rcmp": ("bulk-1m-1024gb", "tiny-1k-10240k"), "rlink": ("bulk-1m-1024gb", "tiny-1k-10240k"),
+           "rrm": tuple(CASES)}
+# the file set whose tool trends the first page shows: the one with the most files
+MOST_FILES = "tiny-1k-10240k"
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 DAY = 86400
 
@@ -117,14 +138,23 @@ def time_html(text):
     return "<time datetime='" + escape(text) + "'>" + escape(moment(utc(text))) + "</time>"
 
 
+def present(records):
+    """The scenarios with a page, in page order: local copies, and each other one that some run has a cell of.
+
+    A cell counts whether it was measured or not, so a page appears with the first run that tried.
+    """
+    seen = {cell["scenario"] for value in records.values() for cell in value.get("cells", ())}
+    return tuple(scenario for scenario in SCENARIOS if scenario == LOCAL or scenario in seen)
+
+
 def has_remote(records):
     """Whether any run has a remote cell, measured or not: then remote copies have their page."""
-    return any(cell["scenario"] == REMOTE for value in records.values() for cell in value.get("cells", ()))
+    return REMOTE in present(records)
 
 
 def panels(scenario):
     """The metrics plotted for a scenario, as (key, title, unit)."""
-    return METRICS if scenario == LOCAL else REMOTE_METRICS
+    return METRICS if scenario == LOCAL else TOOL_METRICS if scenario in TOOLS else REMOTE_METRICS
 
 
 def layout(scenario):
@@ -133,7 +163,17 @@ def layout(scenario):
     A remote copy has a tile for each process. The stylesheet stands them in a column per measure,
     the destination under the source, by their position in `REMOTE_METRICS`.
     """
-    return "metrics" if scenario == LOCAL else "metrics processes"
+    return "metrics processes" if scenario == REMOTE else "metrics"
+
+
+def samples(scenario):
+    """What one sample of a scenario is called, as (one, many): a copy, or a run of a tool."""
+    return ("run", "runs") if scenario in TOOLS else ("copy", "copies")
+
+
+def plotted(scenario):
+    """The file sets with a trend under a scenario, in page order."""
+    return PLOTTED.get(scenario, tuple(CASES))
 
 
 def _points(value, extra, scenario=LOCAL):
@@ -141,6 +181,9 @@ def _points(value, extra, scenario=LOCAL):
     started, identity = utc(value["timestamp"]), value["identity"]
     # identical binaries make the reference copies further samples of the same build
     roles = (CURRENT, REFERENCE) if value["comparison"] == projection.IDENTICAL_BINARIES else (CURRENT,)
+    if scenario in TOOLS:
+        # a tool cell is measured under what its tool ran, as its record names it
+        roles = (projection.PUBLIC_CONTRACTS[projection.TOOLS_SCHEMA]["tool_variants"][scenario],)
     selected, outside, seen = {}, 0, set()
     for measurement in value["measurements"]:
         # a record without scenarios predates the matrix: all of its copies are local
@@ -148,9 +191,10 @@ def _points(value, extra, scenario=LOCAL):
         require(key not in seen, "duplicate history case and variant")
         seen.add(key)
         if key[1] == scenario:
-            if key[0] in CASES and key[2] in roles:
+            if key[0] in plotted(scenario) and key[2] in roles:
                 selected.setdefault(key[0], []).append(measurement)
-            else:
+            elif key[0] not in CASES or key[2] not in roles:
+                # a file set that a tool's page leaves out on purpose is not one it failed to place
                 outside += 1
         elif key[1] not in SCENARIOS and scenario == LOCAL:
             # a scenario without a page is reported once, next to the local trends; a measurement
@@ -169,7 +213,7 @@ def _points(value, extra, scenario=LOCAL):
             run_key=value["run_key"], run=identity["run"], revision=identity["candidate"],
             timestamp=started.isoformat().replace("+00:00", "Z"), at=started.timestamp(),
             date=moment(started), day=f"{_day(started)} {started.year}",
-            collected_at=value.get("collected_at"),
+            collected_at=value.get("collected_at"), noun=samples(scenario),
             pooled=len(items) > 1, series_contract=value["series_contract"],
             copies=[dict(variant=item["variant_id"], series_id=item["series_id"]) for item in items],
             setup=None if extra is None else extra["setup"],
@@ -224,7 +268,7 @@ def model(records, companions, scenario=LOCAL):
     require(isinstance(records, dict) and len(records) <= projection.MAX_PUBLIC_HISTORY_RUNS and
             isinstance(companions, dict) and set(companions) <= set(records),
             "history input exceeds its bounded record set")
-    cases, outside = {case: [] for case in CASES}, 0
+    cases, outside = {case: [] for case in plotted(scenario)}, 0
     for run_key, value in sorted(records.items()):
         projection.validate_public(value)
         require(value["run_key"] == run_key, "history record identity differs")
@@ -318,7 +362,7 @@ def _describe(item, metric, unit):
     data = item[metric]
     return (f"{rounded(data['value'])} {unit} · {item['date']} · run {item['run']} · commit {item['revision'][:7]}"
             f" · range {rounded(data['low'])}–{rounded(data['high'])} {unit} · " +
-            plural(data["samples"], "copy", "copies") +
+            plural(data["samples"], *item["noun"]) +
             ("" if not item["changes"] else " · recorded setup change: " +
              ", ".join(name for name, _, _ in item["changes"])))
 
@@ -427,7 +471,7 @@ def _chart(points, metric, title, unit, frame=DETAIL):
                 "</tspan><tspan dx='6'>" + escape(f"{rounded(data['low'])}–{rounded(data['high'])}") + "</tspan></text>"
                 "<text x='10' y='38'>" + escape(item["date"]) + "</text>"
                 "<text x='10' y='53'>" + escape(f"commit {item['revision'][:7]} · " +
-                                                 plural(data["samples"], "copy", "copies")) + "</text>"
+                                                 plural(data["samples"], *item["noun"])) + "</text>"
                 "</g></g></a>")
     return svg + "</svg>"
 
@@ -481,10 +525,18 @@ def _decimal(size):
     return format(size / unit, "g") + " " + name
 
 
+def _reading(scenario):
+    """One line under a set of plots: what a point and its bar are, and where the rest is explained."""
+    of, each = (("runs of the tool", "run") if scenario in TOOLS else ("copies", "copy"))
+    return ("<p class='reading'>Each point is one run: the median of its " + of + ", with a bar from the fastest "
+            "to the slowest " + each + ". <a href='setups.html#reading'>How to read these plots</a>.</p>")
+
+
 def _file_set(case, points, scenario):
     shape = diagnostics.CASE_SHAPES[case]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
     how = ("copied locally by rcp with default settings" if scenario == LOCAL else
+           ACTIONS[scenario] + " after each local copy" if scenario in TOOLS else
            "copied by rcp through a source and a destination rcpd over loopback, with default settings")
     html = ("<section id='history-" + case + "' aria-labelledby='history-" + case + "-title'>"
         "<h2 id='history-" + case + "-title'>" + CASES[case] + "</h2><p class='dataset'>" +
@@ -492,8 +544,7 @@ def _file_set(case, points, scenario):
         + how + " · " + plural(len(points), "run", "runs") +
         "</p><div class='" + layout(scenario) + "'>" +
         "".join(_panel(case, points, metric, title, unit) for metric, title, unit in panels(scenario)) +
-        "</div><p class='reading'>Each point is one run: the median of its copies, with a bar from the fastest "
-        "to the slowest copy. <a href='setups.html#reading'>How to read these plots</a>.</p>")
+        "</div>" + _reading(scenario))
     changed = [item for item in points if item["changes"]]
     if changed:
         html += "<ul class='changes'>"
@@ -506,7 +557,8 @@ def _file_set(case, points, scenario):
                 (" The trend starts a new line here." if item["starts_segment"] else "") + "</li>")
         html += "</ul>"
     html += ("<details><summary>Data table</summary><div class='table-scroll'><table class='data'><thead><tr>"
-        "<th>Run start (worker-reported)</th><th>Run</th><th>Commit</th><th>Copies</th>" +
+        "<th>Run start (worker-reported)</th><th>Run</th><th>Commit</th><th>" + samples(scenario)[1].title() +
+        "</th>" +
         "".join("<th>" + header + "</th>" for _, header in COLUMNS[scenario]) + "<th>Collected</th>"
         "<th>Plotted copies and frozen series</th><th>Observed setup</th></tr></thead><tbody>")
     for item in reversed(points):
@@ -536,11 +588,25 @@ def _render(cases, outside, limit, unmeasured, scenario, several):
                  "runs yet for " + (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
     if limit is not None:
         html += _window(limit, "<a href='index.html#runs'>list of runs</a>")
+    left_out = [case for case in CASES if case not in plotted(scenario)]
+    if left_out:
+        html += _left_out(scenario, left_out)
     if outside:
         html += ("<p class='window'>" + plural(outside, "qualified measurement is", "qualified measurements are") +
                  " outside these trends (reference builds, other variants, scenarios or file sets); "
                  "see the run pages.</p>")
     return html + "</section>"
+
+
+def _left_out(scenario, cases):
+    """Say which file sets a tool's page does not plot, and why: there the tool takes no measurable time."""
+    counts = []
+    for case in cases:
+        shape = diagnostics.CASE_SHAPES[case]
+        counts.append(f"{math.prod(shape['directory_widths']) * shape['files_per_leaf']:,}" +
+                      (" files" if not counts else "") + " of the " + CASES[case].replace(" files", "") + " set")
+    return ("<p class='window'>" + scenario + " is timed on every file set, but on the " + " and the ".join(counts) +
+            " it takes milliseconds: those runs are on the run pages and are not plotted.</p>")
 
 
 def _window(limit, where):
@@ -582,7 +648,7 @@ def render(records, companions, scenario=LOCAL):
     cases, outside = model(records, companions, scenario)
     # a file set is unmeasured only when no run ever measured it, whatever the plots show
     unmeasured = [case for case, points in cases.items() if not points]
-    several = scenario != LOCAL or has_remote(records)
+    several = scenario != LOCAL or len(present(records)) > 1
     return _fit({scenario: cases}, lambda windows, limit: _render(
         windows[scenario], outside, limit, unmeasured, scenario, several))
 
@@ -612,9 +678,37 @@ def _tile(case, points, scenario, page, beside):
                   opening=opening, notes=notes)
 
 
+def _tool_tile(scenario, points):
+    """One tool's duration on the file set with the most files, leading to that tool's page."""
+    title, page, _ = ROWS[scenario]
+    link = ("<a href='" + page + "#history-" + MOST_FILES + "' aria-label='" + title + ", " + CASES[MOST_FILES] +
+            "'>" + title + "</a>")
+    opening = _opening("overview-" + scenario + "-" + MOST_FILES, "data-overview='" + scenario + "'",
+                       link if points else title, "overview-tools-title")
+    if not points:
+        # the tile keeps its place, so that the row always names the same tools in the same order
+        return opening + "</figcaption><p class='delta'>No qualified run yet.</p></figure>"
+    return _panel(MOST_FILES, points, "duration", title + ", duration", "s", frame=COMPACT, opening=opening)
+
+
+def _tools_row(windows):
+    """The row of the other tools: each on the one file set where it has the most to do."""
+    shape = diagnostics.CASE_SHAPES[MOST_FILES]
+    files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
+    return ("<section id='overview-tools' aria-labelledby='overview-tools-title'>"
+            "<div class='overview-title'><h2 id='overview-tools-title'>Other tools</h2><span>" +
+            f"{files:,} files of {_decimal(shape['file_size_bytes'])}, after each local copy" + "</span></div>"
+            "<div class='overview'>" + "".join(
+                _tool_tile(scenario, windows[scenario][MOST_FILES]) for scenario in TOOLS if scenario in windows) +
+            "</div></section>")
+
+
 def _overview(windows, limit, several, local):
     html = "<section id='history' aria-label='Copy duration of every file set'>"
     for scenario, cases in windows.items():
+        if scenario in TOOLS:
+            # the tools share one row, after the copies
+            continue
         title, page, more = ROWS[scenario]
         measured = any(cases.values())
         # one line heads a row, its title and the way to its page: both rows are meant to fit one screen
@@ -628,23 +722,32 @@ def _overview(windows, limit, several, local):
             # once there are two kinds of run, a row without this kind may well have the other
             html += "<p class='empty'>No qualified " + (scenario + " " if several else "") + "runs yet.</p>"
         html += "</section>"
+    tools = any(scenario in TOOLS for scenario in windows)
+    if tools:
+        html += _tools_row(windows)
     if any(points for cases in windows.values() for points in cases.values()):
-        html += ("<p class='reading'>Each point is one run: the median of its copies, with a bar from the fastest "
-                 "to the slowest copy. <a href='setups.html#reading'>How to read these plots</a>.</p>")
+        html += ("<p class='reading'>Each point is one run: the median of its copies" +
+                 (" or of a tool's runs" if tools else "") + ", with a bar from the fastest "
+                 "to the slowest" + ("" if tools else " copy") +
+                 ". <a href='setups.html#reading'>How to read these plots</a>.</p>")
     if limit is not None:
         html += _window(limit, "list below")
     return html + "</section>"
 
 
 def overview(records, companions):
-    """Show the copy duration of every file set at once: a row of small plots for each scenario.
+    """Show the copy duration of every file set at once: a row of small plots for each kind of copy.
 
     The other metrics and the data tables are on the page of each scenario. A row for remote
-    copies appears with the first run that has a remote cell.
+    copies appears with the first run that has a remote cell, and a row for the other tools with
+    the first run that has a cell of one.
     """
-    several = has_remote(records)
-    models = {scenario: model(records, companions, scenario)[0]
-              for scenario in ((LOCAL, REMOTE) if several else (LOCAL,))}
+    shown = present(records)
+    several = len(shown) > 1
+    models = {scenario: model(records, companions, scenario)[0] for scenario in shown if scenario not in TOOLS}
+    # the other tools appear with the first run that has a cell of one, on the file set with the most files
+    models.update({scenario: {MOST_FILES: model(records, companions, scenario)[0][MOST_FILES]}
+                   for scenario in shown if scenario in TOOLS})
     # a remote plot is compared with the local copy of its own run, whether or not that copy is still plotted
     return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL]))
 
@@ -661,10 +764,14 @@ def storage_html(run, href, rows):
         return ""
     rate = lambda value: "unavailable" if value is None else f"{value / 10 ** 9:.2f} GB/s"
     share = lambda value: "unavailable" if value is None else f"{value * 100:.0f}%"
-    html = ("<p>What the arrays and the processors did during the copies of run <a href='" +
+    # a table that also has rows of the other tools says so; one of copies alone reads as it always did
+    tools = any(row["scenario"] in TOOLS for row in rows)
+    html = ("<p>What the arrays and the processors did during the copies " + ("and the tool runs " if tools else "") +
+            "of run <a href='" +
             escape(href, quote=True) + "'>" + escape(run) + "</a>, the newest that recorded it. Each figure is the "
-            "median of the copies of that file set.</p>"
-            "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Copy</th>"
+            "median of the copies" + (", or of the runs of a tool," if tools else "") + " of that file set.</p>"
+            "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>" +
+            ("Scenario" if tools else "Copy") + "</th>"
             "<th>Written to the destination</th><th>Destination busy</th><th>Read from the source</th>"
             "<th>Source busy</th><th>CPU busy</th></tr></thead><tbody>")
     for row in rows:
@@ -673,13 +780,25 @@ def storage_html(run, href, rows):
         html += "<tr>" + "".join("<td>" + escape(cell) + "</td>" for cell in cells) + "</tr>"
     return (html + "</tbody></table></div><p class='reading'>The figures come from the kernel's counters for "
             "each array as a whole, not its drives. They are read every ten seconds, so they cover each copy from "
-            "its first reading to its last, up to ten seconds less than the whole. Busy is the share of that time "
+            "its first reading to its last, up to ten seconds less than the whole" +
+            ("; a tool run shorter than that has no figures" if tools else "") + ". Busy is the share of that time "
             "during which the array had a request in progress. CPU busy is the share of all processors' time that "
             "was neither idle nor waiting for I/O.</p>")
 
 
-def reading_html(remote=False):
-    """Explain once how points, lines and gaps are derived; `remote` when remote copies have a page."""
+def reading_html(remote=False, tools=False):
+    """Explain once how points, lines and gaps are derived.
+
+    `remote` when remote copies have a page, `tools` when the other tools have theirs.
+    """
+    other = ("" if not tools else
+        "<li><strong>Other tools.</strong> A run can also time <code>rcmp</code>, <code>rlink</code> and "
+        "<code>rrm</code> on each of its local copies: comparing the copy with its source, hard-linking it into a "
+        "new tree, and removing it. Each tool has a page of its own (" + ", ".join(
+            '<a href="' + ROWS[tool][1] + '">' + tool + "</a>" for tool in TOOLS) + "), where a point is the median "
+        "of the tool's runs in one benchmark run, and CPU time and peak memory are the tool's own. The AWS "
+        "benchmarks page shows each tool on the file set with the most files. A tool's page leaves out the file "
+        "sets on which it takes milliseconds.</li>")
     scope = (
         "<li><strong>Scope.</strong> The plots show local copies on one host. The AWS benchmarks page shows "
         'the copy duration of every file set; <a href="local.html">Local copies</a> adds CPU time, peak memory '
@@ -731,4 +850,4 @@ def reading_html(remote=False):
         "or a recorded hardware value differs from the last recorded one: CPU model or count, architecture, "
         "storage devices, layout or filesystem. Any other recorded change, such as the kernel, is marked on "
         "the line. A field that an older run did not record is not a change.</li>"
-        + scope + "</ul></section>")
+        + scope + other + "</ul></section>")

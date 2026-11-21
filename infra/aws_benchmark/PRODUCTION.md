@@ -960,6 +960,13 @@ rcp's remote path on the one worker: rcp starts a source and a destination `rcpd
 daemons exchange the data over loopback TCP with rcp's default encryption. No network hardware and
 no added latency are involved; it measures the remote protocol, not a network.
 
+Three more scenarios time the other tools. `rcmp`, `rlink` and `rrm` each run on every copy of the
+same file set's local cell, in that order: compare the copy with its source by file size, hard-link
+it into a new tree beside it, and remove it. A tool cell is three runs of its tool and counts as a
+copy does, on its exit status and the counts of its own summary. No cache is dropped for a tool, and
+`rrm`'s run takes the place of the `rm -rf` that otherwise frees a copy.
+[Tool cells](../../docs/benchmarking.md#tool-cells) says what each one measures.
+
 A suite is named `matrix-<selection>-<scenarios>`:
 
 | Selection    | File sets                                      | Allocation | Reservation |
@@ -971,23 +978,33 @@ A suite is named `matrix-<selection>-<scenarios>`:
 | `1k`         | 1 KB files                                     | 3 hours    | computed    |
 | `commission` | two small fixtures (16 files and 10,000 files) | 3 hours    | computed    |
 
-| Scenarios      | Cells of each selected file set                            |
-| -------------- | ---------------------------------------------------------- |
-| `local`        | one local cell                                             |
-| `remote`       | one remote cell                                            |
-| `local+remote` | a local cell, then a remote cell, on one generated fixture |
+| Scenarios            | Cells of each selected file set                                  |
+| -------------------- | ---------------------------------------------------------------- |
+| `local`              | one local cell                                                   |
+| `remote`             | one remote cell                                                  |
+| `local+remote`       | a local cell, then a remote cell, on one generated fixture       |
+| `local+tools`        | a local cell, then `rcmp`, `rlink` and `rrm` cells on its copies |
+| `local+tools+remote` | the same four cells, then a remote cell                          |
 
-That is eighteen suites, for example `matrix-all-local+remote` (eight cells), `matrix-1m-remote`
-(one cell) and `matrix-commission-local+remote` (four cells on the small fixtures). The allocation
-follows the selection, not the number of cells: whether all eight cells of `matrix-all-local+remote`
-fit eight hours is not known until it has run. Cells that do not fit are reported `not_run` and the
-others count; the 1 KB file set is last.
+That is thirty suites, for example `matrix-all-local+remote` (eight cells), `matrix-1m-remote` (one
+cell), `matrix-commission-local+remote` (four cells on the small fixtures) and
+`matrix-all-local+tools+remote` (twenty cells). The allocation follows the selection, not the number
+of cells. The eight cells of `matrix-all-local+remote` took 5 h 32 min of their eight hours in the
+first full run; how long the twenty of `matrix-all-local+tools+remote` take is not known until that
+suite has run. Cells that do not fit are reported `not_run` and the others count; the 1 KB file set
+is last.
 
 A computed reservation is the ordinary three-hour one: $20 at the current price and ancillary
 allowance. A suite name selects exactly one fixed plan, as before; there is no free-form selection.
 The request keeps its two-sided shape (identical baseline and candidate revisions, six binary keys
 with identical digests), so mailbox, IAM, window and policy-manifest formats are unchanged. The
 baseline copies of the binaries are uploaded and never run.
+
+A suite with `+tools` sends six more keys, `rcmp`, `rlink` and `rrm` on both sides, twelve in all.
+Each plan names its binaries (`binary_names`), and every step holds a request to exactly those: the
+client's manifest, the upload capabilities, the sealed inputs, the worker's mailbox and the tools
+the result says it ran. The workflow builds one artifact with all six tools, and the client sends
+the part that its suite's plan names. A suite without `+tools` sends and accepts what it always did.
 
 ### Select a run by hand
 
@@ -1083,10 +1100,15 @@ by cell:
 Remote cells qualify by the same rules. A remote cell that could not reach its private SSH endpoint
 is `failed` at stage `transport`, with the reason, and the run's other cells still count.
 
+Tool cells qualify by the same rules. A tool that fails is `failed` at stage `command` or `summary`,
+and the copies and the other tools of the run still count. A tool cell whose local copy failed takes
+that copy's outcome at stage `copy`.
+
 Public records of matrix runs are version 4 (`rcp-production-public-report-v4`). Their diagnostics
-are version 2, or version 3 when the run has a remote cell, which adds each daemon's CPU and memory;
-[RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes them. Commissioning runs
-qualify like any other, and their small fixtures stay outside the trends.
+are version 2, or version 3 when the run has a remote cell, which adds each daemon's CPU and memory.
+A run of a suite with tool cells publishes version 5 and diagnostics version 4, where a tool cell is
+named by what its tool ran. [RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes
+them. Commissioning runs qualify like any other, and their small fixtures stay outside the trends.
 
 ### Deploy and commission
 
@@ -1127,6 +1149,23 @@ the extended manual window when the full matrix is among them. Scheduled request
 the policy also names the scheduled suite, its runtime and its slot
 ([The weekly schedule](#the-weekly-schedule)).
 
+Suites with `+tools` need three things of a deployment, again together:
+
+- **The stack template of this revision.** The worker may read, and the admission and runtime
+  functions may stage and copy, object keys for `rcmp`, `rlink` and `rrm` on both sides. Each of the
+  seven access lists names its keys one by one, so this is a template change, not a parameter.
+- **The server packages of this revision.** Earlier packages know three binaries and refuse a
+  manifest with any other.
+- **A worker image of this revision.** Its runner knows the tool cells, and its `worker.py` fetches
+  the binaries that the plan names, which gives it a new pinned digest and the launch template new
+  startup data.
+
+Until all three are in place, a request for such a suite is refused at admission, before any
+reservation: the deployed policy does not name the suite and the deployed packages do not know it.
+The scheduled suite stays `matrix-all-local+remote` in this revision. Change
+`production_workflow.SCHEDULED_SUITE` and the policy's `scheduled_suite` together, in a further
+reviewed step, once `matrix-all-local+tools+remote` has run by hand and its cells fit eight hours.
+
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
 minutes, counted from admission; collection follows. With the default twelve-hour capacity window
@@ -1147,6 +1186,15 @@ and its repeat from these numbers.
    names exactly one suite. Either way it is a further reviewed change.
 3. The same suite once more, to see that two runs agree. The weekly scheduled run can be that
    repeat: it is the same suite.
+
+For the tool cells, after the deployment above:
+
+1. `matrix-commission-local+tools+remote`: a few minutes of work. Expect ten of ten measurements,
+   and on the run page a row for each tool under both small fixtures, with the tool's own CPU time
+   and peak memory.
+2. `matrix-all-local+tools+remote` by hand. This run says how long each tool takes on these arrays,
+   which nothing has measured yet, and whether all twenty cells fit eight hours. If they do not, the
+   remote cells of the 1 KB file set are the ones that are `not_run`.
 
 ### Find the evidence of a run
 

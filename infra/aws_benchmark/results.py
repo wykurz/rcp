@@ -370,8 +370,9 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
                 and context["timeout_seconds"] == contract["timeout"]
                 and [(cell["case_id"], cell["scenario"]) for cell in result["cells"]] == list(contract["cells"]),
                 "unexpected matrix measurement contract")
-        # one build is measured; the request's baseline copies of the same bytes are not run
-        for tool in BINARY_NAMES:
+        # one build is measured; the request's baseline copies of the same bytes are not run. Every
+        # binary of the plan was run: a suite that times the other tools names them in its plan
+        for tool in durable_plan_contract(receipt["window"]["plan"])["binary_names"]:
             require(result["tools"].get(tool, {}).get("sha256") == receipt["request"]["sha256"]["candidate/" + tool],
                     "measured tool does not match approved binary digest")
         return
@@ -521,11 +522,15 @@ def comparison_label(expected, controller):
     hashes = request.get("sha256") if isinstance(request, dict) else None
     if not isinstance(hashes, dict):
         hashes = {}
+    # the binaries of the recorded plan; a window from before plans has the first three tools
+    window = controller.get("window")
+    plan = window.get("plan") if isinstance(window, dict) else None
+    names = BINARY_NAMES if plan is None else durable_plan_contract(plan, exact=False)["binary_names"]
     if not all(isinstance(hashes.get(role + "/" + name), str)
                and re.fullmatch(r"[0-9a-f]{64}", hashes[role + "/" + name])
-               for role in ("baseline", "candidate") for name in BINARY_NAMES):
+               for role in ("baseline", "candidate") for name in names):
         return "Same source revision; binary identity unavailable"
-    if all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in BINARY_NAMES):
+    if all(hashes["baseline/" + name] == hashes["candidate/" + name] for name in names):
         return "A/A (identical source revision and binary digests)"
     return "Same source revision; different binary digests (not A/A)"
 

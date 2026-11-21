@@ -807,6 +807,85 @@ class ReportSiteTests(unittest.TestCase):
         self.assertTrue((self.output / 'aws-benchmarks/remote.html').is_file())
         self.assert_site_links_resolve()
 
+    def test_each_other_tool_gets_a_page_of_its_own_once_a_run_times_it(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        def site(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})
+        copies = matrix_example('matrix-all-local+remote')
+        pages = site([copies])
+        tools = ('rcmp', 'rlink', 'rrm')
+        # until a run has a cell of one, no page says anything about the other tools
+        for path, document in pages.items():
+            if path.suffix == '.html':
+                with self.subTest(page=str(path)):
+                    for phrase in (*tools, 'other tools', 'overview-tools'):
+                        self.assertNotIn(phrase, document.lower())
+        for tool in tools:
+            self.assertNotIn(Path('aws-benchmarks') / (tool + '.html'), pages)
+        timed = matrix_example('matrix-all-local+tools+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')
+        pages = site([copies, timed])
+        index, setup = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/setups.html')]
+        remove = pages[Path('aws-benchmarks/rrm.html')]
+        self.assertIn('<h1>Remove with rrm</h1>', remove)
+        self.assertIn('removed by rrm after each local copy · 1 run</p>', remove)
+        self.assertIn("data-history-metric='cpu'", remove)
+        self.assertEqual(remove.count("<svg "), 12)
+        self.assertEqual(pages[Path('aws-benchmarks/rcmp.html')].count("<svg "), 6)
+        self.assertIn('<h1>Hard-link with rlink</h1>', pages[Path('aws-benchmarks/rlink.html')])
+        # the first page keeps its two rows of copies and gains one for the tools
+        self.assertEqual((index.count("data-overview='local'"), index.count("data-overview='remote'")), (4, 4))
+        self.assertEqual([index.count("data-overview='" + tool + "'") for tool in tools], [1, 1, 1])
+        self.assertIn("<a href='rrm.html#history-tiny-1k-10240k' aria-label='Remove with rrm, 1 KB files'>", index)
+        self.assertIn('locally, and through its remote path over loopback, and how long rcmp, rlink and rrm take on '
+                      'each local copy.</p>', index)
+        # every page of the section links to each tool's page, in the order the tools run
+        links = ('<li><a href="rcmp.html">Compare with rcmp</a></li><li><a href="rlink.html">Hard-link with rlink'
+                 '</a></li><li><a href="rrm.html">Remove with rrm</a></li>')
+        for page in (index, setup, pages[Path('aws-benchmarks/local.html')], pages[Path('aws-benchmarks/remote.html')]):
+            self.assertIn(links, page)
+        # after the pages of the copies and before the list of runs
+        self.assertIn('<li><a href="remote.html">Remote copies</a></li>' + links +
+                      '<li><a href="index.html#runs">Runs</a></li>', setup)
+        self.assertIn('<li><a href="#report-content" aria-current="page">Remove with rrm</a></li>', remove)
+        self.assertIn('<li><a href="rcmp.html">Compare with rcmp</a></li>', remove)
+        page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000002.html')]
+        self.assertIn('<li><a href="../rrm.html">Remove with rrm</a></li>', page)
+        self.assertIn('<td>1 KB files</td><td>Remove with rrm</td><td>measured</td>', page)
+        self.assertIn("href='runs/repo-655073755-run-43200000002.html'", remove)
+        self.assertEqual(json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000002.json')])
+                         ['schema'], 'rcp-public-resource-diagnostics-v4')
+        self.assertIn('<strong>Other tools.</strong> A matrix run can also time the other tools', setup)
+        self.assertIn('<strong>Other tools.</strong> A run can also time <code>rcmp</code>', setup)
+        # the pages of the copies are what they were, apart from the links to the new pages
+        before = site([copies])[Path('aws-benchmarks/local.html')]
+        after = site([copies, timed])[Path('aws-benchmarks/local.html')]
+        self.assertEqual(before.count("<svg "), after.count("<svg "))
+        self.assertNotIn('outside these trends', after)
+
+    def test_a_site_with_tool_cells_has_no_dangling_link(self):
+        from infra.aws_benchmark.production_publish import inventory
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        runs = [matrix_example('matrix-all-local+remote'),
+                matrix_example('matrix-all-local+tools+remote', run='43200000002', at='2026-11-27T08:30:00+00:00')]
+        directory, revision, _ = self.retained_batch([record for record, _ in runs])
+        index = json.loads((directory / 'index.json').read_text())
+        index.update(schema='rcp-production-retained-reports-v2', diagnostics=[])
+        for record, extra in runs:
+            body = json.dumps(extra, separators=(',', ':')).encode()
+            (directory / (record['run_key'] + '.diagnostics.json')).write_bytes(body)
+            index['diagnostics'].append(dict(run_key=record['run_key'], sha256=hashlib.sha256(body).hexdigest(),
+                                             bytes=len(body)))
+        (directory / 'index.json').write_text(json.dumps(index))
+        result = self.build_retained((directory, revision, inventory(directory)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for tool in ('rcmp', 'rlink', 'rrm'):
+            self.assertTrue((self.output / 'aws-benchmarks' / (tool + '.html')).is_file())
+        self.assert_site_links_resolve()
+
     def test_a_remote_cell_that_was_never_measured_still_opens_the_remote_page(self):
         import report_site
         from infra.aws_benchmark import production_export
