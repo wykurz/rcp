@@ -1,5 +1,5 @@
-//! Finalization assertions inspect process-global counters and admission state, and one test
-//! lowers the process's file-size limit. Each test runs in its own child process so these checks
+//! Finalization assertions inspect process-global counters and admission state, and some tests
+//! lower the process's file-size limit. Each test runs in its own child process so these checks
 //! also remain exact under parallel libtest execution.
 
 use super::*;
@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
 const PAYLOAD: &[u8] = b"received payload";
+const NEXT_PAYLOAD: &[u8] = b"next";
 
 struct FdIdentityProbe {
     path: std::path::PathBuf,
@@ -57,6 +58,71 @@ fn create_file(path: &std::path::Path) -> std::fs::File {
         .mode(common::safedir::DST_FILE_CREATE_MODE)
         .open(path)
         .unwrap()
+}
+
+async fn tracker_for_two_files(
+    root: &std::path::Path,
+    parent_was_created: bool,
+    fail_early: bool,
+    errors: Arc<common::error_collector::ErrorCollector>,
+) -> directory_tracker::SharedDirectoryTracker {
+    let send = remote::streams::SendStream::new(
+        Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
+    );
+    let tracker = directory_tracker::SharedDirectoryTracker::new(
+        Arc::new(tokio::sync::Mutex::new(send)),
+        common::preserve::preserve_none(),
+        fail_early,
+        errors,
+    );
+    let admission = tracker
+        .with_state(|state| state.admit_directory(root, true))
+        .unwrap();
+    let directory = Arc::new(
+        Dir::open_root_dir(root, false, common::Side::Destination)
+            .await
+            .unwrap(),
+    );
+    tracker
+        .register_directory(
+            admission,
+            directory,
+            remote::protocol::Metadata::from(&std::fs::metadata(root).unwrap()),
+            parent_was_created,
+            true,
+            None,
+        )
+        .unwrap();
+    tracker.mark_announced(root).await.unwrap();
+    tracker.seal_directory(root, 2).await.unwrap();
+    tracker
+        .with_state(|state| state.finish_discovery(true))
+        .unwrap();
+    tracker
+}
+
+async fn two_file_stream(
+    root: &std::path::Path,
+    metadata: &remote::protocol::Metadata,
+    first_name: &str,
+) -> remote::streams::BoxedRecvStream {
+    let mut wire = Vec::new();
+    for (name, payload) in [(first_name, PAYLOAD), ("next", NEXT_PAYLOAD)] {
+        let header = remote::protocol::File {
+            src: "/source".into(),
+            dst: root.join(name),
+            size: payload.len() as u64,
+            metadata: metadata.clone(),
+            is_root: false,
+        };
+        remote::streams::SendStream::new(&mut wire)
+            .send_control_message(&header)
+            .await
+            .unwrap();
+        wire.extend_from_slice(payload);
+    }
+    // both headers and both payloads fit in the decoder's initial read from this cursor
+    remote::streams::RecvStream::new(Box::new(std::io::Cursor::new(wire)))
 }
 
 struct OccupiedWorker {
@@ -125,6 +191,100 @@ impl tokio::io::AsyncRead for GatedPayload {
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
         std::task::Poll::Ready(Ok(()))
     }
+}
+
+#[test]
+fn receiver_writes_prefetched_payload_in_the_creation_job() {
+    const TEST_NAME: &str =
+        "destination::file_tests::receiver_writes_prefetched_payload_in_the_creation_job";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
+    one_worker_runtime().block_on(async {
+        use tokio::io::AsyncReadExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        drop(create_file(&fixture));
+        let parent = Arc::new(
+            Dir::open_root_dir(temp.path(), false, common::Side::Destination)
+                .await
+                .unwrap(),
+        );
+        let mut header = file_header(&fixture);
+        header.is_root = false;
+        let settings = testutils::copy_settings();
+        let preservation = common::preserve::preserve_none();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        for (name, parent_was_created, prefetched) in [
+            ("fresh-parent-header-only", true, false),
+            ("fresh-parent-prefetched", true, true),
+            ("reused-parent-prefetched", false, true),
+        ] {
+            header.dst = temp.path().join(name);
+            let mut wire = Vec::new();
+            remote::streams::SendStream::new(&mut wire)
+                .send_control_message(&header)
+                .await
+                .unwrap();
+            // a single cursor fills the decoder with both header and payload; a chain returns
+            // after reading from the header cursor, leaving the second reader untouched
+            let reader: remote::streams::BoxedRead = if prefetched {
+                wire.extend_from_slice(PAYLOAD);
+                Box::new(std::io::Cursor::new(wire))
+            } else {
+                Box::new(std::io::Cursor::new(wire).chain(PAYLOAD))
+            };
+            let mut stream = remote::streams::RecvStream::new(reader);
+            let received = stream
+                .recv_object::<remote::protocol::File>()
+                .await
+                .unwrap()
+                .unwrap();
+            let guard = throttle::open_file_permit().await;
+            let mut worker = OccupiedWorker::start().await;
+            let mut receive = Box::pin(common::safedir::with_fd_admission(
+                guard.admission(),
+                process_single_file(
+                    &settings,
+                    &preservation,
+                    &mut stream,
+                    &received,
+                    FileDestination {
+                        parent: parent.clone(),
+                        name: OsStr::new(name),
+                        parent_was_created,
+                    },
+                    &guard,
+                ),
+            ));
+            if !parent_was_created {
+                assert!(futures::poll!(receive.as_mut()).is_pending(), "{name}");
+                assert_eq!(metrics.blocking_queue_depth(), 1, "{name}");
+                worker.finish().await;
+                // the new worker hold starts after the queued lookup has finished
+                worker = OccupiedWorker::start().await;
+                assert!(!header.dst.try_exists().unwrap(), "{name}: after lookup");
+            }
+            assert!(futures::poll!(receive.as_mut()).is_pending(), "{name}");
+            assert_eq!(metrics.blocking_queue_depth(), 1, "{name}");
+            worker.finish().await;
+            // the barrier runs after the queued create, before we poll the receiver again
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let first_job_size = std::fs::metadata(&header.dst).unwrap().len();
+            assert_eq!(
+                first_job_size,
+                if parent_was_created && prefetched {
+                    header.size
+                } else {
+                    0
+                },
+                "{name}: after create"
+            );
+            receive.await.map_err(|error| error.source).unwrap();
+            assert_eq!(std::fs::read(&header.dst).unwrap(), PAYLOAD);
+        }
+    });
+    crate::test_process::completed(TEST_NAME);
 }
 
 #[test]
@@ -520,6 +680,70 @@ async fn receiver_metadata_failure_counts_payload_and_preserves_the_next_frame()
 }
 
 #[test]
+fn fresh_parent_collision_skips_or_replaces_and_keeps_the_next_file() {
+    const TEST_NAME: &str =
+        "destination::file_tests::fresh_parent_collision_skips_or_replaces_and_keeps_the_next_file";
+    if crate::test_process::run_in_child(TEST_NAME) {
+        return;
+    }
+    one_worker_runtime().block_on(async {
+        const ORIGINAL: &[u8] = b"original";
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        drop(create_file(&fixture));
+        let metadata = file_header(&fixture).metadata;
+        for ignore_existing in [true, false] {
+            let root = temp
+                .path()
+                .join(if ignore_existing { "skip" } else { "replace" });
+            std::fs::create_dir(&root).unwrap();
+            let errors = Arc::new(common::error_collector::ErrorCollector::default());
+            let tracker = tracker_for_two_files(&root, true, false, errors.clone()).await;
+            let occupied = root.join("occupied");
+            // fill the name after the tracker marked the parent fresh
+            std::fs::write(&occupied, ORIGINAL).unwrap();
+            let original = std::fs::File::open(&occupied).unwrap();
+            let original_inode = original.metadata().unwrap().ino();
+            let settings = common::copy::Settings {
+                ignore_existing,
+                overwrite: !ignore_existing,
+                overwrite_compare: common::parse_metadata_cmp_settings("size,mtime").unwrap(),
+                ..testutils::copy_settings()
+            };
+            let prog = progress();
+            let files = prog.files_copied.get();
+            let bytes = prog.bytes_copied.get();
+            let unchanged = prog.files_unchanged.get();
+            handle_file_stream(
+                settings,
+                common::preserve::preserve_none(),
+                two_file_stream(&root, &metadata, "occupied").await,
+                tracker.clone(),
+                errors.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(tracker.with_state(|state| state.is_done()));
+            assert!(errors.take_error().is_none());
+            assert_eq!(std::fs::read(root.join("next")).unwrap(), NEXT_PAYLOAD);
+            let occupied_inode = std::fs::metadata(&occupied).unwrap().ino();
+            assert_eq!(occupied_inode == original_inode, ignore_existing);
+            let (expected_payload, copied_files, copied_bytes, unchanged_files) = if ignore_existing
+            {
+                (ORIGINAL, 1, NEXT_PAYLOAD.len(), 1)
+            } else {
+                (PAYLOAD, 2, PAYLOAD.len() + NEXT_PAYLOAD.len(), 0)
+            };
+            assert_eq!(std::fs::read(occupied).unwrap(), expected_payload);
+            assert_eq!(prog.files_copied.get(), files + copied_files);
+            assert_eq!(prog.bytes_copied.get(), bytes + copied_bytes as u64);
+            assert_eq!(prog.files_unchanged.get(), unchanged + unchanged_files);
+        }
+    });
+    crate::test_process::completed(TEST_NAME);
+}
+
+#[test]
 fn final_write_failure_collects_and_continues_but_fail_early_stops() {
     const TEST_NAME: &str =
         "destination::file_tests::final_write_failure_collects_and_continues_but_fail_early_stops";
@@ -540,59 +764,16 @@ fn final_write_failure_collects_and_continues_but_fail_early_stops() {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0);
         }
-        for fail_early in [false, true] {
-            let root = temp
-                .path()
-                .join(if fail_early { "early" } else { "collect" });
+        for (parent_was_created, fail_early) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let root = temp.path().join(format!(
+                "created-{parent_was_created}-fail-early-{fail_early}"
+            ));
             std::fs::create_dir(&root).unwrap();
             let errors = Arc::new(common::error_collector::ErrorCollector::default());
-            let send = remote::streams::SendStream::new(
-                Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
-            );
-            let tracker = directory_tracker::SharedDirectoryTracker::new(
-                Arc::new(tokio::sync::Mutex::new(send)),
-                common::preserve::preserve_none(),
-                fail_early,
-                errors.clone(),
-            );
-            let admission = tracker
-                .with_state(|state| state.admit_directory(&root, true))
-                .unwrap();
-            let directory = Arc::new(
-                Dir::open_root_dir(&root, false, common::Side::Destination)
-                    .await
-                    .unwrap(),
-            );
-            tracker
-                .register_directory(
-                    admission,
-                    directory,
-                    remote::protocol::Metadata::from(&std::fs::metadata(&root).unwrap()),
-                    false,
-                    true,
-                    None,
-                )
-                .unwrap();
-            tracker.mark_announced(&root).await.unwrap();
-            tracker.seal_directory(&root, 2).await.unwrap();
-            tracker
-                .with_state(|state| state.finish_discovery(true))
-                .unwrap();
-            let mut wire = Vec::new();
-            for (name, payload) in [("failed", PAYLOAD), ("next", b"next".as_slice())] {
-                let header = remote::protocol::File {
-                    src: "/source".into(),
-                    dst: root.join(name),
-                    size: payload.len() as u64,
-                    metadata: metadata.clone(),
-                    is_root: false,
-                };
-                remote::streams::SendStream::new(&mut wire)
-                    .send_control_message(&header)
-                    .await
-                    .unwrap();
-                wire.extend_from_slice(payload);
-            }
+            let tracker =
+                tracker_for_two_files(&root, parent_was_created, fail_early, errors.clone()).await;
             let mut settings = testutils::copy_settings();
             settings.fail_early = fail_early;
             let counts = (progress().files_copied.get(), progress().bytes_copied.get());
@@ -601,9 +782,7 @@ fn final_write_failure_collects_and_continues_but_fail_early_stops() {
                 handle_file_stream(
                     settings,
                     common::preserve::preserve_none(),
-                    remote::streams::RecvStream::new(
-                        Box::new(std::io::Cursor::new(wire)) as remote::streams::BoxedRead
-                    ),
+                    two_file_stream(&root, &metadata, "failed").await,
                     tracker.clone(),
                     errors.clone(),
                 ),
@@ -624,9 +803,12 @@ fn final_write_failure_collects_and_continues_but_fail_early_stops() {
                 result.unwrap();
                 assert!(tracker.with_state(|state| state.is_done()));
                 assert!(!tracker.with_state(|state| state.is_closing()));
-                assert_eq!(std::fs::read(root.join("next")).unwrap(), b"next");
+                assert_eq!(std::fs::read(root.join("next")).unwrap(), NEXT_PAYLOAD);
                 assert_eq!(progress().files_copied.get(), counts.0 + 1);
-                assert_eq!(progress().bytes_copied.get(), counts.1 + 4);
+                assert_eq!(
+                    progress().bytes_copied.get(),
+                    counts.1 + NEXT_PAYLOAD.len() as u64
+                );
                 errors.take_error().expect("failed file must be collected")
             };
             assert!(format!("{error:#}").contains("failed to write destination payload"));

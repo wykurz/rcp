@@ -421,6 +421,16 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                         .any(|scope| scope["name"] == "destination.directory.finalize.prune"),
                     "ordinary empty directories are retained"
                 );
+                // only the two files in the new nested directory can arrive with their
+                // headers and use a single worker. TCP may split either payload.
+                let combined = scopes
+                    .iter()
+                    .find(|scope| scope["name"] == "destination.file.create_and_write_buffered")
+                    .map_or(0, |scope| scope["count"].as_u64().unwrap());
+                assert!(
+                    combined <= 2,
+                    "the reused root must create and receive separately"
+                );
                 for stage in [
                     "wait_open",
                     "wait_rate",
@@ -428,15 +438,21 @@ async fn remote_scoped_timings_cover_single_pass_discovery_and_all_process_roles
                     "plan",
                     "wait_iops",
                     "create",
+                    "create_and_write_buffered",
                     "receive",
                     "metadata",
                     "complete",
                 ] {
                     let name = format!("destination.file.{stage}");
                     let scope = scopes.iter().find(|scope| scope["name"] == name);
-                    assert_eq!(scope.is_some(), detail, "{name}");
+                    let expected = match stage {
+                        "plan" => 1,
+                        "create_and_write_buffered" => combined,
+                        "create" | "receive" => files.len() as u64 - combined,
+                        _ => files.len() as u64,
+                    };
+                    assert_eq!(scope.is_some(), detail && expected > 0, "{name}");
                     if let Some(scope) = scope {
-                        let expected = if stage == "plan" { 1 } else { files.len() };
                         assert_eq!(scope["count"], expected, "{name}");
                         assert_eq!(scope["finished"], expected, "{name}");
                         assert_eq!(scope["interrupted"], 0, "{name}");

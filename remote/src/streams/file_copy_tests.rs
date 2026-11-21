@@ -49,6 +49,56 @@ impl std::io::Write for Writer {
 }
 
 #[tokio::test]
+async fn a_buffered_file_can_retry_creation_without_reading_into_the_next_frame()
+-> anyhow::Result<()> {
+    let mut wire = Vec::new();
+    append_frame(&mut wire, 4)?;
+    let header_len = wire.len();
+    wire.extend_from_slice(b"data");
+    append_frame(&mut wire, 42)?;
+    let mut partial = recv_stream(Reader::new(wire.clone(), header_len + 2));
+    let size = partial.recv_object::<u64>().await?.unwrap();
+    let reads = partial.framed.get_ref().requests.len();
+    assert!(partial.buffered_file(size, 4).is_none());
+    assert_eq!(&partial.framed.read_buffer()[..], b"da");
+    assert_eq!(partial.framed.get_ref().requests.len(), reads);
+
+    let mut recv = recv_stream(Reader::new(wire, usize::MAX));
+    assert_eq!(recv.recv_object::<u64>().await?, Some(size));
+    let reads = recv.framed.get_ref().requests.len();
+    assert!(recv.buffered_file(0, 4).is_none());
+    assert!(recv.buffered_file(size, 3).is_none());
+    let temp = tempfile::tempdir()?;
+    let parent =
+        common::safedir::Dir::open_root_dir(temp.path(), false, common::Side::Destination).await?;
+    let admission = throttle::open_file_permit().await;
+    let name = std::ffi::OsStr::new("file");
+    let path = temp.path().join(name);
+    std::fs::write(&path, b"original")?;
+    let create_error = recv
+        .buffered_file(size, 4)
+        .unwrap()
+        .create_at(&parent, name, &admission)
+        .await?
+        .unwrap_err();
+    assert_eq!(create_error.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path)?, b"original");
+
+    std::fs::remove_file(&path)?;
+    let file = recv
+        .buffered_file(size, 4)
+        .unwrap()
+        .create_at(&parent, name, &admission)
+        .await??;
+    assert_eq!(file.metadata()?.len(), size);
+    assert_eq!(std::fs::read(&path)?, b"data");
+    assert!(recv.copy_buffer.is_empty());
+    assert_eq!(recv.recv_object::<u64>().await?, Some(42));
+    assert_eq!(recv.framed.get_ref().requests.len(), reads);
+    Ok(())
+}
+
+#[tokio::test]
 async fn payloads_reach_the_writer_whole_and_frame_boundaries_hold() -> anyhow::Result<()> {
     let admission = throttle::open_file_permit().await;
     let payloads: Vec<Vec<u8>> = [0, 3, 127, 8193, 1, 32769, 0, 19]
