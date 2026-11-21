@@ -992,8 +992,9 @@ size (default: the [network profile](#network-profile)'s buffer size, 16 MiB for
 MiB for internet). The configured value must fit `usize` on the master and each daemon; otherwise
 argument validation or daemon startup fails. The source's read buffer and the destination's receive
 buffer use the same per-file limit, capped to the file size and the host's `isize::MAX`, with a
-one-byte minimum. The source reads into one buffer and sends from it; the destination fills one
-buffer from the network and writes it to the file in whole chunks. Empty payloads need no buffer.
+one-byte minimum. The source reads into one buffer and sends from it. The destination writes in
+whole chunks. In a directory it created, the worker that creates a file can also write its contents
+when they are already buffered with the header and fit in one chunk. Empty payloads need no buffer.
 Individual disk and network operations can be shorter; this does not set TCP packet or TLS record
 sizes.
 

@@ -318,8 +318,10 @@ file and rate admission, parent resolution, destination classification, IOPS adm
 payload reads and writes, metadata, discarded payloads, and tracker completion respectively.
 Completion includes waiting for the tracker and any resulting directory finalization. Under a
 directory it created, the receiver reserves the file's IOPS budget and attempts exclusive creation
-directly. Root files and files in reused directories run `plan` first. An occupied name can add a
-`plan` sample and one create retry.
+directly. When a complete nonempty payload is already buffered and fits one write,
+`destination.file.create_and_write_buffered` covers the combined operation. Other files use separate
+`create` and `receive` scopes. Root files and files in reused directories run `plan` first. An
+occupied name can add a `plan` sample and one create retry.
 
 The destination's coarse per-directory manifest scopes separate build admission, inventory, and
 publication. `destination.manifest.wait_build` measures acquiring the manifest-build semaphore.
@@ -1129,17 +1131,23 @@ nothing. After the header is flushed, payload completion (including empty payloa
 EOF) explicitly flushes the transport before the source checks the byte count and returns the stream
 to the pool. Read, write, flush, and length errors leave the stream poisoned and keep no buffer.
 
-The destination receives a file into the standard file it created. It collects network reads in its
-copy scratch until a whole chunk, or the rest of the file, is there, and writes that chunk with one
-blocking job, which takes the file and the scratch and returns both. A write is a handoff to another
-thread, so it is issued per chunk and not per network read; bytes that arrived with the header come
-first. The receiver borrows the file's admission guard and passes it to each blocking write, as the
-sender does for reads. There is no Tokio file buffer and no second copy of the payload, and every
-write has returned before the file's metadata is applied. An ordinary write error on the final chunk
-leaves the declared payload fully consumed and the next frame intact: the file still fails, but
-default error collection can continue (§7.6). Read errors, truncated payloads, nonfinal write
-errors, blocking-worker failures, and cancelled transfers require discarding the stream. A chunk
-that never filled is not written; failed transfers keep no scratch taken for the copy.
+For files under a directory the receiver created, one worker can both create the file and write its
+contents. The entire nonempty payload must already be in the decoder after its header and fit one
+chunk. The worker writes directly from those buffered bytes to the new file descriptor. The next
+frame stays with the reader. If exclusive creation finds an occupied name, the payload is available
+for the usual skip, overwrite or error handling.
+
+For other files the receiver collects network reads in its copy scratch until a whole chunk, or the
+rest of the file, is there, and writes that chunk with one blocking job, which takes the file and
+the scratch and returns both. A write is a handoff to another thread, so it is issued per chunk and
+not per network read; bytes that arrived with the header come first. The receiver borrows the file's
+admission guard and passes it to each blocking write, as the sender does for reads. There is no
+Tokio file buffer and no second copy of the payload, and every write has returned before the file's
+metadata is applied. An ordinary write error on the final chunk leaves the declared payload fully
+consumed and the next frame intact: the file still fails, but default error collection can continue
+(§7.6). Read errors, truncated payloads, nonfinal write errors, blocking-worker failures, and
+cancelled transfers require discarding the stream. A chunk that never filled is not written; failed
+transfers keep no scratch taken for the copy.
 
 Individual file reads and network operations can be shorter; this setting does not promise TCP
 packet or TLS record sizes. Larger settings allow more working memory per active transfer: one

@@ -60,7 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its data, saving one blocking job submission per new file. Use `--local-copy-handoff=never` to
   queue the copy separately.
 - Speed up remote copies into new directories. For each regular file under a directory it created,
-  the receiver goes straight to exclusive creation and saves one filesystem lookup.
+  the receiver goes straight to exclusive creation and saves one filesystem lookup. When the
+  complete payload is already buffered and fits one chunk, the same worker writes it, saving a
+  second worker submission and a buffer copy.
 - Use the system allocator in `rcp` to reduce local-copy peak memory; keep mimalloc in the source
   and destination `rcpd` processes.
 - Reuse transfer buffers in remote copies. The source `rcpd` now keeps its read buffer per data

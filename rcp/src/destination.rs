@@ -237,6 +237,20 @@ struct ProcessFileError {
     stream_state: StreamState,
 }
 
+impl ProcessFileError {
+    fn payload(source: anyhow::Error) -> Self {
+        let stream_state = if source.is::<remote::streams::PayloadConsumedOnWriteError>() {
+            StreamState::DataConsumed
+        } else {
+            StreamState::Corrupted
+        };
+        Self {
+            source,
+            stream_state,
+        }
+    }
+}
+
 /// Process a single file from the stream.
 ///
 /// On success, all `file_header.size` bytes have been consumed.
@@ -317,10 +331,29 @@ async fn process_single_file(
     // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. it is created owner-only
     // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_owned`
     // below, after the last byte, mirroring copy.rs.
-    let std_file = match common::timing_scope!(trace, "destination.file.create")
-        .measure(dst_parent.create_file(dst_name))
-        .await
+    let buffer_size =
+        remote::streams::file_buffer_size(file_header.size, settings.remote_copy_buffer_size);
+    let created = if slot.parent_was_created
+        && let Some(payload) = file_recv_stream.buffered_file(file_header.size, buffer_size)
     {
+        match common::timing_scope!(trace, "destination.file.create_and_write_buffered")
+            .measure(payload.create_at(dst_parent, dst_name, admission))
+            .await
+            .map_err(ProcessFileError::payload)?
+        {
+            Ok(file) => {
+                return finalize_received_file(file, file_header, preserve)
+                    .await
+                    .map_err(err_data_consumed);
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        common::timing_scope!(trace, "destination.file.create")
+            .measure(dst_parent.create_file(dst_name))
+            .await
+    };
+    let std_file = match created {
         Ok(std_file) => std_file,
         // a name can be occupied even in a directory we created, or filled after classification
         // during an IOPS wait. Exclusive creation detects the collision. Honor --overwrite /
@@ -369,10 +402,6 @@ async fn process_single_file(
     // the payload goes from the connection's scratch straight into this descriptor, one blocking
     // write per chunk; the same descriptor then takes the metadata (no path re-open). The source
     // and the destination share the chunk bound.
-    let buffer_size =
-        remote::streams::file_buffer_size(file_header.size, settings.remote_copy_buffer_size);
-    // an ordinary final-chunk write error leaves the next frame intact, but the file still fails.
-    // read failures and blocking worker failures remain fatal to this stream.
     let file = common::timing_scope!(trace, "destination.file.receive")
         .measure(
             file_recv_stream
@@ -384,16 +413,7 @@ async fn process_single_file(
                 )),
         )
         .await
-        .map_err(|error| {
-            if error
-                .downcast_ref::<remote::streams::PayloadConsumedOnWriteError>()
-                .is_some()
-            {
-                err_data_consumed(error)
-            } else {
-                err_corrupted(error)
-            }
-        })?;
+        .map_err(ProcessFileError::payload)?;
     finalize_received_file(file, file_header, preserve)
         .await
         .map_err(err_data_consumed)
