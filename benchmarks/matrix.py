@@ -13,13 +13,22 @@ destination rcpd over SSH, on a private sshd that this runner owns and that
 listens on IPv4 loopback only (benchmarks/private_sshd.py). The time measured is
 the rcp command's, as for a local copy.
 
-CPU time, peak memory, context switches and page faults are what rcp reports
-about itself: each copy is asked for its summary as JSON (--output-format=json),
-which carries exact figures for the rcp process and, after a remote copy, for
-the source and the destination rcpd. No wrapper runs the commands, and only the
-copy's duration is measured from outside. A build from before rcp had the option
-is timed all the same: its transfer counts are read from the text summary, and
-it has no figures.
+The `rcmp`, `rlink` and `rrm` scenarios time the other tools. A tool cell makes no
+copies of its own: each of its runs follows one copy of the same file set's
+`local` cell and works on the tree that copy has just written. rcmp compares it
+with the source by file size, rlink hard-links it into a new tree beside it, and
+rrm removes it, in that order. No cache is dropped for a tool: it finds whatever
+the copy left in memory. A run counts as a copy does, on its exit status and the
+counts of its own summary. rrm's run takes the place of the `rm -rf` that
+otherwise frees a copy; every other removal stays `rm -rf` and is not measured.
+
+CPU time, peak memory, context switches and page faults are what a command
+reports about itself: each copy and each tool run is asked for its summary as
+JSON (--output-format=json), which carries exact figures for the process and,
+after a remote copy, for the source and the destination rcpd. No wrapper runs
+the commands, and only a command's duration is measured from outside. A build
+from before rcp had the option is timed all the same: its transfer counts are
+read from the text summary, and it has no figures.
 
 The results are saved after every step, so a run that is stopped keeps the cells
 it finished. Once the allocation has ended nothing more is removed: clearing
@@ -53,9 +62,30 @@ from benchmarks.verification import SUMMARY_POLICY
 SCHEMA = "rcp-benchmark-matrix-v1"
 POLICY = SUMMARY_POLICY
 VARIANT = "rcp-default"
-SCENARIOS = ("local", "remote")
+# the scenario whose copies the tool cells work on
+FOLLOWED = "local"
+# what each tool cell runs, in the order the tools run after a copy. `operands` names the trees
+# of the command: the `source` of the copy, the `copy` itself, and a new `tree` beside the copy
+# for a tool that makes one. `counts` are the figures of the tool's summary that must equal the
+# file set's files or directories, by their dotted names. The tool that `removes` the copy is last.
+TOOLS = {
+    "rcmp": dict(variant=dict(id="rcmp-size", description="rcmp of the source and its copy, by file size",
+                              tool="rcmp", args=["--summary", "--quiet", "--metadata-compare=f:size"], processes=1),
+                 operands=("source", "copy"),
+                 counts={"mismatch.file.same": "files", "mismatch.dir.same": "directories"}, removes=False),
+    "rlink": dict(variant=dict(id="rlink-default", description="rlink of the copy into a new tree",
+                               tool="rlink", args=["--summary"], processes=1),
+                  operands=("copy", "tree"),
+                  counts={"hard_links_created": "files", "copy_summary.directories_created": "directories"},
+                  removes=False),
+    "rrm": dict(variant=dict(id="rrm-default", description="rrm of the copy", tool="rrm", args=["--summary"],
+                             processes=1),
+                operands=("copy",), counts={"files_removed": "files", "directories_removed": "directories"},
+                removes=True),
+}
+SCENARIOS = ("local", "remote", *TOOLS)
 # how each scenario reaches its data: directly, or through rcpd on this host's loopback
-TOPOLOGY = {"local": "local", "remote": "loopback"}
+TOPOLOGY = {"local": "local", "remote": "loopback", **{scenario: "local" for scenario in TOOLS}}
 PURPOSES = ("performance", "commissioning")
 CACHE_POLICIES = ("linux-drop-caches", "uncontrolled")
 RUN_STATUSES = ("running", "complete", "partial", "failed")
@@ -155,7 +185,15 @@ def selection(manifest, cells):
         selected.append((case_id, scenario))
     if len(selected) > MAX_CELLS:
         raise ValueError("too many cells")
+    for case_id, scenario in selected:
+        if scenario in TOOLS and (case_id, FOLLOWED) not in selected:
+            raise ValueError(f"a tool cell needs the {FOLLOWED} cell of its file set: {case_id}:{scenario}")
     return [(cases[case_id], scenario) for case_id, scenario in selected]
+
+
+def _variant(scenario, variant):
+    """What a cell of this scenario runs: its tool for a tool cell, the manifest's copy otherwise."""
+    return copy.deepcopy(TOOLS[scenario]["variant"]) if scenario in TOOLS else variant
 
 
 def cell_id(case, scenario, variant, context):
@@ -177,10 +215,10 @@ def _persist(output, record, sampler=None):
     temporary.replace(output / "results.json")
     lines = [f"# Benchmark matrix {record['run_id']}", "", f"Status: **{record['status']}**", "",
              "Copies are not verified: a copy counts when the command exits zero and reports the expected "
-             "transfer counts.", ""]
+             "transfer counts. A run of rcmp, rlink or rrm counts the same way, on the counts of its own summary.", ""]
     if record.get("error"):
         lines += [f"Error: {record['error']}", ""]
-    lines += ["| File set | Scenario | Outcome | Median (s) | Min–max (s) | Copies | Note |",
+    lines += ["| File set | Scenario | Outcome | Median (s) | Min–max (s) | Runs | Note |",
               "| --- | --- | --- | ---: | ---: | ---: | --- |"]
     for cell in record["cells"]:
         summary = cell["summary"]
@@ -254,6 +292,15 @@ def _json_summary(text):
     except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _reported(summary, name):
+    """A count of a summary by its dotted name, or None when it is missing or is not a count."""
+    value = summary
+    for key in name.split("."):
+        value = value.get(key) if isinstance(value, dict) else None
+    # true equals one: a count is a count by type
+    return value if type(value) is int else None
 
 
 def _figures(process):
@@ -337,8 +384,10 @@ def main(argv=None):
         revision = run._revision()
     record = dict(schema=SCHEMA, run_id=uuid.uuid4().hex, timestamp=datetime.now(timezone.utc).isoformat(),
         status="running", revision=revision, context=context, tools={}, file_sets=file_sets,
-        cells=[dict(case_id=case["id"], scenario=scenario, cell_id=cell_id(case, scenario, variant, context),
-                    variant=variant, outcome=dict(status="not_run", stage=None, message="not started"),
+        cells=[dict(case_id=case["id"], scenario=scenario,
+                    cell_id=cell_id(case, scenario, _variant(scenario, variant), context),
+                    variant=_variant(scenario, variant),
+                    outcome=dict(status="not_run", stage=None, message="not started"),
                     copies=[], summary=None) for case, scenario in planned])
     # a selection or label that the results document cannot hold is refused before any work
     validate(record)
@@ -352,7 +401,10 @@ def main(argv=None):
     ended = finished = False
     _persist(output, record)
     try:
-        tools = {name: run._tool(args.bin_dir.resolve() / name) for name in ("filegen", "rcp", "rcpd")}
+        # a tool is needed only when a cell selects it
+        selected = [name for name in TOOLS if any(scenario == name for _, scenario in planned)]
+        tools = {name: run._tool(args.bin_dir.resolve() / name)
+                 for name in ("filegen", "rcp", "rcpd", *(TOOLS[name]["variant"]["tool"] for name in selected))}
         record["tools"] = tools
         paths = {name: tool["path"] for name, tool in tools.items()}
         # a build from before rcp could print its summary as JSON is timed all the same
@@ -477,8 +529,121 @@ def main(argv=None):
                 return None
             return fixture / "filegen"
 
-        def measure(case_index, cell, source, expected):
-            """Copy one cell's file set the configured number of times and settle the cell's outcome."""
+        def follow(case_index, waiting, copied, source, destination, counts):
+            """Time each waiting tool on the copy just made; return whether the copy is gone.
+
+            `copied` is the record of that copy. A tool that fails ends its own cell and nothing
+            else: the tools after it still run, and so do the copies after this one.
+            """
+            nonlocal ended, trial_index
+            runs, iteration, removed = args.repetitions, copied["iteration"], False
+            # every tool counts the root of the tree as a directory too
+            numbers = dict(files=counts["files"], directories=counts["directories"] + 1)
+            for follower in [item for scenario in TOOLS for item in waiting if item["scenario"] == scenario]:
+                limit = None if ended else allocation.limit(args.timeout)
+                if limit is None:
+                    # the cells still waiting are settled with the local cell, which ends here too
+                    ended = True
+                    break
+                tool = TOOLS[follower["scenario"]]
+                trial = Path(follower["case_id"]) / follower["scenario"] / str(iteration)
+                places = dict(source=source, copy=destination, tree=destination_scratch / trial)
+                makes = "tree" in tool["operands"]
+                if makes:
+                    places["tree"].parent.mkdir(parents=True, exist_ok=True)
+                # the option goes before the operands
+                command = [paths[tool["variant"]["tool"]], *tool["variant"]["args"], SUMMARY_FORMAT,
+                           *(str(places[name]) for name in tool["operands"])]
+                # until a step says otherwise the run is under way: that is what a stop finds on disk
+                item = dict(iteration=iteration, trial_index=trial_index, follows_trial_index=copied["trial_index"],
+                            status="interrupted", command=command)
+                trial_index += 1
+                follower["copies"].append(item)
+                settle([follower], "interrupted", "command", f"run stopped during run {iteration} of {runs}")
+                save()
+                mark("command", case_index, item["trial_index"])
+                try:
+                    outcome = run.execute_commands([command], output / "logs" / trial, limit[0],
+                                                   stable_summary_locale=True)
+                finally:
+                    _bound_logs(output / "logs" / trial)
+                item.update({key: outcome[key] for key in ("elapsed_seconds", "exit_codes", "timed_out", "logs")})
+                if outcome["timed_out"]:
+                    ended = limit[1]
+                    item["status"] = "interrupted" if ended else "timed_out"
+                    settle([follower], item["status"], "command",
+                           f"allocation ended during run {iteration} of {runs}" if ended else
+                           f"run {iteration} did not finish within {args.timeout:g} s")
+                elif not outcome["ok"]:
+                    item["status"] = "failed"
+                    settle([follower], "failed", "command",
+                           f"run {iteration} could not be started: {outcome['launch_error']}"
+                           if outcome["launch_error"] is not None else
+                           f"run {iteration} failed with exit code {outcome['exit_codes'][0]}"
+                           f"; see 0.stdout.log and 0.stderr.log in logs/{trial}")
+                else:
+                    reported = _json_summary(run._read(outcome["logs"][0]["stdout"]))
+                    if reported is None:
+                        item["status"] = "failed"
+                        settle([follower], "failed", "summary", f"run {iteration} printed no JSON summary as its "
+                               f"last line of output; see logs/{trial}/0.stdout.log")
+                    else:
+                        expected = {name: numbers[kind] for name, kind in tool["counts"].items()}
+                        found = {name: _reported(reported, name) for name in expected}
+                        # only the counts that the summary was checked for are recorded
+                        item["tool_summary"] = {name: value for name, value in found.items() if value is not None}
+                        # the run stands on its exit status and these counts, as a copy does
+                        item["resources"] = _figures(reported)
+                        wrong = [f"{name} is {'missing' if found[name] is None else found[name]}; "
+                                 f"expected {expected[name]}" for name in expected if found[name] != expected[name]]
+                        if wrong:
+                            item["status"] = "failed"
+                            settle([follower], "failed", "summary",
+                                   f"run {iteration} reported an unexpected summary: " + "; ".join(wrong))
+                        else:
+                            item["status"] = "ok"
+                if item["status"] != "ok":
+                    # a broken cell is not retried after the next copy
+                    waiting.remove(follower)
+                elif iteration == runs:
+                    waiting.remove(follower)
+                    samples = [done["elapsed_seconds"] for done in follower["copies"]]
+                    # in one step: a stop between two would leave a summary on an unfinished cell
+                    follower.update(summary=dict(unit="seconds", median=statistics.median(samples), minimum=min(samples),
+                                                 maximum=max(samples), samples=samples),
+                                    outcome=dict(status="complete", stage=None, message=None))
+                else:
+                    settle([follower], "interrupted", "command", f"run stopped after run {iteration} of {runs}")
+                # the measurement is on disk before the removal that a stop could interrupt
+                save()
+                if makes:
+                    # what the tool made goes, whether it finished or not: later copies need the space
+                    cleaned = time.monotonic()
+                    free(places["tree"], case_index, item["trial_index"])
+                    measurements.add_cost(item, "cleanup", cleaned)
+                removed = removed or tool["removes"] and item["status"] == "ok"
+            return removed
+
+        def leave(cell, waiting):
+            """Settle the tool cells that still waited for a copy when their local cell ended."""
+            outcome, runs = cell["outcome"], args.repetitions
+            for follower in waiting:
+                done = len(follower["copies"])
+                if outcome["status"] in ("failed", "timed_out"):
+                    settle([follower], outcome["status"], "copy",
+                           f"the {FOLLOWED} copy that this cell follows did not complete: {outcome['message']}")
+                elif done:
+                    settle([follower], "interrupted", "command", f"allocation ended before run {done + 1} of {runs}")
+                else:
+                    settle([follower], "not_run", None, "allocation ended before this cell")
+            waiting.clear()
+
+        def measure(case_index, cell, source, expected, waiting, contents):
+            """Copy one cell's file set the configured number of times and settle the cell's outcome.
+
+            `waiting` are the tool cells that work on each of these copies; `contents` is how many
+            files and directories the file set holds.
+            """
             nonlocal ended, trial_index, unreachable
             copies, loopback = args.repetitions, remote(cell)
             if loopback and unreachable is not None:
@@ -620,8 +785,11 @@ def main(argv=None):
                     settle([cell], "interrupted", "copy", f"run stopped after copy {iteration} of {copies}")
                 # the measurement is on disk before the removal that a stop could interrupt
                 save()
+                # the tools work on the copy before it goes, and rrm's run is what removes it
+                removed = bool(waiting) and follow(case_index, waiting, item, source, destination, contents)
                 cleaned = time.monotonic()
-                free(destination, case_index, item["trial_index"])
+                if not removed:
+                    free(destination, case_index, item["trial_index"])
                 measurements.add_cost(item, "cleanup", cleaned)
 
         def fail(cells, error):
@@ -661,19 +829,29 @@ def main(argv=None):
             if source is None:
                 continue
             for cell in cells:
-                if ended:
-                    settle([cell], "not_run", None, "allocation ended before this cell")
+                if cell["scenario"] in TOOLS:
+                    # measured and settled with the local cell whose copies it works on
                     continue
+                followers = [other for other in cells if other["scenario"] in TOOLS] \
+                    if cell["scenario"] == FOLLOWED else []
+                if ended:
+                    settle([cell, *followers], "not_run", None, "allocation ended before this cell")
+                    continue
+                # the tool cells that still take a run after the next copy
+                waiting = list(followers)
                 try:
-                    measure(case_index, cell, source, expected)
+                    measure(case_index, cell, source, expected, waiting, file_set["expected_counts"])
+                    leave(cell, waiting)
                 except InterruptedError:
                     raise
                 except Exception as error:
-                    fail([cell], error)
+                    # a tool cell that had already ended for a reason of its own keeps that reason
+                    fail([cell, *waiting], error)
                     if endpoint is not None and remote(cell):
                         _end_daemons(endpoint, {}, False)
-                    _bound_logs(output / "logs" / case["id"] / cell["scenario"] / str(len(cell["copies"])))
-                    free(destination_scratch / case["id"] / cell["scenario"], case_index)
+                    for item in (cell, *followers):
+                        _bound_logs(output / "logs" / case["id"] / item["scenario"] / str(len(item["copies"])))
+                        free(destination_scratch / case["id"] / item["scenario"], case_index)
                 save()
             free(fixture, case_index)
         complete = sum(cell["outcome"]["status"] == "complete" for cell in record["cells"])
@@ -779,7 +957,8 @@ def _validate(record):
            and all(value is None or _text(value) for value in storage.values()), "invalid storage identities")
     tools = record.get("tools")
     # a run that stops before it has read its tools still reports, with none recorded
-    _check(isinstance(tools, dict) and set(tools) <= {"filegen", "rcp", "rcpd"} and all(
+    _check(isinstance(tools, dict)
+           and set(tools) <= {"filegen", "rcp", "rcpd", *(tool["variant"]["tool"] for tool in TOOLS.values())} and all(
         isinstance(tool, dict) and isinstance(tool.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", tool["sha256"])
         and _text(tool.get("path"), 4096) and _text(tool.get("version"), 4096) for tool in tools.values()),
         "invalid tools")
@@ -803,7 +982,9 @@ def _validate(record):
         _check(isinstance(cell.get("cell_id"), str) and re.fullmatch(r"[0-9a-f]{64}", cell["cell_id"]),
                f"{name}.cell_id must be a SHA256 hex digest")
         variant = cell.get("variant")
-        _check(isinstance(variant, dict) and variant.get("id") == VARIANT and isinstance(variant.get("args"), list)
+        # a tool cell runs its tool; every other cell is a copy by the one copy variant
+        expected = TOOLS[cell["scenario"]]["variant"]["id"] if cell["scenario"] in TOOLS else VARIANT
+        _check(isinstance(variant, dict) and variant.get("id") == expected and isinstance(variant.get("args"), list)
                and all(isinstance(argument, str) for argument in variant["args"]), f"{name}.variant is invalid")
         outcome = cell.get("outcome")
         _check(isinstance(outcome, dict) and outcome.get("status") in CELL_OUTCOMES
