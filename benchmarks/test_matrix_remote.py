@@ -14,6 +14,7 @@ from unittest import mock
 
 from benchmarks import matrix, private_sshd, run
 from benchmarks.test_matrix import FILEGEN, RECORDED, REPORTED
+from benchmarks.test_matrix_tools import TOOL
 from benchmarks.test_private_sshd import KEYGEN, SSH, SSHD, tools
 
 # what the stand-in rcp reports for each daemon, and what the runner records of it
@@ -221,6 +222,22 @@ class RemoteCellTests(unittest.TestCase):
         self.assertNotIn("remote", record["context"])
         # a file set with nothing left to measure is not generated at all
         self.assertEqual([item["generation"]["status"] for item in record["file_sets"]], ["ok", "not_run"])
+
+    def test_an_endpoint_that_cannot_start_leaves_a_file_set_of_remote_copies_and_their_tools_ungenerated(self):
+        tools(self.bin, rcmp=TOOL, rrm=TOOL)
+        record = self.run_matrix(cells=("alpha:remote", "alpha:local", "beta:remote", "beta:remote-rcmp",
+                                        "beta:remote-rrm"), environment={"FAKE_SSH": "nologin"})
+        self.assertEqual(self.outcomes(record), [
+            ("alpha", "remote", "failed"), ("alpha", "local", "complete"), ("beta", "remote", "failed"),
+            ("beta", "remote-rcmp", "failed"), ("beta", "remote-rrm", "failed")])
+        # a tool after remote copies needs those copies: nothing of this file set can be measured,
+        # so it is not generated either
+        self.assertEqual([item["generation"]["status"] for item in record["file_sets"]], ["ok", "not_run"])
+        copy = record["cells"][2]["outcome"]
+        self.assertEqual(copy["stage"], "transport")
+        for cell in record["cells"][3:]:
+            self.assertEqual((cell["outcome"]["stage"], cell["outcome"]["message"], cell["copies"]),
+                             ("copy", "the remote copy that this cell follows did not complete: " + copy["message"], []))
 
     def test_a_run_without_remote_cells_never_touches_ssh(self):
         record = self.run_matrix("--sshd", str(self.root / "absent"), cells=("alpha:local",))
@@ -471,8 +488,39 @@ class RemoteCellTests(unittest.TestCase):
         self.assertNotIn("leftover_processes", record["cells"][1]["copies"][0])
         self.assert_stopped([int(pid) for pid in (self.state / "rcpd.pids").read_text().split()])
 
+    def test_the_other_tools_follow_remote_copies_as_they_follow_local_ones(self):
+        tools(self.bin, rcmp=TOOL, rlink=TOOL, rrm=TOOL)
+        seen, execute = [], run.execute_commands
+        def note(commands, *args, **kwargs):
+            seen.append(Path(commands[0][0]).name)
+            return execute(commands, *args, **kwargs)
+        cells = ("alpha:local", "alpha:local-rrm", "alpha:remote", "alpha:remote-rcmp", "alpha:remote-rlink",
+                 "alpha:remote-rrm")
+        with mock.patch.object(run, "execute_commands", side_effect=note):
+            record = self.run_matrix(cells=cells)
+        self.assertEqual((record["status"], {status for _, _, status in self.outcomes(record)}),
+                         ("complete", {"complete"}))
+        # each cell's tools follow its own copies
+        self.assertEqual(seen, ["rcp", "rrm"] * 2 + ["rcp", "rcmp", "rlink", "rrm"] * 2)
+        by_scenario = {cell["scenario"]: cell for cell in record["cells"]}
+        remote = by_scenario["remote"]["copies"]
+        for scenario in ("remote-rcmp", "remote-rlink", "remote-rrm"):
+            runs = by_scenario[scenario]["copies"]
+            self.assertEqual([item["follows_trial_index"] for item in runs], [copy["trial_index"] for copy in remote])
+            self.assertEqual([item["resources"]["status"] for item in runs], ["complete", "complete"])
+            for item in runs:
+                # a tool works on the copy where it is, with plain paths: no host, no daemon, no ssh
+                self.assertFalse(any("127.0.0.1" in argument for argument in item["command"]))
+                self.assertNotIn("role_resources", item)
+        self.assertIn("/alpha/remote/1", by_scenario["remote-rrm"]["copies"][0]["command"][-1])
+        self.assertEqual(by_scenario["remote-rrm"]["variant"], by_scenario["local-rrm"]["variant"])
+        self.assertNotEqual(by_scenario["remote-rrm"]["cell_id"], by_scenario["local-rrm"]["cell_id"])
+        self.assertEqual(list((self.root / "destination").iterdir()), [])
+        self.assertNotIn("rrm_fallback", record)
+
     def test_only_known_scenarios_are_selected(self):
-        self.assertEqual(matrix.SCENARIOS, ("local", "remote"))
+        self.assertEqual(matrix.SCENARIOS, ("local", "remote", "local-rcmp", "local-rlink", "local-rrm",
+                                            "remote-rcmp", "remote-rlink", "remote-rrm"))
         with self.assertRaisesRegex(ValueError, "unknown scenario: wan"):
             self.run_matrix(cells=("alpha:wan",))
         self.assertFalse((self.root / "out").exists())

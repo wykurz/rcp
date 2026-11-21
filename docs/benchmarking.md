@@ -684,8 +684,8 @@ kernel I/O operation can still require the outer process/cgroup timeout.
 ## Performance-only matrix runs
 
 `just benchmark-matrix` (`python3 -m benchmarks.matrix`) measures a list of *cells* and nothing
-else. A cell is one file set copied under one scenario. It is the runner behind the AWS matrix
-suites, and it runs anywhere:
+else. A cell is one file set under one scenario: a copy, or another tool run on a copy. It is the
+runner behind the AWS matrix suites, and it runs anywhere:
 
 ```bash
 just benchmark-matrix --manifest benchmarks/matrix-cases.json \
@@ -694,7 +694,7 @@ just benchmark-matrix --manifest benchmarks/matrix-cases.json \
     --cache uncontrolled --output /tmp/matrix-results
 ```
 
-There are two scenarios:
+Two scenarios copy a file set, and six time another tool on a copy:
 
 - **`local`** copies between two directories:
   `rcp --summary --output-format=json SOURCE DESTINATION`.
@@ -703,12 +703,16 @@ There are two scenarios:
   rcp starts a source and a destination `rcpd` over SSH and the daemons exchange the data over
   loopback TCP, encrypted as by default. No network hardware and no added latency are involved. See
   [Remote cells](#remote-cells) for what the runner sets up.
+- **`local-rcmp`**, **`local-rlink`** and **`local-rrm`** compare, hard-link and remove the tree
+  that a `local` copy has just written, and **`remote-rcmp`**, **`remote-rlink`** and
+  **`remote-rrm`** do the same after a `remote` copy. See [Tool cells](#tool-cells).
 
 It differs from `benchmark-run` in what it promises:
 
-- **One build, default settings.** Every cell runs the `rcp-default` variant from `--bin-dir`. There
-  is no baseline build, no pairing and no comparison; `--repetitions` (default 3) is the number of
-  copies per cell and the cell's value is their median.
+- **One build, default settings.** Every copy runs the `rcp-default` variant from `--bin-dir`, and
+  every tool cell its own fixed command from the same directory. There is no baseline build, no
+  pairing and no comparison; `--repetitions` (default 3) is the number of copies, or of tool runs,
+  per cell and the cell's value is their median.
 - **Cells are independent.** A cell that fails, hangs or hits an error nobody foresaw records its
   own outcome and the run goes on to the next cell. The run exits zero whenever it worked through
   its list, whatever the cells' outcomes. Cells of one file set share its generated fixture and run
@@ -724,7 +728,8 @@ It differs from `benchmark-run` in what it promises:
 - **Copies are not verified.** A copy counts when the command exits zero and its own `--summary`
   reports the expected numbers of files copied and unchanged. No tree is walked or hashed, before or
   after. Correctness is covered by the test suites; this runner only measures. Records, summaries
-  and public pages say so wherever they show these numbers.
+  and public pages say so wherever they show these numbers. A tool run counts the same way, on its
+  exit status and the counts of its own summary.
 - **Resources are what rcp reports about itself.** Every copy is asked for its summary as JSON
   (`--output-format=json`), printed as the last line of its output. The runner takes the transfer
   counts from it, and CPU time, peak memory, context switches and page faults of the `rcp` process,
@@ -743,8 +748,8 @@ It differs from `benchmark-run` in what it promises:
 
 Cell outcomes are `complete`, `failed`, `timed_out`, `interrupted` (cut short by the end of the
 allocation or by a stop signal) and `not_run`. A failed cell is not retried, and its remaining
-copies are skipped. Each outcome carries the stage it happened in and a short reason that names the
-log to read, for example
+copies or runs are skipped. Each outcome carries the stage it happened in and a short reason that
+names the log to read, for example
 `copy 2 failed with exit code 1; see 0.stdout.log and 0.stderr.log in logs/bulk-1m-1024gb/local/2`.
 rcp writes what went wrong to its output; only its argument parser uses the error stream.
 
@@ -755,11 +760,75 @@ Each command log is cut to its first and last half mebibyte once the command has
 that fails for every file cannot fill a small output directory. `benchmarks.matrix.validate` checks
 a document before anything is concluded from it. `--check-capacity` needs source and destination on
 different filesystems, as on the AWS worker. `--system-telemetry` samples the same bounded host and
-cgroup diagnostics as `benchmark-run`. A fixture or destination that could not be removed is counted
-in `removal_failures`.
+cgroup diagnostics as `benchmark-run`; a command's window lasts until the next step starts. A
+fixture, destination or linked tree that could not be removed is counted in `removal_failures`.
 
 These documents are a separate format: the dashboards and change reports described below read
 `benchmark-run` results only.
+
+### Tool cells
+
+Six scenarios time the other tools on real trees without generating anything for them. A tool cell
+is named after the copies it follows and its tool: `local-rcmp`, `local-rlink` and `local-rrm`
+follow local copies, `remote-rcmp`, `remote-rlink` and `remote-rrm` remote ones. A tool cell makes
+no copies of its own. Each of its runs follows one copy of that cell, of the same file set, so that
+cell has to be selected too:
+
+```bash
+just benchmark-matrix --manifest benchmarks/matrix-cases.json \
+    --cell commission-10k:local --cell commission-10k:local-rcmp --cell commission-10k:local-rlink \
+    --cell commission-10k:local-rrm \
+    --bin-dir target/release --source-root /scratch/source --destination-root /scratch/destination \
+    --cache uncontrolled --output /tmp/matrix-results
+```
+
+After each copy the tools selected for it run in this order, whatever the order of the selection:
+
+1. **`rcmp`** compares the source with the copy by file size:
+   `rcmp --summary --quiet --metadata-compare=f:size --output-format=json SOURCE COPY`. A default
+   rcp copy does not keep modification times, so the default comparison would report every file. The
+   run counts when rcmp exits zero, which means no difference, and reports every file and directory
+   as the same.
+2. **`rlink`** hard-links the copy into a new tree beside it:
+   `rlink --summary --output-format=json COPY TREE`. The run counts when it reports a hard link for
+   every file and a directory for every directory. The new tree is then removed, outside the
+   measurement.
+3. **`rrm`** removes the copy: `rrm --summary --output-format=json COPY`. The run counts when it
+   reports every file and directory removed.
+
+A tool runs the same command whichever copies it follows, on the tree where it is: a tool after a
+remote copy uses plain paths, no daemon and no SSH. The two are still separate cells, each with its
+own runs and outcome, so that a remote copy that fails costs the tools after it and not the ones
+after the local copy. On the AWS pages their runs are plotted together.
+
+What a tool cell's numbers mean:
+
+- **Time and resources.** The wall time of the tool's command, measured as a copy's is, and what the
+  tool reports about itself in its JSON summary, recorded under `resources`. The counts that were
+  checked are recorded under `tool_summary`.
+- **Cache.** No cache is dropped for a tool. It finds what the copy before it left in memory:
+  usually the metadata of both trees, and as much file data as fits. `--cache` applies to the copies
+  only. A tool on a cold tree is a different measurement, which this runner does not make.
+- **Order.** `follows_trial_index` names the copy a run followed. The three tools see slightly
+  different trees: rcmp runs first, and rrm removes a tree whose files have been linked and unlinked
+  once.
+
+A tool that fails, hangs or reports the wrong counts ends its own cell and nothing else. The copies
+go on, and so do the other tools. Its outcome names the stage (`command` or `summary`) and the log,
+as
+`run 1 failed with exit code 2; see 0.stdout.log and 0.stderr.log in logs/tiny-1k-10240k/local-rrm/1`.
+When a copy fails, the tool cells that still waited for it take its outcome at stage `copy`. Only
+the tools of the selected cells have to be in `--bin-dir`.
+
+**Removals.** A run with an rrm cell clears every tree with that rrm, as a user of the tools would:
+the tree that rlink made, a file set that is done with, a copy that no rrm cell follows, and the
+scratch directories. These removals are not measured; `context.removal` says `rrm`. The run does not
+depend on them succeeding. When rrm fails at one, exits with an error or does not finish within the
+hang limit, `rm -rf` clears that tree and every later tree of the run, and `rrm_fallback` in the
+results says why. The same happens after a measured run of rrm that failed, for the copy it left. A
+build whose rrm is broken therefore costs its rrm cells, not the copies after them, and an rrm that
+hangs costs the run one hang limit, not one for every tree. A run without an rrm cell has no rrm and
+removes with `rm -rf` (`context.removal` says `rm -rf`).
 
 ### Remote cells
 
@@ -811,10 +880,11 @@ SIGINT or SIGTERM. A runner that is killed outright (SIGKILL, out of memory) cle
 directory `rcp-bench-ssh-*` stays in the temporary directory. On the AWS worker the unit's control
 group and private `/tmp` contain both.
 
-An endpoint that cannot be started fails every remote cell at stage `transport`, with the reason,
-and leaves the other cells alone; a file set that has only such cells is not generated. An sshd that
-dies between copies is started again (`endpoint_restarted` on the next copy); if that fails, the
-remaining remote cells fail at `transport` as well.
+An endpoint that cannot be started fails every remote cell at stage `transport`, with the reason.
+The tool cells on those copies fail with them, at stage `copy`, and the other cells are left alone.
+A file set that has only such cells is not generated. An sshd that dies between copies is started
+again (`endpoint_restarted` on the next copy); if that fails, the remaining remote cells fail at
+`transport` as well.
 
 `python3 -m benchmarks.private_sshd` starts the endpoint, logs in once and stops: a quick check that
 a machine can serve remote cells. When it fails it prints the reason and the end of sshd's log.
