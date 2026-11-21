@@ -336,6 +336,14 @@ remote row, that page and its navigation entry appear with the first run that ha
 run page with remote cells summarizes each cell under its file set and scenario and lists the
 resources of every process of a remote copy.
 
+Each of the other tools has a page as well, with the first run that has a cell of it: `rcmp.html`,
+`rlink.html` and `rrm.html` plot the tool's duration, CPU time and peak memory, one section per file
+set. A tool's page leaves out the file sets on which it takes milliseconds, and says so: `rcmp` and
+`rlink` are plotted for the 1 MB and 1 KB file sets, which hold a million and ten million files, and
+`rrm` for all four, since removing a terabyte takes time whatever the number of files. The AWS
+benchmarks page gains one row for the tools, each on the 1 KB file set. The copies' rows, pages and
+trends are unchanged by tool cells.
+
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe
 drives, which AWS's instance-store specification for compute optimized instances gives together as
 1,400,000 random reads and 680,000 writes of 4 KiB a second; a terabyte file set is several times
