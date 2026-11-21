@@ -55,6 +55,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Speed up ordinary, unfiltered `rrm` removals on filesystems that report entry types in directory
+  listings. One worker can read a file's type and size and unlink it through its open parent
+  directory, preserving the file and byte counts in progress and summary output.
 - Default to `--local-copy-handoff=fresh` for local `rcp` copies and files copied by
   `rlink --update`. When the first create of a vacant destination succeeds, the same worker copies
   its data, saving one blocking job submission per new file. Use `--local-copy-handoff=never` to

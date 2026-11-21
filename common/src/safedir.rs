@@ -1629,6 +1629,85 @@ impl Dir {
         .await
     }
 
+    /// Remove a nondirectory through this pinned parent, keeping its kind and size for accounting.
+    ///
+    /// A directory snapshot requests ordinary pinned classification and descent. A leaf snapshot
+    /// does not bind the final inode: the by-name unlink never follows links or removes a directory.
+    /// The outer error identifies a failed stat and the inner result reports the unlink.
+    pub(crate) async fn unlink_if_nondirectory(
+        &self,
+        name: &OsStr,
+    ) -> std::io::Result<Option<std::io::Result<RemovalSnapshot>>> {
+        use futures::FutureExt as _;
+
+        if !is_single_component(name) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let parent = Arc::clone(&self.fd);
+        let child = name.to_owned();
+        let stat = prepare_metadata_operation(self.side, congestion::MetadataOp::Stat, move || {
+            let st = fstatat(
+                parent.as_fd(),
+                child.as_bytes(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(nix_to_io)?;
+            Ok(RemovalSnapshot {
+                kind: kind_from_stat(&st),
+                identity: (st.st_dev, st.st_ino),
+                size: st.st_size as u64,
+            })
+        })
+        .await
+        .into_blocking();
+        let parent = Arc::clone(&self.fd);
+        let child = name.to_owned();
+        let timing = MetadataOperationTiming::capture(
+            congestion::Side::Destination,
+            congestion::MetadataOp::Unlink,
+        );
+        let waiter = Arc::new(());
+        let live_waiter = Arc::downgrade(&waiter);
+        let next = run_fd_admitted_blocking(move || {
+            let snapshot = stat()?;
+            if snapshot.kind() == EntryKind::Dir {
+                return Ok(MetadataHandoff::Complete(None));
+            }
+            if live_waiter.upgrade().is_none() {
+                return Ok(MetadataHandoff::Cancelled);
+            }
+            #[cfg(test)]
+            let fd = parent.as_raw_fd();
+            let mut admission =
+                Box::pin(prepare_metadata_operation_with_timing(timing, move || {
+                    Self::unlink_nondirectory(&parent, &child)?;
+                    Ok(snapshot)
+                }));
+            if let Some(operation) = admission.as_mut().now_or_never() {
+                #[cfg(test)]
+                let _gate = tests::gate_file_stage(fd, ".rcp-before-hinted-unlink");
+                // cancellation during stat or admission can still withdraw this mutation
+                if live_waiter.upgrade().is_none() {
+                    return Ok(MetadataHandoff::Cancelled);
+                }
+                return Ok(MetadataHandoff::Complete(Some(operation.run())));
+            }
+            // preserve a charged token and the waiter's place in the queue, freeing this worker
+            Ok(MetadataHandoff::AwaitAdmission(admission))
+        })
+        .await?;
+        drop(waiter);
+        match next {
+            MetadataHandoff::Complete(removed) => Ok(removed),
+            MetadataHandoff::AwaitAdmission(admission) => Ok(Some(
+                run_fd_admitted_blocking(admission.await.into_blocking()).await,
+            )),
+            MetadataHandoff::Cancelled => {
+                unreachable!("unlink cancelled while its waiter was alive")
+            }
+        }
+    }
+
     /// Remove a child non-directory entry by name, gated on this directory's own congestion side.
     ///
     /// For a symlink, this unlinks the link itself — never its target.
@@ -1678,14 +1757,17 @@ impl Dir {
         let dir = self.fd.clone();
         let name = name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Unlink, move || {
-            #[cfg(test)]
-            let _visit = tests::gate_unlink(dir.as_raw_fd(), &name)?;
-            unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir)
-                .map_err(nix_to_io)?;
+            Self::unlink_nondirectory(&dir, &name)?;
             after_unlink();
             Ok(())
         })
         .await
+    }
+
+    fn unlink_nondirectory(dir: &DirectoryDescriptor, name: &OsStr) -> std::io::Result<()> {
+        #[cfg(test)]
+        let _visit = tests::gate_unlink(dir.as_raw_fd(), name)?;
+        unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir).map_err(nix_to_io)
     }
 
     /// Remove a child empty directory by name, gated on this directory's own congestion side.
@@ -3335,8 +3417,8 @@ async fn fchown_and_futimens_owned(
     }
 }
 
-enum MetadataHandoff<A> {
-    Complete(OwnedFd),
+enum MetadataHandoff<T, A> {
+    Complete(T),
     AwaitAdmission(A),
     Cancelled,
 }
