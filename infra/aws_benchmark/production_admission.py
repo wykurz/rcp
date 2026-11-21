@@ -12,7 +12,7 @@ import json
 import re
 
 from . import durable
-from .common import BINARIES, require, timestamp, utc, error_code, retryable_io
+from .common import KNOWN_BINARIES, require, timestamp, utc, error_code, retryable_io
 from .durable_client import execution_arn
 from .production_policy import authorize, canonical, manifest, Policy, MAX_RUN_AGE_SECONDS
 from .production_store import AdmissionDecision, RunStore
@@ -30,7 +30,7 @@ def epoch_for(key):
 
 def staged_key(key, binary):
     require(re.fullmatch(r"repo-[1-9][0-9]{0,19}-run-[1-9][0-9]{0,19}", key)
-            and binary in BINARIES, "invalid immutable upload key")
+            and binary in KNOWN_BINARIES, "invalid immutable upload key")
     return "production/staging/" + key + "/" + binary
 
 

@@ -8,7 +8,7 @@ the production worker role must grant only that instance-origin prefix.
 from dataclasses import dataclass
 import re
 
-from .common import BINARIES, REQUEST_KEY, RESULTS_KEY, STATUS_KEY, WINDOW_KEY, require
+from .common import KNOWN_BINARIES, REQUEST_KEY, RESULTS_KEY, STATUS_KEY, WINDOW_KEY, require
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ class MailboxPaths:
         return self.prefix + STATUS_KEY
 
     def binary(self, name):
-        require(isinstance(name, str) and name in BINARIES, "unexpected mailbox binary")
+        require(isinstance(name, str) and name in KNOWN_BINARIES, "unexpected mailbox binary")
         return self.prefix + "input/" + name
 
     @property

@@ -22,17 +22,21 @@ def matrix_example(suite="matrix-1g-local", run="43200000001", at="2026-11-20T08
     raw["timestamp"] = at
     cells = [dict(case_id=cell["case_id"], scenario=cell["scenario"], outcome=cell["outcome"]["status"],
                   stage=cell["outcome"]["stage"], message=cell["outcome"]["message"]) for cell in raw["cells"]]
-    measurements = [dict(case_id=cell["case_id"], variant_id="rcp-default", scenario=cell["scenario"],
+    # the record of a suite with tool cells is the later version, where a tool cell names what its tool ran
+    schema = projection.matrix_schema(cell["scenario"] for cell in raw["cells"])
+    tools = projection.PUBLIC_CONTRACTS[schema].get("tool_variants", {})
+    measurements = [dict(case_id=cell["case_id"], variant_id=tools.get(cell["scenario"], "rcp-default"),
+        scenario=cell["scenario"],
         series_id=hashlib.sha256(cell["cell_id"].encode()).hexdigest(), median=cell["summary"]["median"],
         samples=cell["summary"]["samples"]) for cell in raw["cells"] if cell["outcome"]["status"] == "complete"]
     valid = bool(measurements)
-    record = dict(schema="rcp-production-public-report-v4", run_key="repo-655073755-run-" + run,
+    record = dict(schema=schema, run_key="repo-655073755-run-" + run,
         retirement_sha256="a" * 64, benchmark_valid=valid, cleanup_verified=True,
-        validation=projection.PUBLIC_CONTRACTS["rcp-production-public-report-v4"]["validation"],
+        validation=projection.PUBLIC_CONTRACTS[schema]["validation"],
         identity=dict(run=run + "-1", run_url="https://github.com/wykurz/rcp/actions/runs/" + run + "/attempts/1",
             suite=suite, baseline="1" * 40, candidate="1" * 40, controller="2" * 40),
         comparison=projection.IDENTICAL_BINARIES, measurements=measurements, series_contract="aws-local-ext4-v1",
-        note="Each measurement is the median of 3 copies." if valid
+        note="Each measurement is the median of 3 copies" + (" or tool runs." if tools else ".") if valid
              else "Safely retired failed qualification; excluded from performance history.",
         qualification_outcome="passed" if valid else "failed", collected_at="2026-11-20T18:44:32+00:00",
         cells=cells, diagnostics=list(notes))

@@ -301,6 +301,22 @@ a local copy. A copy without figures for its command publishes none for its daem
 decides the version, so a stored companion never changes it, and the versions do not stand in for
 each other.
 
+A run of a suite that also times the other tools (`+tools` in its name) publishes record version 5,
+`rcp-production-public-report-v5`. It is version 4 with two differences. The measurement of a tool
+cell names what the tool ran in `variant_id` (`rcmp-size`, `rlink-default`, `rrm-default`) where a
+copy's is `rcp-default`, and `validation` reads "Not verified: a copy or a tool run counts when its
+command exits cleanly and reports the expected counts." A tool cell is a cell like any other. Its
+`scenario` names the copies it follows and its tool (`local-rcmp`, `local-rlink`, `local-rrm`,
+`remote-rcmp`, `remote-rlink`, `remote-rrm`), its samples are the durations of the tool's three
+runs, and it has a series of its own. The suite decides the version, so a suite without tool cells
+keeps publishing version 4, and the copies of a version 5 record continue the series of the same
+cells in version 4 records.
+
+The diagnostics companion of a version 5 record is `rcp-public-resource-diagnostics-v4`: version 3
+where every trial carries the `variant_id` of its own cell, and only a remote copy has `roles`. A
+tool run is one process whichever copies it follows, so its `metrics` are the tool's own and its
+`roles` is `null`, as for a local copy.
+
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
 marked setup change (`Copy check`), not as a new line. The run page lists every cell with its result
 and, for anything not measured, what happened. A run that measured only some of its cells is shown

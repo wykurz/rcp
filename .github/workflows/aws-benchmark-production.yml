@@ -20,7 +20,7 @@ on:
         type: string
         required: false
       suite:
-        description: Manual profile; needs server approval and a qualified image. matrix-* measure one build, three copies per cell, locally, over loopback rcpd (remote) or both
+        description: Manual profile; needs server approval and a qualified image. matrix-* measure one build, three copies per cell, locally, over loopback rcpd (remote) or both; +tools also times rcmp, rlink and rrm on each copy of the cell before it
         type: choice
         options:
           - bulk-1g-metadata
@@ -46,6 +46,24 @@ on:
           - matrix-1m-local+remote
           - matrix-1k-local+remote
           - matrix-commission-local+remote
+          - matrix-all-local+tools
+          - matrix-1g-local+tools
+          - matrix-100m-local+tools
+          - matrix-1m-local+tools
+          - matrix-1k-local+tools
+          - matrix-commission-local+tools
+          - matrix-all-local+tools+remote
+          - matrix-1g-local+tools+remote
+          - matrix-100m-local+tools+remote
+          - matrix-1m-local+tools+remote
+          - matrix-1k-local+tools+remote
+          - matrix-commission-local+tools+remote
+          - matrix-all-local+tools+remote+tools
+          - matrix-1g-local+tools+remote+tools
+          - matrix-100m-local+tools+remote+tools
+          - matrix-1m-local+tools+remote+tools
+          - matrix-1k-local+tools+remote+tools
+          - matrix-commission-local+tools+remote+tools
         default: bulk-1g-metadata
         required: true
       revision:
@@ -110,7 +128,7 @@ jobs:
           sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
           just build-release
           mkdir -p "$RUNNER_TEMP/binaries"
-          for name in rcp rcpd filegen; do
+          for name in rcp rcpd filegen rcmp rlink rrm; do
             install -m 0755 "target/x86_64-unknown-linux-musl/release/$name" "$RUNNER_TEMP/binaries/$name"
             strip --strip-debug "$RUNNER_TEMP/binaries/$name"
             size=$(stat -c %s "$RUNNER_TEMP/binaries/$name")

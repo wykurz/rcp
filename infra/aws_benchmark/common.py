@@ -30,6 +30,13 @@ PENDING = "pending"
 COMPLETED = "completed"
 BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
+# the other tools that a matrix suite may time, in the order the runner runs them after a copy
+MATRIX_TOOLS = ("rcmp", "rlink", "rrm")
+# the scenarios of their cells: a tool cell is named after the copies it follows and its tool
+MATRIX_TOOL_CELLS = frozenset(copies + "-" + tool for copies in ("local", "remote") for tool in MATRIX_TOOLS)
+# every binary that any plan may name: what an upload or a mailbox object can be
+KNOWN_BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
+                       for name in (*BINARY_NAMES, *MATRIX_TOOLS))
 # append versions; admission and historical reads use the same frozen policy entry
 _RECORDED_DURABLE_CONTRACTS = {
     "bulk-metadata-plan-v1": MappingProxyType(dict(
@@ -73,31 +80,42 @@ _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"] = MappingPro
         minimum_worker_seconds=28200, boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
 # performance-only matrix suites are an exact catalog: a name still selects one fixed plan.
 # a cell is one file set under one scenario; copies are not verified (benchmarks/matrix.py).
-# a suite is a selection of file sets under local copies, remote copies over loopback, or both.
+# a suite is a selection of file sets under local copies, remote copies over loopback, or both,
+# and with or without the other tools timed on each copy.
 MATRIX_POLICY = SUMMARY_POLICY
 MATRIX_FILE_SETS = MappingProxyType({"1g": "bulk-1g-1tb", "100m": "bulk-100m-1024gb",
                                      "1m": "bulk-1m-1024gb", "1k": "tiny-1k-10240k"})
 # small fixtures that exercise every step of a matrix run in seconds
 MATRIX_COMMISSIONING = ("commission-64m", "commission-10k")
-MATRIX_SCENARIO_SETS = (("local",), ("remote",), ("local", "remote"))
+# a set's name ends the names of its suites and reads as the order of a file set's cells.
+# "tools" stands for the tool cells of the copy cell before it, whose copies they work on
+_LOCAL_TOOLS, _REMOTE_TOOLS = (tuple(copies + "-" + tool for tool in MATRIX_TOOLS) for copies in ("local", "remote"))
+MATRIX_SCENARIO_SETS = MappingProxyType({
+    "local": ("local",), "remote": ("remote",), "local+remote": ("local", "remote"),
+    "local+tools": ("local", *_LOCAL_TOOLS), "local+tools+remote": ("local", *_LOCAL_TOOLS, "remote"),
+    "local+tools+remote+tools": ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS)})
 _MATRIX_SELECTIONS = {"all": tuple(MATRIX_FILE_SETS.values()),
                       **{name: (case,) for name, case in MATRIX_FILE_SETS.items()},
                       "commission": MATRIX_COMMISSIONING}
 _MATRIX_PROFILES, _MATRIX_PLAN_VERSIONS = {}, {}
 # scenario sets outermost: suites added with a later set never move the earlier ones
-for _scenarios in MATRIX_SCENARIO_SETS:
+for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
     for _selection, _cases in _MATRIX_SELECTIONS.items():
-        _suite = "matrix-" + _selection + "-" + "+".join(_scenarios)
+        _suite = "matrix-" + _selection + "-" + _set
         _version = _suite + "-plan-v1"
         # every file set together needs the eight-hour allocation; one set fits the ordinary one
         _base = "all-filesets-qualification-budget-v1" if _selection == "all" else "bulk-100m-qualification-budget-v1"
         # a matrix run uses whatever time it gets, so a slow start must not void the allocation:
         # the worker only declines when less than an hour, too little for one large cell, is left
-        _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+        _contract = dict(
             _RECORDED_DURABLE_CONTRACTS[_base], suite=_suite,
             timing_basis="fixed allocation; cells that do not fit are reported as not run",
             plan=MappingProxyType(dict(_RECORDED_DURABLE_CONTRACTS[_base]["plan"], version=_version,
-                                       minimum_worker_seconds=3600))))
+                                       minimum_worker_seconds=3600)))
+        if MATRIX_TOOL_CELLS.intersection(_scenarios):
+            # the worker runs what it is sent: a suite that times the tools sends them too
+            _contract["binary_names"] = (*BINARY_NAMES, *MATRIX_TOOLS)
+        _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(_contract)
         _MATRIX_PLAN_VERSIONS[_suite] = _version
         # the scenarios of one file set run next to each other, on the one fixture generated for it
         _MATRIX_PROFILES[_suite] = dict(cases=_cases,
@@ -254,6 +272,11 @@ def durable_plan_for_suite(suite):
     """Select an explicit current contract; never scale another fixture's estimate."""
     require(suite in DURABLE_SUITES, "direct qualification suite is not allowlisted")
     return dict(_RECORDED_DURABLE_CONTRACTS[_CURRENT_PLAN_VERSIONS[suite]]["plan"])
+
+
+def suite_binaries(suite):
+    """The binaries that a suite's current plan sends to the worker, by their mailbox names."""
+    return durable_plan_contract(durable_plan_for_suite(suite))["binaries"]
 
 
 def durable_plan_contract(plan, *, exact=True):
