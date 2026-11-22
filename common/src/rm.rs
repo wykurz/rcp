@@ -458,29 +458,30 @@ impl WalkVisitor for RmVisitor {
 
     fn root_dir_context(&self) {}
 
-    fn hinted_leaf<'a>(
+    fn uses_hinted_leaves(&self) -> bool {
+        self.use_leaf_snapshot && !tracing::enabled!(tracing::Level::DEBUG)
+    }
+
+    async fn hinted_leaf<'a>(
         &'a self,
-        cx: &'a EntryCx,
-    ) -> Option<
-        impl std::future::Future<Output = crate::walk_driver::HintedLeafResult<Summary>> + Send + 'a,
-    > {
-        // the ordinary visit emits the per-leaf decision on the caller's tracing subscriber before unlink
-        if !self.use_leaf_snapshot || tracing::enabled!(tracing::Level::DEBUG) {
-            return None;
+        parent: &'a Dir,
+        name: &'a OsStr,
+        parent_display: &'a std::path::Path,
+    ) -> crate::walk_driver::HintedLeafResult<Summary> {
+        // a changed worker tracing filter still gets the ordinary per-leaf visit and its debug event
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            return Ok(None);
         }
-        Some(async move {
-            let removed = cx
-                .parent
-                .unlink_if_nondirectory(&cx.name)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", &cx.real_path))
-                .map_err(|err| Error::new(err, Summary::default()))?
-                .transpose()
-                .with_context(|| format!("failed removing {:?}", &cx.real_path))
-                .map_err(|err| Error::new(err, Summary::default()))?;
-            Ok(removed
-                .map(|entry| account_removed_leaf(self.prog_track, entry.kind(), entry.size())))
-        })
+        let display_path = || crate::walk::join_path(parent_display, std::path::Path::new(name));
+        let removed = parent
+            .unlink_if_nondirectory(name)
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", display_path()))
+            .map_err(|err| Error::new(err, Summary::default()))?
+            .transpose()
+            .with_context(|| format!("failed removing {:?}", display_path()))
+            .map_err(|err| Error::new(err, Summary::default()))?;
+        Ok(removed.map(|entry| account_removed_leaf(self.prog_track, entry.kind(), entry.size())))
     }
 
     fn permit_kind(&self) -> PermitKind {
@@ -962,6 +963,113 @@ mod tests {
 
     static PROGRESS: std::sync::LazyLock<progress::Progress> =
         std::sync::LazyLock::new(progress::Progress::new);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hinted_failure_keeps_the_full_display_path_and_partial_counts() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::{Path, PathBuf};
+        static FIXTURE_PROGRESS: std::sync::LazyLock<progress::Progress> =
+            std::sync::LazyLock::new(progress::Progress::new);
+        let failed_name = OsStr::from_bytes(b"bad-\xfe");
+        let directory_name = OsStr::from_bytes(b"nested-\xfd");
+        let display = PathBuf::from(OsStr::from_bytes(b"display//./branch-\xff"));
+        let _dispatch = tracing::dispatcher::set_default(&tracing::Dispatch::none());
+        for (fail_unlink, alone) in [(false, true), (false, false), (true, true), (true, false)] {
+            let root = tempfile::tempdir()?;
+            let nested = root.path().join(directory_name);
+            let mut entries = vec![(failed_name.to_owned(), Some(EntryKind::File))];
+            if !alone {
+                std::fs::create_dir(&nested)?;
+                std::fs::write(nested.join("inside"), b"inside")?;
+                std::fs::write(root.path().join("good"), b"abc")?;
+                entries.extend([
+                    ("good".into(), Some(EntryKind::File)),
+                    (directory_name.to_owned(), Some(EntryKind::File)),
+                ]);
+            }
+            let failed = root.path().join(failed_name);
+            let _fail_unlink = if fail_unlink {
+                std::fs::write(&failed, b"keep this one")?;
+                Some(testutils::BlockingPathGate::fail_once(
+                    failed.join(".rcp-unlink"),
+                    libc::EACCES,
+                ))
+            } else {
+                None
+            };
+            let parent =
+                Arc::new(Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?);
+            let cx = EntryCx::root(
+                Arc::clone(&parent),
+                OsStr::new("tree").to_owned(),
+                display.clone(),
+                &FIXTURE_PROGRESS,
+            )
+            .with_relative_path(Path::new("logical-filter-coordinate").into());
+            let visitor = Arc::new(RmVisitor {
+                protection: None,
+                prog_track: &FIXTURE_PROGRESS,
+                use_leaf_snapshot: true,
+                settings: Settings {
+                    fail_early: false,
+                    dry_run: None,
+                    filter: None,
+                    time_filter: None,
+                },
+            });
+            let before = FIXTURE_PROGRESS.ops.get();
+            let error = crate::walk_driver::walk_dir_entries(visitor, parent, &cx, &(), entries)
+                .await
+                .expect_err("the missing entry or failed unlink must be reported");
+            let after = FIXTURE_PROGRESS.ops.get();
+            let expected_ops = if alone { 1 } else { 4 };
+            assert_eq!(after.started - before.started, expected_ops);
+            assert_eq!(after.finished - before.finished, expected_ops);
+            let (errno, phase) = if fail_unlink {
+                (libc::EACCES, "failed removing")
+            } else {
+                (libc::ENOENT, "failed reading metadata from")
+            };
+            assert_eq!(
+                error
+                    .source
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(errno),
+            );
+            let expected_path = display.join(failed_name);
+            assert_eq!(
+                error.source.to_string(),
+                format!("{phase} {expected_path:?}")
+            );
+            let counts = error.summary;
+            assert_eq!(
+                (
+                    counts.files_removed,
+                    counts.bytes_removed,
+                    counts.directories_removed
+                ),
+                if alone { (0, 0, 0) } else { (2, 9, 1) }
+            );
+            assert_eq!(
+                (
+                    counts.symlinks_removed,
+                    counts.files_skipped,
+                    counts.symlinks_skipped,
+                    counts.directories_skipped
+                ),
+                (0, 0, 0, 0)
+            );
+            if fail_unlink {
+                assert_eq!(std::fs::read(&failed)?, b"keep this one");
+            } else {
+                assert!(!failed.try_exists()?);
+            }
+            assert!(!nested.try_exists()?);
+            assert!(!root.path().join("good").try_exists()?);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[traced_test]
