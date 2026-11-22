@@ -386,6 +386,10 @@ qualification and rollout.
 - **Sampling.** The journal of system samples is bounded for the longest run: twelve hours, 5,120
   samples and 16 MiB, where the paired profiles keep eight hours, 4,096 samples and 8 MiB. A record
   names the bounds it was sampled under, and the public companion accepts either set.
+- **Credentials.** The instance role's credentials last about six hours, so a longer run renews them
+  when it uploads its results. For that the worker has the SDK ask the instance metadata service up
+  to five times, where the SDK asks once by default: a single failed read there would otherwise cost
+  the run its results, since the archive is not uploaded again after such an error.
 - **Stops and errors.** Results are saved after every step. A copy that fails or hangs fails its
   cell only; so does an error nobody foresaw. A stop signal ends the run and keeps the finished
   cells, which still qualify. Command logs are cut to their head and tail as each command ends: the

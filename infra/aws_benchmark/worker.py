@@ -45,6 +45,11 @@ DATA = Path("/mnt/rcp-benchmark")
 UNIT = "rcp-measure"
 DURABLE_STATE = Path("/var/lib/rcp-benchmark")
 ASSIGNMENT_WAIT_SECONDS = 120
+# the instance role's credentials last about six hours, and the SDK renews them from the instance
+# metadata service when a request next needs them: for a longer run, at the upload of its results.
+# The SDK asks that service once unless told otherwise, and one failed read there would cost the
+# whole run its results
+METADATA_ATTEMPTS = 5
 
 
 def execute(argv, budget, **kwargs):
@@ -641,6 +646,7 @@ def main():
     require(args.production_account is None or args.direct, "production mailbox requires --direct")
     require(os.geteuid() == 0, "supervisor requires root")
     os.chdir(ROOT)
+    os.environ.setdefault("AWS_METADATA_SERVICE_NUM_ATTEMPTS", str(METADATA_ATTEMPTS))
     if args.production_account is None:
         run(clients(args.region)["s3"], args.bucket, direct=args.direct)
     else:
