@@ -28,14 +28,14 @@
 //!
 //! ## Cancellation safety
 //!
-//! Spawned tasks must be `'static`, and an already-started `spawn_blocking` job is not cancellable,
-//! so every per-entry context is **owned**: [`EntryCx`] clones `Arc<Dir>` plus
-//! owned `OsString`/`PathBuf` rather than borrowing, exactly as the existing
-//! per-tool walks do. A dropped surrounding future (timeout or Ctrl-C) therefore
-//! can never leave a spawned task holding a dangling borrow. Fail-early traversal
-//! aborts spawned siblings and its task scope waits for recursively owned async work. A blocking job
-//! that has already started remains non-cancellable; its fd-admission lease outlives the cancelled
-//! waiter without delaying the runtime's bounded shutdown policy.
+//! Each spawned task owns its inputs. An ordinary task carries its name, pinned parent and child
+//! paths in [`EntryCx`]. A hinted removal task owns the name and retains the pinned directory and
+//! parent paths, sharing them with siblings when present. It builds child paths for diagnostics or
+//! fallback. Those inputs stay valid when the surrounding future is dropped.
+//!
+//! Fail-early traversal aborts spawned siblings and waits for recursively owned async work. A
+//! blocking job that has already started runs to completion. Its fd-admission lease outlives the
+//! cancelled waiter without delaying the runtime's bounded shutdown policy.
 //!
 //! ## How copy maps onto this trait
 //!
@@ -422,14 +422,20 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// context as its "parent" context.)
     fn root_dir_context(&self) -> Self::DirContext;
 
-    /// Optionally handle an admitted child with a reliable nondirectory hint and no filter.
-    /// Returning no summary requests ordinary pinned classification, including for stale hints.
+    /// Whether an unfiltered nondirectory hint may be handled using only its parent and name.
+    fn uses_hinted_leaves(&self) -> bool {
+        false
+    }
+
+    /// Handle one admitted hinted child. Returning no summary requests ordinary pinned classification.
+    /// The display path of the parent is available for formatting diagnostics on error.
     fn hinted_leaf<'a>(
         &'a self,
-        _cx: &'a EntryCx,
-    ) -> Option<impl std::future::Future<Output = HintedLeafResult<Self::Summary>> + Send + 'a>
-    {
-        None::<std::future::Ready<HintedLeafResult<Self::Summary>>>
+        _parent: &'a Dir,
+        _name: &'a std::ffi::OsStr,
+        _parent_display: &'a Path,
+    ) -> impl std::future::Future<Output = HintedLeafResult<Self::Summary>> + Send + 'a {
+        std::future::ready(Ok(None))
     }
 
     /// Which backpressure pool a leaf permit comes from for this tool.
@@ -932,33 +938,98 @@ impl<S: WalkSummary> WalkEntryFold<S> {
     }
 }
 
+/// Directory coordinates retained for a hinted child's diagnostics and fallback.
+struct HintedDirectory {
+    dir: Arc<Dir>,
+    rel_path: PathBuf,
+    real_path: PathBuf,
+}
+
+enum HintedDirectoryOwner {
+    Owned(HintedDirectory),
+    Shared(Arc<HintedDirectory>),
+}
+
+enum ScheduledChild {
+    Ordinary(EntryCx),
+    Hinted {
+        directory: HintedDirectoryOwner,
+        name: OsString,
+    },
+}
+
 async fn process_scheduled_entry<V>(
     visitor: Arc<V>,
     cx: EntryCx,
     parent_ctx: V::DirContext,
     ordinal: usize,
     scheduled: ScheduledEntry,
-    hinted_nondirectory: bool,
 ) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
 where
     V: WalkVisitor,
 {
     let _ops_guard = cx.prog_track.ops.guard();
+    dispatch_scheduled_entry(visitor, cx, parent_ctx, ordinal, scheduled).await
+}
+
+async fn process_hinted_entry<V>(
+    visitor: Arc<V>,
+    owner: HintedDirectoryOwner,
+    name: OsString,
+    parent_ctx: V::DirContext,
+    ordinal: usize,
+    scheduled: ScheduledEntry,
+    prog_track: &'static Progress,
+) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
+where
+    V: WalkVisitor,
+{
+    let _ops_guard = prog_track.ops.guard();
+    let directory = match &owner {
+        HintedDirectoryOwner::Owned(directory) => directory,
+        HintedDirectoryOwner::Shared(directory) => directory.as_ref(),
+    };
+    let fd_admission = match &scheduled {
+        ScheduledEntry::Unclassified(admission) | ScheduledEntry::Authoritative(admission) => {
+            admission.admission()
+        }
+    };
+    let handled = crate::safedir::with_optional_fd_admission(
+        fd_admission,
+        visitor.hinted_leaf(&directory.dir, &name, &directory.real_path),
+    )
+    .await?;
+    if let Some(summary) = handled {
+        return Ok(WalkEntryResult {
+            summary,
+            processed: Some((ordinal, name)),
+        });
+    }
+    let cx = EntryCx {
+        parent: Arc::clone(&directory.dir),
+        rel_path: walk::join_path(&directory.rel_path, Path::new(&name)),
+        real_path: walk::join_path(&directory.real_path, Path::new(&name)),
+        name,
+        prog_track,
+    };
+    drop(owner);
+    dispatch_scheduled_entry(visitor, cx, parent_ctx, ordinal, scheduled).await
+}
+
+async fn dispatch_scheduled_entry<V>(
+    visitor: Arc<V>,
+    cx: EntryCx,
+    parent_ctx: V::DirContext,
+    ordinal: usize,
+    scheduled: ScheduledEntry,
+) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
+where
+    V: WalkVisitor,
+{
     let (admission, authoritative) = match scheduled {
         ScheduledEntry::Unclassified(admission) => (admission, false),
         ScheduledEntry::Authoritative(admission) => (admission, true),
     };
-    let handled = if hinted_nondirectory && let Some(visit) = visitor.hinted_leaf(&cx) {
-        crate::safedir::with_optional_fd_admission(admission.admission(), visit).await?
-    } else {
-        None
-    };
-    if let Some(summary) = handled {
-        return Ok(WalkEntryResult {
-            summary,
-            processed: Some((ordinal, cx.name)),
-        });
-    }
     let classified =
         classify_for_dispatch(visitor.as_ref(), &cx, EntrySource::Unclassified(admission)).await?;
     if authoritative
@@ -1051,45 +1122,66 @@ where
     let fail_early = visitor.fail_early();
     let collection = visitor.name_collection();
     let delete_names = matches!(collection, NameCollection::Delete);
-    let unfiltered = !delete_names && visitor.filter().is_none();
+    let defer_hinted_paths =
+        !delete_names && visitor.filter().is_none() && visitor.uses_hinted_leaves();
+    let only_child = entries.len() == 1;
+    let mut shared_directory = None;
+    let hinted_directory = || HintedDirectory {
+        dir: Arc::clone(&dir),
+        rel_path: parent_cx.rel_path.clone(),
+        real_path: parent_cx.real_path.clone(),
+    };
     let mut fold = WalkEntryFold::new(V::Summary::default(), collection);
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
-        // hint exclusions need only the logical path; scheduled entries take this same buffer
-        let child = parent_cx.prepare_child(entry_name);
         let authoritative_filter = visitor.filter().is_some()
             && (delete_names || visitor.filter_requires_admitted_entry());
-        if !delete_names
-            && visitor.filter_allows_hint_only_skip(dir_ctx)
-            && let Some(hinted_kind) = hint
-            && let Some(skip_result) = walk::should_skip_entry_ref(
-                visitor.filter(),
-                &child.rel_path,
-                hinted_kind == EntryKind::Dir,
-            )
-        {
-            // the visitor confirmed that omitting this child cannot authorize downstream work, so
-            // a reliable hint may retain this cheap path. every other outcome is scheduled; an
-            // authoritative visitor rechecks it against the worker's exact classification.
-            fold.add_summary(filter_skip_summary(
-                visitor.as_ref(),
-                &child.skipped(),
-                parent_cx.prog_track,
-                hinted_kind,
-                &skip_result,
-            ));
-            continue;
-        }
-        let child_cx = child.into_context(Arc::clone(&dir));
+        let child_cx = if defer_hinted_paths && hint.is_some_and(|kind| kind != EntryKind::Dir) {
+            let directory = if only_child {
+                HintedDirectoryOwner::Owned(hinted_directory())
+            } else {
+                let shared = shared_directory.get_or_insert_with(|| Arc::new(hinted_directory()));
+                HintedDirectoryOwner::Shared(Arc::clone(shared))
+            };
+            ScheduledChild::Hinted {
+                directory,
+                name: entry_name,
+            }
+        } else {
+            // hint exclusions need only the logical path; scheduled entries take this same buffer
+            let child = parent_cx.prepare_child(entry_name);
+            if !delete_names
+                && visitor.filter_allows_hint_only_skip(dir_ctx)
+                && let Some(hinted_kind) = hint
+                && let Some(skip_result) = walk::should_skip_entry_ref(
+                    visitor.filter(),
+                    &child.rel_path,
+                    hinted_kind == EntryKind::Dir,
+                )
+            {
+                // the visitor confirmed that omitting this child cannot authorize downstream work, so
+                // a reliable hint may retain this cheap path. every other outcome is scheduled; an
+                // authoritative visitor rechecks it against the worker's exact classification.
+                fold.add_summary(filter_skip_summary(
+                    visitor.as_ref(),
+                    &child.skipped(),
+                    parent_cx.prog_track,
+                    hinted_kind,
+                    &skip_result,
+                ));
+                continue;
+            }
+            ScheduledChild::Ordinary(child.into_context(Arc::clone(&dir)))
+        };
         let admission = EntryAdmission::from_hint(hint);
         let scheduled = if authoritative_filter || visitor.filter().is_some() && hint.is_none() {
             ScheduledEntry::Authoritative(admission)
         } else {
             ScheduledEntry::Unclassified(admission)
         };
-        // own everything moved into the task (cancellation safety): the child context
-        // (source parent Arc + owned name/paths), the visitor handle, and a clone of
-        // the inherited context (copy's destination parent dir).
+        // each task owns its child name and parent context across cancellation. separate task
+        // bodies keep the hinted removal state out of ordinary futures, which matters for
+        // filtered walks over wide directories
         let task_visitor = Arc::clone(&visitor);
         let task_ctx = dir_ctx.clone();
         let scheduled = match ensure_scheduled_admission(
@@ -1107,18 +1199,24 @@ where
                 return Err(fold.fail(error));
             }
         };
-        let hinted_nondirectory = unfiltered && hint.is_some_and(|kind| kind != EntryKind::Dir);
-        spawn_tracked(
-            &mut join_set,
-            process_scheduled_entry(
-                task_visitor,
-                child_cx,
-                task_ctx,
-                ordinal,
-                scheduled,
-                hinted_nondirectory,
+        match child_cx {
+            ScheduledChild::Ordinary(cx) => spawn_tracked(
+                &mut join_set,
+                process_scheduled_entry(task_visitor, cx, task_ctx, ordinal, scheduled),
             ),
-        );
+            ScheduledChild::Hinted { directory, name } => spawn_tracked(
+                &mut join_set,
+                process_hinted_entry(
+                    task_visitor,
+                    directory,
+                    name,
+                    task_ctx,
+                    ordinal,
+                    scheduled,
+                    parent_cx.prog_track,
+                ),
+            ),
+        }
     }
     join_walk_entries(join_set, fail_early, fold).await
 }

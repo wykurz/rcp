@@ -1652,16 +1652,15 @@ impl Dir {
                 AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .map_err(nix_to_io)?;
-            Ok(RemovalSnapshot {
+            let snapshot = RemovalSnapshot {
                 kind: kind_from_stat(&st),
                 identity: (st.st_dev, st.st_ino),
                 size: st.st_size as u64,
-            })
+            };
+            Ok((snapshot, parent, child))
         })
         .await
         .into_blocking();
-        let parent = Arc::clone(&self.fd);
-        let child = name.to_owned();
         let timing = MetadataOperationTiming::capture(
             congestion::Side::Destination,
             congestion::MetadataOp::Unlink,
@@ -1669,7 +1668,7 @@ impl Dir {
         let waiter = Arc::new(());
         let live_waiter = Arc::downgrade(&waiter);
         let next = run_fd_admitted_blocking(move || {
-            let snapshot = stat()?;
+            let (snapshot, parent, child) = stat()?;
             if snapshot.kind() == EntryKind::Dir {
                 return Ok(MetadataHandoff::Complete(None));
             }
