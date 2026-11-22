@@ -662,11 +662,11 @@ recurring benchmarks. No history writer key or per-report environment approval i
 A scheduled submission job can finish many hours before the cloud collector retires ownership. The
 reporting scans revisit retained runs rather than treating the submit job conclusion as workload
 completion. The Tuesday refresh follows the regular Monday 08:17 UTC slot, even with the maximum
-one-hour policy lateness, two-hour accepted workflow age, the two-hour capacity search of the
-eight-hour plan, the eight-hour allocation and 15-minute drain, plus more than an hour for
-collection. This is a reporting opportunity, not a promise that recovery has completed: outages can
-leave a pending/held observation, and the daily poll or an existing manual publish refresh can
-observe later progress.
+one-hour policy lateness, two-hour accepted workflow age, the two-hour capacity search of a
+full-matrix plan, its allocation of eight or twelve hours and 15-minute drain, plus more than two
+hours for collection after the longer one. This is a reporting opportunity, not a promise that
+recovery has completed: outages can leave a pending/held observation, and the daily poll or an
+existing manual publish refresh can observe later progress.
 
 Before retirement, the snapshot and Actions summary also show an allowlisted controller-recorded
 worker outcome, safe close category, fixed deadlines and cleanup stage. A recorded worker success is
@@ -971,14 +971,14 @@ on its exit status and the counts of its own summary. No cache is dropped for a 
 
 A suite is named `matrix-<selection>-<scenarios>`:
 
-| Selection    | File sets                                      | Allocation | Reservation |
-| ------------ | ---------------------------------------------- | ---------- | ----------- |
-| `all`        | 1 GB, 100 MB, 1 MB and 1 KB files              | 8 hours    | fixed $50   |
-| `1g`         | 1 GB files                                     | 3 hours    | computed    |
-| `100m`       | 100 MB files                                   | 3 hours    | computed    |
-| `1m`         | 1 MB files                                     | 3 hours    | computed    |
-| `1k`         | 1 KB files                                     | 3 hours    | computed    |
-| `commission` | two small fixtures (16 files and 10,000 files) | 3 hours    | computed    |
+| Selection    | File sets                                      | Allocation               | Reservation                 |
+| ------------ | ---------------------------------------------- | ------------------------ | --------------------------- |
+| `all`        | 1 GB, 100 MB, 1 MB and 1 KB files              | 8 hours, 12 with `tools` | fixed $50, $65 with `tools` |
+| `1g`         | 1 GB files                                     | 3 hours                  | computed                    |
+| `100m`       | 100 MB files                                   | 3 hours                  | computed                    |
+| `1m`         | 1 MB files                                     | 3 hours                  | computed                    |
+| `1k`         | 1 KB files                                     | 3 hours                  | computed                    |
+| `commission` | two small fixtures (16 files and 10,000 files) | 3 hours                  | computed                    |
 
 | Scenarios                  | Cells of each selected file set                                  |
 | -------------------------- | ---------------------------------------------------------------- |
@@ -993,10 +993,22 @@ The name of a scenario set reads as the order of a file set's cells, and `tools`
 cells of the copy cell before it. That is thirty-six suites, for example `matrix-all-local+remote`
 (eight cells), `matrix-1m-remote` (one cell), `matrix-commission-local+remote` (four cells on the
 small fixtures) and `matrix-all-local+tools+remote+tools` (thirty-two cells). The allocation follows
-the selection, not the number of cells. The eight cells of `matrix-all-local+remote` took 5 h 32 min
-of their eight hours in the first full run; how long the tools take on these arrays is not known
-until a suite with them has run. Cells that do not fit are reported `not_run` and the others count;
-the 1 KB file set is last, and within it the remote cell and its tools.
+the selection and, for every file set together, whether the tools are timed: eight hours without
+them, twelve with them. The eight cells of `matrix-all-local+remote` took 5 h 32 min of their eight
+hours in the first full run. How long the tools take on these arrays is not known until a suite with
+them has run, which is why their allocation is generous: the machine is billed for the time it is
+up, and it powers off when the run ends, so time that a run does not use is not paid for. Cells that
+do not fit are reported `not_run` and the others count; the 1 KB file set is last, and within it the
+remote cell and its tools.
+
+Twelve hours are a second runtime profile, `all-filesets-12h-v1`, beside `all-filesets-8h-v1`. A
+profile is one exact runtime, and every place that bounds a run holds it: the plan, the tag that the
+coordinator may put on the instance, the expiry scan that reads that tag, the extension that the
+worker asks its supervisor for, and the sampler, whose journal covers the longest run. The
+reservation of a twelve-hour run is fixed at $65: at $4.608 an hour, with sixteen minutes of
+shutdown and the ancillary allowance, twelve hours compute to $61.47. The three suites were first
+given eight hours. That plan stays recorded as their version 1, so anything admitted under it is
+still read, and the twelve-hour plan is their version 2.
 
 A computed reservation is the ordinary three-hour one: $20 at the current price and ancillary
 allowance. A suite name selects exactly one fixed plan, as before; there is no free-form selection.
@@ -1015,10 +1027,12 @@ the part that its suite's plan names. A suite without `+tools` sends and accepts
 The workflow's `suite` input offers every matrix suite. The server admits one only when the policy's
 `manual_suites` names it. That list stays explicit and holds at most eight suites; nothing is
 enabled by default or by a pattern. Three-hour suites use the ordinary runtime and the ordinary
-manual requesters. The three `matrix-all-…` suites need what every eight-hour run needs:
-`manual_runtime_seconds=28800`, an unexpired `extended_manual_not_after`, and the immutable owner as
-requester. A plan with a runtime profile runs for exactly that profile's time, so no other extended
-runtime is accepted.
+manual requesters. The `matrix-all-…` suites need what every longer run needs:
+`manual_runtime_seconds`, an unexpired `extended_manual_not_after`, and the immutable owner as
+requester. A plan with a runtime profile runs for exactly that profile's time:
+`manual_runtime_seconds` is `28800` for the three suites without the tools and `43200` for the three
+with them, and no other value is accepted. A policy holds one such value, so its `manual_suites` can
+name eight-hour suites or twelve-hour suites next to any three-hour ones, and not both.
 
 ### The weekly schedule
 
@@ -1039,15 +1053,17 @@ The server admits a scheduled request only when its policy agrees, in three fiel
 
 - `scheduled_suite` names the one suite a scheduled request may ask for: `matrix-all-local+remote`.
   A policy stored before the field existed keeps its default, `bulk-1g-metadata`.
-- `scheduled_runtime_seconds` separately approves the eight-hour runtime that the suite's plan
-  needs: `28800`. It is rejected when the scheduled suite has an ordinary plan.
+- `scheduled_runtime_seconds` separately approves the runtime of the suite's profile: `28800` for
+  this suite, `43200` for one with the tools. It is rejected when the scheduled suite has an
+  ordinary plan.
 - `schedule_slots` holds the slot `[0, 8, 17]`: weekday 0 is Monday.
 
 A payload that names only one of the first two fields is not a recorded shape and is refused. A
-scheduled eight-hour run is still owner-only, needs its matching slot and is bounded by the daily,
-monthly and total allowances; it reserves the fixed $50. It has no expiry, because it recurs by
-design. Neither field lets anyone start the suite by hand, and the manual opt-in never stands in for
-the scheduled one.
+scheduled run of either profile is still owner-only, needs its matching slot and is bounded by the
+daily, monthly and total allowances; it reserves the fixed amount of its plan, $50 or $65. It has no
+expiry, because it recurs by design. Neither field lets anyone start the suite by hand, and the
+manual opt-in never stands in for the scheduled one. The two approvals are separate fields, so one
+policy can keep scheduling the eight-hour suite while a twelve-hour suite is tried by hand.
 
 The server refuses a request whose suite differs from its policy before any reservation, so source
 and policy cannot drift silently: under a policy that still names the 1 GB run, a scheduled matrix
@@ -1078,11 +1094,12 @@ aws pricing get-products --region us-east-1 --service-code AmazonEC2 \
 ```
 
 `hourly_microusd` is the price in that answer, `priced_at` is the time it was read, and
-`price_evidence` names the SKU and the SHA-256 of the saved answer. A price that pushes an
-eight-hour reservation over its fixed $50 is refused instead of being absorbed.
+`price_evidence` names the SKU and the SHA-256 of the saved answer. A price that pushes a
+reservation over the fixed amount of its plan, $50 for eight hours and $65 for twelve, is refused
+instead of being absorbed.
 
-`extended_manual_not_after` is separate. It bounds eight-hour runs started by hand, not the
-schedule, and has no effect on how long the schedule keeps running.
+`extended_manual_not_after` is separate. It bounds the runs beyond three hours that are started by
+hand, not the schedule, and has no effect on how long the schedule keeps running.
 
 ### How a run qualifies
 
@@ -1160,30 +1177,38 @@ Suites with `+tools` need three things of a deployment, again together:
 
 - **The stack template of this revision.** The worker may read, and the admission and runtime
   functions may stage and copy, object keys for `rcmp`, `rlink` and `rrm` on both sides. Each of the
-  seven access lists names its keys one by one, so this is a template change, not a parameter.
+  seven access lists names its keys one by one, so this is a template change, not a parameter. The
+  coordinator may also tag an instance with the twelve-hour runtime profile; without that, the
+  launch of every file set with the tools is denied.
 - **The server packages of this revision.** Earlier packages know three binaries and refuse a
-  manifest with any other.
-- **A worker image of this revision.** Its runner knows the tool cells, and its `worker.py` fetches
-  the binaries that the plan names, which gives it a new pinned digest and the launch template new
-  startup data.
+  manifest with any other. They also know one runtime profile: their expiry scan would end an
+  instance tagged with the twelve-hour one at once.
+- **A worker image of this revision.** Its runner knows the tool cells and samples a run for up to
+  twelve hours, and its `worker.py` fetches the binaries that the plan names and asks its supervisor
+  for the time of its plan, which gives it a new pinned digest and the launch template new startup
+  data.
 
 Until all three are in place, a request for such a suite is refused at admission, before any
 reservation: the deployed policy does not name the suite and the deployed packages do not know it.
 The scheduled suite stays `matrix-all-local+remote` in this revision. Change
 `production_workflow.SCHEDULED_SUITE` and the policy's `scheduled_suite` together, in a further
-reviewed step, once a suite with tools has run by hand and its cells fit eight hours:
+reviewed step, once a suite with tools has run by hand and its cells fit twelve hours:
 `matrix-all-local+tools+remote+tools` if its thirty-two cells do, and otherwise
-`matrix-all-local+tools+remote`, which times the tools after the local copies only.
+`matrix-all-local+tools+remote`, which times the tools after the local copies only. The policy
+version that admits that run by hand names the twelve-hour suites in `manual_suites` with
+`manual_runtime_seconds=43200`, and keeps `scheduled_suite` and `scheduled_runtime_seconds=28800` as
+they are until the schedule changes; the change then sets `scheduled_runtime_seconds=43200` with the
+new suite. The Tuesday refresh of the pages still follows a twelve-hour run of the Monday slot.
 
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
 minutes, counted from admission; collection follows. With the default twelve-hour capacity window
-that is about 15 h 15 min for a three-hour suite, however briefly it ran, and about 10 h 15 min for
-`matrix-all-local`, whose plan caps the search at two hours. The run's public page appears only
-after that. A dispatch before then is refused before any reservation, and a run admitted within that
-horizon before a scheduled slot displaces the scheduled run. A lower `capacity_seconds` in the
-commissioning policy version shortens the horizon. Size `extended_manual_not_after` for the full run
-and its repeat from these numbers.
+that is about 15 h 15 min for a three-hour suite, however briefly it ran, about 10 h 15 min for
+`matrix-all-local`, whose plan caps the search at two hours, and about 14 h 15 min for every file
+set with the tools. The run's public page appears only after that. A dispatch before then is refused
+before any reservation, and a run admitted within that horizon before a scheduled slot displaces the
+scheduled run. A lower `capacity_seconds` in the commissioning policy version shortens the horizon.
+Size `extended_manual_not_after` for the full run and its repeat from these numbers.
 
 1. `matrix-commission-local+remote`: a few minutes of work that exercises every step of both
    scenarios, including the public pages. Expect four of four measurements, and on the run page the
@@ -1202,9 +1227,9 @@ For the tool cells, after the deployment above:
    measurements, and on the run page a row for each tool after each kind of copy, under both small
    fixtures, with the tool's own CPU time and peak memory.
 2. `matrix-all-local+tools+remote+tools` by hand. This run says how long each tool takes on these
-   arrays, which nothing has measured yet, and whether all thirty-two cells fit eight hours. If they
-   do not, the cells that are `not_run` are the last ones: the remote cell of the 1 KB file set and
-   its tools. `matrix-all-local+tools+remote` is then the suite to schedule.
+   arrays, which nothing has measured yet, and whether all thirty-two cells fit twelve hours. If
+   they do not, the cells that are `not_run` are the last ones: the remote cell of the 1 KB file set
+   and its tools. `matrix-all-local+tools+remote` is then the suite to schedule.
 
 ### Find the evidence of a run
 

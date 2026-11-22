@@ -458,8 +458,10 @@ def main(argv=None):
             context["resources"] = dict(policy=RESOURCE_POLICY)
         context["environment"] = run.environment(args.source_root, args.destination_root)
         if args.system_telemetry:
-            context["system_telemetry"] = telemetry.descriptor()
-            sampler = telemetry.Sampler(output, args.source_root, args.destination_root)
+            # a matrix run may take the longest allocation there is: its journal is bounded for that
+            context["system_telemetry"] = telemetry.descriptor(telemetry.MATRIX_LIMITS)
+            sampler = telemetry.Sampler(output, args.source_root, args.destination_root,
+                                        limits=telemetry.MATRIX_LIMITS)
             with SignalCancellation():
                 sampler.start()
         source_scratch = Path(tempfile.mkdtemp(prefix="rcp-matrix-source-", dir=args.source_root)).resolve()

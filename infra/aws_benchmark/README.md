@@ -306,7 +306,7 @@ isolation for a dedicated disposable host, not a separate kernel or a hostile-co
 Targeted suites use the existing `linux-drop-caches` policy. A root-owned executable named `sudo`
 accepts exactly the harness's fixed cache-drop argv and sends a bounded, versioned request to a root
 supervisor UNIX socket. It carries only the fixed operation and one monotonic deadline. The helper
-verifies the peer UID and independently clamps that deadline to two hours and the remaining worker
+verifies the peer UID and independently clamps that deadline to eight hours and the remaining worker
 budget, preserving the collection reserve. It calls `sync` and writes `3` to `drop_caches`; it
 accepts no paths or commands. No sudoers grant is installed. The client/server must be baked
 together; no legacy-protocol fallback or operation retry is permitted after an uncertain response.

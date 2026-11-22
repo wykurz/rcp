@@ -76,6 +76,17 @@ PHASES = frozenset({"setup", "generation", "initial_verification", "capacity", "
 TELEMETRY_DESCRIPTOR = dict(policy="linux-bounded-system-sampling-v1", period_seconds=10,
     max_samples=4096, max_bytes=8 * 1024 * 1024, max_seconds=8 * 3600, max_phases=192,
     scope="host aggregate and current harness cgroup with descendants; logical mount-device IO; not per-process attribution")
+# a matrix run may take twelve hours and is sampled under bounds for them. The runs before that,
+# and the paired harness, have the bounds above: a record names the ones it was sampled under
+MATRIX_TELEMETRY_DESCRIPTOR = dict(TELEMETRY_DESCRIPTOR, max_samples=5120, max_bytes=16 * 1024 * 1024,
+                                   max_seconds=12 * 3600)
+TELEMETRY_DESCRIPTORS = (TELEMETRY_DESCRIPTOR, MATRIX_TELEMETRY_DESCRIPTOR)
+# a summary of samples holds no more than the widest journal can: the reader needs no argument
+# about how long one phase, or the phases outside any copy, may take
+MAX_JOURNAL_SAMPLES = max(item["max_samples"] for item in TELEMETRY_DESCRIPTORS)
+MAX_JOURNAL_SECONDS = max(item["max_seconds"] for item in TELEMETRY_DESCRIPTORS)
+# the longest allocation a run can have
+MAX_ALLOCATION_SECONDS = 12 * 3600
 PHASE_METRICS = frozenset({"cpu_usage_usec", "read_bytes", "write_bytes", "memory_current_bytes",
     "cgroup_run_memory_peak_bytes", "host_cpu_total_ticks", "host_cpu_idle_ticks", "host_cpu_iowait_ticks",
     "host_memory_available_bytes", "source_read_sectors", "source_write_sectors", "source_io_milliseconds",
@@ -102,6 +113,15 @@ def _label(value, kind):
 
 def _integer(value, maximum=MAX_NUMBER):
     return value if number(value, integer=True, maximum=maximum) else None
+
+
+def _sampled(context):
+    """The bounds a run says it was sampled under, when a runner has had them; None otherwise.
+
+    The answer is this module's copy of those bounds: nothing of the record's own object is published.
+    """
+    value = context.get("system_telemetry") if isinstance(context, dict) else None
+    return next((dict(known) for known in TELEMETRY_DESCRIPTORS if value == known), None)
 
 
 def _new_setup_value(value, key):
@@ -158,7 +178,7 @@ def setup(raw, worker, *, policies=PAIRED_VERIFICATION):
             context["verification"].get("policy") in policies else None,
         pairing_policy="adjacent-balanced-sha256-v1" if isinstance(context.get("pairing"), dict) and
             context["pairing"].get("policy") == "adjacent-balanced-sha256-v1" else None,
-        instrumentation=TELEMETRY_DESCRIPTOR if context.get("system_telemetry") == TELEMETRY_DESCRIPTOR else None)
+        instrumentation=_sampled(context))
     return value
 
 
@@ -193,7 +213,7 @@ def validate_setup(value):
     require(value["cache_policy"] in {None, "linux-drop-caches", "source-warm", "source-verified"} and
             (value["verification_policy"] is None or value["verification_policy"] in VERIFICATION_POLICIES) and
             value["pairing_policy"] in {None, "adjacent-balanced-sha256-v1"} and
-            value["instrumentation"] in (None, TELEMETRY_DESCRIPTOR), "invalid public setup policy")
+            value["instrumentation"] in (None, *TELEMETRY_DESCRIPTORS), "invalid public setup policy")
     return value
 
 
@@ -236,7 +256,7 @@ def _system(value, *, public=False):
     """Keep counter deltas and gauge bounds; raw repeated counters stay private."""
     unavailable = dict(status="unavailable", samples=0, phases=[])
     if not isinstance(value, dict) or value.get("status") not in {"complete", "partial", "unavailable", "truncated"} or \
-            not number(value.get("samples"), integer=True, maximum=4096):
+            not number(value.get("samples"), integer=True, maximum=MAX_JOURNAL_SAMPLES):
         return unavailable
     phases = value.get("phases")
     if not isinstance(phases, list) or len(phases) > 192:
@@ -245,8 +265,8 @@ def _system(value, *, public=False):
     for phase in phases:
         if not isinstance(phase, dict) or phase.get("phase") not in PHASES or \
                 phase.get("status") not in {"observed", "running", "interrupted"} or \
-                not number(phase.get("elapsed_seconds"), maximum=8 * 3600) or \
-                not number(phase.get("samples"), integer=True, maximum=4096):
+                not number(phase.get("elapsed_seconds"), maximum=MAX_JOURNAL_SECONDS) or \
+                not number(phase.get("samples"), integer=True, maximum=MAX_JOURNAL_SAMPLES):
             return unavailable
         indexes = [phase.get(key) for key in ("case_index", "trial_index")]
         if any(x is not None and not number(x, integer=True, maximum=1000000) for x in indexes):
@@ -365,7 +385,7 @@ def case_progress(raw, selected):
             definition_status[trial["case_id"]] = "observed-only"
     phases = []
     context = raw.get("context")
-    sampled = isinstance(context, dict) and context.get("system_telemetry") == TELEMETRY_DESCRIPTOR
+    sampled = _sampled(context) is not None
     if sampled:
         for summary in [raw.get("system_telemetry"), *[x.get("system_telemetry") for x in raw.get("trials", [])]]:
             phases += _system(summary)["phases"]
@@ -394,7 +414,7 @@ def derive(record, archive, raw, worker):
     grouped = {}
     selected = []
     context = raw.get("context", {})
-    sampled = isinstance(context, dict) and context.get("system_telemetry") == TELEMETRY_DESCRIPTOR
+    sampled = _sampled(context) is not None
     for trial in trials:
         if not isinstance(trial, dict):
             return unavailable(record, "invalid_diagnostics")
@@ -433,7 +453,7 @@ def _derive_matrix(record, archive, raw, worker):
     # contract has none, so nothing it says about itself, names included, reaches a page.
     if any(key not in _cells(record) for key in ((cell["case_id"], cell["scenario"]) for cell in cells)):
         return unavailable(record, "not_matched")
-    sampled = raw["context"].get("system_telemetry") == TELEMETRY_DESCRIPTOR
+    sampled = _sampled(raw["context"]) is not None
     grouped, selected, phases = {}, [], _system(raw.get("system_telemetry") if sampled else None)["phases"]
     schema = _schema(record)
     with_roles = schema in (REMOTE_SCHEMA, TOOLS_SCHEMA)
@@ -478,7 +498,7 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
     observed = setup(raw, worker, policies=VERIFICATION_POLICIES if _matrix(record) else PAIRED_VERIFICATION)
     window = worker.get("window", {})
     window = window if isinstance(window, dict) else {}
-    limits = dict(allocation_seconds=_integer(window.get("runtime_seconds"), 8 * 3600),
+    limits = dict(allocation_seconds=_integer(window.get("runtime_seconds"), MAX_ALLOCATION_SECONDS),
                   command_timeout_seconds=_integer(worker.get("command_timeout_seconds"), 2 * 3600))
     value = dict(schema=_schema(record),
         run_key=record["run_key"], retirement_sha256=record["retirement_sha256"],
@@ -512,7 +532,7 @@ def validate(value, record):
     require(isinstance(value["limits"], dict) and set(value["limits"]) ==
             {"allocation_seconds", "command_timeout_seconds"} and
             (value["limits"]["allocation_seconds"] is None or
-                number(value["limits"]["allocation_seconds"], integer=True, maximum=8 * 3600)) and
+                number(value["limits"]["allocation_seconds"], integer=True, maximum=MAX_ALLOCATION_SECONDS)) and
             (value["limits"]["command_timeout_seconds"] is None or
                 number(value["limits"]["command_timeout_seconds"], integer=True, maximum=2 * 3600)),
             "invalid diagnostic execution limits")

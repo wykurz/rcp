@@ -103,7 +103,9 @@ class ToolSuiteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not allowlisted"):
             common.suite_binaries("matrix-all-local+tools+wan")
 
-    def test_time_budgets_are_those_of_the_same_selection_without_the_tools(self):
+    def test_only_the_time_of_every_file_set_together_grows_with_the_tools(self):
+        # every file set with the tools has twelve hours where it had eight (test_tool_allocation.py)
+        longer = dict(max_runtime=43200, runtime_profile="all-filesets-12h-v1", reservation_microusd=65_000_000)
         for selection in SELECTIONS:
             plain = common.durable_plan_contract(common.durable_plan_for_suite(f"matrix-{selection}-local+remote"))
             for scenarios in WITH_TOOLS:
@@ -112,8 +114,11 @@ class ToolSuiteTests(unittest.TestCase):
                     contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
                     skipped = ("suite", "plan", "binary_names", "binaries")
                     self.assertEqual({key: contract[key] for key in contract if key not in skipped},
-                                     {key: plain[key] for key in plain if key not in skipped})
-                    self.assertEqual(contract["plan"], dict(plain["plan"], version=suite + "-plan-v1"))
+                                     {key: plain[key] for key in plain if key not in skipped}
+                                     | (longer if selection == "all" else {}))
+                    # the twelve-hour plans are a second version: the first stays recorded
+                    version = suite + ("-plan-v2" if selection == "all" else "-plan-v1")
+                    self.assertEqual(contract["plan"], dict(plain["plan"], version=version))
                     self.assertEqual(common.matrix_contract(suite), dict(
                         common.matrix_contract(f"matrix-{selection}-local+remote"), cells=common.MATRIX_SUITES[suite]))
         versions = [common.durable_plan_for_suite(suite)["version"] for suite in common.DURABLE_SUITES]
@@ -404,7 +409,7 @@ class ToolRecordTests(unittest.TestCase):
         record = matrix_record(WEEKLY, {index: dict(status="not_run", stage=None,
                                                     message="allocation ended before this cell")
                                         for index in range(28, 32)})
-        result, report, public = self.collect(WEEKLY, record, remaining=28300, runtime_seconds=28800,
+        result, report, public = self.collect(WEEKLY, record, remaining=42700, runtime_seconds=43200,
                                               capacity_seconds=7200)
         self.assertEqual((result["state"], report["benchmark_valid"]), ("success", True), public["diagnostics"])
         self.assertEqual(len(public["cells"]), 32)
@@ -470,6 +475,28 @@ def sampled_phase(name, case_index, trial_index=None):
                              maximum=3 * 10 ** 12, delta=2 * 10 ** 12))
     return dict(phase=name, case_index=case_index, trial_index=trial_index, status="observed",
                 elapsed_seconds=612.345678, samples=20, metrics=metrics)
+
+
+def sampled_matrix(suite, descriptor):
+    """A run of a suite as its runner records it when every phase was sampled, and how many phases that is."""
+    raw = matrix_record(suite, environment=test_matrix_diagnostics.ENVIRONMENT)
+    raw["context"]["system_telemetry"] = dict(descriptor)
+    cases = [item["case"]["id"] for item in raw["file_sets"]]
+    # what the runner marks: a file set is checked, generated and cleared; a copy has its cache
+    # step and its command; rcmp and rrm a command each; rlink its command and the clearing of its tree
+    run_phases = [sampled_phase("setup", None)] + [sampled_phase(name, index) for index in range(len(cases))
+                                                   for name in ("capacity", "generation", "cleanup")]
+    raw["system_telemetry"] = dict(status="complete", samples=20 * len(run_phases), phases=run_phases)
+    total = len(run_phases)
+    for cell in raw["cells"]:
+        names = (("cache", "command") if cell["scenario"] in ("local", "remote") else
+                 ("command", "cleanup") if cell["scenario"].endswith("-rlink") else ("command",))
+        for item in cell["copies"]:
+            phases = [sampled_phase(name, cases.index(cell["case_id"]), item["trial_index"]) for name in names]
+            item["system_telemetry"] = dict(status="complete", samples=20 * len(phases), phases=phases)
+            total += len(phases)
+    matrix.validate(raw)
+    return raw, total
 
 
 class ToolDiagnosticsTests(unittest.TestCase):
@@ -544,23 +571,7 @@ class ToolDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("<td><code>remote-rrm</code></td><td>1</td><td>source rcpd</td>", html)
 
     def test_the_sampled_detail_of_the_largest_suite_fits_the_public_document(self):
-        raw = matrix_record(WEEKLY, environment=test_matrix_diagnostics.ENVIRONMENT)
-        raw["context"]["system_telemetry"] = dict(diagnostics.TELEMETRY_DESCRIPTOR)
-        cases = [item["case"]["id"] for item in raw["file_sets"]]
-        # what the runner marks: a file set is checked, generated and cleared; a copy has its cache
-        # step and its command; rcmp and rrm a command each; rlink its command and the clearing of its tree
-        run_phases = [sampled_phase("setup", None)] + [sampled_phase(name, index) for index in range(len(cases))
-                                                       for name in ("capacity", "generation", "cleanup")]
-        raw["system_telemetry"] = dict(status="complete", samples=20 * len(run_phases), phases=run_phases)
-        total = len(run_phases)
-        for cell in raw["cells"]:
-            names = (("cache", "command") if cell["scenario"] in ("local", "remote") else
-                     ("command", "cleanup") if cell["scenario"].endswith("-rlink") else ("command",))
-            for item in cell["copies"]:
-                phases = [sampled_phase(name, cases.index(cell["case_id"]), item["trial_index"]) for name in names]
-                item["system_telemetry"] = dict(status="complete", samples=20 * len(phases), phases=phases)
-                total += len(phases)
-        matrix.validate(raw)
+        raw, total = sampled_matrix(WEEKLY, diagnostics.TELEMETRY_DESCRIPTOR)
         # 24 copies of 6 windows each, and 13 of the run: well inside the sampler's limit of 192
         self.assertEqual(total, 157)
         self.assertLess(total, diagnostics.TELEMETRY_DESCRIPTOR["max_phases"] - 24)

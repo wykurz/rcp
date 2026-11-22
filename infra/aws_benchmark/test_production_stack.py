@@ -420,22 +420,21 @@ class ProductionStackTests(unittest.TestCase):
             equals = statement.get("Condition", {}).get("ArnEquals", {})
             if "ec2:InstanceProfile" in equals:
                 equals["ec2:InstanceProfile"] = {"Fn::GetAtt": ["WorkerInstanceProfile", "Arn"]}
-        # the only extension is an exact optional profile on instances, never volumes
+        # the only extension is an optional profile on instances, one of the two exact ones, never volumes
+        profiles = {"aws:RequestTag/rcp:runtime-profile": ["all-filesets-8h-v1", "all-filesets-12h-v1"]}
         expanded = []
         for statement in expected:
             resources = sequence(statement["Resource"])
             if statement["Action"] == "ec2:CreateTags":
                 instance, volume = deepcopy(statement), deepcopy(statement)
                 instance["Resource"], volume["Resource"] = resources
-                instance["Condition"]["StringEqualsIfExists"] = {
-                    "aws:RequestTag/rcp:runtime-profile": "all-filesets-8h-v1"}
+                instance["Condition"]["StringEqualsIfExists"] = dict(profiles)
                 instance["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"].append("rcp:runtime-profile")
                 expanded.extend((instance, volume))
             else:
                 if statement["Action"] == "ec2:RunInstances" and any(
                         "instance/*" in str(resource) for resource in resources):
-                    statement["Condition"]["StringEqualsIfExists"] = {
-                        "aws:RequestTag/rcp:runtime-profile": "all-filesets-8h-v1"}
+                    statement["Condition"]["StringEqualsIfExists"] = dict(profiles)
                     statement["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"].append("rcp:runtime-profile")
                 expanded.append(statement)
         actual = [s for s in current if s["Action"] in ("ec2:RunInstances", "ec2:CreateTags", "iam:PassRole")]

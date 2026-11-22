@@ -320,18 +320,20 @@ may request a bounded systemd runtime extension after validating and consuming t
 instance-bound full-set assignment, before executing candidate code. It uses the documented main-PID
 notification protocol and acknowledgement; changing RuntimeMaxSec on an already-running unit is
 unsupported. Ordinary requests never extend their supervisor. The independent janitor does not
-depend on DynamoDB for expiry. An instance-only runtime-profile tag identifies the reviewed
-eight-hour bound; a missing tag retains three hours and unknown/mismatched values fail closed.
-Volume tags keep their original five-field form. The exact coordinator tag permission change and new
-AMI/resource pin still need live security approval and target-image acceptance.
+depend on DynamoDB for expiry. An instance-only runtime-profile tag identifies the reviewed bound,
+eight hours (`all-filesets-8h-v1`) or the twelve hours of every file set with the other tools
+(`all-filesets-12h-v1`); a missing tag retains three hours and unknown/mismatched values fail
+closed. Volume tags keep their original five-field form. The exact coordinator tag permission change
+and new AMI/resource pin still need live security approval and target-image acceptance.
 
 The full-set reservation is fixed at $50 and rejects price calculations above that amount, rather
 than silently increasing it. The current $4.608/hour price plus sixteen-minute shutdown and existing
-ancillary allowance calculates $43.04 for eight hours. This is a planning reservation, not a
-verified bill, AWS-enforced cost cap or another allowance. Live deployment, updated AMI/tag
-permissions and expanded run need one concrete approval bundle before execution. Reuse previously
-reserved setup overhead only after checking its remaining allocation. Do not spend on an
-intermediate image or run solely to qualify each smaller case.
+ancillary allowance calculates $43.04 for eight hours. A twelve-hour run reserves a fixed $65 by the
+same rule, for a calculated $61.47. This is a planning reservation, not a verified bill,
+AWS-enforced cost cap or another allowance. Live deployment, updated AMI/tag permissions and
+expanded run need one concrete approval bundle before execution. Reuse previously reserved setup
+overhead only after checking its remaining allocation. Do not spend on an intermediate image or run
+solely to qualify each smaller case.
 
 Periodic telemetry is enabled for the full-set experiment, not silently added to existing scheduled
 measurement identities. It samples host CPU/memory/pressure, the measurement cgroup and logical
@@ -378,8 +380,12 @@ qualification and rollout.
 - **Admission floor.** A matrix run uses whatever time it gets, so the worker declines only when
   less than one hour of the allocation is left (`minimum_worker_seconds=3600`), instead of the
   10,200 and 28,200 seconds that the paired profiles need to finish. A slow start costs time, not
-  the run. The eight-hour suite still runs for exactly 28,800 seconds: the supervisor extension and
-  the independent expiry tag are bound to that profile.
+  the run. A suite of every file set still runs for exactly the time of its profile, 28,800 seconds
+  or 43,200 with the tools: the supervisor extension and the independent expiry tag are bound to
+  that profile.
+- **Sampling.** The journal of system samples is bounded for the longest run: twelve hours, 5,120
+  samples and 16 MiB, where the paired profiles keep eight hours, 4,096 samples and 8 MiB. A record
+  names the bounds it was sampled under, and the public companion accepts either set.
 - **Stops and errors.** Results are saved after every step. A copy that fails or hangs fails its
   cell only; so does an error nobody foresaw. A stop signal ends the run and keeps the finished
   cells, which still qualify. Command logs are cut to their head and tail as each command ends: the

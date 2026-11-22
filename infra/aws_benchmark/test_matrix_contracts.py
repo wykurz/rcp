@@ -69,11 +69,15 @@ class MatrixContractTests(unittest.TestCase):
                       "matrix-all-local+tools+remote+tools"}
         for suite in sorted(everything):
             contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
-            # a suite that times the other tools sends more binaries and has the same budget
+            # a suite that times the other tools sends more binaries and has more time: twelve hours
+            # and the reservation that goes with them (test_tool_allocation.py)
             skipped = ("suite", "plan", "binary_names", "binaries")
+            longer = dict(max_runtime=43200, runtime_profile="all-filesets-12h-v1", reservation_microusd=65_000_000) \
+                if "tools" in suite else {}
             self.assertEqual({key: contract[key] for key in full if key not in skipped},
-                             {key: full[key] for key in full if key not in skipped})
-            self.assertEqual(contract["plan"], dict(full["plan"], version=suite + "-plan-v1"))
+                             {key: full[key] for key in full if key not in skipped} | longer)
+            version = suite + ("-plan-v2" if "tools" in suite else "-plan-v1")
+            self.assertEqual(contract["plan"], dict(full["plan"], version=version))
         for suite in sorted(set(common.MATRIX_SUITES) - everything):
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))

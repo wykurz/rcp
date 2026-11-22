@@ -17,6 +17,8 @@ import time
 import uuid
 
 BARRIER_USEC = 1_000_000
+# the longest runtime profile a plan can have: no extension reaches beyond it
+MAX_EXTENSION_SECONDS = 43200
 ACK_BOUND_SECONDS = 2
 SELF_TEST_MARKER = "notify-self-test-child-passed"
 
@@ -81,7 +83,7 @@ class Notifier:
 
     def extend(self, budget, *, maximum_seconds, shutdown_seconds):
         require(self.ready_sent and not self.extension_attempted, "supervisor extension requires unreplayed readiness")
-        require(type(maximum_seconds) is int and 0 < maximum_seconds <= 28800 and
+        require(type(maximum_seconds) is int and 0 < maximum_seconds <= MAX_EXTENSION_SECONDS and
                 type(shutdown_seconds) is int and 0 <= shutdown_seconds <= 300,
                 "invalid supervisor extension bounds")
         # mark uncertainty before notification; never resend an ambiguous extension

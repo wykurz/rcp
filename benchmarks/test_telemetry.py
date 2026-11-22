@@ -196,6 +196,60 @@ class TelemetryTests(unittest.TestCase):
                     self.assertLessEqual(len(snapshot["phases"]), telemetry.MAX_PHASES)
                     self.assertLessEqual((Path(directory) / telemetry.ARTIFACT).stat().st_size, telemetry.MAX_BYTES)
 
+    def test_a_caller_may_widen_the_bounds_of_its_journal_and_the_descriptor_names_them(self):
+        usual = telemetry.descriptor()
+        self.assertEqual((usual["max_samples"], usual["max_bytes"], usual["max_seconds"]),
+                         (4096, 8 * 1024 * 1024, 8 * 3600))
+        # a run of the benchmark matrix may take twelve hours
+        self.assertEqual(telemetry.descriptor(telemetry.MATRIX_LIMITS),
+                         dict(usual, max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600))
+        for unknown in (dict(max_phases=500), dict(period_seconds=1), dict(max_second=1)):
+            with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "unknown journal bound"):
+                    telemetry.descriptor(unknown)
+                with self.assertRaisesRegex(ValueError, "unknown journal bound"):
+                    telemetry.Sampler(directory, directory, directory, reader=Metrics(), limits=unknown)
+
+    def test_a_sampler_stops_at_each_bound_that_it_was_given(self):
+        for limits, reason in ((dict(max_samples=2), "sample_limit"), (dict(max_bytes=1000), "byte_limit"),
+                               (dict(max_seconds=1), "time_limit")):
+            with self.subTest(limits=limits), tempfile.TemporaryDirectory() as directory:
+                clock = Clock()
+                sampler = telemetry.Sampler(directory, directory, directory, reader=Metrics(), clock=clock,
+                                            limits=limits).start()
+                self.wait_for(lambda: sampler.snapshot()["samples"] > 0 or sampler.snapshot()["reason"] is not None)
+                for index in range(10):
+                    clock.now = index
+                    previous = sampler.snapshot()["samples"]
+                    sampler.mark("command", 0, index)
+                    self.wait_for(lambda: sampler.snapshot()["samples"] > previous or sampler.snapshot()["reason"] is not None)
+                sampler.finish(True)
+                snapshot = sampler.snapshot()
+                self.assertEqual(snapshot["reason"], reason)
+                self.assertLessEqual(snapshot["samples"], limits.get("max_samples", telemetry.MAX_SAMPLES))
+                self.assertLessEqual((Path(directory) / telemetry.ARTIFACT).stat().st_size,
+                                     limits.get("max_bytes", telemetry.MAX_BYTES))
+
+    def test_a_journal_with_the_matrix_bounds_goes_on_past_the_usual_time_limit(self):
+        for limits, expected in (({}, ["time_limit", "time_limit"]), (telemetry.MATRIX_LIMITS, [None, "time_limit"])):
+            with self.subTest(limits=dict(limits)), tempfile.TemporaryDirectory() as directory:
+                clock = Clock()
+                sampler = telemetry.Sampler(directory, directory, directory, reader=Metrics(), clock=clock,
+                                            limits=limits).start()
+                self.wait_for(lambda: sampler.snapshot()["samples"] > 0)
+                reasons = []
+                for index, now in enumerate((8 * 3600 + 1, 12 * 3600 + 1)):
+                    clock.now = now
+                    previous = sampler.snapshot()["samples"]
+                    sampler.mark("command", 0, index)
+                    self.wait_for(lambda: sampler.snapshot()["samples"] > previous or sampler.snapshot()["reason"] is not None)
+                    reasons.append(sampler.snapshot()["reason"])
+                sampler.finish(True)
+                self.assertEqual(reasons, expected)
+                # the journal says in its first line which bounds it was written under
+                first = json.loads((Path(directory) / telemetry.ARTIFACT).read_text().splitlines()[0])
+                self.assertEqual((first["kind"], first["policy"]), ("policy", telemetry.descriptor(limits)))
+
     def test_unwritable_artifact_and_sampler_read_failures_do_not_raise(self):
         with tempfile.TemporaryDirectory() as directory:
             reader = Metrics()
