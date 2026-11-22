@@ -760,8 +760,10 @@ Each command log is cut to its first and last half mebibyte once the command has
 that fails for every file cannot fill a small output directory. `benchmarks.matrix.validate` checks
 a document before anything is concluded from it. `--check-capacity` needs source and destination on
 different filesystems, as on the AWS worker. `--system-telemetry` samples the same bounded host and
-cgroup diagnostics as `benchmark-run`; a command's window lasts until the next step starts. A
-fixture, destination or linked tree that could not be removed is counted in `removal_failures`.
+cgroup diagnostics as `benchmark-run`, with bounds for a run of up to twelve hours where
+`benchmark-run` has eight (`context.system_telemetry` names them); a command's window lasts until
+the next step starts. A fixture, destination or linked tree that could not be removed is counted in
+`removal_failures`.
 
 These documents are a separate format: the dashboards and change reports described below read
 `benchmark-run` results only.

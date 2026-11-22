@@ -505,13 +505,15 @@ def supervisor_notifier(budget):
 def extend_supervisor_runtime(window, request, identity, budget, notifier):
     """Send one finite extension only after consuming a fully instance-bound assignment."""
     # the plan, not a suite name, says whether this run needs more than the initial bound
-    if durable_plan_contract(window["plan"]).get("runtime_profile") is None:
+    contract = durable_plan_contract(window["plan"])
+    if contract.get("runtime_profile") is None:
         return None
     require(os.geteuid() == 0, "supervisor runtime extension requires root")
     validate_window(window, minimum=0)
     validate_request(request, window)
+    # a plan with a runtime profile runs for exactly the time its contract allows, no other
     require(window["protocol"] == DIRECT_PROTOCOL and window["instance_id"] == identity
-            and window["runtime_seconds"] == 28800 and notifier is not None,
+            and window["runtime_seconds"] == contract["max_runtime"] and notifier is not None,
             "supervisor extension lacks exact instance/runtime/notification binding")
     microseconds = notifier.extend(budget, maximum_seconds=window["runtime_seconds"],
                                    shutdown_seconds=window["plan"]["shutdown_reserve_seconds"])

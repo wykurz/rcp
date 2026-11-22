@@ -9,12 +9,17 @@ import platform
 import re
 import threading
 import time
+from types import MappingProxyType
 
 PERIOD_SECONDS = 10
 MAX_SAMPLES = 4096
 MAX_BYTES = 8 * 1024 * 1024
 MAX_SECONDS = 8 * 3600
 MAX_PHASES = 192
+# a run of the benchmark matrix may take twelve hours, the longest allocation there is
+# (RUNTIME_PROFILES in infra/aws_benchmark), so its journal is bounded for them: a sample each
+# period and one at each phase mark, at the 2.7 kB that a line took on the AWS worker
+MATRIX_LIMITS = MappingProxyType(dict(max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600))
 READ_BYTES = 64 * 1024
 MAX_NUMBER = (1 << 63) - 1
 ARTIFACT = "system-telemetry.jsonl"
@@ -46,9 +51,18 @@ GROUPS = ("host_cpu", "host_memory", "host_cpu_pressure", "host_memory_pressure"
     "cgroup_memory_pressure", "cgroup_io_pressure", "source_io", "destination_io")
 
 
-def descriptor():
+def _limits(replaced):
+    """What bounds one journal: the usual bounds, with those that a caller replaces."""
+    usual = dict(max_samples=MAX_SAMPLES, max_bytes=MAX_BYTES, max_seconds=MAX_SECONDS)
+    if set(replaced) - set(usual):
+        raise ValueError("unknown journal bound")
+    return dict(usual, **replaced)
+
+
+def descriptor(limits=()):
+    """Say how a journal is sampled and bounded; `limits` are the ones its Sampler was given."""
     return dict(policy="linux-bounded-system-sampling-v1", period_seconds=PERIOD_SECONDS,
-        max_samples=MAX_SAMPLES, max_bytes=MAX_BYTES, max_seconds=MAX_SECONDS, max_phases=MAX_PHASES,
+        **_limits(dict(limits)), max_phases=MAX_PHASES,
         scope="host aggregate and current harness cgroup with descendants; logical mount-device IO; not per-process attribution")
 
 
@@ -254,7 +268,9 @@ class Reader:
 
 class Sampler:
     """One daemon owns diagnostics IO; the benchmark thread only queues/copies bounded state."""
-    def __init__(self, output, source, destination, *, reader=None, clock=time.monotonic):
+    def __init__(self, output, source, destination, *, reader=None, clock=time.monotonic, limits=()):
+        # the bounds of this journal: `descriptor(limits)` names the same ones
+        self.limits = _limits(dict(limits))
         self.reader = reader
         self.output, self.source, self.destination = Path(output), source, destination
         self.clock, self.started = clock, clock()
@@ -270,8 +286,8 @@ class Sampler:
 
     def _limit(self):
         elapsed = max(0, self.clock() - self.started)
-        if elapsed > MAX_SECONDS or self.samples >= MAX_SAMPLES:
-            self.reason = self.reason or ("time_limit" if elapsed > MAX_SECONDS else "sample_limit")
+        if elapsed > self.limits["max_seconds"] or self.samples >= self.limits["max_samples"]:
+            self.reason = self.reason or ("time_limit" if elapsed > self.limits["max_seconds"] else "sample_limit")
         return elapsed
 
     def _event(self, phase):
@@ -283,7 +299,7 @@ class Sampler:
         with self.lock:
             if self.closed:
                 return False
-            if self.bytes + len(encoded) > MAX_BYTES:
+            if self.bytes + len(encoded) > self.limits["max_bytes"]:
                 self.reason = self.reason or "byte_limit"
                 return False
         try:
@@ -347,7 +363,7 @@ class Sampler:
     def _run(self):
         try:
             with (self.output / ARTIFACT).open("xb") as file:
-                if not self._write(file, dict(kind="policy", policy=descriptor())):
+                if not self._write(file, dict(kind="policy", policy=descriptor(self.limits))):
                     return
                 # reader construction includes mount/cgroup discovery and belongs only to this daemon
                 self.reader = self.reader or Reader(self.source, self.destination)

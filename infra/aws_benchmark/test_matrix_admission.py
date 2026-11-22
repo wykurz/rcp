@@ -92,7 +92,9 @@ class MatrixAdmissionTests(unittest.TestCase):
     def test_a_scheduled_eight_hour_suite_needs_its_own_runtime_approval(self):
         for updates, refusal in (
                 (dict(scheduled_runtime_seconds=0), "extended scheduled run is not explicitly approved"),
-                (dict(scheduled_runtime_seconds=28_801), "invalid extended scheduled runtime"),
+                # beyond the longest runtime any suite has, and beyond this suite's own
+                (dict(scheduled_runtime_seconds=43_201), "invalid extended scheduled runtime"),
+                (dict(scheduled_runtime_seconds=28_801), "does not fit its explicit qualification budget"),
                 (dict(scheduled_runtime_seconds=True), "invalid extended scheduled runtime"),
                 (dict(scheduled_runtime_seconds=4_199), "does not fit its explicit qualification budget"),
                 # the eight-hour profile is one fixed runtime, not a range

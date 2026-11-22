@@ -14,7 +14,8 @@ from types import MappingProxyType
 from .common import (DURABLE_PLAN, DURABLE_MAX_RUNTIME, DURABLE_MAX_PROVISIONING,
                      durable_worker_reserve, durable_plan_contract, durable_minimum_runtime,
                      validate_durable_hashes, validate_durable_pins, DIRECT_PROTOCOL, DIRECT_MAX_ATTEMPTS,
-                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity, durable_plan_for_suite, DURABLE_SUITES, FULL_RUNTIME_PROFILE)
+                     INSTANCE_TYPE, require, timestamp, utc, validate_attempt_id, validate_identity, durable_plan_for_suite, DURABLE_SUITES, FULL_RUNTIME_PROFILE,
+                     TOOLS_RUNTIME_PROFILE)
 
 PROTOCOL = DIRECT_PROTOCOL
 CAPACITY_SECONDS = DURABLE_MAX_PROVISIONING
@@ -34,9 +35,11 @@ TAG_DEADLINE = "rcp:deadline"
 TAG_CREATED = "rcp:created-at"
 TAG_KEYS = {TAG_NAMESPACE, TAG_RUN, TAG_ATTEMPT, TAG_DEADLINE, TAG_CREATED}
 TAG_RUNTIME_PROFILE = "rcp:runtime-profile"
-# the independent scan must interpret this instance tag without any DDB read
-RUNTIME_PROFILES = MappingProxyType({FULL_RUNTIME_PROFILE: MappingProxyType(dict(
-    runtime_seconds=28800, max_attempts=120))})
+# the independent scan must interpret this instance tag without any DDB read. Append profiles:
+# a tag on a running instance keeps its meaning, and the launch role names each one it may set
+RUNTIME_PROFILES = MappingProxyType({
+    FULL_RUNTIME_PROFILE: MappingProxyType(dict(runtime_seconds=28800, max_attempts=120)),
+    TOOLS_RUNTIME_PROFILE: MappingProxyType(dict(runtime_seconds=43200, max_attempts=120))})
 PIN_KEYS = frozenset(durable_plan_contract(PLAN)["pin_patterns"])
 minimum_runtime = durable_minimum_runtime
 

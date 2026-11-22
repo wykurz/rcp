@@ -511,6 +511,15 @@ class MatrixTests(unittest.TestCase):
         # a stopping run must exit within seconds: it leaves its scratch data where it is
         self.assertEqual(len(list((self.root / "source").iterdir())), 1)
 
+    def test_a_matrix_run_is_sampled_under_the_bounds_of_the_longest_run(self):
+        with mock.patch.object(matrix.telemetry, "Sampler", wraps=matrix.telemetry.Sampler) as made:
+            record = self.run_matrix("--system-telemetry", cells=("alpha:local",))
+        # what the record says about its journal is what its sampler was given
+        self.assertEqual(record["context"]["system_telemetry"],
+                         matrix.telemetry.descriptor(matrix.telemetry.MATRIX_LIMITS))
+        self.assertEqual(made.call_args.kwargs["limits"], matrix.telemetry.MATRIX_LIMITS)
+        self.assertEqual(record["context"]["system_telemetry"]["max_seconds"], 12 * 3600)
+
     def test_system_telemetry_is_attached_to_the_run_and_each_copy(self):
         record = self.run_matrix("--system-telemetry", cells=("alpha:local",))
         self.assertIn(record["system_telemetry"]["status"], ("complete", "partial", "unavailable", "truncated"))

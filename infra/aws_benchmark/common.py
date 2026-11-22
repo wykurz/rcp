@@ -72,6 +72,8 @@ for _suite, _version in (("bulk-1m-metadata", "bulk-1m-qualification-budget-v1")
                                   boot_reserve_seconds=300, shutdown_reserve_seconds=300))))
 FULL_FILE_SET_SUITE = "all-filesets-metadata"
 FULL_RUNTIME_PROFILE = "all-filesets-8h-v1"
+# every file set with the other tools timed on its copies
+TOOLS_RUNTIME_PROFILE = "all-filesets-12h-v1"
 _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"] = MappingProxyType(dict(
     _RECORDED_DURABLE_CONTRACTS["bulk-100m-qualification-budget-v1"], suite=FULL_FILE_SET_SUITE,
     max_runtime=28800, max_provisioning=7200, max_attempts=120,
@@ -103,7 +105,8 @@ for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
     for _selection, _cases in _MATRIX_SELECTIONS.items():
         _suite = "matrix-" + _selection + "-" + _set
         _version = _suite + "-plan-v1"
-        # every file set together needs the eight-hour allocation; one set fits the ordinary one
+        # every file set together needs the eight-hour allocation, and twelve hours with the
+        # tools (below); one set fits the ordinary one
         _base = "all-filesets-qualification-budget-v1" if _selection == "all" else "bulk-100m-qualification-budget-v1"
         # a matrix run uses whatever time it gets, so a slow start must not void the allocation:
         # the worker only declines when less than an hour, too little for one large cell, is left
@@ -116,6 +119,16 @@ for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
             # the worker runs what it is sent: a suite that times the tools sends them too
             _contract["binary_names"] = (*BINARY_NAMES, *MATRIX_TOOLS)
         _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(_contract)
+        if MATRIX_TOOL_CELLS.intersection(_scenarios) and _selection == "all":
+            # the tools add passes over every copy that nobody has timed on these arrays. The bill
+            # follows the time a run takes, not its allocation, so the allocation is generous:
+            # twelve hours, and the fixed reservation that their price fits. These suites were
+            # first given eight hours; that version stays recorded above and this one is appended
+            _version = _suite + "-plan-v2"
+            _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+                _contract, max_runtime=43200, runtime_profile=TOOLS_RUNTIME_PROFILE,
+                reservation_microusd=65_000_000,
+                plan=MappingProxyType(dict(_contract["plan"], version=_version))))
         _MATRIX_PLAN_VERSIONS[_suite] = _version
         # the scenarios of one file set run next to each other, on the one fixture generated for it
         _MATRIX_PROFILES[_suite] = dict(cases=_cases,
