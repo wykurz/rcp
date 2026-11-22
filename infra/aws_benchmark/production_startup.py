@@ -13,7 +13,7 @@ import re
 
 OUTPUT_CONTRACT = "production-mailbox-sha256-v1"
 # reviewed upload implementation; a worker change requires a fresh image and explicit pin review
-OUTPUT_WORKER_SHA256 = "c4c619147f6fc2b57f4df03a66acf8973b008d3329b7daaf0aac065dd4fb3734"
+OUTPUT_WORKER_SHA256 = "fda2be085ba0dff98b923edb5be0ee29d5f62203203fb0ef9265603bd86e71ef"
 OUTPUT_CONTRACT_FILE = "production-output-contract.txt"
 OUTPUT_WORKER_FILE = "infra/aws_benchmark/worker.py"
 MAX_USER_DATA_BYTES = 16 * 1024
