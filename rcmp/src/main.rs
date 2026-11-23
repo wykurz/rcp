@@ -49,7 +49,8 @@ struct Args {
     #[arg(short = 'e', long = "fail-early", help_heading = "Comparison options")]
     fail_early: bool,
 
-    /// Exit on first mismatch
+    /// Stop scanning a directory once it observes a mismatch. Comparisons already in progress
+    /// can report further differences.
     #[arg(short = 'm', long = "exit-early", help_heading = "Comparison options")]
     exit_early: bool,
 
@@ -189,23 +190,9 @@ fn main() -> Result<()> {
         None
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
-    match res {
-        Some(summary) => {
-            if args.no_check {
-                std::process::exit(0)
-            } else {
-                // if there are any differences, return error code 1
-                for (_, cmp_result) in &summary.mismatch {
-                    let different = cmp_result[common::cmp::CompareResult::Different] > 0
-                        || cmp_result[common::cmp::CompareResult::SrcMissing] > 0
-                        || cmp_result[common::cmp::CompareResult::DstMissing] > 0;
-                    if different {
-                        std::process::exit(1);
-                    }
-                }
-                std::process::exit(0);
-            }
-        }
-        None => std::process::exit(2),
-    }
+    std::process::exit(match res {
+        Some(summary) if !args.no_check && summary.has_differences() => 1,
+        Some(_) => 0,
+        None => 2,
+    });
 }

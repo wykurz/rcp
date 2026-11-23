@@ -251,6 +251,9 @@ Compare `<foo>` vs. `<bar>`:
 > rcmp <foo> <bar> --quiet --log compare.log
 ```
 
+With `--exit-early`, a directory stops scheduling comparisons once it observes a difference.
+Comparisons already in flight can still contribute differences to the log and summary.
+
 # Installation
 
 RCP supports Linux on x86_64 and AArch64. Musl is the primary build, test, and distribution target;

@@ -93,6 +93,18 @@ pub struct Summary {
     pub dst_bytes: u64,
 }
 
+impl Summary {
+    /// Returns whether any compared object differed or was missing on either side.
+    #[must_use]
+    pub fn has_differences(&self) -> bool {
+        self.mismatch.iter().any(|(_, counts)| {
+            counts[CompareResult::Different] > 0
+                || counts[CompareResult::SrcMissing] > 0
+                || counts[CompareResult::DstMissing] > 0
+        })
+    }
+}
+
 impl std::ops::AddAssign for Summary {
     fn add_assign(&mut self, other: Self) {
         for (obj_type, &cmp_res_map) in &other.mismatch {
@@ -652,6 +664,11 @@ async fn cmp_internal(
     // iterate through src entries and recursively call "cmp" on each one
     loop {
         children.drain_ready(&mut cmp_summary)?;
+        if settings.exit_early && cmp_summary.has_differences() {
+            // unvisited source names cannot be classified as destination-only
+            drop(src_entries);
+            return children.finish(cmp_summary).await;
+        }
         let Some((src_entry, entry_file_type)) =
             crate::walk::next_entry_probed(&mut src_entries, congestion::Side::Source, || {
                 format!("failed traversing directory {:?}", &src)
@@ -730,6 +747,9 @@ async fn cmp_internal(
     // iterate through update entries and log each one that's not present in src
     loop {
         children.drain_ready(&mut cmp_summary)?;
+        if settings.exit_early && cmp_summary.has_differences() {
+            break;
+        }
         let Some((dst_entry, entry_file_type)) =
             crate::walk::next_entry_probed(&mut dst_entries, congestion::Side::Destination, || {
                 format!("failed traversing directory {:?}", &dst)
