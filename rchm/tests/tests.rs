@@ -96,6 +96,33 @@ fn include_filter_changes_matches_not_traversed_dirs() {
 }
 
 #[test]
+fn deep_walk_releases_directory_handles_when_no_change_is_deferred() {
+    let root = tempfile::tempdir().unwrap();
+    let mut deepest = root.path().to_path_buf();
+    for _ in 0..64 {
+        deepest.push("d");
+    }
+    std::fs::create_dir_all(&deepest).unwrap();
+    let file = deepest.join("target");
+    std::fs::write(&file, b"x").unwrap();
+
+    // 96 descriptors leave room for each ancestor's readable directory and the runtime,
+    // but retaining a second descriptor for every one of 64 ancestors exhausts the limit.
+    for flags in [&[][..], &["--defer-dir-changes", "--include", "target"]] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Command::new("sh")
+            .args(["-c", r#"ulimit -n 96 && exec "$@""#, "sh"])
+            .arg(assert_cmd::cargo::cargo_bin("rchm"))
+            .args(["--fail-early", "--mode", "f:644 d:u+x"])
+            .args(flags)
+            .arg(root.path())
+            .assert()
+            .success();
+        assert_eq!(mode_of(&file), 0o644);
+    }
+}
+
+#[test]
 fn skips_already_correct_entries() {
     let d = tempfile::tempdir().unwrap();
     let f = d.path().join("f.txt");

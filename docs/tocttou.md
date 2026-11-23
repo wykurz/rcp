@@ -1002,12 +1002,13 @@ fourth is an operational one the caller owes:
   of the aliased inode, and similar attacks (Scenario 4). No userspace scheme can defend against a
   missing `protected_hardlinks` guard. Verify with: `sysctl fs.protected_hardlinks`
 - **`/proc` mounted**: The `/proc/self/fd/<n>` magic links support held-file hard links in `rlink`,
-  descriptor-anchored chmod in `rchm` and removal, and metadata/ACL probes including age filters in
-  `rchm` and `rrm --created-before`. Directory cursors and nonseekable listings also use them when
-  reopening `.` fails with `EACCES`. These operations share `safedir::proc_fd::ProcFd`, which
-  borrows the descriptor through the synchronous operation inside its existing owned blocking job.
-  Its separate diagnostic readlink returns display text only; that text is never used to select an
-  inode. Standard on all Linux distributions.
+  descriptor-anchored chmod in `rchm` and removal, and metadata/ACL probes including
+  `--created-before` in `rchm` and `rrm`. Both tools can evaluate `--modified-before` alone from the
+  modification time already read on the held descriptor. Directory cursors and nonseekable listings
+  also use the magic links when reopening `.` fails with `EACCES`. These operations share
+  `safedir::proc_fd::ProcFd`, which borrows the descriptor through the synchronous operation inside
+  its existing owned blocking job. Its separate diagnostic readlink returns display text only; that
+  text is never used to select an inode. Standard on all Linux distributions.
 - **Actor cannot create bind mounts or manipulate mount namespaces**: Requires privilege; an
   unprivileged actor cannot exploit this.
 - **A destination subtree has a single writer**: The reused-directory lockdown under

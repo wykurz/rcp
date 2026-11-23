@@ -421,8 +421,7 @@ impl FilterSettings {
 /// `now - threshold`). When both fields are set, both conditions must hold (AND).
 ///
 /// `created_before` uses the file's birth time (`std::fs::Metadata::created()`).
-/// Some Linux filesystems do not expose btime; in that case [`Self::matches`]
-/// returns an error rather than silently treating the file as a match.
+/// A creation-time filter returns an error when the filesystem does not expose birth time.
 #[derive(Debug, Clone, Default)]
 pub struct TimeFilter {
     /// minimum age based on mtime; entry matches when mtime is at least this old
@@ -542,22 +541,7 @@ impl TimeFilter {
     pub fn is_empty(&self) -> bool {
         self.modified_before.is_none() && self.created_before.is_none()
     }
-    /// Evaluate this filter against `metadata`.
-    ///
-    /// Returns:
-    /// - `Ok(TimeFilterResult::Matched)` when the entry passes all configured thresholds.
-    /// - `Ok(TimeFilterResult::TooNew*)` when one or both thresholds are not yet met.
-    /// - `Err(_)` when `created_before` is configured and the underlying `created()`
-    ///   call fails (e.g., a filesystem that does not expose birth time).
-    pub fn matches(&self, metadata: &std::fs::Metadata) -> anyhow::Result<TimeFilterResult> {
-        Ok(self
-            .snapshot(
-                || metadata.modified(),
-                self.created_before.map(|_| metadata),
-            )?
-            .evaluate())
-    }
-    /// Captures the classified inode's timestamps before any directory mutations.
+    /// Capture the configured timestamps from the pinned inode for age evaluation.
     pub(crate) async fn snapshot_handle(
         &self,
         handle: &crate::safedir::Handle,
@@ -1131,13 +1115,6 @@ mod tests {
 
     mod time_filter_tests {
         use super::*;
-        use crate::testutils;
-
-        fn write_with_mtime(path: &std::path::Path, age: std::time::Duration) {
-            std::fs::write(path, "x").unwrap();
-            let past = filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
-            filetime::set_file_mtime(path, past).unwrap();
-        }
 
         #[test]
         fn is_empty_when_no_thresholds_set() {
@@ -1155,73 +1132,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn matches_returns_matched_when_no_thresholds() {
-            let tmp = testutils::create_temp_dir().await.unwrap();
-            let path = tmp.join("file");
-            write_with_mtime(&path, std::time::Duration::from_secs(0));
-            let metadata = std::fs::metadata(&path).unwrap();
-            assert_eq!(
-                TimeFilter::default().matches(&metadata).unwrap(),
-                TimeFilterResult::Matched
-            );
-        }
-
-        #[tokio::test]
-        async fn matches_when_mtime_older_than_threshold() {
-            let tmp = testutils::create_temp_dir().await.unwrap();
-            let path = tmp.join("file");
-            write_with_mtime(&path, std::time::Duration::from_secs(7200));
-            let metadata = std::fs::metadata(&path).unwrap();
-            let filter = TimeFilter {
-                modified_before: Some(std::time::Duration::from_secs(3600)),
-                created_before: None,
-            };
-            assert_eq!(
-                filter.matches(&metadata).unwrap(),
-                TimeFilterResult::Matched
-            );
-        }
-
-        #[tokio::test]
-        async fn reports_too_new_modified_when_mtime_recent() {
-            let tmp = testutils::create_temp_dir().await.unwrap();
-            let path = tmp.join("file");
-            write_with_mtime(&path, std::time::Duration::from_secs(0));
-            let metadata = std::fs::metadata(&path).unwrap();
-            let filter = TimeFilter {
-                modified_before: Some(std::time::Duration::from_secs(3600)),
-                created_before: None,
-            };
-            assert_eq!(
-                filter.matches(&metadata).unwrap(),
-                TimeFilterResult::TooNewModified
-            );
-        }
-
-        /// Exercises `matches()` on the `created_before` axis with real metadata.
-        /// The expected outcome depends on whether the filesystem exposes birth time:
-        /// - Supported: a freshly-written file has a recent btime → `TooNewCreated`.
-        /// - Unsupported: `matches()` must return `Err` (the contract is to surface
-        ///   the failure rather than silently treat the file as a match).
-        /// Deterministic on either platform — drift in either branch will fail loudly.
-        #[tokio::test]
-        async fn matches_exercises_btime_deterministically() {
-            let tmp = testutils::create_temp_dir().await.unwrap();
-            let path = tmp.join("file");
-            std::fs::write(&path, "x").unwrap();
-            let metadata = std::fs::metadata(&path).unwrap();
-            let filter = TimeFilter {
-                modified_before: None,
-                created_before: Some(std::time::Duration::from_secs(3600)),
-            };
-            let result = filter.matches(&metadata);
-            match metadata.created() {
-                Ok(_) => assert_eq!(result.unwrap(), TimeFilterResult::TooNewCreated),
-                Err(_) => assert!(
-                    result.is_err(),
-                    "matches() must return Err when created_before is set but btime is unavailable"
-                ),
+        async fn modified_before_evaluates_the_classification_mtime() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("file");
+            std::fs::write(&path, "x")?;
+            let now = std::time::SystemTime::now();
+            let two_hours_ago = now - std::time::Duration::from_secs(7200);
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(two_hours_ago))?;
+            let side = congestion::Side::Source;
+            let dir = crate::safedir::Dir::open_root_dir(tmp.path(), false, side).await?;
+            let handle = dir.child(std::ffi::OsStr::new("file")).await?;
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(now))?;
+            for (seconds, expected) in [
+                (None, TimeFilterResult::Matched),
+                (Some(0), TimeFilterResult::Matched),
+                (Some(3600), TimeFilterResult::Matched),
+                (Some(86400), TimeFilterResult::TooNewModified),
+            ] {
+                let filter = TimeFilter {
+                    modified_before: seconds.map(std::time::Duration::from_secs),
+                    created_before: None,
+                };
+                let snapshot = filter.snapshot_handle(&handle, side, &path).await?;
+                assert_eq!(snapshot.evaluate(), expected);
             }
+            Ok(())
         }
 
         #[tokio::test]
@@ -1253,23 +1188,6 @@ mod tests {
                 }
             }
             Ok(())
-        }
-
-        #[tokio::test]
-        async fn matches_with_zero_threshold_is_always_satisfied() {
-            // any file is at least zero seconds old
-            let tmp = testutils::create_temp_dir().await.unwrap();
-            let path = tmp.join("file");
-            write_with_mtime(&path, std::time::Duration::from_secs(0));
-            let metadata = std::fs::metadata(&path).unwrap();
-            let filter = TimeFilter {
-                modified_before: Some(std::time::Duration::from_secs(0)),
-                created_before: None,
-            };
-            assert_eq!(
-                filter.matches(&metadata).unwrap(),
-                TimeFilterResult::Matched
-            );
         }
 
         /// Focused unit tests for the pure-logic [`TimeFilter::evaluate`] helper.

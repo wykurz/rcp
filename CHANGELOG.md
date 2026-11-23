@@ -55,6 +55,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Speed up `rchm --modified-before` by reusing the modification time already read for each entry.
+  The default directory walk also avoids duplicating a file descriptor for each directory.
 - Speed up `rrm --modified-before` by reusing the modification time already read for each entry. A
   cleanup that retained about 95% of files took 35% less time on warm ext4 and 26% less on tmpfs.
 - Reduce `rcmp` memory use by collecting finished comparisons while directories are still being
