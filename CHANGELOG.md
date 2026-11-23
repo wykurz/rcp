@@ -55,6 +55,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Make `rcmp --exit-early` stop scanning a directory once it observes a difference. Comparisons
+  already in flight still report their results.
 - Speed up `rchm --modified-before` by reusing the modification time already read for each entry.
   The default directory walk also avoids duplicating a file descriptor for each directory.
 - Speed up `rrm --modified-before` by reusing the modification time already read for each entry. A

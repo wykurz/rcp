@@ -25,6 +25,69 @@ fn outputs_differences_to_stdout_by_default() {
         .stdout(predicate::str::contains("\"result\":\"dst_missing\""));
 }
 
+#[tokio::test]
+async fn exit_early_stops_scheduling_after_a_child_differs() -> anyhow::Result<()> {
+    const FILES: usize = 32;
+    let src = tempdir()?;
+    let dst = tempdir()?;
+    for (dir, size) in [(&src, 1), (&dst, 2)] {
+        let mut config = common::filegen::FileGenConfig::new(dir.path(), vec![], FILES, size);
+        config.writebuf = size;
+        common::filegen::filegen(common::get_progress(), &config).await?;
+    }
+    // one leaf permit and one worker let completed children report while the parent is still scanning
+    let result = Command::cargo_bin("rcmp")?
+        .args([
+            "--exit-early",
+            "--max-files-in-flight=1",
+            "--max-workers=1",
+            "--metadata-compare=f:size",
+            "--summary",
+        ])
+        .args([src.path(), dst.path()])
+        .assert()
+        .code(1);
+    let rows = serde_json::Deserializer::from_slice(&result.get_output().stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()?;
+    let (summary, mismatches) = rows.split_last().expect("expected a comparison summary");
+    let count = mismatches.len();
+    assert!(
+        (1..FILES).contains(&count),
+        "compared {count} of {FILES} files"
+    );
+    for mismatch in mismatches {
+        assert_eq!(mismatch["result"], "different", "{mismatch}");
+    }
+    assert_eq!(summary["mismatch"]["file"]["different"], count);
+    assert_eq!(summary["mismatch"]["file"]["src_missing"], 0);
+    assert_eq!(summary["src_bytes"], count);
+    assert_eq!(summary["dst_bytes"], 2 * count);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exit_early_stops_scanning_destination_only_entries() -> anyhow::Result<()> {
+    const FILES: usize = 8;
+    let src = tempdir()?;
+    let dst = tempdir()?;
+    let config = common::filegen::FileGenConfig::new(dst.path(), vec![], FILES, 0);
+    common::filegen::filegen(common::get_progress(), &config).await?;
+    let result = Command::cargo_bin("rcmp")?
+        .args(["--exit-early", "--metadata-compare=f:size", "--no-check"])
+        .args([src.path(), dst.path()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"result\":\"src_missing\""));
+    let stdout = std::str::from_utf8(&result.get_output().stdout)?;
+    let count = stdout.lines().count();
+    assert!(
+        (1..FILES).contains(&count),
+        "reported {count} of {FILES} files"
+    );
+    Ok(())
+}
+
 #[test]
 fn quiet_suppresses_stdout_output() {
     let dir = tempdir().unwrap();
