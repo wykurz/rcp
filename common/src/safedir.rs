@@ -227,6 +227,26 @@ impl FileMeta {
     pub fn ino(&self) -> u64 {
         self.ino
     }
+
+    /// Returns the modification time captured by the classification stat.
+    pub(crate) fn modified(&self) -> std::io::Result<std::time::SystemTime> {
+        use std::time::{Duration, UNIX_EPOCH};
+        if !(0..1_000_000_000).contains(&self.mtime_nsec) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid timestamp",
+            ));
+        }
+        // the fractional second is positive even when the whole-second field is negative
+        let fractional = UNIX_EPOCH + Duration::from_nanos(self.mtime_nsec as u64);
+        let seconds = Duration::from_secs(self.mtime.unsigned_abs());
+        if self.mtime < 0 {
+            fractional.checked_sub(seconds)
+        } else {
+            fractional.checked_add(seconds)
+        }
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid timestamp"))
+    }
 }
 
 impl crate::preserve::Metadata for FileMeta {
@@ -6949,6 +6969,27 @@ mod tests {
         // fully-qualify the std::fs::Metadata side, which implements both that trait and MetadataExt.
         assert_eq!(meta.uid(), std::os::unix::fs::MetadataExt::uid(&std_meta));
         assert_eq!(meta.gid(), std::os::unix::fs::MetadataExt::gid(&std_meta));
+        Ok(())
+    }
+
+    #[test]
+    fn classification_mtime_preserves_fractional_seconds_across_the_epoch() -> anyhow::Result<()> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let mut meta = FileMeta::from_stat(&fstat(tempfile::tempfile()?)?);
+        for (seconds, nanos, expected) in [
+            (-1, 999_999_999, UNIX_EPOCH - Duration::from_nanos(1)),
+            (0, 1, UNIX_EPOCH + Duration::from_nanos(1)),
+            (1, 250_000_000, UNIX_EPOCH + Duration::from_millis(1250)),
+        ] {
+            meta.mtime = seconds;
+            meta.mtime_nsec = nanos;
+            assert_eq!(meta.modified()?, expected);
+        }
+        meta.mtime_nsec = 1_000_000_000;
+        assert_eq!(
+            meta.modified().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
         Ok(())
     }
 

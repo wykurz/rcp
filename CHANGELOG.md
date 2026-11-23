@@ -55,6 +55,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Speed up `rrm --modified-before` by reusing the modification time already read for each entry. A
+  cleanup that retained about 95% of files took 35% less time on warm ext4 and 26% less on tmpfs.
 - Speed up ordinary, unfiltered `rrm` removals on filesystems that report entry types in directory
   listings. One worker can read a file's type and size and unlink it through its open parent
   directory, preserving the file and byte counts in progress and summary output. Each file keeps its

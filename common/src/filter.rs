@@ -431,6 +431,20 @@ pub struct TimeFilter {
     pub created_before: Option<std::time::Duration>,
 }
 
+/// Timestamps and thresholds captured for an entry whose age may be evaluated after traversal.
+pub(crate) struct TimeFilterSnapshot {
+    filter: TimeFilter,
+    mtime: Option<std::time::SystemTime>,
+    btime: Option<std::time::SystemTime>,
+}
+
+impl TimeFilterSnapshot {
+    pub(crate) fn evaluate(self) -> TimeFilterResult {
+        self.filter
+            .evaluate(self.mtime, self.btime, std::time::SystemTime::now())
+    }
+}
+
 /// Outcome of evaluating a [`TimeFilter`] against a metadata entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeFilterResult {
@@ -536,33 +550,58 @@ impl TimeFilter {
     /// - `Err(_)` when `created_before` is configured and the underlying `created()`
     ///   call fails (e.g., a filesystem that does not expose birth time).
     pub fn matches(&self, metadata: &std::fs::Metadata) -> anyhow::Result<TimeFilterResult> {
-        let mtime = if self.modified_before.is_some() {
-            Some(
-                metadata
-                    .modified()
-                    .context("failed to read mtime from metadata")?,
-            )
+        Ok(self
+            .snapshot(
+                || metadata.modified(),
+                self.created_before.map(|_| metadata),
+            )?
+            .evaluate())
+    }
+    /// Captures the classified inode's timestamps before any directory mutations.
+    pub(crate) async fn snapshot_handle(
+        &self,
+        handle: &crate::safedir::Handle,
+        side: congestion::Side,
+        path: &Path,
+    ) -> anyhow::Result<TimeFilterSnapshot> {
+        let snapshot = if self.created_before.is_some() {
+            // the classification stat lacks birth time. read both configured timestamps together
+            // through the held descriptor so they describe the same inode and metadata sample
+            let metadata = crate::safedir::stat_meta_via_proc_fd(handle, side)
+                .await
+                .with_context(|| format!("failed reading metadata for time filter on {path:?}"))?;
+            self.snapshot(|| metadata.modified(), Some(&metadata))
         } else {
-            None
+            self.snapshot(|| handle.meta().modified(), None)
         };
-        let btime = if self.created_before.is_some() {
-            Some(
-                metadata
-                    .created()
-                    .context("failed to read birth time (created) from metadata")?,
-            )
-        } else {
-            None
-        };
-        Ok(self.evaluate(mtime, btime, std::time::SystemTime::now()))
+        snapshot.with_context(|| format!("failed evaluating time filter on {path:?}"))
+    }
+    fn snapshot(
+        &self,
+        modified: impl FnOnce() -> std::io::Result<std::time::SystemTime>,
+        birth_metadata: Option<&std::fs::Metadata>,
+    ) -> anyhow::Result<TimeFilterSnapshot> {
+        let mtime = self
+            .modified_before
+            .map(|_| modified())
+            .transpose()
+            .context("failed to read mtime from metadata")?;
+        let btime = birth_metadata
+            .map(std::fs::Metadata::created)
+            .transpose()
+            .context("failed to read birth time (created) from metadata")?;
+        Ok(TimeFilterSnapshot {
+            filter: self.clone(),
+            mtime,
+            btime,
+        })
     }
     /// Pure-logic evaluation of this filter against raw timestamps.
     ///
     /// The timestamps are only inspected when the corresponding threshold is configured.
     /// When a threshold is configured but the timestamp is `None`, the entry is treated as
     /// "too new" for that axis (a `None` timestamp has no age signal, so it cannot satisfy
-    /// an age threshold). This helper is for deterministic unit testing of the AND logic;
-    /// prefer [`Self::matches`] for real callers.
+    /// an age threshold). An explicit clock lets tests exercise the cutoff exactly.
     fn evaluate(
         &self,
         mtime: Option<std::time::SystemTime>,
@@ -1183,6 +1222,37 @@ mod tests {
                     "matches() must return Err when created_before is set but btime is unavailable"
                 ),
             }
+        }
+
+        #[tokio::test]
+        async fn birth_time_filters_read_the_pinned_timestamps_together() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("file");
+            std::fs::write(&path, "x")?;
+            let side = congestion::Side::Source;
+            let dir = crate::safedir::Dir::open_root_dir(tmp.path(), false, side).await?;
+            let handle = dir.child(std::ffi::OsStr::new("file")).await?;
+            // only the full metadata sample sees this old mtime. the birth time stays recent
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0))?;
+            let age = Some(std::time::Duration::from_secs(3600));
+            for modified_before in [None, age] {
+                let filter = TimeFilter {
+                    modified_before,
+                    created_before: age,
+                };
+                let result = filter.snapshot_handle(&handle, side, &path).await;
+                match path.metadata()?.created() {
+                    Ok(_) => assert_eq!(result?.evaluate(), TimeFilterResult::TooNewCreated),
+                    Err(expected) => {
+                        let err = result.err().context("expected an unavailable birth time")?;
+                        assert_eq!(
+                            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+                            Some(expected.kind())
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
 
         #[tokio::test]

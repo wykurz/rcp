@@ -156,6 +156,50 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
 }
 
 #[tokio::test]
+async fn rm_modified_before_reuses_classification_metadata() -> anyhow::Result<()> {
+    let _guard = SINK_GUARD.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("tree");
+    make_small_tree(&root).await?;
+    std::os::unix::fs::symlink("missing", root.join("link"))?;
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    for name in ["a/1.txt", "a/2.txt", "b/3.txt", "link", "a", "b", ""] {
+        filetime::set_symlink_file_times(root.join(name), old, old)?;
+    }
+    let preview = async |time_filter| -> anyhow::Result<usize> {
+        let sink = install_sink();
+        let result = rm::rm(
+            &PROGRESS,
+            &root,
+            &rm::Settings {
+                fail_early: true,
+                filter: None,
+                dry_run: Some(common::config::DryRunMode::Brief),
+                time_filter,
+            },
+        )
+        .await;
+        congestion::clear_sample_sink();
+        let summary = result?;
+        assert_eq!(summary.files_removed, 3);
+        assert_eq!(summary.directories_removed, 3);
+        assert_eq!(summary.symlinks_removed, 1);
+        Ok(sink.metadata_count_for(congestion::Side::Source))
+    };
+    let unfiltered = preview(None).await?;
+    let modified = preview(Some(common::filter::TimeFilter {
+        modified_before: Some(std::time::Duration::from_secs(3600)),
+        created_before: None,
+    }))
+    .await?;
+    assert_eq!(
+        modified, unfiltered,
+        "mtime needs only the classification stat"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn copy_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
     spend_root_acl_probe().await;

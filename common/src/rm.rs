@@ -440,10 +440,8 @@ struct RmDirState {
     /// Restores the relaxed mode only if filtering deliberately retains this directory. `None` in
     /// dry-run and when the directory already had owner rwx, because neither case changes the mode.
     relaxed: Option<RelaxedDir>,
-    /// The directory's PRISTINE full metadata, snapshotted in `dir_pre` BEFORE the relax or any
-    /// child removal, so the directory's own time filter sees timestamps unperturbed by clearing
-    /// its contents (removing children bumps mtime). `Some` iff a time filter is configured.
-    time_metadata: Option<anyhow::Result<std::fs::Metadata>>,
+    /// The directory's time filter with timestamps captured before relaxation and child removal.
+    time_filter: Option<anyhow::Result<crate::filter::TimeFilterSnapshot>>,
     /// Whether the directory does NOT directly match an include pattern while includes are active —
     /// the path-only half of the "traversed only" decision. Combined in `dir_post` with
     /// "nothing was removed" (derived from the children's folded summary) to reproduce the old
@@ -542,67 +540,23 @@ impl WalkVisitor for RmVisitor {
         };
         // apply time filter before removing (files/symlinks only)
         if let Some(ref time_filter) = settings.time_filter {
-            let entry_type = if is_symlink { "symlink" } else { "file" };
-            let make_skipped_summary = || {
-                tracing::debug!("skipping {:?} due to time filter", &path);
-                if is_symlink {
-                    prog_track.symlinks_skipped.inc();
-                    Summary {
-                        symlinks_skipped: 1,
-                        ..Default::default()
-                    }
-                } else {
-                    prog_track.files_skipped.inc();
-                    Summary {
-                        files_skipped: 1,
-                        ..Default::default()
-                    }
-                }
-            };
-            // the time filter needs full std metadata (btime for --created-before), which the
-            // fd snapshot does not carry; read it inode-exact through the pinned handle so a
-            // concurrent swap of `name` cannot redirect the stat to a different inode.
-            let metadata =
-                match safedir::stat_meta_via_proc_fd(leaf.handle(), congestion::Side::Source).await
-                {
-                    Ok(md) => md,
-                    Err(err) => {
-                        let err = anyhow::Error::new(err).context(format!(
-                            "failed reading metadata for time filter on {path:?}"
-                        ));
-                        if settings.fail_early {
-                            return Err(Error::new(err, Default::default()));
-                        }
-                        // log and skip — never delete an entry whose age we cannot verify.
-                        if is_unsupported_io_error(&err) {
-                            tracing::warn!(
-                                "time filter evaluation unsupported for {} {:?}, skipping: {:#}",
-                                entry_type,
-                                &path,
-                                &err
-                            );
-                        } else {
-                            tracing::error!(
-                                "time filter evaluation failed for {} {:?}, skipping: {:#}",
-                                entry_type,
-                                &path,
-                                &err
-                            );
-                        }
-                        return Ok(make_skipped_summary());
-                    }
-                };
-            match time_filter.matches(&metadata) {
-                Ok(result) => {
+            let entry_type = kind.label();
+            let skipped = match time_filter
+                .snapshot_handle(leaf.handle(), congestion::Side::Source, path)
+                .await
+            {
+                Ok(snapshot) => {
+                    let result = snapshot.evaluate();
                     if let Some(skip_reason) = result.as_skip_reason() {
                         if let Some(mode) = settings.dry_run {
                             crate::dry_run::report_time_skip(path, skip_reason, mode, entry_type);
                         }
-                        return Ok(make_skipped_summary());
+                        true
+                    } else {
+                        false
                     }
                 }
                 Err(err) => {
-                    let err = err.context(format!("failed evaluating time filter on {:?}", &path));
                     if settings.fail_early {
                         return Err(Error::new(err, Default::default()));
                     }
@@ -624,8 +578,13 @@ impl WalkVisitor for RmVisitor {
                             &err
                         );
                     }
-                    return Ok(make_skipped_summary());
+                    true
                 }
+            };
+            if skipped {
+                tracing::debug!("skipping {:?} due to time filter", &path);
+                kind.inc_skipped(prog_track);
+                return Ok(skipped_summary_for(kind));
             }
         }
         if let Some(protection) = &self.protection {
@@ -677,28 +636,16 @@ impl WalkVisitor for RmVisitor {
                 .map_err(|error| Error::new(error.into(), Default::default()))?;
         }
 
-        // Snapshot the directory's full metadata NOW, before relaxing its mode or removing any
-        // child. The directory's own time filter (evaluated in `dir_post`, after its children are
-        // processed) must use these pristine timestamps: removing children bumps the directory's
-        // mtime, so a fresh stat at the end would wrongly see the directory as "just modified".
-        // This mirrors the old code's `src_metadata` captured at entry. We read full std metadata
-        // (not just the fd snapshot) because `--created-before` needs btime; it's read inode-exact
-        // through the pinned handle. Only fetched when a time filter is configured. The relax below
-        // changes only mode/ctime, never mtime/btime, so taking the snapshot before it is correct.
-        let time_metadata: Option<anyhow::Result<std::fs::Metadata>> =
-            if settings.time_filter.is_some() {
-                Some(
-                    safedir::stat_meta_via_proc_fd(handle, congestion::Side::Source)
-                        .await
-                        .map_err(|err| {
-                            anyhow::Error::new(err).context(format!(
-                                "failed reading metadata for time filter on {path:?}"
-                            ))
-                        }),
-                )
-            } else {
-                None
-            };
+        // removing children changes the directory's mtime. capture timestamps here and compare
+        // them against the clock in dir_post, once the children have finished
+        let time_filter = match &settings.time_filter {
+            Some(filter) => Some(
+                filter
+                    .snapshot_handle(handle, congestion::Side::Source, path)
+                    .await,
+            ),
+            None => None,
+        };
         // the path-only half of the "traversed only" decision: a directory is "traversed only" when
         // include filters are active and the directory itself doesn't directly match an include
         // pattern (it was entered only to search for matching content). `dir_post` combines this
@@ -761,7 +708,7 @@ impl WalkVisitor for RmVisitor {
             child_ctx: (),
             state: RmDirState {
                 relaxed,
-                time_metadata,
+                time_filter,
                 matches_no_include,
             },
         })
@@ -778,7 +725,7 @@ impl WalkVisitor for RmVisitor {
         let path = cx.real_path.as_path();
         let RmDirState {
             relaxed,
-            time_metadata,
+            time_filter,
             matches_no_include,
         } = state;
         // a child failed (keep-going mode — fail-early aborts before `dir_post`). do not rmdir or
@@ -800,19 +747,9 @@ impl WalkVisitor for RmVisitor {
         // evaluate the directory's own time filter to decide whether to remove it.
         // the time filter is an entry filter, not a subtree gate: children are already handled
         // by their own recursive calls, so this decision only controls the final rmdir.
-        // the metadata SNAPSHOT taken in `dir_pre` — before relaxing the mode or removing any
-        // child — is used so those mutations (which bump the directory's mtime) don't change the
-        // answer. this mirrors the old code's `src_metadata` captured at entry.
-        let dir_passes_time_filter: bool = if let Some(ref time_filter) = settings.time_filter {
-            // unwrap is safe: time_metadata is Some whenever time_filter is Some (both gated on
-            // settings.time_filter.is_some()).
-            let matched = time_metadata.unwrap().and_then(|md| {
-                time_filter.matches(&md).map_err(|err| {
-                    err.context(format!("failed evaluating time filter on {path:?}"))
-                })
-            });
-            match matched {
-                Ok(result) => match result.as_skip_reason() {
+        let dir_passes_time_filter = if let Some(snapshot) = time_filter {
+            match snapshot {
+                Ok(snapshot) => match snapshot.evaluate().as_skip_reason() {
                     Some(reason) => {
                         if let Some(mode) = settings.dry_run {
                             crate::dry_run::report_time_skip(path, reason, mode, "dir");
