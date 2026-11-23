@@ -852,8 +852,8 @@ async fn apply_plan(handle: &Handle, plan: &EntryPlan) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply the change to a single entry (a leaf, or a directory after its children
-/// were processed). Handles the time filter, dry-run, no-op skip, and counters.
+/// Apply the change to a leaf or to a directory in the configured order.
+/// Handles the time filter, dry-run, no-op skip, and counters.
 ///
 /// `handle` is the entry's fd-pinned `O_PATH` [`Handle`]; its [`Handle::meta`]
 /// snapshot feeds [`compute_plan`] (replacing the old path-based `symlink_metadata`)
@@ -867,26 +867,12 @@ async fn apply_entry_change(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     if let Some(ref time_filter) = settings.time_filter {
-        // the time filter needs full std metadata (btime for --created-before), which
-        // the fd snapshot does not carry; read it inode-exact through the pinned handle.
-        let metadata =
-            match safedir::stat_meta_via_proc_fd(handle, congestion::Side::Destination).await {
-                Ok(md) => md,
-                Err(err) => {
-                    let err = anyhow::Error::new(err).context(format!(
-                        "failed reading metadata for time filter on {path:?}"
-                    ));
-                    if settings.fail_early {
-                        return Err(Error::new(err, Default::default()));
-                    }
-                    tracing::warn!("time filter failed for {:?}, skipping: {:#}", path, &err);
-                    kind.inc_skipped(prog);
-                    return Ok(skipped_summary_for(kind));
-                }
-            };
-        match time_filter.matches(&metadata) {
-            Ok(result) => {
-                if let Some(reason) = result.as_skip_reason() {
+        match time_filter
+            .snapshot_handle(handle, congestion::Side::Destination, path)
+            .await
+        {
+            Ok(snapshot) => {
+                if let Some(reason) = snapshot.evaluate().as_skip_reason() {
                     if let Some(mode) = settings.dry_run {
                         crate::dry_run::report_time_skip(path, reason, mode, kind.label());
                     }
@@ -895,7 +881,6 @@ async fn apply_entry_change(
                 }
             }
             Err(err) => {
-                let err = err.context(format!("failed evaluating time filter on {path:?}"));
                 if settings.fail_early {
                     return Err(Error::new(err, Default::default()));
                 }
@@ -1045,21 +1030,13 @@ struct ChmodVisitor {
     settings: Settings,
 }
 
-/// State threaded from [`WalkVisitor::dir_pre`] to [`WalkVisitor::dir_post`] (same task) — what
-/// `dir_post` needs to apply the directory's own change.
-struct ChmodDirState {
-    /// The directory's owned `O_PATH` handle; the post-order chmod goes through its `/proc/self/fd`
-    /// magic symlink, inode-exact (works even on a `0000`-mode directory).
-    handle: Handle,
-    /// Only traversed to find include-matches (not directly matched), so its own mode/owner is left
-    /// unchanged (mirrors rm.rs).
-    traversed_only: bool,
-    /// The directory's own pre-order contribution, folded into the final summary by `dir_post`.
-    base: Summary,
-    /// A pre-order change error captured in keep-going mode (the descent still proceeded, so
-    /// `dir_post` surfaces it). `None` when the pre-order change succeeded or was deferred —
-    /// mutually exclusive with the post-order change `dir_post` applies under `defer_dir_changes`.
-    pre_order_error: Option<anyhow::Error>,
+/// The directory's contribution before or after its children.
+enum ChmodDirState {
+    /// The change or skip already ran. A keep-going error is reported after descent.
+    Applied(Result<Summary, Error>),
+    /// A selected directory keeps its pinned handle. A traversal-only directory reports
+    /// its skip at the same post-order point without holding an extra descriptor.
+    Deferred(Option<Handle>),
 }
 
 impl WalkVisitor for ChmodVisitor {
@@ -1114,98 +1091,52 @@ impl WalkVisitor for ChmodVisitor {
 
     async fn dir_pre(&self, cx: &EntryCx, _parent_ctx: &(), handle: &Handle) -> DirPreResult<Self> {
         let path = &cx.real_path;
-        // a "traversed-only" dir was entered only because it COULD contain include-matches; it does
-        // not directly match an include pattern, so its own mode/owner is left unchanged (mirrors
-        // rm.rs) — only directly-selected entries are modified.
-        let traversed_only =
-            self.settings.filter.as_ref().is_some_and(|f| {
-                f.has_includes() && !f.directly_matches_include(&cx.rel_path, true)
-            });
-        let mut base = Summary::default();
-        let mut pre_order_error: Option<anyhow::Error> = None;
-        // pre-order (default, like `chmod -R`): change the dir BEFORE descending, via the O_PATH
-        // handle's /proc path (works even on a 0000 dir) — so `--mode d:u+rwx` recovers an
-        // unreadable dir before the open reads it, and a later child failure can't prevent it. a
-        // restrictive change (e.g. `d:a-rwx`) makes the open fail and is reported (like `chmod -R`).
-        if !self.settings.defer_dir_changes {
-            match apply_dir_self(
-                self.prog_track,
-                path,
-                handle,
-                traversed_only,
-                &self.settings,
+        let selected_handle = self
+            .settings
+            .filter
+            .as_ref()
+            .is_none_or(|f| f.directly_matches_include(&cx.rel_path, true))
+            .then_some(handle);
+        let state = if self.settings.defer_dir_changes {
+            // the driver drops its classification handle before descent. keep that exact inode
+            // pinned only when a selected directory still needs its post-order change.
+            ChmodDirState::Deferred(
+                selected_handle
+                    .map(Handle::try_clone)
+                    .transpose()
+                    .with_context(|| format!("cannot duplicate directory handle for {path:?}"))
+                    .map_err(|err| Error::new(err, Summary::default()))?,
             )
-            .await
-            {
-                Ok(dir_summary) => base = base + dir_summary,
-                // fail-early: report now, never open or descend. keep-going: stash the error for
-                // `dir_post` to surface after the descent, and still open and recurse (old flow).
-                Err(error) if self.settings.fail_early => {
-                    return Err(Error::new(error.source, base + error.summary));
-                }
-                Err(error) => {
-                    tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                    base = base + error.summary;
-                    pre_order_error = Some(error.source);
-                }
+        } else {
+            // applying d:u+rwx through the O_PATH handle can recover an unreadable directory
+            // before the read open. conversely, stripping permissions can make that open fail.
+            match self.apply_dir_self(path, selected_handle).await {
+                Err(error) if self.settings.fail_early => return Err(error),
+                result => ChmodDirState::Applied(result),
             }
-        }
-        // dup the dir's O_PATH handle (a pure fd dup — no extra openat/fstatat) so `dir_post` can
-        // apply the deferred/post-order change inode-exact: the driver lends `&handle` only for
-        // `dir_pre`, so the post-order step needs its own owned handle to the same inode.
-        let dir_handle = handle
-            .try_clone()
-            .with_context(|| format!("cannot duplicate directory handle for {path:?}"))
-            .map_err(|err| Error::new(err, base))?;
-        // open the directory's real fd for the driver to enumerate. in post-order the dir still has
-        // its original mode, so the open succeeds and the held fd survives a later search-bit strip.
-        // an open failure (restrictive pre-order change, or a pre-existing unreadable dir) is reported.
+        };
         match cx.parent.open_dir(&cx.name).await {
             Ok(dir) => Ok(DirAction::Descend {
                 dir: Arc::new(dir),
                 child_ctx: (),
-                state: ChmodDirState {
-                    handle: dir_handle,
-                    traversed_only,
-                    base,
-                    pre_order_error,
-                },
+                state,
             }),
             Err(error) => {
                 let error = anyhow::Error::new(error)
                     .context(format!("cannot open directory {path:?} for reading"));
                 if self.settings.fail_early {
-                    return Err(Error::new(error, base));
+                    let applied = match state {
+                        ChmodDirState::Applied(result) => result?,
+                        ChmodDirState::Deferred(_) => Summary::default(),
+                    };
+                    return Err(Error::new(error, applied));
                 }
-                // keep-going: no children to walk. fold the pre-order error (if any) + the open
-                // error, apply the deferred change (if any), and surface the combined error — the
-                // net result of the old open-failure path (empty join loop, then deferred change).
-                let errors = crate::error_collector::ErrorCollector::default();
-                if let Some(pre_order_error) = pre_order_error {
-                    errors.push(pre_order_error);
-                }
+                // an open failure prevents all child work. keep-going still applies a deferred
+                // change through its pinned handle and reports partial work, just like a child error.
                 tracing::error!("chmod: {:#}", &error);
-                errors.push(error);
-                if self.settings.defer_dir_changes {
-                    match apply_dir_self(
-                        self.prog_track,
-                        path,
-                        handle,
-                        traversed_only,
-                        &self.settings,
-                    )
+                self.dir_post(cx, state, Err(Error::new(error, Summary::default())))
                     .await
-                    {
-                        Ok(dir_summary) => base = base + dir_summary,
-                        Err(error) => {
-                            tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                            base = base + error.summary;
-                            errors.push(error.source);
-                        }
-                    }
-                }
-                // `into_error()` is `Some` here: at least the open error was pushed.
-                Err(Error::new(errors.into_error().unwrap(), base))
+                    .map(DirAction::Skip)
             }
         }
     }
@@ -1216,83 +1147,63 @@ impl WalkVisitor for ChmodVisitor {
         state: ChmodDirState,
         child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
-        let ChmodDirState {
-            handle,
-            traversed_only,
-            base,
-            pre_order_error,
-        } = state;
-        let path = &cx.real_path;
-        // seed with the dir's own pre-order contribution, then fold the children (the driver passes
-        // `Err` here only in keep-going mode — fail-early aborts before post-order).
-        let (child_summary, child_error) = match child_result {
-            Ok((summary, _)) => (summary, None),
-            Err(err) => (err.summary, Some(err.source)),
+        let children = child_result.map(|(summary, _)| summary);
+        // preserve the first error's chain in traversal order, including when the directory
+        // could not be opened and the open error takes the place of its children.
+        let (first, second) = match state {
+            ChmodDirState::Applied(result) => (result, children),
+            ChmodDirState::Deferred(handle) => (
+                children,
+                self.apply_dir_self(&cx.real_path, handle.as_ref()).await,
+            ),
         };
-        let mut summary = base + child_summary;
-        // collect the deferred pre-order error and the child error (keep-going only).
-        let errors = crate::error_collector::ErrorCollector::default();
-        if let Some(pre_order_error) = pre_order_error {
-            errors.push(pre_order_error);
-        }
-        if let Some(child_error) = child_error {
-            errors.push(child_error);
-        }
-        // post-order (`--defer-dir-changes`): change the dir AFTER its contents (needed to remove
-        // the owner's own traversal permission). the contents were read through a fd opened before
-        // this change, so stripping the search bit here can't lock us out; the change is inode-exact
-        // through the O_PATH handle. (`pre_order_error` is always `None` here, so the two are
-        // mutually exclusive.)
-        if self.settings.defer_dir_changes {
-            match apply_dir_self(
-                self.prog_track,
-                path,
-                &handle,
-                traversed_only,
-                &self.settings,
-            )
-            .await
-            {
-                Ok(dir_summary) => summary = summary + dir_summary,
-                Err(error) => {
-                    if self.settings.fail_early {
-                        return Err(Error::new(error.source, summary + error.summary));
-                    }
-                    tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                    summary = summary + error.summary;
-                    errors.push(error.source);
-                }
+        match (first, second) {
+            (Ok(a), Ok(b)) => Ok(a + b),
+            (Err(error), Ok(done)) | (Ok(done), Err(error)) => {
+                Err(Error::new(error.source, done + error.summary))
+            }
+            (Err(a), Err(b)) => {
+                let errors = crate::error_collector::ErrorCollector::default();
+                errors.push(a.source);
+                errors.push(b.source);
+                Err(Error::new(
+                    errors.into_error().unwrap(),
+                    a.summary + b.summary,
+                ))
             }
         }
-        if let Some(error) = errors.into_error() {
-            return Err(Error::new(error, summary));
-        }
-        Ok(summary)
     }
 }
 
-/// Apply the directory's own change, or skip it when the directory was only traversed to
-/// find include-matches. Factored out so the walk can run it before (pre-order, default)
-/// or after (post-order, `--defer-dir-changes`) descending into the contents.
-///
-/// `handle` is the directory's `O_PATH` handle; the chmod goes through its `/proc/self/fd`
-/// magic symlink, so the change applies inode-exact and works even on a `0000`-mode
-/// directory (a pre-order `d:u+rwx` recovers traversability before we open the dir to read).
-async fn apply_dir_self(
-    prog_track: &'static Progress,
-    path: &std::path::Path,
-    handle: &Handle,
-    traversed_only: bool,
-    settings: &Settings,
-) -> Result<Summary, Error> {
-    if traversed_only {
-        if let Some(crate::config::DryRunMode::All) = settings.dry_run {
-            println!("skip dir {path:?} (only traversed for include matches)");
+impl ChmodVisitor {
+    /// Apply through the selected directory's pinned handle, or account for a traversal-only skip.
+    async fn apply_dir_self(
+        &self,
+        path: &Path,
+        selected: Option<&Handle>,
+    ) -> Result<Summary, Error> {
+        let Some(handle) = selected else {
+            if let Some(crate::config::DryRunMode::All) = self.settings.dry_run {
+                println!("skip dir {path:?} (only traversed for include matches)");
+            }
+            self.prog_track.directories_skipped.inc();
+            return Ok(skipped_summary_for(EntryKind::Dir));
+        };
+        let result = apply_entry_change(
+            self.prog_track,
+            path,
+            handle,
+            EntryKind::Dir,
+            &self.settings,
+        )
+        .await;
+        if !self.settings.fail_early
+            && let Err(error) = &result
+        {
+            tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
         }
-        prog_track.directories_skipped.inc();
-        return Ok(skipped_summary_for(EntryKind::Dir));
+        result
     }
-    apply_entry_change(prog_track, path, handle, EntryKind::Dir, settings).await
 }
 
 #[cfg(test)]

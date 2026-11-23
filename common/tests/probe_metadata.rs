@@ -5,7 +5,7 @@
 //! Lives in its own test binary so the process-wide `SampleSink` global is
 //! isolated from every other test in the `common` crate.
 
-use common::{copy, link, preserve, progress, rm};
+use common::{chmod, copy, link, preserve, progress, rm};
 use congestion::testing::CollectingSink;
 use std::os::unix::fs::PermissionsExt;
 
@@ -196,6 +196,77 @@ async fn rm_modified_before_reuses_classification_metadata() -> anyhow::Result<(
         modified, unfiltered,
         "mtime needs only the classification stat"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn chmod_age_filters_probe_only_for_birth_time() -> anyhow::Result<()> {
+    let _guard = SINK_GUARD.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("tree");
+    make_small_tree(&root).await?;
+    std::os::unix::fs::symlink("missing", root.join("link"))?;
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    for name in ["a/1.txt", "a/2.txt", "link", "a", ""] {
+        filetime::set_symlink_file_times(root.join(name), old, old)?;
+    }
+    let mut includes = common::filter::FilterSettings::new();
+    for pattern in ["*.txt", "a/", "link"] {
+        includes.add_include(pattern)?;
+    }
+    let mut settings = chmod::Settings {
+        mode: chmod::parse_mode_dsl("f:000 d:000")?,
+        owner: Default::default(),
+        group: Default::default(),
+        no_setid: false,
+        fail_early: false,
+        defer_dir_changes: false,
+        filter: None,
+        time_filter: None,
+        dry_run: Some(common::config::DryRunMode::Brief),
+    };
+    let preview = async |settings: &chmod::Settings| -> anyhow::Result<_> {
+        let sink = install_sink();
+        let result = chmod::chmod(&PROGRESS, &root, settings).await;
+        congestion::clear_sample_sink();
+        assert_eq!(sink.metadata_count_for(congestion::Side::Source), 0);
+        Ok((
+            result?,
+            sink.metadata_count_for(congestion::Side::Destination),
+        ))
+    };
+    for defer in [false, true] {
+        settings.defer_dir_changes = defer;
+        for (filter, old_dirs, selected_entries) in [(None, 2, 7), (Some(includes.clone()), 1, 5)] {
+            settings.filter = filter;
+            settings.time_filter = None;
+            let (_, baseline) = preview(&settings).await?;
+            settings.time_filter = common::filter::TimeFilter::from_cli_args(Some("1h"), None)?;
+            let (summary, probes) = preview(&settings).await?;
+            assert_eq!(summary.files_changed, 2);
+            assert_eq!(summary.files_skipped, 1);
+            assert_eq!(summary.directories_changed, old_dirs);
+            assert_eq!(summary.directories_skipped, 3 - old_dirs);
+            assert_eq!(summary.symlinks_unchanged, 1);
+            assert_eq!(
+                probes,
+                baseline,
+                "mtime-only filtering added metadata probes (defer={defer}, includes={})",
+                settings.filter.is_some()
+            );
+            // a new entry is too young by birth time. keep-going also counts it as skipped
+            // when the platform cannot report birth time. each selected inode needs one probe.
+            for modified in [None, Some("1h")] {
+                settings.time_filter =
+                    common::filter::TimeFilter::from_cli_args(modified, Some("1h"))?;
+                let (summary, probes) = preview(&settings).await?;
+                assert_eq!(summary.files_skipped, 3);
+                assert_eq!(summary.directories_skipped, 3);
+                assert_eq!(summary.symlinks_skipped, 1);
+                assert_eq!(probes, baseline + selected_entries);
+            }
+        }
+    }
     Ok(())
 }
 
