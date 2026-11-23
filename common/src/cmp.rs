@@ -93,25 +93,18 @@ pub struct Summary {
     pub dst_bytes: u64,
 }
 
-impl std::ops::Add for Summary {
-    type Output = Self;
-    fn add(self, other: Self) -> Self {
-        let mut mismatch = self.mismatch;
+impl std::ops::AddAssign for Summary {
+    fn add_assign(&mut self, other: Self) {
         for (obj_type, &cmp_res_map) in &other.mismatch {
             for (cmp_res, &count) in &cmp_res_map {
-                mismatch[obj_type][cmp_res] += count;
+                self.mismatch[obj_type][cmp_res] += count;
             }
         }
-        let mut skipped = self.skipped;
         for (obj_type, &count) in &other.skipped {
-            skipped[obj_type] += count;
+            self.skipped[obj_type] += count;
         }
-        Self {
-            mismatch,
-            skipped,
-            src_bytes: self.src_bytes + other.src_bytes,
-            dst_bytes: self.dst_bytes + other.dst_bytes,
-        }
+        self.src_bytes += other.src_bytes;
+        self.dst_bytes += other.dst_bytes;
     }
 }
 
@@ -321,6 +314,52 @@ fn obj_type(metadata: &std::fs::Metadata) -> ObjType {
     }
 }
 
+struct ChildComparisons<L> {
+    tasks: tokio::task::JoinSet<Result<Summary>>,
+    errors: crate::error_collector::ErrorCollector,
+    fail_early: bool,
+    log_error: L,
+}
+
+impl<L: Fn(&anyhow::Error)> ChildComparisons<L> {
+    fn new(fail_early: bool, log_error: L) -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            errors: crate::error_collector::ErrorCollector::default(),
+            fail_early,
+            log_error,
+        }
+    }
+
+    fn add_result(&self, summary: &mut Summary, child: Result<Summary>) -> Result<()> {
+        match child {
+            Ok(child) => *summary += child,
+            Err(error) if self.fail_early => return Err(error),
+            Err(error) => self.errors.push(error),
+        }
+        Ok(())
+    }
+
+    /// A finished leaf has released its admission permit, but the task still owns its summary
+    /// until joined. Reclaim those results while directory enumeration continues.
+    fn drain_ready(&mut self, summary: &mut Summary) -> Result<()> {
+        while let Some(child) = self.tasks.try_join_next() {
+            self.add_result(summary, child?.inspect_err(&self.log_error))?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self, mut summary: Summary) -> Result<Summary> {
+        while let Some(child) = self.tasks.join_next().await {
+            self.add_result(&mut summary, child?.inspect_err(&self.log_error))?;
+        }
+        match self.errors.into_error() {
+            Some(error) => Err(error),
+            None => Ok(summary),
+        }
+    }
+}
+
 /// Public entry point for compare operations.
 /// Internally delegates to cmp_internal with source_root/dest_root tracking for proper filter matching.
 #[instrument(skip(prog_track))]
@@ -408,9 +447,14 @@ async fn expand_missing_tree(
     let mut entries = tokio::fs::read_dir(existing_path)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", &existing_path))?;
-    let mut join_set = tokio::task::JoinSet::new();
-    let errors = crate::error_collector::ErrorCollector::default();
+    let mut children = ChildComparisons::new(settings.fail_early, |error| {
+        tracing::error!(
+            "expand_missing_tree: {:?} failed with: {error:#}",
+            existing_path
+        );
+    });
     loop {
+        children.drain_ready(&mut summary)?;
         let Some((entry, entry_file_type)) =
             crate::walk::next_entry_probed(&mut entries, side, || {
                 format!("failed traversing directory {:?}", &existing_path)
@@ -463,7 +507,7 @@ async fn expand_missing_tree(
         } else {
             None
         };
-        join_set.spawn(async move {
+        children.tasks.spawn(async move {
             let _pending_guard = pending_guard;
             expand_missing_tree(
                 prog_track,
@@ -478,26 +522,7 @@ async fn expand_missing_tree(
         });
     }
     drop(entries);
-    while let Some(res) = join_set.join_next().await {
-        match res? {
-            Ok(child_summary) => summary = summary + child_summary,
-            Err(error) => {
-                tracing::error!(
-                    "expand_missing_tree: {:?} failed with: {:#}",
-                    existing_path,
-                    &error
-                );
-                errors.push(error);
-                if settings.fail_early {
-                    break;
-                }
-            }
-        }
-    }
-    if let Some(err) = errors.into_error() {
-        return Err(err);
-    }
-    Ok(summary)
+    children.finish(summary).await
 }
 
 #[instrument(skip(prog_track))]
@@ -566,7 +591,7 @@ async fn cmp_internal(
                             settings,
                         )
                         .await?;
-                        cmp_summary = cmp_summary + expanded;
+                        cmp_summary += expanded;
                     } else {
                         cmp_summary.mismatch[src_obj_type][CompareResult::DstMissing] += 1;
                         log.log_mismatch(
@@ -619,12 +644,14 @@ async fn cmp_internal(
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
-    let mut join_set = tokio::task::JoinSet::new();
-    let errors = crate::error_collector::ErrorCollector::default();
+    let mut children = ChildComparisons::new(settings.fail_early, |error| {
+        tracing::error!("cmp: {src:?} vs {dst:?} failed with: {error:#}");
+    });
     // create a set of all the files we already processed
     let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "cmp" on each one
     loop {
+        children.drain_ready(&mut cmp_summary)?;
         let Some((src_entry, entry_file_type)) =
             crate::walk::next_entry_probed(&mut src_entries, congestion::Side::Source, || {
                 format!("failed traversing directory {:?}", &src)
@@ -691,7 +718,7 @@ async fn cmp_internal(
             )
             .await
         };
-        join_set.spawn(do_cmp());
+        children.tasks.spawn(do_cmp());
     }
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
     // one thing we CAN do however is to drop it as soon as we're done with it
@@ -702,6 +729,7 @@ async fn cmp_internal(
         .with_context(|| format!("cannot open directory {:?} for reading", &dst))?;
     // iterate through update entries and log each one that's not present in src
     loop {
+        children.drain_ready(&mut cmp_summary)?;
         let Some((dst_entry, entry_file_type)) =
             crate::walk::next_entry_probed(&mut dst_entries, congestion::Side::Destination, || {
                 format!("failed traversing directory {:?}", &dst)
@@ -748,7 +776,7 @@ async fn cmp_internal(
         .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
         if settings.expand_missing && dst_entry_metadata.is_dir() {
-            match expand_missing_tree(
+            let expanded = expand_missing_tree(
                 prog_track,
                 &dst_path,
                 &src.join(entry_name),
@@ -758,21 +786,10 @@ async fn cmp_internal(
                 settings,
             )
             .await
-            {
-                Ok(expanded) => cmp_summary = cmp_summary + expanded,
-                Err(error) => {
-                    tracing::error!(
-                        "expand_missing_tree: {:?} failed with: {:#}",
-                        &dst_path,
-                        &error
-                    );
-                    errors.push(error);
-                    if settings.fail_early {
-                        // unwrap is safe: we just pushed an error
-                        return Err(errors.into_error().unwrap());
-                    }
-                }
-            }
+            .inspect_err(|error| {
+                tracing::error!("expand_missing_tree: {dst_path:?} failed with: {error:#}");
+            });
+            children.add_result(&mut cmp_summary, expanded)?;
         } else {
             if dst_entry_metadata.is_file() {
                 cmp_summary.dst_bytes += dst_entry_metadata.len();
@@ -791,22 +808,7 @@ async fn cmp_internal(
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
     // one thing we CAN do however is to drop it as soon as we're done with it
     drop(dst_entries);
-    while let Some(res) = join_set.join_next().await {
-        match res? {
-            Ok(summary) => cmp_summary = cmp_summary + summary,
-            Err(error) => {
-                tracing::error!("cmp: {:?} vs {:?} failed with: {:#}", src, dst, &error);
-                errors.push(error);
-                if settings.fail_early {
-                    break;
-                }
-            }
-        }
-    }
-    if let Some(err) = errors.into_error() {
-        return Err(err);
-    }
-    Ok(cmp_summary)
+    children.finish(cmp_summary).await
 }
 
 #[cfg(test)]
@@ -825,6 +827,69 @@ mod cmp_tests {
         std::sync::LazyLock::new(preserve::preserve_none);
     static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
         std::sync::LazyLock::new(preserve::preserve_all);
+
+    #[tokio::test]
+    async fn reports_child_errors_from_enumeration_and_final_join() -> Result<()> {
+        let mut children = ChildComparisons::new(false, |_| {});
+        let first = children
+            .tasks
+            .spawn(async { anyhow::bail!("first child failed") });
+        let (release, wait) = tokio::sync::oneshot::channel();
+        children.tasks.spawn(async {
+            wait.await?;
+            anyhow::bail!("second child failed")
+        });
+        while !first.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut summary = Summary::default();
+        children.drain_ready(&mut summary)?;
+        assert_eq!(children.tasks.len(), 1);
+        release
+            .send(())
+            .expect("second child must still be waiting");
+        let error = children.finish(summary).await.err().expect("child errors");
+        let message = error.to_string();
+        assert!(message.contains("first child failed"), "{message}");
+        assert!(message.contains("second child failed"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_early_preserves_the_child_error_and_releases_a_blocked_sibling() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut children = ChildComparisons::new(true, |_| {});
+            let (started, running) = tokio::sync::oneshot::channel();
+            let (mut release, wait) = tokio::sync::oneshot::channel::<()>();
+            children.tasks.spawn(async move {
+                let _ = started.send(());
+                wait.await?;
+                Ok(Summary::default())
+            });
+            running.await?;
+            let failed = children.tasks.spawn(async {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    .context("could not compare the child")
+            });
+            while !failed.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let error = children
+                .drain_ready(&mut Summary::default())
+                .expect_err("fail-early must return the completed child error");
+            assert_eq!(error.to_string(), "could not compare the child");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+                Some(std::io::ErrorKind::PermissionDenied)
+            );
+            assert!(!release.is_closed());
+            drop(children);
+            release.closed().await;
+            anyhow::Ok(())
+        })
+        .await
+        .context("the sibling should be released when the comparison stops")?
+    }
 
     async fn setup_test_dirs(preserve: bool) -> Result<testutils::TestDir> {
         let tmp_dir = testutils::setup_test_dir().await?;
