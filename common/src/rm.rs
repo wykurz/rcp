@@ -606,11 +606,16 @@ impl WalkVisitor for RmVisitor {
         }
         // the filter decision depends only on path plus directory-vs-nondirectory. Every kind this
         // branch accepts has the same nondirectory decision, while unlinkat without AT_REMOVEDIR
-        // cannot remove a directory swapped into the name. Keep the classified handle for exact
-        // metadata/time/accounting, then perform the single fd-relative removal without opening a
-        // second PendingMeta descriptor. A same-class final-component replacement remains contained
-        // to the held parent, matching the documented best-effort residual.
+        // cannot remove a directory swapped into the name. The classified handle gave the exact
+        // metadata, time and accounting above; the removal is a single fd-relative unlink by name
+        // and opens no second PendingMeta descriptor. A same-class final-component replacement
+        // remains contained to the held parent, matching the documented best-effort residual.
         //
+        // the handle is closed before the unlink and only the admission is kept. The unlink never
+        // used it, and a file whose name goes while a descriptor is open on it is not removed by a
+        // network filesystem client: NFS renames it to `.nfsXXXX` and removes it at the close, three
+        // requests where one does, two of them under the directory's lock.
+        let _admission = leaf.into_permit();
         // unlink_at never follows a symlink and is resolved relative to the parent dir fd, so it
         // cannot be redirected outside the tree.
         // gated on the Destination side to match the side the path-based rm used for remove_file.
@@ -1005,6 +1010,70 @@ mod tests {
             assert!(!nested.try_exists()?);
             assert!(!root.path().join("good").try_exists()?);
         }
+        Ok(())
+    }
+
+    /// The descriptors of this process that refer to `path`, as `/proc` names them.
+    fn descriptors_on(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            // the descriptor that lists the directory is gone by the time it is looked at
+            if std::fs::read_link(entry.path()).is_ok_and(|target| target == path) {
+                found.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(found)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_classified_file_is_unlinked_after_its_handle_is_closed() -> anyhow::Result<()> {
+        // a network filesystem client keeps a file whose name is removed while it is still open:
+        // NFS renames it to .nfsXXXX and removes it at the close, three requests where one does
+        static FIXTURE_PROGRESS: std::sync::LazyLock<progress::Progress> =
+            std::sync::LazyLock::new(progress::Progress::new);
+        let root = tempfile::tempdir()?;
+        let directory = root.path().canonicalize()?;
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"abc")?;
+        let mut gate = testutils::BlockingPathGate::install(victim.join(".rcp-unlink"));
+        let parent =
+            Arc::new(Dir::open_root_dir(&directory, false, congestion::Side::Source).await?);
+        let cx = EntryCx::root(
+            Arc::clone(&parent),
+            OsStr::new("tree").to_owned(),
+            directory.clone(),
+            &FIXTURE_PROGRESS,
+        );
+        // without the snapshot path every entry is classified through a handle, as it is under a
+        // filter, in a pruning copy, and for an entry whose listing names no type
+        let visitor = Arc::new(RmVisitor {
+            protection: None,
+            prog_track: &FIXTURE_PROGRESS,
+            use_leaf_snapshot: false,
+            settings: Settings {
+                fail_early: false,
+                dry_run: None,
+                filter: None,
+                time_filter: None,
+            },
+        });
+        let entries = vec![(std::ffi::OsString::from("victim"), None)];
+        let removal = tokio::spawn(async move {
+            crate::walk_driver::walk_dir_entries(visitor, parent, &cx, &(), entries).await
+        });
+        // the blocking job now waits immediately before its unlinkat
+        gate.wait_started().await?;
+        let open = descriptors_on(&victim)?;
+        gate.release_all();
+        let (summary, _) = removal.await?.map_err(|error| error.source)?;
+        assert_eq!(
+            open,
+            Vec::<String>::new(),
+            "descriptors still open on the file when it was unlinked"
+        );
+        assert_eq!((summary.files_removed, summary.bytes_removed), (1, 3));
+        assert!(!victim.try_exists()?);
         Ok(())
     }
 
