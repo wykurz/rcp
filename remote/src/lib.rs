@@ -3130,9 +3130,15 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("invalid IP address: {}", ip_str))?;
         match ip {
-            std::net::IpAddr::V4(ipv4) => {
+            std::net::IpAddr::V4(ipv4) if !ipv4.is_unspecified() => {
                 tracing::debug!("using explicit bind IP: {}", ipv4);
                 return Ok(std::net::IpAddr::V4(ipv4));
+            }
+            std::net::IpAddr::V4(_) => {
+                // wildcard 0.0.0.0 binds all interfaces, so advertise an auto-detected concrete IP
+                tracing::debug!(
+                    "explicit bind IP is wildcard 0.0.0.0; auto-detecting concrete IPv4 address"
+                );
             }
             std::net::IpAddr::V6(_) => {
                 anyhow::bail!(
@@ -6460,6 +6466,48 @@ mod tests {
         assert_eq!(
             ip,
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_with_wildcard_resolves_concrete_ipv4() {
+        let ip = get_local_ip(Some("0.0.0.0"))
+            .expect("wildcard bind IP must resolve to a concrete IPv4 address");
+        assert!(ip.is_ipv4(), "expected IPv4 address, got {ip}");
+        assert!(
+            !ip.is_unspecified(),
+            "wildcard bind IP must not advertise unspecified address 0.0.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_tcp_listener_addr_advertises_concrete_ip_for_wildcard_bind() {
+        let config = TcpConfig::default();
+        let control_listener = create_tcp_control_listener(&config, Some("0.0.0.0"))
+            .await
+            .expect("control listener must bind 0.0.0.0");
+        let data_listener = create_tcp_data_listener(&config, Some("0.0.0.0"))
+            .await
+            .expect("data listener must bind 0.0.0.0");
+        assert!(
+            control_listener.local_addr().unwrap().ip().is_unspecified(),
+            "wildcard bind must preserve 0.0.0.0 socket binding on control listener"
+        );
+        assert!(
+            data_listener.local_addr().unwrap().ip().is_unspecified(),
+            "wildcard bind must preserve 0.0.0.0 socket binding on data listener"
+        );
+        let control_addr = get_tcp_listener_addr(&control_listener, Some("0.0.0.0"))
+            .expect("control listener address resolution must succeed");
+        let data_addr = get_tcp_listener_addr(&data_listener, Some("0.0.0.0"))
+            .expect("data listener address resolution must succeed");
+        assert!(
+            !control_addr.ip().is_unspecified(),
+            "advertised control addr must be concrete, got {control_addr}"
+        );
+        assert!(
+            !data_addr.ip().is_unspecified(),
+            "advertised data addr must be concrete, got {data_addr}"
         );
     }
 

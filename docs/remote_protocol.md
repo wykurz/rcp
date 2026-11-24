@@ -981,17 +981,21 @@ operation or protocol failures remain the primary error; teardown still drains t
 Optional `RcpdToMaster::Tracing` frames are serialized and checked against the framing codec's
 maximum frame length before reaching the shared stdout sink; an oversized or unserializable trace is
 discarded with a best-effort `stderr` note rather than closing the control channel, while real
-transport errors remain fatal. Once `RcpdResult` has been acknowledged by the stdout writer, the
-daemon closes message admission on both channels and drains already-accepted trailing traces for up
-to five seconds before closing the SSH stdout descriptor. Live tracing/progress producers do not
-keep this drain open. A frame already being sent completes before the writer handles shutdown; it is
-never cancelled and restarted on the same stream. A transport failure ends forwarding, and grace
-expiry or caller cancellation aborts the owned writer rather than detaching it. Forwarding remains
-best effort: a failed or stalled peer can lose remaining output, and these failures do not replace
-the operation result. If the master was lost or `RcpdResult` delivery failed, the daemon aborts the
-stdout writer immediately instead of running the drain grace so an unacknowledged result cannot
-flush after the daemon decides to fail. The master keeps its stdout demux tasks alive while waiting
-for daemon exit, then gives them their existing final drain grace.
+transport errors remain fatal. Once `RcpdResult` has been acknowledged by the stdout writer — or on
+a non-timeout pre-result exit such as pre-hello `stdin` EOF where no `RcpdResult` was queued — the
+daemon closes message admission on both channels and drains already-accepted trailing traces and
+startup notices for up to five seconds before closing the SSH stdout descriptor. Live
+tracing/progress producers do not keep this drain open. A frame already being sent completes before
+the writer handles shutdown; it is never cancelled and restarted on the same stream. A transport
+failure ends forwarding, and grace expiry or caller cancellation aborts the owned writer rather than
+detaching it. Forwarding remains best effort: a failed or stalled peer can lose remaining output,
+and these failures do not replace the operation result. On a keepalive timeout or failed
+`RcpdResult` delivery, the daemon stops the stdout writer immediately instead of running the drain
+grace, and the writer skips any queued control frame whose acknowledgement receiver has already been
+dropped; if a write had already begun on another worker, aborting the writer cannot retract bytes
+already accepted by the OS, and the master still requires a successful daemon exit status alongside
+successful wire results. The master keeps its stdout demux tasks alive while waiting for daemon
+exit, then gives them their existing final drain grace.
 
 **rcpd Lifecycle Management:**
 

@@ -695,6 +695,120 @@ fn test_remote_direct_rcpd_exits_when_master_stdin_heartbeats_stop() {
     });
 }
 
+#[test]
+fn test_remote_direct_rcpd_drains_chrome_trace_notice_on_pre_hello_eof_under_backpressure() {
+    use std::io::{BufRead, Read, Write};
+    use std::os::fd::AsRawFd;
+    let temp = tempfile::tempdir().unwrap();
+    let trace_prefix = temp.path().join("chrome-trace");
+    let (mut stdout_read, mut stdout_write) = std::io::pipe().unwrap();
+    // fill the stdout pipe until full so rcpd's stdout writer blocks on backpressure
+    let write_fd = stdout_write.as_raw_fd();
+    let orig_flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+    assert!(orig_flags >= 0, "F_GETFL failed");
+    assert_eq!(
+        unsafe { libc::fcntl(write_fd, libc::F_SETFL, orig_flags | libc::O_NONBLOCK) },
+        0,
+        "F_SETFL O_NONBLOCK failed"
+    );
+    let pad_chunk = [0u8; 4096];
+    let mut pad_bytes = 0usize;
+    loop {
+        match stdout_write.write(&pad_chunk) {
+            Ok(0) => break,
+            Ok(n) => pad_bytes += n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("unexpected error pre-filling stdout pipe: {err}"),
+        }
+    }
+    assert!(pad_bytes > 0, "pipe must hold pre-filled padding bytes");
+    assert_eq!(
+        unsafe { libc::fcntl(write_fd, libc::F_SETFL, orig_flags) },
+        0,
+        "restoring blocking mode on stdout pipe failed"
+    );
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcpd"))
+        .args([
+            "--role=source",
+            &format!("--chrome-trace={}", trace_prefix.display()),
+            "--remote-keepalive-sec=15",
+            "--remote-copy-conn-timeout-sec=15",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(stdout_write))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rcpd must start with --chrome-trace");
+    let stderr = child.stderr.take().expect("rcpd stderr must be piped");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = line_tx.send(line);
+        // keep draining stderr so rcpd never blocks on stderr writes
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    let first_stderr = line_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("rcpd must announce readiness");
+    assert!(
+        first_stderr.starts_with("RCP_READY "),
+        "unexpected readiness line: {first_stderr:?}"
+    );
+    // close stdin before MasterHello while stdout is still full (simulating destination failure)
+    drop(child.stdin.take());
+    // keep stdout non-writable briefly, then resume reading well inside the 5s trace drain grace
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut pad_discard = vec![0u8; pad_bytes];
+    stdout_read
+        .read_exact(&mut pad_discard)
+        .expect("must drain pre-filled padding bytes");
+    let mut framed_bytes = Vec::new();
+    stdout_read
+        .read_to_end(&mut framed_bytes)
+        .expect("must read drained rcpd stdout frames");
+    let status = child.wait().expect("rcpd must exit after pre-hello EOF");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "rcpd should exit with code 1 after pre-hello EOF: {status:?}"
+    );
+    assert!(
+        !framed_bytes.is_empty(),
+        "pre-hello EOF must drain queued Chrome trace notice when stdout becomes writable"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let notices = rt.block_on(async {
+        let mut stream = remote::streams::RecvStream::new(std::io::Cursor::new(framed_bytes));
+        let mut messages = Vec::new();
+        while let Some(frame) = stream
+            .recv_object::<remote::protocol::RcpdToMaster>()
+            .await
+            .expect("rcpd stdout must contain only valid binary RcpdToMaster frames")
+        {
+            match frame {
+                remote::protocol::RcpdToMaster::Tracing(
+                    common::remote_tracing::TracingMessage::Log { message, .. },
+                ) => messages.push(message),
+                remote::protocol::RcpdToMaster::Tracing(_) => {}
+                other => panic!("unexpected non-tracing frame before MasterHello: {other:?}"),
+            }
+        }
+        messages
+    });
+    assert!(
+        notices
+            .iter()
+            .any(|msg| msg.contains("Chrome trace will be written to:")),
+        "expected Chrome trace startup notice after pre-hello EOF drain, got: {notices:?}"
+    );
+}
+
 /// Test that --help output is generated without errors
 #[test]
 fn test_help_runs() {
