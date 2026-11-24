@@ -814,6 +814,8 @@ async fn link_inner(
     let update_ref = update_parent
         .as_ref()
         .map(|(dir, name)| (dir, name.as_os_str()));
+    // share settings and their compiled filters across all child tasks
+    let settings = Arc::new(settings.clone());
     link_internal(
         prog_track,
         &src_parent,
@@ -825,7 +827,7 @@ async fn link_inner(
         update.as_deref(),
         std::path::Path::new(""),
         update_root_requirement,
-        settings,
+        &settings,
         is_fresh,
         admission,
         copy::DestinationContext::for_operand(src, update.as_deref(), dst)
@@ -1103,7 +1105,7 @@ async fn link_internal(
     update_root: Option<&std::path::Path>,
     rel_path: &std::path::Path,
     update_root_requirement: UpdateRootRequirement,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     is_fresh: bool,
     admission: LinkEntryAdmission,
     mut destination: copy::DestinationContext,
@@ -1633,7 +1635,7 @@ async fn link_dir_entry(
     src_path: &std::path::Path,
     dst_path: &std::path::Path,
     update_path: Option<&std::path::Path>,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     is_fresh: bool,
     destination: copy::DestinationContext,
 ) -> Result<Summary, Error> {
@@ -1897,7 +1899,7 @@ async fn process_update_only_entry(
     dst_root: std::path::PathBuf,
     entry_rel: std::path::PathBuf,
     destination: copy::DestinationContext,
-    settings: Settings,
+    settings: &Settings,
     is_fresh: bool,
     admission: EntryAdmission,
 ) -> Result<LinkTaskResult, Error> {
@@ -1965,7 +1967,7 @@ async fn process_update_only_entry(
         &dst_root,
         &entry_rel,
         destination.with_input_role(safedir::overlap::InputRole::Update),
-        &settings,
+        settings,
         is_fresh,
         entry,
     )
@@ -2084,7 +2086,7 @@ async fn link_dir_contents_prepared(
     we_created_this_dir: bool,
     is_fresh: bool,
     reused_lock: Option<crate::safedir::ReusedDirLock>,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     base: Summary,
     source_entries: SourceEntries,
     update_entries: UpdateEntries,
@@ -2148,7 +2150,7 @@ async fn link_dir_contents_prepared(
             let src_parent = Arc::clone(src_dir);
             let dst_parent = dst_dir.map(Arc::clone);
             let update_parent = update_dir.map(Arc::clone);
-            let settings = settings.clone();
+            let settings = Arc::clone(settings);
             let src_root = src_root.to_owned();
             let dst_root = dst_root.to_owned();
             let update_root = update_root.map(std::path::Path::to_path_buf);
@@ -2237,7 +2239,7 @@ async fn link_dir_contents_prepared(
                 let dst_root = dst_root.to_path_buf();
                 let update_parent = Arc::clone(update_dir);
                 let dst_parent = dst_dir.map(Arc::clone);
-                let settings = settings.clone();
+                let settings = Arc::clone(settings);
                 let destination = destination.child();
                 let source_for_delete = (settings.copy_settings.delete.is_some()
                     && !settings.update_exclusive)
@@ -2298,7 +2300,7 @@ async fn link_dir_contents_prepared(
                         dst_root,
                         entry_rel,
                         destination,
-                        settings,
+                        &settings,
                         is_fresh,
                         admission,
                     )
@@ -2523,6 +2525,7 @@ async fn link_dir_contents(
     let destination = copy::destination::test_prepared(destination, dst_dir, preview_dir)
         .await
         .map_err(|error| Error::new(error, base))?;
+    let settings = Arc::new(settings.clone());
     link_dir_contents_prepared(
         prog_track,
         src_dir,
@@ -2540,7 +2543,7 @@ async fn link_dir_contents(
         we_created_this_dir,
         is_fresh,
         reused_lock,
-        settings,
+        &settings,
         base,
         source_entries,
         update_entries,
@@ -2971,6 +2974,7 @@ mod link_tests {
         let mut settings = common_settings(false, false);
         settings.filter = Some(filter.clone());
         settings.copy_settings.filter = Some(filter);
+        let settings = Arc::new(settings);
         // admission chooses the held parent, independently of the adapter's display-path parent
         let summary = link_internal(
             &PROGRESS,
@@ -3305,6 +3309,7 @@ mod link_tests {
         let dir = Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Source).await?);
         let source = root.join("missing-source");
         let destination = std::path::Path::new("/");
+        let settings = Arc::new(common_settings(false, false));
         let result = link_internal(
             &PROGRESS,
             &dir,
@@ -3316,7 +3321,7 @@ mod link_tests {
             None,
             std::path::Path::new(""),
             UpdateRootRequirement::Optional,
-            &common_settings(false, false),
+            &settings,
             false,
             EntryAdmission::RootOrDelegated.into(),
             copy::DestinationContext::new(destination),
@@ -4558,6 +4563,7 @@ mod link_tests {
             tokio::fs::write(update.join("replacement.txt"), "UNSELECTED").await?;
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter);
+            let settings = Arc::new(settings);
 
             let result = run_with_open_file_cleanup(
                 &admission_limits,
@@ -4642,6 +4648,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
+            let settings = Arc::new(settings);
 
             run_with_open_file_cleanup(
                 &admission_limits,
@@ -4707,6 +4714,7 @@ mod link_tests {
 
             tokio::fs::remove_file(&update).await?;
             tokio::fs::write(&update, "REPLACEMENT-CONTENT").await?;
+            let settings = Arc::new(common_settings(false, false));
             run_with_open_file_cleanup(
                 &admission_limits,
                 link_internal(
@@ -4720,7 +4728,7 @@ mod link_tests {
                     Some(&update),
                     std::path::Path::new(""),
                     UpdateRootRequirement::Optional,
-                    &common_settings(false, false),
+                    &settings,
                     false,
                     LinkEntryAdmission::Filtered(entry),
                     copy::DestinationContext::new(&dst),
@@ -4846,6 +4854,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
+            let settings = Arc::new(settings);
             let delete_settings = copy::DeleteSettings {
                 delete_excluded: true,
             };
@@ -4919,6 +4928,7 @@ mod link_tests {
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             settings.copy_settings.delete = Some(delete_settings.clone());
+            let settings = Arc::new(settings);
             let decision = select_source_for_dispatch(
                 Some(EntryKind::Dir),
                 std::path::Path::new("node"),
@@ -4999,6 +5009,7 @@ mod link_tests {
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            let settings = Arc::new(settings);
             let decision = select_source_for_dispatch(
                 Some(EntryKind::Dir),
                 std::path::Path::new("node"),
@@ -5067,6 +5078,7 @@ mod link_tests {
             let mut settings = common_settings(false, true);
             settings.copy_settings.skip_specials = true;
             settings.copy_settings.delete = Some(delete_settings.clone());
+            let settings = Arc::new(settings);
             let decision = select_source_for_dispatch(
                 Some(EntryKind::Special),
                 std::path::Path::new("node"),
@@ -7146,6 +7158,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
+            let settings = Arc::new(settings);
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(1),
@@ -7200,6 +7213,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
+            let settings = Arc::new(settings);
 
             let operation = link_internal(
                 &PROGRESS,
@@ -7356,6 +7370,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
+            let settings = Arc::new(settings);
             admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
@@ -7430,6 +7445,7 @@ mod link_tests {
             let dst_entry = dst_root.join("entry");
             let task_dst_entry = dst_entry.clone();
             let mut task = tokio::spawn(async move {
+                let settings = Arc::new(common_settings(false, false));
                 link_internal(
                     &PROGRESS,
                     &src_parent,
@@ -7441,7 +7457,7 @@ mod link_tests {
                     None,
                     std::path::Path::new(""),
                     UpdateRootRequirement::Optional,
-                    &common_settings(false, false),
+                    &settings,
                     true,
                     EntryAdmission::from(permit).into(),
                     copy::DestinationContext::new(&task_dst_entry),
