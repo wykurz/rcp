@@ -1,4 +1,3 @@
-use anyhow::Context as _;
 use chrono::TimeZone;
 // re-export RcpdType from common to avoid duplication
 pub use common::RcpdType;
@@ -13,109 +12,71 @@ pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::Ser
     PROGRESS_MAP.lock().unwrap().clone()
 }
 
-/// Sends tracing messages from rcpd to the master process over the TCP stream.
-///
-/// Shutdown closes message admission and drains the accepted queue, even when producers retain
-/// sender clones. An in-flight frame finishes before shutdown is observed. The owner must bound
-/// this drain and abort the task on timeout; dropping an interrupted send also discards its stream.
-pub async fn run_sender<W: tokio::io::AsyncWrite + Unpin + Send>(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
-    mut send_stream: crate::streams::SendStream<W>,
-    cancellation_token: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
-    loop {
-        let message = tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled(), if !receiver.is_closed() => {
-                receiver.close();
-                continue;
-            }
-            message = receiver.recv() => message,
-        };
-        let Some(message) = message else { break };
-        send_stream
-            .send_batch_message(&message)
-            .await
-            .context("failed to forward tracing message")?;
-    }
-    send_stream
-        .close()
-        .await
-        .context("failed to close tracing stream")?;
-    println!("Remote tracing sender done, no more messages to send");
-    Ok(())
-}
-
-pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin + Send>(
-    mut recv_stream: crate::streams::RecvStream<R>,
+/// Dispatch one forwarded tracing or progress message received from a remote `rcpd`.
+pub(crate) fn dispatch_message(
+    tracing_message: common::remote_tracing::TracingMessage,
     rcpd_type: RcpdType,
-) -> anyhow::Result<()> {
-    while let Some(tracing_message) = recv_stream
-        .recv_object::<common::remote_tracing::TracingMessage>()
-        .await?
-    {
-        match tracing_message {
-            common::remote_tracing::TracingMessage::Log {
-                timestamp,
-                level,
-                target,
-                message,
-            } => {
-                let log_level = match level.as_str() {
-                    "ERROR" => tracing::Level::ERROR,
-                    "WARN" => tracing::Level::WARN,
-                    "INFO" => tracing::Level::INFO,
-                    "DEBUG" => tracing::Level::DEBUG,
-                    "TRACE" => tracing::Level::TRACE,
-                    _ => tracing::Level::INFO,
-                };
-                let remote_target = format!("remote::{rcpd_type}::{target}");
-                let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
-                    Ok(duration) => {
-                        let datetime = chrono::Local
-                            .timestamp_opt(duration.as_secs() as i64, duration.subsec_nanos());
-                        match datetime.single() {
-                            Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                            None => format!("{timestamp:?}"),
-                        }
-                    }
-                    Err(_) => format!("{timestamp:?}"),
-                };
-                match log_level {
-                    tracing::Level::ERROR => {
-                        tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
-                    }
-                    // A forwarded NOTICE keeps its own target instead of the blanket `remote` one.
-                    // Re-emitting it as `remote` would hand it to the master's filter, which at the
-                    // default verbosity passes only `error` and `rcp::notice` — so the notice would
-                    // survive the rcpd's filter, cross the wire, and then be dropped one step from
-                    // the user. That is the exact gap the dedicated target exists to close, and it
-                    // is invisible unless a test runs a real remote copy. The `remote::<role>::`
-                    // provenance stays in the message text, as for every other forwarded line.
-                    tracing::Level::WARN if target == common::NOTICE_TARGET => {
-                        tracing::warn!(target: common::NOTICE_TARGET, "[{}] {}: {}", timestamp_str, remote_target, message)
-                    }
-                    tracing::Level::WARN => {
-                        tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
-                    }
-                    tracing::Level::INFO => {
-                        tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
-                    }
-                    tracing::Level::DEBUG => {
-                        tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
-                    }
-                    tracing::Level::TRACE => {
-                        tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+) {
+    match tracing_message {
+        common::remote_tracing::TracingMessage::Log {
+            timestamp,
+            level,
+            target,
+            message,
+        } => {
+            let log_level = match level.as_str() {
+                "ERROR" => tracing::Level::ERROR,
+                "WARN" => tracing::Level::WARN,
+                "INFO" => tracing::Level::INFO,
+                "DEBUG" => tracing::Level::DEBUG,
+                "TRACE" => tracing::Level::TRACE,
+                _ => tracing::Level::INFO,
+            };
+            let remote_target = format!("remote::{rcpd_type}::{target}");
+            let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => {
+                    let datetime = chrono::Local
+                        .timestamp_opt(duration.as_secs() as i64, duration.subsec_nanos());
+                    match datetime.single() {
+                        Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        None => format!("{timestamp:?}"),
                     }
                 }
-            }
-            common::remote_tracing::TracingMessage::Progress(progress) => {
-                tracing::debug!(target: "remote", "Received progress update from {} rcpd: {:?}", rcpd_type, progress);
-                PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress;
+                Err(_) => format!("{timestamp:?}"),
+            };
+            match log_level {
+                tracing::Level::ERROR => {
+                    tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
+                // A forwarded NOTICE keeps its own target instead of the blanket `remote` one.
+                // Re-emitting it as `remote` would hand it to the master's filter, which at the
+                // default verbosity passes only `error` and `rcp::notice` — so the notice would
+                // survive the rcpd's filter, cross the wire, and then be dropped one step from
+                // the user. That is the exact gap the dedicated target exists to close, and it
+                // is invisible unless a test runs a real remote copy. The `remote::<role>::`
+                // provenance stays in the message text, as for every other forwarded line.
+                tracing::Level::WARN if target == common::NOTICE_TARGET => {
+                    tracing::warn!(target: common::NOTICE_TARGET, "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
+                tracing::Level::WARN => {
+                    tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
+                tracing::Level::INFO => {
+                    tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
+                tracing::Level::DEBUG => {
+                    tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
+                tracing::Level::TRACE => {
+                    tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                }
             }
         }
+        common::remote_tracing::TracingMessage::Progress(progress) => {
+            tracing::debug!(target: "remote", "Received progress update from {} rcpd: {:?}", rcpd_type, progress);
+            PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress;
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

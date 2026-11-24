@@ -57,6 +57,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Move `rcp` master↔`rcpd` control and tracing communication onto the existing SSH exec channel's
+  `stdin`/`stdout` pipes instead of opening master-facing TCP/TLS listeners on each remote host.
+  `--remote-keepalive-sec` now drives OpenSSH `ServerAlive` probing and periodic `stdin` heartbeats
+  for master↔daemon liveness alongside Source↔Destination TCP keepalive. Advance the remote
+  compatibility revision to 13 (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), requiring matching
+  `rcp`/`rcpd` binaries.
 - Speed up filtered `rlink` runs by sharing settings and compiled include and exclude patterns
   across workers. This applies to both fresh hard-link trees and incremental snapshots built with
   `--update`.

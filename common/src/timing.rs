@@ -413,7 +413,11 @@ impl TimingGuard {
 impl Drop for TimingGuard {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
-            eprintln!("Failed to write scoped timings: {error:#}");
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Failed to write scoped timings: {error:#}"
+            );
         }
     }
 }

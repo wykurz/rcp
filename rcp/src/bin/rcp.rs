@@ -239,7 +239,7 @@ struct Args {
     common: common::cli::CommonArgs,
 
     // Remote copy options
-    /// IP address to bind the master TCP server to
+    /// IP address to bind the source TCP server to
     ///
     /// By default, the best available network interface is automatically selected.
     /// Use this option to explicitly bind to a specific IP address (e.g., "192.168.1.5").
@@ -261,9 +261,9 @@ struct Args {
     /// Connection timeout for remote setup and copy operations in seconds
     ///
     /// Applies to: remote SSH setup, binary discovery, tilde-expansion HOME lookup, rcpd version
-    /// probes, deployment readiness/write-idle periods, daemon readiness, rcpd→master connection,
-    /// and destination→source connection. It does not cap total deployment transfer time;
-    /// post-transfer verification gets at least 60 seconds. Must be at least 1.
+    /// probes, deployment readiness/write-idle periods, daemon readiness, and destination→source
+    /// connection. It does not cap total deployment transfer time; post-transfer verification gets
+    /// at least 60 seconds. Must be at least 1.
     /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
     /// for sequential binary deployment to multiple hosts).
     #[arg(
@@ -276,15 +276,17 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
-    /// Liveness budget for every rcp TCP connection in seconds (0 disables)
+    /// Liveness budget for remote connections in seconds (0 disables)
     ///
     /// A peer whose host vanishes (power loss, severed link, destroyed VM) sends neither FIN
-    /// nor RST, so a copy waiting on it would otherwise hang forever. Every connection is probed
-    /// when idle (TCP keepalive); control connections additionally bound unacknowledged data
-    /// (TCP_USER_TIMEOUT). The bulk data connections deliberately do not, because a throttled
-    /// receiver legitimately stops reading mid-file — so a host that vanishes mid-transfer is
-    /// still only detected by the kernel's retransmission limit (~15 min). Widen it on a flaky
-    /// WAN; a stall shorter than the budget is survived untouched. Propagated to both rcpds.
+    /// nor RST, so a copy waiting on it would otherwise hang forever. Master↔rcpd SSH sessions
+    /// enforce this budget via OpenSSH ServerAlive probes and periodic stdin heartbeats.
+    /// Source↔Destination TCP connections probe when idle (TCP keepalive); the control connection
+    /// additionally bounds unacknowledged data (TCP_USER_TIMEOUT). The bulk data connections
+    /// deliberately do not, because a throttled receiver legitimately stops reading mid-file — so
+    /// a host that vanishes mid-transfer is still only detected by the kernel's retransmission
+    /// limit (~15 min). Widen it on a flaky WAN; a stall shorter than the budget is survived
+    /// untouched. Propagated to both rcpds.
     #[arg(
         long,
         value_name = "N",
@@ -376,13 +378,14 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
-    /// Disable TLS encryption and authentication for remote copy operations
+    /// Disable TLS encryption and authentication for source↔destination TCP connections
     ///
-    /// By default, remote copy connections use mutual TLS for authentication and encryption.
-    /// This flag disables BOTH encryption AND authentication on ALL rcp TCP connections
-    /// (master<->rcpd control and tracing, plus source<->destination control and data).
-    /// WARNING: all traffic is sent in plaintext and every rcpd listener accepts connections
-    /// from anyone who can reach its port. Only use on isolated, trusted networks.
+    /// By default, source↔destination TCP connections use mutual TLS for authentication and
+    /// encryption, while master↔rcpd control and tracing run over SSH. This flag disables BOTH
+    /// encryption AND authentication on source↔destination TCP connections (control and data).
+    /// WARNING: file data and control traffic between source and destination are sent in plaintext
+    /// and the source listener accepts connections from anyone who can reach its port. Only use on
+    /// isolated, trusted networks.
     #[arg(long, help_heading = "Remote copy options")]
     no_encryption: bool,
 
@@ -503,13 +506,14 @@ fn extract_bind_ip_from_host(host: &str) -> Option<String> {
 
 /// The diagnostic for an `rcpd` whose connection FAILED before it said what happened.
 ///
-/// A dying `rcpd` reaches the master two different ways, and which one is not something the master
-/// controls: the kernel delivers an RST if the socket's receive queue was non-empty when the process
-/// died, and a clean EOF if it was not. Those surface as `Err` and `Ok(None)` respectively — the same
-/// event wearing two shapes — and both mean the same thing to the user, so both are reported the same
-/// way: as what the master did not receive rather than how the connection ended. This is the `Err`
-/// half, which keeps its transport error in the chain underneath. See [`rcpd_closed_quietly`] for the
-/// other.
+/// User-facing explanation for a failed read from a remote `rcpd`'s SSH stdout control stream.
+///
+/// A dying `rcpd` or severed SSH channel can end the master's stdout demux two ways: a framing or
+/// transport `Err` (truncated frame, pipe error) or a clean `Ok(None)` EOF (daemon exited/killed or
+/// SSH mux closed cleanly). Both mean the daemon did not deliver the expected control message, so
+/// both are reported in terms of what the master did not receive. This is the `Err` half, which
+/// keeps its underlying transport/framing error in the chain. See [`rcpd_closed_quietly`] for the
+/// clean-EOF half.
 fn rcpd_went_quiet(role: &str, host: &str, expected: &str) -> String {
     format!(
         "{role} rcpd on '{host}' did not {expected} (the process likely died - check the remote \
@@ -517,26 +521,20 @@ fn rcpd_went_quiet(role: &str, host: &str, expected: &str) -> String {
     )
 }
 
-/// The [`rcpd_went_quiet`] situation reached through a clean end-of-stream instead: the peer's
-/// control connection closed with nothing left to read, so there is no transport error to report.
+/// The [`rcpd_went_quiet`] situation reached through a clean end-of-stream instead: the daemon's
+/// SSH stdout closed cleanly with no further control frames, so there is no transport error.
 ///
-/// Distinct wording rather than a shared one, for two reasons. It points somewhere different — a
-/// connection that closed cleanly but silently means the peer *exited* without sending its message
-/// (a crash, an OOM kill, a `SIGKILL`), whereas a failed one can also mean the network went away. And
-/// it makes the branch observable: this is the `Ok(None)` that the master used to `.expect()`, which
-/// under `panic = "abort"` turned a diagnosable error into `SIGABRT` with its output discarded, so the
-/// regression test for it has to be able to tell the two branches apart.
+/// Distinct wording rather than a shared one, for two reasons. A clean silent close points at a
+/// daemon that exited or was killed (`SIGKILL`, OOM) or an SSH session torn down by `ServerAlive`
+/// without sending its message, whereas a read/decode error points at truncation or framing
+/// corruption. And it makes the branch observable: this is the `Ok(None)` that the master used to
+/// `.expect()`, which under `panic = "abort"` turned a diagnosable error into `SIGABRT` with its
+/// output discarded, so the regression test for it can tell the two branches apart.
 fn rcpd_closed_quietly(role: &str, host: &str, expected: &str) -> String {
     format!(
         "{role} rcpd on '{host}' closed its control connection cleanly but did not {expected} (the \
          process likely died - check the remote host for crashes or OOM kills)"
     )
-}
-
-#[derive(Debug)]
-struct MasterRemoteConfigs {
-    tcp: remote::TcpConfig,
-    rcpd: remote::protocol::RcpdConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -704,7 +702,6 @@ fn remote_buffer_size_for_host(size: u64, host_max: usize) -> anyhow::Result<usi
 fn build_master_remote_request(
     args: &Args,
     files_in_flight: common::ResolvedFilesInFlight,
-    master_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<MasterRemoteRequest> {
     let filter = common::filter::FilterSettings::from_args(
         args.filter_file.as_deref(),
@@ -837,7 +834,6 @@ fn build_master_remote_request(
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
         encryption: !args.no_encryption,
-        master_cert_fingerprint,
     };
     Ok(MasterRemoteRequest {
         tcp,
@@ -853,17 +849,16 @@ fn endpoint_config(
     request: &MasterRemoteRequest,
     files_in_flight: remote::protocol::RcpdFilesInFlight,
     concurrency: Option<remote::ResolvedRemoteConcurrency>,
-) -> MasterRemoteConfigs {
-    let tcp = request.tcp.clone();
+) -> remote::protocol::RcpdConfig {
     let mut rcpd = request.rcpd.clone();
     rcpd.files_in_flight = files_in_flight;
     if let Some(concurrency) = concurrency {
         rcpd.max_connections = concurrency.max_connections().get();
     }
-    MasterRemoteConfigs { tcp, rcpd }
+    rcpd
 }
 
-fn build_source_remote_config(request: &MasterRemoteRequest) -> MasterRemoteConfigs {
+fn build_source_remote_config(request: &MasterRemoteRequest) -> remote::protocol::RcpdConfig {
     match request.concurrency_policy {
         RemoteConcurrencyPolicy::MasterAuthoritative {
             files_in_flight,
@@ -883,8 +878,8 @@ fn build_source_remote_config(request: &MasterRemoteRequest) -> MasterRemoteConf
 
 fn build_destination_remote_config(
     request: &MasterRemoteRequest,
-    source: &remote::RcpdConnectionInfo,
-) -> anyhow::Result<MasterRemoteConfigs> {
+    source: &remote::RcpdReadiness,
+) -> anyhow::Result<remote::protocol::RcpdConfig> {
     let (concurrency, files_in_flight) = match request.concurrency_policy {
         RemoteConcurrencyPolicy::Automatic => {
             let concurrency = remote::resolve_remote_concurrency(
@@ -937,8 +932,8 @@ fn build_destination_remote_config(
 }
 
 fn validate_destination_readiness(
-    source: &remote::RcpdConnectionInfo,
-    destination: &remote::RcpdConnectionInfo,
+    source: &remote::RcpdReadiness,
+    destination: &remote::RcpdReadiness,
 ) -> anyhow::Result<()> {
     if destination.files_in_flight != source.files_in_flight
         || destination.max_connections != source.max_connections
@@ -954,15 +949,17 @@ fn validate_destination_readiness(
     Ok(())
 }
 
-fn spawn_tracing_receiver(
-    recv_stream: remote::streams::BoxedRecvStream,
-    rcpd_type: remote::tracelog::RcpdType,
-) -> remote::AbortOnDropTask<()> {
-    remote::AbortOnDropTask::new(tokio::spawn(async move {
-        if let Err(error) = remote::tracelog::run_receiver(recv_stream, rcpd_type).await {
-            tracing::debug!("{rcpd_type} tracing receiver ended: {error:#}");
-        }
-    }))
+fn validate_readiness_encryption(
+    role: &str,
+    expected_encryption: bool,
+    readiness: &remote::RcpdReadiness,
+) -> anyhow::Result<()> {
+    if readiness.fingerprint.is_some() != expected_encryption {
+        anyhow::bail!(
+            "TLS configuration mismatch: {role} rcpd and master must both use encryption or both disable it"
+        );
+    }
+    Ok(())
 }
 
 const TRACING_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1131,13 +1128,95 @@ fn remote_copy_operands(
     Ok(Some(operands))
 }
 
-#[instrument(skip(master_cert))]
+const PEER_FAILURE_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn decode_daemon_result(
+    result: anyhow::Result<Option<remote::protocol::RcpdResult>>,
+    role: &str,
+    host: &str,
+) -> anyhow::Result<remote::protocol::RcpdResult> {
+    let went_quiet = rcpd_went_quiet(role, host, "report a result");
+    let closed_quietly = rcpd_closed_quietly(role, host, "report a result");
+    result
+        .with_context(|| went_quiet)?
+        .ok_or_else(|| anyhow!(closed_quietly))
+}
+
+async fn await_daemon_results(
+    source_control_rx: &mut remote::stdio::MasterControlReceiver,
+    dest_control_rx: &mut remote::stdio::MasterControlReceiver,
+    source_stdin: &mut Option<remote::stdio::MasterStdinSender>,
+    source_host: &str,
+    dest_host: &str,
+) -> anyhow::Result<(remote::protocol::RcpdResult, remote::protocol::RcpdResult)> {
+    let source_fut = source_control_rx.recv_result();
+    let dest_fut = dest_control_rx.recv_result();
+    tokio::pin!(source_fut);
+    tokio::pin!(dest_fut);
+    tokio::select! {
+        src_res = &mut source_fut => {
+            let source_result = decode_daemon_result(src_res, "source", source_host)?;
+            let dest_result = decode_daemon_result(dest_fut.await, "destination", dest_host)?;
+            Ok((source_result, dest_result))
+        }
+        dst_res = &mut dest_fut => {
+            match decode_daemon_result(dst_res, "destination", dest_host) {
+                Ok(dest_result @ remote::protocol::RcpdResult::Success { .. }) => {
+                    let source_result = decode_daemon_result(source_fut.await, "source", source_host)?;
+                    Ok((source_result, dest_result))
+                }
+                Ok(dest_result @ remote::protocol::RcpdResult::Failure { .. }) => {
+                    // destination failed first: give an already-connected source a short grace to
+                    // observe TCP close and report its own summary/attribution, without stalling
+                    // for the full accept timeout if destination failed before connecting
+                    match tokio::time::timeout(PEER_FAILURE_RESULT_GRACE, &mut source_fut).await {
+                        Ok(src_res) => {
+                            let source_result = decode_daemon_result(src_res, "source", source_host)?;
+                            Ok((source_result, dest_result))
+                        }
+                        Err(_) => {
+                            if let Some(stdin) = source_stdin.take() {
+                                stdin.close().await;
+                            }
+                            let remote::protocol::RcpdResult::Failure { error, summary, .. } =
+                                dest_result
+                            else {
+                                unreachable!("matched Failure variant above");
+                            };
+                            // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
+                            tracing::error!("Destination rcpd failed: {error}");
+                            Err(common::copy::Error::new(
+                                anyhow!("rcpd operation(s) failed: Destination: {error}"),
+                                summary,
+                            )
+                            .into())
+                        }
+                    }
+                }
+                Err(dest_error) => {
+                    // destination died without reporting a result: give an already-connected
+                    // source a short grace to observe TCP close and log its attribution before
+                    // closing source stdin
+                    if tokio::time::timeout(PEER_FAILURE_RESULT_GRACE, &mut source_fut)
+                        .await
+                        .is_err()
+                        && let Some(stdin) = source_stdin.take()
+                    {
+                        stdin.close().await;
+                    }
+                    Err(dest_error)
+                }
+            }
+        }
+    }
+}
+
+#[instrument]
 async fn run_rcpd_master(
     args: &Args,
     preserve: &common::preserve::Settings,
     operands: &RemoteCopyOperands,
     request: MasterRemoteRequest,
-    master_cert: Option<remote::tls::CertifiedKey>,
     cleanup: &remote::RemoteCleanup,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
@@ -1146,8 +1225,8 @@ async fn run_rcpd_master(
     let mut teardown = RemoteTeardown::default();
     let source_config = build_source_remote_config(&request);
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
-    let same_session = src.session() == dst.session();
     let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
+    let keepalive_sec = request.tcp.keepalive_sec;
     let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
         src.session(),
         dst.session(),
@@ -1155,11 +1234,11 @@ async fn run_rcpd_master(
         args.auto_deploy_rcpd,
         cleanup,
         bootstrap_timeout,
+        keepalive_sec,
         &operands.local_operand_roots,
     )
     .await?;
-
-    let source_rcpd = {
+    let mut source_rcpd = {
         let _span = tracing::trace_span!(
             "start_rcpd",
             host = %src.session().host,
@@ -1168,122 +1247,54 @@ async fn run_rcpd_master(
         .entered();
         prepared_source
             .spawn(
-                &source_config.rcpd,
+                &source_config,
                 source_bind_ip.as_deref(),
                 remote::protocol::RcpdRole::Source,
             )
             .await?
     };
-    let source_conn_info = source_rcpd.conn_info.clone();
+    let source_readiness = source_rcpd.readiness.clone();
+    let source_stdio = source_rcpd.take_stdio();
     teardown.retain_process(source_rcpd);
-    tracing::info!(
-        "Source rcpd at {} (encryption={})",
-        source_conn_info.addr,
-        source_conn_info.fingerprint.is_some()
-    );
-    // helper to connect to an rcpd and wrap with TLS if needed
-    async fn connect_to_rcpd(
-        conn_info: &remote::RcpdConnectionInfo,
-        master_cert: Option<&remote::tls::CertifiedKey>,
-        tcp_config: &remote::TcpConfig,
-        purpose: &str,
-    ) -> anyhow::Result<(
-        remote::streams::BoxedSendStream,
-        remote::streams::BoxedRecvStream,
-    )> {
-        let timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
-        // this is the connection the master then awaits `RcpdResult` on, with no timeout of its
-        // own — the keepalive the connect helper configures is what stops a vanished rcpd host
-        // from hanging the master forever
-        let stream = remote::connect_tcp_control(conn_info.addr, tcp_config)
-            .await
-            .with_context(|| format!("connecting to rcpd for {purpose}"))?;
-        tracing::debug!("Connected to rcpd at {} for {}", conn_info.addr, purpose);
-        match (conn_info.fingerprint, master_cert) {
-            (Some(rcpd_fingerprint), Some(cert)) => {
-                // mutual TLS: master presents cert, verifies rcpd fingerprint
-                let tls_config =
-                    remote::tls::create_client_config_with_cert(cert, rcpd_fingerprint)
-                        .context("failed to create TLS client config with certificate")?;
-                let connector = tokio_rustls::TlsConnector::from(tls_config);
-                remote::tls::connect_bounded(
-                    Some(&connector),
-                    remote::tls::SERVER_NAME_RCPD,
-                    stream,
-                    timeout,
-                    purpose,
-                )
-                .await
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!(
-                    "TLS configuration mismatch: rcpd and master must both use encryption or both disable it"
-                );
-            }
-            (None, None) => {
-                // plain TCP (no encryption)
-                remote::tls::connect_bounded(
-                    None,
-                    remote::tls::SERVER_NAME_RCPD,
-                    stream,
-                    timeout,
-                    purpose,
-                )
-                .await
-            }
-        }
-    }
-    // connect to source rcpd (control + tracing)
-    tracing::info!("Connecting to source rcpd...");
-    let source_setup = async {
-        let (source_send_stream, source_recv_stream) = connect_to_rcpd(
-            &source_conn_info,
-            master_cert.as_ref(),
-            &source_config.tcp,
-            "source control",
-        )
-        .await?;
-        let (source_tracing_send, source_tracing_recv) = connect_to_rcpd(
-            &source_conn_info,
-            master_cert.as_ref(),
-            &source_config.tcp,
-            "source tracing",
-        )
-        .await?;
-        drop(source_tracing_send); // we only receive on tracing connection
-        anyhow::Ok((source_send_stream, source_recv_stream, source_tracing_recv))
-    }
-    .await;
-    let (mut source_send_stream, mut source_recv_stream, source_tracing_recv) = match source_setup {
-        Ok(setup) => setup,
+    let (source_stdin, source_stdout) = match source_stdio {
+        Ok(stdio) => stdio,
         Err(error) => {
             let _ = teardown.finish(false).await;
             return Err(error);
         }
     };
-    // start draining immediately. Source startup notices are already queued by this point and must
-    // remain visible even if any part of destination bring-up fails.
-    teardown.retain_tracing_receiver(
-        spawn_tracing_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source),
+    let mut source_stdin = Some(remote::stdio::MasterStdinSender::new(
+        source_stdin,
+        keepalive_sec,
+    ));
+    let (mut source_control_rx, source_stdout_demux) = remote::stdio::spawn_master_stdout_demux(
+        remote::streams::RecvStream::new(source_stdout),
         remote::tracelog::RcpdType::Source,
     );
-
+    // start draining immediately. Source startup notices are already queued by this point and must
+    // remain visible even if any part of destination bring-up fails.
+    teardown.retain_tracing_receiver(source_stdout_demux, remote::tracelog::RcpdType::Source);
+    tracing::info!(
+        "Source rcpd ready (encryption={})",
+        source_readiness.fingerprint.is_some()
+    );
+    let mut dest_stdin: Option<remote::stdio::MasterStdinSender> = None;
     let destination_setup = async {
-        let destination_config = build_destination_remote_config(&request, &source_conn_info)?;
+        validate_readiness_encryption("source", request.rcpd.encryption, &source_readiness)?;
+        let destination_config = build_destination_remote_config(&request, &source_readiness)?;
         if let Some(notice) = remote_stream_clamp_notice(
             request.concurrency_policy,
-            source_conn_info.files_in_flight,
+            source_readiness.files_in_flight,
             request.connection_ceiling,
-            source_conn_info.max_connections,
+            source_readiness.max_connections,
         ) {
             tracing::warn!(target: common::NOTICE_TARGET, "{notice}");
         }
         tracing::info!(
             "Effective remote connection count: {}",
-            source_conn_info.max_connections
+            source_readiness.max_connections
         );
-        let destination_bind_ip = same_session.then_some(source_bind_ip.as_deref()).flatten();
-        let destination_rcpd = {
+        let mut destination_rcpd = {
             let _span = tracing::trace_span!(
                 "start_rcpd",
                 host = %dst.session().host,
@@ -1292,72 +1303,69 @@ async fn run_rcpd_master(
             .entered();
             prepared_destination
                 .spawn(
-                    &destination_config.rcpd,
-                    destination_bind_ip,
+                    &destination_config,
+                    None,
                     remote::protocol::RcpdRole::Destination,
                 )
                 .await?
         };
-        let destination_conn_info = destination_rcpd.conn_info.clone();
-        // retain process ownership before validation or connection work introduces another exit.
+        let destination_readiness = destination_rcpd.readiness.clone();
+        let dest_stdio = destination_rcpd.take_stdio();
+        // retain process ownership before validation introduces another exit
         teardown.retain_process(destination_rcpd);
-        validate_destination_readiness(&source_conn_info, &destination_conn_info)?;
-        tracing::info!(
-            "Destination rcpd at {} (encryption={})",
-            destination_conn_info.addr,
-            destination_conn_info.fingerprint.is_some()
+        let (raw_dest_stdin, raw_dest_stdout) = dest_stdio?;
+        dest_stdin = Some(remote::stdio::MasterStdinSender::new(
+            raw_dest_stdin,
+            keepalive_sec,
+        ));
+        let (dest_control_rx, dest_stdout_demux) = remote::stdio::spawn_master_stdout_demux(
+            remote::streams::RecvStream::new(raw_dest_stdout),
+            remote::tracelog::RcpdType::Destination,
         );
-
-        // connect to destination rcpd (control + tracing)
-        tracing::info!("Connecting to destination rcpd...");
-        let (dest_send_stream, dest_recv_stream) = connect_to_rcpd(
-            &destination_conn_info,
-            master_cert.as_ref(),
-            &destination_config.tcp,
-            "dest control",
-        )
-        .await?;
-        let (dest_tracing_send, dest_tracing_recv) = connect_to_rcpd(
-            &destination_conn_info,
-            master_cert.as_ref(),
-            &destination_config.tcp,
-            "dest tracing",
-        )
-        .await?;
-        drop(dest_tracing_send); // we only receive on tracing connection
-        anyhow::Ok((
-            destination_conn_info,
-            dest_send_stream,
-            dest_recv_stream,
-            dest_tracing_recv,
-        ))
+        // retain destination stdout demux before validation so destination startup notices drain
+        // symmetrically with source even if readiness validation rejects the destination
+        teardown
+            .retain_tracing_receiver(dest_stdout_demux, remote::tracelog::RcpdType::Destination);
+        validate_destination_readiness(&source_readiness, &destination_readiness)?;
+        validate_readiness_encryption(
+            "destination",
+            request.rcpd.encryption,
+            &destination_readiness,
+        )?;
+        tracing::info!(
+            "Destination rcpd ready (encryption={})",
+            destination_readiness.fingerprint.is_some()
+        );
+        anyhow::Ok((destination_readiness, dest_control_rx))
     }
     .await;
-    let (destination_conn_info, mut dest_send_stream, mut dest_recv_stream, dest_tracing_recv) =
-        match destination_setup {
-            Ok(setup) => setup,
-            Err(error) => {
-                let _ = source_send_stream.close().await;
-                drop(source_recv_stream);
-                let _ = teardown.finish(false).await;
-                return Err(error);
+    let (destination_readiness, mut dest_control_rx) = match destination_setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            if let Some(stdin) = source_stdin.take() {
+                stdin.close().await;
             }
-        };
+            if let Some(stdin) = dest_stdin.take() {
+                stdin.close().await;
+            }
+            drop(source_control_rx);
+            let _ = teardown.finish(false).await;
+            return Err(error);
+        }
+    };
     tracing::info!("Connected to all rcpd processes");
-    teardown.retain_tracing_receiver(
-        spawn_tracing_receiver(dest_tracing_recv, remote::tracelog::RcpdType::Destination),
-        remote::tracelog::RcpdType::Destination,
-    );
     let operation_result = async {
         let filter = request.filter;
         // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
         {
             let _span = tracing::trace_span!("send_master_hello_to_source").entered();
-            source_send_stream
-                .send_control_message(&remote::protocol::MasterHello::Source {
+            source_stdin
+                .as_ref()
+                .expect("source stdin remains open until operation teardown")
+                .send_hello(remote::protocol::MasterHello::Source {
                     src: src.path().to_path_buf(),
                     dst: dst.path().to_path_buf(),
-                    dest_cert_fingerprint: destination_conn_info.fingerprint,
+                    dest_cert_fingerprint: destination_readiness.fingerprint,
                     filter,
                     dry_run: args.dry_run,
                     // derived from the SAME `preserve` the destination is handed below, so what
@@ -1374,59 +1382,69 @@ async fn run_rcpd_master(
             let went_quiet = rcpd_went_quiet("source", &src.session().host, "send its hello");
             let closed_quietly =
                 rcpd_closed_quietly("source", &src.session().host, "send its hello");
-            source_recv_stream
-                .recv_object::<remote::protocol::SourceMasterHello>()
+            match source_control_rx
+                .recv_source_hello()
                 .await
                 .with_context(|| went_quiet)?
                 .ok_or_else(|| anyhow!(closed_quietly))?
+            {
+                remote::stdio::SourceHelloOutcome::Hello(hello) => hello,
+                remote::stdio::SourceHelloOutcome::Result(
+                    remote::protocol::RcpdResult::Failure { error, summary, .. },
+                ) => {
+                    // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
+                    tracing::error!("Source rcpd failed before starting listeners: {error}");
+                    return Err(common::copy::Error::new(
+                        anyhow!("Source rcpd failed: {error}"),
+                        summary,
+                    )
+                    .into());
+                }
+                remote::stdio::SourceHelloOutcome::Result(
+                    remote::protocol::RcpdResult::Success { message, .. },
+                ) => {
+                    anyhow::bail!(
+                        "source rcpd completed unexpectedly before sending its hello: {message}"
+                    );
+                }
+            }
         };
         // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
         {
             let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
-            dest_send_stream
-                .send_control_message(&remote::protocol::MasterHello::Destination {
+            dest_stdin
+                .as_ref()
+                .expect("destination stdin remains open until operation teardown")
+                .send_hello(remote::protocol::MasterHello::Destination {
                     source_control_addr: source_hello.control_addr,
                     source_data_addr: source_hello.data_addr,
                     server_name: source_hello.server_name.clone(),
                     preserve: *preserve,
-                    source_cert_fingerprint: source_conn_info.fingerprint,
+                    source_cert_fingerprint: source_readiness.fingerprint,
                     dry_run: request.rcpd.preview_only,
                 })
                 .await?;
         }
         tracing::info!("Forwarded source connection info to destination");
-        let source_result = {
-            let _span = tracing::trace_span!("wait_for_source_result").entered();
-            let went_quiet = rcpd_went_quiet("source", &src.session().host, "report a result");
-            let closed_quietly =
-                rcpd_closed_quietly("source", &src.session().host, "report a result");
-            source_recv_stream
-                .recv_object::<remote::protocol::RcpdResult>()
-                .await
-                .with_context(|| went_quiet)?
-                .ok_or_else(|| anyhow!(closed_quietly))?
-        };
-        let dest_result = {
-            let _span = tracing::trace_span!("wait_for_dest_result").entered();
-            let went_quiet = rcpd_went_quiet("destination", &dst.session().host, "report a result");
-            let closed_quietly =
-                rcpd_closed_quietly("destination", &dst.session().host, "report a result");
-            dest_recv_stream
-                .recv_object::<remote::protocol::RcpdResult>()
-                .await
-                .with_context(|| went_quiet)?
-                .ok_or_else(|| anyhow!(closed_quietly))?
-        };
-        anyhow::Ok((source_result, dest_result))
+        await_daemon_results(
+            &mut source_control_rx,
+            &mut dest_control_rx,
+            &mut source_stdin,
+            &src.session().host,
+            &dst.session().host,
+        )
+        .await
     }
     .await;
-
-    let _ = source_send_stream.close().await;
-    let _ = dest_send_stream.close().await;
-    drop(source_recv_stream);
-    drop(dest_recv_stream);
-    let teardown_result = teardown.finish(true).await;
-
+    if let Some(stdin) = source_stdin.take() {
+        stdin.close().await;
+    }
+    if let Some(stdin) = dest_stdin.take() {
+        stdin.close().await;
+    }
+    drop(source_control_rx);
+    drop(dest_control_rx);
+    let teardown_result = teardown.finish(operation_result.is_ok()).await;
     let (source_result, dest_result) = operation_result?;
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details + runtime stats
@@ -1621,27 +1639,12 @@ async fn async_main(
         let cleanup = cleanup
             .as_ref()
             .expect("remote operations start with a cleanup supervisor");
-        // install rustls crypto provider (ring) before any TLS operations
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-        let master_cert = if !args.no_encryption {
-            Some(
-                remote::tls::generate_self_signed_cert()
-                    .context("failed to generate master TLS certificate")?,
-            )
-        } else {
-            None
-        };
         // explicit limits can be validated entirely by the master, so reject invalid capacities
         // before a `~` operand can trigger a remote HOME lookup. Automatic selection remains
         // source-owned and is resolved only after source readiness.
-        let request = build_master_remote_request(
-            &args,
-            files_in_flight,
-            master_cert.as_ref().map(|cert| cert.fingerprint),
-        )?;
+        let request = build_master_remote_request(&args, files_in_flight)?;
         let remote_home_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
+        let keepalive_sec = request.tcp.keepalive_sec;
         {
             let remote_src = &mut operands.source;
             let remote_dst = &mut operands.destination;
@@ -1652,6 +1655,7 @@ async fn async_main(
                     remote_src.session(),
                     cleanup,
                     remote_home_timeout,
+                    keepalive_sec,
                     &operands.local_operand_roots,
                 )
                 .await?;
@@ -1663,6 +1667,7 @@ async fn async_main(
                         remote_src.session(),
                         cleanup,
                         remote_home_timeout,
+                        keepalive_sec,
                         &operands.local_operand_roots,
                     )
                     .await?;
@@ -1673,6 +1678,7 @@ async fn async_main(
                         remote_dst.session(),
                         cleanup,
                         remote_home_timeout,
+                        keepalive_sec,
                         &operands.local_operand_roots,
                     )
                     .await?;
@@ -1687,9 +1693,7 @@ async fn async_main(
                 operands.destination.path()
             ));
         }
-        return match run_rcpd_master(&args, &preserve, &operands, request, master_cert, cleanup)
-            .await
-        {
+        return match run_rcpd_master(&args, &preserve, &operands, request, cleanup).await {
             Ok(summary) => Ok(summary),
             Err(error) => {
                 if let Some(copy_error) = error.downcast_ref::<common::copy::Error>()
@@ -2303,13 +2307,25 @@ mod tests {
     fn readiness(
         files_in_flight: common::ConcurrencyLimit,
         max_connections: usize,
-    ) -> remote::RcpdConnectionInfo {
-        remote::RcpdConnectionInfo {
-            addr: "127.0.0.1:1234".parse().unwrap(),
+    ) -> remote::RcpdReadiness {
+        remote::RcpdReadiness {
             fingerprint: None,
             files_in_flight,
             max_connections: std::num::NonZeroUsize::new(max_connections).unwrap(),
         }
+    }
+
+    #[test]
+    fn master_rejects_readiness_encryption_mismatch() {
+        let plain = readiness(common::ConcurrencyLimit::Unlimited, 4);
+        let encrypted = remote::RcpdReadiness {
+            fingerprint: Some([0xabu8; 32]),
+            ..plain.clone()
+        };
+        assert!(validate_readiness_encryption("source", false, &plain).is_ok());
+        assert!(validate_readiness_encryption("source", true, &encrypted).is_ok());
+        assert!(validate_readiness_encryption("source", true, &plain).is_err());
+        assert!(validate_readiness_encryption("destination", false, &encrypted).is_err());
     }
 
     #[test]
@@ -2378,32 +2394,30 @@ mod tests {
             let args = master_args(&options);
             let files =
                 common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(4).unwrap());
-            let request = build_master_remote_request(&args, files, None).unwrap();
+            let request = build_master_remote_request(&args, files).unwrap();
             let source = build_source_remote_config(&request);
             let destination =
                 build_destination_remote_config(&request, &readiness(files.limit(), 4)).unwrap();
+            assert_eq!(request.tcp.effective_buffer_size(), chunk);
+            assert_eq!(request.tcp.effective_buffer_retention_limit(), kept);
             for config in [&source, &destination] {
-                assert_eq!(config.tcp.effective_buffer_size(), chunk);
-                assert_eq!(config.rcpd.buffer_size, config.tcp.buffer_size);
+                assert_eq!(config.buffer_size, request.tcp.buffer_size);
                 let buffer_args: Vec<_> = config
-                    .rcpd
                     .to_args()
                     .into_iter()
                     .filter(|arg| arg.starts_with("--buffer-size="))
                     .collect();
                 assert_eq!(
                     buffer_args,
-                    config
+                    request
                         .tcp
                         .buffer_size
                         .map(|value| format!("--buffer-size={value}"))
                         .into_iter()
                         .collect::<Vec<_>>()
                 );
-                assert_eq!(config.tcp.effective_buffer_retention_limit(), kept);
-                assert_eq!(config.rcpd.buffer_retention_limit, limit);
+                assert_eq!(config.buffer_retention_limit, limit);
                 let retained_args: Vec<_> = config
-                    .rcpd
                     .to_args()
                     .into_iter()
                     .filter(|arg| arg.starts_with("--buffer-retention-limit="))
@@ -2464,11 +2478,11 @@ mod tests {
             let args = master_args(&options);
             let files =
                 common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
-            let request = build_master_remote_request(&args, files, None).unwrap();
+            let request = build_master_remote_request(&args, files).unwrap();
             let source = build_source_remote_config(&request);
             let source_readiness = readiness(files.limit(), 100);
             let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
-            for config in [&source.rcpd, &destination.rcpd] {
+            for config in [&source, &destination] {
                 assert_eq!(config.preview_only, args.dry_run.is_some());
                 assert_eq!(
                     config.to_args().iter().any(|arg| arg == "--preview-only"),
@@ -2482,12 +2496,11 @@ mod tests {
     fn master_automatic_source_omits_file_limit_overrides() {
         let args = master_args(&[]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic()).unwrap();
         assert_eq!(request.connection_ceiling.value().get(), 100);
         assert!(!request.connection_ceiling.is_explicit());
         let source = build_source_remote_config(&request);
-        let spawn_args = source.rcpd.to_args();
+        let spawn_args = source.to_args();
         assert!(!spawn_args.iter().any(|arg| arg.contains("files-in-flight")));
         assert!(
             !spawn_args
@@ -2501,14 +2514,13 @@ mod tests {
     fn master_automatic_destination_uses_source_selected_concurrency() {
         let args = master_args(&[]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic()).unwrap();
         let source = readiness(
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(32).unwrap()),
             32,
         );
         let destination = build_destination_remote_config(&request, &source).unwrap();
-        let spawn_args = destination.rcpd.to_args();
+        let spawn_args = destination.to_args();
         assert!(
             spawn_args
                 .iter()
@@ -2523,7 +2535,6 @@ mod tests {
         let request = build_master_remote_request(
             &args,
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(64).unwrap()),
-            None,
         )
         .unwrap();
         assert!(request.connection_ceiling.is_explicit());
@@ -2533,7 +2544,7 @@ mod tests {
             64,
         );
         let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
-        for config in [&source.rcpd, &destination.rcpd] {
+        for config in [&source, &destination] {
             let spawn_args = config.to_args();
             assert!(
                 spawn_args
@@ -2548,12 +2559,12 @@ mod tests {
     fn master_explicit_unlimited_configures_both_endpoints_identically() {
         let args = master_args(&["--max-files-in-flight=unlimited", "--max-connections=3"]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::unlimited(), None)
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::unlimited())
                 .expect("explicit unlimited file admission must be valid remotely");
         let source = build_source_remote_config(&request);
         let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 3);
         let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
-        for config in [&source.rcpd, &destination.rcpd] {
+        for config in [&source, &destination] {
             let spawn_args = config.to_args();
             assert!(
                 spawn_args
@@ -2575,7 +2586,6 @@ mod tests {
         let request = build_master_remote_request(
             &args,
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(64).unwrap()),
-            None,
         )
         .unwrap();
         let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 64);
@@ -2593,15 +2603,14 @@ mod tests {
     fn master_legacy_finite_preserves_provenance_for_both_daemons() {
         let args = master_args(&["--max-connections=100", "--max-open-files=7"]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(7), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(7)).unwrap();
         let source = build_source_remote_config(&request);
         let source_readiness = readiness(
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap()),
             7,
         );
         let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
-        for config in [&source.rcpd, &destination.rcpd] {
+        for config in [&source, &destination] {
             let spawn_args = config.to_args();
             assert!(
                 spawn_args
@@ -2620,12 +2629,11 @@ mod tests {
     fn master_legacy_unlimited_preserves_provenance_for_both_daemons() {
         let args = master_args(&["--max-connections=100", "--max-open-files=0"]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(0), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(0)).unwrap();
         let source = build_source_remote_config(&request);
         let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 100);
         let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
-        for config in [&source.rcpd, &destination.rcpd] {
+        for config in [&source, &destination] {
             let spawn_args = config.to_args();
             assert!(
                 spawn_args
@@ -2690,11 +2698,8 @@ mod tests {
     fn master_rejects_capacity_invalid_for_every_automatic_source() {
         let multiplier = usize::MAX.to_string();
         let args = master_args(&[&format!("--pending-writes-multiplier={multiplier}")]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .expect_err(
-                    "the automatic source floor makes this capacity unconditionally invalid",
-                );
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .expect_err("the automatic source floor makes this capacity unconditionally invalid");
         assert!(
             error.to_string().contains("pending file capacity"),
             "unexpected automatic-capacity error: {error:#}"
@@ -2708,11 +2713,8 @@ mod tests {
             "--max-connections=8",
             &format!("--pending-writes-multiplier={multiplier}"),
         ]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .expect_err(
-                    "an unsafe connection upper bound must fail before remote side effects",
-                );
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .expect_err("an unsafe connection upper bound must fail before remote side effects");
         assert!(
             error.to_string().contains("pending file capacity"),
             "unexpected automatic-capacity error: {error:#}"
@@ -2722,9 +2724,8 @@ mod tests {
     #[test]
     fn master_rejects_invalid_filter_before_remote_side_effects() {
         let args = master_args(&["--include=["]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap_err();
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("invalid glob pattern"),
             "unexpected error: {error:#}"
@@ -2736,9 +2737,8 @@ mod tests {
         let filter_directory = tempfile::tempdir().unwrap();
         let filter_arg = format!("--filter-file={}", filter_directory.path().display());
         let args = master_args(&[&filter_arg]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap_err();
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("filter file"),
             "unexpected error: {error:#}"
@@ -2748,9 +2748,8 @@ mod tests {
     #[test]
     fn master_rejects_invalid_overwrite_compare_before_remote_side_effects() {
         let args = master_args(&["--overwrite-compare=size,unknown"]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap_err();
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("Unknown metadata comparison setting"),
             "unexpected error: {error:#}"
@@ -2760,9 +2759,8 @@ mod tests {
     #[test]
     fn master_rejects_invalid_port_ranges_before_remote_side_effects() {
         let args = master_args(&["--port-ranges=9000-8000"]);
-        let error =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap_err();
+        let error = build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic())
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("start port 9000 > end port 8000"),
             "unexpected error: {error:#}"
@@ -2778,8 +2776,8 @@ mod tests {
             &format!("--pending-writes-multiplier={pending_writes_multiplier}"),
             "--max-open-files=0",
         ]);
-        let error = build_master_remote_request(&args, args.common.resolve_files_in_flight(), None)
-            .unwrap_err();
+        let error =
+            build_master_remote_request(&args, args.common.resolve_files_in_flight()).unwrap_err();
         assert!(
             error.to_string().contains("pending file capacity overflow"),
             "unexpected error: {error:#}"
@@ -2791,9 +2789,9 @@ mod tests {
         let args = master_args(&["--max-connections=100"]);
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
-        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
+        let request = build_master_remote_request(&args, files_in_flight).unwrap();
         let source = build_source_remote_config(&request);
-        let effective = std::num::NonZeroUsize::new(source.rcpd.max_connections).unwrap();
+        let effective = std::num::NonZeroUsize::new(source.max_connections).unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
                 request.concurrency_policy,
@@ -2813,9 +2811,9 @@ mod tests {
         let args = master_args(&[]);
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
-        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
+        let request = build_master_remote_request(&args, files_in_flight).unwrap();
         let source = build_source_remote_config(&request);
-        let effective = std::num::NonZeroUsize::new(source.rcpd.max_connections).unwrap();
+        let effective = std::num::NonZeroUsize::new(source.max_connections).unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
                 request.concurrency_policy,
@@ -2834,8 +2832,7 @@ mod tests {
     fn explicit_connection_clamp_names_the_source_automatic_file_ceiling() {
         let args = master_args(&["--max-connections=200"]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic()).unwrap();
         let notice = remote_stream_clamp_notice(
             request.concurrency_policy,
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4).unwrap()),
@@ -2854,8 +2851,7 @@ mod tests {
     fn automatic_default_connection_intersection_stays_quiet() {
         let args = master_args(&[]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic()).unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
                 request.concurrency_policy,
@@ -2871,8 +2867,7 @@ mod tests {
     fn explicit_connection_ceiling_reports_automatic_file_limit_clamp() {
         let args = master_args(&["--max-connections=16"]);
         let request =
-            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
-                .unwrap();
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic()).unwrap();
         let notice = remote_stream_clamp_notice(
             request.concurrency_policy,
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(64).unwrap()),
@@ -2891,7 +2886,7 @@ mod tests {
     fn legacy_file_limit_clamp_preserves_the_deprecated_option_name() {
         let args = master_args(&["--max-open-files=200", "--max-connections=100"]);
         let files_in_flight = common::ResolvedFilesInFlight::legacy(200);
-        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
+        let request = build_master_remote_request(&args, files_in_flight).unwrap();
         let notice = remote_stream_clamp_notice(
             request.concurrency_policy,
             files_in_flight.limit(),

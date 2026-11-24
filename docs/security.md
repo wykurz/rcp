@@ -17,12 +17,15 @@ This document describes the security architecture of the rcp (remote copy) tool.
 
 The rcp remote copy system provides:
 
-1. **SSH** for initial authentication, authorization, and rcpd deployment
-2. **TLS with certificate pinning** for encrypted and authenticated data transfer
+1. **SSH** for authentication, authorization, rcpd deployment, and all Master↔rcpd control and
+   tracing traffic
+2. **TLS with certificate pinning** for encrypted and authenticated Source↔Destination data transfer
 
-All TCP connections are encrypted and mutually authenticated by default using TLS 1.3 with
-self-signed certificates and fingerprint pinning. Each party generates an ephemeral certificate, and
-fingerprints are distributed via SSH (for master↔rcpd) or protocol messages (for source↔dest).
+Master↔rcpd control and tracing run inside the authenticated SSH exec channel (`stdin`/`stdout`), so
+daemons never open a master-facing TCP listener. Source↔Destination TCP connections are encrypted
+and mutually authenticated by default using TLS 1.3 with self-signed certificates and fingerprint
+pinning. Source and destination each generate an ephemeral certificate, report its fingerprint to
+the master over SSH `stderr`, and receive their peer's fingerprint from the master over SSH `stdin`.
 
 ## Architecture
 
@@ -31,16 +34,17 @@ fingerprints are distributed via SSH (for master↔rcpd) or protocol messages (f
 A remote copy operation involves three participants:
 
 ```text
-                 ┌─────────────┐
-                 │   Master    │  (Local machine running `rcp`)
-                 │    (rcp)    │
-                 └─────────────┘
-                  │ │       │ │
-        ┌─────────┘ │       │ └─────────┐
-        │   ┌───────┘       └───────┐   │
-    SSH │   │ TLS               TLS │   │ SSH
-(spawn) │   │ (control)   (control) │   │ (spawn)
-        v   v                       v   v
+                ┌─────────────┐
+                │   Master    │  (Local machine running `rcp`)
+                │    (rcp)    │
+                └─────────────┘
+                  │         │
+        ┌─────────┘         └─────────┐
+    SSH │                             │ SSH
+(spawn, │                             │ (spawn,
+control,│                             │ control,
+tracing)│                             │ tracing)
+        v                             v
    ┌─────────────┐             ┌─────────────┐
    │   Source    │             │ Destination │
    │   (rcpd)    │─── TLS ────>│   (rcpd)    │
@@ -48,78 +52,70 @@ A remote copy operation involves three participants:
                  (control + data)
 ```
 
-Each master↔rcpd TLS arrow above stands for two connections — control plus a tracing/progress
-channel — listed separately in the table below.
-
 ### Communication Channels
 
-| Channel                                  | Protocol | Authentication             | Encryption |
-| ---------------------------------------- | -------- | -------------------------- | ---------- |
-| Master → Source (spawn)                  | SSH      | SSH keys/password          | SSH        |
-| Master → Destination (spawn)             | SSH      | SSH keys/password          | SSH        |
-| Master ↔ Source (control + tracing)      | TLS      | Mutual fingerprint pinning | TLS 1.3    |
-| Master ↔ Destination (control + tracing) | TLS      | Mutual fingerprint pinning | TLS 1.3    |
-| Source ↔ Destination (control)           | TLS      | Mutual fingerprint pinning | TLS 1.3    |
-| Source → Destination (data)              | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Channel                                    | Protocol | Authentication             | Encryption |
+| ------------------------------------------ | -------- | -------------------------- | ---------- |
+| Master ↔ Source (spawn, control, tracing)  | SSH      | SSH keys/password          | SSH        |
+| Master ↔ Destination (spawn, control, ...) | SSH      | SSH keys/password          | SSH        |
+| Source ↔ Destination (control)             | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Source → Destination (data)                | TLS      | Mutual fingerprint pinning | TLS 1.3    |
 
 ## TLS Certificate Authentication
 
 ### How It Works
 
-Each party generates an ephemeral self-signed certificate. The key design principle is that **for
-master connections, rcpd is always the TLS server** (master connects to it as a TLS client) - this
-allows master to read the certificate fingerprint from rcpd's stderr, carried over the trusted SSH
-channel, before connecting. (For source↔destination connections, the source is the TLS server and
-the destination connects as a client.)
+Source and destination each generate an ephemeral self-signed certificate for their direct TCP
+connections (the master communicates with both daemons over SSH and needs no TLS certificate). Each
+daemon reports its certificate fingerprint in `RCP_READY` on SSH `stderr`, and the master
+distributes the peer fingerprints over SSH `stdin`. For Source↔Destination connections, the source
+is the TLS server and the destination connects as a client.
 
 **Authentication Flow:**
 
 ```
-PHASE 1: rcpd Spawn and Setup (via SSH)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Master generates its own ephemeral certificate, then spawns rcpd processes via SSH:
-  ssh host-a "rcpd --role=source --master-cert-fp=<master_fingerprint>"
-  ssh host-b "rcpd --role=destination --master-cert-fp=<master_fingerprint>"
+PHASE 1: rcpd Spawn and Readiness (via SSH)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Master spawns rcpd processes via SSH:
+  ssh host-a "rcpd --role=source ..."
+  ssh host-b "rcpd --role=destination ..."
 
 Each rcpd:
   1. Generates ephemeral self-signed certificate
   2. Computes fingerprint: SHA256(cert.to_der())
-  3. Creates TLS server listener (requires a client cert matching --master-cert-fp)
-  4. Outputs to stderr: "RCP_TLS <addr> <hex_fingerprint> <F> <E>"
+  3. Outputs to stderr: "RCP_READY <hex_fingerprint> <F> <E>"
+  4. Switches SSH stdin/stdout to framed binary control + tracing
 
-PHASE 2: Master → rcpd Connection
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2: Fingerprint Exchange (via SSH)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Master reads from SSH stderr for each rcpd:
-  - Parses "RCP_TLS <addr> <fingerprint> <F> <E>"
+  - Parses "RCP_READY <fingerprint> <F> <E>"
   - Fingerprint received via trusted SSH channel!
 
 `F` is the negotiated logical file-work ceiling and `E` is the effective data-stream ceiling. They
 carry performance policy, not secret material; the TLS fingerprint remains the value authenticated
 through the SSH channel.
 
-Master connects TO rcpd as TLS client (control connection, then tracing connection):
-  1. TLS handshake (rcpd is server)
-  2. Master verifies rcpd's cert fingerprint matches the SSH-delivered value
-  3. rcpd verifies master's client cert against --master-cert-fp
-  4. Connection mutually authenticated ✓
+Master sends each peer's fingerprint over SSH stdin inside MasterHello:
+  - MasterHello::Source carries destination's cert fingerprint
+  - MasterHello::Destination carries source's cert fingerprint and TCP addresses
 
 PHASE 3: Source ↔ Destination Connection
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Master distributes fingerprints via authenticated protocol messages.
 Source creates TLS server, destination connects with client cert:
   - Destination verifies source's cert fingerprint
   - Source verifies destination's client cert fingerprint
-  - Mutual authentication achieved
+  - Mutual authentication achieved ✓
 ```
 
 ### Security Properties
 
 | Property            | Guarantee                                                |
 | ------------------- | -------------------------------------------------------- |
-| **Confidentiality** | All data encrypted with AES-256-GCM or ChaCha20-Poly1305 |
-| **Integrity**       | AEAD (Authenticated Encryption with Associated Data)     |
-| **Authentication**  | Certificate fingerprint verification                     |
-| **Forward Secrecy** | TLS 1.3 ephemeral key exchange                           |
+| **Confidentiality** | SSH for Master↔rcpd; AES-256-GCM or ChaCha20-Poly1305    |
+| **Integrity**       | SSH MAC/AEAD and TLS AEAD                                |
+| **Authentication**  | SSH plus mutual TLS certificate fingerprint verification |
+| **Forward Secrecy** | Ephemeral key exchange on SSH and TLS 1.3                |
 
 ### Why Certificate Pinning?
 
@@ -133,16 +129,16 @@ We use self-signed certificates with fingerprint pinning because:
 
 ### Fingerprint Distribution Security
 
-Certificate fingerprints are distributed via trusted channels:
+Certificate fingerprints are distributed via trusted SSH channels:
 
-- **SSH command line**: master passes its own fingerprint to rcpd via `--master-cert-fp`
-- **SSH stderr**: rcpd outputs its fingerprint to stderr; master reads it via SSH
-- **Protocol messages**: Source/dest fingerprints exchanged via authenticated TLS channels
+- **SSH stderr**: each rcpd outputs its fingerprint in `RCP_READY`; master reads it via SSH
+- **SSH stdin**: master sends each peer's fingerprint to source and destination inside `MasterHello`
 - **Per-session**: New certificates and fingerprints for each rcp invocation
 - **Memory-only**: Private keys are never written to disk
 
-The key insight is that rcpd acts as the TLS server, allowing master to receive the fingerprint
-through the trusted SSH channel BEFORE making any network connection.
+Because both `RCP_READY` and `MasterHello` travel inside the SSH exec channels, neither daemon
+accepts any master-facing TCP connections and both peers learn each other's fingerprint before
+opening any direct TCP connection.
 
 ## Trust Model
 
@@ -248,33 +244,31 @@ These TLS guarantees assume trustworthy fingerprint distribution; the
 
 ### Race Condition Prevention
 
-A potential attack vector is an attacker racing to connect to a freshly started rcpd listener before
-the legitimate master does. Certificate fingerprint verification prevents an attacker from
-*authenticating* — it cannot establish a trusted session or impersonate the master:
+A potential attack vector is an attacker racing to connect to a freshly started source rcpd listener
+before the legitimate destination does (master↔rcpd traffic runs over SSH stdio and exposes no TCP
+listener at all). Certificate fingerprint verification prevents an attacker from *authenticating* —
+it cannot establish a trusted session or impersonate the destination:
 
-1. Attacker observes SSH spawning rcpd and probes rcpd's TCP port
-2. Attacker attempts a TLS handshake before master connects
-3. rcpd requires a client certificate and verifies its fingerprint against `--master-cert-fp`
-   (received via SSH)
+1. Attacker observes source rcpd's TCP listeners and probes its control or data port
+2. Attacker attempts a TLS handshake before destination connects
+3. Source rcpd requires a client certificate and verifies its fingerprint against the destination
+   fingerprint delivered by master via SSH stdin
 4. **Attacker's certificate has wrong fingerprint** - handshake rejected, no authenticated session
    is established (confidentiality and integrity are preserved)
 
 **Availability caveat**: this protects authenticity, not availability. Every TLS handshake is
 bounded by `--remote-copy-conn-timeout-sec`, so a peer that establishes TCP and then stalls can only
-occupy a sequential accept loop until that deadline. A failed master-facing or source-control
-handshake is still fatal to its daemon, however, so an attacker who can reach a listening port can
+occupy a sequential accept loop until that deadline. A failed source-control handshake is still
+fatal to the source daemon, however, so an attacker who can reach the source's listening port can
 still deny service by initiating a bad or deliberately stalled handshake:
 
-- **Master-facing listeners (rcpd):** accept the two master connections one at a time and treat a
-  failed handshake as fatal — a wrong-certificate attempt aborts rcpd, and a client that stalls
-  mid-handshake delays it until the configured deadline.
-- **Source↔destination listeners (source rcpd):** the control listener likewise propagates a failed
-  handshake as fatal; the data listener logs and continues on failure, but a peer that stalls
-  mid-handshake delays its sequential accept loop until the configured deadline.
+- **Source↔destination listeners (source rcpd):** the control listener propagates a failed handshake
+  as fatal; the data listener logs and continues on failure, but a peer that stalls mid-handshake
+  delays its sequential accept loop until the configured deadline.
 
-Reaching these ports requires network access to the (typically trusted) source/destination hosts;
-restrict it with `--port-ranges` plus firewall rules. Tolerating failed master-facing and
-source-control handshakes without aborting their daemons remains a future hardening.
+Reaching these ports requires network access to the (typically trusted) source host; restrict it
+with `--port-ranges` plus firewall rules. Tolerating failed source-control handshakes without
+aborting the daemon remains a future hardening.
 
 ### Cipher Suites
 
@@ -301,15 +295,15 @@ For trusted networks where encryption overhead is undesirable, use `--no-encrypt
 rcp --no-encryption source:/path dest:/path
 ```
 
-**Important**: `--no-encryption` disables **both encryption AND authentication** on **all** rcp TCP
-connections — master↔rcpd (control and tracing) as well as Source↔Destination (control and data).
-With this flag:
+**Important**: `--no-encryption` disables **both encryption AND authentication** on
+Source↔Destination TCP connections (control and data). Master↔rcpd control and tracing continue to
+run inside the SSH exec channel. With this flag:
 
-- All traffic (control messages and file data) is transmitted in plaintext
-- Every listener accepts connections from anyone who can reach its port (rcpd advertises
-  `RCP_TCP <addr>` with no fingerprint)
-- SSH authenticates only the *spawning* of rcpd — the subsequent TCP connections are made directly
-  to rcpd's port and are not protected by SSH
+- All Source↔Destination traffic (control messages and file data) is transmitted in plaintext
+- The source TCP listeners accept connections from anyone who can reach their ports (`rcpd` emits
+  `RCP_READY - <F> <E>` with no fingerprint)
+- SSH protects Master↔rcpd communication and spawning, not the direct Source↔Destination TCP
+  connections
 
 The security model with `--no-encryption` relies entirely on network isolation.
 

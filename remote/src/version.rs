@@ -44,8 +44,9 @@ pub struct ProtocolVersion {
 /// cache) would otherwise pass compatibility and then fail or misbehave mid-copy.
 /// Fixed payload tests live in `remote/tests/wire_compatibility.rs`; see the fixture README
 /// there when changing serialized layouts. They do not cover the spawn contract.
-/// Revision 12 adds context switch and page fault counts to the statistics in `RcpdResult`.
-pub const WIRE_REVISION: u32 = 12;
+/// Revision 13 moves master↔rcpd control and tracing onto SSH stdio (`RCP_READY`,
+/// `MasterToRcpd`, `RcpdToMaster`), removing the master-facing TCP listener and `--master-cert-fp`.
+pub const WIRE_REVISION: u32 = 13;
 
 impl ProtocolVersion {
     /// Get the current protocol version

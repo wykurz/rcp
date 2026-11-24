@@ -1,7 +1,7 @@
 //! Remote copy protocol and networking for distributed file operations
 //!
 //! This crate provides the networking layer and protocol definitions for remote file copying in the RCP tools suite.
-//! It enables efficient distributed copying between remote hosts using SSH for orchestration and TCP for high-throughput data transfer.
+//! It enables efficient distributed copying between remote hosts using SSH for orchestration and master↔daemon communication, and TCP for high-throughput source↔destination data transfer.
 //!
 //! # Overview
 //!
@@ -9,24 +9,22 @@
 //!
 //! ```text
 //! Master (rcp)
-//! ├── SSH → Source Host (rcpd)
-//! │   ├── TCP Server ← Master (control + tracing)
+//! ├── SSH stdio ↔ Source Host (rcpd) (control + tracing)
 //! │   └── TCP Server ← Destination (control + data)
-//! └── SSH → Destination Host (rcpd)
-//!     ├── TCP Server ← Master (control + tracing)
+//! └── SSH stdio ↔ Destination Host (rcpd) (control + tracing)
 //!     └── TCP Client → Source (control + data)
 //! ```
 //!
 //! ## Connection Flow
 //!
 //! 1. **Initialization**: Master starts `rcpd` processes on source and destination via SSH
-//! 2. **Control Connections**: Master connects to each `rcpd`'s TCP listener (address read
-//!    from the rcpd's stderr over SSH)
+//! 2. **Control & Tracing Channel**: Master exchanges framed control messages and receives
+//!    tracing/progress updates over each `rcpd`'s SSH `stdin`/`stdout` pipes
 //! 3. **Address Exchange**: Source starts TCP listeners and sends addresses to Master
 //! 4. **Direct Connection**: Master forwards addresses to Destination, which connects to Source
 //! 5. **Data Transfer**: Files flow directly from Source to Destination (not through Master)
 //!
-//! This design ensures efficient data transfer while allowing the Master to coordinate operations and monitor progress.
+//! This design ensures efficient data transfer while allowing the Master to coordinate operations and monitor progress without opening TCP ports back to the Master.
 //!
 //! # Key Components
 //!
@@ -34,11 +32,11 @@
 //!
 //! The [`SshSession`] type represents an SSH connection to a remote host and is used to:
 //! - Launch `rcpd` daemons on remote hosts
-//! - Configure connection parameters (user, host, port)
+//! - Configure connection parameters (user, host, port, keepalive)
 //!
 //! ## TCP Networking
 //!
-//! TCP provides high-throughput bulk data transfer with:
+//! TCP provides high-throughput bulk data transfer between source and destination with:
 //! - Connection pooling for parallel file transfers
 //! - Configurable buffer sizes for different network profiles
 //! - Length-delimited message framing for control messages
@@ -68,21 +66,25 @@
 //! ## Protocol Messages
 //!
 //! The [`protocol`] module defines the message types exchanged between nodes:
-//! - `MasterHello` - Master → rcpd configuration
-//! - `SourceMasterHello` - Source → Master address information
-//! - `RcpdResult` - rcpd → Master operation results
+//! - `MasterToRcpd` / `MasterHello` - Master → rcpd configuration and heartbeats over SSH stdin
+//! - `RcpdToMaster` / `SourceMasterHello` / `RcpdResult` - rcpd → Master replies and tracing over SSH stdout
 //!
 //! ## Stream Communication
 //!
-//! The [`streams`] module provides high-level abstractions over TCP streams:
+//! The [`streams`] module provides high-level abstractions over async byte streams:
 //! - [`streams::SendStream`] / [`streams::RecvStream`] for framed message passing
 //! - Length-bounded file payload transfers that preserve subsequent message boundaries
 //! - Object serialization/deserialization using bitcode
 //!
+//! ## Master↔Daemon SSH Stdio Framing
+//!
+//! The [`stdio`] module handles binary framing, multiplexing, and keepalive heartbeats over each
+//! `rcpd` process's SSH `stdin`/`stdout` pipes.
+//!
 //! ## Remote Tracing
 //!
 //! The [`tracelog`] module enables distributed logging and progress tracking:
-//! - Forward tracing events from remote `rcpd` processes to Master
+//! - Forward tracing events from remote `rcpd` processes to Master over SSH stdout
 //! - Aggregate progress information across multiple remote operations
 //! - Display unified progress for distributed operations
 //!
@@ -90,32 +92,31 @@
 //!
 //! The remote copy system provides multiple security layers:
 //!
-//! - **SSH Authentication**: All remote operations require SSH authentication to spawn rcpd
-//! - **TLS Encryption**: All TCP connections encrypted with TLS 1.3 by default
+//! - **SSH Authentication & Transport**: Master↔rcpd control and tracing run inside the authenticated, encrypted SSH exec channel
+//! - **TLS Encryption**: Source↔Destination TCP connections are encrypted with TLS 1.3 by default
 //! - **Certificate Pinning**: Self-signed certificates with fingerprint verification
 //! - **Mutual Authentication**: Source↔Destination connections use mutual TLS
 //!
 //! **How it works**:
 //! 1. Each rcpd generates an ephemeral self-signed certificate
-//! 2. rcpd outputs its certificate fingerprint to stderr (read by master over the trusted SSH channel)
-//! 3. Master connects to rcpd as TLS client, verifies fingerprint
-//! 4. Master distributes fingerprints to enable Source↔Destination mutual auth
+//! 2. rcpd outputs its certificate fingerprint in `RCP_READY` on stderr (read by master over the trusted SSH channel)
+//! 3. Master exchanges fingerprints over SSH stdin to enable Source↔Destination mutual TLS authentication
 //!
-//! Use `--no-encryption` to disable TLS for trusted networks where performance is critical.
+//! Use `--no-encryption` to disable Source↔Destination TLS for trusted networks where performance is critical (Master↔rcpd remains encrypted by SSH).
 //!
 //! # Network Troubleshooting
 //!
 //! Common failure scenarios:
 //!
 //! - **SSH Connection Fails**: Host unreachable or authentication failure
-//! - **Master Cannot Connect to rcpd**: Firewall blocks TCP ports
-//! - **Destination Cannot Connect to Source**: Use `--port-ranges` to specify allowed ports
+//! - **Destination Cannot Connect to Source**: Firewall blocks direct TCP; use `--port-ranges` to specify allowed ports
 //!
 //! # Module Organization
 //!
 //! - [`port_ranges`] - Port range parsing and socket binding
 //! - [`protocol`] - Protocol message definitions and serialization
-//! - [`streams`] - TCP stream wrappers with typed message passing
+//! - [`stdio`] - Master↔rcpd SSH stdio framing, demultiplexing, and heartbeats
+//! - [`streams`] - Async stream wrappers with typed message passing
 //! - [`tls`] - TLS certificate generation and configuration
 //! - [`tracelog`] - Remote tracing and progress aggregation
 
@@ -1428,6 +1429,7 @@ pub mod port_ranges;
 pub mod protocol;
 mod socket_buffers;
 use socket_buffers::{ReceiveBufferRequest, SendBufferRequest};
+pub mod stdio;
 pub mod streams;
 pub mod tls;
 pub mod tracelog;
@@ -1674,9 +1676,16 @@ async fn setup_ssh_session(
     session: &SshSession,
     preparation: &PreparationContext,
     deadline: BootstrapDeadline,
+    keepalive_sec: u64,
 ) -> anyhow::Result<ManagedSshSession> {
-    setup_ssh_session_with_program(session, preparation, std::path::Path::new("ssh"), deadline)
-        .await
+    setup_ssh_session_with_program(
+        session,
+        preparation,
+        std::path::Path::new("ssh"),
+        deadline,
+        keepalive_sec,
+    )
+    .await
 }
 
 async fn setup_ssh_session_with_program(
@@ -1684,6 +1693,7 @@ async fn setup_ssh_session_with_program(
     preparation: &PreparationContext,
     ssh_program: &std::path::Path,
     deadline: BootstrapDeadline,
+    keepalive_sec: u64,
 ) -> anyhow::Result<ManagedSshSession> {
     let session = session.clone();
     let ssh_program = ssh_program.to_path_buf();
@@ -1696,7 +1706,7 @@ async fn setup_ssh_session_with_program(
                     .context("no usable SSH control directory found outside local copy operands")
             })
             .await?;
-        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup)
+        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup, keepalive_sec)
             .await
             .context("Failed to establish SSH connection")
     });
@@ -1771,11 +1781,60 @@ fn ssh_master_launcher_command(ssh_program: &std::path::Path) -> tokio::process:
     launcher
 }
 
+fn ssh_master_args(
+    session: &SshSession,
+    log: &std::path::Path,
+    control_path: &std::path::Path,
+    keepalive_sec: u64,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-E".into(),
+        log.as_os_str().to_os_string(),
+        "-S".into(),
+        control_path.as_os_str().to_os_string(),
+        "-M".into(),
+        "-N".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
+        "-o".into(),
+        "ControlPersist=no".into(),
+    ];
+    match stdio::ssh_server_alive_params(keepalive_sec) {
+        Some((interval, count)) => {
+            args.push("-o".into());
+            args.push(format!("ServerAliveInterval={interval}").into());
+            args.push("-o".into());
+            args.push(format!("ServerAliveCountMax={count}").into());
+        }
+        None => {
+            // override any ServerAliveInterval configured in the user's ~/.ssh/config so
+            // --remote-keepalive-sec=0 disables SSH-level liveness probing
+            args.push("-o".into());
+            args.push("ServerAliveInterval=0".into());
+        }
+    }
+    if let Some(port) = session.port {
+        args.push("-p".into());
+        args.push(port.to_string().into());
+    }
+    if let Some(user) = session.user.as_deref() {
+        args.push("-l".into());
+        args.push(user.into());
+    }
+    args.push(session.openssh_host().into());
+    args
+}
+
 async fn launch_ssh_master(
     session: &SshSession,
     control_dir: &std::path::Path,
     ssh_program: &std::path::Path,
     cleanup: RemoteCleanup,
+    keepalive_sec: u64,
 ) -> anyhow::Result<ManagedSshSession> {
     tracing::debug!("Connecting to SSH destination: {}", session.host);
     tracing::debug!("Using SSH control directory: {}", control_dir.display());
@@ -1798,28 +1857,8 @@ async fn launch_ssh_master(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .arg("-E")
-        .arg(&log)
-        .arg("-S")
-        .arg(&control_path)
-        .arg("-M")
-        .arg("-N")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("ForkAfterAuthentication=no")
-        .arg("-o")
-        .arg("ControlPersist=no");
-    if let Some(port) = session.port {
-        launcher.arg("-p").arg(port.to_string());
-    }
-    if let Some(user) = session.user.as_deref() {
-        launcher.arg("-l").arg(user);
-    }
+        .args(ssh_master_args(session, &log, &control_path, keepalive_sec));
     let launcher = launcher
-        .arg(session.openssh_host())
         .spawn()
         .context("failed to launch SSH multiplex master")?;
     preparing.retain_launcher(launcher);
@@ -2005,18 +2044,23 @@ pub async fn get_remote_home_for_session_with_timeout(
     session: &SshSession,
     cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
+    keepalive_sec: u64,
     local_operand_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<std::path::PathBuf> {
     let preparation = PreparationContext::uncancelled(cleanup.clone())
         .with_control_directory_exclusions(local_operand_roots.to_vec().into());
     let deadline = BootstrapDeadline::new(bootstrap_timeout);
-    let ssh_session = setup_ssh_session(session, &preparation, deadline).await?;
+    let ssh_session = setup_ssh_session(session, &preparation, deadline, keepalive_sec).await?;
     let home = get_remote_home_with_context(&ssh_session, &preparation, deadline).await?;
     Ok(std::path::PathBuf::from(home))
 }
 
 #[instrument(skip(process))]
 pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<()> {
+    // drop untaken stdio pipes before waiting so the daemon always observes stdin EOF even when
+    // teardown runs before attaching master↔rcpd stream handlers
+    drop(process.stdin.take());
+    drop(process.stdout.take());
     let child = process
         .child
         .take()
@@ -2025,33 +2069,26 @@ pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<(
         .stderr_drain
         .take()
         .expect("an owned rcpd process retains its stderr collector until wait");
-    let stdout_drain = process.stdout_drain.take();
     tracing::info!("Waiting on rcpd server on: {:?}", child);
-    // closing the child's stdin is the daemon watchdog signal. Always join the output collectors,
+    // closing the child's stdin is the daemon watchdog signal. Always join the stderr collector,
     // even when waiting fails, so teardown neither detaches tasks nor loses bounded diagnostics.
     let wait = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
-    let (stderr, stdout) = tokio::join!(
-        finish_rcpd_output_drain(stderr_drain, "stderr"),
-        finish_optional_rcpd_output_drain(stdout_drain, "stdout"),
-    );
+    let stderr = finish_rcpd_output_drain(stderr_drain, "stderr").await;
     let status = wait
         .context("Timeout waiting for rcpd process to exit")?
         .context("Failed to wait for rcpd process")?;
     if !status.success() {
         return Err(anyhow!(
-            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{}\nstderr:\n{}",
+            "rcpd command failed on remote host, status code: {:?}\nstderr:\n{}",
             status.code(),
-            stdout.rendered(),
             stderr.rendered()
         ));
     }
-    for (stream, output) in [("stdout", stdout), ("stderr", stderr)] {
-        if let Some(error) = output.read_error {
-            tracing::debug!("rcpd {stream} collector failed after startup: {error:#}");
-        }
-        if output.truncated {
-            tracing::debug!("rcpd {stream} diagnostic tail was truncated after live forwarding");
-        }
+    if let Some(error) = stderr.read_error {
+        tracing::debug!("rcpd stderr collector failed after startup: {error:#}");
+    }
+    if stderr.truncated {
+        tracing::debug!("rcpd stderr diagnostic tail was truncated after live forwarding");
     }
     Ok(())
 }
@@ -2070,16 +2107,6 @@ async fn finish_rcpd_output_drain(
             tracing::debug!("rcpd {stream} collector did not finish during drain grace");
             CapturedOutput::default()
         }
-    }
-}
-
-async fn finish_optional_rcpd_output_drain(
-    task: Option<AbortOnDropTask<CapturedOutput>>,
-    stream: &'static str,
-) -> CapturedOutput {
-    match task {
-        Some(task) => finish_rcpd_output_drain(task, stream).await,
-        None => CapturedOutput::default(),
     }
 }
 
@@ -2515,12 +2542,10 @@ fn rcpd_version_mismatch_error(
     )
 }
 
-/// Connection info received from rcpd after it starts listening.
-#[derive(Debug, Clone)]
-pub struct RcpdConnectionInfo {
-    /// Address rcpd is listening on
-    pub addr: std::net::SocketAddr,
-    /// TLS certificate fingerprint (None if encryption disabled)
+/// Readiness metadata received from rcpd after startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcpdReadiness {
+    /// TLS certificate fingerprint for source↔destination mTLS (`None` if encryption disabled).
     pub fingerprint: Option<tls::Fingerprint>,
     /// Logical file-work ceiling resolved by this daemon.
     pub files_in_flight: common::ConcurrencyLimit,
@@ -2531,33 +2556,24 @@ pub struct RcpdConnectionInfo {
 /// Format the first stderr record emitted by a successfully started rcpd.
 #[must_use]
 pub fn format_rcpd_readiness(
-    addr: std::net::SocketAddr,
     fingerprint: Option<&tls::Fingerprint>,
     concurrency: ResolvedRemoteConcurrency,
 ) -> String {
+    let fingerprint = fingerprint.map_or_else(|| "-".to_string(), tls::fingerprint_to_hex);
     let files_in_flight = match concurrency.files_in_flight() {
         common::ConcurrencyLimit::Unlimited => "unlimited".to_string(),
         common::ConcurrencyLimit::Limited(value) => value.to_string(),
     };
-    match fingerprint {
-        Some(fingerprint) => format!(
-            "RCP_TLS {} {} {} {}",
-            addr,
-            tls::fingerprint_to_hex(fingerprint),
-            files_in_flight,
-            concurrency.max_connections(),
-        ),
-        None => format!(
-            "RCP_TCP {} {} {}",
-            addr,
-            files_in_flight,
-            concurrency.max_connections(),
-        ),
-    }
+    format!(
+        "RCP_READY {} {} {}",
+        fingerprint,
+        files_in_flight,
+        concurrency.max_connections(),
+    )
 }
 
 /// Parse the version-sensitive first stderr record emitted by rcpd.
-fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
+fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdReadiness> {
     fn parse_files_in_flight(token: &str) -> anyhow::Result<common::ConcurrencyLimit> {
         if token == "unlimited" {
             return Ok(common::ConcurrencyLimit::Unlimited);
@@ -2570,29 +2586,22 @@ fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
         })?;
         Ok(common::ConcurrencyLimit::Limited(value))
     }
-
     let (kind, rest) = line
         .split_once(' ')
         .context("rcpd readiness record is missing its fields")?;
     let parts: Vec<&str> = rest.split_whitespace().collect();
-    let (addr, fingerprint, files_token, connections_token) =
-        match (kind, parts.as_slice()) {
-            ("RCP_TLS", [addr, fingerprint, files, connections]) => (
-                addr,
-                Some(tls::fingerprint_from_hex(fingerprint).with_context(|| {
-                    format!("invalid fingerprint in RCP_TLS line: {fingerprint}")
-                })?),
-                files,
-                connections,
-            ),
-            ("RCP_TCP", [addr, files, connections]) => (addr, None, files, connections),
-            ("RCP_TLS", _) => anyhow::bail!("invalid RCP_TLS line from rcpd: {line}"),
-            ("RCP_TCP", _) => anyhow::bail!("invalid RCP_TCP line from rcpd: {line}"),
-            _ => anyhow::bail!("unexpected output from rcpd (expected RCP_TLS or RCP_TCP): {line}"),
-        };
-    let addr = addr
-        .parse()
-        .with_context(|| format!("invalid address in rcpd readiness record: {addr}"))?;
+    let (fingerprint, files_token, connections_token) = match (kind, parts.as_slice()) {
+        ("RCP_READY", ["-", files, connections]) => (None, files, connections),
+        ("RCP_READY", [fingerprint, files, connections]) => (
+            Some(tls::fingerprint_from_hex(fingerprint).with_context(|| {
+                format!("invalid fingerprint in RCP_READY line: {fingerprint}")
+            })?),
+            files,
+            connections,
+        ),
+        ("RCP_READY", _) => anyhow::bail!("invalid RCP_READY line from rcpd: {line}"),
+        _ => anyhow::bail!("unexpected output from rcpd (expected RCP_READY): {line}"),
+    };
     let files_in_flight = parse_files_in_flight(files_token)?;
     let max_connections = connections_token.parse::<usize>().with_context(|| {
         format!("invalid effective stream count in rcpd readiness record: {connections_token}")
@@ -2600,8 +2609,7 @@ fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
     let max_connections = std::num::NonZeroUsize::new(max_connections).with_context(|| {
         format!("invalid zero stream count in rcpd readiness record: {connections_token}")
     })?;
-    Ok(RcpdConnectionInfo {
-        addr,
+    Ok(RcpdReadiness {
         fingerprint,
         files_in_flight,
         max_connections,
@@ -2619,7 +2627,7 @@ impl std::fmt::Display for RcpdStartupRefusal {
 
 impl std::error::Error for RcpdStartupRefusal {}
 
-fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
+fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdReadiness> {
     let refusal_token = RCPD_STARTUP_ERROR_PREFIX.trim_end();
     let diagnostic = if line == refusal_token {
         Some("")
@@ -2639,18 +2647,17 @@ fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
     parse_rcpd_readiness(line)
 }
 
-async fn read_rcpd_startup_record<R>(reader: &mut R) -> anyhow::Result<RcpdConnectionInfo>
+async fn read_rcpd_startup_record<R>(reader: &mut R) -> anyhow::Result<RcpdReadiness>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     use tokio::io::AsyncBufReadExt;
-
     let mut bytes = Vec::new();
     loop {
         let available = reader
             .fill_buf()
             .await
-            .context("failed to read connection info from rcpd")?;
+            .context("failed to read readiness record from rcpd")?;
         if available.is_empty() {
             if bytes.is_empty() {
                 anyhow::bail!("rcpd exited before writing a readiness record");
@@ -2673,22 +2680,37 @@ where
     }
     let line = String::from_utf8(bytes).context("rcpd readiness record is not valid UTF-8")?;
     let line = line.trim();
-    tracing::debug!("rcpd connection line: {line}");
+    tracing::debug!("rcpd readiness line: {line}");
     parse_rcpd_startup_record(line)
 }
 
 /// Result of starting an rcpd process.
 ///
-/// Dropping it closes the SSH child channel and aborts both owned output collectors.
+/// Dropping it closes any untaken SSH stdio pipes, closes the SSH child channel, and aborts the
+/// owned stderr collector.
 pub struct RcpdProcess {
-    /// SSH child process handle
+    /// Stdin pipe to the remote daemon until taken by the master control loop.
+    stdin: Option<openssh::ChildStdin>,
+    /// Stdout pipe from the remote daemon until taken by the master stdout demux loop.
+    stdout: Option<openssh::ChildStdout>,
+    /// SSH child process handle.
     child: Option<openssh::Child<ManagedSshSession>>,
-    /// Connection info (address and optional fingerprint)
-    pub conn_info: RcpdConnectionInfo,
+    /// Readiness metadata reported by the daemon (optional TLS fingerprint and concurrency limits).
+    pub readiness: RcpdReadiness,
     /// Handle for the bounded stderr collector.
     stderr_drain: Option<AbortOnDropTask<CapturedOutput>>,
-    /// Handle for the bounded stdout collector.
-    stdout_drain: Option<AbortOnDropTask<CapturedOutput>>,
+}
+
+impl RcpdProcess {
+    /// Take ownership of the daemon's SSH stdin and stdout pipes for binary master↔rcpd framing.
+    ///
+    /// Returns an error if the pipes have already been taken.
+    pub fn take_stdio(&mut self) -> anyhow::Result<(openssh::ChildStdin, openssh::ChildStdout)> {
+        let (Some(stdin), Some(stdout)) = (self.stdin.take(), self.stdout.take()) else {
+            anyhow::bail!("rcpd stdio pipes have already been taken");
+        };
+        Ok((stdin, stdout))
+    }
 }
 
 #[derive(Clone)]
@@ -2699,6 +2721,7 @@ pub struct PreparedRcpd {
 }
 
 /// Prepare two endpoints with a caller-selected remote bootstrap timeout.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_rcpd_endpoints_with_timeout(
     source: &SshSession,
     destination: &SshSession,
@@ -2706,6 +2729,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
     auto_deploy_rcpd: bool,
     cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
+    keepalive_sec: u64,
     local_operand_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     let control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]> =
@@ -2718,6 +2742,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
             PreparationContext::uncancelled(cleanup.clone())
                 .with_control_directory_exclusions(control_directory_exclusions),
             bootstrap_timeout,
+            keepalive_sec,
         )
         .await?;
         return Ok((prepared.clone(), prepared));
@@ -2732,6 +2757,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 auto_deploy_rcpd,
                 preparation.with_control_directory_exclusions(source_control_directory_exclusions),
                 bootstrap_timeout,
+                keepalive_sec,
             )
         },
         move |preparation| {
@@ -2741,6 +2767,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 auto_deploy_rcpd,
                 preparation.with_control_directory_exclusions(control_directory_exclusions),
                 bootstrap_timeout,
+                keepalive_sec,
             )
         },
     )
@@ -2856,6 +2883,7 @@ async fn prepare_rcpd_with_context(
     auto_deploy_rcpd: bool,
     preparation: PreparationContext,
     bootstrap_timeout: std::time::Duration,
+    keepalive_sec: u64,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
@@ -2863,6 +2891,7 @@ async fn prepare_rcpd_with_context(
         session,
         &preparation,
         BootstrapDeadline::new(bootstrap_timeout),
+        keepalive_sec,
     )
     .await?;
     let rcpd_path = match try_discover_and_check_version(
@@ -2959,8 +2988,8 @@ impl PreparedRcpd {
         );
         let mut cmd = openssh::Session::to_command(self.session.clone(), &self.rcpd_path);
         cmd.args(rcpd_args);
-        // configure stdin/stdout/stderr
-        // stdin must be piped so rcpd can monitor it for master disconnection (stdin watchdog)
+        // configure stdin/stdout/stderr: stdin and stdout carry the framed master↔rcpd control and
+        // tracing protocol, while stderr carries the initial RCP_READY record and diagnostic text
         cmd.stdin(openssh::Stdio::piped());
         cmd.stdout(openssh::Stdio::piped());
         cmd.stderr(openssh::Stdio::piped());
@@ -2972,10 +3001,8 @@ impl PreparedRcpd {
         let mut child = PreparationContext::uncancelled(self.session.cleanup())
             .run_abortable_with_deadline(spawn, "spawning rcpd command", startup_deadline)
             .await?;
-        // read connection info from rcpd's stderr
-        // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
-        // rcpd doesn't display progress bars locally - it sends progress data over the network)
-        // format: "RCP_TLS <addr> <fingerprint> <F> <E>" or "RCP_TCP <addr> <F> <E>"
+        // read readiness metadata from rcpd's stderr
+        // format: "RCP_READY <hex_fp|-> <F> <E>"
         let Some(stderr) = child.stderr().take() else {
             let error = anyhow::anyhow!("rcpd stderr not available");
             let diagnostic = reap_failed_rcpd(child, &session.host, None).await;
@@ -2988,37 +3015,42 @@ impl PreparedRcpd {
                 read_rcpd_startup_record(&mut stderr_reader),
             )
             .await;
-        let conn_info = match startup {
-            Ok(conn_info) => conn_info,
+        let readiness = match startup {
+            Ok(readiness) => readiness,
             Err(error) => {
                 let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
                 return Err(attach_startup_diagnostic(error, diagnostic));
             }
         };
-        // drain both streams concurrently so the daemon cannot block on a full pipe; retain only a
-        // bounded tail for completion diagnostics
+        let Some(stdin) = child.stdin().take() else {
+            let error = anyhow::anyhow!("rcpd stdin not available");
+            let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
+            return Err(attach_startup_diagnostic(error, diagnostic));
+        };
+        let Some(stdout) = child.stdout().take() else {
+            drop(stdin);
+            let error = anyhow::anyhow!("rcpd stdout not available");
+            let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
+            return Err(attach_startup_diagnostic(error, diagnostic));
+        };
+        // drain stderr concurrently so the daemon cannot block on a full pipe; retain only a
+        // bounded tail for completion diagnostics (stdout is owned by the binary protocol demux)
         let stderr_drain = AbortOnDropTask::new(tokio::spawn(drain_rcpd_output(
             stderr_reader,
             session.host.clone(),
             "stderr",
         )));
-        let stdout_drain = child.stdout().take().map(|stdout| {
-            AbortOnDropTask::new(tokio::spawn(drain_rcpd_output(
-                stdout,
-                session.host.clone(),
-                "stdout",
-            )))
-        });
         tracing::info!(
-            "rcpd listening on {} (encryption={})",
-            conn_info.addr,
-            conn_info.fingerprint.is_some()
+            "rcpd ready on {} (encryption={})",
+            session.host,
+            readiness.fingerprint.is_some()
         );
         Ok(RcpdProcess {
+            stdin: Some(stdin),
+            stdout: Some(stdout),
             child: Some(child),
-            conn_info,
+            readiness,
             stderr_drain: Some(stderr_drain),
-            stdout_drain,
         })
     }
 }
@@ -3483,7 +3515,7 @@ pub const TCP_KEEPALIVE_RETRIES: u32 = 6;
 /// therefore only safe on a connection that application backpressure never legitimately blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionKind {
-    /// Protocol messages: master↔rcpd (control and tracing) and source↔destination control.
+    /// Protocol messages: source↔destination control.
     /// Reads are driven by a dispatch loop that does not block on transfer-sized work.
     Control,
     /// Pooled source→destination bulk file transfer, where the receiver legitimately stops
@@ -3618,12 +3650,11 @@ fn unmark_receive_buffer(socket: &socket2::SockRef<'_>) {
 ///
 /// `keepalive_sec` is the budget for noticing that the peer's HOST has vanished (power loss,
 /// severed link, destroyed VM). Such a peer sends neither FIN nor RST, so an await on it never
-/// completes — the master waiting for `RcpdResult` hangs forever, and so do the control reads on
-/// both rcpds. Two options cover different halves of that, and `kind` decides which apply:
+/// completes — the control reads on source and destination hang forever. Two options cover
+/// different halves of that, and `kind` decides which apply:
 ///
 /// - `SO_KEEPALIVE` (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`), on EVERY connection, probes an
-///   IDLE one — the awaiting-`RcpdResult` case, the control streams generally, and a data
-///   connection between transfers.
+///   IDLE one — source↔destination control streams and data connections between transfers.
 /// - `TCP_USER_TIMEOUT`, on [`ConnectionKind::Control`] ONLY, bounds how long UNACKED data may
 ///   stay outstanding. Keepalive never fires while data is in flight, so without it the kernel
 ///   retransmits for roughly 15 minutes (`tcp_retries2`) before giving up.
@@ -3820,7 +3851,6 @@ mod tests {
                 tokio_console: false,
                 tokio_console_port: None,
                 encryption: false,
-                master_cert_fingerprint: None,
             }
         }
 
@@ -3836,6 +3866,7 @@ mod tests {
                 auto_deploy_rcpd,
                 PreparationContext::uncancelled(cleanup.clone()),
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
         }
@@ -3926,6 +3957,7 @@ mod tests {
                 &SshSession::local(),
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
             .expect("localhost SSH must be available");
@@ -3959,6 +3991,7 @@ mod tests {
                 &SshSession::local(),
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4006,6 +4039,7 @@ mod tests {
                 &SshSession::local(),
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4042,6 +4076,7 @@ mod tests {
                 &SshSession::local(),
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4079,6 +4114,7 @@ mod tests {
                 &SshSession::local(),
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4142,6 +4178,7 @@ mod tests {
                     false,
                     PreparationContext::uncancelled(cleanup.clone()),
                     std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
+                    config.remote_keepalive_sec,
                 )
                 .await?
                 .spawn(&config, None, protocol::RcpdRole::Source)
@@ -4283,7 +4320,7 @@ mod tests {
                 .to_json()
                 .unwrap();
             let contents = format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf 'probe\\n' >> {}\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\ncat >/dev/null\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf 'probe\\n' >> {}\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\ncat >/dev/null\n",
                 shell_escape(marker.to_str().unwrap()),
                 shell_escape(&version),
             );
@@ -4335,7 +4372,7 @@ mod tests {
                 .to_json()
                 .unwrap();
             let contents = format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\nprintf '%s\\n' 'daemon stdout detail'\nprintf '%s\\n' 'daemon stderr detail' >&2\nexit 42\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\nprintf '%s\\n' 'daemon stderr detail' >&2\nexit 42\n",
                 shell_escape(&version),
             );
             std::fs::write(&script, contents).unwrap();
@@ -4356,10 +4393,6 @@ mod tests {
                 .unwrap();
             let error = wait_for_rcpd_process(process).await.unwrap_err();
             let error = format!("{error:#}");
-            assert!(
-                error.contains("daemon stdout detail"),
-                "stdout diagnostic missing: {error}"
-            );
             assert!(
                 error.contains("daemon stderr detail"),
                 "stderr diagnostic missing: {error}"
@@ -4478,19 +4511,19 @@ mod tests {
         let fingerprint_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let cases = [
             (
-                "RCP_TCP 127.0.0.1:1234 8 8".to_string(),
+                "RCP_READY - 8 8".to_string(),
                 common::ConcurrencyLimit::Limited(nonzero(8)),
                 nonzero(8),
                 None,
             ),
             (
-                "RCP_TCP 127.0.0.1:1234 unlimited 100".to_string(),
+                "RCP_READY - unlimited 100".to_string(),
                 common::ConcurrencyLimit::Unlimited,
                 nonzero(100),
                 None,
             ),
             (
-                format!("RCP_TLS 127.0.0.1:1234 {fingerprint_hex} 32 16"),
+                format!("RCP_READY {fingerprint_hex} 32 16"),
                 common::ConcurrencyLimit::Limited(nonzero(32)),
                 nonzero(16),
                 Some(tls::fingerprint_from_hex(fingerprint_hex).unwrap()),
@@ -4498,25 +4531,88 @@ mod tests {
         ];
         for (record, expected_files, expected_streams, expected_fingerprint) in cases {
             let parsed = parse_rcpd_readiness(&record).unwrap();
-            assert_eq!(parsed.addr, "127.0.0.1:1234".parse().unwrap());
             assert_eq!(parsed.fingerprint, expected_fingerprint);
             assert_eq!(parsed.files_in_flight, expected_files);
             assert_eq!(parsed.max_connections, expected_streams);
+            let concurrency =
+                resolve_remote_concurrency(expected_files, expected_streams, nonzero(1)).unwrap();
+            assert_eq!(
+                format_rcpd_readiness(expected_fingerprint.as_ref(), concurrency),
+                record
+            );
         }
     }
 
     #[test]
-    fn readiness_records_reject_invalid_limit_tokens() {
+    fn readiness_records_reject_invalid_limit_tokens_and_legacy_formats() {
         for record in [
-            "RCP_TCP 127.0.0.1:1234 0 1",
-            "RCP_TCP 127.0.0.1:1234 automatic 1",
-            "RCP_TCP 127.0.0.1:1234 1 0",
+            "RCP_READY - 0 1",
+            "RCP_READY - automatic 1",
+            "RCP_READY - 1 0",
+            "RCP_READY not-a-fingerprint 1 1",
+            "RCP_READY - 4",
+            "RCP_READY - 4 4 extra",
+            "RCP_TCP 127.0.0.1:1234 4 4",
+            "RCP_TLS 127.0.0.1:1234 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 4 4",
         ] {
             assert!(
                 parse_rcpd_readiness(record).is_err(),
                 "invalid readiness record was accepted: {record}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_master_args_configure_server_alive_for_keepalive_budget() {
+        let session = SshSession::local();
+        let log = std::path::Path::new("/tmp/log");
+        let socket = std::path::Path::new("/tmp/master");
+        let disabled: Vec<String> = ssh_master_args(&session, log, socket, 0)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            disabled
+                .windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveInterval=0"]),
+            "keepalive_sec=0 must explicitly disable ServerAliveInterval: {disabled:?}"
+        );
+        assert!(
+            !disabled
+                .iter()
+                .any(|arg| arg.starts_with("ServerAliveCountMax=")),
+            "keepalive_sec=0 must not pass ServerAliveCountMax: {disabled:?}"
+        );
+        let fast: Vec<String> = ssh_master_args(&session, log, socket, 5)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            fast.windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveInterval=1"]),
+            "keepalive_sec=5 should use ServerAliveInterval=1: {fast:?}"
+        );
+        assert!(
+            fast.windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveCountMax=5"]),
+            "keepalive_sec=5 should use ServerAliveCountMax=5: {fast:?}"
+        );
+        let default_args: Vec<String> = ssh_master_args(&session, log, socket, 120)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            default_args
+                .windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveInterval=20"]),
+            "keepalive_sec=120 should use ServerAliveInterval=20: {default_args:?}"
+        );
+        assert!(
+            default_args
+                .windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveCountMax=6"]),
+            "keepalive_sec=120 should use ServerAliveCountMax=6: {default_args:?}"
+        );
     }
 
     #[tokio::test]
@@ -4581,6 +4677,7 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
         });
@@ -4696,6 +4793,7 @@ mod tests {
             &preparation,
             &launcher,
             BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
+            DEFAULT_REMOTE_KEEPALIVE_SEC,
         )
         .await
         .unwrap();
@@ -4751,6 +4849,7 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(std::time::Duration::from_millis(500)),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             )
             .await
         });
@@ -4841,6 +4940,7 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
             ))
             .unwrap();
         let pid = std::fs::read_to_string(&pid_file).unwrap();

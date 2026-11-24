@@ -586,7 +586,7 @@ fn assert_direct_rcpd_readiness_first(extra: &[String]) -> std::process::Output 
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("rcpd must announce its listener before the watchdog deadline");
     assert!(
-        first_stderr.starts_with("RCP_TCP "),
+        first_stderr.starts_with("RCP_READY "),
         "readiness must own the first stderr line, got {first_stderr:?}"
     );
     drop(child.stdin.take());
@@ -622,6 +622,77 @@ fn test_remote_direct_rcpd_tokio_console_leaves_connection_record_on_stderr() {
         "--tokio-console".to_string(),
         "--tokio-console-port=0".to_string(),
     ]);
+}
+
+#[test]
+fn test_remote_direct_rcpd_exits_when_master_stdin_heartbeats_stop() {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcpd"))
+        .args([
+            "--role=source",
+            "--remote-keepalive-sec=1",
+            "--remote-copy-conn-timeout-sec=15",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rcpd must start with encryption enabled and no --master-cert-fp");
+    let stderr = child.stderr.take().expect("rcpd stderr must be piped");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = line_tx.send(line);
+    });
+    let first_stderr = line_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("rcpd must announce readiness");
+    let parts: Vec<&str> = first_stderr.split_whitespace().collect();
+    assert_eq!(parts.first().copied(), Some("RCP_READY"));
+    assert_eq!(
+        parts.get(1).map(|fp| fp.len()),
+        Some(64),
+        "encrypted rcpd must emit a 64-hex SHA-256 fingerprint, got {first_stderr:?}"
+    );
+    // keep stdin open without sending any hello or heartbeat: rcpd must time out under
+    // --remote-keepalive-sec=1 rather than hanging for --remote-copy-conn-timeout-sec=15
+    let _keep_stdin_open = child.stdin.take();
+    let started = std::time::Instant::now();
+    let output = child
+        .wait_with_output()
+        .expect("rcpd must exit after keepalive timeout");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rcpd should exit cleanly with code 1 (not abort on closed stderr) when heartbeats stop: {:?}",
+        output.status
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "rcpd took too long to time out on missing heartbeats: {:?}",
+        started.elapsed()
+    );
+    // stdout must carry only valid framed RcpdToMaster messages (empty or startup tracing frames),
+    // never stray plaintext error output
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut stream = remote::streams::RecvStream::new(std::io::Cursor::new(output.stdout));
+        while let Some(frame) = stream
+            .recv_object::<remote::protocol::RcpdToMaster>()
+            .await
+            .expect("rcpd stdout must contain only valid binary RcpdToMaster frames")
+        {
+            assert!(
+                matches!(frame, remote::protocol::RcpdToMaster::Tracing(_)),
+                "unexpected non-tracing frame before MasterHello: {frame:?}"
+            );
+        }
+    });
 }
 
 /// Test that --help output is generated without errors

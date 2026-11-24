@@ -1,9 +1,9 @@
 //! TLS support for encrypted and authenticated connections.
 //!
-//! This module provides certificate generation and TLS configuration for:
-//! - Master↔rcpd connections (rcpd is server; mutual fingerprint verification — master
-//!   verifies rcpd's server cert, rcpd verifies master's client cert)
-//! - Source↔Destination connections (source is server; mutual TLS with client certificates)
+//! This module provides certificate generation and mutual-TLS configuration for
+//! Source↔Destination connections (source is server; destination presents a client certificate,
+//! and both sides verify each other's SSH-distributed certificate fingerprints). Master↔rcpd
+//! control and tracing travel directly over SSH stdio and do not use TLS.
 use anyhow::Context;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -111,9 +111,7 @@ fn create_server_config(cert_key: &CertifiedKey) -> anyhow::Result<Arc<ServerCon
 
 /// Creates a TLS server config with client certificate verification.
 ///
-/// Used for all production TLS servers: rcpd's master-facing listener (verifies master's
-/// client cert against `--master-cert-fp`) and source's listeners for the destination
-/// (verifies destination's client cert).
+/// Used for source's listeners for the destination (verifies destination's client cert).
 pub fn create_server_config_with_client_auth(
     cert_key: &CertifiedKey,
     expected_client_fingerprint: Fingerprint,
@@ -149,9 +147,8 @@ fn create_client_config(expected_server_fingerprint: Fingerprint) -> Arc<ClientC
 
 /// Creates a TLS client config with a client certificate.
 ///
-/// Used for all production TLS clients: master→rcpd connections (master presents its
-/// certificate for rcpd to verify) and destination→source connections (destination
-/// presents its certificate for source to verify).
+/// Used for destination→source connections (destination presents its certificate for source to
+/// verify).
 pub fn create_client_config_with_cert(
     client_cert_key: &CertifiedKey,
     expected_server_fingerprint: Fingerprint,
@@ -399,8 +396,6 @@ pub async fn connect_bounded(
 /// SNI placeholder for destination→source connections. Authentication is by certificate
 /// fingerprint, so the name itself is never checked.
 pub const SERVER_NAME_SOURCE: &str = "rcp";
-/// SNI placeholder for master→rcpd connections.
-pub const SERVER_NAME_RCPD: &str = "rcpd";
 
 fn split_into_streams(
     write_half: crate::streams::BoxedWrite,

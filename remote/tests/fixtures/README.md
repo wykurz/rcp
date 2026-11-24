@@ -1,7 +1,7 @@
 # Remote wire fixtures
 
-`wire-v12.txt` records named, fixed bitcode payloads (hexadecimal, one message per line) for
-`remote::version::WIRE_REVISION = 12`. `wire_compatibility.rs` selects the fixture set by revision;
+`wire-v13.txt` records named, fixed bitcode payloads (hexadecimal, one message per line) for
+`remote::version::WIRE_REVISION = 13`. `wire_compatibility.rs` selects the fixture set by revision;
 an unrecognized revision fails even if its bytes have not changed. The tests encode deterministic
 values to those bytes and separately decode the stored bytes to named field values, compared through
 Serde JSON values. They never regenerate fixtures while testing.
@@ -12,13 +12,14 @@ Run from the repository root, inside `nix develop` when needed:
 just test -p rcp-tools-remote --test wire_compatibility
 ```
 
-The samples cover both master hello variants, source readiness, tracing/control hello roles, success
-and failure results, directory limits, every source/destination control variant, file headers, and
-tracing log/progress messages. Nested samples include populated copy/removal summaries, all nonzero
-runtime statistics, distinct metadata fields, unknown/captured/absent ACLs, filters, preserve
-settings, all dry-run modes, optional fingerprints, IPv4/IPv6, and UTF-8 paths. ACL blobs are opaque
-byte samples; no kernel ACL operation is exercised. Fixtures use explicit values rather than runtime
-statistics, filesystem metadata, clocks, or production defaults.
+The samples cover `MasterToRcpd` envelopes (both `MasterHello` variants and `Heartbeat`),
+`RcpdToMaster` envelopes (source readiness, success and failure results, and tracing log/progress
+messages), directory limits, every source/destination control variant, and file headers. Nested
+samples include populated copy/removal summaries, all nonzero runtime statistics, distinct metadata
+fields, unknown/captured/absent ACLs, filters, preserve settings, all dry-run modes, optional
+fingerprints, IPv4/IPv6, and UTF-8 paths. ACL blobs are opaque byte samples; no kernel ACL operation
+is exercised. Fixtures use explicit values rather than runtime statistics, filesystem metadata,
+clocks, or production defaults.
 
 ## Maintaining compatibility
 

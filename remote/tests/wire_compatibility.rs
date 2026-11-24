@@ -16,7 +16,7 @@ struct Fixtures {
 impl Fixtures {
     fn new(direction: Direction) -> Self {
         let text = match remote::version::WIRE_REVISION {
-            12 => include_str!("fixtures/wire-v12.txt"),
+            13 => include_str!("fixtures/wire-v13.txt"),
             revision => panic!(
                 "wire revision {revision} needs reviewed fixtures; see remote/tests/fixtures/README.md"
             ),
@@ -156,19 +156,19 @@ fn check_messages(direction: Direction) {
     ] {
         fixtures.check(
             name,
-            MasterHello::Source {
+            MasterToRcpd::Hello(MasterHello::Source {
                 src: "/src/α".into(),
                 dst: "/dst/b".into(),
                 dest_cert_fingerprint: Some(std::array::from_fn(|i| i as u8)),
                 filter: Some(filter.clone()),
                 dry_run,
                 capture,
-            },
+            }),
         );
     }
     fixtures.check(
         "master-source-none",
-        MasterHello::Source {
+        MasterToRcpd::Hello(MasterHello::Source {
             src: "/source".into(),
             dst: "/destination".into(),
             dest_cert_fingerprint: None,
@@ -179,7 +179,7 @@ fn check_messages(direction: Direction) {
                 dir_acl: false,
                 root_acl_notice: false,
             },
-        },
+        }),
     );
     for (name, fingerprint, dry_run) in [
         (
@@ -191,7 +191,7 @@ fn check_messages(direction: Direction) {
     ] {
         fixtures.check(
             name,
-            MasterHello::Destination {
+            MasterToRcpd::Hello(MasterHello::Destination {
                 source_control_addr: "192.0.2.7:2345".parse().unwrap(),
                 source_data_addr: "[2001:db8::1234]:3456".parse().unwrap(),
                 server_name: "source.example".into(),
@@ -224,38 +224,33 @@ fn check_messages(direction: Direction) {
                 },
                 source_cert_fingerprint: fingerprint,
                 dry_run,
-            },
+            }),
         );
     }
+    fixtures.check("master-heartbeat", MasterToRcpd::Heartbeat);
     fixtures.check(
         "source-master",
-        SourceMasterHello {
+        RcpdToMaster::SourceHello(SourceMasterHello {
             control_addr: "[2001:db8::5678]:4567".parse().unwrap(),
             data_addr: "198.51.100.9:5678".parse().unwrap(),
             server_name: "data.example".into(),
-        },
+        }),
     );
-    for (name, role, is_tracing) in [
-        ("hello-source-control", RcpdRole::Source, false),
-        ("hello-destination-tracing", RcpdRole::Destination, true),
-    ] {
-        fixtures.check(name, TracingHello { role, is_tracing });
-    }
     fixtures.check(
         "result-success",
-        RcpdResult::Success {
+        RcpdToMaster::Result(RcpdResult::Success {
             message: "copied α".into(),
             summary: summary(),
             runtime_stats: runtime_stats(),
-        },
+        }),
     );
     fixtures.check(
         "result-failure",
-        RcpdResult::Failure {
+        RcpdToMaster::Result(RcpdResult::Failure {
             error: "copy failed: permission denied".into(),
             summary: summary(),
             runtime_stats: runtime_stats(),
-        },
+        }),
     );
     fixtures.check(
         "directory-limits",
@@ -413,37 +408,39 @@ fn check_messages(direction: Direction) {
     let timestamp = std::time::UNIX_EPOCH + std::time::Duration::new(1700000123, 456789123);
     fixtures.check(
         "tracing-log",
-        common::remote_tracing::TracingMessage::Log {
+        RcpdToMaster::Tracing(common::remote_tracing::TracingMessage::Log {
             timestamp,
             level: "WARN".into(),
             target: "rcp::wire".into(),
             message: "example α".into(),
-        },
+        }),
     );
     fixtures.check(
         "tracing-progress",
-        common::remote_tracing::TracingMessage::Progress(common::progress::SerializableProgress {
-            ops_started: 101,
-            ops_finished: 99,
-            bytes_copied: 0x6789abcde,
-            hard_links_created: 2,
-            files_copied: 3,
-            symlinks_created: 4,
-            directories_created: 5,
-            files_unchanged: 6,
-            symlinks_unchanged: 7,
-            directories_unchanged: 8,
-            hard_links_unchanged: 9,
-            files_removed: 10,
-            symlinks_removed: 11,
-            directories_removed: 12,
-            bytes_removed: 0x789abcdef,
-            files_skipped: 13,
-            symlinks_skipped: 14,
-            directories_skipped: 15,
-            specials_skipped: 16,
-            current_time: timestamp,
-        }),
+        RcpdToMaster::Tracing(common::remote_tracing::TracingMessage::Progress(
+            common::progress::SerializableProgress {
+                ops_started: 101,
+                ops_finished: 99,
+                bytes_copied: 0x6789abcde,
+                hard_links_created: 2,
+                files_copied: 3,
+                symlinks_created: 4,
+                directories_created: 5,
+                files_unchanged: 6,
+                symlinks_unchanged: 7,
+                directories_unchanged: 8,
+                hard_links_unchanged: 9,
+                files_removed: 10,
+                symlinks_removed: 11,
+                directories_removed: 12,
+                bytes_removed: 0x789abcdef,
+                files_skipped: 13,
+                symlinks_skipped: 14,
+                directories_skipped: 15,
+                specials_skipped: 16,
+                current_time: timestamp,
+            },
+        )),
     );
     fixtures.finish();
 }

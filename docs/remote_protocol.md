@@ -24,13 +24,14 @@ The remote copy system consists of three distinct components:
 2. Master validates pure configuration, then prepares compatible source and destination rcpd
    endpoints. Equal `SshSession` values share one preparation; distinct endpoints may prepare
    concurrently.
-3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source --master-cert-fp=... ...`
-4. Source creates a TCP listener and prints `RCP_TLS <addr> <fingerprint> <F> <E>` (or
-   `RCP_TCP <addr> <F> <E>` when encryption is disabled) as the first stderr record. The master
-   immediately opens source control and tracing connections.
+3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source ...`
+4. Source emits `RCP_READY <hex_fingerprint|-> <F> <E>` as the first stderr record (`-` when
+   `--no-encryption` disables source↔destination TLS) and switches its SSH `stdin`/`stdout` pipes to
+   binary framed protocol I/O (redirecting process fd 1 to `stderr` so stray writes cannot corrupt
+   framing). The master immediately starts the source stdout demux and stdin heartbeat tasks.
 5. Master constructs the destination configuration from source readiness, spawns destination rcpd,
-   verifies its readiness reports the same `F/E`, and opens destination control and tracing
-   connections.
+   verifies its readiness reports the same `F/E` and encryption mode, and starts the destination
+   stdout demux and stdin heartbeat tasks.
 
 **Propagated security flags:** When the master runs with `--require-toctou-safe`, it mirrors the
 flag into each rcpd's spawn arguments (via `RcpdConfig::to_args()`). Each rcpd then arms strict
@@ -62,9 +63,10 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 12 adds context switch and page fault counts to the statistics a daemon reports with its
-result, following revision 11's receiver copy-buffer retention configuration at daemon startup. It
-requires exact-version rcp/rcpd binaries.
+revision 13 moves master↔rcpd control and tracing onto the SSH exec channel's framed
+`stdin`/`stdout` pipes (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), removing the master-facing TCP
+listener and `--master-cert-fp`, following revision 12's process statistics counters and revision
+11's receiver copy-buffer retention configuration. It requires exact-version rcp/rcpd binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
 and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
@@ -122,7 +124,9 @@ before its local SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
-SSH configuration from forking it away from its owner. Cancelling setup aborts that owner and
+SSH configuration from forking it away from its owner, and `ServerAliveInterval` /
+`ServerAliveCountMax` (or `ServerAliveInterval=0` when `--remote-keepalive-sec=0`) enforce the
+configured keepalive budget on the SSH transport. Cancelling setup aborts that owner and
 `kill_on_drop` terminates the actual connecting process. The configured SSH executable is resolved
 inside a known-local shell child. Brackets that delimit IPv6 in an rcp operand are removed from the
 direct OpenSSH host argument; leaving them in argv makes OpenSSH resolve the brackets as literal
@@ -178,70 +182,71 @@ line for exactly one readiness record. The master bounds both SSH exec-channel c
 read by `--remote-copy-conn-timeout-sec`, and rejects a record larger than 64 KiB. Chrome-trace,
 flamegraph, Tokio-console, legacy-option, and explicit concurrency-clamp announcements are collected
 until tracing is installed and emitted through the default-visible `rcp::notice` target. Remote
-tracing queues daemon notices until the master connects, so they reach master output without
-becoming readiness preamble. An intentional fatal startup refusal instead emits one
-`RCP_ERROR <diagnostic>` record and exits, including configuration failures found before tracing is
-installed. The master treats that typed record as a nested failure cause, closes its stdin, and
-gives a directly owned reaper a bounded grace before returning. The SSH child and both output drains
-remain lexically inside that timeout future, so grace expiry or caller cancellation drops them and
-releases the managed session instead of detaching ownership. If startup fails without a typed
-record, captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr
-remains an invalid readiness record. After readiness, stdout/stderr collectors forward raw daemon
-output at debug verbosity as it arrives and retain only a bounded tail. They are joined on daemon
-completion, so a nonzero exit keeps diagnostics without allowing unbounded output to grow in memory
-or leaving collector tasks detached. An explicit `F` reduced by `M`, an automatic `F` reduced by an
-explicit `M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by endpoint
+tracing queues daemon notices until the daemon's SSH stdout writer starts right after `RCP_READY`,
+so they reach master output without becoming readiness preamble. An intentional fatal startup
+refusal instead emits one `RCP_ERROR <diagnostic>` record and exits, including configuration
+failures found before tracing is installed. The master treats that typed record as a nested failure
+cause, closes its stdin, and gives a directly owned reaper a bounded grace before returning. The SSH
+child and both output drains remain lexically inside that timeout future, so grace expiry or caller
+cancellation drops them and releases the managed session instead of detaching ownership. If startup
+fails without a typed record, captured stdout and remaining stderr are attached to the handshake
+error. Arbitrary stderr remains an invalid readiness record. After readiness, `stdout` carries the
+framed binary `RcpdToMaster` stream while the stderr collector forwards raw daemon stderr at debug
+verbosity as it arrives and retains only a bounded tail. It is joined on daemon completion, so a
+nonzero exit keeps stderr diagnostics without allowing unbounded output to grow in memory or leaving
+a collector task detached. An explicit `F` reduced by `M`, an automatic `F` reduced by an explicit
+`M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by endpoint
 descriptor safety produces a notice naming the requested and effective values. The ordinary
-automatic/default intersection remains quiet. The master retains the source process before
-attempting its control/tracing connections and waits for daemon cleanup if either connection fails.
-It starts the source tracing receiver as soon as its tracing connection is established, before
-destination configuration or startup. Every later startup and protocol exit closes the control
-streams, waits for owned daemon processes, and gives tracing receivers a bounded drain, so
-already-queued source notices remain visible alongside a destination failure rather than being
-dropped during unwinding.
+automatic/default intersection remains quiet. The master retains the source process and starts its
+stdout demux immediately after readiness, before destination configuration or startup. Every later
+startup and protocol exit closes daemon stdin, waits for owned daemon processes, and gives stdout
+demux tasks a bounded drain, so already-queued source notices remain visible alongside a destination
+failure rather than being dropped during unwinding.
 
 ### 1.3 Connection Topology
 
-The system uses a **triangle topology** with TCP connections:
+The system uses a **triangle topology** combining SSH exec stdio (Master ↔ daemons) with direct TCP
+connections (Source ↔ Destination):
 
 ![Triangle topology: master, source, destination](assets/remote_architecture.svg)
 
 <details>
 <summary>Text transcript</summary>
 
-The diagram distinguishes the SSH bootstrap from the rcp TCP connections and shows every
-application-data direction:
+The diagram distinguishes the Master ↔ rcpd SSH exec channels from the Source ↔ Destination TCP
+connections and shows every application-data direction:
 
-1. Master uses SSH to start source rcpd. It reports its listener address, optional TLS fingerprint,
-   logical file ceiling `F`, and effective stream count `E` back to master on SSH stderr.
-2. Master opens source rcpd's bidirectional control TCP connection and separate tracing/progress
-   connection, dropping the tracing send half.
-3. Master starts destination rcpd with source `F/E`, verifies its readiness, and opens destination's
-   control and tracing/progress connections in the same way.
+1. Master uses SSH to start source rcpd. It reports its optional TLS fingerprint (for
+   source↔destination mTLS), logical file ceiling `F`, and effective stream count `E` back to master
+   in `RCP_READY` on SSH stderr.
+2. Master uses the source SSH exec channel's `stdin` (`MasterToRcpd`: `MasterHello` and periodic
+   `Heartbeat`) and `stdout` (`RcpdToMaster`: `SourceHello`, `RcpdResult`, and `Tracing`) for
+   control and tracing/progress.
+3. Master starts destination rcpd with source `F/E`, verifies its readiness matches, and uses the
+   destination SSH exec channel's `stdin`/`stdout` in the same way.
 4. Master sends `MasterHello::Source`; source returns `SourceMasterHello` and later `RcpdResult`.
 5. Master sends `MasterHello::Destination`; destination later returns `RcpdResult`.
-6. Destination opens the source/destination bidirectional control connection. Directory and symlink
-   messages flow source → destination; manifests, directory acknowledgements, and `DestinationDone`
-   flow destination → source.
-7. For copy operations, destination also opens the pooled data connections to source. File headers
-   and bytes flow only source → destination and never through master. A dry run uses only control
-   connections and starts no destination data workers.
+6. Destination opens the source/destination bidirectional TCP control connection. Directory and
+   symlink messages flow source → destination; manifests, directory acknowledgements, and
+   `DestinationDone` flow destination → source.
+7. For copy operations, destination also opens the pooled TCP data connections to source. File
+   headers and bytes flow only source → destination and never through master. A dry run uses only
+   control connections and starts no destination data workers.
 
-By default every rcp TCP connection uses TLS 1.3 and certificate-fingerprint authentication. The
-`--no-encryption` option disables TLS and certificate authentication on every rcp TCP connection;
-SSH remains protected and still launches rcpd and carries its listener announcement.
+By default, every Source ↔ Destination TCP connection uses TLS 1.3 and mutual
+certificate-fingerprint authentication, while Master ↔ rcpd traffic is protected by SSH. The
+`--no-encryption` option disables TLS and certificate authentication on Source ↔ Destination TCP
+connections; Master ↔ rcpd control and tracing remain protected by SSH.
 
 </details>
 
 **Connection Details:**
 
-1. **Master ↔ Source**: Two TCP connections (master connects to source rcpd's listener twice):
-   - **Control**: Bidirectional, used for handshake and result reporting
-   - **Tracing/progress**: One-way rcpd → master; master drops this connection's send half
-2. **Master ↔ Destination**: Two TCP connections (master connects to destination rcpd's listener
-   twice):
-   - **Control**: Bidirectional, used for handshake and result reporting
-   - **Tracing/progress**: One-way rcpd → master; master drops this connection's send half
+1. **Master ↔ Source**: SSH exec channel `stdin`/`stdout` (length-delimited bitcode framing):
+   - **Master → Source (`stdin`)**: `MasterToRcpd::Hello` and periodic `MasterToRcpd::Heartbeat`
+   - **Source → Master (`stdout`)**: Multiplexed `RcpdToMaster::{SourceHello, Result, Tracing}`
+     (control frames prioritized over tracing/progress)
+2. **Master ↔ Destination**: SSH exec channel `stdin`/`stdout` (same framing and multiplexing)
 3. **Source ↔ Destination**: Two TCP ports on source (destination connects to both):
    - **Control port**: Bidirectional TCP for directory metadata and coordination
    - **Data port**: A pool of TCP connections for file transfers (each connection is reused for
@@ -249,54 +254,62 @@ SSH remains protected and still launches rcpd and carries its listener announcem
 
 **Connection Establishment Order:**
 
-1. Source rcpd reports readiness; master opens its control connection and then its separate
-   tracing/progress connection immediately.
-2. Destination rcpd is configured from source `F/E`, reports matching readiness, and receives the
-   corresponding two master connections.
-3. Master sends `MasterHello::Source` to source rcpd with src/dst paths.
-4. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with
-   both addresses
-5. Master sends `MasterHello::Destination` to destination rcpd with source addresses
-6. Destination rcpd connects to source's control port
+1. Source rcpd emits `RCP_READY` on stderr and switches `stdin`/`stdout` to binary framing; master
+   immediately starts source stdout demux and stdin heartbeats.
+2. Destination rcpd is configured from source `F/E`, emits matching `RCP_READY`, and master starts
+   destination stdout demux and stdin heartbeats.
+3. Master sends `MasterToRcpd::Hello(MasterHello::Source)` over source SSH stdin with src/dst paths.
+4. Source rcpd starts TCP listeners (control + data) and sends
+   `RcpdToMaster::SourceHello(SourceMasterHello)` over SSH stdout with both addresses.
+5. Master sends `MasterToRcpd::Hello(MasterHello::Destination)` over destination SSH stdin with
+   source addresses.
+6. Destination rcpd connects to source's control port.
 7. Destination opens a pool of connections to source's data port; files are streamed over these
-   pooled connections (the `size` field in each header delimits file boundaries)
+   pooled connections (the `size` field in each header delimits file boundaries).
 
 ### 1.4 Security Model
 
-All TCP connections are encrypted and authenticated using TLS 1.3 with self-signed certificates and
-fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiated) — see the
-[Cipher Suites](security.md#cipher-suites) section of security.md.
+Master ↔ rcpd control and tracing run inside the authenticated, encrypted SSH exec channel (no
+master-facing TCP port is opened). Source ↔ Destination TCP connections are encrypted and mutually
+authenticated using TLS 1.3 with self-signed certificates and fingerprint pinning. TLS 1.3 is pinned
+in the config (TLS 1.2 is never negotiated) — see the [Cipher Suites](security.md#cipher-suites)
+section of security.md.
 
 **Security Architecture:**
 
-- SSH is used for authentication and rcpd deployment
-- Each party generates an ephemeral self-signed certificate
-- rcpd outputs its certificate fingerprint to stderr (read by master via SSH)
-- Master distributes fingerprints to source/destination for mutual TLS authentication
-- All TCP connections use TLS with certificate fingerprint verification
+- SSH authenticates, deploys, and carries all Master ↔ rcpd control and tracing traffic
+- Source and destination each generate an ephemeral self-signed certificate (master needs no TLS
+  certificate)
+- Each rcpd outputs its certificate fingerprint in `RCP_READY` on stderr (read by master via SSH)
+- Master distributes fingerprints over SSH stdin to source/destination for mutual TLS authentication
+- All Source ↔ Destination TCP connections use TLS 1.3 with mutual certificate fingerprint
+  verification
 
 **Security Properties:**
 
-- **Confidentiality**: All data encrypted with AES-256-GCM or ChaCha20-Poly1305
-- **Authentication**: Certificate fingerprint verification prevents unauthorized connections
-- **Forward secrecy**: TLS 1.3 ephemeral key exchange
+- **Confidentiality**: Master↔rcpd protected by SSH; Source↔Destination encrypted with AES-256-GCM
+  or ChaCha20-Poly1305
+- **Authentication**: SSH authenticates Master↔rcpd; mutual certificate fingerprint verification
+  prevents unauthorized Source↔Destination connections
+- **Forward secrecy**: Ephemeral key exchange on both SSH and TLS 1.3
 - **Integrity**: AEAD ensures data cannot be tampered with
 
 **Opt-out:**
 
 - Use `--no-encryption` for trusted networks where performance is critical. It disables TLS and
-  certificate authentication on every rcp TCP connection; SSH remains protected.
+  certificate authentication on Source ↔ Destination TCP connections; Master ↔ rcpd remains
+  protected by SSH.
 - See [security.md](security.md) for detailed threat model and best practices
 
 ### 1.5 Scoped Performance Timings
 
 `--timings=PREFIX` is propagated to both daemons, which aggregate timing spans locally and write
 their own `.timings.json` files on their respective hosts at shutdown. These measurements are not
-sent over the tracing connection. Startup notices follow the existing readiness/logging rules.
-`--timings-detail` enables per-file, metadata, and tracker scopes; ordinary copies collect neither
-summaries nor elapsed timelines unless requested. `--chrome-trace` additionally produces a separate
-`.scopes.json` elapsed timeline. See [the profiling reference](../README.md#scoped-timings) for the
-schema and scope API.
+sent over the SSH `stdout` tracing/protocol stream. Startup notices follow the existing
+readiness/logging rules. `--timings-detail` enables per-file, metadata, and tracker scopes; ordinary
+copies collect neither summaries nor elapsed timelines unless requested. `--chrome-trace`
+additionally produces a separate `.scopes.json` elapsed timeline. See
+[the profiling reference](../README.md#scoped-timings) for the schema and scope API.
 
 The source scopes have these boundaries in both the hardened and dereferencing walks:
 
@@ -381,11 +394,20 @@ do not establish semantic or daemon-spawn compatibility.
 
 ### 2.1 Handshake Messages
 
-**`MasterHello`** (Master → rcpd, bidirectional stream)
+**`MasterToRcpd`** (Master → rcpd, SSH `stdin` stream)
 
-- **Purpose**: Provide configuration and connection details. This is the ONLY message the master
-  ever sends on this connection; it then holds the connection open to await `RcpdResult`, and each
-  rcpd keeps a reader on it as a liveness watchdog for the whole operation (§6.3).
+- **Purpose**: Envelope carried over each daemon's SSH `stdin` pipe.
+- **Variants**:
+  - `Hello(MasterHello)`: Configuration and connection details sent once after daemon readiness.
+  - `Heartbeat`: Periodic keepalive frame sent while `--remote-keepalive-sec > 0` (every
+    `keepalive_sec / 3`), starting immediately upon daemon spawn so daemons detect a vanished master
+    within `--remote-keepalive-sec` without relying on `sshd`'s `ClientAlive` settings (§6.3, §8.4).
+
+**`MasterHello`** (inside `MasterToRcpd::Hello`)
+
+- **Purpose**: Provide configuration and connection details. After sending `Hello`, the master sends
+  only periodic `Heartbeat` frames until tearing down (closing `stdin` for EOF); each rcpd keeps a
+  reader on `stdin` as its unified liveness watchdog for the whole operation (§6.3).
 - **Variants**:
   - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture }`: Tells source rcpd what
     to copy
@@ -406,12 +428,17 @@ do not establish semantic or daemon-spawn compatibility.
       receive that acknowledgement; premature control EOF is a failure. The data connection timeout
       does not limit dry-run traversal.
 
-**`SourceMasterHello`** (Source → Master, bidirectional stream)
+**`RcpdToMaster`** (rcpd → Master, SSH `stdout` stream)
 
-- **Purpose**: Provide source's TCP server details for destination to connect
-- **Fields**: `control_addr`, `data_addr`, `server_name`
+- **Purpose**: Multiplexed envelope carried over each daemon's SSH `stdout` pipe. Control frames
+  (`SourceHello`, `Result`) are prioritized ahead of `Tracing` frames.
+- **Variants**:
+  - `SourceHello(SourceMasterHello)`: Source's TCP server details (`control_addr`, `data_addr`,
+    `server_name`) for destination to connect.
+  - `Result(RcpdResult)`: Final success/failure status and statistics.
+  - `Tracing(TracingMessage)`: Remote tracing logs, `rcp::notice` messages, and progress snapshots.
 
-**`RcpdResult`** (rcpd → Master, bidirectional stream)
+**`RcpdResult`** (inside `RcpdToMaster::Result`)
 
 - **Purpose**: Report final success/failure status and statistics
 - **Variants**:
@@ -421,8 +448,7 @@ do not establish semantic or daemon-spawn compatibility.
   and kernel CPU time in milliseconds, peak resident set size in bytes, voluntary and involuntary
   context switches, and minor and major page faults. Every figure covers the whole process. The
   master prints them per role with `--summary`. The set of fields is not negotiated: master and rcpd
-  are always the same build, and wire revision 12 tells builds with the four counters apart from
-  earlier builds of the same version.
+  are always the same build.
 
 ### 2.2 Source → Destination Messages (Control Stream)
 
@@ -944,7 +970,7 @@ remaining receiver future. Successful Sent remains sticky through cleanup.
 **Master Orchestrates Shutdown:**
 
 1. Receives `RcpdResult` from both source and destination
-2. Closes TCP connections to both rcpd processes
+2. Closes SSH `stdin` pipes to both rcpd processes
 3. Waits for rcpd SSH processes to exit
 4. Reports combined results to user
 
@@ -952,30 +978,29 @@ After successful wire results, a failed daemon exit or process wait still fails 
 includes errors flushing explicitly requested timing artifacts during daemon shutdown. Earlier
 operation or protocol failures remain the primary error; teardown still drains tracing receivers.
 
-After the daemon operation finishes, its tracing sender closes message admission when it observes
-the shutdown request and forwards the already-accepted messages in order before closing the stream.
-Live tracing/progress producers do not keep this drain open. A frame already being sent completes
-before the sender handles shutdown; it is never cancelled and restarted on the same stream. The
-daemon gives the in-flight frame and queued messages one shared five-second grace. A transport
-failure ends forwarding, and grace expiry or caller cancellation aborts the owned sender rather than
-detaching it. Forwarding remains best effort: a failed or stalled peer can lose remaining output,
-and these failures do not replace the operation result. The master keeps its tracing receivers alive
-while waiting for daemon exit, then gives them their existing final drain grace.
+After the daemon operation finishes, its stdout writer closes message admission on both the control
+and tracing channels when it observes the shutdown request and forwards the already-accepted frames
+in order before closing the SSH stdout descriptor. Live tracing/progress producers do not keep this
+drain open. A frame already being sent completes before the writer handles shutdown; it is never
+cancelled and restarted on the same stream. The daemon gives the in-flight frame and queued messages
+one shared five-second grace. A transport failure ends forwarding, and grace expiry or caller
+cancellation aborts the owned writer rather than detaching it. Forwarding remains best effort: a
+failed or stalled peer can lose remaining output, and these failures do not replace the operation
+result. The master keeps its stdout demux tasks alive while waiting for daemon exit, then gives them
+their existing final drain grace.
 
 **rcpd Lifecycle Management:**
 
-- **stdin watchdog**: Monitors stdin for EOF to detect master disconnection (SSH-level: fires when
-  the SSH connection itself closes)
-- **master-control watchdog**: After `MasterHello`, the master sends nothing further on the control
-  connection — it holds it open to await `RcpdResult` — so each rcpd keeps a reader on it for the
-  entire operation. An EOF (master exited or aborted) or a transport error (the keepalive +
-  `TCP_USER_TIMEOUT` on that socket marking a vanished master HOST dead) cancels the in-flight
-  operation and reports a failure. This bounds vanished-master detection by `--remote-keepalive-sec`
-  even when SSH's own liveness settings are slower — or when stdin is unavailable and the stdin
-  watchdog cannot fire at all. Any post-hello frame violates the protocol: a stray re-sent
-  `MasterHello` is logged and ignored, while a frame that does not decode as one is treated as a
-  connection failure — deliberately, since version-matched binaries mean no legitimate master sends
-  post-hello traffic.
+- **Unified master stdin watchdog**: Each rcpd reads framed `MasterToRcpd` messages from SSH `stdin`
+  until the copy operation finishes. Before `MasterHello` and throughout the operation, periodic
+  `MasterToRcpd::Heartbeat` frames refresh the `--remote-keepalive-sec` read deadline (when
+  nonzero). An EOF (master exited, killed, or SSH channel closed), a missing-heartbeat timeout
+  (vanished master host even when `sshd` has no `ClientAliveInterval`), or a decode/I/O error
+  cancels the in-flight operation and reports a failure. Once the operation completes, the daemon
+  drops the watchdog before sending `RcpdResult` (bounded by a short flush timeout), so normal
+  master teardown closing `stdin` after consuming `RcpdResult` cannot race with result delivery. A
+  stray post-hello `MasterToRcpd::Hello` is logged and ignored, while an undecodable frame is
+  treated as a channel failure.
 - If master dies unexpectedly, rcpd detects it and winds down through the normal return path (so
   strict-mode lockdown guards restore reused-directory ACLs)
 - No orphaned processes remain on remote hosts
@@ -1434,8 +1459,8 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
   deployment command/readiness, each deployment payload-write idle period, cleanup commands, daemon
   SSH exec/readiness, and TCP connection setup; it does not cap total binary-transfer duration, and
   post-EOF deployment verification gets at least 60 seconds
-- `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for every rcp TCP
-  connection
+- `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for remote connections
+  (Source↔Destination TCP keepalive/`TCP_USER_TIMEOUT` and Master↔rcpd SSH `ServerAlive`/heartbeat)
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
 - `--max-connections=N` (default: 100) - Separately configurable data-connection ceiling; effective
   streams are `min(max-files-in-flight, max-connections)`
@@ -1456,9 +1481,9 @@ and configures the source. For automatic policy, the master validates the config
 upper bound before remote side effects; source readiness then supplies `F/E`, the source validates
 its actual product before readiness, and the master gives the destination the same values and
 rejects a mismatch in destination readiness. A directly launched daemon validates before announcing
-its listener. File concurrency travels in version-sensitive rcpd spawn arguments and readiness;
-directory lifetime limits use the separate initial control header (§2.3). A zero remote-copy
-connection timeout is rejected.
+readiness (`RCP_READY`). File concurrency travels in version-sensitive rcpd spawn arguments and
+readiness; directory lifetime limits use the separate initial control header (§2.3). A zero
+remote-copy connection timeout is rejected.
 
 ### 8.2 Network Profiles
 
@@ -1521,34 +1546,46 @@ The warning goes out on the `rcp::notice` target, so the master prints it at its
 
 ### 8.4 Connection Liveness
 
-Every rcp TCP connection — master↔rcpd (control and tracing), source↔destination control, and each
-pooled data connection — is configured through one function (`configure_tcp_socket` in the `remote`
-crate) that applies `TCP_NODELAY`, the buffer requests of §8.2, and dead-peer detection. A peer
-whose HOST vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`, so
-without detection a read on it never completes: the master awaits `RcpdResult` with no timeout of
+Every Source↔Destination TCP connection — control and each pooled data connection — is configured
+through one function (`configure_tcp_socket` in the `remote` crate) that applies `TCP_NODELAY`, the
+buffer requests of §8.2, and dead-peer detection. Master↔rcpd control and tracing run over SSH and
+use the same `--remote-keepalive-sec` budget via two complementary mechanisms:
+
+- **Master → SSH server (`ServerAliveInterval` / `ServerAliveCountMax`)**: The retained `ssh -M -N`
+  multiplex master configures `interval = min(ceil(N / 6), i32::MAX)` and
+  `count = min(ceil(N / interval), 6)` (or `ServerAliveInterval=0` when `N = 0`, overriding
+  `~/.ssh/config`) so the master tears down a blackholed daemon host within the budget instead of
+  waiting forever for `RcpdResult`.
+- **Master → rcpd (`MasterToRcpd::Heartbeat`)**: The master sends periodic heartbeat frames over
+  each daemon's SSH `stdin` every `N / 3` seconds when `N > 0`, and each daemon bounds its `stdin`
+  reads by `N` seconds so a daemon whose master host vanishes exits within the budget even when
+  `sshd` does not configure `ClientAliveInterval`.
+
+A peer whose HOST vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`,
+so without detection a read on it never completes: the master awaits `RcpdResult` with no timeout of
 its own, and the source↔destination control reads behave the same way, so all three processes hang.
 
-`--remote-keepalive-sec=N` is the budget for noticing this. It arms two options, and **which ones
-apply depends on what the connection carries** — the function takes a `ConnectionKind` (`Control` or
-`Data`), and it is reached only through one typed entry point for each kind of socket (a control
-connection, an accepted data connection, a data socket about to connect), so no call site can leave
-that open:
+`--remote-keepalive-sec=N` is the budget for noticing this. On TCP connections it arms two options,
+and **which ones apply depends on what the connection carries** — the function takes a
+`ConnectionKind` (`Control` or `Data`), and it is reached only through one typed entry point for
+each kind of socket (a control connection, an accepted data connection, a data socket about to
+connect), so no call site can leave that open:
 
 This is not an overall operation deadline. A live host whose userspace `rcpd` is stopped or wedged
-can still have its kernel acknowledge TCP keepalives and zero-window probes, so neither keepalive
-nor `TCP_USER_TIMEOUT` necessarily fires. The master can consequently remain waiting for an
-`RcpdResult`; use external supervision when an absolute copy deadline is required.
+can still have its kernel acknowledge TCP keepalives and zero-window probes (and `sshd` can still
+answer OpenSSH keepalives), so neither keepalive nor `TCP_USER_TIMEOUT` necessarily fires. The
+master can consequently remain waiting for an `RcpdResult`; use external supervision when an
+absolute copy deadline is required.
 
-|                                                                                  | control connections                                         | data connections                         |
-| -------------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------- |
-| what they carry                                                                  | master↔rcpd (control + tracing), source↔destination control | pooled source→destination file transfers |
-| `SO_KEEPALIVE` (`TCP_KEEPIDLE` = N/2, `TCP_KEEPINTVL` = N/12, `TCP_KEEPCNT` = 6) | yes                                                         | yes                                      |
-| `TCP_USER_TIMEOUT` = N                                                           | yes                                                         | **no**                                   |
+|                                                                                  | source↔destination control | data connections                         |
+| -------------------------------------------------------------------------------- | -------------------------- | ---------------------------------------- |
+| what they carry                                                                  | source↔destination control | pooled source→destination file transfers |
+| `SO_KEEPALIVE` (`TCP_KEEPIDLE` = N/2, `TCP_KEEPINTVL` = N/12, `TCP_KEEPCNT` = 6) | yes                        | yes                                      |
+| `TCP_USER_TIMEOUT` = N                                                           | yes                        | **no**                                   |
 
-`SO_KEEPALIVE` probes an **idle** connection — the awaiting-`RcpdResult` case, the control streams
-generally, and a data connection between transfers. `TCP_USER_TIMEOUT` bounds how long
-**unacknowledged** data may stay outstanding, which keepalive cannot cover because it never fires
-while data is in flight.
+`SO_KEEPALIVE` probes an **idle** TCP connection — the source↔destination control stream and a data
+connection between transfers. `TCP_USER_TIMEOUT` bounds how long **unacknowledged** data may stay
+outstanding, which keepalive cannot cover because it never fires while data is in flight.
 
 **Why data connections are excluded.** `TCP_USER_TIMEOUT` cannot distinguish a dead peer from a live
 one that has stopped reading: with the receiver's window at zero and every zero-window probe ACKed,
@@ -1572,11 +1609,11 @@ receive buffer and close the window, pending source control writes can reach the
 budget. Removing the per-message rate charge does not make control connections backpressure-free.
 
 The sub-values are derived from the single budget rather than configured individually, so their
-relationship stays correct by construction. `N = 0` disables both, leaving no-delay and buffer
-sizing.
+relationship stays correct by construction. `N = 0` disables TCP keepalive, `TCP_USER_TIMEOUT`,
+OpenSSH `ServerAlive` probing, and master `stdin` heartbeats/read timeouts, leaving no-delay and
+buffer sizing on TCP sockets.
 
 The master mirrors its value into each rcpd's spawn arguments (via `RcpdConfig::to_args()`, like
 `--require-toctou-safe` in §1.2); without that the master would recover from a vanished host while
-both rcpds kept hanging. This is a spawn-argument change, not a wire-format change. Setting an
-option is best effort — one that a platform or container policy refuses is logged and tolerated, not
-a copy failure.
+both rcpds kept hanging. Setting a TCP socket option is best effort — one that a platform or
+container policy refuses is logged and tolerated, not a copy failure.

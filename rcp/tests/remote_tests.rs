@@ -1241,7 +1241,7 @@ fn test_remote_destination_startup_failure_drains_source_tracing_notices() {
 }
 
 #[test]
-fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
+fn test_remote_source_readiness_validation_failure_waits_for_source_rcpd_cleanup() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("source_connect_failure.txt");
@@ -1249,13 +1249,8 @@ fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
     create_test_file(&src_file, "source cleanup", 0o644);
     let src_remote = format!("localhost:{}", src_file.display());
     let dst_remote = format!("localhost:{}", dst_file.display());
-
-    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let unavailable_port = unavailable.local_addr().unwrap().port();
-    drop(unavailable);
-
     let scratch = tempfile::tempdir().unwrap();
-    let wrapper = scratch.path().join("source-connect-failure-rcpd");
+    let wrapper = scratch.path().join("source-readiness-failure-rcpd");
     let cleanup_marker = scratch.path().join("source-cleaned-up");
     let destination_marker = scratch.path().join("destination-spawned");
     let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
@@ -1267,7 +1262,7 @@ fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
                exec {} \"$@\"\n\
              fi\n\
              if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"source\" ]; then\n\
-               printf 'RCP_TCP 127.0.0.1:{} 4 4\\n' >&2\n\
+               printf 'RCP_READY - 4 99\\n' >&2\n\
                cat >/dev/null\n\
                sleep 0.5\n\
                printf 'cleaned\\n' > {}\n\
@@ -1276,14 +1271,12 @@ fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
              printf 'spawned\\n' > {}\n\
              exit 20\n",
             shell_quote_for_test(&rcpd),
-            unavailable_port,
             shell_quote_for_test(&cleanup_marker),
             shell_quote_for_test(&destination_marker),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-
     let rcpd_path = format!("--rcpd-path={}", wrapper.display());
     let output = run_rcp_with_args_at_default_verbosity(&[
         &rcpd_path,
@@ -1294,16 +1287,16 @@ fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
     print_command_output(&output);
     assert!(
         !output.status.success(),
-        "the unavailable source listener must fail the copy"
+        "an inconsistent source readiness record must fail the copy"
     );
     assert_eq!(
         std::fs::read_to_string(&cleanup_marker).unwrap(),
         "cleaned\n",
-        "rcp must wait for source cleanup before returning the connection error"
+        "rcp must wait for source cleanup before returning the post-readiness error"
     );
     assert!(
         !destination_marker.exists(),
-        "destination must not spawn after a source connection failure"
+        "destination must not spawn after a source readiness failure"
     );
 }
 
@@ -1842,6 +1835,203 @@ fn test_remote_copy_port_range() {
     run_rcp_and_expect_success(&["--port-ranges", port_range, &src_remote, &dst_remote]);
     // verify the file was copied successfully
     assert_eq!(get_file_content(&dst_file), "port range test content");
+}
+
+#[test]
+fn test_remote_copy_uses_only_two_tcp_ports_without_master_listeners() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("two_ports.txt");
+    let dst_file = dst_dir.path().join("two_ports.txt");
+    create_test_file(
+        &src_file,
+        "master over ssh stdio needs only two tcp ports",
+        0o644,
+    );
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // reserve two distinct ephemeral ports while both sockets stay live so the OS assigns two
+    // different free ports, then release them right before launching rcp. A same-host copy needs
+    // only two TCP listeners total (source control + source data) because master↔rcpd runs over
+    // SSH stdio rather than opening master-facing TCP listeners.
+    let first = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let second = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port_range = format!(
+        "{},{}",
+        first.local_addr().unwrap().port(),
+        second.local_addr().unwrap().port()
+    );
+    drop(first);
+    drop(second);
+    run_rcp_and_expect_success(&["--port-ranges", &port_range, &src_remote, &dst_remote]);
+    assert_eq!(
+        get_file_content(&dst_file),
+        "master over ssh stdio needs only two tcp ports"
+    );
+}
+
+#[test]
+fn test_remote_copy_succeeds_with_zero_keepalive() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("zero_keepalive.txt");
+    let dst_file = dst_dir.path().join("zero_keepalive.txt");
+    create_test_file(&src_file, "zero keepalive payload", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    run_rcp_and_expect_success(&["--remote-keepalive-sec=0", &src_remote, &dst_remote]);
+    assert_eq!(get_file_content(&dst_file), "zero keepalive payload");
+}
+
+#[test]
+fn test_remote_source_survives_slow_destination_startup_via_stdin_heartbeats() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("slow_dest.txt");
+    let dst_file = dst_dir.path().join("slow_dest.txt");
+    create_test_file(&src_file, "heartbeats kept source alive", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = scratch.path().join("slow-destination-rcpd");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    // delay destination longer than --remote-keepalive-sec=2 before exec'ing rcpd; source
+    // stays alive while waiting for MasterHello::Source only because master starts sending
+    // stdin heartbeats immediately after source readiness
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"destination\" ]; then\n\
+               sleep 3\n\
+             fi\n\
+             exec {} \"$@\"\n",
+            shell_quote_for_test(&rcpd),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    run_rcp_and_expect_success(&[
+        &rcpd_path,
+        "--remote-keepalive-sec=2",
+        &src_remote,
+        &dst_remote,
+    ]);
+    assert_eq!(get_file_content(&dst_file), "heartbeats kept source alive");
+}
+
+#[test]
+fn test_remote_source_listener_failure_before_hello_reports_exact_error() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("single_port.txt");
+    let dst_file = dst_dir.path().join("single_port.txt");
+    create_test_file(&src_file, "cannot bind two listeners on one port", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = scratch.path().join("fast-bind-timeout-rcpd");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             export RCP_TCP_BIND_MAX_DURATION_SECONDS=1\n\
+             exec {} \"$@\"\n",
+            shell_quote_for_test(&rcpd),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // supply only a single port so source binds control and fails binding data before
+    // sending SourceMasterHello
+    let single = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port_range = single.local_addr().unwrap().port().to_string();
+    drop(single);
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        &rcpd_path,
+        "--port-ranges",
+        &port_range,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "a single port must fail source listener binding"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Source rcpd failed:") && combined.contains("Failed to bind TCP"),
+        "expected exact source listener bind error, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("the process likely died"),
+        "early source RcpdResult::Failure must not be misreported as a crash/OOM:\n{combined}"
+    );
+}
+
+#[test]
+fn test_remote_mismatched_readiness_encryption_fails_cleanly() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("tls_mismatch.txt");
+    let dst_file = dst_dir.path().join("tls_mismatch.txt");
+    create_test_file(&src_file, "tls mismatch", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = scratch.path().join("tls-mismatch-rcpd");
+    let cleanup_marker = scratch.path().join("source-cleaned");
+    let destination_marker = scratch.path().join("dest-spawned");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--protocol-version\" ]; then\n\
+               exec {} \"$@\"\n\
+             fi\n\
+             if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"source\" ]; then\n\
+               printf 'RCP_READY - 4 4\\n' >&2\n\
+               cat >/dev/null\n\
+               printf 'cleaned\\n' > {}\n\
+               exit 0\n\
+             fi\n\
+             printf 'spawned\\n' > {}\n\
+             exit 20\n",
+            shell_quote_for_test(&rcpd),
+            shell_quote_for_test(&cleanup_marker),
+            shell_quote_for_test(&destination_marker),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    // encryption is enabled by default, so a source reporting `-` must be rejected before dest spawns
+    let output = run_rcp_with_args_at_default_verbosity(&[&rcpd_path, &src_remote, &dst_remote]);
+    print_command_output(&output);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("TLS configuration mismatch"),
+        "expected TLS configuration mismatch error, got:\n{combined}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cleanup_marker).unwrap(),
+        "cleaned\n"
+    );
+    assert!(!destination_marker.exists());
 }
 
 #[test]
@@ -3439,11 +3629,11 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // consuming that message (rcp/src/destination.rs), so seeing it means the queue is drained and
     // SIGKILL yields a clean FIN, which is the dispatcher's missing-DestinationDone branch under test.
     //
-    // Waiting for it does not weaken the master-side barrier above: the master sends nothing on its
-    // own control connection to the destination after `MasterHello::Destination`, so that queue stays
-    // drained no matter how much later the kill lands. And the copy cannot finish first: the source
-    // reserves the whole file's iops budget before it opens the file at all (rcp/src/source.rs), so
-    // it is ~10s from sending even the header when this marker appears.
+    // Waiting for it does not weaken the master-side barrier above: master↔rcpd control runs over
+    // the SSH exec channel's stdout pipe, so SIGKILL on destination closes stdout cleanly with EOF.
+    // And the copy cannot finish first: the source reserves the whole file's iops budget before it
+    // opens the file at all (rcp/src/source.rs), so it is ~10s from sending even the header when
+    // this marker appears.
     let structure_marker = "Received DiscoveryComplete";
     // its own origin, not `spawn_start`: the barrier above may already have consumed most of that
     // budget, and a timeout measured from it would blame this marker for the first barrier's delay
@@ -3523,10 +3713,9 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // `rcpd_closed_quietly` vs `rcpd_went_quiet` in rcp.rs - so this assertion fails rather than
     // passes if the kill starts landing on the RST path.
     //
-    // Reaching clean EOF deterministically needs the destination's control-socket receive queue to be
-    // empty when it dies, which is what the marker barrier above establishes: the destination has
-    // CONSUMED the MasterHello, and the master sends nothing further on that connection before
-    // awaiting the result. SIGKILL with an empty queue yields FIN, not RST.
+    // Master↔destination control runs over the SSH exec channel's stdout pipe, so killing the
+    // destination daemon closes stdout cleanly (yielding `Ok(None)` EOF at the master's stdout
+    // demux, which surfaces as `rcpd_closed_quietly`).
     assert!(
         combined.contains("destination rcpd on")
             && combined
