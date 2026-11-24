@@ -130,6 +130,35 @@ fn log_writes_to_file_not_stdout() {
 }
 
 #[test]
+fn keeps_logged_mismatches_when_a_child_comparison_fails() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src)?;
+    std::fs::create_dir(dir.path().join("dst"))?;
+    std::fs::write(src.join("ok"), "")?;
+    std::fs::write(src.join("too-long"), "")?;
+    // leave room for dst/ok while dst/too-long exceeds Linux's 4096-byte path limit
+    let dst = format!("{}dst", "./".repeat(2044));
+    Command::cargo_bin("rcmp")?
+        .current_dir(dir.path())
+        .args([
+            "--metadata-compare=f:size",
+            "--log=compare.log",
+            "src",
+            &dst,
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("dst/too-long"));
+    let log = std::fs::read(dir.path().join("compare.log"))?;
+    let record: serde_json::Value =
+        serde_json::from_slice(&log).expect("expected the completed mismatch record in the log");
+    assert_eq!(record["result"], "dst_missing");
+    assert_eq!(record["src"], "src/ok");
+    Ok(())
+}
+
+#[test]
 fn text_output_format_produces_legacy_output() {
     let dir = tempdir().unwrap();
     let src = dir.path().join("src");
