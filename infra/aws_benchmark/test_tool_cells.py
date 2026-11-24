@@ -45,8 +45,10 @@ class ToolSuiteTests(unittest.TestCase):
         self.assertEqual(common.MATRIX_TOOLS, TOOLS)
         # each tool is its own program, and a cell is named after the copies it follows and that program
         self.assertEqual([run["variant"]["tool"] for run in matrix.TOOL_RUNS.values()], list(TOOLS))
-        self.assertEqual(tuple(matrix.TOOLS), (*AFTER_LOCAL, *AFTER_REMOTE))
-        self.assertEqual(common.MATRIX_TOOL_CELLS, frozenset(matrix.TOOLS))
+        self.assertEqual(tuple(matrix.TOOLS)[:6], (*AFTER_LOCAL, *AFTER_REMOTE))
+        self.assertEqual(common.MATRIX_TOOL_CELLS, frozenset((*AFTER_LOCAL, *AFTER_REMOTE)))
+        # the runner also times the tools after copies on other storage, which no suite selects yet
+        self.assertLess(common.MATRIX_TOOL_CELLS, frozenset(matrix.TOOLS))
 
     def test_every_selection_has_suites_with_the_tools_after_local_copies_or_after_both(self):
         self.assertEqual(sorted(common.MATRIX_SUITES), sorted(
@@ -352,14 +354,17 @@ class ToolRecordTests(unittest.TestCase):
     collect = test_matrix_results.MatrixCollectionTests.collect
 
     def test_the_published_variants_are_the_ones_the_runner_runs(self):
+        # of the tool cells the runner knows, the ones a suite can select
+        selectable = {scenario: cell for scenario, cell in matrix.TOOLS.items()
+                      if scenario in common.MATRIX_TOOL_CELLS}
         self.assertEqual(projection.PUBLIC_CONTRACTS[V5]["tool_variants"],
-                         {scenario: cell["variant"]["id"] for scenario, cell in matrix.TOOLS.items()})
+                         {scenario: cell["variant"]["id"] for scenario, cell in selectable.items()})
         self.assertEqual({key: value for key, value in projection.PUBLIC_CONTRACTS[V5].items()
                           if key not in ("tool_variants", "validation")},
                          {key: value for key, value in projection.PUBLIC_CONTRACTS[V4].items() if key != "validation"})
         self.assertEqual(diagnostics.TOOL_VARIANTS, projection.PUBLIC_CONTRACTS[V5]["tool_variants"])
         self.assertEqual({scenario: tool for scenario, (tool, _) in diagnostics.TOOL_CELLS.items()},
-                         {scenario: cell["tool"] for scenario, cell in matrix.TOOLS.items()})
+                         {scenario: cell["tool"] for scenario, cell in selectable.items()})
 
     def test_a_run_with_tool_cells_publishes_each_cell_under_what_it_ran(self):
         record = matrix_record(SUITE, {2: FAILED})
