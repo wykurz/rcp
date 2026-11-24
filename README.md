@@ -547,8 +547,10 @@ Manual deployment is still supported and may be preferred for:
 - `--remote-copy-conn-timeout-sec` - remote SSH setup, tilde-expansion HOME lookup, discovery,
   version-probe, deployment-readiness/write-idle, daemon-readiness, and TCP connection timeout in
   seconds (default: 15; 60 with `--auto-deploy-rcpd`; deployment verification gets at least 60)
-- `--remote-keepalive-sec` - liveness budget for every rcp TCP connection in seconds, 0 disables
-  (default: 120); idle connections everywhere, unacknowledged data on control connections only
+- `--remote-keepalive-sec` - liveness budget for remote connections in seconds, 0 disables (default:
+  120); OpenSSH `ServerAlive` and `stdin` heartbeats for master↔rcpd, TCP keepalive on all
+  source↔destination connections, and `TCP_USER_TIMEOUT` on the source↔destination control
+  connection only
 
 **Architecture:** The remote copy uses a three-node architecture:
 
@@ -582,10 +584,10 @@ For detailed network connectivity and troubleshooting information, see `docs/rem
 > rcp --no-encryption source:/path dest:/path
 ```
 
-Warning: This disables both encryption and authentication on **all** rcp TCP connections
-(master↔rcpd control and tracing, plus source↔destination control and data) — not just the file-data
-path. Every rcpd listener then accepts connections from anyone who can reach its port; only SSH
-still authenticates rcpd startup.
+Warning: This disables both encryption and authentication on Source↔Destination TCP connections
+(control and data) — not just the file-data path. The source's TCP listeners then accept connections
+from anyone who can reach their ports. Master↔rcpd control and tracing continue to run inside the
+authenticated SSH exec channel (no master-facing TCP listener is opened).
 
 **Best Practices:**
 
@@ -1268,7 +1270,7 @@ Artifact timestamps use UTC with filename-safe separators so reports can be uplo
 
 Artifact paths, Tokio-console addresses, legacy-option warnings, and explicit concurrency-clamp
 warnings are emitted through the normal notice logging target. In remote mode, daemon artifact
-notices are forwarded to the master after its tracing connection is established; they never precede
+notices are forwarded to the master over the daemon's framed SSH `stdout` stream; they never precede
 the daemon's readiness record on raw stderr.
 
 View traces by opening https://ui.perfetto.dev and dragging the JSON file into the browser.

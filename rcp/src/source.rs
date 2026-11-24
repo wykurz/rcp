@@ -1272,10 +1272,10 @@ async fn handle_dry_run_connection(
     }
 }
 
-#[instrument(skip(master_send_stream, cert_key))]
+#[instrument(skip(master_control, cert_key))]
 #[allow(clippy::too_many_arguments)]
-pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
-    master_send_stream: remote::streams::SharedSendStream<W>,
+pub async fn run_source(
+    master_control: &remote::stdio::DaemonControlSender,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &common::copy::Settings,
@@ -1300,7 +1300,12 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 server_config,
             )))
         }
-        _ => None,
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "TLS configuration mismatch: source certificate and destination fingerprint must both be present or both absent"
+            );
+        }
     };
     tracing::info!(
         "Source TLS encryption: {}",
@@ -1326,11 +1331,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         server_name: remote::get_random_server_name(),
     };
     tracing::info!("Sending master hello: {:?}", master_hello);
-    master_send_stream
-        .lock()
-        .await
-        .send_control_message(&master_hello)
-        .await?;
+    master_control.send_source_hello(master_hello).await?;
     tracing::info!("Waiting for connection from destination");
     // wait for destination to connect with a timeout
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());

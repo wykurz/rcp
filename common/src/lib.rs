@@ -147,7 +147,7 @@ pub(crate) mod walk_driver;
 pub use config::{
     AdmissionPolicy, AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings,
     FilesInFlightSource, MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, OutputFormat,
-    ResolvedFilesInFlight, RuntimeConfig, ThrottleConfig, TracingConfig,
+    ResolvedFilesInFlight, ResultOutput, RuntimeConfig, ThrottleConfig, TracingConfig,
 };
 // Re-export `Side` from the congestion crate so downstream binaries
 // (rcp, rrm, …) and integration tests can pass `common::Side::Source` /
@@ -666,6 +666,7 @@ where
         print_summary,
         format,
         startup_error_prefix,
+        result_output,
     } = output;
     if let Err(error) = throttle_config.validate() {
         print_startup_configuration_error(startup_error_prefix, &error);
@@ -719,26 +720,39 @@ where
         // here, where text is printed, and written as the last thing this function does, so
         // that nothing logged while the run winds down can follow it on stdout.
         let mut json_summary = None;
-        match &res {
-            Ok(summary) => {
-                if print_summary || verbose > 0 {
-                    match format {
-                        OutputFormat::Text => println!("{summary}"),
-                        OutputFormat::Json => {
-                            json_summary = Some(runtime_setup::json_summary(summary));
+        match result_output {
+            ResultOutput::Stdout => {
+                match &res {
+                    Ok(summary) => {
+                        if print_summary || verbose > 0 {
+                            match format {
+                                OutputFormat::Text => println!("{summary}"),
+                                OutputFormat::Json => {
+                                    json_summary = Some(runtime_setup::json_summary(summary));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if !quiet {
+                            println!("{err:?}");
                         }
                     }
                 }
-            }
-            Err(err) => {
-                if !quiet {
-                    println!("{err:?}");
+                // a run that failed reports in text, statistics included, whatever the format
+                if (print_summary || verbose > 0) && json_summary.is_none() {
+                    runtime_setup::print_runtime_stats();
                 }
             }
-        }
-        // a run that failed reports in text, statistics included, whatever the format
-        if (print_summary || verbose > 0) && json_summary.is_none() {
-            runtime_setup::print_runtime_stats();
+            ResultOutput::StderrErrorsOnly => {
+                if let Err(err) = &res
+                    && !quiet
+                {
+                    // ignore broken pipe if the parent SSH channel already closed stderr during teardown
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "{err:?}");
+                }
+            }
         }
         // Signal the histogram logger to exit cleanly so its final
         // snapshot is written before the runtime drops and aborts it.
@@ -767,7 +781,11 @@ where
     // probes acquire against stale limits even when auto_meta is off.
     reset_process_throttle_state();
     if let Err(error) = tracing_guards.finish() {
-        eprintln!("Failed to write scoped timings: {error:#}");
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "Failed to write scoped timings: {error:#}"
+        );
         return None;
     }
     if let Some(json_summary) = json_summary {

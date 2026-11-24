@@ -1944,7 +1944,12 @@ pub async fn run_destination(
                 client_config,
             )))
         }
-        _ => None,
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "TLS configuration mismatch: destination certificate and source fingerprint must both be present or both absent"
+            );
+        }
     };
     tracing::info!(
         "Destination TLS encryption: {}",

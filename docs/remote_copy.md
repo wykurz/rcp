@@ -21,8 +21,9 @@ The rcp remote copy system uses a three-node architecture:
 - **Source (rcpd)**: Reads and sends files
 - **Destination (rcpd)**: Receives and writes files
 
-The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer.
-All TCP connections (Master↔rcpd and Source↔Destination) are encrypted with TLS by default.
+The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer
+over each daemon's SSH `stdin`/`stdout` pipes. Source↔Destination TCP connections are encrypted with
+TLS 1.3 by default.
 
 Keep remote source and destination trees disjoint, including on the same host: remote copies have no
 [overlap check](tocttou.md#remote-sourcedestination-overlap) and can copy their own output
@@ -30,15 +31,16 @@ recursively.
 
 ## TLS Encryption
 
-By default, all TCP connections are encrypted using TLS 1.3 with self-signed certificates and
+By default, Master↔rcpd control and tracing run inside the authenticated SSH exec channel, and all
+Source↔Destination TCP connections are encrypted using TLS 1.3 with self-signed certificates and
 fingerprint pinning.
 
 ### Security Properties
 
-| Connection           | Authentication                                 | Encryption |
-| -------------------- | ---------------------------------------------- | ---------- |
-| Master → rcpd        | Mutual fingerprint pinning (exchanged via SSH) | TLS 1.3    |
-| Source ↔ Destination | Mutual fingerprint pinning (via Master)        | TLS 1.3    |
+| Connection           | Authentication                                   | Encryption |
+| -------------------- | ------------------------------------------------ | ---------- |
+| Master ↔ rcpd        | SSH (exec channel `stdin`/`stdout`)              | SSH        |
+| Source ↔ Destination | Mutual fingerprint pinning (distributed via SSH) | TLS 1.3    |
 
 **Key features**:
 
@@ -50,26 +52,25 @@ fingerprint pinning.
 ### Connection Flow
 
 1. **Master prepares compatible rcpd endpoints**, sharing one SSH preparation for a same-host copy
-2. **Master spawns source rcpd via SSH**: `ssh host "rcpd --role source --master-cert-fp <fp>"`
+2. **Master spawns source rcpd via SSH**: `ssh host "rcpd --role source ..."`
 3. **Source generates an ephemeral certificate** and reports its fingerprint plus negotiated file
-   and stream limits in the first stderr readiness record
-4. **Master connects to the source before spawning the destination**, then starts the destination
-   with the source-negotiated limits and verifies its readiness record matches
-5. **Master connects with TLS**, verifying each rcpd's certificate fingerprint; rcpd in turn
-   verifies master's client certificate against `--master-cert-fp`
-6. **Master distributes fingerprints** to source and destination for mutual TLS
+   and stream limits in the first stderr readiness record (`RCP_READY <fp|-> <F> <E>`)
+4. **Master attaches to source SSH `stdin`/`stdout` before spawning the destination**, then starts
+   the destination with the source-negotiated limits and verifies its readiness record matches
+5. **Master distributes fingerprints** to source and destination over SSH `stdin` for mutual TLS
 
 ### Disabling Encryption
 
-For performance on fully trusted networks, encryption can be disabled:
+For performance on fully trusted networks, Source↔Destination TLS encryption can be disabled:
 
 ```bash
 rcp --no-encryption source:/path dest:/path
 ```
 
-**WARNING**: This disables both encryption and certificate authentication on all rcp TCP
-connections, including control and tracing, not just file data. SSH does not protect these direct
-TCP connections. Only use on trusted, isolated networks.
+**WARNING**: This disables both encryption and certificate authentication on Source↔Destination TCP
+connections (control and data). Master↔rcpd control and tracing continue to run over SSH, but SSH
+does not protect the direct Source↔Destination TCP connections. Only use on trusted, isolated
+networks.
 
 For more details on the security model, see [security.md](security.md).
 
@@ -261,10 +262,11 @@ already failed, submission tries an isolated worker and, if no worker can be cre
 so the OS reclaims its owned resources at process exit. Nested cleanup deliberately stays in its
 parent cleanup worker, independent invocations cannot drain each other's workers, and the CLI uses
 one bounded budget to wait for the last resource owner, supervisor, and all work it queued. Daemon
-waits run concurrently across endpoints while tracing receivers remain live; any receiver tasks left
-afterward share one final drain deadline, so endpoint count does not multiply the teardown grace. At
-debug verbosity, raw daemon stdout/stderr is forwarded as it arrives while a bounded tail is
-retained for nonzero-exit diagnostics.
+waits run concurrently across endpoints while stdout demux/tracing receivers remain live; any
+receiver tasks left afterward share one final drain deadline, so endpoint count does not multiply
+the teardown grace. At debug verbosity, raw daemon stderr is forwarded as it arrives while a bounded
+tail is retained for nonzero-exit diagnostics (daemon stdout carries the framed binary protocol
+after `RCP_READY`).
 
 Cancellation during staging closes stdin and gives the local SSH-channel task a bounded grace to
 drain the transaction pipes and wait for the child. If it remains blocked, the task is aborted and
@@ -391,17 +393,17 @@ Please try again or check network connectivity.
      prevents a blocked peer from hiding that error, while remote bootstrap tasks close their local
      SSH channels before returning
 
-2. **Master starts and connects to source rcpd**
+2. **Master starts source rcpd over SSH**
    - The configured remote bootstrap timeout bounds both SSH exec-channel creation and the first
      readiness record
-   - Source creates a TCP listener and emits `RCP_TLS <addr> <fingerprint> <F> <E>` (or plaintext
-     `RCP_TCP <addr> <F> <E>`) as its first stderr record
-   - Master immediately opens the source control and tracing connections
+   - Source emits `RCP_READY <fingerprint|-> <F> <E>` as its first stderr record and switches
+     `stdin`/`stdout` to binary framed protocol I/O
+   - Master immediately starts the source stdout demux and stdin heartbeat tasks
 
-3. **Master starts and connects to destination rcpd**
+3. **Master starts destination rcpd over SSH**
    - Automatic policy uses the source-selected `F`; explicit policy retains master authority
-   - Destination readiness must report the same `F` and `E`, after which the master opens its
-     control and tracing connections
+   - Destination readiness must report the same `F`, `E`, and encryption mode, after which the
+     master starts the destination stdout demux and stdin heartbeat tasks
 
 4. **Source waits for Destination**
    - Source starts TCP listeners (control + data ports)
@@ -442,32 +444,6 @@ bootstrap timeout, including each executable check and PATH lookup. Two distinct
   deployment, with stale candidates skipped in favor of later fallbacks. The published remote path
   is checked again before either rcpd role is spawned.)
 
-#### Master Cannot Connect to rcpd
-
-**Scenario**: TCP connection from Master to rcpd's listener fails (firewall, network)
-
-The master opens two connections — control then tracing — to *each* rcpd. In the master's error the
-`<purpose>` is therefore one of `source control`, `source tracing`, `dest control`, or
-`dest tracing`; in the rcpd's own error it is the bare `control` or `tracing`.
-
-**Master error**:
-
-```
-failed to connect to rcpd at <addr> for <purpose>
-```
-
-or, on timeout:
-
-```
-timeout connecting to rcpd for <purpose>
-```
-
-**rcpd error** (while waiting for the master to connect):
-
-```
-timeout waiting for master <purpose> connection
-```
-
 #### Destination Cannot Connect to Source (Most Common)
 
 **Scenario**: Destination cannot reach Source's TCP server
@@ -506,7 +482,6 @@ failed to connect to <addr>
 | Deployment verification    | At least 60s                        | `--remote-copy-conn-timeout-sec` |
 | Old-version cleanup        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | rcpd SSH exec/readiness    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Master → rcpd              | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Destination → Source       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Dead-peer detection        | 120s (0 disables)                   | `--remote-keepalive-sec`         |
 
@@ -514,12 +489,13 @@ Old-version cleanup is idempotent, best-effort cache hygiene. When its deadline 
 closes its local SSH channel instead of delaying bootstrap indefinitely; an already-started remote
 cleanup command may finish independently.
 
-Dead-peer detection covers idle connections everywhere, and unacknowledged data on control
-connections only — a data transfer to a vanished host still falls back to the kernel's
-retransmission limit (~15 min). See [remote_protocol.md](remote_protocol.md#84-connection-liveness).
-It is not an overall copy deadline: a stopped or wedged `rcpd` can leave its host kernel responsive
-to TCP probes indefinitely. Use an external supervisor such as `timeout` when an absolute operation
-deadline is required.
+Dead-peer detection covers Master↔rcpd SSH sessions (via OpenSSH `ServerAlive` probes and periodic
+`stdin` heartbeats), idle Source↔Destination TCP connections everywhere, and unacknowledged data on
+the Source↔Destination control connection — a data transfer to a vanished host still falls back to
+the kernel's retransmission limit (~15 min). See
+[remote_protocol.md](remote_protocol.md#84-connection-liveness). It is not an overall copy deadline:
+a stopped or wedged `rcpd` can leave its host kernel and `sshd` responsive to probes indefinitely.
+Use an external supervisor such as `timeout` when an absolute operation deadline is required.
 
 Example:
 
@@ -647,8 +623,9 @@ effective values. The ordinary automatic/default intersection remains quiet. Pro
 Tokio-console artifact announcements likewise use the tracing notice target and reach master output
 only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
 `RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
-errors. Wire revision 12 additionally protects the statistics a daemon reports with its result,
-which gained context switch and page fault counts, and requires matching binaries.
+errors. Wire revision 13 moves master↔rcpd control and tracing onto SSH `stdin`/`stdout`
+(`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), building on revision 12's daemon runtime statistics,
+and requires matching binaries.
 
 ### Network Profiles
 

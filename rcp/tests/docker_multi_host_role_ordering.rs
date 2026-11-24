@@ -172,7 +172,7 @@ fn test_destination_waits_for_delayed_source_startup() -> Result<()> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let source_ready = stdout
-        .find("Source rcpd at")
+        .find("Source rcpd ready")
         .expect("verbose output should report source readiness");
     let destination_start = stdout
         .find("Starting prepared rcpd server on: host-b")

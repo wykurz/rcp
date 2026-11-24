@@ -451,8 +451,8 @@ pub struct RcpdConfig {
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
-    /// Mirror of master's --remote-keepalive-sec: the liveness budget for every rcp TCP
-    /// connection this rcpd establishes or accepts. Without propagation the master would
+    /// Mirror of master's --remote-keepalive-sec: the liveness budget for source↔destination TCP
+    /// connections and master↔rcpd SSH stdin heartbeats. Without propagation the master would
     /// recover from a vanished host while both rcpds keep hanging.
     pub remote_keepalive_sec: u64,
     /// Network profile for buffer sizing
@@ -482,10 +482,8 @@ pub struct RcpdConfig {
     pub tokio_console: bool,
     /// Port for tokio-console server
     pub tokio_console_port: Option<u16>,
-    /// Enable TLS encryption (default: true)
+    /// Enable TLS encryption for source↔destination connections (default: true)
     pub encryption: bool,
-    /// Master's certificate fingerprint for client authentication (when encryption enabled)
-    pub master_cert_fingerprint: Option<CertFingerprint>,
 }
 
 impl RcpdConfig {
@@ -606,12 +604,6 @@ impl RcpdConfig {
         if !self.encryption {
             args.push("--no-encryption".to_string());
         }
-        if let Some(fp) = self.master_cert_fingerprint {
-            args.push(format!(
-                "--master-cert-fp={}",
-                crate::tls::fingerprint_to_hex(&fp)
-            ));
-        }
         // propagate the adaptive metadata-ops throttle settings to rcpd so a
         // remote copy uses the same control law as the master-side tool.
         if let Some(auto) = &self.auto_meta {
@@ -688,13 +680,6 @@ impl std::str::FromStr for RcpdRole {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TracingHello {
-    pub role: RcpdRole,
-    /// true for tracing/progress connection, false for control connection
-    pub is_tracing: bool,
-}
-
 /// TLS certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type CertFingerprint = [u8; 32];
 
@@ -765,6 +750,26 @@ impl From<ExtendedMetadataCapture> for common::safedir::RootAclNotice {
             dir_acl_preserved: capture.dir_acl,
         }
     }
+}
+
+/// Framed messages sent from master (`rcp`) to `rcpd` over SSH stdin.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum MasterToRcpd {
+    /// Initial role configuration sent once after daemon readiness.
+    Hello(MasterHello),
+    /// Periodic liveness heartbeat when `--remote-keepalive-sec` is nonzero.
+    Heartbeat,
+}
+
+/// Framed messages sent from `rcpd` to master (`rcp`) over SSH stdout.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum RcpdToMaster {
+    /// Source daemon's TCP listener addresses for the destination to connect to.
+    SourceHello(SourceMasterHello),
+    /// Final operation status, summary, and process runtime statistics.
+    Result(RcpdResult),
+    /// Forwarded tracing log event or progress snapshot.
+    Tracing(common::remote_tracing::TracingMessage),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1088,7 +1093,6 @@ mod tests {
             tokio_console: false,
             tokio_console_port: None,
             encryption: true,
-            master_cert_fingerprint: None,
             overwrite_manifest_max_entries: DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
         }
     }

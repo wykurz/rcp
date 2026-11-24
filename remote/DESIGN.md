@@ -13,10 +13,11 @@ specification.
 
 ![Three-node remote copy architecture](../docs/assets/remote_architecture.svg)
 
-SSH starts and supervises the daemons. The master then opens TCP control and tracing connections to
-each daemon. The destination opens control and pooled data connections to the source; file contents
-flow from source to destination, not through the master. These TCP connections use TLS by default.
-SSH reachability alone is therefore insufficient: see
+SSH starts, supervises, and carries all master↔daemon control and tracing traffic over each daemon's
+framed `stdin`/`stdout` pipes. The destination opens control and pooled data TCP connections
+directly to the source; file contents flow from source to destination, not through the master.
+Source↔Destination TCP connections use mutual TLS 1.3 by default. Direct Source↔Destination TCP
+reachability is therefore required alongside SSH: see
 [network connectivity](../docs/remote_copy.md#network-connectivity).
 
 ## Ownership and lifecycle
@@ -24,14 +25,16 @@ SSH reachability alone is therefore insufficient: see
 1. **Prepare endpoints.** The master validates configuration, discovers compatible binaries, and
    optionally deploys them. Equal SSH sessions share preparation; distinct endpoints can prepare
    concurrently.
-2. **Establish roles.** Source readiness reports its address, certificate fingerprint when
-   encrypted, and resolved file/stream limits. The master uses those limits when starting the
-   destination and checks agreement before dispatching work.
-3. **Transfer.** The master distributes source addresses and fingerprints. The source/destination
-   control stream coordinates discovery and admission; reusable data streams carry file contents.
-4. **Finish and reap.** Wire results are not enough: the master also waits for daemon exits and
-   drains tracing. Owned SSH children and bootstrap work must retain a cleanup owner on
-   cancellation.
+2. **Establish roles.** Source readiness (`RCP_READY`) reports its certificate fingerprint when
+   encrypted and its resolved file/stream limits on stderr, then switches `stdin`/`stdout` to binary
+   framing. The master uses those limits when starting the destination and checks agreement before
+   dispatching work.
+3. **Transfer.** The master distributes source addresses and fingerprints over SSH `stdin`. The
+   source/destination control stream coordinates discovery and admission; reusable data streams
+   carry file contents.
+4. **Finish and reap.** Wire results are not enough: the master closes daemon `stdin`, waits for
+   daemon exits, and drains stdout demux/tracing tasks. Owned SSH children and bootstrap work must
+   retain a cleanup owner on cancellation.
 
 Keep these boundaries intact when changing the component:
 
@@ -50,6 +53,7 @@ Keep these boundaries intact when changing the component:
 | Concern                                                          | Implementation                                                            |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | SSH sessions, readiness, cleanup ownership, socket configuration | [`src/lib.rs`](src/lib.rs)                                                |
+| Master↔daemon SSH stdio framing, demux, and heartbeats           | [`src/stdio.rs`](src/stdio.rs)                                            |
 | Binary deployment                                                | [`src/deploy.rs`](src/deploy.rs)                                          |
 | Protocol compatibility and build identity                        | [`src/version.rs`](src/version.rs), [`build.rs`](build.rs)                |
 | Serialized messages and daemon configuration                     | [`src/protocol`](src/protocol)                                            |

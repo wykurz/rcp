@@ -398,6 +398,17 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Where `common::run` writes final summaries, errors, and runtime statistics.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ResultOutput {
+    /// Print summaries, errors, and runtime statistics to stdout (default for CLI tools).
+    #[default]
+    Stdout,
+    /// Never write to stdout (used by `rcpd`, which owns stdout for framed SSH protocol I/O);
+    /// print fatal errors to stderr instead.
+    StderrErrorsOnly,
+}
+
 /// Output and logging configuration
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutputConfig {
@@ -412,6 +423,8 @@ pub struct OutputConfig {
     pub format: OutputFormat,
     /// Prefix pre-tracing configuration failures with a machine-readable startup record.
     pub startup_error_prefix: Option<&'static str>,
+    /// Where final summaries, errors, and runtime statistics are written.
+    pub result_output: ResultOutput,
 }
 
 /// Warnings and adjustments for dry-run mode.
