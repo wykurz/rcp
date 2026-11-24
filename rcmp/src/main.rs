@@ -144,7 +144,7 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
     let use_stdout = args.log.is_none() && !args.quiet;
     let log_handle =
         common::cmp::LogWriter::new(args.log.as_deref(), use_stdout, args.output_format).await?;
-    let summary = common::cmp(
+    let comparison = common::cmp(
         &args.src,
         &args.dst,
         &log_handle,
@@ -156,9 +156,15 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
             filter,
         },
     )
-    .await?;
-    log_handle.flush().await?;
-    Ok(summary)
+    .await;
+    if let Err(flush_error) = log_handle.flush().await {
+        if comparison.is_ok() {
+            return Err(flush_error);
+        }
+        // keep the comparison error as the primary diagnostic
+        tracing::error!("{flush_error:#}");
+    }
+    comparison
 }
 
 fn main() -> Result<()> {

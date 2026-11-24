@@ -31,6 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Flush `rcmp --log` when a comparison fails so the log includes differences found before the
+  failure.
 - Avoid rebuilding the shared library and its dependents on every Cargo invocation in a linked Git
   worktree. Resolve version-metadata watch paths through Git, track packed refs, and avoid
   invalidating builds when unrelated branches change while the current branch has a loose ref. Keep
