@@ -890,6 +890,14 @@ explicit entry admission, and checked leaf ownership — rather than duplicating
 `DT_UNKNOWN` source and update-only entries are classified in their scheduled workers; reliable
 terminal hint exclusions remain a producer-side fast path.
 
+In an ordinary source-only directory, `rlink` can classify a regular-file hint or an unfiltered
+unknown entry by opening it with `O_PATH|O_NOFOLLOW` and requesting its type and inode number with
+`statx(AT_EMPTY_PATH)`. A confirmed regular file can be hard-linked using only that descriptor and
+its device/inode identity. A different type, incomplete result, or unavailable `statx` uses the full
+stat of the held descriptor. Update comparisons continue to read both entries' metadata. The
+blocking `linkat` operation and any overwrite retry share ownership of the original source
+descriptor.
+
 ### Scope
 
 The following are fully TOCTOU-hardened on Linux, against both leaf-entry and intermediate-directory

@@ -315,6 +315,61 @@ pub struct Handle {
     meta: FileMeta,
 }
 
+/// The pinned inode and stable identity needed to create or recognize a hard link.
+#[derive(Debug)]
+pub(crate) struct HardLinkSource {
+    fd: OwnedFd,
+    identity: (u64, u64),
+}
+
+impl HardLinkSource {
+    pub(crate) fn matches(&self, other: &Handle) -> bool {
+        other.kind() == EntryKind::File && self.identity == (other.dev(), other.ino())
+    }
+}
+
+/// A regular hard-link source, or the full classification needed to dispatch another entry.
+pub(crate) enum LinkChild {
+    File(HardLinkSource),
+    Other(Handle),
+}
+
+impl LinkChild {
+    const FIELDS: rustix::fs::StatxFlags =
+        rustix::fs::StatxFlags::TYPE.union(rustix::fs::StatxFlags::INO);
+
+    fn from_statx(
+        fd: OwnedFd,
+        result: rustix::io::Result<rustix::fs::Statx>,
+    ) -> std::io::Result<Self> {
+        use rustix::fs::{FileType, StatxFlags};
+        use rustix::io::Errno;
+        match result {
+            Ok(st)
+                if StatxFlags::from_bits_retain(st.stx_mask).contains(Self::FIELDS)
+                    && FileType::from_raw_mode(st.stx_mode.into()).is_file() =>
+            {
+                let dev = rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor);
+                return Ok(Self::File(HardLinkSource {
+                    fd,
+                    identity: (dev, st.stx_ino),
+                }));
+            }
+            Ok(_)
+            | Err(Errno::NOSYS | Errno::OPNOTSUPP | Errno::INVAL | Errno::PERM | Errno::ACCESS) => {
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // a stale hint, partial mask or unavailable statx still dispatches from the same inode
+        let handle = Handle::from_fd(fd)?;
+        Ok(if handle.kind() == EntryKind::File {
+            Self::File(handle.into_link_source())
+        } else {
+            Self::Other(handle)
+        })
+    }
+}
+
 /// The classification, identity, and size needed to remove an occupied destination slot.
 ///
 /// Unlike [`Handle`], this snapshot does not keep an inode pinned. Overwrite removal operates by
@@ -347,6 +402,24 @@ impl RemovalSnapshot {
 }
 
 impl Handle {
+    fn from_fd(fd: OwnedFd) -> std::io::Result<Self> {
+        let st = fstatat(&fd, "", AtFlags::AT_EMPTY_PATH).map_err(nix_to_io)?;
+        Ok(Self {
+            fd,
+            kind: kind_from_stat(&st),
+            dev: st.st_dev,
+            ino: st.st_ino,
+            meta: FileMeta::from_stat(&st),
+        })
+    }
+
+    pub(crate) fn into_link_source(self) -> HardLinkSource {
+        HardLinkSource {
+            fd: self.fd,
+            identity: (self.dev, self.ino),
+        }
+    }
+
     /// The entry's classification (File / Dir / Symlink / Special).
     #[must_use]
     pub fn kind(&self) -> EntryKind {
@@ -1162,6 +1235,24 @@ impl Dir {
     /// stat is then obtained via `fstatat` with `AT_EMPTY_PATH` on the resulting
     /// fd so the classification is always consistent with the opened entry.
     pub async fn child(&self, name: &OsStr) -> std::io::Result<Handle> {
+        self.classify_child_with(name, Handle::from_fd).await
+    }
+
+    /// Pin a likely regular source and request only its immutable hard-link attributes.
+    pub(crate) async fn child_for_link(&self, name: &OsStr) -> std::io::Result<LinkChild> {
+        self.classify_child_with(name, |fd| {
+            let stat =
+                rustix::fs::statx(&fd, c"", rustix::fs::AtFlags::EMPTY_PATH, LinkChild::FIELDS);
+            LinkChild::from_statx(fd, stat)
+        })
+        .await
+    }
+
+    async fn classify_child_with<T: Send + 'static>(
+        &self,
+        name: &OsStr,
+        classify: impl FnOnce(OwnedFd) -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
         // see open_dir: `O_NOFOLLOW`/`O_PATH` only guard the final component, so a
         // `name` containing `/` could traverse an intermediate symlink. Reject
         // multi-component names at runtime (debug_assert is compiled out in release).
@@ -1179,21 +1270,12 @@ impl Dir {
             let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
             let fd =
                 openat(dir.as_fd(), name.as_bytes(), flags, Mode::empty()).map_err(nix_to_io)?;
-            // stat the fd itself (empty path + AT_EMPTY_PATH): works for symlinks too
-            let st = fstatat(&fd, "", AtFlags::AT_EMPTY_PATH).map_err(nix_to_io)?;
-            let kind = kind_from_stat(&st);
-            let dev = st.st_dev;
-            let ino = st.st_ino;
-            let meta = FileMeta::from_stat(&st);
             #[cfg(test)]
-            let _gate = resource_tests::gate_classified_entry(fd.as_raw_fd())?;
-            Ok(Handle {
-                fd,
-                kind,
-                dev,
-                ino,
-                meta,
-            })
+            let raw = fd.as_raw_fd();
+            let child = classify(fd)?;
+            #[cfg(test)]
+            let _gate = resource_tests::gate_classified_entry(raw)?;
+            Ok(child)
         })
         .await
     }
@@ -1947,24 +2029,20 @@ impl Dir {
     /// inode has no remaining links (fail-closed); `EEXIST` if an entry at
     /// `dst_name` already exists; `EPERM` if the handle refers to a directory.
     /// Requires `/proc` mounted (same precondition as `chmod_via_proc_fd`).
-    pub async fn hard_link_handle_at(
+    pub(crate) async fn hard_link_handle_at(
         &self,
-        src_handle: &Handle,
+        src_handle: Arc<HardLinkSource>,
         dst_name: &OsStr,
     ) -> std::io::Result<()> {
         if !is_single_component(dst_name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
-        // clone the source O_PATH fd into an owned fd the blocking closure can hold,
-        // keeping the pinned inode alive for the syscall's full duration even if the
-        // originating Handle is dropped after the closure starts. started spawn_blocking work is
-        // not cancellable.
-        let src_owned = src_handle.as_fd().try_clone_to_owned()?;
+        // the blocking operation owns the pin until linkat returns, including on cancellation
         let dst_dir = self.fd.clone();
         let side = self.side;
         let dst_name = dst_name.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::HardLink, move || {
-            proc_fd::ProcFd::new(src_owned.as_fd()).hard_link_at(dst_dir.as_fd(), &dst_name)
+            proc_fd::ProcFd::new(src_handle.fd.as_fd()).hard_link_at(dst_dir.as_fd(), &dst_name)
         })
         .await
     }
@@ -7152,7 +7230,10 @@ mod tests {
         assert_ne!(orig_ino, decoy_ino, "decoy must be a different inode");
 
         // inode-exact link: either links the ORIGINAL pinned inode, or fails closed.
-        match dst.hard_link_handle_at(&handle, OsStr::new("linked")).await {
+        match dst
+            .hard_link_handle_at(Arc::new(handle.into_link_source()), OsStr::new("linked"))
+            .await
+        {
             Ok(()) => {
                 let lm = tokio::fs::symlink_metadata(tmp.join("dst/linked")).await?;
                 assert!(
@@ -7198,7 +7279,10 @@ mod tests {
         let dir_handle = src.child(OsStr::new("adir")).await?;
         assert_eq!(dir_handle.kind(), EntryKind::Dir);
         let result = dst
-            .hard_link_handle_at(&dir_handle, OsStr::new("linked_dir"))
+            .hard_link_handle_at(
+                Arc::new(dir_handle.into_link_source()),
+                OsStr::new("linked_dir"),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -7234,7 +7318,10 @@ mod tests {
             &tmp.join("src/entry"),
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )?;
-        match dst.hard_link_handle_at(&handle, OsStr::new("linked")).await {
+        match dst
+            .hard_link_handle_at(Arc::new(handle.into_link_source()), OsStr::new("linked"))
+            .await
+        {
             Ok(()) => {
                 let lm = tokio::fs::symlink_metadata(tmp.join("dst/linked")).await?;
                 assert!(
@@ -7270,8 +7357,10 @@ mod tests {
         let src = Dir::open_root_dir(&tmp.join("src"), false, congestion::Side::Source).await?;
         let dst =
             Dir::open_root_dir(&tmp.join("dst"), false, congestion::Side::Destination).await?;
-        let handle = src.child(OsStr::new("f")).await?;
-        dst.hard_link_handle_at(&handle, OsStr::new("f_link"))
+        let LinkChild::File(file) = src.child_for_link(OsStr::new("f")).await? else {
+            anyhow::bail!("expected a regular link source");
+        };
+        dst.hard_link_handle_at(Arc::new(file), OsStr::new("f_link"))
             .await?;
         let orig = src.child(OsStr::new("f")).await?;
         let linked = dst.child(OsStr::new("f_link")).await?;
@@ -7279,6 +7368,53 @@ mod tests {
         assert_eq!(orig.ino(), linked.ino(), "hard link must share the inode");
         let content = tokio::fs::read_to_string(tmp.join("dst/f_link")).await?;
         assert_eq!(content, "STABLE");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn link_classification_preserves_symlink_metadata() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = Dir::open_root_dir(root.path(), false, congestion::Side::Source).await?;
+        std::os::unix::fs::symlink("target", root.path().join("entry"))?;
+        let LinkChild::Other(handle) = dir.child_for_link(OsStr::new("entry")).await? else {
+            anyhow::bail!("classified a symlink as a regular hard-link source");
+        };
+        let (target, meta) = handle.read_symlink(congestion::Side::Source).await?;
+        assert_eq!(target, Path::new("target"));
+        assert_eq!(meta.size(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn link_classification_recovers_identity_when_statx_is_unavailable() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let file = tempfile::tempfile()?;
+        let meta = file.metadata()?;
+        let identity = (meta.dev(), meta.ino());
+        let LinkChild::File(source) =
+            LinkChild::from_statx(file.into(), Err(rustix::io::Errno::NOSYS))?
+        else {
+            anyhow::bail!("expected a regular link source");
+        };
+        assert_eq!(source.identity, identity);
+        Ok(())
+    }
+
+    #[test]
+    fn link_classification_uses_full_stat_when_inode_is_missing() -> anyhow::Result<()> {
+        use rustix::fs::{AtFlags, StatxFlags, statx};
+        use std::os::unix::fs::MetadataExt;
+        let file = tempfile::tempfile()?;
+        let meta = file.metadata()?;
+        let partial = statx(&file, c"", AtFlags::EMPTY_PATH, LinkChild::FIELDS).map(|mut st| {
+            st.stx_mask &= !StatxFlags::INO.bits();
+            st.stx_ino = 0;
+            st
+        });
+        let LinkChild::File(source) = LinkChild::from_statx(file.into(), partial)? else {
+            anyhow::bail!("expected a regular link source");
+        };
+        assert_eq!(source.identity, (meta.dev(), meta.ino()));
         Ok(())
     }
 

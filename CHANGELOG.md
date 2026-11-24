@@ -75,6 +75,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for master↔daemon liveness alongside Source↔Destination TCP keepalive. Advance the remote
   compatibility revision to 13 (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), requiring matching
   `rcp`/`rcpd` binaries.
+- Reduce NFS attribute requests for regular files on fresh `rlink` trees. Fresh and incremental hard
+  links also reuse the source descriptor for link creation and overwrite retries.
 - Speed up filtered `rlink` runs by sharing settings and compiled include and exclude patterns
   across workers. This applies to both fresh hard-link trees and incremental snapshots built with
   `--update`.
