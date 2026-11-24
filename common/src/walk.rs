@@ -368,11 +368,8 @@ impl AdmittedLeaf {
         }
     }
 
-    /// Check and bundle an authoritative non-directory classification with its admission.
-    ///
-    /// A directory returns its original handle and permit so callers with a multi-entry decision
-    /// can close every related handle before releasing admission. The shared single-entry driver
-    /// instead consumes [`AdmittedEntry`], which centralizes its drop-before-recursion transition.
+    /// Bundle a non-directory fixture with admission for tests that start at leaf dispatch.
+    #[cfg(test)]
     #[allow(clippy::result_large_err)]
     pub(crate) fn try_new(
         handle: crate::safedir::Handle,

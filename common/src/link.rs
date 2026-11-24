@@ -11,10 +11,8 @@ use crate::copy::{
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
-use crate::safedir::{self, Dir, Handle};
-use crate::walk::{
-    self, AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind,
-};
+use crate::safedir::{self, Dir, Handle, HardLinkSource, LinkChild};
+use crate::walk::{self, AdmittedEntry, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 
 /// Error type for link operations. See [`crate::error::OperationError`] for
 /// logging conventions and rationale.
@@ -149,10 +147,10 @@ impl std::fmt::Display for Summary {
     }
 }
 
-/// Hard-link the already-classified source entry (pinned by `src_handle`) to `dst_name` within
+/// Hard-link the already-classified source entry (pinned by `file`) to `dst_name` within
 /// `dst_dir`, fd-relative and inode-exact.
 ///
-/// `dst_dir.hard_link_handle_at` links the EXACT inode `src_handle` pins (via its `O_PATH` fd,
+/// `dst_dir.hard_link_handle_at` links the EXACT inode `file` pins (via its `O_PATH` fd,
 /// using `linkat(.., "/proc/self/fd/N", .., AT_SYMLINK_FOLLOW)`) rather than re-resolving the
 /// source by name. On an actor-writable source, `name` can be swapped to a different inode
 /// (symlink, FIFO, another file) after classification; linking the pinned inode ensures rlink either
@@ -169,11 +167,11 @@ impl std::fmt::Display for Summary {
 /// SOURCE's permissions. There is nothing to apply anyway — the shared inode already carries the
 /// source's metadata verbatim, which is the whole point of a hard link. `f:acl` therefore applies
 /// only on rlink's real copy path ([`copy::copy_child`], for changed files under `--update`).
-#[instrument(skip(prog_track, settings))]
+#[instrument(skip(prog_track, settings, file), fields(src_handle = ?file.source))]
 #[allow(clippy::too_many_arguments)]
 async fn hard_link_entry_fd(
     prog_track: &'static progress::Progress,
-    src_handle: &crate::safedir::Handle,
+    file: AdmittedHardLink,
     dst_dir: &Arc<Dir>,
     dst_name: &std::ffi::OsStr,
     dst_path: &std::path::Path,
@@ -181,7 +179,10 @@ async fn hard_link_entry_fd(
     destination: &copy::DestinationContext,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
-    match dst_dir.hard_link_handle_at(src_handle, dst_name).await {
+    match dst_dir
+        .hard_link_handle_at(Arc::clone(&file.source), dst_name)
+        .await
+    {
         Ok(()) => {}
         Err(error)
             if settings.copy_settings.overwrite
@@ -196,10 +197,7 @@ async fn hard_link_entry_fd(
             // identical hard link: same file type and same (dev, ino) as the source entry. Both
             // handles pin their inodes (O_PATH), so a matching (dev, ino) genuinely proves the two
             // names already resolve to the same inode — no change needed.
-            if dst_handle.kind() == src_handle.kind()
-                && dst_handle.dev() == src_handle.dev()
-                && dst_handle.ino() == src_handle.ino()
-            {
+            if file.source.matches(&dst_handle) {
                 tracing::debug!("no change, leaving file as is");
                 prog_track.hard_links_unchanged.inc();
                 return Ok(Summary {
@@ -229,7 +227,7 @@ async fn hard_link_entry_fd(
             })?;
             link_summary.copy_summary.rm_summary = rm_summary;
             dst_dir
-                .hard_link_handle_at(src_handle, dst_name)
+                .hard_link_handle_at(Arc::clone(&file.source), dst_name)
                 .await
                 .with_context(|| format!("failed to hard link to {dst_path:?}"))
                 .map_err(|err| Error::new(err, link_summary))?;
@@ -745,7 +743,7 @@ async fn link_inner(
                 )
                 .await;
             }
-            LinkEntryAdmission::Unclassified { .. } => {
+            LinkEntryAdmission::Unclassified { .. } | LinkEntryAdmission::PossibleFile(_) => {
                 crate::safedir::warn_if_root_acl_unpreserved_at(
                     &src_parent,
                     src_name,
@@ -843,8 +841,25 @@ struct AdmittedLinkEntry<S = Handle, U = Handle, P = LeafPermit> {
     permit: Option<P>,
 }
 
+/// Retains the source inode through overwrite recovery and closes it before releasing admission.
+struct AdmittedHardLink {
+    source: Arc<HardLinkSource>,
+    _permit: Option<LeafPermit>,
+}
+
+impl AdmittedHardLink {
+    fn new(source: HardLinkSource, permit: Option<LeafPermit>) -> Self {
+        Self {
+            source: Arc::new(source),
+            _permit: permit,
+        }
+    }
+}
+
 /// Owns exactly one link entry's classification and admission state.
 enum LinkEntryAdmission {
+    /// A nested source can link immediately if its held descriptor confirms a regular file.
+    PossibleFile(Option<LeafPermit>),
     Unclassified {
         admission: EntryAdmission,
         hinted_src_handle: Option<Handle>,
@@ -903,6 +918,7 @@ impl LinkTaskResult {
 impl LinkEntryAdmission {
     fn admission(&self) -> Option<throttle::FdAdmission> {
         match self {
+            Self::PossibleFile(permit) => permit.as_ref().map(LeafPermit::admission),
             Self::Unclassified { admission, .. } => admission.admission(),
             Self::Filtered(entry) => entry.permit.as_ref().map(LeafPermit::admission),
         }
@@ -1019,26 +1035,15 @@ impl AdmittedLinkEntry<Handle, Handle, LeafPermit> {
         }
     }
 
-    // the directory outcome returns the original private bundle so its two handles can be closed
-    // before the permit. boxing that expected recursive transition would allocate per directory.
-    #[allow(clippy::result_large_err)]
-    fn into_source_leaf(self) -> Result<AdmittedLeaf, Self> {
+    fn into_hard_link(self) -> AdmittedHardLink {
         let Self {
             src_handle,
             update_handle,
             permit,
         } = self;
-        match AdmittedLeaf::try_new(src_handle, permit) {
-            Ok(leaf) => {
-                drop(update_handle);
-                Ok(leaf)
-            }
-            Err((src_handle, permit)) => Err(Self {
-                src_handle,
-                update_handle,
-                permit,
-            }),
-        }
+        debug_assert_eq!(src_handle.kind(), EntryKind::File);
+        drop(update_handle);
+        AdmittedHardLink::new(src_handle.into_link_source(), permit)
     }
 
     fn into_update_entry(self) -> AdmittedEntry {
@@ -1079,8 +1084,8 @@ impl AdmittedLinkEntry<Handle, Handle, LeafPermit> {
 
 /// Process one entry in the dual source/update tree.
 ///
-/// The source entry is classified via `src_parent.child(name)` (fstat-authoritative; the getdents
-/// hint is only a spawn-loop heuristic). When an update entry exists at this name it is classified
+/// The held source descriptor supplies the authoritative type. A regular source-only link needs
+/// just type and inode identity. When an update entry exists at this name it is classified
 /// too, and the hard-link-vs-copy decision mirrors the old `--update` overlay logic exactly:
 /// a type mismatch, changed file, or symlink in the update tree is copied from the update version
 /// via [`copy::copy_child`]; an unchanged file is hard-linked from the source; a directory recurses
@@ -1167,8 +1172,36 @@ async fn link_internal(
         Directory { has_update_dir: bool },
     }
 
+    let create_link = async |file: AdmittedHardLink, destination: &copy::DestinationContext| {
+        let dst = dst_parent.expect("a real hard link has a destination parent");
+        hard_link_entry_fd(
+            prog_track,
+            file,
+            dst,
+            dst_name,
+            &dst_path,
+            settings,
+            destination,
+        )
+        .await
+        .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)))
+    };
     let dispatch = safedir::with_optional_fd_admission(weak_admission, async {
         let (mut entry, root_filter_applied) = match admission {
+            LinkEntryAdmission::PossibleFile(permit) => {
+                match src_parent
+                    .child_for_link(name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {src_path:?}"))
+                    .map_err(|err| Error::new(err, Default::default()))?
+                {
+                    LinkChild::File(source) => {
+                        return create_link(AdmittedHardLink::new(source, permit), &destination)
+                            .await;
+                    }
+                    LinkChild::Other(handle) => (AdmittedLinkEntry::new(handle, permit), false),
+                }
+            }
             LinkEntryAdmission::Filtered(entry) => (entry, true),
             LinkEntryAdmission::Unclassified {
                 admission,
@@ -1288,30 +1321,35 @@ async fn link_internal(
                 .reserve_roots(&directories)
                 .map_err(|error| Error::new(error.into(), Default::default()))?;
         }
-        // from this point every leaf-dispatch action retains the private entry bundle or an
-        // `AdmittedLeaf` through its final fd-bearing work, including nested overwrite removal. A
-        // delegated update action closes the comparison source handle, then transfers the selected
-        // update handle and permit together as one AdmittedEntry. copy consumes that exact owner through
-        // the shared driver, including its directory drop-before-recursion transition. Direct dual-tree
-        // directory recursion closes admission and both handles here.
+        // link and copy retain admission through their final fd-bearing work, including overwrite.
+        // delegated copy takes the selected handle and its permit. direct directory recursion
+        // closes both handles and releases admission before descent
+        if entry.src_handle.kind() == EntryKind::File
+            && entry.update_handle.as_ref().is_none_or(|update| {
+                update.kind() == EntryKind::File
+                    && filecmp::metadata_equal(
+                        &settings.update_compare,
+                        entry.src_handle.meta(),
+                        update.meta(),
+                    )
+            })
+        {
+            if settings.dry_run.is_some() {
+                crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
+                return Ok(LinkDispatch::Complete(LinkEntryResult::selected(Summary {
+                    hard_links_created: 1,
+                    ..Default::default()
+                })));
+            }
+            return create_link(entry.into_hard_link(), &destination).await;
+        }
         if let Some(update_entry) = entry.update_handle.as_ref() {
             let (update_dir, update_name) = update.unwrap();
             let update_path = update_path.as_deref().unwrap();
-            if update_entry.kind() != entry.src_handle.kind() {
-                // file type changed, just copy the updated one
-                tracing::debug!(
-                    "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
-                    src_path,
-                    entry.src_handle.kind(),
-                    update_path,
-                    update_entry.kind()
-                );
-                // delegate at this entry's logical path so that, under --delete, pruning inside the
-                // delegated subtree matches include/exclude descendants at the correct filter root
-                // (e.g. `node/*.log`). Pass the held update parent + name and transfer the exact selected
-                // update handle with its admission. The shared copy driver releases provisional
-                // admission itself when that handle is an authoritative directory.
-                let admission = entry.into_update_entry();
+            if update_entry.kind() != entry.src_handle.kind()
+                || matches!(update_entry.kind(), EntryKind::File | EntryKind::Symlink)
+            {
+                tracing::debug!("copying selected update entry {:?}", update_path);
                 return delegate_copy(
                     prog_track,
                     update_dir,
@@ -1325,150 +1363,29 @@ async fn link_internal(
                         .with_input_role(safedir::overlap::InputRole::Update),
                     settings,
                     is_fresh,
-                    admission,
+                    entry.into_update_entry(),
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
             }
-            if update_entry.kind() == EntryKind::File {
-                // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
-                if filecmp::metadata_equal(
-                    &settings.update_compare,
-                    entry.src_handle.meta(),
-                    update_entry.meta(),
-                ) {
-                    // unchanged file: hard-link from src while retaining admission across `linkat`.
-                    tracing::debug!("no change, hard link 'src'");
-                    let leaf = match entry.into_source_leaf() {
-                        Ok(leaf) => leaf,
-                        Err(entry) => {
-                            return Ok(LinkDispatch::Directory {
-                                has_update_dir: entry.close_for_directory(),
-                            });
-                        }
-                    };
-                    if settings.dry_run.is_some() {
-                        crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
-                        return Ok(LinkDispatch::Complete(LinkEntryResult::selected(Summary {
-                            hard_links_created: 1,
-                            ..Default::default()
-                        })));
-                    }
-                    let dst_dir =
-                        dst_parent.expect("destination parent must be open for a real hard link");
-                    return hard_link_entry_fd(
-                        prog_track,
-                        leaf.handle(),
-                        dst_dir,
-                        dst_name,
-                        &dst_path,
-                        settings,
-                        &destination,
-                    )
-                    .await
-                    .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
-                }
-                tracing::debug!(
-                    "link: {:?} metadata has changed, copying from {:?}",
-                    src_path,
-                    update_path
-                );
-                // changed file: delegate to copy, transferring the same admission guard.
-                let admission = entry.into_update_entry();
-                return delegate_copy(
-                    prog_track,
-                    update_dir,
-                    dst_parent,
-                    update_name,
-                    update_path,
-                    dst_root,
-                    rel_path,
-                    destination
-                        .clone()
-                        .with_input_role(safedir::overlap::InputRole::Update),
-                    settings,
-                    is_fresh,
-                    admission,
-                )
-                .await
-                .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
-            }
-            if update_entry.kind() == EntryKind::Symlink {
-                // update symlink: copy it under the same leaf admission guard, including any overwrite
-                // removal it triggers
-                tracing::debug!("'update' is a symlink so just symlink that");
-                let admission = entry.into_update_entry();
-                return delegate_copy(
-                    prog_track,
-                    update_dir,
-                    dst_parent,
-                    update_name,
-                    update_path,
-                    dst_root,
-                    rel_path,
-                    destination
-                        .clone()
-                        .with_input_role(safedir::overlap::InputRole::Update),
-                    settings,
-                    is_fresh,
-                    admission,
-                )
-                .await
-                .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
-            }
-        } else {
-            // update hasn't been specified (or is absent at this name): hard-link a source file or copy
-            // a source symlink, retaining admission across all leaf work and nested overwrite removal
-            tracing::debug!("no 'update' entry");
-            if entry.src_handle.kind() == EntryKind::File {
-                let leaf = match entry.into_source_leaf() {
-                    Ok(leaf) => leaf,
-                    Err(entry) => {
-                        return Ok(LinkDispatch::Directory {
-                            has_update_dir: entry.close_for_directory(),
-                        });
-                    }
-                };
-                if settings.dry_run.is_some() {
-                    crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
-                    return Ok(LinkDispatch::Complete(LinkEntryResult::selected(Summary {
-                        hard_links_created: 1,
-                        ..Default::default()
-                    })));
-                }
-                let dst_dir =
-                    dst_parent.expect("destination parent must be open for a real hard link");
-                return hard_link_entry_fd(
-                    prog_track,
-                    leaf.handle(),
-                    dst_dir,
-                    dst_name,
-                    &dst_path,
-                    settings,
-                    &destination,
-                )
-                .await
-                .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
-            }
-            if entry.src_handle.kind() == EntryKind::Symlink {
-                tracing::debug!("'src' is a symlink so just symlink that");
-                let admission = entry.into_source_entry();
-                return delegate_copy(
-                    prog_track,
-                    src_parent,
-                    dst_parent,
-                    name,
-                    &src_path,
-                    dst_root,
-                    rel_path,
-                    destination.clone(),
-                    settings,
-                    is_fresh,
-                    admission,
-                )
-                .await
-                .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
-            }
+        } else if entry.src_handle.kind() == EntryKind::Symlink {
+            tracing::debug!("'src' is a symlink so just symlink that");
+            let admission = entry.into_source_entry();
+            return delegate_copy(
+                prog_track,
+                src_parent,
+                dst_parent,
+                name,
+                &src_path,
+                dst_root,
+                rel_path,
+                destination.clone(),
+                settings,
+                is_fresh,
+                admission,
+            )
+            .await
+            .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
         }
         if entry.src_handle.kind() != EntryKind::Dir {
             // special file (or unsupported type): retain admission until this branch returns and drops
@@ -2142,6 +2059,17 @@ async fn link_dir_contents_prepared(
                 dst_path,
             )
             .await?;
+            // a file hint has passed the producer's filter. an unknown type still needs
+            // filtering in the worker whenever a filter is active
+            let may_link_file =
+                hint == Some(EntryKind::File) || (hint.is_none() && settings.filter.is_none());
+            let admission =
+                if may_link_file && update_dir.is_none() && !requires_exact_entry_outcome(settings)
+                {
+                    LinkEntryAdmission::PossibleFile(admission.into_permit())
+                } else {
+                    admission.into()
+                };
             // acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
             // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
             // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
@@ -2172,7 +2100,7 @@ async fn link_dir_contents_prepared(
                     UpdateRootRequirement::Optional,
                     &settings,
                     is_fresh,
-                    admission.into(),
+                    admission,
                     destination,
                 )
                 .await
@@ -4898,6 +4826,44 @@ mod link_tests {
                 "the exact filtered result did not remove the stale outer keep decision"
             );
             assert_eq!(summary.copy_summary.directories_skipped, 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn regular_file_hint_rechecks_directory_filter_on_held_entry() -> anyhow::Result<()> {
+            let root = tempfile::tempdir()?;
+            let src = root.path().join("src");
+            let dst = root.path().join("dst");
+            std::fs::create_dir_all(src.join("node"))?;
+            std::fs::create_dir(&dst)?;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("node/")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            let result = link_internal(
+                &PROGRESS,
+                &src_dir,
+                None,
+                Some(&dst_dir),
+                std::ffi::OsStr::new("node"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new("node"),
+                UpdateRootRequirement::Optional,
+                &Arc::new(settings),
+                true,
+                LinkEntryAdmission::PossibleFile(None),
+                copy::DestinationContext::new(&dst),
+            )
+            .await?;
+            assert_eq!(result.summary.copy_summary.directories_skipped, 1);
+            assert_eq!(result.summary.hard_links_created, 0);
+            assert!(!dst.join("node").exists());
             Ok(())
         }
 
