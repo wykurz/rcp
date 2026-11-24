@@ -511,9 +511,15 @@ impl<R: tokio::io::AsyncRead + Unpin> MasterStdinStream<R> {
     }
 }
 
-async fn recv_master_hello<R>(
+/// Receive the initial `MasterHello` before starting the operation.
+///
+/// Pre-hello `Eof` (for example when destination startup fails and the master closes source
+/// stdin while draining source startup notices) and decode/I/O errors return `drain_stdout = true`
+/// because no `RcpdResult` has been queued yet. A keepalive timeout returns `drain_stdout = false`
+/// because the master host vanished.
+async fn receive_master_hello<R>(
     master_stdin: &mut MasterStdinStream<R>,
-) -> anyhow::Result<remote::protocol::MasterHello>
+) -> Result<remote::protocol::MasterHello, OperationOutcome>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -527,19 +533,48 @@ where
                 continue;
             }
             MasterReadOutcome::Eof => {
-                anyhow::bail!("master closed its stdin control channel before sending its hello");
+                return Err(OperationOutcome {
+                    result: remote::protocol::RcpdResult::Failure {
+                        error: "master closed its stdin control channel before sending its hello"
+                            .to_string(),
+                        summary: common::copy::Summary::default(),
+                        runtime_stats: common::collect_runtime_stats(),
+                    },
+                    drain_stdout: true,
+                });
             }
             MasterReadOutcome::KeepaliveTimedOut(budget) => {
-                anyhow::bail!(
-                    "master control channel timed out after {}s waiting for hello",
-                    budget.as_secs()
-                );
+                return Err(OperationOutcome {
+                    result: remote::protocol::RcpdResult::Failure {
+                        error: format!(
+                            "master control channel timed out after {}s waiting for hello",
+                            budget.as_secs()
+                        ),
+                        summary: common::copy::Summary::default(),
+                        runtime_stats: common::collect_runtime_stats(),
+                    },
+                    drain_stdout: false,
+                });
             }
             MasterReadOutcome::Error(error) => {
-                return Err(error).context("Failed to receive hello message from master");
+                return Err(OperationOutcome {
+                    result: remote::protocol::RcpdResult::Failure {
+                        error: format!("Failed to receive hello message from master: {error:#}"),
+                        summary: common::copy::Summary::default(),
+                        runtime_stats: common::collect_runtime_stats(),
+                    },
+                    drain_stdout: true,
+                });
             }
         }
     }
+}
+
+struct MasterLoss {
+    cause: String,
+    /// True when the master may still be draining stdout diagnostics (for example after an
+    /// explicit stdin EOF); false after a keepalive timeout where the master host vanished.
+    drain_stdout: bool,
 }
 
 /// Monitor the master's SSH stdin control stream for disconnect or missed heartbeats.
@@ -547,7 +582,7 @@ where
 /// The master sends periodic [`remote::protocol::MasterToRcpd::Heartbeat`] frames while alive
 /// (whenever `keepalive_sec > 0`) and closes stdin when tearing down. Returning ends the active
 /// operation.
-async fn master_stdin_watchdog<R>(master_stdin: &mut MasterStdinStream<R>) -> String
+async fn master_stdin_watchdog<R>(master_stdin: &mut MasterStdinStream<R>) -> MasterLoss
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -560,27 +595,38 @@ where
                 );
             }
             MasterReadOutcome::Eof => {
-                return "master closed its stdin control channel".to_string();
+                return MasterLoss {
+                    cause: "master closed its stdin control channel".to_string(),
+                    drain_stdout: true,
+                };
             }
             MasterReadOutcome::KeepaliveTimedOut(budget) => {
-                return format!(
-                    "master control channel timed out after {}s without a heartbeat",
-                    budget.as_secs()
-                );
+                return MasterLoss {
+                    cause: format!(
+                        "master control channel timed out after {}s without a heartbeat",
+                        budget.as_secs()
+                    ),
+                    drain_stdout: false,
+                };
             }
             MasterReadOutcome::Error(error) => {
-                return format!("master control channel failed: {error:#}");
+                return MasterLoss {
+                    cause: format!("master control channel failed: {error:#}"),
+                    drain_stdout: true,
+                };
             }
         }
     }
 }
 
 /// Outcome of running an `rcpd` operation and attempting to deliver its final `RcpdResult`.
+#[derive(Debug)]
 struct OperationOutcome {
     result: remote::protocol::RcpdResult,
-    /// True once `result` was acknowledged by the stdout writer, meaning `async_main` should
-    /// drain trailing best-effort traces for [`TRACING_DRAIN_GRACE`]. False when the master was
-    /// lost or result delivery failed, so `async_main` aborts the stdout writer immediately.
+    /// True when `async_main` should drain queued tracing notices for [`TRACING_DRAIN_GRACE`]
+    /// (after `RcpdResult` delivery succeeded, or on non-timeout pre-result exits where no
+    /// `RcpdResult` was queued). False after a keepalive timeout or failed `RcpdResult` delivery
+    /// so `async_main` aborts the stdout writer immediately.
     drain_stdout: bool,
 }
 
@@ -627,18 +673,9 @@ async fn run_operation<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let master_hello = match recv_master_hello(&mut master_stdin).await {
+    let master_hello = match receive_master_hello(&mut master_stdin).await {
         Ok(hello) => hello,
-        Err(error) => {
-            return OperationOutcome {
-                result: remote::protocol::RcpdResult::Failure {
-                    error: format!("{error:#}"),
-                    summary: common::copy::Summary::default(),
-                    runtime_stats: common::collect_runtime_stats(),
-                },
-                drain_stdout: false,
-            };
-        }
+        Err(outcome) => return outcome,
     };
     tracing::info!("Received side: {:?}", master_hello);
     let control_for_source = master_control.clone();
@@ -708,7 +745,7 @@ where
 
 enum WatchdogOutcome<T> {
     Completed(T),
-    MasterLost(String),
+    MasterLost(MasterLoss),
 }
 
 async fn run_with_master_watchdog<Operation, Watchdog, T>(
@@ -717,7 +754,7 @@ async fn run_with_master_watchdog<Operation, Watchdog, T>(
 ) -> WatchdogOutcome<T>
 where
     Operation: std::future::Future<Output = T>,
-    Watchdog: std::future::Future<Output = String>,
+    Watchdog: std::future::Future<Output = MasterLoss>,
 {
     // watchdog cancellation drops the losing operation inside this surviving scope, so aborted
     // tracked descendants release their captures before daemon teardown can finish
@@ -728,7 +765,7 @@ where
             // in the same poll the finished operation wins
             biased;
             result = &mut operation => WatchdogOutcome::Completed(result),
-            cause = watchdog => WatchdogOutcome::MasterLost(cause),
+            loss = watchdog => WatchdogOutcome::MasterLost(loss),
         }
     })
     .await
@@ -878,19 +915,20 @@ where
     let outcome =
         match run_with_master_watchdog(operation, master_stdin_watchdog(master_stdin)).await {
             WatchdogOutcome::Completed(outcome) => outcome,
-            WatchdogOutcome::MasterLost(cause) => {
+            WatchdogOutcome::MasterLost(loss) => {
                 tracing::error!(
-                    "Master (rcp) control channel lost mid-operation - {cause}. This usually \
+                    "Master (rcp) control channel lost mid-operation - {}. This usually \
                      means the master process was killed or its host became unreachable. \
-                     Shutting down."
+                     Shutting down.",
+                    loss.cause
                 );
                 return OperationOutcome {
                     result: remote::protocol::RcpdResult::Failure {
-                        error: format!("master control channel lost: {cause}"),
+                        error: format!("master control channel lost: {}", loss.cause),
                         summary: common::copy::Summary::default(),
                         runtime_stats: common::collect_runtime_stats(),
                     },
-                    drain_stdout: false,
+                    drain_stdout: loss.drain_stdout,
                 };
             }
         };
@@ -1296,7 +1334,7 @@ mod tests {
         .await
         .expect("stdin cancellation must drain child captures");
         closer.await.unwrap();
-        assert!(!outcome.drain_stdout);
+        assert!(outcome.drain_stdout);
         assert!(
             matches!(outcome.result, remote::protocol::RcpdResult::Failure { error, .. } if error.contains("master closed its stdin control channel"))
         );
@@ -1579,6 +1617,84 @@ mod tests {
         }
     }
     #[tokio::test(start_paused = true)]
+    async fn pre_hello_eof_drains_queued_startup_notice_when_reader_resumes_during_grace() {
+        let (master_stdin_tx, daemon_stdin_rx) = tokio::io::duplex(4096);
+        let (daemon_stdout_tx, master_stdout_rx) = tokio::io::duplex(64);
+        let (control_tx, control_rx) = remote::stdio::daemon_control_channel();
+        let (tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stdout_cancel = tokio_util::sync::CancellationToken::new();
+        let expected_notice = format!(
+            "Chrome trace will be written to: /tmp/trace-{}.json",
+            "x".repeat(128)
+        );
+        // queue a startup notice larger than the 64-byte duplex buffer so stdout is backpressured
+        tracing_tx
+            .send(common::remote_tracing::TracingMessage::Log {
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                level: "INFO".to_owned(),
+                target: common::NOTICE_TARGET.to_owned(),
+                message: expected_notice.clone(),
+            })
+            .unwrap();
+        let writer_task = {
+            let cancel = stdout_cancel.clone();
+            remote::AbortOnDropTask::new(tokio::spawn(async move {
+                remote::stdio::run_daemon_stdout_writer(
+                    control_rx,
+                    tracing_rx,
+                    remote::streams::SendStream::new(daemon_stdout_tx),
+                    cancel,
+                )
+                .await
+                .unwrap();
+            }))
+        };
+        // park the stdout writer on the backpressured pipe, then close stdin before MasterHello
+        tokio::task::yield_now().await;
+        drop(master_stdin_tx);
+        let mut master_stdin = MasterStdinStream::new(daemon_stdin_rx, 5);
+        let outcome = receive_master_hello(&mut master_stdin)
+            .await
+            .expect_err("EOF before MasterHello must fail startup");
+        assert!(
+            outcome.drain_stdout,
+            "pre-hello EOF must drain queued startup notices within TRACING_DRAIN_GRACE"
+        );
+        assert!(
+            matches!(
+                outcome.result,
+                remote::protocol::RcpdResult::Failure { ref error, .. }
+                    if error.contains("closed its stdin control channel before sending its hello")
+            ),
+            "unexpected pre-hello EOF result: {:?}",
+            outcome.result
+        );
+        // drop control_tx (as run_operation returning does) and start draining while the reader
+        // stays stalled for 100ms before resuming within the 5-second drain grace
+        drop(control_tx);
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut stdout = remote::streams::RecvStream::new(master_stdout_rx);
+            let mut notices = Vec::new();
+            while let Some(frame) = stdout
+                .recv_object::<remote::protocol::RcpdToMaster>()
+                .await
+                .unwrap()
+            {
+                if let remote::protocol::RcpdToMaster::Tracing(
+                    common::remote_tracing::TracingMessage::Log { message, .. },
+                ) = frame
+                {
+                    notices.push(message);
+                }
+            }
+            notices
+        });
+        finish_stdout_writer(writer_task, stdout_cancel).await;
+        let notices = reader.await.unwrap();
+        assert_eq!(notices, vec![expected_notice]);
+    }
+    #[tokio::test(start_paused = true)]
     async fn zero_keepalive_never_times_out_and_exits_on_eof() {
         let (writer, reader) = tokio::io::duplex(4096);
         let mut send_stream = remote::streams::SendStream::new(writer);
@@ -1602,12 +1718,13 @@ mod tests {
             drop(send_stream);
         });
         let started = tokio::time::Instant::now();
-        let _hello = recv_master_hello(&mut master_stdin).await.unwrap();
+        let _hello = receive_master_hello(&mut master_stdin).await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(600));
-        let cause = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin).await;
         sender.await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(1200));
-        assert_eq!(cause, "master closed its stdin control channel");
+        assert_eq!(loss.cause, "master closed its stdin control channel");
+        assert!(loss.drain_stdout);
     }
     #[tokio::test(start_paused = true)]
     async fn recv_master_hello_keeps_advancing_large_frame_alive_and_times_out_if_stalled() {
@@ -1650,7 +1767,7 @@ mod tests {
             writer
         });
         let started = tokio::time::Instant::now();
-        let received = recv_master_hello(&mut master_stdin).await.unwrap();
+        let received = receive_master_hello(&mut master_stdin).await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(9));
         assert_eq!(format!("{received:?}"), format!("{expected_hello:?}"));
         let _keep_open = sender.await.unwrap();
@@ -1663,26 +1780,38 @@ mod tests {
             stalled_writer
         });
         let stalled_start = tokio::time::Instant::now();
-        let error = recv_master_hello(&mut stalled_stdin)
+        let outcome = receive_master_hello(&mut stalled_stdin)
             .await
             .expect_err("mid-frame stall must time out");
         assert_eq!(stalled_start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(!outcome.drain_stdout);
         assert!(
-            format!("{error:#}").contains("timed out after 5s waiting for hello"),
-            "unexpected stall error: {error:#}"
+            matches!(
+                outcome.result,
+                remote::protocol::RcpdResult::Failure { ref error, .. }
+                    if error.contains("timed out after 5s waiting for hello")
+            ),
+            "unexpected stall outcome: {:?}",
+            outcome.result
         );
         let _keep_stalled = stalled_sender.await.unwrap();
         // a completely silent peer must also time out after one budget
         let (_silent_writer, silent_reader) = tokio::io::duplex(4096);
         let mut silent_stdin = MasterStdinStream::new(silent_reader, 5);
         let silent_start = tokio::time::Instant::now();
-        let error = recv_master_hello(&mut silent_stdin)
+        let outcome = receive_master_hello(&mut silent_stdin)
             .await
             .expect_err("silent peer must time out");
         assert_eq!(silent_start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(!outcome.drain_stdout);
         assert!(
-            format!("{error:#}").contains("timed out after 5s waiting for hello"),
-            "unexpected silent error: {error:#}"
+            matches!(
+                outcome.result,
+                remote::protocol::RcpdResult::Failure { ref error, .. }
+                    if error.contains("timed out after 5s waiting for hello")
+            ),
+            "unexpected silent outcome: {:?}",
+            outcome.result
         );
     }
     #[tokio::test(start_paused = true)]
@@ -1712,16 +1841,19 @@ mod tests {
                 .unwrap();
             send_stream
         });
-        let received = recv_master_hello(&mut master_stdin).await.unwrap();
+        let received = receive_master_hello(&mut master_stdin).await.unwrap();
         assert_eq!(format!("{received:?}"), format!("{expected_hello:?}"));
         let _keep_open = sender.await.unwrap();
         // silence longer than keepalive_sec triggers timeout in the post-hello watchdog
         let started = tokio::time::Instant::now();
-        let cause = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin).await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert!(!loss.drain_stdout);
         assert!(
-            cause.contains("timed out after 5s without a heartbeat"),
-            "unexpected watchdog cause: {cause}"
+            loss.cause
+                .contains("timed out after 5s without a heartbeat"),
+            "unexpected watchdog cause: {}",
+            loss.cause
         );
     }
     #[tokio::test(start_paused = true)]
@@ -1740,10 +1872,11 @@ mod tests {
             drop(send_stream);
         });
         let started = tokio::time::Instant::now();
-        let cause = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin).await;
         sender.await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(6));
-        assert_eq!(cause, "master closed its stdin control channel");
+        assert_eq!(loss.cause, "master closed its stdin control channel");
+        assert!(loss.drain_stdout);
     }
 
     fn daemon_args(extra: &[&str]) -> Args {

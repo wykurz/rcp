@@ -2100,6 +2100,49 @@ fn test_remote_source_bind_ip_honors_explicit_flag_and_operand_fallback() {
         "source control listener must bind inferred 127.0.0.1:\n{log}"
     );
     assert_eq!(get_file_content(&dst_fallback), "bind ip payload");
+    // 4. explicit --bind-ip=0.0.0.0 preserves wildcard binding while advertising concrete IPv4
+    //    addresses for both source control and data endpoints
+    let dst_wildcard = dst_dir.path().join("wildcard_bind.txt");
+    let dst_wildcard_remote = format!("localhost:{}", dst_wildcard.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--bind-ip=0.0.0.0", &src_host_remote, &dst_wildcard_remote]);
+    let src_line = rcpd_line_for_role(&output, "source");
+    assert!(
+        src_line.contains("\"--bind-ip\", \"0.0.0.0\""),
+        "source rcpd must receive explicit --bind-ip=0.0.0.0:\n{src_line}"
+    );
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        log.contains("TCP control listener bound to 0.0.0.0:"),
+        "source control listener must keep wildcard 0.0.0.0 bind:\n{log}"
+    );
+    assert!(
+        log.contains("TCP data listener bound to 0.0.0.0:"),
+        "source data listener must keep wildcard 0.0.0.0 bind:\n{log}"
+    );
+    let dest_hello_line = log
+        .lines()
+        .find(|line| line.contains("Received side: Destination {"))
+        .unwrap_or_else(|| panic!("missing destination hello log:\n{log}"));
+    for field in ["source_control_addr: ", "source_data_addr: "] {
+        let after = dest_hello_line
+            .split(field)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {field} in destination hello:\n{dest_hello_line}"));
+        let addr_str = after
+            .split(',')
+            .next()
+            .expect("socket addr must precede comma")
+            .trim();
+        let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|err| {
+            panic!("failed to parse {field} '{addr_str}' ({err}):\n{dest_hello_line}")
+        });
+        assert!(
+            !addr.ip().is_unspecified(),
+            "wildcard --bind-ip=0.0.0.0 must advertise a concrete IP for {field}, got {addr}:\n{dest_hello_line}"
+        );
+    }
+    assert_eq!(get_file_content(&dst_wildcard), "bind ip payload");
 }
 
 #[test]
