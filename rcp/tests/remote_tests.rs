@@ -2035,6 +2035,74 @@ fn test_remote_mismatched_readiness_encryption_fails_cleanly() {
 }
 
 #[test]
+fn test_remote_source_bind_ip_honors_explicit_flag_and_operand_fallback() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("bind_ip.txt");
+    create_test_file(&src_file, "bind ip payload", 0o644);
+    let rcpd_line_for_role = |output: &std::process::Output, role: &str| -> String {
+        let log = String::from_utf8_lossy(&output.stdout);
+        let role_field = format!("role={role}");
+        log.lines()
+            .find(|line| line.contains("Will run remote rcpd") && line.contains(&role_field))
+            .unwrap_or_else(|| {
+                panic!("missing Will run remote rcpd log for {role_field}:\n{log}");
+            })
+            .to_owned()
+    };
+    // 1. explicit --bind-ip with a hostname source reaches the source rcpd and binds that address
+    let dst_explicit_host = dst_dir.path().join("explicit_host.txt");
+    let src_host_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_host_remote = format!("localhost:{}", dst_explicit_host.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--bind-ip=127.0.0.2", &src_host_remote, &dst_host_remote]);
+    let src_line = rcpd_line_for_role(&output, "source");
+    let dst_line = rcpd_line_for_role(&output, "destination");
+    assert!(
+        src_line.contains("\"--bind-ip\", \"127.0.0.2\""),
+        "source rcpd must receive explicit --bind-ip=127.0.0.2:\n{src_line}"
+    );
+    assert!(
+        !dst_line.contains("--bind-ip"),
+        "destination rcpd must not receive --bind-ip:\n{dst_line}"
+    );
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        log.contains("TCP control listener bound to 127.0.0.2:"),
+        "source control listener must bind explicit --bind-ip 127.0.0.2:\n{log}"
+    );
+    assert_eq!(get_file_content(&dst_explicit_host), "bind ip payload");
+    // 2. explicit --bind-ip takes precedence over an IPv4 source operand
+    let dst_explicit_ip = dst_dir.path().join("explicit_ip.txt");
+    let src_ip_remote = format!("127.0.0.1:{}", src_file.to_str().unwrap());
+    let dst_ip_remote = format!("localhost:{}", dst_explicit_ip.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--bind-ip=127.0.0.2", &src_ip_remote, &dst_ip_remote]);
+    let src_line = rcpd_line_for_role(&output, "source");
+    assert!(
+        src_line.contains("\"--bind-ip\", \"127.0.0.2\"")
+            && !src_line.contains("\"--bind-ip\", \"127.0.0.1\""),
+        "explicit --bind-ip must override IPv4 operand:\n{src_line}"
+    );
+    assert_eq!(get_file_content(&dst_explicit_ip), "bind ip payload");
+    // 3. omitting --bind-ip falls back to the IPv4 source operand
+    let dst_fallback = dst_dir.path().join("fallback_ip.txt");
+    let dst_fallback_remote = format!("localhost:{}", dst_fallback.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[&src_ip_remote, &dst_fallback_remote]);
+    let src_line = rcpd_line_for_role(&output, "source");
+    assert!(
+        src_line.contains("\"--bind-ip\", \"127.0.0.1\""),
+        "omitted --bind-ip must fall back to IPv4 operand 127.0.0.1:\n{src_line}"
+    );
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        log.contains("TCP control listener bound to 127.0.0.1:"),
+        "source control listener must bind inferred 127.0.0.1:\n{log}"
+    );
+    assert_eq!(get_file_content(&dst_fallback), "bind ip payload");
+}
+
+#[test]
 fn test_remote_overwrite_directory_with_directory() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();

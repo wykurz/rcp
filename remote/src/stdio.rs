@@ -7,8 +7,17 @@
 use anyhow::Context as _;
 use std::os::fd::{AsRawFd, FromRawFd};
 
-/// Maximum number of OpenSSH `ServerAlive` probes before declaring a silent host dead.
-const SSH_SERVER_ALIVE_MAX_PROBES: u64 = 6;
+/// Maximum number of `ServerAliveInterval` periods before OpenSSH declares a silent host dead.
+///
+/// OpenSSH increments its unanswered-probe counter before checking `> ServerAliveCountMax`, so
+/// `(interval, count)` disconnects after `interval * (count + 1)` silent seconds. Capping the
+/// total periods at 6 keeps `ServerAliveCountMax <= 5` and matches standard budgets exactly
+/// (for example `120s -> (20, 5) -> 20 * 6 = 120s`, `5s -> (1, 4) -> 1 * 5 = 5s`).
+const SSH_SERVER_ALIVE_MAX_INTERVALS: u64 = 6;
+
+/// Minimum number of `ServerAliveInterval` periods (`ServerAliveCountMax >= 1`) so OpenSSH
+/// always sends at least one probe before closing an idle healthy connection.
+const SSH_SERVER_ALIVE_MIN_INTERVALS: u64 = 2;
 
 /// Upper bound OpenSSH accepts for `ServerAliveInterval` (`INT_MAX` seconds).
 const MAX_SSH_SERVER_ALIVE_INTERVAL: u64 = i32::MAX as u64;
@@ -16,20 +25,23 @@ const MAX_SSH_SERVER_ALIVE_INTERVAL: u64 = i32::MAX as u64;
 /// Compute OpenSSH `(ServerAliveInterval, ServerAliveCountMax)` from `--remote-keepalive-sec`.
 ///
 /// Returns `None` when `keepalive_sec == 0` (dead-peer detection disabled). For nonzero budgets,
-/// `interval * count` stays at or slightly above `keepalive_sec` with `1 <= count <= 6` and
-/// `interval <= i32::MAX` (OpenSSH's upper bound for `ServerAliveInterval`).
+/// OpenSSH disconnects after `interval * (count + 1)` silent seconds with `1 <= count <= 5` and
+/// `interval <= i32::MAX` (OpenSSH's upper bound for `ServerAliveInterval`). Because OpenSSH
+/// requires `ServerAliveInterval >= 1` and `ServerAliveCountMax >= 1` to probe before
+/// disconnecting, `keepalive_sec == 1` maps to `(1, 1)` (an effective 2-second OpenSSH bound).
 #[must_use]
 pub(crate) fn ssh_server_alive_params(keepalive_sec: u64) -> Option<(u64, u64)> {
     if keepalive_sec == 0 {
         return None;
     }
     let interval = keepalive_sec
-        .div_ceil(SSH_SERVER_ALIVE_MAX_PROBES)
+        .div_ceil(SSH_SERVER_ALIVE_MAX_INTERVALS)
         .min(MAX_SSH_SERVER_ALIVE_INTERVAL);
-    let count = keepalive_sec
-        .div_ceil(interval)
-        .min(SSH_SERVER_ALIVE_MAX_PROBES);
-    Some((interval, count))
+    let total_intervals = keepalive_sec.div_ceil(interval).clamp(
+        SSH_SERVER_ALIVE_MIN_INTERVALS,
+        SSH_SERVER_ALIVE_MAX_INTERVALS,
+    );
+    Some((interval, total_intervals - 1))
 }
 
 /// Compute the interval between master→`rcpd` stdin heartbeat frames from `--remote-keepalive-sec`.
@@ -488,6 +500,10 @@ pub async fn run_daemon_stdout_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
         };
         match next {
             NextOutbound::Control(outbound) => {
+                if outbound.ack.is_closed() {
+                    // caller already abandoned this control message; do not leak a stale frame
+                    continue;
+                }
                 match send_stream.send_control_message(&outbound.message).await {
                     Ok(()) => {
                         let _ = outbound.ack.send(Ok(()));
@@ -503,8 +519,33 @@ pub async fn run_daemon_stdout_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
                 }
             }
             NextOutbound::Tracing(tracing_msg) => {
+                let frame = crate::protocol::RcpdToMaster::Tracing(tracing_msg);
+                let bytes = match bitcode::serialize(&frame) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        // discard unserializable optional traces before touching the shared sink;
+                        // never emit through tracing here because we own the tracing receiver
+                        let _ = std::io::Write::write_fmt(
+                            &mut std::io::stderr(),
+                            format_args!("Dropping unserializable remote trace frame: {error:#}\n"),
+                        );
+                        continue;
+                    }
+                };
+                let max_len = send_stream.max_frame_length();
+                if bytes.len() > max_len {
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!(
+                            "Dropping oversized remote trace frame ({} bytes > {} byte frame limit)\n",
+                            bytes.len(),
+                            max_len,
+                        ),
+                    );
+                    continue;
+                }
                 send_stream
-                    .send_batch_message(&crate::protocol::RcpdToMaster::Tracing(tracing_msg))
+                    .send_serialized_frame(bytes::Bytes::from(bytes))
                     .await
                     .context("failed to forward tracing message")?;
             }
@@ -743,30 +784,41 @@ mod tests {
     #[test]
     fn ssh_server_alive_params_respect_keepalive_budget() {
         assert_eq!(ssh_server_alive_params(0), None);
+        // keepalive_sec == 1 hits OpenSSH's 2-second minimum effective bound (interval=1, count=1)
+        // so at least one probe is sent before disconnecting an idle healthy session
+        assert_eq!(ssh_server_alive_params(1), Some((1, 1)));
+        let max_count = SSH_SERVER_ALIVE_MAX_INTERVALS - 1;
         for (budget, expected) in [
-            (1, (1, 1)),
-            (2, (1, 2)),
-            (3, (1, 3)),
-            (5, (1, 5)),
-            (6, (1, 6)),
-            (10, (2, 5)),
-            (15, (3, 5)),
-            (30, (5, 6)),
-            (60, (10, 6)),
-            (120, (20, 6)),
+            (2, (1, 1)),
+            (3, (1, 2)),
+            (5, (1, 4)),
+            (6, (1, 5)),
+            (7, (2, 3)),
+            (10, (2, 4)),
+            (15, (3, 4)),
+            (30, (5, 5)),
+            (60, (10, 5)),
+            (120, (20, 5)),
         ] {
             let actual = ssh_server_alive_params(budget).unwrap();
             assert_eq!(actual, expected, "budget={budget}");
             let (interval, count) = actual;
+            let effective_timeout = interval * (count + 1);
             assert!(interval >= 1);
-            assert!((1..=SSH_SERVER_ALIVE_MAX_PROBES).contains(&count));
-            assert!(interval * count >= budget);
-            assert!(interval * count < budget + interval);
+            assert!((1..=max_count).contains(&count));
+            assert!(
+                effective_timeout >= budget,
+                "budget={budget}, effective={effective_timeout}"
+            );
+            assert!(
+                effective_timeout < budget + interval,
+                "budget={budget}, effective={effective_timeout}"
+            );
         }
         // huge budgets must stay within OpenSSH's i32::MAX ServerAliveInterval limit
         let (interval, count) = ssh_server_alive_params(u64::MAX).unwrap();
         assert_eq!(interval, MAX_SSH_SERVER_ALIVE_INTERVAL);
-        assert_eq!(count, SSH_SERVER_ALIVE_MAX_PROBES);
+        assert_eq!(count, max_count);
     }
 
     #[test]
@@ -1116,5 +1168,145 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_stdout_writer_drops_oversized_trace_and_still_delivers_control_result()
+    -> anyhow::Result<()> {
+        let (daemon_write, master_read) = tokio::io::duplex(64 * 1024);
+        let (control_tx, control_rx) = daemon_control_channel();
+        let (tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let send_stream = crate::streams::SendStream::new(daemon_write);
+        let max_len = send_stream.max_frame_length();
+        // enqueue an oversized trace frame before a normal trace and control result so the
+        // writer encounters it first
+        tracing_tx.send(common::remote_tracing::TracingMessage::Log {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            level: "INFO".to_owned(),
+            target: "rcpd".to_owned(),
+            message: "x".repeat(max_len + 1024),
+        })?;
+        tracing_tx.send(preview("after-oversized"))?;
+        let writer_task = tokio::spawn(run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            send_stream,
+            shutdown.clone(),
+        ));
+        let reader_task = tokio::spawn(async move {
+            let mut recv = crate::streams::RecvStream::new(master_read);
+            let mut frames = Vec::new();
+            while let Some(frame) = recv.recv_object::<crate::protocol::RcpdToMaster>().await? {
+                frames.push(frame);
+            }
+            Ok::<_, anyhow::Error>(frames)
+        });
+        // yield so the writer processes the oversized trace before we send the control result
+        tokio::task::yield_now().await;
+        control_tx
+            .send_result(crate::protocol::RcpdResult::Success {
+                message: "copy ok".to_owned(),
+                summary: Default::default(),
+                runtime_stats: Default::default(),
+            })
+            .await?;
+        drop(control_tx);
+        shutdown.cancel();
+        writer_task.await??;
+        let frames = reader_task.await??;
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                crate::protocol::RcpdToMaster::Tracing(
+                    common::remote_tracing::TracingMessage::Log { message, .. }
+                ) if message == "after-oversized"
+            )),
+            "normal trace after oversized trace must still arrive: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                crate::protocol::RcpdToMaster::Result(crate::protocol::RcpdResult::Success {
+                    message,
+                    ..
+                }) if message == "copy ok"
+            )),
+            "control result after oversized trace must still arrive: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|frame| matches!(
+                frame,
+                crate::protocol::RcpdToMaster::Tracing(
+                    common::remote_tracing::TracingMessage::Log { message, .. }
+                ) if message.len() > max_len
+            )),
+            "oversized trace must be discarded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_stdout_writer_fails_on_real_transport_error_for_trace() -> anyhow::Result<()> {
+        let (daemon_write, master_read) = tokio::io::duplex(4096);
+        // close the peer reader so writing a valid trace hits a real transport error
+        drop(master_read);
+        let (_control_tx, control_rx) = daemon_control_channel();
+        let (tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tracing_tx.send(preview("normal-trace"))?;
+        let result = run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            crate::streams::SendStream::new(daemon_write),
+            shutdown,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "real transport errors on tracing frames must remain fatal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_stdout_writer_skips_abandoned_control_frame() -> anyhow::Result<()> {
+        let (daemon_write, master_read) = tokio::io::duplex(4096);
+        let (control_tx, control_rx) = daemon_control_channel();
+        let (_tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        // enqueue a control frame and immediately drop its ack receiver before the writer runs
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        control_tx
+            .tx
+            .send(ControlOutbound {
+                message: crate::protocol::RcpdToMaster::Result(
+                    crate::protocol::RcpdResult::Success {
+                        message: "stale".to_owned(),
+                        summary: Default::default(),
+                        runtime_stats: Default::default(),
+                    },
+                ),
+                ack: ack_tx,
+            })
+            .unwrap();
+        drop(control_tx);
+        shutdown.cancel();
+        let writer_task = tokio::spawn(run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            crate::streams::SendStream::new(daemon_write),
+            shutdown,
+        ));
+        let mut recv = crate::streams::RecvStream::new(master_read);
+        assert!(
+            recv.recv_object::<crate::protocol::RcpdToMaster>()
+                .await?
+                .is_none(),
+            "abandoned control frame must not be written to master stdout"
+        );
+        writer_task.await??;
+        Ok(())
     }
 }

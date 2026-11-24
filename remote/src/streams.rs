@@ -77,10 +77,23 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
         self.payload_buffer_retention_limit
     }
 
+    /// Return the maximum frame payload length accepted by the framing codec.
+    pub(crate) fn max_frame_length(&self) -> usize {
+        self.framed.encoder().max_frame_length()
+    }
+
+    /// Write and flush an already-serialized frame payload.
+    pub(crate) async fn send_serialized_frame(
+        &mut self,
+        bytes: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        self.framed.send(bytes).await?;
+        Ok(())
+    }
+
     pub async fn send_batch_message<T: serde::Serialize>(&mut self, obj: &T) -> anyhow::Result<()> {
         let bytes = bitcode::serialize(obj).map_err(anyhow::Error::from)?;
-        self.framed.send(bytes::Bytes::from(bytes)).await?;
-        Ok(())
+        self.send_serialized_frame(bytes::Bytes::from(bytes)).await
     }
 
     pub async fn send_control_message<T: serde::Serialize>(
