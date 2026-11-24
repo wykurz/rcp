@@ -506,6 +506,10 @@ Specific invariants enforced:
   snapshot or an unknown hint goes through normal pinned classification. A worker continuing
   directly from stat checks for cancellation immediately before starting the unlink. Roots and
   `--require-toctou-safe` retain their descriptor-based classification.
+- A nondirectory that was classified through a pinned handle is removed after that handle is closed.
+  The by-name `unlinkat` never used the handle, so closing it first gives up nothing, and a
+  descriptor left open on the entry would change what the removal costs: an NFS client keeps a file
+  whose name is removed while it is open, renaming it to `.nfsXXXX` and removing it at the close.
 - Before recursively removing a directory, `rrm` verifies that the opened descent handle is still
   the walked inode, and all descendant work uses that verified fd. Final `rmdir` is a single by-name
   syscall relative to the pinned parent: it cannot follow a symlink or remove a non-empty directory,

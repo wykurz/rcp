@@ -31,6 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Stop making NFS clients rename files before removing them. `rrm` with a path or time filter,
+  pruning with `--delete`, and plain `rrm` on entries whose directory listing names no file type (on
+  NFSv3, entries beyond the first few hundred of a directory) unlinked each file while still holding
+  their own handle on it. An NFS client then renames the file to `.nfsXXXX` and removes it when the
+  handle closes: three requests where one does, two of them under the directory's lock. The handle
+  is now closed before the unlink.
 - Flush `rcmp --log` when a comparison fails so the log includes differences found before the
   failure.
 - Avoid rebuilding the shared library and its dependents on every Cargo invocation in a linked Git
