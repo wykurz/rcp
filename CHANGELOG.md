@@ -55,6 +55,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Speed up filtered `rlink` runs by sharing settings and compiled include and exclude patterns
+  across workers. This applies to both fresh hard-link trees and incremental snapshots built with
+  `--update`.
 - Make `rcmp --exit-early` stop scanning a directory once it observes a difference. Comparisons
   already in flight still report their results.
 - Speed up `rchm --modified-before` by reusing the modification time already read for each entry.
