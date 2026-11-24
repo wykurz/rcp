@@ -694,10 +694,13 @@ just benchmark-matrix --manifest benchmarks/matrix-cases.json \
     --cache uncontrolled --output /tmp/matrix-results
 ```
 
-Two scenarios copy a file set, and six time another tool on a copy:
+Four scenarios copy a file set, and twelve time another tool on a copy:
 
 - **`local`** copies between two directories:
   `rcp --summary --output-format=json SOURCE DESTINATION`.
+- **`nfs`** and **`memory`** make the same local copy on other storage: between two mounts that show
+  the run's two roots, and between two roots in memory. See
+  [Cells on other storage](#cells-on-other-storage).
 - **`remote`** makes the same copy through rcp's remote path on one host:
   `rcp --summary --output-format=json --force-remote --bind-ip=127.0.0.1 --rcpd-path=BIN_DIR/rcpd 127.0.0.1:SOURCE 127.0.0.1:DESTINATION`.
   rcp starts a source and a destination `rcpd` over SSH and the daemons exchange the data over
@@ -705,7 +708,8 @@ Two scenarios copy a file set, and six time another tool on a copy:
   [Remote cells](#remote-cells) for what the runner sets up.
 - **`local-rcmp`**, **`local-rlink`** and **`local-rrm`** compare, hard-link and remove the tree
   that a `local` copy has just written, and **`remote-rcmp`**, **`remote-rlink`** and
-  **`remote-rrm`** do the same after a `remote` copy. See [Tool cells](#tool-cells).
+  **`remote-rrm`** do the same after a `remote` copy. `nfs` and `memory` copies have theirs too
+  (`nfs-rcmp`, `memory-rrm` and so on). See [Tool cells](#tool-cells).
 
 It differs from `benchmark-run` in what it promises:
 
@@ -770,11 +774,11 @@ These documents are a separate format: the dashboards and change reports describ
 
 ### Tool cells
 
-Six scenarios time the other tools on real trees without generating anything for them. A tool cell
-is named after the copies it follows and its tool: `local-rcmp`, `local-rlink` and `local-rrm`
-follow local copies, `remote-rcmp`, `remote-rlink` and `remote-rrm` remote ones. A tool cell makes
-no copies of its own. Each of its runs follows one copy of that cell, of the same file set, so that
-cell has to be selected too:
+Twelve scenarios time the other tools on real trees without generating anything for them. A tool
+cell is named after the copies it follows and its tool: `local-rcmp`, `local-rlink` and `local-rrm`
+follow local copies, `remote-rcmp`, `remote-rlink` and `remote-rrm` remote ones, and the same three
+follow `nfs` and `memory` copies. A tool cell makes no copies of its own. Each of its runs follows
+one copy of that cell, of the same file set, so that cell has to be selected too:
 
 ```bash
 just benchmark-matrix --manifest benchmarks/matrix-cases.json \
@@ -808,9 +812,10 @@ What a tool cell's numbers mean:
 - **Time and resources.** The wall time of the tool's command, measured as a copy's is, and what the
   tool reports about itself in its JSON summary, recorded under `resources`. The counts that were
   checked are recorded under `tool_summary`.
-- **Cache.** No cache is dropped for a tool. It finds what the copy before it left in memory:
-  usually the metadata of both trees, and as much file data as fits. `--cache` applies to the copies
-  only. A tool on a cold tree is a different measurement, which this runner does not make.
+- **Cache.** No cache is dropped for a tool on the disks. It finds what the copy before it left in
+  memory: usually the metadata of both trees, and as much file data as fits. There `--cache` applies
+  to the copies only. A tool on a cold tree is a different measurement, which the runner makes for
+  `nfs` cells only (see [Cells on other storage](#cells-on-other-storage)).
 - **Order.** `follows_trial_index` names the copy a run followed. The three tools see slightly
   different trees: rcmp runs first, and rrm removes a tree whose files have been linked and unlinked
   once.
@@ -831,6 +836,47 @@ results says why. The same happens after a measured run of rrm that failed, for 
 build whose rrm is broken therefore costs its rrm cells, not the copies after them, and an rrm that
 hangs costs the run one hang limit, not one for every tree. A run without an rrm cell has no rrm and
 removes with `rm -rf` (`context.removal` says `rm -rf`).
+
+### Cells on other storage
+
+`local` and `remote` cells keep their trees on the run's two roots. Two more copy scenarios keep
+them elsewhere, each with its tool cells:
+
+- **`nfs`** copies between two mounts that show those same two roots: `--nfs-source-root` is another
+  path to the tree under `--source-root`, and `--nfs-destination-root` to the one under
+  `--destination-root`. It is meant for a network filesystem, where every operation costs a request
+  to a server. Only what is measured goes through the mounts: the copy, and the operands of rcmp,
+  rlink and rrm. The file set is generated through the direct path, and every removal that is not
+  measured (the tree rlink made, the file set, a copy that no rrm cell follows) goes through the
+  direct paths too, where it takes seconds and not the minutes a slow mount could need.
+- **`memory`** copies between two roots of its own, `--memory-source-root` and
+  `--memory-destination-root`, meant for two filesystems in memory. Its file set is generated there.
+
+```bash
+just benchmark-matrix --manifest benchmarks/matrix-cases.json \
+    --cell commission-10k:nfs --cell commission-10k:nfs-rrm \
+    --bin-dir target/release --source-root /scratch/source --destination-root /scratch/destination \
+    --nfs-source-root /mnt/nfs/source --nfs-destination-root /mnt/nfs/destination \
+    --cache uncontrolled --output /tmp/matrix-results
+```
+
+How these cells differ from the others:
+
+- **Cache.** With `--cache linux-drop-caches` an `nfs` cell drops the caches before each copy and
+  before each tool run, recorded with the run as it is for a copy. What a client still remembers of
+  a tree decides how many requests a tool sends for it, and a client forgets within seconds or a
+  minute: a tool that followed its copy at once would measure the timing of the run more than the
+  tool. A `memory` cell drops no cache at all, since its files have no other home.
+- **Identity.** Such a cell is identified by its own storage, named with `--nfs-source-storage-id`
+  and its three siblings, as the others are by `--source-storage-id` and `--destination-storage-id`.
+  A mount with another delay or another protocol version is other storage and starts another line of
+  results. `context.storages` records the roots, the names and the mounts found there.
+- **One home per file set.** A file set is generated once, so its cells are all `memory` or all on
+  the disks (`local`, `remote` and `nfs` share a fixture). A selection that mixes the two is
+  refused, and so is a cell whose roots are not given.
+
+The runner makes no mount: it is given the paths. Setting up a server, a mount and a delay is left
+to whoever starts the run.
 
 ### Remote cells
 

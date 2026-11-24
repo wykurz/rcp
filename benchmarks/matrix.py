@@ -22,6 +22,16 @@ hard-links it into a new tree beside it, and rrm removes it, in that order. No
 cache is dropped for a tool: it finds whatever the copy left in memory. A run
 counts as a copy does, on its exit status and the counts of its own summary.
 
+Two more copy scenarios keep their trees elsewhere, and each has its three tool
+scenarios as the others do. `nfs` copies between two mounts that show the run's
+two roots: every operation then costs a request to a server. The file set is
+generated and the trees are cleared through the direct paths; only what is
+measured goes through the mounts. There a cache is dropped before every tool run
+too, since what the client still remembers decides how many requests a tool
+sends. `memory` copies between two roots of its own that live in memory, where no
+cache is dropped at all. A file set is generated once, so its cells share the
+disks (`local`, `remote`, `nfs`) or are all `memory`.
+
 A run that has an rrm cell clears every tree with that rrm, as a user of the
 tools would: what rlink made, a file set that is done with, a copy that no rrm
 cell follows. Such a removal is not measured. Should rrm fail at one, `rm -rf`
@@ -69,8 +79,16 @@ from benchmarks.verification import SUMMARY_POLICY
 SCHEMA = "rcp-benchmark-matrix-v1"
 POLICY = SUMMARY_POLICY
 VARIANT = "rcp-default"
-# the scenarios that copy a file set
-COPIES = ("local", "remote")
+# the scenarios that copy a file set, and where each keeps its trees
+STORAGE = {"local": "disks", "remote": "disks", "nfs": "nfs", "memory": "memory"}
+COPIES = tuple(STORAGE)
+# the storage a run is given roots for beside its two disks, and where the file sets of each are
+# generated and cleared: `nfs` shows the disks' own roots through mounts, `memory` has its own
+STORAGES = ("nfs", "memory")
+HOME = {"disks": "disks", "nfs": "disks", "memory": "memory"}
+# where a cache is dropped before a tool run as before a copy, and where none is dropped at all
+COLD_TOOLS = ("nfs",)
+UNCACHED = ("memory",)
 # what each of the other tools runs on a copy, in the order the tools run. `operands` names the
 # trees of the command: the `source` of the copy, the `copy` itself, and a new `tree` beside the
 # copy for a tool that makes one. `counts` are the figures of the tool's summary that must equal
@@ -106,7 +124,15 @@ def _tool_cells(copies):
 TOOLS = _tool_cells(COPIES)
 SCENARIOS = (*COPIES, *TOOLS)
 # how each scenario reaches its data: directly, or through rcpd on this host's loopback
-TOPOLOGY = {"local": "local", "remote": "loopback", **{scenario: "local" for scenario in TOOLS}}
+TOPOLOGY = {**{scenario: "local" for scenario in SCENARIOS}, "remote": "loopback"}
+
+
+def storage_of(scenario):
+    """Where a scenario keeps its trees: a tool cell works where the copies it follows are.
+
+    A copy scenario that names no storage is on the disks.
+    """
+    return STORAGE.get(TOOLS[scenario]["follows"] if scenario in TOOLS else scenario, "disks")
 # what clears the trees of a run: its own rrm when it times one, the system's rm otherwise
 REMOVALS = ("rrm", "rm -rf")
 PURPOSES = ("performance", "commissioning")
@@ -172,6 +198,11 @@ def _arguments(argv):
     parser.add_argument("--destination-root", type=Path, required=True)
     parser.add_argument("--source-storage-id")
     parser.add_argument("--destination-storage-id")
+    for kind, what in (("nfs", "the mount that shows the {} root, for nfs cells"),
+                       ("memory", "the {} root in memory, for memory cells")):
+        for side in ("source", "destination"):
+            parser.add_argument(f"--{kind}-{side}-root", type=Path, help=what.format(side))
+            parser.add_argument(f"--{kind}-{side}-storage-id")
     parser.add_argument("--cache", choices=CACHE_POLICIES, default="linux-drop-caches")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=3600,
@@ -212,7 +243,33 @@ def selection(manifest, cells):
         if scenario in TOOLS and (case_id, TOOLS[scenario]["follows"]) not in selected:
             raise ValueError(f"a tool cell needs the {TOOLS[scenario]['follows']} cell of its file set: "
                              f"{case_id}:{scenario}")
+    for case_id in cases:
+        homes = sorted({HOME[storage_of(scenario)] for other, scenario in selected if other == case_id})
+        if len(homes) > 1:
+            raise ValueError(f"a file set is generated once, so its cells share one storage: {case_id} has cells on "
+                             + " and ".join(homes))
     return [(cases[case_id], scenario) for case_id, scenario in selected]
+
+
+def storages(planned, args):
+    """The roots and identities of the storage the planned cells need beside the disks, by kind.
+
+    A root keeps the path it was given: a mount is another path to the same tree, and resolving
+    it would be the place to lose that.
+    """
+    found = {}
+    for kind in STORAGES:
+        if all(storage_of(scenario) != kind for _, scenario in planned):
+            continue
+        roots = {side: getattr(args, f"{kind}_{side}_root") for side in ("source", "destination")}
+        if None in roots.values():
+            raise ValueError(f"{kind} cells need --{kind}-source-root and --{kind}-destination-root")
+        for root in roots.values():
+            if not root.is_dir():
+                raise ValueError(f"{kind} root does not exist: {root}")
+        found[kind] = dict({side: os.path.abspath(root) for side, root in roots.items()},
+                           storage_ids={side: getattr(args, f"{kind}_{side}_storage_id") for side in roots})
+    return found
 
 
 def _variant(scenario, variant):
@@ -221,10 +278,16 @@ def _variant(scenario, variant):
 
 
 def cell_id(case, scenario, variant, context):
-    """Identify the same cell across runs: its definition, never the code, machine or time."""
+    """Identify the same cell across runs: its definition, never the code, machine or time.
+
+    A cell is identified by the storage it works on: the disks for most, and for the others the
+    storage named in the context, so another delay or another mount is another cell.
+    """
+    kind = storage_of(scenario)
+    storage = context["storage_ids"] if kind == "disks" else context["storages"][kind]["storage_ids"]
     identity = [SCHEMA, {key: value for key, value in case.items() if key != "description"}, scenario,
                 variant["args"], context["cache_policy"], context["verification"], context["runner_label"],
-                context["storage_ids"]]
+                storage]
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -405,6 +468,7 @@ def main(argv=None):
     for root in (args.source_root, args.destination_root):
         if not root.is_dir():
             raise ValueError(f"scratch parent does not exist: {root}")
+    elsewhere = storages(planned, args)
     allocation = Allocation(os.environ)
     run_started = time.monotonic()
     output = args.output.resolve()
@@ -413,6 +477,8 @@ def main(argv=None):
         source=str(args.source_root.resolve()), destination=str(args.destination_root.resolve()),
         storage_ids=dict(source=args.source_storage_id, destination=args.destination_storage_id),
         repository=os.environ.get("GITHUB_REPOSITORY", ""), run_url=os.environ.get("BENCHMARK_RUN_URL", ""))
+    if elsewhere:
+        context["storages"] = elsewhere
     file_sets = []
     for case, _ in planned:
         if all(item["case"]["id"] != case["id"] for item in file_sets):
@@ -437,7 +503,8 @@ def main(argv=None):
     remover = None
     # why remote cells cannot be measured, once the private ssh endpoint is known to be unusable
     unreachable = None
-    source_scratch = destination_scratch = None
+    # every scratch directory this run made, and the pair that holds the trees of each home
+    made, scratch = [], {}
     # ended: the allocation leaves no time for another command; finished: the plan ran to its end
     ended = finished = False
     _persist(output, record)
@@ -457,6 +524,8 @@ def main(argv=None):
         if reports:
             context["resources"] = dict(policy=RESOURCE_POLICY)
         context["environment"] = run.environment(args.source_root, args.destination_root)
+        for storage in elsewhere.values():
+            storage["filesystem"] = {side: run._mount(storage[side]) for side in ("source", "destination")}
         if args.system_telemetry:
             # a matrix run may take the longest allocation there is: its journal is bounded for that
             context["system_telemetry"] = telemetry.descriptor(telemetry.MATRIX_LIMITS)
@@ -464,8 +533,27 @@ def main(argv=None):
                                         limits=telemetry.MATRIX_LIMITS)
             with SignalCancellation():
                 sampler.start()
-        source_scratch = Path(tempfile.mkdtemp(prefix="rcp-matrix-source-", dir=args.source_root)).resolve()
-        destination_scratch = Path(tempfile.mkdtemp(prefix="rcp-matrix-destination-", dir=args.destination_root)).resolve()
+        parents = dict(disks=(args.source_root, args.destination_root))
+        if "memory" in elsewhere:
+            parents["memory"] = (Path(elsewhere["memory"]["source"]), Path(elsewhere["memory"]["destination"]))
+        for home, pair in parents.items():
+            for side, parent in zip(("source", "destination"), pair):
+                made.append(Path(tempfile.mkdtemp(prefix=f"rcp-matrix-{side}-", dir=parent)).resolve())
+            scratch[home] = tuple(made[-2:])
+        # the disks' roots as a mount shows them, for what is measured through it
+        mounts = {side: (Path(direct).resolve(), Path(elsewhere["nfs"][side]))
+                  for side, direct in (("source", args.source_root), ("destination", args.destination_root))
+                  } if "nfs" in elsewhere else {}
+
+        def seen(path, kind, side):
+            """The path a measured command is given: through the mount of its side for `nfs`, itself otherwise.
+
+            The side is named and never found from the path: the two roots of a run may overlap.
+            """
+            if kind != "nfs":
+                return path
+            direct, mount = mounts[side]
+            return mount / path.relative_to(direct)
         _persist(output, record, sampler)
         trial_index = 0
 
@@ -561,8 +649,9 @@ def main(argv=None):
             try:
                 if args.check_capacity:
                     mark("capacity", case_index)
+                    # where this file set and its copies are kept: the disks, or the roots in memory
                     file_set["capacity_admission"] = capacity.check_pair(
-                        args.source_root, args.destination_root, case, **capacity.policy())
+                        *parents[HOME[storage_of(cells[0]["scenario"])]], case, **capacity.policy())
             except InterruptedError:
                 # a stop signal is an OSError too; it ends the run instead of failing this file set
                 raise
@@ -605,6 +694,42 @@ def main(argv=None):
                 return None
             return fixture / "filegen"
 
+        def cool(case_index, cell, item, source, limit, what, total):
+            """Prepare the cache before a measured command; return its time limit, or None once the cell is settled.
+
+            `what` names the command in the cell's messages: a "copy", or a "run" of a tool.
+            """
+            nonlocal ended
+            number = item["iteration"]
+            settle([cell], "interrupted", "cache",
+                   f"run stopped during cache preparation before {what} {number} of {total}")
+            save()
+            mark("cache", case_index, item["trial_index"])
+            prepared = time.monotonic()
+            try:
+                diagnostics = item.setdefault("cache_preparation", {}) if args.cache == "linux-drop-caches" else None
+                run._prepare_cache(args.cache, source, limit[0], diagnostics=diagnostics, cache_timeout=limit[0])
+            except InterruptedError:
+                # a stop signal ends the run; it is not this cell's failure
+                raise
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                slow = _out_of_time(error)
+                # a step that fails just as a clipped limit runs out is the allocation ending
+                ended = limit[1] and (slow or allocation.limit(args.timeout) is None)
+                item["status"] = "interrupted" if ended else "timed_out" if slow else "failed"
+                settle([cell], item["status"], "cache",
+                       f"allocation ended during cache preparation before {what} {number} of {total}"
+                       if ended else f"cache preparation before {what} {number} failed: {error}")
+                return None
+            measurements.add_cost(item, "preparation", prepared)
+            # the cache step took its share: the command gets what is left now, not what was left before it
+            limit = allocation.limit(args.timeout)
+            if limit is None:
+                ended = True
+                settle([cell], "interrupted", "cache",
+                       f"allocation ended after cache preparation before {what} {number} of {total}")
+            return limit
+
         def follow(case_index, waiting, copied, source, destination, counts):
             """Time each waiting tool on the copy just made; return whether rrm removed it or failed to.
 
@@ -624,18 +749,30 @@ def main(argv=None):
                     break
                 tool = TOOLS[follower["scenario"]]
                 trial = Path(follower["case_id"]) / follower["scenario"] / str(iteration)
-                places = dict(source=source, copy=destination, tree=destination_scratch / trial)
+                kind = storage_of(follower["scenario"])
+                places = dict(source=source, copy=destination, tree=scratch[HOME[kind]][1] / trial)
                 makes = "tree" in tool["operands"]
                 if makes:
                     places["tree"].parent.mkdir(parents=True, exist_ok=True)
                 # the option goes before the operands
                 command = [paths[tool["variant"]["tool"]], *tool["variant"]["args"], SUMMARY_FORMAT,
-                           *(str(places[name]) for name in tool["operands"])]
+                           # the copy and what a tool makes beside it are on the destination side
+                           *(str(seen(places[name], kind, "source" if name == "source" else "destination"))
+                             for name in tool["operands"])]
                 # until a step says otherwise the run is under way: that is what a stop finds on disk
                 item = dict(iteration=iteration, trial_index=trial_index, follows_trial_index=copied["trial_index"],
                             status="interrupted", command=command)
                 trial_index += 1
                 follower["copies"].append(item)
+                if kind in COLD_TOOLS:
+                    # what the client remembers of the copy would spare the tool its requests
+                    limit = cool(case_index, follower, item, source, limit, "run", runs)
+                    if limit is None:
+                        # the tool did not run, so the copy is still there and no tool failed on it;
+                        # as after a run that failed, the cell is not tried again after the next copy
+                        waiting.remove(follower)
+                        save()
+                        continue
                 settle([follower], "interrupted", "command", f"run stopped during run {iteration} of {runs}")
                 save()
                 mark("command", case_index, item["trial_index"])
@@ -739,9 +876,11 @@ def main(argv=None):
                            f"allocation ended before copy {iteration} of {copies}")
                     return
                 trial = Path(cell["case_id"]) / cell["scenario"] / str(iteration)
-                destination = destination_scratch / trial
+                kind = storage_of(cell["scenario"])
+                destination = scratch[HOME[kind]][1] / trial
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                commands = run.plan_commands(variant, source, destination, paths, "local")
+                commands = run.plan_commands(variant, seen(source, kind, "source"),
+                                             seen(destination, kind, "destination"), paths, "local")
                 if reports:
                     # the option goes before the two operands
                     commands = [[*command[:-2], SUMMARY_FORMAT, *command[-2:]] for command in commands]
@@ -764,34 +903,10 @@ def main(argv=None):
                     item["endpoint_restarted"] = True
                 trial_index += 1
                 cell["copies"].append(item)
-                settle([cell], "interrupted", "cache",
-                       f"run stopped during cache preparation before copy {iteration} of {copies}")
-                save()
-                mark("cache", case_index, item["trial_index"])
-                prepared = time.monotonic()
-                try:
-                    diagnostics = item.setdefault("cache_preparation", {}) if args.cache == "linux-drop-caches" else None
-                    run._prepare_cache(args.cache, source, limit[0], diagnostics=diagnostics, cache_timeout=limit[0])
-                except InterruptedError:
-                    # a stop signal ends the run; it is not this cell's failure
-                    raise
-                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                    slow = _out_of_time(error)
-                    # a step that fails just as a clipped limit runs out is the allocation ending
-                    ended = limit[1] and (slow or allocation.limit(args.timeout) is None)
-                    item["status"] = "interrupted" if ended else "timed_out" if slow else "failed"
-                    settle([cell], item["status"], "cache",
-                           f"allocation ended during cache preparation before copy {iteration} of {copies}"
-                           if ended else f"cache preparation before copy {iteration} failed: {error}")
-                    return
-                measurements.add_cost(item, "preparation", prepared)
-                # the cache step took its share: the copy gets what is left now, not what was left before it
-                limit = allocation.limit(args.timeout)
-                if limit is None:
-                    ended = True
-                    settle([cell], "interrupted", "cache",
-                           f"allocation ended after cache preparation before copy {iteration} of {copies}")
-                    return
+                if kind not in UNCACHED:
+                    limit = cool(case_index, cell, item, source, limit, "copy", copies)
+                    if limit is None:
+                        return
                 settle([cell], "interrupted", "copy", f"run stopped during copy {iteration} of {copies}")
                 save()
                 mark("command", case_index, item["trial_index"])
@@ -896,7 +1011,9 @@ def main(argv=None):
                     leave(cell, following(cell, cells))
                 save()
                 continue
-            fixture = source_scratch / case["id"]
+            # the cells of a file set share one home (see `selection`)
+            home = HOME[storage_of(cells[0]["scenario"])]
+            fixture = scratch[home][0] / case["id"]
             # an error nobody foresaw costs the file set or the cell it happened in, never the
             # ones after it. A stop signal is an exception too, and still ends the run.
             try:
@@ -933,7 +1050,7 @@ def main(argv=None):
                         _end_daemons(endpoint, {}, False)
                     for item in (cell, *followers):
                         _bound_logs(output / "logs" / case["id"] / item["scenario"] / str(len(item["copies"])))
-                        free(destination_scratch / case["id"] / item["scenario"], case_index)
+                        free(scratch[home][1] / case["id"] / item["scenario"], case_index)
                 save()
             free(fixture, case_index)
         complete = sum(cell["outcome"]["status"] == "complete" for cell in record["cells"])
@@ -961,10 +1078,10 @@ def main(argv=None):
                     endpoint.stop()
                     _bound_logs(output / "logs")
         # a stopped run must exit within seconds and an ended allocation has no time left to spend
-        for scratch in (source_scratch, destination_scratch):
-            limit = allocation.limit(args.timeout) if finished and not ended and scratch is not None else None
-            if limit is not None and (remover is None or _remove_with(remover, scratch, limit[0]) != "removed"):
-                _remove(scratch, limit[0])
+        for directory in made:
+            limit = allocation.limit(args.timeout) if finished and not ended else None
+            if limit is not None and (remover is None or _remove_with(remover, directory, limit[0]) != "removed"):
+                _remove(directory, limit[0])
     return record
 
 
@@ -1037,6 +1154,14 @@ def _validate(record):
     storage = context.get("storage_ids")
     _check(isinstance(storage, dict) and set(storage) == {"source", "destination"}
            and all(value is None or _text(value) for value in storage.values()), "invalid storage identities")
+    # the storage beside the disks, for the cells that work there: where it is and what identifies it
+    elsewhere = context.get("storages", {})
+    _check(isinstance(elsewhere, dict) and set(elsewhere) <= set(STORAGES) and all(
+        isinstance(item, dict)
+        and all(isinstance(item.get(side), str) and 0 < len(item[side]) <= 4096 for side in ("source", "destination"))
+        and isinstance(item.get("storage_ids"), dict) and set(item["storage_ids"]) == {"source", "destination"}
+        and all(value is None or _text(value) for value in item["storage_ids"].values())
+        for item in elsewhere.values()), "invalid storages")
     tools = record.get("tools")
     # a run that stops before it has read its tools still reports, with none recorded
     _check(isinstance(tools, dict)
@@ -1061,6 +1186,8 @@ def _validate(record):
         key = (cell["case_id"], cell["scenario"])
         _check(key not in seen, f"{name} duplicates a cell")
         seen.add(key)
+        kind = storage_of(cell["scenario"]) if cell["scenario"] in SCENARIOS else "disks"
+        _check(kind == "disks" or kind in elsewhere, f"{name} is on storage that the context does not describe")
         _check(isinstance(cell.get("cell_id"), str) and re.fullmatch(r"[0-9a-f]{64}", cell["cell_id"]),
                f"{name}.cell_id must be a SHA256 hex digest")
         variant = cell.get("variant")

@@ -163,10 +163,13 @@ class ToolCellTests(unittest.TestCase):
 
     def test_a_tool_cell_is_named_after_the_copies_it_follows_and_its_tool(self):
         self.assertEqual(list(matrix.TOOLS), ["local-rcmp", "local-rlink", "local-rrm",
-                                              "remote-rcmp", "remote-rlink", "remote-rrm"])
-        self.assertEqual(matrix.SCENARIOS, ("local", "remote", *matrix.TOOLS))
+                                              "remote-rcmp", "remote-rlink", "remote-rrm",
+                                              "nfs-rcmp", "nfs-rlink", "nfs-rrm",
+                                              "memory-rcmp", "memory-rlink", "memory-rrm"])
+        self.assertEqual(matrix.SCENARIOS, ("local", "remote", "nfs", "memory", *matrix.TOOLS))
         self.assertEqual([(cell["follows"], cell["tool"]) for cell in matrix.TOOLS.values()],
-                         [(copies, tool) for copies in ("local", "remote") for tool in ("rcmp", "rlink", "rrm")])
+                         [(copies, tool) for copies in ("local", "remote", "nfs", "memory")
+                          for tool in ("rcmp", "rlink", "rrm")])
         # the same tool runs the same command whichever copies it follows
         self.assertEqual(matrix.TOOLS["remote-rrm"]["variant"], matrix.TOOLS["local-rrm"]["variant"])
         self.assertEqual({matrix.TOPOLOGY[scenario] for scenario in matrix.TOOLS}, {"local"})
