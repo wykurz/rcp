@@ -978,29 +978,36 @@ After successful wire results, a failed daemon exit or process wait still fails 
 includes errors flushing explicitly requested timing artifacts during daemon shutdown. Earlier
 operation or protocol failures remain the primary error; teardown still drains tracing receivers.
 
-After the daemon operation finishes, its stdout writer closes message admission on both the control
-and tracing channels when it observes the shutdown request and forwards the already-accepted frames
-in order before closing the SSH stdout descriptor. Live tracing/progress producers do not keep this
-drain open. A frame already being sent completes before the writer handles shutdown; it is never
-cancelled and restarted on the same stream. The daemon gives the in-flight frame and queued messages
-one shared five-second grace. A transport failure ends forwarding, and grace expiry or caller
-cancellation aborts the owned writer rather than detaching it. Forwarding remains best effort: a
-failed or stalled peer can lose remaining output, and these failures do not replace the operation
-result. The master keeps its stdout demux tasks alive while waiting for daemon exit, then gives them
-their existing final drain grace.
+Optional `RcpdToMaster::Tracing` frames are serialized and checked against the framing codec's
+maximum frame length before reaching the shared stdout sink; an oversized or unserializable trace is
+discarded with a best-effort `stderr` note rather than closing the control channel, while real
+transport errors remain fatal. Once `RcpdResult` has been acknowledged by the stdout writer, the
+daemon closes message admission on both channels and drains already-accepted trailing traces for up
+to five seconds before closing the SSH stdout descriptor. Live tracing/progress producers do not
+keep this drain open. A frame already being sent completes before the writer handles shutdown; it is
+never cancelled and restarted on the same stream. A transport failure ends forwarding, and grace
+expiry or caller cancellation aborts the owned writer rather than detaching it. Forwarding remains
+best effort: a failed or stalled peer can lose remaining output, and these failures do not replace
+the operation result. If the master was lost or `RcpdResult` delivery failed, the daemon aborts the
+stdout writer immediately instead of running the drain grace so an unacknowledged result cannot
+flush after the daemon decides to fail. The master keeps its stdout demux tasks alive while waiting
+for daemon exit, then gives them their existing final drain grace.
 
 **rcpd Lifecycle Management:**
 
 - **Unified master stdin watchdog**: Each rcpd reads framed `MasterToRcpd` messages from SSH `stdin`
-  until the copy operation finishes. Before `MasterHello` and throughout the operation, periodic
-  `MasterToRcpd::Heartbeat` frames refresh the `--remote-keepalive-sec` read deadline (when
-  nonzero). An EOF (master exited, killed, or SSH channel closed), a missing-heartbeat timeout
-  (vanished master host even when `sshd` has no `ClientAliveInterval`), or a decode/I/O error
-  cancels the in-flight operation and reports a failure. Once the operation completes, the daemon
-  drops the watchdog before sending `RcpdResult` (bounded by a short flush timeout), so normal
-  master teardown closing `stdin` after consuming `RcpdResult` cannot race with result delivery. A
-  stray post-hello `MasterToRcpd::Hello` is logged and ignored, while an undecodable frame is
-  treated as a channel failure.
+  until the copy operation finishes. Before `MasterHello`, during the operation, and while waiting
+  for the final `RcpdResult` to flush, read progress on `stdin` (including advancing chunks of a
+  large `MasterHello` and periodic `MasterToRcpd::Heartbeat` frames) refreshes the
+  `--remote-keepalive-sec` idle read deadline (when nonzero). During startup and operation, an EOF
+  (master exited, killed, or SSH channel closed), an idle timeout (vanished master host even when
+  `sshd` has no `ClientAliveInterval`), or a decode/I/O error cancels the in-flight operation and
+  reports a failure. While delivering `RcpdResult`, delivery remains tied to actual stdout
+  disconnect or the configured liveness policy rather than the five-second trace drain grace (with a
+  brief post-EOF ack grace so normal master teardown closing `stdin` right after decoding
+  `RcpdResult` cannot race with the writer's flush acknowledgement). A stray post-hello
+  `MasterToRcpd::Hello` is logged and ignored, while an undecodable frame is treated as a channel
+  failure.
 - If master dies unexpectedly, rcpd detects it and winds down through the normal return path (so
   strict-mode lockdown guards restore reused-directory ACLs)
 - No orphaned processes remain on remote hosts
@@ -1553,13 +1560,17 @@ use the same `--remote-keepalive-sec` budget via two complementary mechanisms:
 
 - **Master → SSH server (`ServerAliveInterval` / `ServerAliveCountMax`)**: The retained `ssh -M -N`
   multiplex master configures `interval = min(ceil(N / 6), i32::MAX)` and
-  `count = min(ceil(N / interval), 6)` (or `ServerAliveInterval=0` when `N = 0`, overriding
-  `~/.ssh/config`) so the master tears down a blackholed daemon host within the budget instead of
-  waiting forever for `RcpdResult`.
+  `count = clamp(ceil(N / interval), 2, 6) - 1` (or `ServerAliveInterval=0` when `N = 0`, overriding
+  `~/.ssh/config`). Because OpenSSH increments its unanswered-probe counter before checking
+  `> ServerAliveCountMax`, it disconnects after `interval * (count + 1)` silent seconds — matching
+  standard budgets such as `120s` (`(20, 5)`) and `5s` (`(1, 4)`) directly while guaranteeing at
+  least one probe before disconnecting an idle healthy session (giving a 2-second minimum effective
+  OpenSSH bound `(1, 1)` when `N = 1`).
 - **Master → rcpd (`MasterToRcpd::Heartbeat`)**: The master sends periodic heartbeat frames over
-  each daemon's SSH `stdin` every `N / 3` seconds when `N > 0`, and each daemon bounds its `stdin`
-  reads by `N` seconds so a daemon whose master host vanishes exits within the budget even when
-  `sshd` does not configure `ClientAliveInterval`.
+  each daemon's SSH `stdin` every `N / 3` seconds when `N > 0`, and each daemon enforces an
+  `N`-second idle read deadline on `stdin` (refreshed on every non-empty read so large advancing
+  frames stay alive) so a daemon whose master host vanishes exits within the budget even when `sshd`
+  does not configure `ClientAliveInterval`.
 
 A peer whose HOST vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`,
 so without detection a read on it never completes: the master awaits `RcpdResult` with no timeout of

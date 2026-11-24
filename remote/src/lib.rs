@@ -4594,8 +4594,8 @@ mod tests {
         );
         assert!(
             fast.windows(2)
-                .any(|pair| pair == ["-o", "ServerAliveCountMax=5"]),
-            "keepalive_sec=5 should use ServerAliveCountMax=5: {fast:?}"
+                .any(|pair| pair == ["-o", "ServerAliveCountMax=4"]),
+            "keepalive_sec=5 should use ServerAliveCountMax=4 (1 * (4 + 1) = 5s): {fast:?}"
         );
         let default_args: Vec<String> = ssh_master_args(&session, log, socket, 120)
             .into_iter()
@@ -4610,8 +4610,8 @@ mod tests {
         assert!(
             default_args
                 .windows(2)
-                .any(|pair| pair == ["-o", "ServerAliveCountMax=6"]),
-            "keepalive_sec=120 should use ServerAliveCountMax=6: {default_args:?}"
+                .any(|pair| pair == ["-o", "ServerAliveCountMax=5"]),
+            "keepalive_sec=120 should use ServerAliveCountMax=5 (20 * (5 + 1) = 120s): {default_args:?}"
         );
     }
 

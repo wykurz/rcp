@@ -246,8 +246,8 @@ struct Args {
     /// This is useful for multi-homed hosts or when you want to control which network
     /// is used for TCP traffic. Only IPv4 addresses are supported.
     ///
-    /// When the source path uses an IP address (e.g., "192.168.1.100:/path"), that IP
-    /// is automatically passed to the source rcpd so it binds explicitly to that address.
+    /// When omitted and the source path uses an IP address (e.g., "192.168.1.100:/path"),
+    /// that IP is automatically passed to the source rcpd so it binds explicitly to that address.
     #[arg(long, value_name = "IP", help_heading = "Remote copy options")]
     bind_ip: Option<String>,
 
@@ -502,6 +502,14 @@ fn extract_bind_ip_from_host(host: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Select the source `rcpd` bind IP, giving explicit `--bind-ip` precedence over an IPv4
+/// literal inferred from the source operand host.
+fn resolve_source_bind_ip(explicit_bind_ip: Option<&str>, source_host: &str) -> Option<String> {
+    explicit_bind_ip
+        .map(str::to_owned)
+        .or_else(|| extract_bind_ip_from_host(source_host))
 }
 
 /// The diagnostic for an `rcpd` whose connection FAILED before it said what happened.
@@ -1224,7 +1232,7 @@ async fn run_rcpd_master(
     let dst = &operands.destination;
     let mut teardown = RemoteTeardown::default();
     let source_config = build_source_remote_config(&request);
-    let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
+    let source_bind_ip = resolve_source_bind_ip(args.bind_ip.as_deref(), &src.session().host);
     let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
     let keepalive_sec = request.tcp.keepalive_sec;
     let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
@@ -2899,5 +2907,22 @@ mod tests {
                 "Requested --max-open-files=200, but --max-connections=100 reduced remote data streams to 100"
             )
         );
+    }
+
+    #[test]
+    fn resolve_source_bind_ip_prefers_explicit_flag_and_falls_back_to_ipv4_operand() {
+        assert_eq!(
+            resolve_source_bind_ip(Some("127.0.0.2"), "localhost"),
+            Some("127.0.0.2".to_string())
+        );
+        assert_eq!(
+            resolve_source_bind_ip(Some("127.0.0.2"), "127.0.0.1"),
+            Some("127.0.0.2".to_string())
+        );
+        assert_eq!(
+            resolve_source_bind_ip(None, "127.0.0.1"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(resolve_source_bind_ip(None, "localhost"), None);
     }
 }
