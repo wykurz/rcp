@@ -3725,7 +3725,11 @@ pub async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
     if let Some(acls) = acls.filter(|acls| acls.access.is_some()) {
         // the ACL is the widening step; this chmod carries only the special bits
         let fd = fchmod_owned(fd, side, (mode & 0o7000) | DST_FILE_CREATE_MODE).await?;
-        set_or_remove_acl_owned(fd, side, ACL_ACCESS_XATTR, acls.access.clone()).await?;
+        let access = acls.access.clone();
+        finish_owned(fd, side, move |fd| {
+            apply_one_acl(fd.as_raw_fd(), ACL_ACCESS_XATTR, access.as_deref())
+        })
+        .await
     } else {
         // clearing an inherited ACL can only narrow, so it is safe before the widening chmod
         let fd = if let Some(acls) = acls {
@@ -3733,9 +3737,32 @@ pub async fn set_file_metadata_owned<Meta: crate::preserve::Metadata>(
         } else {
             fd
         };
-        fchmod_owned(fd, side, mode).await?;
+        finish_owned(fd, side, move |fd| {
+            fchmod(fd, Mode::from_bits_truncate(mode)).map_err(nix_to_io)
+        })
+        .await
     }
-    Ok(())
+}
+
+/// Run the last metadata call on an owned descriptor and close the descriptor in the same blocking
+/// job.
+///
+/// A close can wait for the filesystem: NFSv4 sends CLOSE and waits for the reply unless the client
+/// holds a delegation, and other network filesystems close through a metadata server too. Handed
+/// back to async code and dropped there, the descriptor would spend that wait on a runtime worker
+/// thread, and with more files in flight than workers the runtime stands still while ready tasks
+/// wait for a thread. Here the wait occupies the blocking thread that already holds the descriptor,
+/// with no further hand-off. The descriptor is closed whether or not `last` succeeds, and the
+/// latency probe of the call covers the close.
+async fn finish_owned(
+    owned: OwnedFd,
+    side: congestion::Side,
+    last: impl FnOnce(BorrowedFd<'_>) -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<()> {
+    run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
+        last(owned.as_fd())
+    })
+    .await
 }
 
 /// Apply directory metadata (owner, mode, ACLs, timestamps) to an open [`Dir`] fd,
@@ -7256,6 +7283,60 @@ mod tests {
     }
 
     // ── fd-based metadata application ───────────────────────────────────────
+
+    #[test]
+    fn a_copied_file_is_closed_by_the_blocking_job_that_sets_its_metadata() -> anyhow::Result<()> {
+        // a close can wait for the filesystem: NFSv4 sends CLOSE and waits for the reply. It must
+        // not run on the thread that polls the copy. With one blocking thread the jobs run in the
+        // order they were queued, which lets this test see the descriptor after the metadata job
+        // and before its future is polled again
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir()?;
+            let source = tmp.path().join("source");
+            std::fs::write(&source, b"payload")?;
+            let source_meta = std::fs::metadata(&source)?;
+            let root = Dir::open_root_dir(tmp.path(), false, congestion::Side::Destination).await?;
+            let file = root.create_file(OsStr::new("destination")).await?;
+            let identity = testutils::FdIdentityProbe::capture(file.as_raw_fd())?;
+            // hold the only blocking thread, so that the metadata job waits in the queue
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || held.recv());
+            let preserve = crate::preserve::preserve_none();
+            let mut applying = Box::pin(set_file_metadata_owned(
+                &preserve,
+                &source_meta,
+                None,
+                file.into(),
+                congestion::Side::Destination,
+            ));
+            for _ in 0..64 {
+                assert!(
+                    futures::poll!(applying.as_mut()).is_pending(),
+                    "the metadata call finished without its blocking job"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !identity.original_is_closed()?,
+                "closed before the metadata job ran"
+            );
+            // queued behind the metadata job: when this one has run, that one is done
+            let after = tokio::task::spawn_blocking(|| ());
+            release.send(())?;
+            holder.await??;
+            after.await?;
+            assert!(
+                identity.original_is_closed()?,
+                "the metadata job left the descriptor open for the thread that polls its future"
+            );
+            applying.await?;
+            Ok(())
+        })
+    }
 
     #[tokio::test]
     async fn owned_file_metadata_follows_the_created_inode_after_name_replacement()

@@ -37,6 +37,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their own handle on it. An NFS client then renames the file to `.nfsXXXX` and removes it when the
   handle closes: three requests where one does, two of them under the directory's lock. The handle
   is now closed before the unlink.
+- Close a copied file on the blocking thread that sets its metadata, not on a runtime thread. Where
+  a close waits for the filesystem (NFSv4 sends CLOSE and waits for the reply unless the client
+  holds a delegation), every finished file held one of `rcp`'s runtime threads for a round trip.
+  With `--max-files-in-flight` well above the CPU count, all of them could be waiting at once while
+  ready work had no thread, and raising the limit stopped helping. This covers local copies and the
+  destination of remote ones.
 - Flush `rcmp --log` when a comparison fails so the log includes differences found before the
   failure.
 - Avoid rebuilding the shared library and its dependents on every Cargo invocation in a linked Git
