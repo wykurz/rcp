@@ -1934,7 +1934,7 @@ pub use common::is_localhost;
 
 /// Host-key verification policy for an SSH master connection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum HostKeyPolicy {
+pub(crate) enum HostKeyPolicy {
     /// Pass `-o StrictHostKeyChecking=no` (default for ordinary non-agent-forwarded sessions).
     #[default]
     AutoAccept,
@@ -2403,7 +2403,7 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Retrieve a remote home directory with a caller-selected bootstrap timeout and host-key policy.
+/// Retrieve a remote home directory with a caller-selected bootstrap timeout.
 #[instrument(skip(cleanup, local_operand_roots))]
 pub async fn get_remote_home_for_session_with_timeout(
     session: &SshSession,
@@ -2411,7 +2411,6 @@ pub async fn get_remote_home_for_session_with_timeout(
     bootstrap_timeout: std::time::Duration,
     keepalive_sec: u64,
     local_operand_roots: &[std::path::PathBuf],
-    host_key_policy: HostKeyPolicy,
 ) -> anyhow::Result<std::path::PathBuf> {
     let preparation = PreparationContext::uncancelled(cleanup.clone())
         .with_control_directory_exclusions(local_operand_roots.to_vec().into());
@@ -2423,7 +2422,7 @@ pub async fn get_remote_home_for_session_with_timeout(
         SshConnectOptions {
             keepalive_sec,
             agent_forward: AgentForwardMode::Off,
-            host_key_policy,
+            host_key_policy: HostKeyPolicy::AutoAccept,
             hostname_override: None,
         },
     )
@@ -3289,6 +3288,69 @@ pub struct PreparedRcpd {
     agent_forward: AgentForwardMode,
 }
 
+/// Destination SSH multiplex master authenticated up front under its configured
+/// `StrictHostKeyChecking` policy before any source SSH connection can update `known_hosts`.
+///
+/// Retained across optional remote `~` HOME expansion and handed directly to
+/// [`prepare_rcpd_endpoints_with_timeout`] so destination setup reuses the verified master
+/// session without a second handshake.
+pub struct PreauthenticatedDestination {
+    session: ManagedSshSession,
+    remote: SshSession,
+    agent_forward: AgentForwardMode,
+}
+
+impl PreauthenticatedDestination {
+    /// Authenticate the destination SSH master under its configured `StrictHostKeyChecking`
+    /// policy before any source SSH connection starts.
+    ///
+    /// The foreground `ssh -M -N` master opens no session channel, and subsequent bootstrap
+    /// commands (remote `~` HOME lookup, `rcpd` discovery, peer identity probing) run over the
+    /// native OpenSSH mux protocol with agent forwarding disabled.
+    #[instrument(skip(cleanup, local_operand_roots))]
+    pub async fn connect(
+        session: &SshSession,
+        cleanup: &RemoteCleanup,
+        bootstrap_timeout: std::time::Duration,
+        keepalive_sec: u64,
+        local_operand_roots: &[std::path::PathBuf],
+        agent_forward: AgentForwardMode,
+    ) -> anyhow::Result<Self> {
+        let preparation = PreparationContext::uncancelled(cleanup.clone())
+            .with_control_directory_exclusions(local_operand_roots.to_vec().into());
+        let deadline = BootstrapDeadline::new(bootstrap_timeout);
+        let managed = setup_ssh_session_with_options(
+            session,
+            &preparation,
+            deadline,
+            SshConnectOptions {
+                keepalive_sec,
+                agent_forward,
+                host_key_policy: HostKeyPolicy::HonorConfig,
+                hostname_override: None,
+            },
+        )
+        .await?;
+        Ok(Self {
+            session: managed,
+            remote: session.clone(),
+            agent_forward,
+        })
+    }
+
+    /// Retrieve the destination's remote `HOME` directory over the already-authenticated master
+    /// session without opening a second SSH connection or forwarding the SSH agent.
+    pub async fn get_remote_home_with_timeout(
+        &self,
+        bootstrap_timeout: std::time::Duration,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let preparation = PreparationContext::uncancelled(self.session.cleanup());
+        let deadline = BootstrapDeadline::new(bootstrap_timeout);
+        let home = get_remote_home_with_context(&self.session, &preparation, deadline).await?;
+        Ok(std::path::PathBuf::from(home))
+    }
+}
+
 /// Prepare two endpoints with a caller-selected remote bootstrap timeout.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_rcpd_endpoints_with_timeout(
@@ -3300,24 +3362,21 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
     bootstrap_timeout: std::time::Duration,
     keepalive_sec: u64,
     local_operand_roots: &[std::path::PathBuf],
-    source_host_key_policy: HostKeyPolicy,
     destination_agent_forward: AgentForwardMode,
+    preauthenticated_destination: Option<PreauthenticatedDestination>,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
-    let dest_host_key_policy = if destination_agent_forward == AgentForwardMode::Off {
-        HostKeyPolicy::AutoAccept
+    let existing_dest_session = if let Some(preauth) = preauthenticated_destination {
+        anyhow::ensure!(
+            preauth.remote == *destination && preauth.agent_forward == destination_agent_forward,
+            "pre-authenticated destination session does not match endpoint parameters"
+        );
+        Some(preauth.session)
     } else {
-        HostKeyPolicy::HonorConfig
+        None
     };
     let control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]> =
         local_operand_roots.to_vec().into();
     if source == destination {
-        let shared_host_key_policy = if dest_host_key_policy == HostKeyPolicy::HonorConfig
-            || source_host_key_policy == HostKeyPolicy::HonorConfig
-        {
-            HostKeyPolicy::HonorConfig
-        } else {
-            HostKeyPolicy::AutoAccept
-        };
         let dest_prepared = prepare_rcpd_with_context(
             source,
             explicit_rcpd_path,
@@ -3327,7 +3386,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
             bootstrap_timeout,
             keepalive_sec,
             destination_agent_forward,
-            shared_host_key_policy,
+            existing_dest_session,
         )
         .await?;
         let mut source_prepared = dest_prepared.clone();
@@ -3346,7 +3405,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 bootstrap_timeout,
                 keepalive_sec,
                 AgentForwardMode::Off,
-                source_host_key_policy,
+                None,
             )
         },
         move |preparation| {
@@ -3358,7 +3417,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 bootstrap_timeout,
                 keepalive_sec,
                 destination_agent_forward,
-                dest_host_key_policy,
+                existing_dest_session,
             )
         },
     )
@@ -3467,7 +3526,7 @@ where
     }
 }
 
-#[instrument(skip(preparation))]
+#[instrument(skip(preparation, existing_session))]
 #[allow(clippy::too_many_arguments)]
 async fn prepare_rcpd_with_context(
     session: &SshSession,
@@ -3477,27 +3536,35 @@ async fn prepare_rcpd_with_context(
     bootstrap_timeout: std::time::Duration,
     keepalive_sec: u64,
     agent_forward: AgentForwardMode,
-    host_key_policy: HostKeyPolicy,
+    existing_session: Option<ManagedSshSession>,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
-    let effective_host_key_policy = if agent_forward != AgentForwardMode::Off {
-        HostKeyPolicy::HonorConfig
-    } else {
-        host_key_policy
+    let ssh_session = match existing_session {
+        Some(existing) => {
+            preparation.ensure_active()?;
+            existing
+        }
+        None => {
+            let host_key_policy = if agent_forward == AgentForwardMode::Off {
+                HostKeyPolicy::AutoAccept
+            } else {
+                HostKeyPolicy::HonorConfig
+            };
+            setup_ssh_session_with_options(
+                session,
+                &preparation,
+                BootstrapDeadline::new(bootstrap_timeout),
+                SshConnectOptions {
+                    keepalive_sec,
+                    agent_forward,
+                    host_key_policy,
+                    hostname_override: None,
+                },
+            )
+            .await?
+        }
     };
-    let ssh_session = setup_ssh_session_with_options(
-        session,
-        &preparation,
-        BootstrapDeadline::new(bootstrap_timeout),
-        SshConnectOptions {
-            keepalive_sec,
-            agent_forward,
-            host_key_policy: effective_host_key_policy,
-            hostname_override: None,
-        },
-    )
-    .await?;
     let rcpd_path = match try_discover_and_check_version(
         &ssh_session,
         explicit_rcpd_path,
@@ -4757,7 +4824,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::Off,
-                HostKeyPolicy::AutoAccept,
+                None,
             )
             .await
         }
@@ -5076,7 +5143,7 @@ mod tests {
                     std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
                     config.remote_keepalive_sec,
                     AgentForwardMode::Off,
-                    HostKeyPolicy::AutoAccept,
+                    None,
                 )
                 .await?
                 .spawn(&config, None, protocol::RcpdRole::Source)
@@ -5407,7 +5474,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::ForceOn,
-                HostKeyPolicy::HonorConfig,
+                None,
             )
             .await
             .unwrap();
@@ -5875,7 +5942,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::ForceOn,
-                HostKeyPolicy::HonorConfig,
+                None,
             )
             .await
             .unwrap();
@@ -6138,7 +6205,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::InheritConfig,
-                HostKeyPolicy::HonorConfig,
+                None,
             )
             .await
             .unwrap();
@@ -6159,7 +6226,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::InheritConfig,
-                HostKeyPolicy::HonorConfig,
+                None,
             )
             .await
             .unwrap();
@@ -6191,7 +6258,7 @@ mod tests {
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
                 AgentForwardMode::InheritConfig,
-                HostKeyPolicy::HonorConfig,
+                None,
             )
             .await
             .unwrap();

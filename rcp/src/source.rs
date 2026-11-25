@@ -1188,6 +1188,16 @@ async fn handle_dry_run_connection(
     peer_connected.store(true, std::sync::atomic::Ordering::Release);
     let control_send_stream: remote::streams::BoxedSharedSendStream =
         std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
+    // announce active dry-run readiness before traversing so a plaintext (--no-encryption)
+    // destination marks `peer_connected = true` immediately and distinguishes an active preview
+    // from an SSH forward denied before reaching source.
+    {
+        let mut stream = control_send_stream.lock().await;
+        stream
+            .send_control_message(&remote::protocol::SourceMessage::DryRunReady)
+            .await
+            .context("failed to send dry-run readiness to destination")?;
+    }
     // traverse and log dry-run entries (output goes via tracing). The default path uses the
     // fd-relative walker — the same hardened shape as the real copy, so a concurrent swap
     // cannot make the dry run report content from outside the source tree, and under strict

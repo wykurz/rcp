@@ -110,6 +110,12 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
                         receive
                             .recv_object::<remote::protocol::SourceMessage>()
                             .await?,
+                        Some(remote::protocol::SourceMessage::DryRunReady)
+                    ));
+                    assert!(matches!(
+                        receive
+                            .recv_object::<remote::protocol::SourceMessage>()
+                            .await?,
                         Some(remote::protocol::SourceMessage::DiscoveryComplete {
                             has_root_item: false
                         })
@@ -206,8 +212,24 @@ async fn dry_run_aborts_promptly_when_peer_control_drops_during_slow_preview() -
             ),
         );
         let peer_drop = async move {
+            let (_send, mut receive) = remote::tls::connect_bounded(
+                None,
+                remote::tls::SERVER_NAME_SOURCE,
+                peer,
+                std::time::Duration::from_secs(5),
+                "dry-run drop test control",
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                receive
+                    .recv_object::<remote::protocol::SourceMessage>()
+                    .await
+                    .unwrap(),
+                Some(remote::protocol::SourceMessage::DryRunReady)
+            ));
             seen_first.notified().await;
-            drop(peer);
+            drop((_send, receive));
         };
         let started = std::time::Instant::now();
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {

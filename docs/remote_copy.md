@@ -557,9 +557,10 @@ Key behavior:
   wrong backend. If `host2` cannot authenticate to `host1`, configure keys between them, pass
   `--ssh-forward-agent` (or enable `ForwardAgent` for `host2` in `~/.ssh/config`), open
   `--port-ranges` for direct TCP, or run `rcp` from `host1` or `host2`. When agent forwarding is
-  enabled or configured for the destination, `rcp` preserves the user's `StrictHostKeyChecking`
-  policy from the first SSH connection to the destination — including remote `~` home expansion
-  (which still runs with `ForwardAgent=no`) — instead of disabling host-key verification.
+  enabled or configured for the destination, `rcp` authenticates the destination first under the
+  user's configured `StrictHostKeyChecking` policy — before any source SSH connection can update
+  `known_hosts` (even across routes sharing a `HostKeyAlias`) — and retains that verified master
+  session for destination `~` home expansion (with agent forwarding disabled) and `rcpd` setup.
 - **Flags interaction, firewalls & IPv6**: `--remote-transport=ssh` binds the source to loopback
   (`127.0.0.1`, or `::1` when the source requires IPv6) on an ephemeral port and warns and ignores
   `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both flags during the direct-TCP
@@ -568,9 +569,11 @@ Key behavior:
   the control-port TCP connection succeeds, `--remote-transport=auto` commits to direct TCP; if a
   firewall permits the control port while blocking the separate data port, pass
   `--remote-transport=ssh` or open both listeners with `--port-ranges`. For SSH port forwarding,
-  `rcp` selects the source loopback target family independently of the client-side listener family,
-  supporting both `AddressFamily inet6` and mixed client `AddressFamily any` with IPv6-only `sshd`
-  servers across download, upload, and 3-host transfers.
+  `rcp` uses the forwarding server's actual address family (`SSH_CONNECTION`) for server-side
+  sockets while keeping the client's `AddressFamily` for client-opened sockets, supporting direct
+  IPv6, mixed client `AddressFamily any` with IPv6-only `sshd`, and cross-family `ProxyCommand`
+  connections (such as an `AddressFamily inet6` client reaching an IPv4-only `sshd`) across
+  download, upload, and 3-host transfers.
 - **Slow-path notice & `sshd` requirements**: Any non-same-host copy over SSH emits a
   default-visible warning (`rcp::notice`). Remote `sshd` servers must allow TCP forwarding
   (`AllowTcpForwarding yes`, or `local` for downloads / `remote` for uploads); 3-host agent

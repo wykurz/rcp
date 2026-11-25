@@ -433,6 +433,7 @@ fn check_messages(direction: Direction) {
             dst: "/dst/g".into(),
         },
     );
+    fixtures.check("dry-run-ready", SourceMessage::DryRunReady);
     fixtures.check(
         "manifest",
         DestinationMessage::DirectoryManifestChunk {
