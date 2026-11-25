@@ -64,6 +64,20 @@ impl Drop for NetworkCleanupGuard<'_> {
     }
 }
 
+/// Fail the test if the bandwidth limit on `container` refused a packet.
+///
+/// The limit is there to slow a host, not to lose its packets. A queue that keeps refusing the
+/// packets of one of the host's own connections makes Linux abort that connection, and the SSH
+/// session that carries the daemon is one of them.
+fn assert_limit_refused_nothing(env: &DockerEnv, container: &str) -> Result<()> {
+    let refused = env.refused_packets(container)?;
+    assert_eq!(
+        refused, 0,
+        "the bandwidth limit on {container} refused {refused} packets"
+    );
+    Ok(())
+}
+
 /// Test backpressure mechanism with extreme bandwidth limiting.
 ///
 /// This test applies very low bandwidth (64 kbit/s) to the destination
@@ -113,6 +127,7 @@ fn test_chaos_protocol_backpressure_slow_destination() -> Result<()> {
         "destination file should be 256KB, got {} bytes",
         dst_size
     );
+    assert_limit_refused_nothing(&env, "host-b")?;
     eprintln!(
         "✓ Backpressure test passed (256KB transferred in {:?} with 64kbit limit)",
         elapsed
@@ -166,6 +181,7 @@ fn test_chaos_protocol_backpressure_slow_source() -> Result<()> {
         "destination file should be 256KB, got {} bytes",
         dst_size
     );
+    assert_limit_refused_nothing(&env, "host-a")?;
     eprintln!(
         "✓ Slow source backpressure test passed (256KB transferred in {:?} with 64kbit limit)",
         elapsed
@@ -406,6 +422,7 @@ fn test_chaos_protocol_combined_stress() -> Result<()> {
         "all {} files should be copied, got {}",
         file_count, copied_count
     );
+    assert_limit_refused_nothing(&env, "host-b")?;
     eprintln!(
         "✓ Combined stress test passed ({} files with bandwidth limit and limited connections in {:?})",
         file_count, elapsed
