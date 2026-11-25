@@ -14,11 +14,14 @@ from unittest import mock
 
 from benchmarks import matrix, telemetry
 from . import common, other_storage, production_collection as collection, production_diagnostics as diagnostics
+from . import production_export as export, production_history as history
 from . import production_projection as projection, storage_check, test_matrix_diagnostics, test_matrix_results, worker
 from .test_durable_worker import durable_fixture, request as worker_request
 from .test_matrix_pages import matrix_example
 from .test_matrix_results import matrix_record
+from .test_production_history import split
 from .test_tool_cells import sampled_matrix
+from .test_tool_pages import weeks
 from .test_worker_review import report
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -602,6 +605,35 @@ class StorageDiagnosticsTests(unittest.TestCase):
         record, extra = companion(COMMISSION, failed)
         self.assertIn("The mounts of the network filesystem could not be prepared for this run", diagnostics.render(extra, record))
         self.assertNotIn("other-storage", diagnostics.render(*companion("matrix-commission-local+tools")[::-1]))
+
+
+class StoragePageTests(unittest.TestCase):
+    """The pages take a run with cells on other storage: those cells are on its run page and have no trend yet."""
+
+    def test_the_cells_of_the_arrays_keep_their_trends_and_the_others_are_counted_beside_them(self):
+        records, companions = split(weeks(2, suite=WEEKLY))
+        self.assertEqual(history.present(records), ("local", "remote", "rcmp", "rlink", "rrm"))
+        outside = {}
+        for trend in history.TRENDS:
+            cases, outside[trend] = history.model(records, companions, trend)
+            with self.subTest(trend=trend):
+                self.assertEqual({len(points) for points in cases.values()}, {2})
+                self.assertTrue(set(cases) <= set(FILE_SETS))
+                history.render(records, companions, trend)
+        # each run has four cells between the mounts and four in memory, reported once: beside the local trends
+        self.assertEqual(outside, dict(local=16, remote=0, rcmp=0, rlink=0, rrm=0))
+        self.assertIn("16 qualified measurements are outside these trends",
+                      history.render(records, companions, "local"))
+        history.overview(records, companions)
+
+    def test_the_run_page_lists_every_cell_and_its_diagnostics(self):
+        record, extra = companion(COMMISSION)
+        page = export.render(record, diagnostics=extra)
+        for case, scenario in common.MATRIX_SUITES[COMMISSION]:
+            self.assertIn("<code>" + scenario + "</code>", page)
+        self.assertIn("24 of 24 measurements completed", page)
+        self.assertIn("<h3 id='other-storage'>Other storage of this run</h3>", page)
+        self.assertIn("NFS 4.2", page)
 
 
 class StorageImageTests(unittest.TestCase):

@@ -317,6 +317,26 @@ where every trial carries the `variant_id` of its own cell, and only a remote co
 tool run is one process whichever copies it follows, so its `metrics` are the tool's own and its
 `roles` is `null`, as for a local copy.
 
+A run of a suite with cells on other storage (`nfs` or `memory` in its name) publishes record
+version 6, `rcp-production-public-report-v6`. It is version 5 with two more copy scenarios, `nfs`
+(between two mounts of a network filesystem) and `memory` (between two filesystems in memory), and
+the tool cells that follow each (`nfs-rcmp`, `memory-rrm` and so on). A cell whose storage the
+worker could not prepare is `failed` at stage `storage`, with the reason as its message. The cells
+of the arrays in a version 6 record continue the series of the same cells in earlier records.
+
+The diagnostics companion of a version 6 record is `rcp-public-resource-diagnostics-v5`: version 4
+where a copy through a mount or in memory is one process like a local copy, with `roles` `null`, and
+with one more part, `other_storage`. It has an entry for each of `nfs` and `memory` that the run has
+cells on:
+
+- `status` `prepared`, with the figures the worker reported: for `nfs` the protocol `version`, the
+  `delay_microseconds` added to every packet, the server `threads` and the `round_trip_microseconds`
+  measured before the run; for `memory` the `size_bytes` and `inodes` limits of each root.
+- `status` `unavailable` when the worker could not prepare it, or `not_recorded` when its report
+  says nothing usable about it.
+
+A run may have six file sets where earlier documents had at most four.
+
 On the pages, a matrix run continues the trend of its file set: the change of method appears as a
 marked setup change (`Copy check`), not as a new line. The run page lists every cell with its result
 and, for anything not measured, what happened. A run that measured only some of its cells is shown
