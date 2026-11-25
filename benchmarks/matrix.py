@@ -30,7 +30,10 @@ measured goes through the mounts. There a cache is dropped before every tool run
 too, since what the client still remembers decides how many requests a tool
 sends. `memory` copies between two roots of its own that live in memory, where no
 cache is dropped at all. A file set is generated once, so its cells share the
-disks (`local`, `remote`, `nfs`) or are all `memory`.
+disks (`local`, `remote`, `nfs`) or are all `memory`. The runner is given these
+mounts and roots and makes none. A run that was given a reason in their place
+(`--nfs-unavailable`, `--memory-unavailable`) fails the cells there with it and
+measures the rest.
 
 A run that has an rrm cell clears every tree with that rrm, as a user of the
 tools would: what rlink made, a file set that is done with, a copy that no rrm
@@ -89,6 +92,8 @@ HOME = {"disks": "disks", "nfs": "disks", "memory": "memory"}
 # where a cache is dropped before a tool run as before a copy, and where none is dropped at all
 COLD_TOOLS = ("nfs",)
 UNCACHED = ("memory",)
+# the longest reason a run may be given for storage it has no roots on
+MESSAGE_LIMIT = 1024
 # what each of the other tools runs on a copy, in the order the tools run. `operands` names the
 # trees of the command: the `source` of the copy, the `copy` itself, and a new `tree` beside the
 # copy for a tool that makes one. `counts` are the figures of the tool's summary that must equal
@@ -203,6 +208,9 @@ def _arguments(argv):
         for side in ("source", "destination"):
             parser.add_argument(f"--{kind}-{side}-root", type=Path, help=what.format(side))
             parser.add_argument(f"--{kind}-{side}-storage-id")
+        parser.add_argument(f"--{kind}-unavailable", metavar="WHY",
+                            help=f"why this run has no {kind} roots: its {kind} cells fail with this message "
+                                 "and every other cell is measured")
     parser.add_argument("--cache", choices=CACHE_POLICIES, default="linux-drop-caches")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=3600,
@@ -255,13 +263,22 @@ def storages(planned, args):
     """The roots and identities of the storage the planned cells need beside the disks, by kind.
 
     A root keeps the path it was given: a mount is another path to the same tree, and resolving
-    it would be the place to lose that.
+    it would be the place to lose that. Storage that whoever starts the run could not prepare has
+    no roots and says why instead: its cells keep their identity and fail.
     """
     found = {}
     for kind in STORAGES:
         if all(storage_of(scenario) != kind for _, scenario in planned):
             continue
         roots = {side: getattr(args, f"{kind}_{side}_root") for side in ("source", "destination")}
+        why = getattr(args, f"{kind}_unavailable")
+        if why is not None:
+            if not _text(why, MESSAGE_LIMIT) or any(root is not None for root in roots.values()):
+                raise ValueError(f"--{kind}-unavailable takes the reason, of at most {MESSAGE_LIMIT} characters, "
+                                 f"and stands in place of the {kind} roots")
+            found[kind] = dict(unavailable=why,
+                               storage_ids={side: getattr(args, f"{kind}_{side}_storage_id") for side in roots})
+            continue
         if None in roots.values():
             raise ValueError(f"{kind} cells need --{kind}-source-root and --{kind}-destination-root")
         for root in roots.values():
@@ -469,6 +486,9 @@ def main(argv=None):
         if not root.is_dir():
             raise ValueError(f"scratch parent does not exist: {root}")
     elsewhere = storages(planned, args)
+    # the storage beside the disks that this run has roots on, and why it has none on the rest
+    usable = {kind: storage for kind, storage in elsewhere.items() if "unavailable" not in storage}
+    missing = {kind: storage["unavailable"] for kind, storage in elsewhere.items() if "unavailable" in storage}
     allocation = Allocation(os.environ)
     run_started = time.monotonic()
     output = args.output.resolve()
@@ -524,7 +544,7 @@ def main(argv=None):
         if reports:
             context["resources"] = dict(policy=RESOURCE_POLICY)
         context["environment"] = run.environment(args.source_root, args.destination_root)
-        for storage in elsewhere.values():
+        for storage in usable.values():
             storage["filesystem"] = {side: run._mount(storage[side]) for side in ("source", "destination")}
         if args.system_telemetry:
             # a matrix run may take the longest allocation there is: its journal is bounded for that
@@ -534,16 +554,16 @@ def main(argv=None):
             with SignalCancellation():
                 sampler.start()
         parents = dict(disks=(args.source_root, args.destination_root))
-        if "memory" in elsewhere:
-            parents["memory"] = (Path(elsewhere["memory"]["source"]), Path(elsewhere["memory"]["destination"]))
+        if "memory" in usable:
+            parents["memory"] = (Path(usable["memory"]["source"]), Path(usable["memory"]["destination"]))
         for home, pair in parents.items():
             for side, parent in zip(("source", "destination"), pair):
                 made.append(Path(tempfile.mkdtemp(prefix=f"rcp-matrix-{side}-", dir=parent)).resolve())
             scratch[home] = tuple(made[-2:])
         # the disks' roots as a mount shows them, for what is measured through it
-        mounts = {side: (Path(direct).resolve(), Path(elsewhere["nfs"][side]))
+        mounts = {side: (Path(direct).resolve(), Path(usable["nfs"][side]))
                   for side, direct in (("source", args.source_root), ("destination", args.destination_root))
-                  } if "nfs" in elsewhere else {}
+                  } if "nfs" in usable else {}
 
         def seen(path, kind, side):
             """The path a measured command is given: through the mount of its side for `nfs`, itself otherwise.
@@ -559,6 +579,15 @@ def main(argv=None):
 
         def remote(cell):
             return TOPOLOGY[cell["scenario"]] == "loopback"
+
+        def barred(cell):
+            """Why a copy cell cannot be measured at all, as the stage and message of its failure; None if it can."""
+            kind = storage_of(cell["scenario"])
+            if kind in missing:
+                return "storage", missing[kind]
+            if unreachable is not None and remote(cell):
+                return "transport", unreachable
+            return None
 
         def following(cell, cells):
             """The tool cells among `cells` that work on the copies of this copy cell."""
@@ -864,8 +893,9 @@ def main(argv=None):
             """
             nonlocal ended, trial_index, unreachable
             copies, loopback = args.repetitions, remote(cell)
-            if loopback and unreachable is not None:
-                settle([cell], "failed", "transport", unreachable)
+            reason = barred(cell)
+            if reason is not None:
+                settle([cell], "failed", *reason)
                 return
             for iteration in range(1, copies + 1):
                 limit = None if ended else allocation.limit(args.timeout)
@@ -1003,11 +1033,11 @@ def main(argv=None):
                 continue
             # a tool cell is measured and settled with the cell whose copies it works on
             copying = [cell for cell in cells if cell["scenario"] not in TOOLS]
-            if unreachable is not None and all(remote(cell) for cell in copying):
+            if all(barred(cell) is not None for cell in copying):
                 # nothing here can be measured, the tools on these copies included: the file set is
                 # not generated for it
                 for cell in copying:
-                    settle([cell], "failed", "transport", unreachable)
+                    settle([cell], "failed", *barred(cell))
                     leave(cell, following(cell, cells))
                 save()
                 continue
@@ -1154,11 +1184,14 @@ def _validate(record):
     storage = context.get("storage_ids")
     _check(isinstance(storage, dict) and set(storage) == {"source", "destination"}
            and all(value is None or _text(value) for value in storage.values()), "invalid storage identities")
-    # the storage beside the disks, for the cells that work there: where it is and what identifies it
+    # the storage beside the disks, for the cells that work there: what identifies it, and either
+    # where it is or why this run has none
     elsewhere = context.get("storages", {})
     _check(isinstance(elsewhere, dict) and set(elsewhere) <= set(STORAGES) and all(
         isinstance(item, dict)
-        and all(isinstance(item.get(side), str) and 0 < len(item[side]) <= 4096 for side in ("source", "destination"))
+        and (_text(item["unavailable"], MESSAGE_LIMIT) and set(item) == {"unavailable", "storage_ids"}
+             if "unavailable" in item else
+             all(isinstance(item.get(side), str) and 0 < len(item[side]) <= 4096 for side in ("source", "destination")))
         and isinstance(item.get("storage_ids"), dict) and set(item["storage_ids"]) == {"source", "destination"}
         and all(value is None or _text(value) for value in item["storage_ids"].values())
         for item in elsewhere.values()), "invalid storages")
@@ -1201,6 +1234,9 @@ def _validate(record):
                        for field in ("stage", "message")), f"{name}.outcome is invalid")
         copies = cell.get("copies")
         _check(isinstance(copies, list) and len(copies) <= repetitions, f"{name}.copies is invalid")
+        _check(kind == "disks" or "unavailable" not in elsewhere[kind]
+               or (not copies and outcome["status"] in ("failed", "not_run")),
+               f"{name} holds a measurement on storage that the run did not have")
         for position, item in enumerate(copies, 1):
             label = f"{name}.copies[{position - 1}]"
             _check(isinstance(item, dict) and type(item.get("iteration")) is int and item["iteration"] == position

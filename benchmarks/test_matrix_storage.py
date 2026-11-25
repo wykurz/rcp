@@ -48,19 +48,19 @@ class StorageTests(unittest.TestCase):
                           f"--{kind}-destination-storage-id", f"{kind}-destination-v1"]
         return arguments
 
-    def arguments(self, cells, *extra, cache_policy="uncontrolled"):
+    def arguments(self, cells, *extra, cache_policy="uncontrolled", output="out"):
         arguments = ["--manifest", str(self.manifest), "--bin-dir", str(self.bin),
                      "--source-root", str(self.root / "source"), "--destination-root", str(self.root / "destination"),
                      "--source-storage-id", "disk-source-v1", "--destination-storage-id", "disk-destination-v1",
-                     "--cache", cache_policy, "--repetitions", "2", "--output", str(self.root / "out")]
+                     "--cache", cache_policy, "--repetitions", "2", "--output", str(self.root / output)]
         for cell in cells:
             arguments += ["--cell", cell]
         return [*arguments, *extra]
 
-    def run_matrix(self, cells, *extra, cache_policy="uncontrolled"):
+    def run_matrix(self, cells, *extra, cache_policy="uncontrolled", output="out"):
         with contextlib.redirect_stdout(io.StringIO()):
-            record = matrix.main(self.arguments(cells, *extra, cache_policy=cache_policy))
-        saved = json.loads((self.root / "out/results.json").read_text())
+            record = matrix.main(self.arguments(cells, *extra, cache_policy=cache_policy, output=output))
+        saved = json.loads((self.root / output / "results.json").read_text())
         self.assertEqual(saved, json.loads(json.dumps(record)))
         matrix.validate(saved)
         return saved
@@ -216,6 +216,71 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(nfs["storage_ids"], dict(source="nfs-source-v1", destination="nfs-destination-v1"))
         self.assertEqual(nfs["source"], str(self.root / "nfs-source"))
         self.assertIn("filesystem", nfs)
+
+    def missing(self, kind, why):
+        """Arguments that name a storage and say why this run has no roots on it."""
+        return [f"--{kind}-unavailable", why, f"--{kind}-source-storage-id", f"{kind}-source-v1",
+                f"--{kind}-destination-storage-id", f"{kind}-destination-v1"]
+
+    def test_storage_that_could_not_be_prepared_costs_its_cells_only(self):
+        seen, patched = self.launches()
+        with patched:
+            record = self.run_matrix(("alpha:local", "alpha:local-rrm", *NFS, *MEMORY),
+                                     *self.missing("nfs", "the NFS server did not start"), *self.roots("memory"))
+        self.assertEqual(record["status"], "partial")
+        for case, scenario in (("alpha", "local"), ("alpha", "local-rrm"), *(cell.split(":") for cell in MEMORY)):
+            self.assertEqual(self.cell(record, scenario, case)["outcome"]["status"], "complete", scenario)
+        copy = self.cell(record, "nfs", "alpha")
+        self.assertEqual(copy["outcome"], dict(status="failed", stage="storage", message="the NFS server did not start"))
+        self.assertEqual(copy["copies"], [])
+        for scenario in ("nfs-rcmp", "nfs-rlink", "nfs-rrm"):
+            outcome = self.cell(record, scenario, "alpha")["outcome"]
+            self.assertEqual((outcome["status"], outcome["stage"]), ("failed", "copy"))
+            self.assertIn("the NFS server did not start", outcome["message"])
+        # what the storage is stays on record, and that it was missing: a cell is identified by it
+        self.assertEqual(record["context"]["storages"]["nfs"],
+                         dict(unavailable="the NFS server did not start",
+                              storage_ids=dict(source="nfs-source-v1", destination="nfs-destination-v1")))
+        self.assertFalse(any(self.below(argument, "nfs-source") or self.below(argument, "nfs-destination")
+                             for command in seen for argument in command[1:] if argument.startswith("/")))
+
+    def test_a_file_set_whose_storage_is_missing_is_not_generated(self):
+        seen, patched = self.launches()
+        with patched:
+            record = self.run_matrix(MEMORY, *self.missing("memory", "no room for the roots in memory"))
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual([command for command in seen if command[0] == "filegen"], [])
+        self.assertEqual(record["file_sets"][0]["generation"], dict(status="not_run"))
+        self.assertEqual([cell["outcome"]["stage"] for cell in record["cells"]], ["storage", "copy", "copy", "copy"])
+        self.assertEqual({cell["outcome"]["status"] for cell in record["cells"]}, {"failed"})
+
+    def test_a_cell_keeps_its_identity_when_its_storage_is_missing(self):
+        # the failure belongs on the line of the cell that would have been measured
+        usual = self.run_matrix(NFS, *self.roots("nfs"))
+        without = self.run_matrix(NFS, *self.missing("nfs", "why"), output="again")
+        self.assertEqual([cell["cell_id"] for cell in without["cells"]], [cell["cell_id"] for cell in usual["cells"]])
+
+    def test_missing_storage_has_no_roots(self):
+        for extra, expected in ((self.roots("nfs"), "--nfs-unavailable"), (self.roots("nfs")[:2], "--nfs-unavailable")):
+            with self.assertRaisesRegex(ValueError, expected):
+                self.run_matrix(NFS, *extra, "--nfs-unavailable", "why")
+            self.assertFalse((self.root / "out").exists())
+        with self.assertRaisesRegex(ValueError, "--nfs-unavailable"):
+            self.run_matrix(NFS, *self.missing("nfs", ""))
+
+    def test_a_result_with_missing_storage_holds_no_measurement_there(self):
+        record = self.run_matrix(NFS, *self.missing("nfs", "why"))
+        matrix.validate(record)
+        measured = self.run_matrix(NFS, *self.roots("nfs"), output="again")
+        for change in (lambda storage, cells: storage.update(source="/somewhere"),
+                       lambda storage, cells: storage.update(unavailable=""),
+                       lambda storage, cells: storage.update(unavailable=3),
+                       lambda storage, cells: storage.update(filesystem={}),
+                       lambda storage, cells: cells.__setitem__(slice(None), measured["cells"])):
+            changed = json.loads(json.dumps(record))
+            change(changed["context"]["storages"]["nfs"], changed["cells"])
+            with self.assertRaises(matrix.Invalid):
+                matrix.validate(changed)
 
     def test_a_cell_without_its_roots_is_refused_before_any_work(self):
         for cells, roots, expected in ((NFS, (), "nfs"), (MEMORY, ("nfs",), "memory")):

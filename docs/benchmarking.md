@@ -878,6 +878,12 @@ How these cells differ from the others:
 The runner makes no mount: it is given the paths. Setting up a server, a mount and a delay is left
 to whoever starts the run.
 
+When that setup fails, the run can still measure everything else. `--nfs-unavailable WHY` (and
+`--memory-unavailable WHY`) stands in place of the two roots of that storage and keeps its storage
+names. The cells there keep their identity and are not measured: each copy cell fails at stage
+`storage` with the reason given, its tool cells fail with it, and a file set that has no other cells
+is not generated. `context.storages` then records the reason where the roots would be.
+
 ### Remote cells
 
 A run that selects a `remote` cell starts one private SSH endpoint (`benchmarks/private_sshd.py`)
