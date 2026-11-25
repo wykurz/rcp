@@ -403,6 +403,14 @@ qualification and rollout.
   Such a run clears every tree with its own `rrm`, the file sets on the source array included; if
   `rrm` fails at one, `rm -rf` clears the trees from then on, so the copies after it still have
   their space.
+- **Other storage.** A suite whose name has `nfs` or `memory` also measures beside the arrays. For
+  `nfs` the supervisor exports the two arrays from the kernel's NFS server on the loopback, adds a
+  delay to that loopback and mounts them at `/mnt/rcp-benchmark/nfs-source` and `nfs-destination`.
+  The measurement unit has a network of its own, so the delay reaches nothing but these mounts. For
+  `memory` it mounts two tmpfs at `memory-source` and `memory-destination`, owned by the benchmark
+  account. The arrays hold up to six file sets; a file set in memory is not theirs to fit and is
+  checked by the runner where it is generated. A preparation that fails costs the cells on that
+  storage and no others.
 - **Commissioning fixtures.** The `matrix-commission-…` suites use `commission-64m` (16 files of 4
   MB) and `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every
   step in seconds and are not performance evidence.

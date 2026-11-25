@@ -969,6 +969,26 @@ on its exit status and the counts of its own summary. No cache is dropped for a 
 `rrm` cell also clears every other tree with that `rrm`, unmeasured, and falls back to `rm -rf` if
 `rrm` fails at one. [Tool cells](../../docs/benchmarking.md#tool-cells) says what each one measures.
 
+Two more copy scenarios keep their trees on other storage, each with its three tool cells
+(`nfs-rcmp`, `memory-rrm` and so on):
+
+- **`nfs`** copies between two mounts of a network filesystem. The supervisor serves the two arrays
+  with the kernel's NFS server on the loopback and mounts them back with NFS 4.2, with 2.5 ms added
+  to every packet on that loopback. A request to the server and its reply then cost 5 ms, as an
+  operation on a file that is not cached does on a filer. The server answers without waiting for its
+  disks (`async` exports), runs 256 threads and hands out no delegations. The client's caches are
+  dropped before every copy and before every tool run. Only what is measured goes through the
+  mounts: the file set is generated on the array itself.
+- **`memory`** copies between two filesystems in memory (tmpfs, 64 GiB each), where no operation
+  costs I/O. No cache is dropped there.
+
+[Cells on other storage](../../docs/benchmarking.md#cells-on-other-storage) says how the runner
+treats them. The supervisor prepares this storage before any candidate process exists
+(`other_storage.py`) and checks it before it trusts it: the daemons run, the server is past its
+grace period, the mounts are the loopback exports, and a round trip costs what the delay says. If a
+preparation fails, the run still measures every other cell. The cells on that storage are `failed`
+at stage `storage` with the reason, and the worker's status says what went wrong (`other_storage`).
+
 A suite is named `matrix-<selection>-<scenarios>`:
 
 | Selection    | File sets                                      | Allocation               | Reservation                 |
@@ -1000,6 +1020,30 @@ them has run, which is why their allocation is generous: the machine is billed f
 up, and it powers off when the run ends, so time that a run does not use is not paid for. Cells that
 do not fit are reported `not_run` and the others count; the 1 KB file set is last, and within it the
 remote cell and its tools.
+
+Three more scenario sets measure on other storage. They exist for the selections `all` and
+`commission` only: a single file set of the arrays has nothing to measure there. A file set has the
+cells of the storage it is kept on, so these suites are not every file set under every scenario:
+
+| Scenarios                                         | Cells                                                            |
+| ------------------------------------------------- | ---------------------------------------------------------------- |
+| `nfs+tools`                                       | an `nfs` cell and its three tool cells, on the NFS file set      |
+| `memory+tools`                                    | a `memory` cell and its three tool cells, on the set in memory   |
+| `local+tools+remote+tools+nfs+tools+memory+tools` | the eight cells of each file set of the arrays, then those eight |
+
+| Selection    | NFS file set                                                 | File set in memory                                  |
+| ------------ | ------------------------------------------------------------ | --------------------------------------------------- |
+| `all`        | `tiny-1k-700x1024`: 716,800 files of 1 KB in 700 directories | `tiny-1k-10240k-memory`: the 1 KB files once more   |
+| `commission` | `commission-10k`, the small fixture of the arrays            | `commission-10k-memory`: the same fixture in memory |
+
+That is six more suites, forty-two in all.
+`matrix-all-local+tools+remote+tools+nfs+tools+memory+tools` has forty cells, and the twelve-hour
+allocation with its $65 reservation from its first plan version. `matrix-all-nfs+tools` and
+`matrix-all-memory+tools` have four cells each and three hours. A network filesystem takes one new
+file at a time in a directory, so its file set is many small directories. At 5 ms a request, a copy
+of it is estimated at five minutes and each tool at about one, from runs in a virtual machine: no
+worker has measured it yet. The file set in memory has an id of its own because a file set is
+generated once, on one storage.
 
 Twelve hours are a second runtime profile, `all-filesets-12h-v1`, beside `all-filesets-8h-v1`. A
 profile is one exact runtime, and every place that bounds a run holds it: the plan, the tag that the
@@ -1128,11 +1172,17 @@ after the local copy. When `rrm` failed while clearing a tree and `rm -rf` took 
 carries the note `worker: rrm failed while clearing a tree; rm -rf cleared the trees after that`;
 the cells are unaffected.
 
+Cells on other storage qualify by the same rules too. When the supervisor could not prepare a
+storage, its copy cell is `failed` at stage `storage` with the reason, its tool cells are `failed`
+at stage `copy`, and the run's other cells still count.
+
 Public records of matrix runs are version 4 (`rcp-production-public-report-v4`). Their diagnostics
 are version 2, or version 3 when the run has a remote cell, which adds each daemon's CPU and memory.
 A run of a suite with tool cells publishes version 5 and diagnostics version 4, where a tool cell is
-named by what its tool ran. [RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes
-them. Commissioning runs qualify like any other, and their small fixtures stay outside the trends.
+named by what its tool ran. A run of a suite with cells on other storage publishes version 6 and
+diagnostics version 5, which also says what that storage was in the run.
+[RESULTS.md](RESULTS.md#matrix-records-and-retained-evidence) describes them. Commissioning runs
+qualify like any other, and their small fixtures stay outside the trends.
 
 ### Deploy and commission
 
@@ -1200,6 +1250,23 @@ version that admits that run by hand names the twelve-hour suites in `manual_sui
 they are until the schedule changes; the change then sets `scheduled_runtime_seconds=43200` with the
 new suite. The Tuesday refresh of the pages still follows a twelve-hour run of the Monday slot.
 
+Suites with cells on other storage need two things of a deployment, together. They send the binaries
+that the suites with `+tools` send, so the stack template is unchanged:
+
+- **The server packages of this revision.** Earlier packages do not know these suites, their file
+  sets or the record version they publish.
+- **A worker image of this revision.** Its installer adds the NFS server packages with their
+  services and sockets masked before they arrive, so that nothing of them starts or listens by
+  itself. Its build then proves on the image's own kernel that the supervisor can serve two
+  directories over NFS with the delay, mount them, and reach every mount as the benchmark account
+  from the measurement sandbox, and takes everything down again (`storage_check.py`, stage
+  `verify-storage-cells`). A build that cannot do this fails there. `worker.py` prepares the storage
+  and has a new pinned digest, which gives the launch template new startup data. The runner of this
+  image samples a run for more phases than before, because the largest suite marks more of them.
+
+Until both are in place and the policy names the suites, a request for one is refused at admission,
+before any reservation. This revision does not change the scheduled suite.
+
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
 minutes, counted from admission; collection follows. With the default twelve-hour capacity window
@@ -1230,6 +1297,17 @@ For the tool cells, after the deployment above:
    arrays, which nothing has measured yet, and whether all thirty-two cells fit twelve hours. If
    they do not, the cells that are `not_run` are the last ones: the remote cell of the 1 KB file set
    and its tools. `matrix-all-local+tools+remote` is then the suite to schedule.
+
+For the cells on other storage, after the deployment above:
+
+1. `matrix-commission-local+tools+remote+tools+nfs+tools+memory+tools`: a few minutes of work.
+   Expect twenty-four of twenty-four measurements. Under *Other storage of this run* the run page
+   shows the NFS version, the round trip the worker measured (5 ms and a little more), the added
+   delay and the limits of the roots in memory.
+2. `matrix-all-nfs+tools` and `matrix-all-memory+tools` by hand, four cells each. They say how long
+   a copy and each tool take there, which no worker has measured: the NFS file set is sized from a
+   virtual machine and may need another size.
+3. `matrix-all-local+tools+remote+tools+nfs+tools+memory+tools` by hand, before it is scheduled.
 
 ### Find the evidence of a run
 
