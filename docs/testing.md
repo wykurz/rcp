@@ -681,6 +681,17 @@ are close proxies for the full hosted matrix; a few CI steps live outside them:
   profile, including chaos, in privileged Compose containers. Use `just depot-chaos` for an explicit
   remote chaos check when changing failure handling or the chaos tests themselves.
 
+## Simulated Remote Framing
+
+The remote crate's Turmoil tests run two peers over simulated TCP in the normal Rust test suite.
+They check that an interrupted payload can't complete early, that transfer resumes at the next file
+boundary after the link is released, and that truncating a data socket doesn't break a separate
+control socket.
+
+Run just these cases with `just test -p rcp-tools-remote --test turmoil_framing`. They exercise the
+real wire codecs but don't launch daemons or emulate TLS, SSH, or storage. Keep the Docker chaos
+tests for those end-to-end paths.
+
 ## Chaos Testing
 
 Chaos tests verify rcp's behavior under adverse conditions. They run in Docker containers with
