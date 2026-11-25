@@ -305,10 +305,11 @@ is selected, data never relays through the master host in 3-host topologies:
 - **Upload (`/local/src remote:/dst`)**: Local `source rcpd` binds the client's loopback family
   (since the local `ssh` client dials it), while master probes `destination sshd`'s live
   `SSH_CONNECTION` endpoint and opens `1..=K` parallel `-R` remote port forwards (`<loopback>:0`,
-  receiving `MUX_S_REMOTE_PORT`, cancelled via `MUX_C_CLOSE_FWD` with original listen port `0`) on
-  the forwarding server's actual loopback family (or falling back `127.0.0.1` → `::1` when the
-  server endpoint could not be probed), reusing the prepared destination SSH session as tunnel #1
-  and verifying `PeerIdentity` on extra tunnels `2..=K`.
+  receiving `MUX_S_REMOTE_PORT`, cancelled via `MUX_C_CLOSE_FWD` with original listen port `0`),
+  preferring the forwarding server's ingress loopback family and trying the alternate literal
+  loopback once if the server rejects it (for example under `PermitListen 127.0.0.1:*` on an IPv6
+  session), reusing the prepared destination SSH session as tunnel #1 and verifying `PeerIdentity`
+  on extra tunnels `2..=K`.
 - **3-Host (`host1:/src host2:/dst`, distinct or unverified remote peers)**: Master resolves
   `host1`'s effective `(user, hostname, port)` locally with `ssh -G` and passes it (together with
   `dest_root`, `source_peer`, and `source_node_endpoint`) in `DestinationTransport::DirectSsh` or

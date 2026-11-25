@@ -629,9 +629,10 @@ fn resolve_tunnel_listen_address_family(
         // download (-L): the local `ssh` client opens the listening socket, so keep the client's
         // configured AddressFamily.
         remote::ssh_tunnel::ForwardDirection::Local => client_address_family,
-        // upload (-R): the remote `sshd` server opens the listening socket, so follow the server's
-        // actual address family from `SSH_CONNECTION`, or allow loopback IPv4->IPv6 fallback when
-        // the server endpoint could not be probed.
+        // upload (-R): the remote `sshd` server opens the listening socket. Prefer the server's
+        // ingress address family from `SSH_CONNECTION` (falling back once to the alternate literal
+        // loopback inside `MuxClient::open_forward` if the server rejects it, e.g. under
+        // `PermitListen 127.0.0.1:*` on an IPv6 session).
         remote::ssh_tunnel::ForwardDirection::Remote => match server_ssh_endpoint {
             Some(ep) if ep.is_ipv6() => remote::ssh_tunnel::SshAddressFamily::Inet6,
             Some(_) => remote::ssh_tunnel::SshAddressFamily::Inet,

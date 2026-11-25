@@ -46,13 +46,29 @@ impl SshAddressFamily {
         }
     }
 
-    /// Alternate loopback address to try when `AddressFamily any` cannot bind or listen on IPv4
-    /// loopback.
+    /// Alternate literal loopback address to try once if the preferred listener address fails.
+    ///
+    /// Local (`-L`) listeners are opened by the local `ssh` client and strictly honor its
+    /// configured `AddressFamily` (only `any` falls back from `127.0.0.1` to `::1`). Remote (`-R`)
+    /// listeners are opened by the remote `sshd` server, so if the server rejects the preferred
+    /// ingress loopback (for example due to `PermitListen 127.0.0.1:*` on an IPv6 session or
+    /// `PermitListen [::1]:*` on an IPv4 session), we try the other literal loopback once.
     #[must_use]
-    pub const fn fallback_loopback_ip(self) -> Option<std::net::IpAddr> {
-        match self {
-            Self::Any => Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
-            Self::Inet | Self::Inet6 => None,
+    const fn fallback_loopback_ip_for(
+        self,
+        direction: ForwardDirection,
+    ) -> Option<std::net::IpAddr> {
+        match (direction, self) {
+            (ForwardDirection::Local, Self::Any) => {
+                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+            }
+            (ForwardDirection::Local, Self::Inet | Self::Inet6) => None,
+            (ForwardDirection::Remote, Self::Inet6) => {
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            }
+            (ForwardDirection::Remote, Self::Any | Self::Inet) => {
+                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+            }
         }
     }
 }
@@ -627,7 +643,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> MuxClient<S> {
         match self.open_forward_on_ip(direction, target, preferred).await {
             Ok(addr) => Ok(addr),
             Err(first_err) => {
-                let Some(fallback) = address_family.fallback_loopback_ip() else {
+                let Some(fallback) = address_family.fallback_loopback_ip_for(direction) else {
                     return Err(first_err);
                 };
                 tracing::debug!(
@@ -817,6 +833,18 @@ impl SshTunnelSet {
         if let Some(addr) = primary_data_addr {
             data_addrs.push(addr);
         }
+        let extra_address_family = match direction {
+            ForwardDirection::Local => address_family,
+            // prefer the loopback family the remote sshd actually accepted for tunnel #1 so extra
+            // tunnels avoid repeating a rejected preferred address (e.g. under PermitListen).
+            ForwardDirection::Remote => {
+                if control_addr.is_ipv6() {
+                    SshAddressFamily::Inet6
+                } else {
+                    SshAddressFamily::Inet
+                }
+            }
+        };
         let mut owned_sessions = Vec::new();
         if let Some(target_data) = target_data
             && requested_tunnels > 1
@@ -835,7 +863,7 @@ impl SshTunnelSet {
                     unpinned_opts,
                     pinned.as_ref(),
                     target_data,
-                    address_family,
+                    extra_address_family,
                     Some(expected),
                     requested_tunnels - 1,
                     deadline,
@@ -1344,12 +1372,22 @@ where
         Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
         None => std::time::Duration::MAX,
     };
+    let data_address_family = match direction {
+        ForwardDirection::Local => address_family,
+        ForwardDirection::Remote => {
+            if control_addr.is_ipv6() {
+                SshAddressFamily::Inet6
+            } else {
+                SshAddressFamily::Inet
+            }
+        }
+    };
     let data_result = if remaining.is_zero() {
         Err(anyhow::anyhow!(timeout_context()))
     } else {
         match tokio::time::timeout(
             remaining,
-            mux.open_forward(direction, target_data, address_family),
+            mux.open_forward(direction, target_data, data_address_family),
         )
         .await
         {
@@ -1928,6 +1966,96 @@ proxyjump jump.internal
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mux_client_remote_forward_falls_back_to_alternate_loopback_while_local_honors_family()
+    {
+        // local (-L) forwards honor the client's AddressFamily strictly (only `any` falls back).
+        assert_eq!(
+            SshAddressFamily::Any.fallback_loopback_ip_for(ForwardDirection::Local),
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            SshAddressFamily::Inet.fallback_loopback_ip_for(ForwardDirection::Local),
+            None
+        );
+        assert_eq!(
+            SshAddressFamily::Inet6.fallback_loopback_ip_for(ForwardDirection::Local),
+            None
+        );
+        // remote (-R) forwards try the preferred ingress family first and fall back to the other
+        // literal loopback once if the server rejects it (e.g. PermitListen 127.0.0.1:* on IPv6
+        // or PermitListen [::1]:* on IPv4).
+        for (preferred_af, first_expected, fallback_expected, expected_addr) in [
+            (
+                SshAddressFamily::Inet6,
+                "::1",
+                "127.0.0.1",
+                "127.0.0.1:44111",
+            ),
+            (SshAddressFamily::Inet, "127.0.0.1", "::1", "[::1]:44222"),
+        ] {
+            let (client_io, mut server_io) = tokio::io::duplex(4096);
+            let allocated_port = expected_addr
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .port();
+            let server = tokio::spawn(async move {
+                let mut len = [0u8; 4];
+                server_io.read_exact(&mut len).await.unwrap();
+                let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+                server_io.read_exact(&mut payload).await.unwrap();
+                server_io.write_all(&encode_hello_packet()).await.unwrap();
+                // 1st attempt on preferred loopback: server rejects (e.g. PermitListen).
+                server_io.read_exact(&mut len).await.unwrap();
+                let mut req1 = vec![0u8; u32::from_be_bytes(len) as usize];
+                server_io.read_exact(&mut req1).await.unwrap();
+                let mut cursor = req1.as_slice();
+                assert_eq!(read_u32(&mut cursor).unwrap(), MUX_C_OPEN_FWD);
+                let req1_id = read_u32(&mut cursor).unwrap();
+                assert_eq!(read_u32(&mut cursor).unwrap(), MUX_FWD_REMOTE);
+                assert_eq!(read_ssh_string(&mut cursor).unwrap(), first_expected);
+                let mut fail = Vec::new();
+                write_u32(&mut fail, MUX_S_FAILURE);
+                write_u32(&mut fail, req1_id);
+                write_ssh_string(
+                    &mut fail,
+                    b"remote port forwarding failed for listen port 0",
+                );
+                server_io
+                    .write_all(&frame_mux_payload(&fail))
+                    .await
+                    .unwrap();
+                server_io.flush().await.unwrap();
+                // 2nd attempt on alternate literal loopback: server accepts.
+                server_io.read_exact(&mut len).await.unwrap();
+                let mut req2 = vec![0u8; u32::from_be_bytes(len) as usize];
+                server_io.read_exact(&mut req2).await.unwrap();
+                let mut cursor = req2.as_slice();
+                assert_eq!(read_u32(&mut cursor).unwrap(), MUX_C_OPEN_FWD);
+                let req2_id = read_u32(&mut cursor).unwrap();
+                assert_eq!(read_u32(&mut cursor).unwrap(), MUX_FWD_REMOTE);
+                assert_eq!(read_ssh_string(&mut cursor).unwrap(), fallback_expected);
+                let mut ok = Vec::new();
+                write_u32(&mut ok, MUX_S_REMOTE_PORT);
+                write_u32(&mut ok, req2_id);
+                write_u32(&mut ok, u32::from(allocated_port));
+                server_io.write_all(&frame_mux_payload(&ok)).await.unwrap();
+                server_io.flush().await.unwrap();
+            });
+            let target: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+            let mut client = MuxClient::handshake(client_io).await.unwrap();
+            let allocated = client
+                .open_forward(ForwardDirection::Remote, target, preferred_af)
+                .await
+                .unwrap();
+            assert_eq!(
+                allocated,
+                expected_addr.parse::<std::net::SocketAddr>().unwrap()
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
