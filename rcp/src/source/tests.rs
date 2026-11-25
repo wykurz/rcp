@@ -156,6 +156,88 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test]
+async fn dry_run_aborts_promptly_when_peer_control_drops_during_slow_preview() -> anyhow::Result<()>
+{
+    for dereference in [false, true] {
+        let source = tempfile::tempdir()?;
+        for idx in 0..4 {
+            std::fs::write(source.path().join(format!("file-{idx}")), "payload")?;
+        }
+        let destination = source.path().join("preview");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_config = remote::TcpConfig::default();
+        let (accepted, peer) = tokio::try_join!(
+            async {
+                remote::accept_tcp_control(&listener, &tcp_config)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            remote::connect_tcp_control(listener.local_addr()?, &tcp_config),
+        )?;
+        let seen_first = Arc::new(tokio::sync::Notify::new());
+        let seen_first_for_hook = seen_first.clone();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook: DryRunProgressHook = Box::new(move || {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let notify = seen_first_for_hook.clone();
+            Box::pin(async move {
+                if n == 0 {
+                    // signal that one file was already previewed, then stall to simulate a slow
+                    // filesystem or huge tree while the tunnel drops
+                    notify.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            })
+        });
+        let settings = settings(dereference);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
+        let source_op = DRY_RUN_PROGRESS_HOOK.scope(
+            hook,
+            handle_dry_run_connection(
+                accepted.0,
+                &settings,
+                source.path(),
+                &destination,
+                common::config::DryRunMode::Brief,
+                None,
+                5,
+                &peer_connected,
+            ),
+        );
+        let peer_drop = async move {
+            seen_first.notified().await;
+            drop(peer);
+        };
+        let started = std::time::Instant::now();
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(source_op, peer_drop)
+        })
+        .await
+        .expect("dry-run must stop promptly when peer drops mid-preview");
+        let error = result
+            .expect_err("dropped peer control stream must fail dry-run")
+            .downcast::<common::copy::Error>()
+            .expect("peer loss during dry-run must preserve partial preview summary");
+        assert!(
+            format!("{:#}", error.source).contains("dry run"),
+            "unexpected error: {:#}",
+            error.source
+        );
+        assert_eq!(
+            error.summary.files_copied, 1,
+            "partial preview summary must retain entries counted before peer loss (dereference={dereference})"
+        );
+        assert_eq!(error.summary.bytes_copied, 7);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "dry-run took too long to notice peer drop: {:?}",
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
 fn pool(writer: remote::streams::BoxedWrite) -> Arc<AcceptingSendStreamPool> {
     let (send, receive) = async_channel::bounded(1);
     send.try_send(remote::streams::SendStream::new(writer))

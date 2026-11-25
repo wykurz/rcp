@@ -11170,16 +11170,31 @@ fn write_test_rcpd_with_ssh_wrapper(dir: &std::path::Path) -> std::path::PathBuf
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TestPrivateSshdOptions<'a> {
+    address_family: Option<&'a str>,
+    allow_tcp_forwarding: Option<&'a str>,
+    force_home: Option<&'a std::path::Path>,
+    alt_key_fake_hostname: Option<&'a str>,
+}
+
+#[cfg(target_os = "linux")]
 struct TestPrivateSshd {
     _dir: tempfile::TempDir,
     child: std::process::Child,
     addr: std::net::SocketAddr,
     client_key: std::path::PathBuf,
+    alt_client_key: Option<std::path::PathBuf>,
+    host_key_pub: String,
 }
 
 #[cfg(target_os = "linux")]
 impl TestPrivateSshd {
     fn start(bind_ip: std::net::IpAddr) -> Self {
+        Self::start_with_options(bind_ip, TestPrivateSshdOptions::default())
+    }
+
+    fn start_with_options(bind_ip: std::net::IpAddr, options: TestPrivateSshdOptions<'_>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let host_key = dir.path().join("host_key");
         let client_key = dir.path().join("client_key");
@@ -11194,8 +11209,55 @@ impl TestPrivateSshd {
                 .expect("failed to run ssh-keygen");
             assert!(status.success(), "ssh-keygen failed for {}", key.display());
         }
-        let client_pub = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
-        std::fs::write(&auth_keys, client_pub).unwrap();
+        let host_key_pub = std::fs::read_to_string(host_key.with_extension("pub"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut auth_keys_contents =
+            std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+        let alt_client_key = if let Some(fake_hostname) = options.alt_key_fake_hostname {
+            let alt_key = dir.path().join("alt_client_key");
+            let status = std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&alt_key)
+                .status()
+                .expect("failed to run ssh-keygen for alt key");
+            assert!(status.success(), "ssh-keygen failed for alt key");
+            let shim_dir = dir.path().join("alt-shim-bin");
+            std::fs::create_dir_all(&shim_dir).unwrap();
+            let real_uname = find_test_program("uname", &["/usr/bin/uname", "/bin/uname"]);
+            let fake_uname = shim_dir.join("uname");
+            std::fs::write(
+                &fake_uname,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"-n\" ]; then printf '%s\\n' {}; else exec {} \"$@\"; fi\n",
+                    shell_quote_for_test(std::path::Path::new(fake_hostname)),
+                    shell_quote_for_test(&real_uname),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let forced_cmd = dir.path().join("alt-force-cmd.sh");
+            std::fs::write(
+                &forced_cmd,
+                format!(
+                    "#!/bin/sh\nexport PATH={}:\"$PATH\"\nexec /bin/sh -c \"${{SSH_ORIGINAL_COMMAND:-exec /bin/sh}}\"\n",
+                    shell_quote_for_test(&shim_dir)
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&forced_cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let alt_pub = std::fs::read_to_string(alt_key.with_extension("pub")).unwrap();
+            auth_keys_contents.push_str(&format!(
+                "command=\"{}\" {}",
+                forced_cmd.display(),
+                alt_pub
+            ));
+            Some(alt_key)
+        } else {
+            None
+        };
+        std::fs::write(&auth_keys, auth_keys_contents).unwrap();
         std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600)).unwrap();
         let probe = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
         let port = probe.local_addr().unwrap().port();
@@ -11204,10 +11266,31 @@ impl TestPrivateSshd {
             std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
             std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
         };
+        let address_family_line = options
+            .address_family
+            .map(|af| format!("AddressFamily {af}\n"))
+            .unwrap_or_default();
+        let allow_tcp_forwarding = options.allow_tcp_forwarding.unwrap_or("yes");
+        let force_command_line = if let Some(force_home) = options.force_home {
+            let forced_cmd = dir.path().join("force-home-cmd.sh");
+            std::fs::write(
+                &forced_cmd,
+                format!(
+                    "#!/bin/sh\nexport HOME={}\nexec /bin/sh -c \"${{SSH_ORIGINAL_COMMAND:-exec /bin/sh}}\"\n",
+                    shell_quote_for_test(force_home)
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&forced_cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            format!("ForceCommand {}\n", forced_cmd.display())
+        } else {
+            String::new()
+        };
         std::fs::write(
             &sshd_config,
             format!(
-                "ListenAddress {listen_spec}\n\
+                "{address_family_line}\
+                 ListenAddress {listen_spec}\n\
                  HostKey {}\n\
                  AuthorizedKeysFile {}\n\
                  PidFile {}\n\
@@ -11217,9 +11300,10 @@ impl TestPrivateSshd {
                  KbdInteractiveAuthentication no\n\
                  PubkeyAuthentication yes\n\
                  UsePAM no\n\
-                 AllowTcpForwarding yes\n\
+                 AllowTcpForwarding {allow_tcp_forwarding}\n\
                  AllowAgentForwarding yes\n\
                  GatewayPorts no\n\
+                 {force_command_line}\
                  Subsystem sftp internal-sftp\n",
                 host_key.display(),
                 auth_keys.display(),
@@ -11261,6 +11345,8 @@ impl TestPrivateSshd {
             child,
             addr,
             client_key,
+            alt_client_key,
+            host_key_pub,
         }
     }
 }
@@ -11727,4 +11813,720 @@ fn test_remote_shared_alias_different_user_spellings_follow_resolved_endpoint() 
     assert_eq!(get_file_content(&dst_diff), "resolved endpoint test");
     drop(sshd_a);
     drop(sshd_b);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_shared_endpoint_mismatched_peers_uses_three_host_not_same_host() {
+    let home = tempfile::tempdir().unwrap();
+    // single private sshd with two keys: default key reports the real host identity (matching
+    // source rcpd's gethostname), while alt key wraps commands with a fake `uname -n` so two
+    // independently opened sessions resolving to the EXACT same (HostName, Port) report distinct
+    // live peer identities (simulating a load-balanced SSH pool landing on different backends).
+    let sshd = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            alt_key_fake_hostname: Some("lb-backend-b"),
+            ..Default::default()
+        },
+    );
+    let alt_key = sshd.alt_client_key.as_ref().unwrap();
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host lb-src\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host lb-dst\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd.addr.port(),
+            sshd.client_key.display(),
+            sshd.addr.port(),
+            alt_key.display(),
+            sshd.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("lb.txt");
+    create_test_file(&src_file, "load-balanced peer check", 0o644);
+    let dst_file = dst_dir.path().join("lb_out.txt");
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_remote = format!("lb-src:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("lb-dst:{}", dst_file.to_str().unwrap());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "shared-endpoint mismatched-peer 3-host copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "matching ssh -G endpoint with differing live peers must NOT take SameHost shortcut:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_file), "load-balanced peer check");
+    drop(sshd);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_three_host_tilde_destination_honors_strict_host_key_checking_before_agent_forward() {
+    let home = tempfile::tempdir().unwrap();
+    let remote_home = tempfile::tempdir().unwrap();
+    let known_hosts = home.path().join("known_hosts");
+    std::fs::write(&known_hosts, "").unwrap();
+    let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            force_home: Some(remote_home.path()),
+            ..Default::default()
+        },
+    );
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host src-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host dst-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {}\n\
+             Host dst-node-cfg-fwd\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               ForwardAgent yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {}\n\
+             Host src-same-ep\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {}\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            known_hosts.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            known_hosts.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            known_hosts.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, _dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("secret.txt");
+    create_test_file(&src_file, "host-key-guarded payload", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_remote = format!("src-node:{}", src_file.to_str().unwrap());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. Before trusting dst's host key, BOTH --ssh-forward-agent and config ForwardAgent yes must
+    //    reject the untrusted host on the very first SSH connection (`~` HOME lookup) without
+    //    auto-recording the host key in known_hosts.
+    let out_flag = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            &src_remote,
+            "dst-node:~/out_flag.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_flag.status.success(),
+        "untrusted ~/out destination with --ssh-forward-agent must fail host-key check"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "~ HOME lookup must NOT auto-write untrusted host key to known_hosts"
+    );
+    assert!(!remote_home.path().join("out_flag.txt").exists());
+    let out_cfg = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            &rcpd_flag,
+            &src_remote,
+            "dst-node-cfg-fwd:~/out_cfg.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_cfg.status.success(),
+        "untrusted ~/out destination with ForwardAgent yes in ssh config must fail host-key check"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "~ HOME lookup with config ForwardAgent yes must NOT auto-write untrusted host key"
+    );
+    assert!(!remote_home.path().join("out_cfg.txt").exists());
+    // 1b. when source and destination resolve to the SAME untrusted (HostName, Port) under
+    //     --ssh-forward-agent, neither source's `~` HOME lookup nor parallel endpoint preparation
+    //     may auto-accept the host key into known_hosts before destination checks it.
+    let same_ep_src = remote_home.path().join("same_ep_src.txt");
+    create_test_file(&same_ep_src, "same-ep payload", 0o644);
+    let out_same_ep_tilde = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            "src-same-ep:~/same_ep_src.txt",
+            "dst-node:~/out_same_ep_tilde.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_same_ep_tilde.status.success(),
+        "same-endpoint untrusted ~/src -> ~/dst with --ssh-forward-agent must fail host-key check"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "source ~ HOME lookup sharing endpoint with agent-forwarded dst must NOT poison known_hosts"
+    );
+    let same_ep_abs_dst = remote_home.path().join("out_same_ep_abs.txt");
+    let src_same_ep_abs = format!("src-same-ep:{}", same_ep_src.to_str().unwrap());
+    let dst_same_ep_abs = format!("dst-node:{}", same_ep_abs_dst.to_str().unwrap());
+    let out_same_ep_abs = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            &src_same_ep_abs,
+            &dst_same_ep_abs,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_same_ep_abs.status.success(),
+        "same-endpoint untrusted abs src -> dst with --ssh-forward-agent must fail host-key check"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "parallel source preparation sharing endpoint with agent-forwarded dst must NOT poison known_hosts"
+    );
+    // 2. after explicitly trusting dst's host key in known_hosts, both invocations succeed and
+    //    expand `~` to `remote_home`.
+    std::fs::write(
+        &known_hosts,
+        format!(
+            "[127.0.0.1]:{} {}\n",
+            sshd_dst.addr.port(),
+            sshd_dst.host_key_pub
+        ),
+    )
+    .unwrap();
+    let out_flag_ok = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            &src_remote,
+            "dst-node:~/out_flag.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out_flag_ok.status.success(),
+        "trusted ~/out destination with --ssh-forward-agent failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out_flag_ok.stdout),
+        String::from_utf8_lossy(&out_flag_ok.stderr)
+    );
+    assert_eq!(
+        get_file_content(&remote_home.path().join("out_flag.txt")),
+        "host-key-guarded payload"
+    );
+    let out_cfg_ok = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            &rcpd_flag,
+            &src_remote,
+            "dst-node-cfg-fwd:~/out_cfg.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out_cfg_ok.status.success(),
+        "trusted ~/out destination with config ForwardAgent yes failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out_cfg_ok.stdout),
+        String::from_utf8_lossy(&out_cfg_ok.stderr)
+    );
+    assert_eq!(
+        get_file_content(&remote_home.path().join("out_cfg.txt")),
+        "host-key-guarded payload"
+    );
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_ssh_transport_mixed_client_any_server_inet6() {
+    if let Err(err) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+        ) {
+            eprintln!("skipping: this kernel/container lacks IPv6 loopback (::1): {err}");
+            return;
+        }
+        panic!("unexpected failure probing IPv6 loopback (::1): {err}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let v6_opts = || TestPrivateSshdOptions {
+        address_family: Some("inet6"),
+        ..Default::default()
+    };
+    let sshd_local = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        v6_opts(),
+    );
+    let sshd_src = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        v6_opts(),
+    );
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        v6_opts(),
+    );
+    // client ssh_config explicitly uses `AddressFamily any` while every server `sshd` enforces
+    // `AddressFamily inet6`: source loopback target family must be chosen independently of the
+    // client-side listener family so Download (-L), Upload (-R), 3-Host, and Auto all succeed.
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6src\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6dst\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host ::1\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("mixed_v6_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "mixed v6 alpha", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "mixed v6 beta", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_path = src_tree.to_str().unwrap();
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. Download (-L: client listener on any, remote source sshd inet6 dialing ::1)
+    let dst_dl = dst_dir.path().join("mixed_dl");
+    let src_v6 = format!("v6src:{src_path}");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            dst_dl.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "mixed client any + server inet6 SSH download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_dl.join("a.txt")), "mixed v6 alpha");
+    assert_eq!(get_file_content(&dst_dl.join("b.txt")), "mixed v6 beta");
+    // 2. Upload (-R: remote destination sshd inet6 falls back 127.0.0.1 -> ::1, local ssh dials 127.0.0.1)
+    let dst_ul = dst_dir.path().join("mixed_ul");
+    let dst_ul_remote = format!("v6dst:{}", dst_ul.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_ul_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "mixed client any + server inet6 SSH upload failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_ul.join("a.txt")), "mixed v6 alpha");
+    assert_eq!(get_file_content(&dst_ul.join("b.txt")), "mixed v6 beta");
+    // 3. 3-Host (v6src -> v6dst)
+    let dst_3h = dst_dir.path().join("mixed_3h");
+    let dst_3h_remote = format!("v6dst:{}", dst_3h.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            &dst_3h_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "mixed client any + server inet6 3-host SSH copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_3h.join("a.txt")), "mixed v6 alpha");
+    assert_eq!(get_file_content(&dst_3h.join("b.txt")), "mixed v6 beta");
+    // 4. Auto download
+    let dst_auto = dst_dir.path().join("mixed_auto");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            dst_auto.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "mixed client any + server inet6 auto download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_auto.join("a.txt")), "mixed v6 alpha");
+    assert_eq!(get_file_content(&dst_auto.join("b.txt")), "mixed v6 beta");
+    drop(sshd_local);
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_ssh_plaintext_denied_forward_fails_promptly() {
+    let home = tempfile::tempdir().unwrap();
+    let sshd_local = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_no_fwd = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            allow_tcp_forwarding: Some("no"),
+            ..Default::default()
+        },
+    );
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host no-fwd-src\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_no_fwd.addr.port(),
+            sshd_no_fwd.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("plain.txt");
+    create_test_file(&src_file, "plaintext payload", 0o644);
+    let dst_file = dst_dir.path().join("plain_out.txt");
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_remote = format!("no-fwd-src:{}", src_file.to_str().unwrap());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // conn_timeout=30 gives source a 60s accept_timeout_sec; with --no-encryption, a denied -L
+    // forward must keep peer_connected=false so master cancels source promptly (~2s grace) instead
+    // of waiting 60s for source's accept timeout.
+    let started = std::time::Instant::now();
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--no-encryption",
+            "--remote-copy-conn-timeout-sec=30",
+            &rcpd_flag,
+            &src_remote,
+            dst_file.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        !out.status.success(),
+        "SSH transfer with AllowTcpForwarding no must fail"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("AllowTcpForwarding"),
+        "expected AllowTcpForwarding diagnostic on denied plaintext forward:\n{combined}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(12),
+        "plaintext denied forward must fail promptly without waiting for source accept_timeout_sec (elapsed={elapsed:?}):\n{combined}"
+    );
+    drop(sshd_local);
+    drop(sshd_no_fwd);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_dry_run_stops_promptly_when_tunnel_drops_mid_preview() {
+    let home = tempfile::tempdir().unwrap();
+    let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host src-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host dst-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("slow_preview_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    // 20 files at --ops-throttle=1 take ~20 seconds to traverse completely; dropping the 3-host
+    // tunnel ~1.5s in (while both master SSH sessions remain healthy) must abort source promptly.
+    for i in 0..20 {
+        create_test_file(
+            &src_tree.join(format!("item-{i:02}.txt")),
+            "preview payload",
+            0o644,
+        );
+    }
+    let bin_dir = home.path().join("bin");
+    let wrapper = home.path().join("rcpd-drop-dry-run-tunnel");
+    let real_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    let wrapper_body = format!(
+        concat!(
+            "#!/usr/bin/env python3\n",
+            "import os, signal, subprocess, sys, threading, time\n",
+            "os.environ['PATH'] = {bin_dir:?} + ':' + os.environ.get('PATH', '')\n",
+            "args = sys.argv[1:]\n",
+            "is_dest = any(a == '--role=destination' or (a == '--role' and i + 1 < len(args) and args[i + 1] == 'destination') for i, a in enumerate(args))\n",
+            "if not is_dest:\n",
+            "    os.execv({rcpd:?}, [{rcpd:?}] + args)\n",
+            "proc = subprocess.Popen([{rcpd:?}] + args)\n",
+            "def find_tunnel_ssh(parent_pid):\n",
+            "    for entry in os.listdir('/proc'):\n",
+            "        if not entry.isdigit():\n",
+            "            continue\n",
+            "        pid = int(entry)\n",
+            "        try:\n",
+            "            with open(f'/proc/{{pid}}/status', 'r') as f:\n",
+            "                ppid = None\n",
+            "                for line in f:\n",
+            "                    if line.startswith('PPid:'):\n",
+            "                        ppid = int(line.split()[1])\n",
+            "                        break\n",
+            "            if ppid != parent_pid:\n",
+            "                continue\n",
+            "            with open(f'/proc/{{pid}}/cmdline', 'rb') as f:\n",
+            "                cmd = f.read().split(b'\\x00')\n",
+            "            if b'-M' in cmd and b'-N' in cmd:\n",
+            "                return pid\n",
+            "        except OSError:\n",
+            "            pass\n",
+            "    return None\n",
+            "def kill_tunnel():\n",
+            "    deadline = time.monotonic() + 10.0\n",
+            "    tunnel_pid = None\n",
+            "    while time.monotonic() < deadline and proc.poll() is None:\n",
+            "        tunnel_pid = find_tunnel_ssh(proc.pid)\n",
+            "        if tunnel_pid is not None:\n",
+            "            break\n",
+            "        time.sleep(0.05)\n",
+            "    if tunnel_pid is not None:\n",
+            "        time.sleep(1.5)\n",
+            "        try:\n",
+            "            os.kill(tunnel_pid, signal.SIGKILL)\n",
+            "        except OSError:\n",
+            "            pass\n",
+            "threading.Thread(target=kill_tunnel, daemon=True).start()\n",
+            "sys.exit(proc.wait())\n",
+        ),
+        bin_dir = bin_dir.to_string_lossy(),
+        rcpd = real_rcpd.to_string_lossy(),
+    );
+    std::fs::write(&wrapper, wrapper_body).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_flag = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("src-node:{}", src_tree.to_str().unwrap());
+    let dst_tree = dst_dir.path().join("slow_preview_dst");
+    let dst_remote = format!("dst-node:{}", dst_tree.to_str().unwrap());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    let started = std::time::Instant::now();
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--dry-run=brief",
+            "--remote-transport=ssh",
+            "--ops-throttle=1",
+            &rcpd_flag,
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        !out.status.success(),
+        "dropping the 3-host tunnel mid-dry-run must fail rcp"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "source dry-run must stop promptly when tunnel drops mid-preview instead of traversing all 20 throttled files (elapsed={elapsed:?}):\n{combined}"
+    );
+    assert!(!dst_tree.exists());
+    drop(sshd_src);
+    drop(sshd_dst);
 }

@@ -134,6 +134,7 @@ struct DataConnectionPool {
     /// file-handler future — and thus `run_destination`'s teardown — waiting indefinitely).
     conn_timeout: std::time::Duration,
     shutdown: ReceiverShutdown,
+    peer_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DataConnectionPool {
@@ -154,7 +155,19 @@ impl DataConnectionPool {
             tls_connector,
             conn_timeout: std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
             shutdown,
+            peer_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+    fn with_peer_connected(
+        mut self,
+        peer_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.peer_connected = peer_connected;
+        self
+    }
+    fn mark_peer_connected(&self) {
+        self.peer_connected
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     /// Open a new connection to the source's data port.
     async fn connect(&self) -> ConnectOutcome {
@@ -630,13 +643,14 @@ fn truncated_stream_error() -> anyhow::Error {
 /// Handle a stream that may contain multiple files.
 ///
 /// Loops until the stream is closed (EOF on header read).
-#[instrument(skip(error_collector, file_recv_stream, directory_tracker))]
+#[instrument(skip(error_collector, file_recv_stream, directory_tracker, peer_connected))]
 async fn handle_file_stream(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
     mut file_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
     let prog = progress();
     tracing::info!("Processing file stream (may contain multiple files)");
@@ -647,7 +661,10 @@ async fn handle_file_stream(
             .recv_object::<remote::protocol::File>()
             .await
         {
-            Ok(Some(h)) => h,
+            Ok(Some(h)) => {
+                peer_connected.store(true, std::sync::atomic::Ordering::Release);
+                h
+            }
             Ok(None) => {
                 // A CLEAN framed EOF at a header boundary. This is NOT self-evidently benign: the
                 // source closes a data stream gracefully while it keeps running (a send failure
@@ -868,6 +885,7 @@ async fn process_incoming_file_streams_tcp(
                         recv_stream,
                         tracker.clone(),
                         collector.clone(),
+                        &pool.peer_connected,
                     )
                     .await?;
                     // permit is released when _permit is dropped
@@ -1602,6 +1620,7 @@ async fn process_control_stream(
                 let Some(source_message) = source_message else {
                     break;
                 };
+                data_pool.mark_peer_connected();
                 // preserve a ready framing error above, but never admit buffered work after teardown
                 if data_pool.shutdown.is_cancelled() {
                     break;
@@ -2203,7 +2222,7 @@ pub async fn run_destination(
     master_control: &remote::stdio::DaemonControlSender,
     fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
     cleanup: &remote::RemoteCleanup,
-    peer_connected: &std::sync::atomic::AtomicBool,
+    peer_connected: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let admitted_ssh_tunnels = match admission {
         common::EndpointAdmission::Remote(resources) if resources.ssh_tunnels > 0 => {
@@ -2291,7 +2310,13 @@ pub async fn run_destination(
         )
         .await
         .map_err(attach_ssh_control_hint)?;
-        peer_connected.store(true, std::sync::atomic::Ordering::Release);
+        // a completed mTLS handshake proves end-to-end reachability to source `rcpd`. With
+        // `--no-encryption`, `connect_bounded` only splits the local TCP socket — on an SSH `-L`
+        // tunnel the local listener accepts TCP before `sshd` permits the forward, so defer
+        // `peer_connected` until a framed protocol message arrives from source.
+        if tls_connector.is_some() {
+            peer_connected.store(true, std::sync::atomic::Ordering::Release);
+        }
         // wrap in Arc<Mutex<>> for shared access
         let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
         if let Some(limits) = directory_limits {
@@ -2314,13 +2339,16 @@ pub async fn run_destination(
         );
         let tls_enabled = tls_connector.is_some();
         // create a pool of data connections to source
-        let data_pool = std::sync::Arc::new(DataConnectionPool::new(
-            data_addrs,
-            concurrency.max_connections().get(),
-            tcp_config,
-            tls_connector,
-            directory_tracker.shutdown().clone(),
-        ));
+        let data_pool = std::sync::Arc::new(
+            DataConnectionPool::new(
+                data_addrs,
+                concurrency.max_connections().get(),
+                tcp_config,
+                tls_connector,
+                directory_tracker.shutdown().clone(),
+            )
+            .with_peer_connected(peer_connected.clone()),
+        );
         // one operation-level indirection bounds the nested receiver layout in rcpd's watchdog
         // future; the same owner still drives control work through completion and teardown
         let mut control_future = Box::pin(process_control_stream(
@@ -5536,12 +5564,14 @@ mod teardown_tests {
         reader: remote::streams::BoxedRead,
     ) -> anyhow::Result<()> {
         let recv = remote::streams::RecvStream::new(reader);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         handle_file_stream(
             testutils::copy_settings(),
             common::preserve::Settings::default(),
             recv,
             tracker,
             std::sync::Arc::new(common::error_collector::ErrorCollector::default()),
+            &peer_connected,
         )
         .await
     }
@@ -5589,6 +5619,7 @@ mod teardown_tests {
             let mut settings = testutils::copy_settings();
             settings.fail_early = true;
             // keep the source open without a payload: a fatal error must not wait to recover framing
+            let peer_connected = std::sync::atomic::AtomicBool::new(false);
             let error = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 handle_file_stream(
@@ -5599,6 +5630,7 @@ mod teardown_tests {
                     ),
                     tracker.clone(),
                     Arc::new(common::error_collector::ErrorCollector::default()),
+                    &peer_connected,
                 ),
             )
             .await
@@ -5671,6 +5703,7 @@ mod teardown_tests {
             source.write_all(payload).await.unwrap();
         }
         source.shutdown().await.unwrap();
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             handle_file_stream(
@@ -5681,6 +5714,7 @@ mod teardown_tests {
                 ),
                 tracker.clone(),
                 errors.clone(),
+                &peer_connected,
             ),
         )
         .await
@@ -6105,6 +6139,252 @@ mod ssh_transport_tests {
         writer_shutdown.cancel();
         writer.await.unwrap().unwrap();
         demux.join().await.unwrap();
+        cleanup.finish();
+    }
+
+    #[tokio::test]
+    async fn plaintext_peer_connected_requires_end_to_end_protocol_frame() {
+        let concurrency = remote::resolve_remote_concurrency(
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(1).unwrap()),
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let tcp = remote::TcpConfig {
+            keepalive_sec: 0,
+            conn_timeout_sec: 5,
+            ..Default::default()
+        };
+        let cleanup = remote::RemoteCleanup::new().unwrap();
+        let spawn_dummy_master = || {
+            let (control_tx, control_rx) = remote::stdio::daemon_control_channel();
+            let (_tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (daemon_write, _master_read) = tokio::io::duplex(4096);
+            let writer_shutdown = tokio_util::sync::CancellationToken::new();
+            let writer = tokio::spawn(remote::stdio::run_daemon_stdout_writer(
+                control_rx,
+                tracing_rx,
+                remote::streams::SendStream::new(daemon_write),
+                writer_shutdown.clone(),
+            ));
+            (control_tx, writer_shutdown, writer)
+        };
+        // 1) immediate EOF on control + data after local TCP accept (simulating a local `-L`
+        //    listener whose remote `sshd` denied port forwarding) must keep peer_connected=false.
+        {
+            let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let control_addr = control_listener.local_addr().unwrap();
+            let data_addr = data_listener.local_addr().unwrap();
+            let tcp_for_source = tcp.clone();
+            let fake_denied_forward = tokio::spawn(async move {
+                let accept_ctrl = async {
+                    if let Ok((stream, _)) =
+                        remote::accept_tcp_control(&control_listener, &tcp_for_source).await
+                    {
+                        drop(stream);
+                    }
+                };
+                let accept_data = async {
+                    if let Ok((stream, _)) = remote::accept_tcp_data(
+                        &data_listener,
+                        tcp_for_source.network_profile,
+                        tcp_for_source.keepalive_sec,
+                    )
+                    .await
+                    {
+                        drop(stream);
+                    }
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(accept_ctrl, accept_data)
+                })
+                .await;
+            });
+            let (control_tx, writer_shutdown, writer) = spawn_dummy_master();
+            let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = run_destination(
+                &control_addr,
+                &[data_addr],
+                "test-source",
+                &testutils::copy_settings(),
+                false,
+                0,
+                &common::preserve::preserve_none(),
+                &tcp,
+                concurrency,
+                common::EndpointAdmission::Disabled,
+                None,
+                None,
+                &remote::protocol::DestinationTransport::MasterSshTunnel,
+                &control_tx,
+                None,
+                &cleanup,
+                &peer_connected,
+            )
+            .await;
+            assert!(result.is_err(), "denied forward must fail run_destination");
+            assert!(
+                !peer_connected.load(std::sync::atomic::Ordering::Acquire),
+                "plaintext TCP accept + immediate EOF without protocol frame must leave peer_connected=false"
+            );
+            let _ = fake_denied_forward.await;
+            drop(control_tx);
+            writer_shutdown.cancel();
+            let _ = writer.await;
+        }
+        // 2) receiving a framed SourceMessage on control marks peer_connected=true.
+        {
+            let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let control_addr = control_listener.local_addr().unwrap();
+            let data_addr = data_listener.local_addr().unwrap();
+            let tcp_for_source = tcp.clone();
+            let fake_source = tokio::spawn(async move {
+                let (stream, _) = remote::accept_tcp_control(&control_listener, &tcp_for_source)
+                    .await
+                    .unwrap();
+                let (read, write) = stream.into_split();
+                let mut recv = remote::streams::RecvStream::new(read);
+                let mut send = remote::streams::SendStream::new(write);
+                let _limits = recv
+                    .recv_object::<remote::protocol::DirectoryLimits>()
+                    .await
+                    .unwrap();
+                send.send_control_message(&remote::protocol::SourceMessage::DiscoveryComplete {
+                    has_root_item: false,
+                })
+                .await
+                .unwrap();
+                let _done = recv
+                    .recv_object::<remote::protocol::DestinationMessage>()
+                    .await;
+                // close any accepted/queued data connections just like real source teardown
+                drop(data_listener);
+                let _ = send.close().await;
+            });
+            let (control_tx, writer_shutdown, writer) = spawn_dummy_master();
+            let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_destination(
+                    &control_addr,
+                    &[data_addr],
+                    "test-source",
+                    &testutils::copy_settings(),
+                    false,
+                    0,
+                    &common::preserve::preserve_none(),
+                    &tcp,
+                    concurrency,
+                    common::EndpointAdmission::Disabled,
+                    None,
+                    None,
+                    &remote::protocol::DestinationTransport::MasterSshTunnel,
+                    &control_tx,
+                    None,
+                    &cleanup,
+                    &peer_connected,
+                ),
+            )
+            .await
+            .expect("empty plaintext discovery exchange timed out");
+            assert!(
+                result.is_ok(),
+                "empty discovery exchange must succeed: {result:?}"
+            );
+            assert!(
+                peer_connected.load(std::sync::atomic::Ordering::Acquire),
+                "receiving a framed SourceMessage must mark peer_connected=true"
+            );
+            fake_source.await.unwrap();
+            drop(control_tx);
+            writer_shutdown.cancel();
+            let _ = writer.await;
+        }
+        // 3) receiving a framed File header on a plaintext data stream before any control message
+        //    marks peer_connected=true (covers single-file copies failing before DiscoveryComplete).
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let existing = temp.path().join("existing");
+            std::fs::write(&existing, b"original").unwrap();
+            let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let control_addr = control_listener.local_addr().unwrap();
+            let data_addr = data_listener.local_addr().unwrap();
+            let existing_for_source = existing.clone();
+            let tcp_for_source = tcp.clone();
+            let fake_source = tokio::spawn(async move {
+                let (ctrl_stream, _) =
+                    remote::accept_tcp_control(&control_listener, &tcp_for_source)
+                        .await
+                        .unwrap();
+                let (data_stream, _) = remote::accept_tcp_data(
+                    &data_listener,
+                    tcp_for_source.network_profile,
+                    tcp_for_source.keepalive_sec,
+                )
+                .await
+                .unwrap();
+                let (ctrl_read, _ctrl_write) = ctrl_stream.into_split();
+                let mut ctrl_recv = remote::streams::RecvStream::new(ctrl_read);
+                let _limits = ctrl_recv
+                    .recv_object::<remote::protocol::DirectoryLimits>()
+                    .await
+                    .unwrap();
+                let mut data_send = remote::streams::SendStream::new(data_stream);
+                let header = remote::protocol::File {
+                    src: "/source".into(),
+                    dst: existing_for_source.clone(),
+                    size: 4,
+                    metadata: remote::protocol::Metadata::from(
+                        &std::fs::metadata(&existing_for_source).unwrap(),
+                    ),
+                    is_root: true,
+                };
+                data_send.send_control_message(&header).await.unwrap();
+                // hold control open until destination aborts on fail_early collision
+                let _ = ctrl_recv
+                    .recv_object::<remote::protocol::DestinationMessage>()
+                    .await;
+            });
+            let (control_tx, writer_shutdown, writer) = spawn_dummy_master();
+            let mut settings = testutils::copy_settings();
+            settings.fail_early = true;
+            let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = run_destination(
+                &control_addr,
+                &[data_addr],
+                "test-source",
+                &settings,
+                false,
+                0,
+                &common::preserve::preserve_none(),
+                &tcp,
+                concurrency,
+                common::EndpointAdmission::Disabled,
+                None,
+                None,
+                &remote::protocol::DestinationTransport::MasterSshTunnel,
+                &control_tx,
+                None,
+                &cleanup,
+                &peer_connected,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "fail_early file collision must fail run_destination"
+            );
+            assert!(
+                peer_connected.load(std::sync::atomic::Ordering::Acquire),
+                "receiving a framed File header on data must mark peer_connected=true"
+            );
+            fake_source.await.unwrap();
+            drop(control_tx);
+            writer_shutdown.cancel();
+            let _ = writer.await;
+        }
         cleanup.finish();
     }
 }

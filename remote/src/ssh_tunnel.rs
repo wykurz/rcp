@@ -825,6 +825,7 @@ impl SshTunnelSet {
                 let unpinned_opts = crate::SshConnectOptions {
                     keepalive_sec,
                     agent_forward: crate::AgentForwardMode::Off,
+                    host_key_policy: crate::HostKeyPolicy::AutoAccept,
                     hostname_override: None,
                 };
                 let pinned = pinned_session_and_options(session, node_endpoint, keepalive_sec);
@@ -908,6 +909,7 @@ impl SshTunnelSet {
         let unpinned_opts = crate::SshConnectOptions {
             keepalive_sec,
             agent_forward: crate::AgentForwardMode::Off,
+            host_key_policy: crate::HostKeyPolicy::AutoAccept,
             hostname_override: None,
         };
         let pinned_candidate =
@@ -1030,6 +1032,7 @@ fn pinned_session_and_options(
     let options = crate::SshConnectOptions {
         keepalive_sec,
         agent_forward: crate::AgentForwardMode::Off,
+        host_key_policy: crate::HostKeyPolicy::AutoAccept,
         hostname_override: Some(endpoint.ip()),
     };
     Some((pinned_session, options))
@@ -1137,14 +1140,32 @@ async fn connect_verified_three_host_primary(
                 ));
             }
             Err(error) => {
-                tracing::warn!(
-                    "could not verify peer identity on primary 3-host SSH tunnel to '{}': {error:#}",
-                    base_session.host
-                );
+                drop(session);
+                return Err(error.context(format_three_host_peer_unverified_error(
+                    &base_session.host,
+                    expected,
+                    source_node_endpoint,
+                    pinned_candidate.is_some(),
+                )));
             }
         }
     }
     Ok((session, base_session.clone(), unpinned_opts, extra_pinned))
+}
+
+fn format_three_host_pin_note(
+    source_node_endpoint: Option<std::net::SocketAddr>,
+    tried_pinning: bool,
+) -> String {
+    match (source_node_endpoint, tried_pinning) {
+        (Some(ep), true) => {
+            format!("direct node pinning to {ep} was not reachable from destination")
+        }
+        (Some(ep), false) => {
+            format!("source reported endpoint {ep} which is not directly usable from destination")
+        }
+        (None, _) => "source did not expose a directly addressable node endpoint".to_owned(),
+    }
 }
 
 fn format_three_host_peer_mismatch_error(
@@ -1154,15 +1175,7 @@ fn format_three_host_peer_mismatch_error(
     source_node_endpoint: Option<std::net::SocketAddr>,
     tried_pinning: bool,
 ) -> String {
-    let pin_note = match (source_node_endpoint, tried_pinning) {
-        (Some(ep), true) => {
-            format!("direct node pinning to {ep} was not reachable from destination")
-        }
-        (Some(ep), false) => {
-            format!("source reported endpoint {ep} which is not directly usable from destination")
-        }
-        (None, _) => "source did not expose a directly addressable node endpoint".to_owned(),
-    };
+    let pin_note = format_three_host_pin_note(source_node_endpoint, tried_pinning);
     format!(
         "3-host SSH tunnel from destination to '{source_host}' connected to peer ({}) \
          instead of the peer running source rcpd ({}) — '{source_host}' appears to be a \
@@ -1171,6 +1184,24 @@ fn format_three_host_peer_mismatch_error(
          - run rcp directly on the source or destination host so data tunnels reuse the existing SSH session, or\n\
          - use direct TCP (--remote-transport=tcp) if source and destination can reach each other directly",
         actual.display_summary(),
+        expected.display_summary(),
+    )
+}
+
+fn format_three_host_peer_unverified_error(
+    source_host: &str,
+    expected: &crate::protocol::PeerIdentity,
+    source_node_endpoint: Option<std::net::SocketAddr>,
+    tried_pinning: bool,
+) -> String {
+    let pin_note = format_three_host_pin_note(source_node_endpoint, tried_pinning);
+    format!(
+        "3-host SSH tunnel from destination to '{source_host}' could not verify that it reached \
+         the peer running source rcpd ({}) ({pin_note}). Refusing to forward traffic to an \
+         unverified loopback endpoint. To fix this:\n\
+         - allow POSIX `sh` execution on the destination→source SSH account so peer verification can run, or\n\
+         - run rcp directly on the source or destination host so data tunnels reuse the existing SSH session, or\n\
+         - use direct TCP (--remote-transport=tcp) if source and destination can reach each other directly",
         expected.display_summary(),
     )
 }
