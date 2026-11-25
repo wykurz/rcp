@@ -137,15 +137,19 @@ promptly. Explicit `ForkAfterAuthentication=no`, `ControlPersist=no`, and `Clear
 command-line overrides prevent user or system SSH configuration from backgrounding it or colliding
 with user-configured port forwards, and `ServerAliveInterval` / `ServerAliveCountMax` (or
 `ServerAliveInterval=0` when `--remote-keepalive-sec=0`) enforce the configured keepalive budget on
-the SSH transport. For 3-host SSH copies where agent forwarding is active (`--ssh-forward-agent` or
-`ForwardAgent` in `~/.ssh/config`), the retained master omits `StrictHostKeyChecking=no` so the
-user's host-key policy is honored before delegating the agent, and the destination daemon is spawned
+the SSH transport. For 3-host SSH copies where agent forwarding is active or configured
+(`--ssh-forward-agent` or `ForwardAgent` in `~/.ssh/config`), every SSH connection to the
+destination — including any preceding remote `~` HOME lookup (which still passes
+`-o ForwardAgent=no`) and the retained master — omits `StrictHostKeyChecking=no` so the user's
+host-key policy is honored before delegating the agent, and the destination daemon is spawned
 through `ssh -E <private_exec_log> -S <control_path> -T -o ForkAfterAuthentication=no` so OpenSSH
 propagates `SSH_AUTH_SOCK` into the multiplexed session without polluting `RCP_READY` on stderr with
-local OpenSSH diagnostics (the private log tail is attached on startup or nonzero-exit failures);
-`--ssh-forward-agent` passes `-o ForwardAgent=yes` only on the destination endpoint. Cancelling
-setup aborts that owner and its drop terminates the actual connecting process. The configured SSH
-executable is resolved inside a known-local shell child. Brackets that delimit IPv6 in an rcp
+local OpenSSH diagnostics (the private log tail is read with a bounded wait on a disposable
+filesystem worker on startup or nonzero-exit failures, while supervised control-directory cleanup
+owns its removal after the master exits); `--ssh-forward-agent` passes `-o ForwardAgent=yes` only on
+the destination endpoint. Cancelling setup aborts that owner and its single-owner preparation guard
+terminates and reaps the connecting process before removing the control directory. The configured
+SSH executable is resolved inside a known-local shell child. Brackets that delimit IPv6 in an rcp
 operand are removed from the direct OpenSSH host argument; leaving them in argv makes OpenSSH
 resolve the brackets as literal hostname characters. After setup, commands open channels with the
 native OpenSSH multiplex protocol over the retained control socket rather than synchronously
@@ -279,37 +283,47 @@ connections; Master ↔ rcpd control and tracing remain protected by SSH.
 Direct TCP (`--remote-transport=tcp`) remains the default. When `--remote-transport=ssh` or `auto`
 is selected, data never relays through the master host in 3-host topologies:
 
-- **Same-host (`host:/a host:/b`, identical session or matching resolved SSH endpoint)**: Direct
-  loopback (`127.0.0.1` or `::1` under `AddressFamily inet6` in `ssh` mode), no SSH data tunnels,
-  and no slow-path warning. When remote operands differ in user, host, or port, `ssh -G` resolves
-  both effective endpoints before taking the same-host shortcut so `Match user` host/port rewrites
-  stay 3-host.
-- **Download (`remote:/src /local/dst`)**: Master opens `1..=K` parallel `-L` local port forwards
-  over OpenSSH mux v4 (`MUX_C_OPEN_FWD`) on the loopback family matching `AddressFamily`
-  (`127.0.0.1` or `::1`) to the source host's `tunnel_target_ip`, reusing the prepared source SSH
-  session as tunnel #1 and spawning up to `K - 1` independent `ssh -M -N` sessions (attempting node
-  pinning via `ssh_node_endpoint` and verifying `PeerIdentity` before advertising each extra port,
-  degrading gracefully down to `1`).
+- **Same-host (`host:/a host:/b`, shared session or verified co-located peers)**: Direct loopback
+  (`127.0.0.1`, or `::1` under `AddressFamily inet6` in `ssh` mode), no SSH data tunnels, and no
+  slow-path warning. Identical `(user, host, port)` reuses one SSH master session, establishing
+  co-location directly. When two independently opened remote sessions resolve via `ssh -G` to the
+  same effective `(hostname, port)` and proxy route, master probes both sessions and verifies
+  `PeerIdentity::matches` before taking the same-host shortcut (and disables destination agent
+  forwarding once confirmed); mismatched or unverified peers stay 3-host so load-balanced aliases
+  that land on different backend nodes never take the same-host shortcut.
+- **Download (`remote:/src /local/dst`)**: Master selects the source loopback target family
+  independently of the local client listener family (binding IPv6 on source when client config pins
+  `AddressFamily inet6` or `source sshd` accepted an IPv6 `SSH_CONNECTION`), then opens `1..=K`
+  parallel `-L` local port forwards over OpenSSH mux v4 (`MUX_C_OPEN_FWD`) on the client listener's
+  loopback family (`127.0.0.1` or `::1`, with fallback under `AddressFamily any`) to the source
+  host's `tunnel_target_ip`, reusing the prepared source SSH session as tunnel #1 and spawning up to
+  `K - 1` independent `ssh -M -N` sessions (attempting node pinning via `ssh_node_endpoint` and
+  verifying `PeerIdentity` before advertising each extra port, degrading gracefully down to `1`).
 - **Upload (`/local/src remote:/dst`)**: Master opens `1..=K` parallel `-R` remote port forwards
   (`<loopback>:0`, receiving `MUX_S_REMOTE_PORT`, cancelled via `MUX_C_CLOSE_FWD` with original
-  listen port `0`) on the destination host back to the local source's `tunnel_target_ip`, reusing
-  the prepared destination SSH session as tunnel #1 and verifying `PeerIdentity` on extra tunnels
-  `2..=K`.
-- **3-Host (`host1:/src host2:/dst`, distinct effective remote endpoints)**: Master resolves
+  listen port `0`) on the destination host back to the local source's `tunnel_target_ip` (falling
+  back from `127.0.0.1` to `::1` under `AddressFamily any` when remote `sshd` uses
+  `AddressFamily inet6`), reusing the prepared destination SSH session as tunnel #1 and verifying
+  `PeerIdentity` on extra tunnels `2..=K`.
+- **3-Host (`host1:/src host2:/dst`, distinct or unverified remote peers)**: Master resolves
   `host1`'s effective `(user, hostname, port)` locally with `ssh -G` and passes it (together with
   `dest_root`, `source_peer`, and `source_node_endpoint`) in `DestinationTransport::DirectSsh` or
   `DestinationTransport::AutoDirectSsh`, and passes `--ssh-tunnels=<K>` to destination `rcpd` so
   `RemoteResources` reserves and caps local SSH tunnel handles within `RLIMIT_NOFILE`. The
   destination daemon on `host2` opens `1..=K_admitted` parallel `-L` tunnels directly to `host1`
-  (trying `source_node_endpoint` first when reachable, verifying `PeerIdentity` on tunnel #1 with an
-  explicit load-balanced mismatch error if a different backend responds, and verifying extra tunnels
-  `2..=K_admitted` before advertising their ports).
+  (trying `source_node_endpoint` first when reachable, requiring positive `PeerIdentity`
+  verification on tunnel #1 — failing closed with an actionable routing error on mismatch or probe
+  failure, while allowing SSH port translation when Linux `boot_id`, `net_ns`, and `hostname` all
+  match — and verifying extra tunnels `2..=K_admitted` before advertising their ports).
 - **Automatic fallback (`--remote-transport=auto`)**: Destination first probes direct TCP to
   `source_control_addr` using `--remote-direct-probe-timeout-sec` (capped at
   `--remote-copy-conn-timeout-sec`). If TCP connect succeeds, that socket becomes the control
-  connection with zero extra round trips; if it fails before connecting, destination either requests
-  master-managed tunnels (`DirectConnectFailed` → `SshFallbackEndpoints`) for download and upload,
-  or opens direct `host2 → host1` tunnels for 3-host copies.
+  connection with zero extra round trips and the transfer commits to direct TCP (it does not fall
+  back to SSH later if a firewall permits the control port while blocking `source_data_addrs`; such
+  asymmetric firewalls require `--remote-transport=ssh` or `--port-ranges` covering both listeners).
+  If the control probe fails before connecting, destination either requests master-managed tunnels
+  (`DirectConnectFailed` → `SshFallbackEndpoints`) for download and upload, or opens direct
+  `host2 → host1` tunnels for 3-host copies.
 - **Dry-run (`--dry-run`)**: Only forwards the control port over tunnel #1 (`K = 1`); no data
   forwards or extra SSH connections are opened.
 - **Notice and TLS**: Any non-same-host transfer over SSH emits a default-visible `rcp::notice`

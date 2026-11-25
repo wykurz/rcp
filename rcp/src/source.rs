@@ -581,6 +581,8 @@ async fn dry_run_traverse(
             summary.files_skipped += 1;
             progress().files_skipped.inc();
         }
+        #[cfg(test)]
+        maybe_run_dry_run_progress_hook().await;
         return Ok(());
     }
     if src_metadata.is_symlink() {
@@ -911,6 +913,8 @@ async fn dry_run_traverse_fd(
                 summary.files_skipped += 1;
                 progress().files_skipped.inc();
             }
+            #[cfg(test)]
+            maybe_run_dry_run_progress_hook().await;
             Ok(())
         }
         common::walk::EntryKind::Symlink => {
@@ -1141,6 +1145,23 @@ async fn dry_run_traverse_fd(
     }
 }
 
+#[cfg(test)]
+type DryRunProgressHook =
+    Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static DRY_RUN_PROGRESS_HOOK: DryRunProgressHook;
+}
+
+#[cfg(test)]
+async fn maybe_run_dry_run_progress_hook() {
+    let fut = DRY_RUN_PROGRESS_HOOK.try_with(|hook| hook()).ok();
+    if let Some(fut) = fut {
+        fut.await;
+    }
+}
+
 /// Handle a dry-run connection: traverse, log entries, and complete without transferring data.
 /// Destination completes after receiving the empty discovery marker.
 #[allow(clippy::too_many_arguments)]
@@ -1172,62 +1193,107 @@ async fn handle_dry_run_connection(
     // cannot make the dry run report content from outside the source tree, and under strict
     // operand resolution a symlinked operand prefix fails closed at the parent open. `-L`
     // keeps the path-based reporter (follows symlinks by request; documented not hardened).
+    // monitor `control_recv_stream` concurrently so a dropped tunnel or failed destination stops
+    // a slow dry-run preview promptly instead of walking the entire tree first.
+    enum DryRunTraversalOutcome {
+        Completed(anyhow::Result<()>),
+        PeerLost(anyhow::Error),
+    }
     let mut summary = common::copy::Summary::default();
     let errors = common::error_collector::ErrorCollector::default();
-    let traversal = async {
-        if settings.dereference {
-            dry_run_traverse(
-                settings,
-                src,
-                dst,
-                src,
-                true,
-                dry_run_mode,
-                &mut summary,
-                &errors,
-            )
-            .await?;
-        } else {
-            let operand = common::walk::split_root_operand(src).await?;
-            let display = operand.display.clone();
-            // strict operand resolution: open the parent EAGERLY (openat2 RESOLVE_NO_SYMLINKS)
-            // so a symlinked operand prefix fails closed before anything is reported. On the
-            // default path the parent is opened lazily — only if the walk proceeds past the
-            // root filter — so an excluded root under an execute-only (0111) parent skips
-            // cleanly, matching the local copy's root-filter behavior (see DryRunDirSource).
-            let parent = if common::safedir::strict_operand_resolution() {
-                let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
-                    .await
-                    .with_context(|| {
-                        format!("cannot open parent directory of dry-run source {src:?}")
-                    })?
-                    .into_tree();
-                DryRunDirSource::Opened(Arc::new(parent))
+    let outcome = {
+        let traversal = async {
+            if settings.dereference {
+                dry_run_traverse(
+                    settings,
+                    src,
+                    dst,
+                    src,
+                    true,
+                    dry_run_mode,
+                    &mut summary,
+                    &errors,
+                )
+                .await?;
             } else {
-                DryRunDirSource::Lazy(operand.parent.clone())
-            };
-            dry_run_traverse_fd(
-                settings,
-                &parent,
-                &operand.name,
-                &display,
-                dst,
-                &display,
-                true,
-                dry_run_mode,
-                &mut summary,
-                &errors,
-            )
-            .await?;
+                let operand = common::walk::split_root_operand(src).await?;
+                let display = operand.display.clone();
+                // strict operand resolution: open the parent EAGERLY (openat2 RESOLVE_NO_SYMLINKS)
+                // so a symlinked operand prefix fails closed before anything is reported. On the
+                // default path the parent is opened lazily — only if the walk proceeds past the
+                // root filter — so an excluded root under an execute-only (0111) parent skips
+                // cleanly, matching the local copy's root-filter behavior (see DryRunDirSource).
+                let parent = if common::safedir::strict_operand_resolution() {
+                    let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
+                        .await
+                        .with_context(|| {
+                            format!("cannot open parent directory of dry-run source {src:?}")
+                        })?
+                        .into_tree();
+                    DryRunDirSource::Opened(Arc::new(parent))
+                } else {
+                    DryRunDirSource::Lazy(operand.parent.clone())
+                };
+                dry_run_traverse_fd(
+                    settings,
+                    &parent,
+                    &operand.name,
+                    &display,
+                    dst,
+                    &display,
+                    true,
+                    dry_run_mode,
+                    &mut summary,
+                    &errors,
+                )
+                .await?;
+            }
+            anyhow::Ok(())
+        };
+        let peer_watch = async {
+            loop {
+                match control_recv_stream
+                    .recv_object::<remote::protocol::DestinationMessage>()
+                    .await
+                {
+                    Ok(None) => {
+                        return anyhow::anyhow!(
+                            "destination closed control connection during dry run"
+                        );
+                    }
+                    Err(error) => {
+                        return error
+                            .context("control connection to destination failed during dry run");
+                    }
+                    Ok(Some(remote::protocol::DestinationMessage::DestinationDone)) => {
+                        return anyhow::anyhow!(
+                            "destination ended dry run prematurely before DiscoveryComplete"
+                        );
+                    }
+                    Ok(Some(other)) => {
+                        tracing::debug!("Ignoring message during dry-run traversal: {:?}", other);
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            peer_err = peer_watch => DryRunTraversalOutcome::PeerLost(peer_err),
+            result = traversal => DryRunTraversalOutcome::Completed(result),
         }
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(source) = traversal {
-        if settings.fail_early {
+    };
+    match outcome {
+        DryRunTraversalOutcome::PeerLost(source) => {
+            // drop the send stream without awaiting TLS shutdown on a dead peer
             return Err(common::copy::Error { source, summary }.into());
         }
-        errors.push(source);
+        DryRunTraversalOutcome::Completed(Err(source)) => {
+            if settings.fail_early {
+                return Err(common::copy::Error { source, summary }.into());
+            }
+            errors.push(source);
+        }
+        DryRunTraversalOutcome::Completed(Ok(())) => {}
     }
     // tell destination we're done with directory structure (nothing was sent in dry-run)
     {

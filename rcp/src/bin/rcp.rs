@@ -582,6 +582,42 @@ fn resolve_source_bind_ip(explicit_bind_ip: Option<&str>, source_host: &str) -> 
         .or_else(|| extract_bind_ip_from_host(source_host))
 }
 
+fn resolve_source_target_address_family(
+    source_is_local: bool,
+    client_listener_af: remote::ssh_tunnel::SshAddressFamily,
+    resolved_src_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+    source_ssh_endpoint: Option<std::net::SocketAddr>,
+) -> remote::ssh_tunnel::SshAddressFamily {
+    if source_is_local {
+        // upload (-R): local `ssh` dials local `source rcpd`, so the local client's AddressFamily
+        // governs the loopback family `source rcpd` binds.
+        return client_listener_af;
+    }
+    // download (-L) / 3-host / same-host: remote `source sshd` dials `source rcpd`'s loopback
+    // listener. Bind IPv6 when client config pinned inet6 OR when `source sshd` accepted our SSH
+    // connection over IPv6 (handles mixed client `AddressFamily any` + server `AddressFamily
+    // inet6`), falling back to checking whether the resolved target host is a literal IPv6 address
+    // if the SSH endpoint probe was unavailable.
+    if resolved_src_ssh
+        .is_some_and(|c| c.address_family == remote::ssh_tunnel::SshAddressFamily::Inet6)
+        || source_ssh_endpoint.is_some_and(|ep| ep.is_ipv6())
+        || (source_ssh_endpoint.is_none()
+            && resolved_src_ssh.is_some_and(|c| {
+                c.target
+                    .host
+                    .trim_matches(['[', ']'])
+                    .split('%')
+                    .next()
+                    .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+            }))
+    {
+        return remote::ssh_tunnel::SshAddressFamily::Inet6;
+    }
+    resolved_src_ssh.map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
+        c.address_family
+    })
+}
+
 fn resolve_source_bind_ip_for_transport(
     transport: RemoteTransport,
     explicit_bind_ip: Option<&str>,
@@ -1199,6 +1235,42 @@ enum CopyTopology {
     ThreeHost,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialTopology {
+    /// Identical `(user, host, port)` reuses one SSH master session, guaranteeing co-location.
+    SameHostSharedSession,
+    /// Two independently opened remote sessions whose `ssh -G` resolves to the same endpoint;
+    /// requires live `PeerIdentity::matches` verification before taking the `SameHost` shortcut.
+    SameEndpointNeedsPeerCheck,
+    /// Remote source → local destination (master opens `-L` tunnels to source).
+    Download,
+    /// Local source → remote destination (master opens `-R` tunnels to destination).
+    Upload,
+    /// Two distinct remote hosts (destination opens `-L` tunnels directly to source).
+    ThreeHost,
+}
+
+impl InitialTopology {
+    fn resolve(
+        self,
+        verified_peers: Option<(
+            &remote::protocol::PeerIdentity,
+            &remote::protocol::PeerIdentity,
+        )>,
+    ) -> CopyTopology {
+        match self {
+            Self::SameHostSharedSession => CopyTopology::SameHost,
+            Self::SameEndpointNeedsPeerCheck => match verified_peers {
+                Some((src, dst)) if src.matches(dst) => CopyTopology::SameHost,
+                _ => CopyTopology::ThreeHost,
+            },
+            Self::Download => CopyTopology::Download,
+            Self::Upload => CopyTopology::Upload,
+            Self::ThreeHost => CopyTopology::ThreeHost,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RemoteCopyOperands {
     source: path::RemotePath,
@@ -1209,25 +1281,187 @@ struct RemoteCopyOperands {
 }
 
 impl RemoteCopyOperands {
-    fn topology_with_resolved(
+    fn initial_topology(
         &self,
         resolved_src: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
         resolved_dst: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
-    ) -> CopyTopology {
+    ) -> InitialTopology {
         match (self.source_is_local, self.destination_is_local) {
-            (false, true) => CopyTopology::Download,
-            (true, false) => CopyTopology::Upload,
+            (false, true) => InitialTopology::Download,
+            (true, false) => InitialTopology::Upload,
             (false, false) if self.source.session() == self.destination.session() => {
                 // identical (user, host, port) shares one SSH session, guaranteeing the same host
-                CopyTopology::SameHost
+                InitialTopology::SameHostSharedSession
             }
             (false, false) => match (resolved_src, resolved_dst) {
-                (Some(src), Some(dst)) if src.same_endpoint(dst) => CopyTopology::SameHost,
-                _ => CopyTopology::ThreeHost,
+                (Some(src), Some(dst)) if src.same_endpoint(dst) => {
+                    InitialTopology::SameEndpointNeedsPeerCheck
+                }
+                _ => InitialTopology::ThreeHost,
             },
             (true, true) => unreachable!("remote_copy_operands never accepts two local paths"),
         }
     }
+}
+
+fn destination_agent_forward_mode(
+    operands: &RemoteCopyOperands,
+    transport: RemoteTransport,
+    cli_forward_agent: bool,
+    resolved_dst_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+) -> remote::AgentForwardMode {
+    if transport == RemoteTransport::Tcp
+        || operands.source_is_local
+        || operands.destination_is_local
+        || operands.source.session() == operands.destination.session()
+    {
+        return remote::AgentForwardMode::Off;
+    }
+    if cli_forward_agent {
+        remote::AgentForwardMode::ForceOn
+    } else if resolved_dst_ssh.is_some_and(|dst_cfg| dst_cfg.forward_agent_enabled) {
+        remote::AgentForwardMode::InheritConfig
+    } else {
+        remote::AgentForwardMode::Off
+    }
+}
+
+fn host_key_policy_for_agent_forward(mode: remote::AgentForwardMode) -> remote::HostKeyPolicy {
+    if mode == remote::AgentForwardMode::Off {
+        remote::HostKeyPolicy::AutoAccept
+    } else {
+        remote::HostKeyPolicy::HonorConfig
+    }
+}
+
+fn source_host_key_policy(
+    dest_agent_forward_mode: remote::AgentForwardMode,
+    resolved_src_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+    resolved_dst_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+) -> remote::HostKeyPolicy {
+    if dest_agent_forward_mode == remote::AgentForwardMode::Off {
+        return remote::HostKeyPolicy::AutoAccept;
+    }
+    // when source and destination resolve to the same (HostName, Port), they share an OpenSSH
+    // known_hosts entry; source must also honor StrictHostKeyChecking so neither its `~` HOME
+    // lookup nor parallel endpoint preparation can auto-accept an untrusted host key before the
+    // agent-forwarded destination verifies it.
+    if let (Some(src), Some(dst)) = (resolved_src_ssh, resolved_dst_ssh)
+        && src.target.host.eq_ignore_ascii_case(&dst.target.host)
+        && src.target.port.unwrap_or(22) == dst.target.port.unwrap_or(22)
+    {
+        return remote::HostKeyPolicy::HonorConfig;
+    }
+    remote::HostKeyPolicy::AutoAccept
+}
+
+struct ResolvedMasterSshPlan {
+    resolved_src_ssh: Option<remote::ssh_tunnel::ResolvedSshConfig>,
+    resolved_dst_ssh: Option<remote::ssh_tunnel::ResolvedSshConfig>,
+    source_host_key_policy: remote::HostKeyPolicy,
+    dest_agent_forward_mode: remote::AgentForwardMode,
+    dest_home_host_key_policy: remote::HostKeyPolicy,
+}
+
+async fn resolve_ssh_configs_for_operands(
+    operands: &RemoteCopyOperands,
+    transport: RemoteTransport,
+    bootstrap_timeout: std::time::Duration,
+    cleanup: &remote::RemoteCleanup,
+) -> anyhow::Result<(
+    Option<remote::ssh_tunnel::ResolvedSshConfig>,
+    Option<remote::ssh_tunnel::ResolvedSshConfig>,
+)> {
+    if transport == RemoteTransport::Tcp {
+        return Ok((None, None));
+    }
+    let src = &operands.source;
+    let dst = &operands.destination;
+    let resolved = match (operands.source_is_local, operands.destination_is_local) {
+        (false, true) => {
+            let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
+                src.session(),
+                bootstrap_timeout,
+                cleanup,
+            )
+            .await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    tracing::debug!(
+                        host = %src.session().host,
+                        "could not resolve source SSH config (defaulting AddressFamily to any): {error:#}"
+                    );
+                    None
+                }
+            };
+            (resolved_src, None)
+        }
+        (true, false) => {
+            let resolved_dst = match remote::ssh_tunnel::resolve_ssh_config(
+                dst.session(),
+                bootstrap_timeout,
+                cleanup,
+            )
+            .await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    tracing::debug!(
+                        host = %dst.session().host,
+                        "could not resolve destination SSH config (defaulting AddressFamily to any): {error:#}"
+                    );
+                    None
+                }
+            };
+            (None, resolved_dst)
+        }
+        (false, false) if src.session() == dst.session() => {
+            let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
+                src.session(),
+                bootstrap_timeout,
+                cleanup,
+            )
+            .await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    tracing::debug!(
+                        host = %src.session().host,
+                        "could not resolve same-host SSH config (defaulting AddressFamily to any): {error:#}"
+                    );
+                    None
+                }
+            };
+            (resolved_src, None)
+        }
+        (false, false) => {
+            let resolve_src = async {
+                remote::ssh_tunnel::resolve_ssh_config(src.session(), bootstrap_timeout, cleanup)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve SSH configuration for source host '{}'",
+                            src.session().host
+                        )
+                    })
+            };
+            let resolve_dst = async {
+                remote::ssh_tunnel::resolve_ssh_config(dst.session(), bootstrap_timeout, cleanup)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve SSH configuration for destination host '{}'",
+                            dst.session().host
+                        )
+                    })
+            };
+            let (resolved_src, resolved_dst) = tokio::try_join!(resolve_src, resolve_dst)?;
+            (Some(resolved_src), Some(resolved_dst))
+        }
+        (true, true) => unreachable!("remote_copy_operands never accepts two local paths"),
+    };
+    Ok(resolved)
 }
 
 fn source_accept_timeout_sec(
@@ -1685,12 +1919,13 @@ where
     }
 }
 
-#[instrument]
+#[instrument(skip(ssh_plan))]
 async fn run_rcpd_master(
     args: &Args,
     preserve: &common::preserve::Settings,
     operands: &RemoteCopyOperands,
     request: MasterRemoteRequest,
+    ssh_plan: ResolvedMasterSshPlan,
     cleanup: &remote::RemoteCleanup,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
@@ -1699,110 +1934,114 @@ async fn run_rcpd_master(
     let transport = args.remote_transport;
     let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
     let keepalive_sec = request.tcp.keepalive_sec;
-    // resolve SSH config for the effective endpoint(s) whenever SSH transport/fallback is active:
-    // - determines whether two distinct remote specs (e.g. alice@cluster vs bob@cluster with Match
-    //   user rules) actually resolve to the same SSH endpoint
-    // - discovers AddressFamily (inet6 vs inet/any) for loopback listener & forward selection
-    // - resolves effective source target & destination ForwardAgent for 3-host mode
-    let (resolved_src_ssh, resolved_dst_ssh) = if transport == RemoteTransport::Tcp {
-        (None, None)
+    let ResolvedMasterSshPlan {
+        resolved_src_ssh,
+        resolved_dst_ssh,
+        source_host_key_policy,
+        dest_agent_forward_mode,
+        dest_home_host_key_policy: _,
+    } = ssh_plan;
+    let initial_topology =
+        operands.initial_topology(resolved_src_ssh.as_ref(), resolved_dst_ssh.as_ref());
+    let mut teardown = RemoteTeardown::default();
+    let source_config = build_source_remote_config(&request);
+    let (prepared_source, mut prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
+        src.session(),
+        dst.session(),
+        args.rcpd_path.as_deref(),
+        args.auto_deploy_rcpd,
+        cleanup,
+        bootstrap_timeout,
+        keepalive_sec,
+        &operands.local_operand_roots,
+        source_host_key_policy,
+        dest_agent_forward_mode,
+    )
+    .await?;
+    let probe_timeout = bootstrap_timeout.min(std::time::Duration::from_secs(5));
+    let (topology, source_ssh_endpoint) = if transport == RemoteTransport::Tcp {
+        (initial_topology.resolve(None), None)
     } else {
-        match (operands.source_is_local, operands.destination_is_local) {
-            (false, true) => {
-                let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
-                    src.session(),
-                    bootstrap_timeout,
-                    cleanup,
-                )
-                .await
-                {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        tracing::debug!(
-                            host = %src.session().host,
-                            "could not resolve source SSH config (defaulting AddressFamily to any): {error:#}"
-                        );
-                        None
+        match initial_topology {
+            InitialTopology::SameEndpointNeedsPeerCheck => {
+                // independently opened sessions (e.g., alice@login-pool vs bob@login-pool) may
+                // land on different load-balanced backends even though `ssh -G` resolves to the
+                // same endpoint; verify their actual peers before taking the SameHost shortcut.
+                let (src_probe, dst_probe) = tokio::join!(
+                    prepared_source.probe_peer_identity(probe_timeout),
+                    prepared_destination.probe_peer_identity(probe_timeout),
+                );
+                match (src_probe, dst_probe) {
+                    (Ok((src_peer, src_ep)), Ok((dst_peer, _dst_ep))) => {
+                        let resolved = initial_topology.resolve(Some((&src_peer, &dst_peer)));
+                        if resolved == CopyTopology::SameHost {
+                            tracing::debug!(
+                                host = %src.session().host,
+                                "verified co-located peer identity across independent SSH sessions; using SameHost direct transport"
+                            );
+                            prepared_destination.disable_agent_forward();
+                        } else {
+                            tracing::info!(
+                                src_host = %src.session().host,
+                                dst_host = %dst.session().host,
+                                src_peer = %src_peer.hostname,
+                                dst_peer = %dst_peer.hostname,
+                                "independent SSH sessions resolved to the same endpoint but landed on different peers; using ThreeHost transport"
+                            );
+                        }
+                        (resolved, src_ep)
                     }
-                };
-                (resolved_src, None)
-            }
-            (true, false) => {
-                let resolved_dst = match remote::ssh_tunnel::resolve_ssh_config(
-                    dst.session(),
-                    bootstrap_timeout,
-                    cleanup,
-                )
-                .await
-                {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        tracing::debug!(
-                            host = %dst.session().host,
-                            "could not resolve destination SSH config (defaulting AddressFamily to any): {error:#}"
-                        );
-                        None
+                    (src_res, dst_res) => {
+                        let src_ep = match src_res {
+                            Ok((_, ep)) => ep,
+                            Err(error) => {
+                                tracing::debug!(
+                                    host = %src.session().host,
+                                    "could not verify source peer identity for same-endpoint check (using ThreeHost): {error:#}"
+                                );
+                                None
+                            }
+                        };
+                        if let Err(error) = dst_res {
+                            tracing::debug!(
+                                host = %dst.session().host,
+                                "could not verify destination peer identity for same-endpoint check (using ThreeHost): {error:#}"
+                            );
+                        }
+                        (CopyTopology::ThreeHost, src_ep)
                     }
-                };
-                (None, resolved_dst)
+                }
             }
-            (false, false) if src.session() == dst.session() => {
-                let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
-                    src.session(),
-                    bootstrap_timeout,
-                    cleanup,
-                )
-                .await
-                {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        tracing::debug!(
-                            host = %src.session().host,
-                            "could not resolve same-host SSH config (defaulting AddressFamily to any): {error:#}"
-                        );
-                        None
+            other => {
+                let topology = other.resolve(None);
+                // when an SSH tunnel will dial remote `source rcpd` through `source sshd` and
+                // client SSH config did not already pin inet6, probe the live SSH connection's
+                // endpoint family so mixed client `AddressFamily any` + server `AddressFamily
+                // inet6` binds IPv6 on `source rcpd` independently of the client-side listener.
+                let need_source_endpoint_probe = !operands.source_is_local
+                    && matches!(topology, CopyTopology::Download | CopyTopology::ThreeHost)
+                    && resolved_src_ssh.as_ref().is_none_or(|c| {
+                        c.address_family != remote::ssh_tunnel::SshAddressFamily::Inet6
+                    });
+                let src_ep = if need_source_endpoint_probe {
+                    match prepared_source.probe_peer_identity(probe_timeout).await {
+                        Ok((_, ep)) => ep,
+                        Err(error) => {
+                            tracing::debug!(
+                                host = %src.session().host,
+                                "could not probe source SSH endpoint address family: {error:#}"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
-                (resolved_src, None)
+                (topology, src_ep)
             }
-            (false, false) => {
-                let resolve_src = async {
-                    remote::ssh_tunnel::resolve_ssh_config(
-                        src.session(),
-                        bootstrap_timeout,
-                        cleanup,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to resolve SSH configuration for source host '{}'",
-                            src.session().host
-                        )
-                    })
-                };
-                let resolve_dst = async {
-                    remote::ssh_tunnel::resolve_ssh_config(
-                        dst.session(),
-                        bootstrap_timeout,
-                        cleanup,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to resolve SSH configuration for destination host '{}'",
-                            dst.session().host
-                        )
-                    })
-                };
-                let (resolved_src, resolved_dst) = tokio::try_join!(resolve_src, resolve_dst)?;
-                (Some(resolved_src), Some(resolved_dst))
-            }
-            (true, true) => unreachable!("remote_copy_operands never accepts two local paths"),
         }
     };
-    let topology =
-        operands.topology_with_resolved(resolved_src_ssh.as_ref(), resolved_dst_ssh.as_ref());
-    let forwarding_address_family = match topology {
+    let client_listener_af = match topology {
         CopyTopology::Download => resolved_src_ssh
             .as_ref()
             .map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
@@ -1819,11 +2058,17 @@ async fn run_rcpd_master(
                 c.address_family
             }),
     };
+    let source_target_af = resolve_source_target_address_family(
+        operands.source_is_local,
+        client_listener_af,
+        resolved_src_ssh.as_ref(),
+        source_ssh_endpoint,
+    );
     let source_bind_ip = resolve_source_bind_ip_for_transport(
         transport,
         args.bind_ip.as_deref(),
         &src.session().host,
-        forwarding_address_family,
+        source_target_af,
     );
     if transport == RemoteTransport::Ssh {
         if args.port_ranges.is_some() {
@@ -1840,39 +2085,18 @@ async fn run_rcpd_master(
             );
         }
     }
-    let mut teardown = RemoteTeardown::default();
-    let source_config = build_source_remote_config(&request);
-    let (three_host_source_ssh, dest_agent_forward_mode) =
+    let three_host_source_ssh =
         if topology == CopyTopology::ThreeHost && transport != RemoteTransport::Tcp {
-            let resolved_src = resolved_src_ssh
-                .as_ref()
-                .expect("three-host SSH/auto resolves source SSH config");
-            let agent_mode = if args.ssh_forward_agent {
-                remote::AgentForwardMode::ForceOn
-            } else if resolved_dst_ssh
-                .as_ref()
-                .is_some_and(|dst_cfg| dst_cfg.forward_agent_enabled)
-            {
-                remote::AgentForwardMode::InheritConfig
-            } else {
-                remote::AgentForwardMode::Off
-            };
-            (Some(resolved_src.target.clone()), agent_mode)
+            Some(
+                resolved_src_ssh
+                    .as_ref()
+                    .expect("three-host SSH/auto resolves source SSH config")
+                    .target
+                    .clone(),
+            )
         } else {
-            (None, remote::AgentForwardMode::Off)
+            None
         };
-    let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
-        src.session(),
-        dst.session(),
-        args.rcpd_path.as_deref(),
-        args.auto_deploy_rcpd,
-        cleanup,
-        bootstrap_timeout,
-        keepalive_sec,
-        &operands.local_operand_roots,
-        dest_agent_forward_mode,
-    )
-    .await?;
     let mut source_rcpd = {
         let _span = tracing::trace_span!(
             "start_rcpd",
@@ -2089,7 +2313,7 @@ async fn run_rcpd_master(
                     std::net::SocketAddr::new(target_ip, source_hello.data_addr.port())
                 }),
                 requested_tunnels,
-                address_family: forwarding_address_family,
+                address_family: client_listener_af,
                 expected_peer,
                 node_endpoint,
                 keepalive_sec,
@@ -2438,6 +2662,34 @@ async fn async_main(
         let request = build_master_remote_request(&args, files_in_flight)?;
         let remote_home_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
         let keepalive_sec = request.tcp.keepalive_sec;
+        // resolve local `ssh -G` config once up front (no network I/O) so `~` HOME expansion on
+        // the destination preserves the destination's `StrictHostKeyChecking` policy whenever an
+        // agent-forwarded 3-host session may follow on the same host, while still passing
+        // `ForwardAgent=no` during the lookup itself.
+        let (resolved_src_ssh, resolved_dst_ssh) = resolve_ssh_configs_for_operands(
+            &operands,
+            args.remote_transport,
+            remote_home_timeout,
+            cleanup,
+        )
+        .await?;
+        let dest_agent_forward_mode = destination_agent_forward_mode(
+            &operands,
+            args.remote_transport,
+            args.ssh_forward_agent,
+            resolved_dst_ssh.as_ref(),
+        );
+        let ssh_plan = ResolvedMasterSshPlan {
+            source_host_key_policy: source_host_key_policy(
+                dest_agent_forward_mode,
+                resolved_src_ssh.as_ref(),
+                resolved_dst_ssh.as_ref(),
+            ),
+            dest_home_host_key_policy: host_key_policy_for_agent_forward(dest_agent_forward_mode),
+            dest_agent_forward_mode,
+            resolved_src_ssh,
+            resolved_dst_ssh,
+        };
         {
             let remote_src = &mut operands.source;
             let remote_dst = &mut operands.destination;
@@ -2450,6 +2702,7 @@ async fn async_main(
                     remote_home_timeout,
                     keepalive_sec,
                     &operands.local_operand_roots,
+                    remote::HostKeyPolicy::AutoAccept,
                 )
                 .await?;
                 remote_src.apply_remote_home(&home);
@@ -2462,6 +2715,7 @@ async fn async_main(
                         remote_home_timeout,
                         keepalive_sec,
                         &operands.local_operand_roots,
+                        ssh_plan.source_host_key_policy,
                     )
                     .await?;
                     remote_src.apply_remote_home(&home);
@@ -2473,6 +2727,7 @@ async fn async_main(
                         remote_home_timeout,
                         keepalive_sec,
                         &operands.local_operand_roots,
+                        ssh_plan.dest_home_host_key_policy,
                     )
                     .await?;
                     remote_dst.apply_remote_home(&home);
@@ -2486,7 +2741,8 @@ async fn async_main(
                 operands.destination.path()
             ));
         }
-        return match run_rcpd_master(&args, &preserve, &operands, request, cleanup).await {
+        return match run_rcpd_master(&args, &preserve, &operands, request, ssh_plan, cleanup).await
+        {
             Ok(summary) => Ok(summary),
             Err(error) => {
                 if let Some(copy_error) = error.downcast_ref::<common::copy::Error>()
@@ -3735,15 +3991,19 @@ mod tests {
                 proxy_command: None,
             }
         };
-        // identical (user, host, port) takes SameHost directly without needing ssh -G
+        // identical (user, host, port) takes SameHost directly without needing ssh -G or peer probe
         assert_eq!(
             remote_copy_operands(remote_a.clone(), remote_a.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
+                .initial_topology(None, None),
+            InitialTopology::SameHostSharedSession
+        );
+        assert_eq!(
+            InitialTopology::SameHostSharedSession.resolve(None),
             CopyTopology::SameHost
         );
-        // different user on the same alias takes SameHost ONLY when effective endpoints match
+        // different user on the same alias requires live peer verification before taking SameHost
         let alice_cfg = resolved(Some("alice"), "10.0.0.1", Some(22));
         let bob_same_cfg = resolved(Some("deploy"), "10.0.0.1", Some(22));
         let bob_other_host_cfg = resolved(Some("deploy"), "10.0.0.2", Some(22));
@@ -3751,71 +4011,183 @@ mod tests {
         let shared_alias = remote_copy_operands(remote_a.clone(), remote_a_user, vec![])
             .unwrap()
             .unwrap();
+        let peer_a = remote::protocol::PeerIdentity {
+            hostname: "node-a".to_owned(),
+            boot_id: Some("boot-1".to_owned()),
+            net_ns: Some("net:[1]".to_owned()),
+            ssh_server_port: Some(22),
+        };
+        let peer_b = remote::protocol::PeerIdentity {
+            hostname: "node-b".to_owned(),
+            ..peer_a.clone()
+        };
+        let same_endpoint_initial =
+            shared_alias.initial_topology(Some(&alice_cfg), Some(&bob_same_cfg));
         assert_eq!(
-            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_same_cfg)),
+            same_endpoint_initial,
+            InitialTopology::SameEndpointNeedsPeerCheck
+        );
+        assert_eq!(
+            same_endpoint_initial.resolve(Some((&peer_a, &peer_a))),
             CopyTopology::SameHost
         );
         assert_eq!(
-            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_other_host_cfg)),
+            same_endpoint_initial.resolve(Some((&peer_a, &peer_b))),
             CopyTopology::ThreeHost
         );
+        assert_eq!(same_endpoint_initial.resolve(None), CopyTopology::ThreeHost);
         assert_eq!(
-            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_other_port_cfg)),
-            CopyTopology::ThreeHost
+            shared_alias.initial_topology(Some(&alice_cfg), Some(&bob_other_host_cfg)),
+            InitialTopology::ThreeHost
         );
         assert_eq!(
-            shared_alias.topology_with_resolved(None, None),
-            CopyTopology::ThreeHost
+            shared_alias.initial_topology(Some(&alice_cfg), Some(&bob_other_port_cfg)),
+            InitialTopology::ThreeHost
+        );
+        assert_eq!(
+            shared_alias.initial_topology(None, None),
+            InitialTopology::ThreeHost
         );
         assert_eq!(
             remote_copy_operands(remote_a.clone(), remote_b.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(Some(&alice_cfg), Some(&bob_other_host_cfg)),
-            CopyTopology::ThreeHost
+                .initial_topology(Some(&alice_cfg), Some(&bob_other_host_cfg)),
+            InitialTopology::ThreeHost
         );
         assert_eq!(
             remote_copy_operands(remote_a, local_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::Download
+                .initial_topology(None, None),
+            InitialTopology::Download
         );
         assert_eq!(
             remote_copy_operands(local_src.clone(), remote_b, vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::Upload
+                .initial_topology(None, None),
+            InitialTopology::Upload
         );
         // --force-remote distinguishes Download (-L), Upload (-R), SameHost, and ThreeHost locally
         assert_eq!(
             remote_copy_operands(forced_localhost_src.clone(), local_dst, vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::Download
+                .initial_topology(None, None),
+            InitialTopology::Download
         );
         assert_eq!(
             remote_copy_operands(local_src, forced_localhost_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::Upload
+                .initial_topology(None, None),
+            InitialTopology::Upload
         );
         assert_eq!(
             remote_copy_operands(forced_localhost_src, forced_localhost_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::SameHost
+                .initial_topology(None, None),
+            InitialTopology::SameHostSharedSession
         );
         assert_eq!(
             remote_copy_operands(forced_ip_src, forced_localhost_dst, vec![])
                 .unwrap()
                 .unwrap()
-                .topology_with_resolved(None, None),
-            CopyTopology::ThreeHost
+                .initial_topology(None, None),
+            InitialTopology::ThreeHost
+        );
+    }
+
+    #[test]
+    fn resolve_source_target_address_family_separates_server_from_client_listener() {
+        let any = remote::ssh_tunnel::SshAddressFamily::Any;
+        let inet = remote::ssh_tunnel::SshAddressFamily::Inet;
+        let inet6 = remote::ssh_tunnel::SshAddressFamily::Inet6;
+        let cfg = |host: &str, af: remote::ssh_tunnel::SshAddressFamily| {
+            remote::ssh_tunnel::ResolvedSshConfig {
+                original_host: host.to_owned(),
+                target: remote::protocol::SshTarget {
+                    user: None,
+                    host: host.to_owned(),
+                    port: Some(22),
+                },
+                forward_agent_enabled: false,
+                address_family: af,
+                proxy_jump: None,
+                proxy_command: None,
+            }
+        };
+        let v6_ep: std::net::SocketAddr = "[::1]:2222".parse().unwrap();
+        let v4_ep: std::net::SocketAddr = "127.0.0.1:2222".parse().unwrap();
+        // mixed client AddressFamily any + server sshd AddressFamily inet6 (accepted IPv6):
+        // download/3-host binds IPv6 on source independently of client listener family
+        assert_eq!(
+            resolve_source_target_address_family(false, any, Some(&cfg("srv", any)), Some(v6_ep)),
+            inet6
+        );
+        // fallback when probe was unavailable but target host is a literal IPv6 address
+        assert_eq!(
+            resolve_source_target_address_family(false, any, Some(&cfg("::1", any)), None),
+            inet6
+        );
+        // IPv4 SSH_CONNECTION keeps client family (any -> 127.0.0.1)
+        assert_eq!(
+            resolve_source_target_address_family(false, any, Some(&cfg("srv", any)), Some(v4_ep)),
+            any
+        );
+        // upload (-R): local source follows local client listener family regardless of remote sshd
+        assert_eq!(
+            resolve_source_target_address_family(true, any, None, Some(v6_ep)),
+            any
+        );
+        assert_eq!(
+            resolve_source_target_address_family(true, inet6, None, None),
+            inet6
+        );
+        assert_eq!(
+            resolve_source_target_address_family(true, inet, None, None),
+            inet
+        );
+    }
+
+    #[test]
+    fn source_host_key_policy_honors_config_when_sharing_endpoint_with_agent_forwarded_dest() {
+        let cfg = |host: &str, port: Option<u16>| remote::ssh_tunnel::ResolvedSshConfig {
+            original_host: host.to_owned(),
+            target: remote::protocol::SshTarget {
+                user: None,
+                host: host.to_owned(),
+                port,
+            },
+            forward_agent_enabled: false,
+            address_family: remote::ssh_tunnel::SshAddressFamily::Any,
+            proxy_jump: None,
+            proxy_command: None,
+        };
+        let a = cfg("Cluster.Example", Some(22));
+        let a_same = cfg("cluster.example", None);
+        let b_port = cfg("cluster.example", Some(2222));
+        assert_eq!(
+            source_host_key_policy(remote::AgentForwardMode::ForceOn, Some(&a), Some(&a_same)),
+            remote::HostKeyPolicy::HonorConfig
+        );
+        assert_eq!(
+            source_host_key_policy(
+                remote::AgentForwardMode::InheritConfig,
+                Some(&a),
+                Some(&a_same),
+            ),
+            remote::HostKeyPolicy::HonorConfig
+        );
+        assert_eq!(
+            source_host_key_policy(remote::AgentForwardMode::ForceOn, Some(&a), Some(&b_port)),
+            remote::HostKeyPolicy::AutoAccept
+        );
+        assert_eq!(
+            source_host_key_policy(remote::AgentForwardMode::Off, Some(&a), Some(&a_same)),
+            remote::HostKeyPolicy::AutoAccept
         );
     }
 

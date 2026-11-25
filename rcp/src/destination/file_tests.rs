@@ -714,12 +714,14 @@ fn fresh_parent_collision_skips_or_replaces_and_keeps_the_next_file() {
             let files = prog.files_copied.get();
             let bytes = prog.bytes_copied.get();
             let unchanged = prog.files_unchanged.get();
+            let peer_connected = std::sync::atomic::AtomicBool::new(false);
             handle_file_stream(
                 settings,
                 common::preserve::preserve_none(),
                 two_file_stream(&root, &metadata, "occupied").await,
                 tracker.clone(),
                 errors.clone(),
+                &peer_connected,
             )
             .await
             .unwrap();
@@ -777,6 +779,7 @@ fn final_write_failure_collects_and_continues_but_fail_early_stops() {
             let mut settings = testutils::copy_settings();
             settings.fail_early = fail_early;
             let counts = (progress().files_copied.get(), progress().bytes_copied.get());
+            let peer_connected = std::sync::atomic::AtomicBool::new(false);
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 handle_file_stream(
@@ -785,6 +788,7 @@ fn final_write_failure_collects_and_continues_but_fail_early_stops() {
                     two_file_stream(&root, &metadata, "failed").await,
                     tracker.clone(),
                     errors.clone(),
+                    &peer_connected,
                 ),
             )
             .await

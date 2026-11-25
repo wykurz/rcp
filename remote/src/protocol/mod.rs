@@ -829,24 +829,30 @@ impl PeerIdentity {
         (identity, ssh_endpoint)
     }
 
-    /// Return true when `other` identifies the same peer host/SSH server instance.
+    /// Return true when `other` identifies the same peer host/network stack.
+    ///
+    /// When both `boot_id` and `net_ns` are established and match alongside `hostname`, both
+    /// sessions share the same loopback network namespace even under SSH port translation, so a
+    /// differing `ssh_server_port` alone does not reject the peer. When `boot_id` or `net_ns` is
+    /// unavailable (e.g. non-Linux peers), `ssh_server_port` is still compared as a discriminator.
     #[must_use]
     pub fn matches(&self, other: &Self) -> bool {
         if self.hostname.is_empty() || other.hostname.is_empty() || self.hostname != other.hostname
         {
             return false;
         }
-        if let (Some(a), Some(b)) = (&self.boot_id, &other.boot_id)
-            && a != b
-        {
-            return false;
-        }
-        if let (Some(a), Some(b)) = (&self.net_ns, &other.net_ns)
-            && a != b
-        {
-            return false;
-        }
-        if let (Some(a), Some(b)) = (self.ssh_server_port, other.ssh_server_port)
+        let same_boot_id = match (&self.boot_id, &other.boot_id) {
+            (Some(a), Some(b)) if a != b => return false,
+            (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        let same_net_ns = match (&self.net_ns, &other.net_ns) {
+            (Some(a), Some(b)) if a != b => return false,
+            (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        if !(same_boot_id && same_net_ns)
+            && let (Some(a), Some(b)) = (self.ssh_server_port, other.ssh_server_port)
             && a != b
         {
             return false;
@@ -1677,10 +1683,24 @@ mod tests {
             net_ns: Some("net:[4026532000]".to_owned()),
             ..base.clone()
         }));
-        assert!(!base.matches(&PeerIdentity {
+        // when both boot_id and net_ns match, a different SSH ingress port (port translation) still
+        // identifies the same node and loopback stack
+        assert!(base.matches(&PeerIdentity {
             ssh_server_port: Some(2202),
             ..base.clone()
         }));
+        // when boot_id or net_ns is unavailable, ssh_server_port still distinguishes peers
+        let non_linux_a = PeerIdentity {
+            hostname: "node01".to_owned(),
+            boot_id: None,
+            net_ns: None,
+            ssh_server_port: Some(22),
+        };
+        let non_linux_b = PeerIdentity {
+            ssh_server_port: Some(2202),
+            ..non_linux_a.clone()
+        };
+        assert!(!non_linux_a.matches(&non_linux_b));
         let empty = PeerIdentity {
             hostname: String::new(),
             boot_id: None,

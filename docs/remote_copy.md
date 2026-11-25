@@ -542,26 +542,35 @@ Key behavior:
   the remote `sshd` rate-limits extra connections. Dry runs (`--dry-run`) open only tunnel #1 for
   control.
 - **Same-host copies** (`host:/a host:/b`): stay on direct loopback without SSH data tunneling or
-  slow-path warnings whenever both operands share the same `(user, host, port)` or resolve via
-  `ssh -G` to the same effective `(hostname, port)` and proxy route. When different users on a
-  shared alias resolve to different `HostName`/`Port` values (for example via OpenSSH `Match user`),
-  `rcp` treats the copy as a 3-host transfer while keeping each daemon's credentials.
+  slow-path warnings whenever both operands share the same `(user, host, port)` (reusing one SSH
+  session), or when two independently opened sessions resolve via `ssh -G` to the same effective
+  `(hostname, port)` and proxy route AND verify matching live peer identity. When different users on
+  a shared alias resolve to different `HostName`/`Port` values (for example via OpenSSH
+  `Match user`) or land on different backend nodes behind a load-balanced alias, `rcp` treats the
+  copy as a 3-host transfer while keeping each daemon's credentials.
 - **Zero master relay in 3-host copies** (`host1:/src host2:/dst`): `rcp` resolves `host1`'s
   effective SSH target locally via `ssh -G` and has destination `rcpd` on `host2` open `-L` tunnels
   directly to `host1`, attempting to pin directly to the specific node running `source rcpd`
-  (`SSH_CONNECTION`) and verifying peer identity before advertising tunnel ports. On load-balanced
-  SSH hostnames where the destination cannot reach the specific source node directly, `rcp` reports
-  the peer mismatch explicitly instead of silently connecting to the wrong backend. If `host2`
-  cannot authenticate to `host1`, configure keys between them, pass `--ssh-forward-agent` (or enable
-  `ForwardAgent` for `host2` in `~/.ssh/config`), open `--port-ranges` for direct TCP, or run `rcp`
-  from `host1` or `host2`. When agent forwarding is enabled for the destination, `rcp` preserves the
-  user's `StrictHostKeyChecking` policy instead of disabling host-key verification.
-- **Flags interaction & IPv6**: `--remote-transport=ssh` binds the source to loopback (`127.0.0.1`,
-  or `::1` when `AddressFamily inet6` is configured) on an ephemeral port and warns and ignores
+  (`SSH_CONNECTION`) and requiring positive peer verification before advertising tunnel ports. On
+  load-balanced SSH hostnames where the destination cannot reach or verify the specific source node
+  directly, `rcp` fails closed with an explicit routing error instead of silently connecting to the
+  wrong backend. If `host2` cannot authenticate to `host1`, configure keys between them, pass
+  `--ssh-forward-agent` (or enable `ForwardAgent` for `host2` in `~/.ssh/config`), open
+  `--port-ranges` for direct TCP, or run `rcp` from `host1` or `host2`. When agent forwarding is
+  enabled or configured for the destination, `rcp` preserves the user's `StrictHostKeyChecking`
+  policy from the first SSH connection to the destination — including remote `~` home expansion
+  (which still runs with `ForwardAgent=no`) — instead of disabling host-key verification.
+- **Flags interaction, firewalls & IPv6**: `--remote-transport=ssh` binds the source to loopback
+  (`127.0.0.1`, or `::1` when the source requires IPv6) on an ephemeral port and warns and ignores
   `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both flags during the direct-TCP
   probe (`--remote-direct-probe-timeout-sec`, default `3`s, capped at
-  `--remote-copy-conn-timeout-sec`) before switching to SSH if the probe fails, and honors
-  `AddressFamily inet6` for both `-L` and `-R` loopback forwarding.
+  `--remote-copy-conn-timeout-sec`) before switching to SSH if the control-port probe fails. Once
+  the control-port TCP connection succeeds, `--remote-transport=auto` commits to direct TCP; if a
+  firewall permits the control port while blocking the separate data port, pass
+  `--remote-transport=ssh` or open both listeners with `--port-ranges`. For SSH port forwarding,
+  `rcp` selects the source loopback target family independently of the client-side listener family,
+  supporting both `AddressFamily inet6` and mixed client `AddressFamily any` with IPv6-only `sshd`
+  servers across download, upload, and 3-host transfers.
 - **Slow-path notice & `sshd` requirements**: Any non-same-host copy over SSH emits a
   default-visible warning (`rcp::notice`). Remote `sshd` servers must allow TCP forwarding
   (`AllowTcpForwarding yes`, or `local` for downloads / `remote` for uploads); 3-host agent
