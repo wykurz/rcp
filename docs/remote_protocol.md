@@ -1157,15 +1157,17 @@ nonempty file, the async sender takes one initialized buffer after flushing the 
 connection's kept buffer when the file's chunk fits the retention limit, a new allocation otherwise.
 Every read of the file reuses it without resizing or reinitializing it. The sender borrows the
 caller's admission guard and passes it explicitly to each blocking read; payload reads need no
-ambient admission scope. The same file and buffer move into each unprobed blocking job and return
-together. Interrupted reads retry; positive short reads are sent immediately. Each read is bounded
-by the remaining advertised bytes. The async writer borrows that buffer until `write_all` completes,
-before another read can overwrite it. There is no source Tokio file buffer or copy from such a
-buffer into an outer reader, and no read-ahead. A buffer within the retention limit stays with the
-connection for the next file; a larger one is released with its file. Empty payloads take and read
-nothing. After the header is flushed, payload completion (including empty payloads and premature
-EOF) explicitly flushes the transport before the source checks the byte count and returns the stream
-to the pool. Read, write, flush, and length errors leave the stream poisoned and keep no buffer.
+ambient admission scope. An intermediate read returns the file and buffer. The final read or EOF
+closes the file on that worker and returns only the buffer. Empty files close in a blocking job
+without reading. Interrupted reads retry; positive short reads are sent immediately. Reads are
+bounded by the remaining advertised bytes. The async writer borrows that buffer until `write_all`
+completes, before another read can overwrite it. There is no source Tokio file buffer or copy from
+such a buffer into an outer reader, and no read-ahead. A buffer within the retention limit stays
+with the connection for the next file; a larger one is released with its file. Empty payloads take
+and read nothing. After the header is flushed, payload completion (including empty payloads and
+premature EOF) explicitly flushes the transport before the source checks the byte count and returns
+the stream to the pool. Read, write, flush, and length errors leave the stream poisoned and keep no
+buffer.
 
 For files under a directory the receiver created, one worker can both create the file and write its
 contents. The entire nonempty payload must already be in the decoder after its header and fit one
