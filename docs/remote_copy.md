@@ -570,10 +570,12 @@ Key behavior:
   firewall permits the control port while blocking the separate data port, pass
   `--remote-transport=ssh` or open both listeners with `--port-ranges`. For SSH port forwarding,
   `rcp` uses the forwarding server's actual address family (`SSH_CONNECTION`) for server-side
-  sockets while keeping the client's `AddressFamily` for client-opened sockets, supporting direct
-  IPv6, mixed client `AddressFamily any` with IPv6-only `sshd`, and cross-family `ProxyCommand`
-  connections (such as an `AddressFamily inet6` client reaching an IPv4-only `sshd`) across
-  download, upload, and 3-host transfers.
+  sockets (trying the alternate literal loopback once for remote `-R` listeners if the server
+  rejects the ingress loopback, e.g. under `PermitListen`) while keeping the client's
+  `AddressFamily` for client-opened sockets, supporting direct IPv6, mixed client
+  `AddressFamily any` with IPv6-only `sshd`, and cross-family `ProxyCommand` connections (such as an
+  `AddressFamily inet6` client reaching an IPv4-only `sshd`) across download, upload, and 3-host
+  transfers.
 - **Slow-path notice & `sshd` requirements**: Any non-same-host copy over SSH emits a
   default-visible warning (`rcp::notice`). Remote `sshd` servers must allow TCP forwarding
   (`AllowTcpForwarding yes`, or `local` for downloads / `remote` for uploads); 3-host agent

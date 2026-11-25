@@ -11174,6 +11174,7 @@ fn write_test_rcpd_with_ssh_wrapper(dir: &std::path::Path) -> std::path::PathBuf
 struct TestPrivateSshdOptions<'a> {
     address_family: Option<&'a str>,
     allow_tcp_forwarding: Option<&'a str>,
+    permit_listen: Option<&'a str>,
     force_home: Option<&'a std::path::Path>,
     alt_key_fake_hostname: Option<&'a str>,
     host_key_path: Option<&'a std::path::Path>,
@@ -11281,6 +11282,10 @@ impl TestPrivateSshd {
             .map(|af| format!("AddressFamily {af}\n"))
             .unwrap_or_default();
         let allow_tcp_forwarding = options.allow_tcp_forwarding.unwrap_or("yes");
+        let permit_listen_line = options
+            .permit_listen
+            .map(|pl| format!("PermitListen {pl}\n"))
+            .unwrap_or_default();
         let force_command_line = if let Some(force_home) = options.force_home {
             let forced_cmd = dir.path().join("force-home-cmd.sh");
             std::fs::write(
@@ -11311,6 +11316,7 @@ impl TestPrivateSshd {
                  PubkeyAuthentication yes\n\
                  UsePAM no\n\
                  AllowTcpForwarding {allow_tcp_forwarding}\n\
+                 {permit_listen_line}\
                  AllowAgentForwarding yes\n\
                  GatewayPorts no\n\
                  {force_command_line}\
@@ -13368,4 +13374,155 @@ fn test_remote_plaintext_dry_run_retains_partial_counts_and_fails_promptly_on_de
     drop(sshd_src);
     drop(sshd_dst);
     drop(sshd_no_fwd);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_ssh_transport_upload_ipv6_session_with_ipv4_permit_listen() {
+    if let Err(err) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+        ) {
+            eprintln!("skipping: this kernel/container lacks IPv6 loopback (::1): {err}");
+            return;
+        }
+        panic!("unexpected failure probing IPv6 loopback (::1): {err}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let sshd_local = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            address_family: Some("any"),
+            ..Default::default()
+        },
+    );
+    // server accepts IPv6 SSH sessions under `AddressFamily any` but restricts reverse forwards
+    // via `PermitListen 127.0.0.1:*`: `-R` must try the ingress family (`::1`) first and fall
+    // back to the alternate literal loopback (`127.0.0.1`) once rejected.
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            address_family: Some("any"),
+            permit_listen: Some("127.0.0.1:*"),
+            ..Default::default()
+        },
+    );
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6-permit-v4-any\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily any\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6-permit-v4-inet6\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("permit_listen_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "permit-listen alpha", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "permit-listen beta", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_path = src_tree.to_str().unwrap();
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. upload with client `AddressFamily any` + IPv6 SSH session + server `PermitListen 127.0.0.1:*`
+    let dst_any = dst_dir.path().join("permit_listen_any");
+    let dst_any_remote = format!("v6-permit-v4-any:{}", dst_any.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_any_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "upload over IPv6 session with PermitListen 127.0.0.1:* (client any) failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected 2 parallel tunnels on PermitListen upload (client any):\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_any.join("a.txt")),
+        "permit-listen alpha"
+    );
+    assert_eq!(
+        get_file_content(&dst_any.join("b.txt")),
+        "permit-listen beta"
+    );
+    // 2. upload with client `AddressFamily inet6` + IPv6 SSH session + server `PermitListen 127.0.0.1:*`:
+    //    local source target remains `::1` while remote `-R` listener falls back to `127.0.0.1`.
+    let dst_v6 = dst_dir.path().join("permit_listen_inet6");
+    let dst_v6_remote = format!("v6-permit-v4-inet6:{}", dst_v6.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_v6_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "upload over IPv6 session with PermitListen 127.0.0.1:* (client inet6) failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected 2 parallel tunnels on PermitListen upload (client inet6):\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_v6.join("a.txt")),
+        "permit-listen alpha"
+    );
+    assert_eq!(
+        get_file_content(&dst_v6.join("b.txt")),
+        "permit-listen beta"
+    );
+    drop(sshd_local);
+    drop(sshd_dst);
 }
