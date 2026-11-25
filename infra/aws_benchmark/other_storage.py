@@ -22,6 +22,13 @@ from .large_storage import SIDES
 
 NFS_MOUNTS = {"source": "nfs-source", "destination": "nfs-destination"}
 MEMORY_MOUNTS = {"source": "memory-source", "destination": "memory-destination"}
+# where each kind of storage is found under the data directory, by its side
+MOUNTS = {"nfs": NFS_MOUNTS, "memory": MEMORY_MOUNTS}
+# what names each storage in a result. A result is kept on the line of its storage: another
+# protocol version, another delay or a server that waits for its disks is other storage and
+# takes another name here
+STORAGE_IDS = {"nfs": {side: f"c5d-raid0-ext4-{side}-nfs42-5ms-v1" for side in SIDES},
+               "memory": {side: f"c5d-tmpfs-{side}-v1" for side in SIDES}}
 NFS_VERSION = "4.2"
 # an NFS 4 server answers no more requests at once than it has threads, and the tools keep one
 # request per file in flight: as many as the machine has CPUs, 96 on the worker

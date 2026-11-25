@@ -56,10 +56,15 @@ CASE_SHAPES = {
     "bulk-1m-1024gb": dict(directory_widths=[10, 10, 10], files_per_leaf=1024, file_size_bytes=1000000),
     "tiny-1k-10240k": dict(directory_widths=[10, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
 }
-# matrix runs may also use the small fixtures that exercise a whole run in seconds
+# matrix runs may also use the file sets of other storage (a network filesystem: many small
+# directories; memory: the tiny files under a name of their own) and the small fixtures that
+# exercise a whole run in seconds
 MATRIX_CASE_SHAPES = dict(CASE_SHAPES, **{
+    "tiny-1k-700x1024": dict(directory_widths=[7, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
+    "tiny-1k-10240k-memory": dict(directory_widths=[10, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
     "commission-64m": dict(directory_widths=[4], files_per_leaf=4, file_size_bytes=4000000),
     "commission-10k": dict(directory_widths=[10, 10], files_per_leaf=100, file_size_bytes=1000),
+    "commission-10k-memory": dict(directory_widths=[10, 10], files_per_leaf=100, file_size_bytes=1000),
 })
 SCENARIO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 # what a setup may say about how copies were checked: the paired rules, and the matrix rule

@@ -4,7 +4,7 @@ import copy
 import re
 
 from . import results
-from .common import MATRIX_SUITES, digest, durable_plan_contract, require, timestamp
+from .common import MATRIX_SUITES, digest, durable_plan_contract, matrix_storage, require, timestamp
 from .json_bytes import encoded
 
 SCHEMA = "rcp-production-public-report-v1"
@@ -48,11 +48,25 @@ PUBLIC_CONTRACTS = {
             "local-rcmp": "rcmp-size", "local-rlink": "rlink-default", "local-rrm": "rrm-default",
             "remote-rcmp": "rcmp-size", "remote-rlink": "rlink-default", "remote-rrm": "rrm-default"},
     },
+    # a matrix run with cells on other storage: version 5 with two more copy scenarios, between two
+    # mounts of a network filesystem (`nfs`) and between two roots in memory (`memory`), and the
+    # tool cells that follow each. The cells of the arrays keep the series they had
+    "rcp-production-public-report-v6": {
+        "validation": "Not verified: a copy or a tool run counts when its command exits cleanly and reports the "
+                      "expected counts.",
+        "series_contract": "aws-local-ext4-v1",
+        "verification": {"policy": "exit-status-summary-v1"},
+        "variant": "rcp-default",
+        "tool_variants": {copies + "-" + tool: variant for copies in ("local", "remote", "nfs", "memory")
+                          for tool, variant in (("rcmp", "rcmp-size"), ("rlink", "rlink-default"),
+                                                ("rrm", "rrm-default"))},
+    },
 }
 VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 MATRIX_SCHEMA = "rcp-production-public-report-v4"
 TOOLS_SCHEMA = "rcp-production-public-report-v5"
-MATRIX_SCHEMAS = (MATRIX_SCHEMA, TOOLS_SCHEMA)
+STORAGE_SCHEMA = "rcp-production-public-report-v6"
+MATRIX_SCHEMAS = (MATRIX_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA)
 CELL_OUTCOMES = ("complete", "failed", "timed_out", "interrupted", "not_run")
 MAX_CELLS = 64
 
@@ -84,7 +98,10 @@ def comparison_label(identity, controller):
 
 def matrix_schema(scenarios):
     """The version of a matrix run's record: fixed by the scenarios of its suite, never by its outcome."""
-    return TOOLS_SCHEMA if set(scenarios) & set(PUBLIC_CONTRACTS[TOOLS_SCHEMA]["tool_variants"]) else MATRIX_SCHEMA
+    scenarios = set(scenarios)
+    if any(matrix_storage(scenario) != "disks" for scenario in scenarios):
+        return STORAGE_SCHEMA
+    return TOOLS_SCHEMA if scenarios & set(PUBLIC_CONTRACTS[TOOLS_SCHEMA]["tool_variants"]) else MATRIX_SCHEMA
 
 
 def qualification_outcome(value):
@@ -138,7 +155,7 @@ def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execu
         value["verification"] = evidence["expected_verification"]
         value["timestamp"] = raw["timestamp"]
         value["note"] = (f"Each measurement is the median of {raw['context']['repetitions']} copies" +
-                         (" or tool runs." if schema == TOOLS_SCHEMA else "."))
+                         (" or tool runs." if "tool_variants" in contract else "."))
     elif valid:
         require(raw is not None and raw["status"] == "complete", "successful projection requires complete measurements")
         value["measurements"] = [{

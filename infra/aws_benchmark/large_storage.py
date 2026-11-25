@@ -152,7 +152,8 @@ def prepare_output(data, budget, uid, gid, execute):
 def prepare(data, case, budget, uid, gid, execute):
     """Fail before formatting unless all disks and both newly created arrays pass."""
     cases = (case,) if isinstance(case, dict) else tuple(case)
-    require(1 <= len(cases) <= 4 and all(isinstance(item, dict) for item in cases), "invalid storage case set")
+    # every file set a run keeps on the arrays: none for a run that measures in memory alone
+    require(len(cases) <= 6 and all(isinstance(item, dict) for item in cases), "invalid storage case set")
     if len(cases) > 1:
         require(all(isinstance(item.get("id"), str) for item in cases) and
                 len({item["id"] for item in cases}) == len(cases), "duplicate or missing storage case identity")
@@ -186,7 +187,8 @@ def prepare(data, case, budget, uid, gid, execute):
         for side in SIDES:
             os.chown(data / side, uid, gid)
         prepare_output(data, budget, uid, gid, execute)
-        result = dict(layout="two-disjoint-raid0-ext4-v1", capacity=proofs[0],
+        # a run that keeps no file set here has no proof: an empty one, of the kind a proof is
+        result = dict(layout="two-disjoint-raid0-ext4-v1", capacity=proofs[0] if proofs else {},
             arrays={side: dict(device=number, members=members, chunk_bytes=CHUNK_BYTES,
                 member_models=[disk["model"].strip() for disk in disks[index * 2:index * 2 + 2]],
                 member_bytes=[disk["size"] for disk in disks[index * 2:index * 2 + 2]])
