@@ -46,7 +46,11 @@ pub struct ProtocolVersion {
 /// there when changing serialized layouts. They do not cover the spawn contract.
 /// Revision 13 moves master↔rcpd control and tracing onto SSH stdio (`RCP_READY`,
 /// `MasterToRcpd`, `RcpdToMaster`), removing the master-facing TCP listener and `--master-cert-fp`.
-pub const WIRE_REVISION: u32 = 13;
+/// Revision 14 adds destination↔source SSH tunnel transport and `auto` fallback negotiation
+/// (`DestinationTransport`, `SshTarget`, `MasterToRcpd::SshFallbackEndpoints`,
+/// `RcpdToMaster::DirectConnectFailed`, `SourceMasterHello::tunnel_target_ip`,
+/// `MasterHello::Source::accept_timeout_sec`, and `MasterHello::Destination::source_data_addrs`).
+pub const WIRE_REVISION: u32 = 14;
 
 impl ProtocolVersion {
     /// Get the current protocol version

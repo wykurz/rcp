@@ -2124,15 +2124,16 @@ fn test_remote_source_bind_ip_honors_explicit_flag_and_operand_fallback() {
         .lines()
         .find(|line| line.contains("Received side: Destination {"))
         .unwrap_or_else(|| panic!("missing destination hello log:\n{log}"));
-    for field in ["source_control_addr: ", "source_data_addr: "] {
+    for field in ["source_control_addr: ", "source_data_addrs: "] {
         let after = dest_hello_line
             .split(field)
             .nth(1)
             .unwrap_or_else(|| panic!("missing {field} in destination hello:\n{dest_hello_line}"));
         let addr_str = after
-            .split(',')
+            .trim_start_matches('[')
+            .split([',', ']'])
             .next()
-            .expect("socket addr must precede comma")
+            .expect("socket addr must precede delimiter")
             .trim();
         let addr: std::net::SocketAddr = addr_str.parse().unwrap_or_else(|err| {
             panic!("failed to parse {field} '{addr_str}' ({err}):\n{dest_hello_line}")
@@ -10704,4 +10705,291 @@ fn test_remote_strict_reused_dir_restores_its_own_acls() {
          finalize chmod instead of before would leave it at its own original 0o755"
     );
     assert_eq!(get_file_content(&dst_tree.join("a.txt")), "payload");
+}
+
+#[test]
+fn test_remote_ssh_transport_download_upload_three_host_and_same_host() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    std::fs::create_dir_all(src_tree.join("sub")).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "alpha payload", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "beta payload", 0o644);
+    create_test_file(&src_tree.join("sub/c.txt"), "gamma payload", 0o644);
+    let src_path = src_tree.to_str().unwrap();
+    // 1. Download (-L) with 3 parallel tunnels and default mTLS at default verbosity
+    let dst_download = dst_dir.path().join("download");
+    let src_localhost = format!("localhost:{src_path}");
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=3",
+        &src_localhost,
+        dst_download.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (3 parallel tunnels)"),
+        "expected SSH slow-path notice on download:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_download.join("a.txt")),
+        "alpha payload"
+    );
+    assert_eq!(
+        get_file_content(&dst_download.join("b.txt")),
+        "beta payload"
+    );
+    assert_eq!(
+        get_file_content(&dst_download.join("sub/c.txt")),
+        "gamma payload"
+    );
+    // 2. Download dry-run uses only 1 tunnel and does not create destination
+    let dst_dry_run = dst_dir.path().join("dry_run");
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=4",
+        "--dry-run=brief",
+        &src_localhost,
+        dst_dry_run.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH dry-run failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (1 tunnel)"),
+        "dry-run over SSH should open only 1 tunnel:\n{combined}"
+    );
+    assert!(!dst_dry_run.exists());
+    // 3. Download with --no-encryption
+    let dst_plain = dst_dir.path().join("download_plain");
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--no-encryption",
+        "--ssh-tunnels=2",
+        &src_localhost,
+        dst_plain.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH --no-encryption download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_plain.join("a.txt")), "alpha payload");
+    // 4. Upload (-R) with 2 parallel tunnels at default verbosity
+    let dst_upload = dst_dir.path().join("upload");
+    let dst_upload_remote = format!("localhost:{}", dst_upload.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=2",
+        src_path,
+        &dst_upload_remote,
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH upload failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected SSH slow-path notice on upload:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_upload.join("a.txt")), "alpha payload");
+    assert_eq!(
+        get_file_content(&dst_upload.join("sub/c.txt")),
+        "gamma payload"
+    );
+    // 5. 3-Host (127.0.0.1 -> localhost) opens direct destination->source -L tunnels
+    let dst_three_host = dst_dir.path().join("three_host");
+    let src_ip = format!("127.0.0.1:{src_path}");
+    let dst_three_host_remote = format!("localhost:{}", dst_three_host.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=2",
+        &src_ip,
+        &dst_three_host_remote,
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH 3-host copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected forwarded SSH slow-path notice on 3-host copy:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_three_host.join("a.txt")),
+        "alpha payload"
+    );
+    // 6. 3-Host with --ssh-forward-agent exercises the `ssh -S -T -o ForwardAgent=yes` spawn path
+    let dst_agent = dst_dir.path().join("three_host_agent");
+    let dst_agent_remote = format!("localhost:{}", dst_agent.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--ssh-forward-agent",
+        "--ssh-tunnels=1",
+        &src_ip,
+        &dst_agent_remote,
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH 3-host --ssh-forward-agent copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_agent.join("a.txt")), "alpha payload");
+    // 7. Same-host (localhost -> localhost) stays on direct loopback with NO slow-path SSH notice
+    let dst_same = dst_dir.path().join("same_host");
+    let dst_same_remote = format!("localhost:{}", dst_same.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        &src_localhost,
+        &dst_same_remote,
+    ]);
+    assert!(
+        out.status.success(),
+        "same-host copy with --remote-transport=ssh failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Transferring file data over SSH"),
+        "same-host copy must not emit SSH slow-path warning:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_same.join("a.txt")), "alpha payload");
+}
+
+#[test]
+fn test_remote_ssh_transport_warns_and_ignores_port_ranges_and_bind_ip() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("data.txt");
+    create_test_file(&src_file, "ssh ignores port-ranges and bind-ip", 0o644);
+    let dst_file = dst_dir.path().join("data.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=ssh",
+        "--port-ranges=30000-30010",
+        "--bind-ip=127.0.0.2",
+        &src_remote,
+        dst_file.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "SSH copy with --port-ranges/--bind-ip failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("--port-ranges is ignored when --remote-transport=ssh is set"),
+        "expected --port-ranges ignored notice:\n{combined}"
+    );
+    assert!(
+        combined.contains("--bind-ip is ignored when --remote-transport=ssh is set"),
+        "expected --bind-ip ignored notice:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_file),
+        "ssh ignores port-ranges and bind-ip"
+    );
+}
+
+#[test]
+fn test_remote_auto_transport_succeeds_direct_without_ssh_warning() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("auto.txt");
+    create_test_file(&src_file, "auto direct payload", 0o644);
+    // Download auto (direct TCP succeeds on localhost -> no SSH fallback warning)
+    let dst_download = dst_dir.path().join("auto_download.txt");
+    let src_localhost = format!("localhost:{}", src_file.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=auto",
+        &src_localhost,
+        dst_download.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "auto download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("falling back to SSH")
+            && !combined.contains("Transferring file data over SSH"),
+        "auto mode must not warn when direct TCP succeeds:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_download), "auto direct payload");
+    // 3-host auto (direct TCP succeeds -> no SSH fallback warning)
+    let dst_three = dst_dir.path().join("auto_three.txt");
+    let src_ip = format!("127.0.0.1:{}", src_file.to_str().unwrap());
+    let dst_three_remote = format!("localhost:{}", dst_three.to_str().unwrap());
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "--remote-transport=auto",
+        &src_ip,
+        &dst_three_remote,
+    ]);
+    assert!(
+        out.status.success(),
+        "auto 3-host failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("falling back to SSH")
+            && !combined.contains("Transferring file data over SSH"),
+        "auto 3-host must not warn when direct TCP succeeds:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_three), "auto direct payload");
 }

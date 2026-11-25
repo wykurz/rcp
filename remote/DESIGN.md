@@ -14,10 +14,12 @@ specification.
 ![Three-node remote copy architecture](../docs/assets/remote_architecture.svg)
 
 SSH starts, supervises, and carries all master↔daemon control and tracing traffic over each daemon's
-framed `stdin`/`stdout` pipes. The destination opens control and pooled data TCP connections
-directly to the source; file contents flow from source to destination, not through the master.
-Source↔Destination TCP connections use mutual TLS 1.3 by default. Direct Source↔Destination TCP
-reachability is therefore required alongside SSH: see
+framed `stdin`/`stdout` pipes. By default (`--remote-transport=tcp`), the destination opens control
+and pooled data TCP connections directly to the source; file contents flow from source to
+destination, not through the master. When direct TCP ports are blocked, `--remote-transport=ssh` and
+`--remote-transport=auto` tunnel source↔destination traffic over parallel OpenSSH `-L`/`-R` port
+forwards (and directly destination→source in 3-host copies, never relaying through the master).
+Source↔Destination TCP connections use mutual TLS 1.3 by default. See
 [network connectivity](../docs/remote_copy.md#network-connectivity).
 
 ## Ownership and lifecycle
@@ -54,6 +56,7 @@ Keep these boundaries intact when changing the component:
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | SSH sessions, readiness, cleanup ownership, socket configuration | [`src/lib.rs`](src/lib.rs)                                                |
 | Master↔daemon SSH stdio framing, demux, and heartbeats           | [`src/stdio.rs`](src/stdio.rs)                                            |
+| OpenSSH mux v4 port forwarding (`-L`/`-R`) and `ssh -G` config   | [`src/ssh_tunnel.rs`](src/ssh_tunnel.rs)                                  |
 | Binary deployment                                                | [`src/deploy.rs`](src/deploy.rs)                                          |
 | Protocol compatibility and build identity                        | [`src/version.rs`](src/version.rs), [`build.rs`](build.rs)                |
 | Serialized messages and daemon configuration                     | [`src/protocol`](src/protocol)                                            |

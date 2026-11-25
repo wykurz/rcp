@@ -267,8 +267,9 @@ still deny service by initiating a bad or deliberately stalled handshake:
   delays its sequential accept loop until the configured deadline.
 
 Reaching these ports requires network access to the (typically trusted) source host; restrict it
-with `--port-ranges` plus firewall rules. Tolerating failed source-control handshakes without
-aborting the daemon remains a future hardening.
+with `--port-ranges` plus firewall rules, or use `--remote-transport=ssh` (which binds source to
+`127.0.0.1` only and tunnels traffic over SSH while preserving mutual TLS 1.3 by default).
+Tolerating failed source-control handshakes without aborting the daemon remains a future hardening.
 
 ### Cipher Suites
 
@@ -332,7 +333,10 @@ The security model with `--no-encryption` relies entirely on network isolation.
    - Configure proper file permissions on SSH keys
 
 2. **Network Security**
-   - Use firewall rules to restrict TCP ports if needed (via `--port-ranges`)
+   - Use firewall rules to restrict TCP ports if needed (via `--port-ranges`), or tunnel traffic
+     over SSH with `--remote-transport=ssh` / `--remote-transport=auto` when only port 22 is open
+   - Only pass `--ssh-forward-agent` to trusted destination hosts when 3-host SSH copies require
+     agent forwarding (the flag applies solely to the destination endpoint and is off by default)
    - Monitor for unusual connection patterns
    - Log SSH and rcp operations for audit trails
    - Use network segmentation for sensitive operations

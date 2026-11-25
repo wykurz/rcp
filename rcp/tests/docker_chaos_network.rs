@@ -217,3 +217,161 @@ fn test_chaos_network_helpers_work() -> Result<()> {
     eprintln!("✓ Network helpers test passed");
     Ok(())
 }
+
+/// Guard that flushes container iptables INPUT rules on Drop so firewall chaos tests cannot
+/// leave containers partitioned after a failure or panic.
+struct FirewallGuard<'a> {
+    env: &'a DockerEnv,
+    containers: Vec<&'a str>,
+}
+
+impl<'a> FirewallGuard<'a> {
+    fn block_non_ssh_inbound(env: &'a DockerEnv, containers: Vec<&'a str>) -> Result<Self> {
+        let guard = Self {
+            env,
+            containers: containers.clone(),
+        };
+        for container in containers {
+            // allow loopback (needed by SSH port forwards) and SSH port 22; drop all other new
+            // inbound TCP SYNs to simulate a stateful firewall that permits only SSH
+            for args in [
+                &["iptables", "-F", "INPUT"][..],
+                &["iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"][..],
+                &[
+                    "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT",
+                ][..],
+                &[
+                    "iptables", "-A", "INPUT", "-p", "tcp", "--syn", "-j", "DROP",
+                ][..],
+            ] {
+                let out = env.exec(container, None, args)?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "iptables {:?} failed on {container}: {}",
+                        args,
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for FirewallGuard<'_> {
+    fn drop(&mut self) {
+        for container in &self.containers {
+            let _ = self.env.exec(container, None, &["iptables", "-F", "INPUT"]);
+        }
+    }
+}
+
+/// Verify that when a firewall drops all non-SSH TCP ports, default `--remote-transport=tcp`
+/// fails while `--remote-transport=auto` detects the block and automatically completes over SSH
+/// across download (-L), upload (-R), and 3-host (host-b -> host-a) topologies.
+#[test]
+#[ignore = "requires Docker containers (run: just docker-up)"]
+fn test_chaos_firewall_blocks_direct_tcp_auto_falls_back_to_ssh() -> Result<()> {
+    let env = DockerEnv::new()?;
+    let _fw = FirewallGuard::block_non_ssh_inbound(&env, vec!["host-a", "master"])?;
+    let payload = b"firewall blocked direct tcp - delivered via ssh fallback";
+    env.write_file("host-a", "/tmp/chaos-fw-src.txt", payload)?;
+    env.write_file("master", "/tmp/chaos-fw-ul-src.txt", payload)?;
+    let _ = env.remove_file("host-b", "/tmp/chaos-fw-tcp.txt");
+    let _ = env.remove_file("master", "/tmp/chaos-fw-dl.txt");
+    let _ = env.remove_file("host-b", "/tmp/chaos-fw-ul.txt");
+    let _ = env.remove_file("host-b", "/tmp/chaos-fw-3h.txt");
+    // 1. Confirm direct TCP truly fails under the firewall
+    let tcp_out = env.exec_rcp(&[
+        "--remote-transport=tcp",
+        "--remote-copy-conn-timeout-sec=2",
+        "host-a:/tmp/chaos-fw-src.txt",
+        "host-b:/tmp/chaos-fw-tcp.txt",
+    ])?;
+    let tcp_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&tcp_out.stdout),
+        String::from_utf8_lossy(&tcp_out.stderr)
+    );
+    support::docker_env::assert_clean_failure(
+        tcp_out.status,
+        &tcp_combined,
+        "direct TCP must fail when non-SSH ports are blocked",
+    );
+    // 2. Download (host-a -> master): auto probes, fails, master opens -L fallback tunnels
+    let dl_out = env.exec_rcp(&[
+        "--remote-transport=auto",
+        "--remote-direct-probe-timeout-sec=2",
+        "--ssh-tunnels=2",
+        "host-a:/tmp/chaos-fw-src.txt",
+        "/tmp/chaos-fw-dl.txt",
+    ])?;
+    let dl_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&dl_out.stdout),
+        String::from_utf8_lossy(&dl_out.stderr)
+    );
+    assert!(
+        dl_out.status.success(),
+        "auto download fallback failed:\n{dl_combined}"
+    );
+    assert!(
+        dl_combined.contains("falling back to SSH"),
+        "expected SSH fallback notice on download:\n{dl_combined}"
+    );
+    assert_eq!(env.read_file("master", "/tmp/chaos-fw-dl.txt")?, payload);
+    // 3. Upload (master -> host-b): auto probes blocked master listener, master opens -R tunnels
+    let ul_out = env.exec_rcp(&[
+        "--remote-transport=auto",
+        "--remote-direct-probe-timeout-sec=2",
+        "--ssh-tunnels=2",
+        "/tmp/chaos-fw-ul-src.txt",
+        "host-b:/tmp/chaos-fw-ul.txt",
+    ])?;
+    let ul_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&ul_out.stdout),
+        String::from_utf8_lossy(&ul_out.stderr)
+    );
+    assert!(
+        ul_out.status.success(),
+        "auto upload fallback failed:\n{ul_combined}"
+    );
+    assert!(
+        ul_combined.contains("falling back to SSH"),
+        "expected SSH fallback notice on upload:\n{ul_combined}"
+    );
+    assert_eq!(env.read_file("host-b", "/tmp/chaos-fw-ul.txt")?, payload);
+    // 4. 3-Host (host-a -> host-b) with --port-ranges: auto probes blocked port range, then
+    //    destination (host-b) opens direct -L tunnels to host-a
+    let h3_out = env.exec_rcp(&[
+        "--remote-transport=auto",
+        "--remote-direct-probe-timeout-sec=2",
+        "--port-ranges=20000-20010",
+        "--ssh-tunnels=2",
+        "host-a:/tmp/chaos-fw-src.txt",
+        "host-b:/tmp/chaos-fw-3h.txt",
+    ])?;
+    let h3_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&h3_out.stdout),
+        String::from_utf8_lossy(&h3_out.stderr)
+    );
+    assert!(
+        h3_out.status.success(),
+        "auto 3-host fallback failed:\n{h3_combined}"
+    );
+    assert!(
+        h3_combined.contains("falling back to SSH"),
+        "expected SSH fallback notice on 3-host:\n{h3_combined}"
+    );
+    assert_eq!(env.read_file("host-b", "/tmp/chaos-fw-3h.txt")?, payload);
+    let _ = env.remove_file("host-a", "/tmp/chaos-fw-src.txt");
+    let _ = env.remove_file("master", "/tmp/chaos-fw-ul-src.txt");
+    let _ = env.remove_file("master", "/tmp/chaos-fw-dl.txt");
+    let _ = env.remove_file("host-b", "/tmp/chaos-fw-ul.txt");
+    let _ = env.remove_file("host-b", "/tmp/chaos-fw-3h.txt");
+    eprintln!("✓ Firewall-blocked auto SSH fallback (download, upload, 3-host) passed");
+    Ok(())
+}

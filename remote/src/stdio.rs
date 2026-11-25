@@ -394,7 +394,8 @@ struct ControlOutbound {
     ack: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
 }
 
-/// Cloneable sender for high-priority `rcpd`→master control frames (`SourceHello`, `RcpdResult`).
+/// Cloneable sender for high-priority `rcpd`→master control frames (`SourceHello`,
+/// `DirectConnectFailed`, `RcpdResult`).
 #[derive(Clone)]
 pub struct DaemonControlSender {
     tx: tokio::sync::mpsc::UnboundedSender<ControlOutbound>,
@@ -423,6 +424,17 @@ impl DaemonControlSender {
         hello: crate::protocol::SourceMasterHello,
     ) -> anyhow::Result<()> {
         self.send(crate::protocol::RcpdToMaster::SourceHello(hello))
+            .await
+    }
+
+    /// Notify the master that the destination's `auto` direct-TCP probe failed and wait until
+    /// the frame is flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stdout writer stopped or failed while flushing the frame.
+    pub async fn send_direct_connect_failed(&self, reason: String) -> anyhow::Result<()> {
+        self.send(crate::protocol::RcpdToMaster::DirectConnectFailed { reason })
             .await
     }
 
@@ -457,10 +469,10 @@ enum NextOutbound {
 
 /// Multiplex daemon control and tracing messages onto `rcpd`'s framed SSH stdout stream.
 ///
-/// Control messages (`SourceHello`, `RcpdResult`) take priority over tracing events. When
-/// `shutdown` is cancelled, admission closes on both channels (even if producers still retain
-/// senders), any in-flight frame finishes intact, already-queued messages drain in order, and
-/// the stream closes cleanly.
+/// Control messages (`SourceHello`, `DirectConnectFailed`, `RcpdResult`) take priority over tracing
+/// events. When `shutdown` is cancelled, admission closes on both channels (even if producers still
+/// retain senders), any in-flight frame finishes intact, already-queued messages drain in order,
+/// and the stream closes cleanly.
 ///
 /// # Errors
 ///
@@ -562,6 +574,7 @@ pub async fn run_daemon_stdout_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
 #[derive(Debug)]
 enum MasterControlMessage {
     SourceHello(crate::protocol::SourceMasterHello),
+    DirectConnectFailed(String),
     Result(crate::protocol::RcpdResult),
 }
 
@@ -572,6 +585,15 @@ pub enum SourceHelloOutcome {
     Hello(crate::protocol::SourceMasterHello),
     /// Source failed (or finished) before sending `SourceMasterHello` and reported its result.
     Result(crate::protocol::RcpdResult),
+}
+
+/// Control frame received from the destination daemon after `MasterHello::Destination`.
+#[derive(Debug)]
+pub enum DestinationControlEvent {
+    /// Destination failed its `auto` direct-TCP probe and requests master-managed SSH tunnels.
+    DirectConnectFailed { reason: String },
+    /// Final destination daemon result.
+    Result(Box<crate::protocol::RcpdResult>),
 }
 
 /// Master-side receiver for control frames demuxed from one `rcpd`'s stdout stream.
@@ -587,7 +609,7 @@ impl MasterControlReceiver {
     ///
     /// # Errors
     ///
-    /// Returns an error on transport or decode failure.
+    /// Returns an error on transport/decode failure or an unexpected control variant.
     pub async fn recv_source_hello(&mut self) -> anyhow::Result<Option<SourceHelloOutcome>> {
         match self.rx.recv().await {
             Some(Ok(MasterControlMessage::SourceHello(hello))) => {
@@ -595,6 +617,40 @@ impl MasterControlReceiver {
             }
             Some(Ok(MasterControlMessage::Result(result))) => {
                 Ok(Some(SourceHelloOutcome::Result(result)))
+            }
+            Some(Ok(MasterControlMessage::DirectConnectFailed(reason))) => {
+                anyhow::bail!(
+                    "expected SourceMasterHello from source rcpd, got unexpected DirectConnectFailed: {reason}"
+                )
+            }
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    /// Receive the next destination daemon control event (`DirectConnectFailed` or `RcpdResult`).
+    ///
+    /// Returns `Ok(None)` when the daemon closed stdout cleanly without sending another control frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport/decode failure or an unexpected `SourceHello` variant.
+    pub async fn recv_destination_event(
+        &mut self,
+    ) -> anyhow::Result<Option<DestinationControlEvent>> {
+        match self.rx.recv().await {
+            Some(Ok(MasterControlMessage::DirectConnectFailed(reason))) => {
+                Ok(Some(DestinationControlEvent::DirectConnectFailed {
+                    reason,
+                }))
+            }
+            Some(Ok(MasterControlMessage::Result(result))) => {
+                Ok(Some(DestinationControlEvent::Result(Box::new(result))))
+            }
+            Some(Ok(MasterControlMessage::SourceHello(hello))) => {
+                anyhow::bail!(
+                    "expected destination control frame from rcpd, got unexpected {hello:?}"
+                )
             }
             Some(Err(error)) => Err(error),
             None => Ok(None),
@@ -614,6 +670,11 @@ impl MasterControlReceiver {
             Some(Ok(MasterControlMessage::SourceHello(hello))) => {
                 anyhow::bail!("expected RcpdResult from rcpd, got unexpected {hello:?}")
             }
+            Some(Ok(MasterControlMessage::DirectConnectFailed(reason))) => {
+                anyhow::bail!(
+                    "expected RcpdResult from rcpd, got unexpected DirectConnectFailed: {reason}"
+                )
+            }
             Some(Err(error)) => Err(error),
             None => Ok(None),
         }
@@ -623,9 +684,9 @@ impl MasterControlReceiver {
 /// Spawn the master-side stdout demuxer for one `rcpd`.
 ///
 /// Tracing and progress frames are dispatched immediately via `crate::tracelog::dispatch_message`;
-/// control frames (`SourceHello`, `RcpdResult`) are forwarded to the returned
-/// [`MasterControlReceiver`]. The demuxer continues draining trailing tracing frames until EOF
-/// even after all control frames have been consumed or dropped.
+/// control frames (`SourceHello`, `DirectConnectFailed`, `RcpdResult`) are forwarded to the
+/// returned [`MasterControlReceiver`]. The demuxer continues draining trailing tracing frames
+/// until EOF even after all control frames have been consumed or dropped.
 #[must_use]
 pub fn spawn_master_stdout_demux<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut recv_stream: crate::streams::RecvStream<R>,
@@ -644,6 +705,9 @@ pub fn spawn_master_stdout_demux<R: tokio::io::AsyncRead + Unpin + Send + 'stati
                 Ok(Some(crate::protocol::RcpdToMaster::SourceHello(hello))) => {
                     let _ = control_tx.send(Ok(MasterControlMessage::SourceHello(hello)));
                 }
+                Ok(Some(crate::protocol::RcpdToMaster::DirectConnectFailed { reason })) => {
+                    let _ = control_tx.send(Ok(MasterControlMessage::DirectConnectFailed(reason)));
+                }
                 Ok(Some(crate::protocol::RcpdToMaster::Result(result))) => {
                     let _ = control_tx.send(Ok(MasterControlMessage::Result(result)));
                 }
@@ -660,7 +724,7 @@ pub fn spawn_master_stdout_demux<R: tokio::io::AsyncRead + Unpin + Send + 'stati
 }
 
 /// Master-side framed stdin sender with optional periodic keepalive heartbeats.
-pub struct MasterStdinSender<W = openssh::ChildStdin> {
+pub struct MasterStdinSender<W = crate::streams::BoxedWrite> {
     heartbeat: Option<crate::AbortOnDropTask<()>>,
     stream: std::sync::Arc<tokio::sync::Mutex<Option<crate::streams::SendStream<W>>>>,
 }
@@ -708,13 +772,33 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send + 'static> MasterStdinSender<W> {
     ///
     /// Returns an error if the stream was already closed or writing/flushing fails.
     pub async fn send_hello(&self, hello: crate::protocol::MasterHello) -> anyhow::Result<()> {
+        self.send_frame(&crate::protocol::MasterToRcpd::Hello(hello))
+            .await
+    }
+
+    /// Send master-opened SSH fallback endpoints to destination `rcpd`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream was already closed or writing/flushing fails.
+    pub async fn send_ssh_fallback_endpoints(
+        &self,
+        control_addr: std::net::SocketAddr,
+        data_addrs: Vec<std::net::SocketAddr>,
+    ) -> anyhow::Result<()> {
+        self.send_frame(&crate::protocol::MasterToRcpd::SshFallbackEndpoints {
+            control_addr,
+            data_addrs,
+        })
+        .await
+    }
+
+    async fn send_frame(&self, message: &crate::protocol::MasterToRcpd) -> anyhow::Result<()> {
         let mut guard = self.stream.lock().await;
         let send_stream = guard
             .as_mut()
             .context("master stdin stream is already closed")?;
-        send_stream
-            .send_control_message(&crate::protocol::MasterToRcpd::Hello(hello))
-            .await
+        send_stream.send_control_message(message).await
     }
 
     /// Stop the heartbeat task and drop the underlying stdin pipe to signal immediate EOF to
@@ -1008,6 +1092,7 @@ mod tests {
         let hello = crate::protocol::SourceMasterHello {
             control_addr: "127.0.0.1:4001".parse().unwrap(),
             data_addr: "127.0.0.1:4002".parse().unwrap(),
+            tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             server_name: "source".to_owned(),
         };
         let send_hello = control_tx.send_source_hello(hello);
@@ -1069,6 +1154,7 @@ mod tests {
                 filter: None,
                 dry_run: None,
                 capture: Default::default(),
+                accept_timeout_sec: 15,
             })
             .await?;
         let mut recv = crate::streams::RecvStream::new(daemon_read);
@@ -1113,6 +1199,7 @@ mod tests {
             crate::protocol::SourceMasterHello {
                 control_addr: "127.0.0.1:4100".parse().unwrap(),
                 data_addr: "127.0.0.1:4101".parse().unwrap(),
+                tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 server_name: "src".to_owned(),
             },
         ))
@@ -1307,6 +1394,122 @@ mod tests {
             "abandoned control frame must not be written to master stdout"
         );
         writer_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn master_stdout_demux_routes_destination_fallback_then_result() -> anyhow::Result<()> {
+        let (daemon_write, master_read) = tokio::io::duplex(4096);
+        let (control_tx, control_rx) = daemon_control_channel();
+        let (_tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_task = tokio::spawn(run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            crate::streams::SendStream::new(daemon_write),
+            shutdown.clone(),
+        ));
+        let (mut dest_control_rx, demux_task) = spawn_master_stdout_demux(
+            crate::streams::RecvStream::new(master_read),
+            crate::tracelog::RcpdType::Destination,
+        );
+        control_tx
+            .send_direct_connect_failed("timed out after 3s".to_owned())
+            .await?;
+        match dest_control_rx.recv_destination_event().await? {
+            Some(DestinationControlEvent::DirectConnectFailed { reason }) => {
+                assert_eq!(reason, "timed out after 3s");
+            }
+            other => panic!("expected DirectConnectFailed, got {other:?}"),
+        }
+        control_tx
+            .send_result(crate::protocol::RcpdResult::Success {
+                message: "copied via ssh".to_owned(),
+                summary: Default::default(),
+                runtime_stats: Default::default(),
+            })
+            .await?;
+        drop(control_tx);
+        shutdown.cancel();
+        match dest_control_rx.recv_destination_event().await? {
+            Some(DestinationControlEvent::Result(boxed)) => match *boxed {
+                crate::protocol::RcpdResult::Success { message, .. } => {
+                    assert_eq!(message, "copied via ssh");
+                }
+                other => panic!("expected Success result, got {other:?}"),
+            },
+            other => panic!("expected Result event, got {other:?}"),
+        }
+        assert!(dest_control_rx.recv_destination_event().await?.is_none());
+        writer_task.await??;
+        demux_task.join().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn master_control_receiver_rejects_out_of_order_fallback_and_hello_frames()
+    -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = MasterControlReceiver { rx };
+        tx.send(Ok(MasterControlMessage::DirectConnectFailed(
+            "unexpected".to_owned(),
+        )))
+        .unwrap();
+        let err = receiver
+            .recv_source_hello()
+            .await
+            .expect_err("recv_source_hello must reject DirectConnectFailed");
+        assert!(format!("{err:#}").contains("DirectConnectFailed"));
+        tx.send(Ok(MasterControlMessage::DirectConnectFailed(
+            "unexpected".to_owned(),
+        )))
+        .unwrap();
+        let err = receiver
+            .recv_result()
+            .await
+            .expect_err("recv_result must reject DirectConnectFailed");
+        assert!(format!("{err:#}").contains("DirectConnectFailed"));
+        tx.send(Ok(MasterControlMessage::SourceHello(
+            crate::protocol::SourceMasterHello {
+                control_addr: "127.0.0.1:41001".parse().unwrap(),
+                data_addr: "127.0.0.1:41002".parse().unwrap(),
+                tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server_name: "src".to_owned(),
+            },
+        )))
+        .unwrap();
+        let err = receiver
+            .recv_destination_event()
+            .await
+            .expect_err("recv_destination_event must reject SourceHello");
+        assert!(format!("{err:#}").contains("expected destination control frame"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn master_stdin_sender_emits_ssh_fallback_endpoints() -> anyhow::Result<()> {
+        let (client_write, daemon_read) = tokio::io::duplex(4096);
+        let sender = MasterStdinSender::new(client_write, 0);
+        let control_addr: std::net::SocketAddr = "127.0.0.1:45001".parse().unwrap();
+        let data_addrs: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:45002".parse().unwrap(),
+            "127.0.0.1:45003".parse().unwrap(),
+        ];
+        sender
+            .send_ssh_fallback_endpoints(control_addr, data_addrs.clone())
+            .await?;
+        let mut recv = crate::streams::RecvStream::new(daemon_read);
+        match recv.recv_object::<crate::protocol::MasterToRcpd>().await? {
+            Some(crate::protocol::MasterToRcpd::SshFallbackEndpoints {
+                control_addr: got_control,
+                data_addrs: got_data,
+            }) => {
+                assert_eq!(got_control, control_addr);
+                assert_eq!(got_data, data_addrs);
+            }
+            other => panic!("expected SshFallbackEndpoints, got {other:?}"),
+        }
+        sender.close().await;
         Ok(())
     }
 }
