@@ -4,6 +4,10 @@
 
 use std::process::{Command, Output};
 
+/// The smallest queue a bandwidth limit gets, in bytes: room for the packets of every connection
+/// of the host beside the one that fills the link (see `DockerEnv::add_bandwidth_limit`).
+const SHAPER_QUEUE_FLOOR_BYTES: u32 = 64_000;
+
 /// Result type for docker operations
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -568,13 +572,24 @@ impl DockerEnv {
     pub fn add_bandwidth_limit(&self, container: &str, rate_kbit: u32) -> Result<()> {
         let container_name = format!("rcp-test-{}", container);
         let rate_spec = format!("{}kbit", rate_kbit);
-        // tbf requires burst and latency parameters.
+        // tbf requires a burst and a queue, given as a latency or as a limit in bytes.
         // burst must be at least rate/HZ where HZ is the kernel timer frequency (typically 250-1000).
         // using rate/8 provides a safe margin that works across different kernel configs while
         // keeping burst small enough for effective rate limiting. minimum 32kbit ensures the
         // bucket can hold at least a few packets.
         let burst = std::cmp::max(rate_kbit / 8, 32);
         let burst_spec = format!("{}kbit", burst);
+        // the queue holds what the rate sends in 400 ms plus one burst, and never less than
+        // `SHAPER_QUEUE_FLOOR_BYTES`. Without the floor it is 7,200 bytes at 64 kbit: two packets
+        // of a bulk transfer fill it, and every full-size packet of another connection of the
+        // same host is refused. Linux retries a packet its own queue refused every half second
+        // and aborts the connection after `tcp_retries2` refusals in a row, within ten seconds,
+        // which no slow link does to a connection. With the floor those packets wait their turn.
+        let queue_bytes = std::cmp::max(
+            rate_kbit * 1000 / 8 * 2 / 5 + burst * 1000 / 8,
+            SHAPER_QUEUE_FLOOR_BYTES,
+        );
+        let limit_spec = queue_bytes.to_string();
         let output = Command::new("docker")
             .args([
                 "exec",
@@ -590,8 +605,8 @@ impl DockerEnv {
                 &rate_spec,
                 "burst",
                 &burst_spec,
-                "latency",
-                "400ms",
+                "limit",
+                &limit_spec,
             ])
             .output()?;
         if !output.status.success() {
@@ -602,6 +617,45 @@ impl DockerEnv {
             .into());
         }
         Ok(())
+    }
+
+    /// Count the packets a container's network interface has refused under its current conditions.
+    ///
+    /// The count starts at zero when conditions are set, and is zero when none are.
+    ///
+    /// A bandwidth limit is meant to make a host slow, not to lose its packets. A queue that
+    /// refuses a packet of one of the host's own TCP connections leaves that connection retrying
+    /// every half second, and Linux aborts it after `tcp_retries2` refusals in a row.
+    #[allow(dead_code)]
+    pub fn refused_packets(&self, container: &str) -> Result<u64> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "-s",
+                "qdisc",
+                "show",
+                "dev",
+                "eth0",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to read network statistics: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        // "Sent 286212 bytes 317 pkt (dropped 41, overlimits 502 requeues 0)"
+        let statistics = String::from_utf8_lossy(&output.stdout);
+        statistics
+            .split("(dropped ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|count| count.trim().parse().ok())
+            .ok_or_else(|| format!("no count of refused packets in: {statistics}").into())
     }
 
     /// Add combined network conditions (latency + packet loss).

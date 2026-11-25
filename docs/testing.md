@@ -755,6 +755,13 @@ transport liveness timeouts.
 ### Implementation Details
 
 - **Network simulation**: Linux `tc` (traffic control) with `netem` and `tbf` qdiscs
+- **Bandwidth limits**: the `tbf` queue holds at least 64,000 bytes, so that a low limit delays the
+  packets of a host's other connections instead of refusing them. The queue `tc` derives from a
+  latency of 400 ms is 7,200 bytes at 64 kbit/s: two packets of a transfer fill it, and every
+  full-size packet of another connection is refused. Linux retries a packet its own queue refused
+  every half second and aborts the connection after `tcp_retries2` (15) refusals in a row, within
+  ten seconds, which no slow link does to a connection. That aborted the SSH session carrying the
+  daemon. The protocol tests that set a limit assert that the queue refused no packet.
 - **Process control**: `pkill` with SIGKILL, SIGSTOP, SIGCONT signals
 - **I/O simulation**: tmpfs mounts for disk full, chmod for permission errors
 - **Required capabilities**: `CAP_NET_ADMIN` (tc), `CAP_SYS_ADMIN` (mount)
