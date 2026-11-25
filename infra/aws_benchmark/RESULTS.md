@@ -368,6 +368,16 @@ ten million files, and `rrm` for all four, since removing a terabyte takes time 
 of files. The AWS benchmarks page gains one row for the tools, each on the 1 KB file set. The
 copies' rows, pages and trends are unchanged by tool cells.
 
+Each kind of copy on other storage has a page too, with the first run that has a cell there:
+`nfs.html` (copies between two mounts of a network filesystem) and `memory.html` (copies between two
+filesystems in memory). Each plots the duration, CPU time and peak memory of the copy for its one
+file set, as the page of local copies does: such a copy is one rcp process. The file sets are named
+with their storage, "1 KB files on NFS" and "1 KB files in memory", because their files are those of
+a file set of the arrays. A tool's page gains a section for each of these file sets, once a run has
+a cell on it; a point there holds the three runs of the tool after the one kind of copy. The AWS
+benchmarks page gains one row for the two, after the rows of the arrays. The test setup page then
+also says how that storage is made. The rows, pages and trends of the arrays are unchanged.
+
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe
 drives, which AWS's instance-store specification for compute optimized instances gives together as
 1,400,000 random reads and 680,000 writes of 4 KiB a second; a terabyte file set is several times

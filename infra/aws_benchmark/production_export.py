@@ -108,7 +108,8 @@ RESULTS = {"complete": "measured", "failed": "failed", "timed_out": "timed out",
            "not_run": "not run"}
 STAGES = {"capacity": "During the free-space check", "generation": "During generation",
           "cache": "During cache preparation", "copy": "During copy", "summary": "In the copy summary",
-          "harness": "In the benchmark harness", "transport": "Setting up the remote copy"}
+          "harness": "In the benchmark harness", "transport": "Setting up the remote copy",
+          "storage": "Preparing the storage"}
 
 
 def badge(value):
@@ -145,7 +146,7 @@ def cells_html(value):
             history.exact(max(item["samples"])) + "</td><td>" + str(len(item["samples"])) + "</td>")
         reason = ": ".join(escape(part) for part in (STAGES.get(cell["stage"], cell["stage"]), cell["message"])
                            if part)
-        rows.append("<tr><td>" + _name(cell["case_id"], history.CASES) + "</td><td>" +
+        rows.append("<tr><td>" + _name(cell["case_id"], history.NAMES) + "</td><td>" +
                     _name(cell["scenario"], history.SCENARIOS) + "</td><td>" + RESULTS[cell["outcome"]] + "</td>" +
                     numbers + "<td class='reason'>" + reason + "</td></tr>")
     return ("<div class='table-scroll'><table class='data cells'><thead><tr><th>File set</th><th>Scenario</th>"
@@ -215,7 +216,7 @@ def render(value, *, diagnostics=None):
                    "copies made by the build under test" +
                    (", counting every copy because baseline and candidate binaries are identical"
                     if item["pooled"] else ""))
-        html += ("<h3>" + history.CASES[case] + (" · " + names[scenario] if several else "") +
+        html += ("<h3>" + history.NAMES[case] + (" · " + names[scenario] if several else "") +
             "</h3><p>This run as one history point: the median of the " + counted + ".</p><div class='" +
             history.layout(scenario) + "'>")
         for metric, title, unit in history.panels(scenario):

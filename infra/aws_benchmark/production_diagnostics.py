@@ -44,6 +44,10 @@ STORAGE_FIGURES = {"nfs": (("threads", 65536), ("delay_microseconds", 10_000_000
                            ("round_trip_microseconds", 60_000_000)),
                    "memory": (("size_bytes", 1 << 50), ("inodes", 1 << 40))}
 NFS_VERSIONS = ("3", "4.0", "4.1", "4.2")
+# how the worker sets up that storage (other_storage.py), for the pages that describe it. The
+# server does not ship the worker's module, so its own table must say the same
+CONFIGURED_STORAGE = dict(nfs_version="4.2", nfs_delay_microseconds=2500, nfs_threads=256,
+                          memory_bytes=64 * 1024 ** 3)
 ROLES = ("source", "destination")
 # with every figure of every sampled phase present and large, the largest suite (40 cells on
 # three kinds of storage, 205 phases) fills 488 kB of this; the one before it filled 376 kB of
@@ -813,14 +817,37 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations, *, remote=False, tools=False, storage=""):
+def configuration_html(observations, *, remote=False, tools=False, elsewhere=False, storage=""):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
-    Remote copies are described once a run has a remote cell, and the other tools once a run has a
-    cell of one. `storage` is the table of what the arrays did during the newest run's copies,
-    placed under what the drives allow.
+    Remote copies are described once a run has a remote cell, the other tools once a run has a
+    cell of one, and the storage beside the arrays (`elsewhere`) once a run has a cell there.
+    `storage` is the table of what the arrays did during the newest run's copies, placed under
+    what the drives allow.
     """
+    configured = CONFIGURED_STORAGE
+    delay = configured["nfs_delay_microseconds"] / 1000
+    beside = ("" if not elsewhere else
+        "<li><strong>Network filesystem.</strong> A matrix run can also copy between two mounts of a network "
+        "filesystem. The worker serves its two arrays with the kernel's NFS server on loopback and mounts them "
+        f"back with NFS {configured['nfs_version']}, with {delay:g} ms added to every packet on that loopback: a "
+        f"request to the server and its reply costs {2 * delay:g} ms, as an operation on a file that is not cached "
+        "does on a filer. The server answers without waiting for its disks, runs "
+        f"{configured['nfs_threads']} threads and hands out no delegations. Only what is measured goes through "
+        "the mounts. Each run page shows the round trip its worker measured.</li>"
+        "<li><strong>Memory.</strong> A matrix run can also copy between two filesystems in memory (tmpfs), "
+        f"each limited to {configured['memory_bytes'] >> 30} GiB, where no operation waits for a disk.</li>")
+    more_sets = ("" if not elsewhere else
+        "<tr><td>1 KB on NFS</td><td>716,800</td><td>1,000</td><td>716.8 MB</td></tr>"
+        "<tr><td>1 KB in memory</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>")
+    more_sets_note = ("" if not elsewhere else
+        " The file set on NFS is 700 directories of 1,024 files: a network filesystem takes one new file at a "
+        "time in a directory, so many small directories are what a parallel tool can work on there.")
+    caches = ("Linux cache dropping occurs before every copy." if not elsewhere else
+        "Linux cache dropping occurs before every copy and, on the network filesystem, before every run of a "
+        "tool: what a client still remembers of a tree decides how many requests a tool sends for it. No cache "
+        "is dropped for the filesystems in memory.")
     other = ("" if not tools else
         "<li><strong>Other tools.</strong> A matrix run can also time the other tools on each local copy, and "
         "on each remote copy when its suite says so, in this order: <code>rcmp --metadata-compare=f:size</code> "
@@ -860,7 +887,7 @@ def configuration_html(observations, *, remote=False, tools=False, storage=""):
         "blocks; filesystem creation requests 16,000,000 inodes per array. Available bytes and inodes are "
         "checked before each fixture.</li>"
         "<li><strong>Root disk.</strong> The separate encrypted 16 GiB gp3 EBS root disk holds the OS and "
-        "tools; it is not the benchmark data disk.</li></ul>"
+        "tools; it is not the benchmark data disk.</li>" + beside + "</ul>"
         "<p>This is the current configured design, not a substitute for observed host evidence; historical "
         "runs may differ. What the workers recorded is under <a href='#observed'>Observed values</a>.</p></section>"
         "<section aria-labelledby='storage'><h2 id='storage'>What the storage allows</h2>"
@@ -879,9 +906,10 @@ def configuration_html(observations, *, remote=False, tools=False, storage=""):
         "<tbody><tr><td>1 GB</td><td>1,000</td><td>1,000,000,000</td><td>1 TB</td></tr>"
         "<tr><td>100 MB</td><td>10,240</td><td>100,000,000</td><td>1.024 TB</td></tr>"
         "<tr><td>1 MB</td><td>1,024,000</td><td>1,000,000</td><td>1.024 TB</td></tr>"
-        "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr></tbody></table></div>"
+        "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>" + more_sets +
+        "</tbody></table></div>"
         "<p>Sizes above are decimal bytes. The 1 KB file set has exactly 100 times less total logical "
-        "data than the 1.024 TB sets; it still exercises over ten million files. No file-set "
+        "data than the 1.024 TB sets; it still exercises over ten million files." + more_sets_note + " No file-set "
         "definition establishes a completed AWS qualification. Consult each run's suite, outcome and "
         "diagnostics. " + commissioning + " two small fixtures instead "
         "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "
@@ -896,7 +924,7 @@ def configuration_html(observations, *, remote=False, tools=False, storage=""):
         " with one build, and measure as many file sets as fit their allocation; each run page lists "
         "what was measured and why anything else was not. Runs of the other suites make four copies of each "
         "selected file set, as two balanced adjacent pairs of identical baseline and candidate binaries.</li>"
-        "<li><strong>Caches and validation.</strong> Linux cache dropping occurs before every copy. Matrix "
+        "<li><strong>Caches and validation.</strong> " + caches + " Matrix "
         "runs do not verify copies: a copy counts when rcp exits cleanly and reports the expected file "
         "count. Runs of the other suites check paths, types, counts, sizes and metadata, not file contents. "
         "Each run page says which applies.</li>"

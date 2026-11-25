@@ -390,6 +390,21 @@ class StorageRecordTests(unittest.TestCase):
         # the cells in memory and on the arrays are measured and published as in any other run
         self.assertEqual(published["commission-10k-memory", "memory"]["outcome"], "complete")
         self.assertEqual(published["commission-10k", "local"]["outcome"], "complete")
+        # the run page says in words where the cell failed, as for every other stage
+        page = export.render(projection.bind(public, "a" * 64))
+        self.assertIn("<td class='reason'>Preparing the storage: " + MISSING + "</td>", page)
+        self.assertIn("<td class='reason'>During copy: the nfs copy that this cell follows did not complete: " +
+                      MISSING + "</td>", page)
+
+    def test_a_run_of_every_new_suite_is_collected_and_published(self):
+        # a suite of one storage alone too: a run in memory keeps no file set on the arrays
+        for suite in ADDED:
+            options = dict(remaining=42700, runtime_seconds=43200, capacity_seconds=7200) if suite == WEEKLY else {}
+            with self.subTest(suite=suite):
+                result, report, public = self.collect(suite, matrix_record(suite), **options)
+                self.assertEqual((result["state"], report["benchmark_valid"]), ("success", True), public["diagnostics"])
+                self.assertEqual(len(public["measurements"]), len(common.MATRIX_SUITES[suite]))
+                self.assertEqual(public["schema"], V6)
 
     def test_every_cell_of_the_largest_suite_fits_one_record(self):
         result, report, public = self.collect(WEEKLY, matrix_record(WEEKLY), remaining=42700, runtime_seconds=43200,
@@ -608,23 +623,16 @@ class StorageDiagnosticsTests(unittest.TestCase):
 
 
 class StoragePageTests(unittest.TestCase):
-    """The pages take a run with cells on other storage: those cells are on its run page and have no trend yet."""
+    """The pages take a run with cells on other storage; their trends are in test_storage_pages.py."""
 
-    def test_the_cells_of_the_arrays_keep_their_trends_and_the_others_are_counted_beside_them(self):
+    def test_every_trend_page_and_the_first_page_render_for_runs_of_the_largest_suite(self):
         records, companions = split(weeks(2, suite=WEEKLY))
-        self.assertEqual(history.present(records), ("local", "remote", "rcmp", "rlink", "rrm"))
-        outside = {}
-        for trend in history.TRENDS:
-            cases, outside[trend] = history.model(records, companions, trend)
+        for trend in history.present(records):
             with self.subTest(trend=trend):
-                self.assertEqual({len(points) for points in cases.values()}, {2})
-                self.assertTrue(set(cases) <= set(FILE_SETS))
-                history.render(records, companions, trend)
-        # each run has four cells between the mounts and four in memory, reported once: beside the local trends
-        self.assertEqual(outside, dict(local=16, remote=0, rcmp=0, rlink=0, rrm=0))
-        self.assertIn("16 qualified measurements are outside these trends",
-                      history.render(records, companions, "local"))
-        history.overview(records, companions)
+                cases, outside = history.model(records, companions, trend)
+                self.assertEqual(({len(points) for points in cases.values()}, outside), ({2}, 0))
+                self.assertLess(len(history.render(records, companions, trend).encode()), projection.MAX_PUBLIC_HTML // 8)
+        self.assertLess(len(history.overview(records, companions).encode()), projection.MAX_PUBLIC_HTML // 8)
 
     def test_the_run_page_lists_every_cell_and_its_diagnostics(self):
         record, extra = companion(COMMISSION)

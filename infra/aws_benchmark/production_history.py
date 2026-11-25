@@ -24,18 +24,24 @@ from .results import utc
 MAX_PLOT_RUNS = 32
 # the build under test with default settings, and the same command run with a reference build
 CURRENT, REFERENCE = "rcp-default", "rcp-baseline"
-# the two kinds of copy
+# the two kinds of copy on the arrays, and the two on other storage: between two mounts of a
+# network filesystem, and between two filesystems in memory
 LOCAL, REMOTE = "local", "remote"
+NFS, MEMORY = "nfs", "memory"
+COPIES = (LOCAL, REMOTE, NFS, MEMORY)
 # the other tools, each timed on the copies of a run, in the order they run, and what each does
 TOOLS = ("rcmp", "rlink", "rrm")
 TOOL_TITLES = {"rcmp": "Compare with rcmp", "rlink": "Hard-link with rlink", "rrm": "Remove with rrm"}
 # what a cell's scenario means to a reader. A tool cell is named after the copies it follows and its tool
-SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback",
-             **{copies + "-" + tool: TOOL_TITLES[tool] + ", after a " + copies + " copy"
-                for copies in (LOCAL, REMOTE) for tool in TOOLS}}
-TOOL_CELLS = frozenset(SCENARIOS) - {LOCAL, REMOTE}
+_AFTER = {LOCAL: "a local copy", REMOTE: "a remote copy", NFS: "a copy between NFS mounts", MEMORY: "a copy in memory"}
+_tool_cells = lambda *kinds: {copies + "-" + tool: TOOL_TITLES[tool] + ", after " + _AFTER[copies]
+                              for copies in kinds for tool in TOOLS}
+# the cells of the arrays first: they came first, and the tables that list cells keep their order
+SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback", **_tool_cells(LOCAL, REMOTE),
+             NFS: "Copy between NFS mounts", MEMORY: "Copy in memory", **_tool_cells(NFS, MEMORY)}
+TOOL_CELLS = frozenset(SCENARIOS) - set(COPIES)
 # what has a trend of its own: each kind of copy, and each tool whichever copies it followed
-TRENDS = (LOCAL, REMOTE, *TOOLS)
+TRENDS = (*COPIES, *TOOLS)
 # what a tool does with a file set, after "files of … each"
 ACTIONS = {"rcmp": "compared with their source by rcmp, by file size,", "rlink": "hard-linked into a new tree by rlink",
            "rrm": "removed by rrm"}
@@ -45,6 +51,11 @@ CASES = {
     "bulk-1m-1024gb": "1 MB files",
     "tiny-1k-10240k": "1 KB files",
 }
+# the file sets of other storage. Their files are those of a set of the arrays, so each is named
+# with its storage. The copies of one kind measure each, and the tools after those copies
+OTHER_CASES = {"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-10240k-memory": "1 KB files in memory"}
+# what every file set with a trend is called
+NAMES = {**CASES, **OTHER_CASES}
 METRICS = (
     ("duration", "Copy duration", "s"),
     ("cpu", "CPU time", "s"),
@@ -72,17 +83,22 @@ COLUMNS = {
              ("destination_memory", "Destination rcpd peak RSS MiB"), ("cpu", "rcp CPU s"),
              ("memory", "rcp peak RSS MiB")),
 }
-COLUMNS.update({tool: COLUMNS[LOCAL] for tool in TOOLS})
+# a copy on other storage is one process, as a local copy and a tool run are
+COLUMNS.update({trend: COLUMNS[LOCAL] for trend in (NFS, MEMORY, *TOOLS)})
 # each scenario's title where its trends are listed, the page with every metric, and what that page adds
 ROWS = {
     LOCAL: ("Local copies", "local.html", "CPU time, peak memory and data tables"),
     REMOTE: ("Remote copies", "remote.html", "CPU time and peak memory of each rcpd, and data tables"),
+    NFS: ("Copies between NFS mounts", "nfs.html", "CPU time, peak memory and data tables"),
+    MEMORY: ("Copies in memory", "memory.html", "CPU time, peak memory and data tables"),
 }
 ROWS.update({tool: (TOOL_TITLES[tool], tool + ".html", "CPU time, peak memory and data tables") for tool in TOOLS})
-# the file sets a tool's page plots. What a tool does with a thousand files takes milliseconds:
-# that is noise, not a trend, so only the sets where a tool takes real time are plotted
-PLOTTED = {"rcmp": ("bulk-1m-1024gb", "tiny-1k-10240k"), "rlink": ("bulk-1m-1024gb", "tiny-1k-10240k"),
-           "rrm": tuple(CASES)}
+# the file sets each page plots: the copies on other storage their own, and a tool every set
+# where it takes real time. What a tool does with a thousand files takes milliseconds: that is
+# noise, not a trend. The file sets of other storage have a section once a run has a cell there
+PLOTTED = {NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-10240k-memory",),
+           "rcmp": ("bulk-1m-1024gb", "tiny-1k-10240k", *OTHER_CASES),
+           "rlink": ("bulk-1m-1024gb", "tiny-1k-10240k", *OTHER_CASES), "rrm": (*CASES, *OTHER_CASES)}
 # the file set whose tool trends the first page shows: the one with the most files
 MOST_FILES = "tiny-1k-10240k"
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -147,8 +163,8 @@ def time_html(text):
 
 
 def cells(trend):
-    """The cell scenarios whose runs a trend holds: a kind of copy its own, a tool its cells after either kind."""
-    return tuple(copies + "-" + trend for copies in (LOCAL, REMOTE)) if trend in TOOLS else (trend,)
+    """The cell scenarios whose runs a trend holds: a kind of copy its own, a tool its cells after every kind."""
+    return tuple(copies + "-" + trend for copies in COPIES) if trend in TOOLS else (trend,)
 
 
 def present(records):
@@ -167,7 +183,8 @@ def has_remote(records):
 
 def panels(scenario):
     """The metrics plotted for a scenario, as (key, title, unit)."""
-    return METRICS if scenario == LOCAL else TOOL_METRICS if scenario in TOOLS else REMOTE_METRICS
+    return (METRICS if scenario in (LOCAL, NFS, MEMORY) else TOOL_METRICS if scenario in TOOLS else
+            REMOTE_METRICS)
 
 
 def layout(scenario):
@@ -200,7 +217,7 @@ def _points(value, extra, scenario=LOCAL):
     pooled = cells(scenario)
     if scenario in TOOLS:
         # a tool cell is measured under what its tool ran, as its record names it
-        variants = projection.PUBLIC_CONTRACTS[projection.TOOLS_SCHEMA]["tool_variants"]
+        variants = projection.PUBLIC_CONTRACTS[projection.STORAGE_SCHEMA]["tool_variants"]
         roles = tuple({variants[cell] for cell in pooled})
     # which cell a measurement or a trial is of: a record without scenarios predates the matrix
     of = lambda item: (item.get("scenario", LOCAL), item["variant_id"])
@@ -213,7 +230,7 @@ def _points(value, extra, scenario=LOCAL):
         if key[1] in pooled:
             if key[0] in plotted(scenario) and key[2] in roles:
                 selected.setdefault(key[0], []).append(measurement)
-            elif key[0] not in CASES or key[2] not in roles:
+            elif key[0] not in NAMES or key[2] not in roles:
                 # a file set that a tool's page leaves out on purpose is not one it failed to place
                 outside += 1
         elif key[1] not in SCENARIOS and scenario == LOCAL:
@@ -288,7 +305,10 @@ def model(records, companions, scenario=LOCAL):
     require(isinstance(records, dict) and len(records) <= projection.MAX_PUBLIC_HISTORY_RUNS and
             isinstance(companions, dict) and set(companions) <= set(records),
             "history input exceeds its bounded record set")
-    cases, outside = {case: [] for case in plotted(scenario)}, 0
+    # a file set of other storage has its section on a tool's page once a run has a cell on it
+    tried = {cell["case_id"] for value in records.values() for cell in value.get("cells", ())}
+    cases, outside = {case: [] for case in plotted(scenario)
+                      if case in CASES or scenario not in TOOLS or case in tried}, 0
     for run_key, value in sorted(records.items()):
         projection.validate_public(value)
         require(value["run_key"] == run_key, "history record identity differs")
@@ -553,13 +573,17 @@ def _reading(scenario):
 
 
 def _file_set(case, points, scenario):
-    shape = diagnostics.CASE_SHAPES[case]
+    shape = diagnostics.MATRIX_CASE_SHAPES[case]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
     how = ("copied locally by rcp with default settings" if scenario == LOCAL else
+           "copied by rcp with default settings between two mounts of a network filesystem, where a request to "
+           f"the server costs {2 * diagnostics.CONFIGURED_STORAGE['nfs_delay_microseconds'] / 1000:g} ms"
+           if scenario == NFS else
+           "copied by rcp with default settings between two filesystems in memory" if scenario == MEMORY else
            ACTIONS[scenario] + " after each copy" if scenario in TOOLS else
            "copied by rcp through a source and a destination rcpd over loopback, with default settings")
     html = ("<section id='history-" + case + "' aria-labelledby='history-" + case + "-title'>"
-        "<h2 id='history-" + case + "-title'>" + CASES[case] + "</h2><p class='dataset'>" +
+        "<h2 id='history-" + case + "-title'>" + NAMES[case] + "</h2><p class='dataset'>" +
         f"{files:,} files of {_decimal(shape['file_size_bytes'])} each ({_decimal(files * shape['file_size_bytes'])}), "
         + how + " · " + plural(len(points), "run", "runs") +
         "</p><div class='" + layout(scenario) + "'>" +
@@ -602,14 +626,15 @@ def _file_set(case, points, scenario):
 def _render(cases, outside, limit, unmeasured, scenario, several):
     html = "<section id='history' aria-label='Performance history'>"
     html += "".join(_file_set(case, points, scenario) for case, points in cases.items() if points)
-    empty = [CASES[case] for case in unmeasured]
+    empty = [NAMES[case] for case in unmeasured]
     if empty:
         # once there are two kinds of run, a file set without this kind may well have the other
         html += ("<p class='empty'>No qualified " + (scenario + " " if several else "") +
                  "runs yet for " + (", ".join(empty[:-1]) + " and " if len(empty) > 1 else "") + empty[-1] + ".</p>")
     if limit is not None:
         html += _window(limit, "<a href='index.html#runs'>list of runs</a>")
-    left_out = [case for case in CASES if case not in plotted(scenario)]
+    # only a tool leaves file sets of the arrays out: a kind of copy plots every set of its storage
+    left_out = [case for case in CASES if case not in plotted(scenario)] if scenario in TOOLS else []
     if left_out:
         html += _left_out(scenario, left_out)
     if outside:
@@ -674,15 +699,18 @@ def render(records, companions, scenario=LOCAL):
         windows[scenario], outside, limit, unmeasured, scenario, several))
 
 
-def _tile(case, points, scenario, page, beside):
-    """One file set's copy duration under one scenario; `beside` holds its local copies, run by run."""
-    name = CASES[case]
+def _tile(case, points, scenario, page, beside, row=None):
+    """One file set's copy duration under one scenario; `beside` holds its local copies, run by run.
+
+    `row` is the title of the row the tile stands in, when that is not the row of its own scenario.
+    """
+    name = NAMES[case]
     # both rows have a tile of this name: its link and its plot say which copy they are, for a reader
     # who meets them in a list instead of in their row
     link = ("<a href='" + page + "#history-" + case + "' aria-label='" + name + ", " + scenario + " copies'>" +
             name + "</a>")
     opening = _opening("overview-" + scenario + "-" + case, "data-overview='" + scenario + "'",
-                       link if points else name, "overview-" + scenario + "-title")
+                       link if points else name, row or "overview-" + scenario + "-title")
     if not points:
         # the tile keeps its place, so that a column is the same file set in every row
         return opening + "</figcaption><p class='delta'>No qualified run yet.</p></figure>"
@@ -724,11 +752,23 @@ def _tools_row(windows):
             "</div></section>")
 
 
+def _storage_row(windows):
+    """The row of the copies on other storage: each kind on its one file set, leading to its page."""
+    tiles = "".join(_tile(case, points, scenario, ROWS[scenario][1], (), row="overview-storage-title")
+                    for scenario in (NFS, MEMORY) if scenario in windows
+                    for case, points in windows[scenario].items())
+    return ("<section id='overview-storage' aria-labelledby='overview-storage-title'>"
+            "<div class='overview-title'><h2 id='overview-storage-title'>Copies on other storage</h2>"
+            "<span>between two NFS mounts, and between two filesystems in memory</span></div>"
+            "<div class='overview'>" + tiles + "</div></section>")
+
+
 def _overview(windows, limit, several, local):
     html = "<section id='history' aria-label='Copy duration of every file set'>"
     for scenario, cases in windows.items():
-        if scenario in TOOLS:
-            # the tools share one row, after the copies
+        if scenario in (NFS, MEMORY, *TOOLS):
+            # the copies on other storage share one row after the copies on the arrays, and the
+            # tools one after that
             continue
         title, page, more = ROWS[scenario]
         measured = any(cases.values())
@@ -743,6 +783,8 @@ def _overview(windows, limit, several, local):
             # once there are two kinds of run, a row without this kind may well have the other
             html += "<p class='empty'>No qualified " + (scenario + " " if several else "") + "runs yet.</p>"
         html += "</section>"
+    if NFS in windows or MEMORY in windows:
+        html += _storage_row(windows)
     tools = any(scenario in TOOLS for scenario in windows)
     if tools:
         html += _tools_row(windows)
@@ -760,8 +802,9 @@ def overview(records, companions):
     """Show the copy duration of every file set at once: a row of small plots for each kind of copy.
 
     The other metrics and the data tables are on the page of each scenario. A row for remote
-    copies appears with the first run that has a remote cell, and a row for the other tools with
-    the first run that has a cell of one.
+    copies appears with the first run that has a remote cell, one for the copies on other storage
+    with the first run that has a cell there, and a row for the other tools with the first run
+    that has a cell of one.
     """
     shown = present(records)
     several = len(shown) > 1

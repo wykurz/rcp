@@ -261,12 +261,13 @@ def aws_link(label, target, *, nested=False, current=False):
             (' aria-current="page"' if current else '') + '>' + html.escape(label) + '</a></li>')
 
 
-def aws_navigation(route, *, status, remote=False, tools=()):
+def aws_navigation(route, *, status, remote=False, others=(), tools=()):
     """List the AWS section pages; links into the current page stay within the document.
 
     The first page shows every trend; each kind of copy and each other tool has a page with all of
-    its metrics. Remote copies are listed once a run has a remote cell, and a tool once a run has
-    a cell of it: `tools` are (title, page name) of those.
+    its metrics. Remote copies are listed once a run has a remote cell, the copies on other storage
+    once a run has a cell there, and a tool once a run has a cell of it: `others` and `tools` are
+    (title, page name) of those.
     """
     home, setup = Path('aws-benchmarks/index.html'), Path('aws-benchmarks/setups.html')
     near, far = Path('aws-benchmarks/local.html'), Path('aws-benchmarks/remote.html')
@@ -276,7 +277,7 @@ def aws_navigation(route, *, status, remote=False, tools=()):
     items = [aws_link('History', index + '#history'), page('Local copies', near)]
     if remote:
         items.append(page('Remote copies', far))
-    items += [page(title, Path('aws-benchmarks') / name) for title, name in tools]
+    items += [page(title, Path('aws-benchmarks') / name) for title, name in (*others, *tools)]
     items.append(aws_link('Runs', index + '#runs'))
     if status:
         items.append(aws_link('Collection status', index + '#collection-status'))
@@ -366,7 +367,11 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     remote = production_history.has_remote(normalized)
     # and so does each of the other tools, with the first run that has a cell of it
     tools = [scenario for scenario in production_history.present(normalized) if scenario in production_history.TOOLS]
-    navigation = lambda route: aws_navigation(route, status=status, remote=remote, tools=[
+    # and so does each kind of copy on other storage, with the first run that has a cell there
+    others = [scenario for scenario in production_history.present(normalized)
+              if scenario in (production_history.NFS, production_history.MEMORY)]
+    navigation = lambda route: aws_navigation(route, status=status, remote=remote, others=[
+        production_history.ROWS[other][:2] for other in others], tools=[
         production_history.ROWS[tool][:2] for tool in tools])
     for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
         value = normalized[run_key]
@@ -409,7 +414,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         'datasets below and one of two methods, so they are described here once. What an individual run '
         "observed is in that run's appendix and its diagnostics JSON.</p>" +
         production_export.resource_diagnostics.configuration_html(
-            observed[::-1], remote=remote, tools=bool(tools), storage=storage) +
+            observed[::-1], remote=remote, tools=bool(tools), elsewhere=bool(others), storage=storage) +
         production_history.reading_html(remote, bool(tools)))
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
@@ -435,6 +440,8 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     pages[home] = aws_page(home, 'AWS benchmarks', (
         '<h1>AWS benchmarks</h1><p class="lede">How long rcp takes to copy '
         '<a href="setups.html#datasets">fixed datasets</a> on one AWS machine type, tracked from commit to commit' + (
+            ': locally, through its remote path over loopback, between two mounts of a network filesystem and in '
+            'memory' if remote and len(others) == 2 else
             ': locally, and through its remote path over loopback' if remote else '') + (
             ', and how long ' + ', '.join(tools[:-1]) + ' and ' + tools[-1] + ' take on each copy'
             if len(tools) > 1 else ', and how long ' + tools[0] + ' takes on each copy' if tools else '') +
@@ -455,6 +462,20 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             'path on one AWS machine: a source and a destination rcpd, started over SSH, exchange the data over '
             'loopback. <a href="local.html">Local copies</a> have their own page; ' + elsewhere +
             production_history.render(normalized, diagnostics, production_history.REMOTE)), navigation(far), footer)
+    # where each kind of copy on other storage is made and what that storage is, for the first lines of its page
+    where = {production_history.NFS: (
+                 'between two mounts of a network filesystem',
+                 'The worker serves its two arrays over NFS on loopback, with a delay that makes every request to '
+                 'the server cost milliseconds.'),
+             production_history.MEMORY: ('between two filesystems in memory', 'No operation there waits for a disk.')}
+    for other in others:
+        title, name = production_history.ROWS[other][:2]
+        route = Path('aws-benchmarks') / name
+        pages[route] = aws_page(route, title + ' · AWS benchmarks', (
+            '<h1>' + title + '</h1><p class="lede">How long rcp takes to copy a dataset ' + where[other][0] +
+            ' on one AWS machine, with the CPU time and peak memory of the copy. ' + where[other][1] +
+            ' <a href="setups.html#machine">Test setup</a> says how that storage is made; ' + elsewhere +
+            production_history.render(normalized, diagnostics, other)), navigation(route), footer)
     # what each of the other tools does to a copy, for the first line of its page
     does = dict(rcmp='compare what rcp has just copied with its source, by file size',
                 rlink='hard-link what rcp has just copied into a new tree',
