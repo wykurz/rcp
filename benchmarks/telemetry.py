@@ -18,8 +18,11 @@ MAX_SECONDS = 8 * 3600
 MAX_PHASES = 192
 # a run of the benchmark matrix may take twelve hours, the longest allocation there is
 # (RUNTIME_PROFILES in infra/aws_benchmark), so its journal is bounded for them: a sample each
-# period and one at each phase mark, at the 2.7 kB that a line took on the AWS worker
-MATRIX_LIMITS = MappingProxyType(dict(max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600))
+# period and one at each phase mark, at the 2.7 kB that a line took on the AWS worker. It also
+# marks a phase for every step of every cell: the largest suite, of 40 cells on three kinds of
+# storage, marks about 205, and the bound leaves room for the suites after it
+MATRIX_LIMITS = MappingProxyType(dict(max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600,
+                                      max_phases=384))
 READ_BYTES = 64 * 1024
 MAX_NUMBER = (1 << 63) - 1
 ARTIFACT = "system-telemetry.jsonl"
@@ -53,7 +56,7 @@ GROUPS = ("host_cpu", "host_memory", "host_cpu_pressure", "host_memory_pressure"
 
 def _limits(replaced):
     """What bounds one journal: the usual bounds, with those that a caller replaces."""
-    usual = dict(max_samples=MAX_SAMPLES, max_bytes=MAX_BYTES, max_seconds=MAX_SECONDS)
+    usual = dict(max_samples=MAX_SAMPLES, max_bytes=MAX_BYTES, max_seconds=MAX_SECONDS, max_phases=MAX_PHASES)
     if set(replaced) - set(usual):
         raise ValueError("unknown journal bound")
     return dict(usual, **replaced)
@@ -62,7 +65,7 @@ def _limits(replaced):
 def descriptor(limits=()):
     """Say how a journal is sampled and bounded; `limits` are the ones its Sampler was given."""
     return dict(policy="linux-bounded-system-sampling-v1", period_seconds=PERIOD_SECONDS,
-        **_limits(dict(limits)), max_phases=MAX_PHASES,
+        **_limits(dict(limits)),
         scope="host aggregate and current harness cgroup with descendants; logical mount-device IO; not per-process attribution")
 
 
@@ -418,7 +421,7 @@ class Sampler:
             now = self._limit()
             if self.current is not None:
                 self.current.update(elapsed_seconds=max(0, now - self.current["started"]), status="observed")
-            if len(self.phases) >= MAX_PHASES:
+            if len(self.phases) >= self.limits["max_phases"]:
                 self.reason = self.reason or "phase_limit"
                 self.current = None
                 return

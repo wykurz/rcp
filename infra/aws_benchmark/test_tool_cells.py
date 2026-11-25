@@ -496,8 +496,10 @@ def sampled_matrix(suite, descriptor):
     raw["system_telemetry"] = dict(status="complete", samples=20 * len(run_phases), phases=run_phases)
     total = len(run_phases)
     for cell in raw["cells"]:
-        names = (("cache", "command") if cell["scenario"] in ("local", "remote") else
-                 ("command", "cleanup") if cell["scenario"].endswith("-rlink") else ("command",))
+        # no cache is dropped for a copy in memory, and one is before every tool on a network filesystem
+        copies, tool = cell["scenario"].split("-")[0], cell["scenario"] in matrix.TOOLS
+        names = ((("cache",) if (copies == "nfs" if tool else copies != "memory") else ()) + ("command",) +
+                 (("cleanup",) if cell["scenario"].endswith("-rlink") else ()))
         for item in cell["copies"]:
             phases = [sampled_phase(name, cases.index(cell["case_id"]), item["trial_index"]) for name in names]
             item["system_telemetry"] = dict(status="complete", samples=20 * len(phases), phases=phases)

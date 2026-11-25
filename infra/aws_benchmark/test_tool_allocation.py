@@ -317,11 +317,14 @@ class SamplerTests(unittest.TestCase):
         limits = telemetry.MATRIX_LIMITS
         self.assertEqual(limits["max_seconds"], longest)
         # a sample each period and one at each phase mark
-        self.assertGreaterEqual(limits["max_samples"], longest // telemetry.PERIOD_SECONDS + telemetry.MAX_PHASES)
+        self.assertGreaterEqual(limits["max_samples"], longest // telemetry.PERIOD_SECONDS + limits["max_phases"])
         # a line took 2.7 kB on the AWS worker: 2,144 lines in 5,803,658 bytes, in the first full run
         self.assertGreaterEqual(limits["max_bytes"], limits["max_samples"] * 2_800)
         # a companion names the bounds its run was sampled under: the earlier ones or these
-        self.assertEqual(diagnostics.TELEMETRY_DESCRIPTORS, (telemetry.descriptor(), telemetry.descriptor(limits)))
+        # a companion names the bounds its run was sampled under: the first ones, those of the
+        # matrix runs before there were cells on other storage, or these
+        self.assertEqual(diagnostics.TELEMETRY_DESCRIPTORS, (
+            telemetry.descriptor(), dict(telemetry.descriptor(limits), max_phases=192), telemetry.descriptor(limits)))
         self.assertEqual(diagnostics.MAX_ALLOCATION_SECONDS, longest)
 
     def test_a_twelve_hour_run_publishes_its_allocation_and_the_bounds_of_its_journal(self):
