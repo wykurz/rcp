@@ -167,10 +167,14 @@ pub struct AutoMetaThrottleConfig {
 pub enum AdmissionPolicy {
     #[default]
     Local,
-    /// Jointly reserve leaf, directory, and socket capacity for a remote endpoint.
+    /// Jointly reserve leaf, directory, socket, and optional 3-host SSH tunnel capacity for a
+    /// remote endpoint.
     Remote {
         streams: std::num::NonZeroUsize,
         pending: std::num::NonZeroUsize,
+        /// Number of destination-owned direct SSH tunnel processes requested for 3-host SSH/auto
+        /// transfers (0 for source daemons, direct TCP, same-host, and 2-host transfers).
+        ssh_tunnels: usize,
     },
 }
 

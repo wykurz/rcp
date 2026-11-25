@@ -156,7 +156,7 @@ fn check_messages(direction: Direction) {
     ] {
         fixtures.check(
             name,
-            MasterToRcpd::Hello(MasterHello::Source {
+            MasterToRcpd::Hello(Box::new(MasterHello::Source {
                 src: "/src/α".into(),
                 dst: "/dst/b".into(),
                 dest_cert_fingerprint: Some(std::array::from_fn(|i| i as u8)),
@@ -164,12 +164,12 @@ fn check_messages(direction: Direction) {
                 dry_run,
                 capture,
                 accept_timeout_sec: 30,
-            }),
+            })),
         );
     }
     fixtures.check(
         "master-source-none",
-        MasterToRcpd::Hello(MasterHello::Source {
+        MasterToRcpd::Hello(Box::new(MasterHello::Source {
             src: "/source".into(),
             dst: "/destination".into(),
             dest_cert_fingerprint: None,
@@ -181,7 +181,7 @@ fn check_messages(direction: Direction) {
                 root_acl_notice: false,
             },
             accept_timeout_sec: 15,
-        }),
+        })),
     );
     let preserve = common::preserve::Settings {
         file: common::preserve::FileSettings {
@@ -254,6 +254,13 @@ fn check_messages(direction: Direction) {
                 tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 ssh_tunnels: 4,
                 dest_root: "/dst/tree".into(),
+                source_peer: PeerIdentity {
+                    hostname: "node01".into(),
+                    boot_id: Some("11111111-1111-1111-1111-111111111111".into()),
+                    net_ns: Some("net:[4026531992]".into()),
+                    ssh_server_port: Some(22),
+                },
+                source_node_endpoint: Some("10.20.30.40:2222".parse().unwrap()),
             },
         ),
         (
@@ -271,20 +278,27 @@ fn check_messages(direction: Direction) {
                 tunnel_target_ip: std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
                 ssh_tunnels: 2,
                 dest_root: "/tmp/dst".into(),
+                source_peer: PeerIdentity {
+                    hostname: "node02".into(),
+                    boot_id: None,
+                    net_ns: None,
+                    ssh_server_port: None,
+                },
+                source_node_endpoint: None,
             },
         ),
     ] {
         fixtures.check(
             name,
-            MasterToRcpd::Hello(MasterHello::Destination {
+            MasterToRcpd::Hello(Box::new(MasterHello::Destination {
                 source_control_addr: "192.0.2.7:2345".parse().unwrap(),
                 source_data_addrs: data_addrs,
                 server_name: "source.example".into(),
                 preserve,
                 source_cert_fingerprint: fingerprint,
                 dry_run,
-                transport,
-            }),
+                transport: Box::new(transport),
+            })),
         );
     }
     fixtures.check("master-heartbeat", MasterToRcpd::Heartbeat);
@@ -305,6 +319,13 @@ fn check_messages(direction: Direction) {
             data_addr: "198.51.100.9:5678".parse().unwrap(),
             tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)),
             server_name: "data.example".into(),
+            peer_identity: PeerIdentity {
+                hostname: "node01".into(),
+                boot_id: Some("11111111-1111-1111-1111-111111111111".into()),
+                net_ns: Some("net:[4026531992]".into()),
+                ssh_server_port: Some(22),
+            },
+            ssh_node_endpoint: Some("198.51.100.9:22".parse().unwrap()),
         }),
     );
     fixtures.check(
@@ -327,6 +348,7 @@ fn check_messages(direction: Direction) {
             error: "copy failed: permission denied".into(),
             summary: summary(),
             runtime_stats: runtime_stats(),
+            peer_connected: true,
         }),
     );
     fixtures.check(

@@ -484,6 +484,9 @@ pub struct RcpdConfig {
     pub tokio_console_port: Option<u16>,
     /// Enable TLS encryption for source↔destination connections (default: true)
     pub encryption: bool,
+    /// Number of destination-owned direct SSH tunnel processes requested for 3-host SSH/auto
+    /// transfers (0 when not applicable; only forwarded on destination daemons when > 0).
+    pub ssh_tunnels: usize,
 }
 
 impl RcpdConfig {
@@ -603,6 +606,9 @@ impl RcpdConfig {
         }
         if !self.encryption {
             args.push("--no-encryption".to_string());
+        }
+        if self.ssh_tunnels > 0 {
+            args.push(format!("--ssh-tunnels={}", self.ssh_tunnels));
         }
         // propagate the adaptive metadata-ops throttle settings to rcpd so a
         // remote copy uses the same control law as the master-side tool.
@@ -752,6 +758,124 @@ impl From<ExtendedMetadataCapture> for common::safedir::RootAclNotice {
     }
 }
 
+/// Parse `<client_ip> <client_port> <server_ip> <server_port>` from OpenSSH's `SSH_CONNECTION`
+/// environment variable into the concrete remote `sshd` socket address (`server_ip:server_port`).
+#[must_use]
+pub fn parse_ssh_connection_server_addr(value: &str) -> Option<std::net::SocketAddr> {
+    let mut parts = value.split_whitespace();
+    let _client_ip = parts.next()?;
+    let _client_port = parts.next()?;
+    let server_ip = parts.next()?.parse::<std::net::IpAddr>().ok()?;
+    let server_port = parts.next()?.parse::<u16>().ok()?;
+    if server_ip.is_unspecified() || server_port == 0 {
+        return None;
+    }
+    Some(std::net::SocketAddr::new(server_ip, server_port))
+}
+
+fn current_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // safety: `buf` is valid for writes of `buf.len()` bytes.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).trim().to_owned()
+}
+
+/// Identity of the host and SSH server instance running an `rcpd` daemon or SSH mux session.
+///
+/// Used to verify that independent SSH tunnel connections (3-host primary/extra tunnels and
+/// 2-host extra tunnels) land on the same peer rather than a different backend behind a
+/// load-balanced SSH hostname.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PeerIdentity {
+    /// Hostname reported by the OS (`gethostname` / `uname -n`).
+    pub hostname: String,
+    /// Linux kernel boot UUID (`/proc/sys/kernel/random/boot_id`), when available.
+    pub boot_id: Option<String>,
+    /// Linux network namespace identifier (`readlink /proc/self/ns/net`), when available.
+    /// Distinguishes distinct containers/namespaces sharing one host kernel.
+    pub net_ns: Option<String>,
+    /// Local `sshd` listening port parsed from `SSH_CONNECTION` (field 4), when available.
+    /// Distinguishes distinct `sshd` instances on the same machine/namespace.
+    pub ssh_server_port: Option<u16>,
+}
+
+impl PeerIdentity {
+    /// Collect the current process's peer identity and optional concrete SSH server endpoint
+    /// (`SSH_CONNECTION` fields 3 & 4) in-process.
+    #[must_use]
+    pub fn current() -> (Self, Option<std::net::SocketAddr>) {
+        let hostname = current_hostname();
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let net_ns = std::fs::read_link("/proc/self/ns/net")
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+        let ssh_endpoint = std::env::var("SSH_CONNECTION")
+            .ok()
+            .and_then(|value| parse_ssh_connection_server_addr(&value));
+        let identity = Self {
+            hostname,
+            boot_id,
+            net_ns,
+            ssh_server_port: ssh_endpoint.map(|addr| addr.port()),
+        };
+        (identity, ssh_endpoint)
+    }
+
+    /// Return true when `other` identifies the same peer host/SSH server instance.
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        if self.hostname.is_empty() || other.hostname.is_empty() || self.hostname != other.hostname
+        {
+            return false;
+        }
+        if let (Some(a), Some(b)) = (&self.boot_id, &other.boot_id)
+            && a != b
+        {
+            return false;
+        }
+        if let (Some(a), Some(b)) = (&self.net_ns, &other.net_ns)
+            && a != b
+        {
+            return false;
+        }
+        if let (Some(a), Some(b)) = (self.ssh_server_port, other.ssh_server_port)
+            && a != b
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Concise human-readable peer summary for error diagnostics.
+    #[must_use]
+    pub fn display_summary(&self) -> String {
+        let mut parts = vec![if self.hostname.is_empty() {
+            "<unknown-host>".to_owned()
+        } else {
+            self.hostname.clone()
+        }];
+        if let Some(port) = self.ssh_server_port {
+            parts.push(format!("sshd_port={port}"));
+        }
+        if let Some(boot_id) = &self.boot_id {
+            let prefix: String = boot_id.chars().take(8).collect();
+            parts.push(format!("boot={prefix}"));
+        }
+        if let Some(net_ns) = &self.net_ns {
+            parts.push(format!("netns={net_ns}"));
+        }
+        parts.join(", ")
+    }
+}
+
 /// Serializable SSH connection target passed to a destination daemon for direct 3-host tunneling.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SshTarget {
@@ -790,6 +914,8 @@ pub enum DestinationTransport {
         tunnel_target_ip: std::net::IpAddr,
         ssh_tunnels: usize,
         dest_root: std::path::PathBuf,
+        source_peer: PeerIdentity,
+        source_node_endpoint: Option<std::net::SocketAddr>,
     },
     /// Probe `source_control_addr` for `probe_timeout_sec`; if TCP connect fails, emit a slow-path
     /// notice and open `ssh_tunnels` parallel `-L` tunnels directly from destination to
@@ -801,6 +927,8 @@ pub enum DestinationTransport {
         tunnel_target_ip: std::net::IpAddr,
         ssh_tunnels: usize,
         dest_root: std::path::PathBuf,
+        source_peer: PeerIdentity,
+        source_node_endpoint: Option<std::net::SocketAddr>,
     },
 }
 
@@ -808,7 +936,7 @@ pub enum DestinationTransport {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterToRcpd {
     /// Initial role configuration sent once after daemon readiness.
-    Hello(MasterHello),
+    Hello(Box<MasterHello>),
     /// Periodic liveness heartbeat when `--remote-keepalive-sec` is nonzero.
     Heartbeat,
     /// Loopback tunnel endpoints opened by the master after [`RcpdToMaster::DirectConnectFailed`].
@@ -864,7 +992,7 @@ pub enum MasterHello {
         /// Preview-only operation; the source does not accept data connections.
         dry_run: bool,
         /// Transport and fallback strategy for reaching the source daemon.
-        transport: DestinationTransport,
+        transport: Box<DestinationTransport>,
     },
 }
 
@@ -879,6 +1007,12 @@ pub struct SourceMasterHello {
     /// address otherwise).
     pub tunnel_target_ip: std::net::IpAddr,
     pub server_name: String,
+    /// Identity of the host/SSH instance running this source daemon, used to detect load-balanced
+    /// SSH tunnel mismatches.
+    pub peer_identity: PeerIdentity,
+    /// Concrete `sshd` server address (`server_ip:server_port`) observed via `SSH_CONNECTION` on
+    /// the source daemon, when running over SSH.
+    pub ssh_node_endpoint: Option<std::net::SocketAddr>,
 }
 
 // re-export RuntimeStats from common for convenience
@@ -895,6 +1029,11 @@ pub enum RcpdResult {
         error: String,
         summary: common::copy::Summary,
         runtime_stats: common::RuntimeStats,
+        /// True when the source↔destination control session had already been established (including
+        /// TLS authentication when enabled) before this failure occurred. When true, the peer may
+        /// hold partial copy/skip counts and the master waits for its terminal result rather than
+        /// cancelling it after the pre-connection peer-failure grace timer.
+        peer_connected: bool,
     },
 }
 
@@ -1164,6 +1303,7 @@ mod tests {
             tokio_console: false,
             tokio_console_port: None,
             encryption: true,
+            ssh_tunnels: 0,
             overwrite_manifest_max_entries: DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
         }
     }
@@ -1480,5 +1620,74 @@ mod tests {
             !args.iter().any(|a| a == "--auto-meta-histogram"),
             "panel-only flag must not be forwarded; the log flag implies the pipeline",
         );
+    }
+
+    #[test]
+    fn to_args_propagates_ssh_tunnels_only_when_nonzero() {
+        let mut config = minimal_rcpd_config();
+        assert!(
+            !config
+                .to_args()
+                .iter()
+                .any(|a| a.starts_with("--ssh-tunnels"))
+        );
+        config.ssh_tunnels = 8;
+        assert!(config.to_args().iter().any(|a| a == "--ssh-tunnels=8"));
+    }
+
+    #[test]
+    fn parse_ssh_connection_server_addr_handles_v4_v6_and_invalid() {
+        assert_eq!(
+            parse_ssh_connection_server_addr("10.0.0.1 54321 10.0.0.2 2222"),
+            Some("10.0.0.2:2222".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ssh_connection_server_addr("::1 54321 ::1 22"),
+            Some("[::1]:22".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ssh_connection_server_addr("10.0.0.1 54321 0.0.0.0 22"),
+            None
+        );
+        assert_eq!(
+            parse_ssh_connection_server_addr("10.0.0.1 54321 10.0.0.2 0"),
+            None
+        );
+        assert_eq!(parse_ssh_connection_server_addr("bad"), None);
+    }
+
+    #[test]
+    fn peer_identity_matches_distinguishes_host_boot_netns_and_port() {
+        let base = PeerIdentity {
+            hostname: "node01".to_owned(),
+            boot_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
+            net_ns: Some("net:[4026531992]".to_owned()),
+            ssh_server_port: Some(22),
+        };
+        assert!(base.matches(&base));
+        assert!(!base.matches(&PeerIdentity {
+            hostname: "node02".to_owned(),
+            ..base.clone()
+        }));
+        assert!(!base.matches(&PeerIdentity {
+            boot_id: Some("22222222-2222-2222-2222-222222222222".to_owned()),
+            ..base.clone()
+        }));
+        assert!(!base.matches(&PeerIdentity {
+            net_ns: Some("net:[4026532000]".to_owned()),
+            ..base.clone()
+        }));
+        assert!(!base.matches(&PeerIdentity {
+            ssh_server_port: Some(2202),
+            ..base.clone()
+        }));
+        let empty = PeerIdentity {
+            hostname: String::new(),
+            boot_id: None,
+            net_ns: None,
+            ssh_server_port: None,
+        };
+        assert!(!empty.matches(&empty));
+        assert!(!base.matches(&empty));
     }
 }

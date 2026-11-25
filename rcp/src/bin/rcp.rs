@@ -586,13 +586,19 @@ fn resolve_source_bind_ip_for_transport(
     transport: RemoteTransport,
     explicit_bind_ip: Option<&str>,
     source_host: &str,
+    address_family: remote::ssh_tunnel::SshAddressFamily,
 ) -> Option<String> {
     match transport {
-        RemoteTransport::Ssh => Some("127.0.0.1".to_string()),
+        RemoteTransport::Ssh => Some(address_family.loopback_ip().to_string()),
         // in `auto` mode, do not infer `--bind-ip` from a literal IPv4 operand: cloud/NAT public
         // IPs are not bound on the host's local interfaces and would fail at bind before `auto`
-        // can probe or fall back to SSH
-        RemoteTransport::Auto => explicit_bind_ip.map(str::to_owned),
+        // can probe or fall back to SSH. Under `AddressFamily inet6` without an explicit
+        // `--bind-ip`, bind dual-stack `::` so IPv4 direct TCP still works while `::1` stays
+        // reachable for IPv6 SSH `-L`/`-R` fallback.
+        RemoteTransport::Auto => explicit_bind_ip.map(str::to_owned).or_else(|| {
+            (address_family == remote::ssh_tunnel::SshAddressFamily::Inet6)
+                .then(|| "::".to_string())
+        }),
         RemoteTransport::Tcp => resolve_source_bind_ip(explicit_bind_ip, source_host),
     }
 }
@@ -932,6 +938,7 @@ fn build_master_remote_request(
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
         encryption: !args.no_encryption,
+        ssh_tunnels: 0,
     };
     Ok(MasterRemoteRequest {
         tcp,
@@ -1202,17 +1209,22 @@ struct RemoteCopyOperands {
 }
 
 impl RemoteCopyOperands {
-    fn topology(&self) -> CopyTopology {
+    fn topology_with_resolved(
+        &self,
+        resolved_src: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+        resolved_dst: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
+    ) -> CopyTopology {
         match (self.source_is_local, self.destination_is_local) {
             (false, true) => CopyTopology::Download,
             (true, false) => CopyTopology::Upload,
-            (false, false)
-                if self.source.session().host == self.destination.session().host
-                    && self.source.session().port == self.destination.session().port =>
-            {
+            (false, false) if self.source.session() == self.destination.session() => {
+                // identical (user, host, port) shares one SSH session, guaranteeing the same host
                 CopyTopology::SameHost
             }
-            (false, false) => CopyTopology::ThreeHost,
+            (false, false) => match (resolved_src, resolved_dst) {
+                (Some(src), Some(dst)) if src.same_endpoint(dst) => CopyTopology::SameHost,
+                _ => CopyTopology::ThreeHost,
+            },
             (true, true) => unreachable!("remote_copy_operands never accepts two local paths"),
         }
     }
@@ -1299,11 +1311,13 @@ const PEER_FAILURE_RESULT_GRACE: std::time::Duration = std::time::Duration::from
 
 struct MasterSshTunnelPlan<'a> {
     direction: remote::ssh_tunnel::ForwardDirection,
-    primary_control_path: std::path::PathBuf,
-    session: remote::SshSession,
+    endpoint: &'a remote::PreparedRcpd,
     target_control: std::net::SocketAddr,
     target_data: Option<std::net::SocketAddr>,
     requested_tunnels: usize,
+    address_family: remote::ssh_tunnel::SshAddressFamily,
+    expected_peer: Option<remote::protocol::PeerIdentity>,
+    node_endpoint: Option<std::net::SocketAddr>,
     keepalive_sec: u64,
     timeout: std::time::Duration,
     cleanup: &'a remote::RemoteCleanup,
@@ -1312,13 +1326,41 @@ struct MasterSshTunnelPlan<'a> {
 
 impl MasterSshTunnelPlan<'_> {
     async fn open(&self) -> anyhow::Result<remote::ssh_tunnel::SshTunnelSet> {
+        let mut expected_peer = self.expected_peer.clone();
+        let mut node_endpoint = self.node_endpoint;
+        // for multi-tunnel uploads (-R), probe the destination's peer identity over its retained
+        // control master so extra tunnels 2..=K can pin and verify they hit the same backend node
+        if self.direction == remote::ssh_tunnel::ForwardDirection::Remote
+            && self.target_data.is_some()
+            && self.requested_tunnels > 1
+            && expected_peer.is_none()
+        {
+            match self
+                .endpoint
+                .probe_peer_identity(self.timeout.min(std::time::Duration::from_secs(5)))
+                .await
+            {
+                Ok((peer, endpoint)) => {
+                    expected_peer = Some(peer);
+                    node_endpoint = endpoint;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "could not probe destination peer identity for parallel upload tunnels (using primary tunnel only): {error:#}"
+                    );
+                }
+            }
+        }
         remote::ssh_tunnel::SshTunnelSet::open_on_existing_session(
             self.direction,
-            &self.primary_control_path,
-            &self.session,
+            &self.endpoint.control_path(),
+            self.endpoint.remote(),
             self.target_control,
             self.target_data,
             self.requested_tunnels,
+            self.address_family,
+            expected_peer.as_ref(),
+            node_endpoint,
             self.keepalive_sec,
             self.timeout,
             self.cleanup,
@@ -1380,10 +1422,36 @@ where
             let source_result = decode_daemon_result(source_fut.await, "source", source_host)?;
             Ok((source_result, dest_result))
         }
-        Ok(dest_result @ remote::protocol::RcpdResult::Failure { .. }) => {
-            // destination failed first: give an already-connected source a short grace to observe
-            // TCP close and report its own summary/attribution, without stalling for the full
-            // accept timeout if destination failed before connecting
+        Ok(
+            dest_result @ remote::protocol::RcpdResult::Failure {
+                peer_connected: true,
+                ..
+            },
+        ) => {
+            // destination failed on an established copy: source observes TCP close and owns skip
+            // counts, so let it deliver its terminal result (bounded by SSH keepalive) rather than
+            // cutting it off after the pre-connection grace timer
+            match decode_daemon_result(source_fut.await, "source", source_host) {
+                Ok(source_result) => Ok((source_result, dest_result)),
+                Err(source_err) => {
+                    tracing::debug!(
+                        "source on '{source_host}' did not report a result after destination failure: {source_err:#}"
+                    );
+                    if let Some(stdin) = source_stdin.take() {
+                        stdin.close().await;
+                    }
+                    Err(format_single_role_failure("Destination", dest_result))
+                }
+            }
+        }
+        Ok(
+            dest_result @ remote::protocol::RcpdResult::Failure {
+                peer_connected: false,
+                ..
+            },
+        ) => {
+            // destination failed before connecting: give source a short grace in case it already
+            // failed independently, without stalling for the full accept timeout
             match tokio::time::timeout(peer_failure_grace, source_fut).await {
                 Ok(src_res) => match decode_daemon_result(src_res, "source", source_host) {
                     Ok(source_result) => Ok((source_result, dest_result)),
@@ -1448,17 +1516,24 @@ where
             biased;
             src_res = &mut source_fut => {
                 let source_result = decode_daemon_result(src_res, "source", source_host)?;
-                if matches!(source_result, remote::protocol::RcpdResult::Failure { .. }) {
-                    // source failed first: give an already-connected destination a short grace to
-                    // report its own result/summary, without stalling (e.g. while 3-host auto
-                    // opens fallback tunnels) or letting destination EOF/DirectConnectFailed
-                    // overwrite the authoritative source error and summary
-                    match tokio::time::timeout(
-                        peer_failure_grace,
-                        dest_control_rx.recv_destination_event(),
-                    )
-                    .await
-                    {
+                if let remote::protocol::RcpdResult::Failure { peer_connected, .. } = &source_result
+                {
+                    let peer_connected = *peer_connected;
+                    let dest_event = if peer_connected {
+                        // source failed on an established copy: destination owns the copied file
+                        // and byte counts and may need more than `peer_failure_grace` to flush and
+                        // finalize partial writes before sending its terminal RcpdResult
+                        Ok(dest_control_rx.recv_destination_event().await)
+                    } else {
+                        // source failed before destination connected: keep prompt cancellation so
+                        // a destination probing direct TCP or setting up fallback does not stall
+                        tokio::time::timeout(
+                            peer_failure_grace,
+                            dest_control_rx.recv_destination_event(),
+                        )
+                        .await
+                    };
+                    match dest_event {
                         Ok(Ok(Some(remote::stdio::DestinationControlEvent::Result(
                             dest_result,
                         )))) => {
@@ -1621,8 +1696,135 @@ async fn run_rcpd_master(
     tracing::debug!("running rcpd src/dst");
     let src = &operands.source;
     let dst = &operands.destination;
-    let topology = operands.topology();
     let transport = args.remote_transport;
+    let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
+    let keepalive_sec = request.tcp.keepalive_sec;
+    // resolve SSH config for the effective endpoint(s) whenever SSH transport/fallback is active:
+    // - determines whether two distinct remote specs (e.g. alice@cluster vs bob@cluster with Match
+    //   user rules) actually resolve to the same SSH endpoint
+    // - discovers AddressFamily (inet6 vs inet/any) for loopback listener & forward selection
+    // - resolves effective source target & destination ForwardAgent for 3-host mode
+    let (resolved_src_ssh, resolved_dst_ssh) = if transport == RemoteTransport::Tcp {
+        (None, None)
+    } else {
+        match (operands.source_is_local, operands.destination_is_local) {
+            (false, true) => {
+                let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
+                    src.session(),
+                    bootstrap_timeout,
+                    cleanup,
+                )
+                .await
+                {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        tracing::debug!(
+                            host = %src.session().host,
+                            "could not resolve source SSH config (defaulting AddressFamily to any): {error:#}"
+                        );
+                        None
+                    }
+                };
+                (resolved_src, None)
+            }
+            (true, false) => {
+                let resolved_dst = match remote::ssh_tunnel::resolve_ssh_config(
+                    dst.session(),
+                    bootstrap_timeout,
+                    cleanup,
+                )
+                .await
+                {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        tracing::debug!(
+                            host = %dst.session().host,
+                            "could not resolve destination SSH config (defaulting AddressFamily to any): {error:#}"
+                        );
+                        None
+                    }
+                };
+                (None, resolved_dst)
+            }
+            (false, false) if src.session() == dst.session() => {
+                let resolved_src = match remote::ssh_tunnel::resolve_ssh_config(
+                    src.session(),
+                    bootstrap_timeout,
+                    cleanup,
+                )
+                .await
+                {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        tracing::debug!(
+                            host = %src.session().host,
+                            "could not resolve same-host SSH config (defaulting AddressFamily to any): {error:#}"
+                        );
+                        None
+                    }
+                };
+                (resolved_src, None)
+            }
+            (false, false) => {
+                let resolve_src = async {
+                    remote::ssh_tunnel::resolve_ssh_config(
+                        src.session(),
+                        bootstrap_timeout,
+                        cleanup,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve SSH configuration for source host '{}'",
+                            src.session().host
+                        )
+                    })
+                };
+                let resolve_dst = async {
+                    remote::ssh_tunnel::resolve_ssh_config(
+                        dst.session(),
+                        bootstrap_timeout,
+                        cleanup,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve SSH configuration for destination host '{}'",
+                            dst.session().host
+                        )
+                    })
+                };
+                let (resolved_src, resolved_dst) = tokio::try_join!(resolve_src, resolve_dst)?;
+                (Some(resolved_src), Some(resolved_dst))
+            }
+            (true, true) => unreachable!("remote_copy_operands never accepts two local paths"),
+        }
+    };
+    let topology =
+        operands.topology_with_resolved(resolved_src_ssh.as_ref(), resolved_dst_ssh.as_ref());
+    let forwarding_address_family = match topology {
+        CopyTopology::Download => resolved_src_ssh
+            .as_ref()
+            .map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
+                c.address_family
+            }),
+        CopyTopology::Upload => resolved_dst_ssh
+            .as_ref()
+            .map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
+                c.address_family
+            }),
+        CopyTopology::ThreeHost | CopyTopology::SameHost => resolved_src_ssh
+            .as_ref()
+            .map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
+                c.address_family
+            }),
+    };
+    let source_bind_ip = resolve_source_bind_ip_for_transport(
+        transport,
+        args.bind_ip.as_deref(),
+        &src.session().host,
+        forwarding_address_family,
+    );
     if transport == RemoteTransport::Ssh {
         if args.port_ranges.is_some() {
             tracing::warn!(
@@ -1631,59 +1833,34 @@ async fn run_rcpd_master(
             );
         }
         if args.bind_ip.is_some() {
+            let bound = source_bind_ip.as_deref().unwrap_or("127.0.0.1");
             tracing::warn!(
                 target: common::NOTICE_TARGET,
-                "--bind-ip is ignored when --remote-transport=ssh is set; source binds to 127.0.0.1"
+                "--bind-ip is ignored when --remote-transport=ssh is set; source binds to {bound}"
             );
         }
     }
     let mut teardown = RemoteTeardown::default();
     let source_config = build_source_remote_config(&request);
-    let source_bind_ip = resolve_source_bind_ip_for_transport(
-        transport,
-        args.bind_ip.as_deref(),
-        &src.session().host,
-    );
-    let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
-    let keepalive_sec = request.tcp.keepalive_sec;
-    let (three_host_source_ssh, dest_agent_forward_mode) = if topology == CopyTopology::ThreeHost
-        && transport != RemoteTransport::Tcp
-    {
-        let resolve_src = async {
-            remote::ssh_tunnel::resolve_ssh_config(src.session(), bootstrap_timeout, cleanup)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve SSH configuration for source host '{}'",
-                        src.session().host
-                    )
-                })
-        };
-        if args.ssh_forward_agent {
-            let resolved_src = resolve_src.await?;
-            (Some(resolved_src.target), remote::AgentForwardMode::ForceOn)
-        } else {
-            let resolve_dst = async {
-                remote::ssh_tunnel::resolve_ssh_config(dst.session(), bootstrap_timeout, cleanup)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to resolve SSH configuration for destination host '{}'",
-                            dst.session().host
-                        )
-                    })
-            };
-            let (resolved_src, resolved_dst) = tokio::try_join!(resolve_src, resolve_dst)?;
-            let agent_mode = if resolved_dst.forward_agent_enabled {
+    let (three_host_source_ssh, dest_agent_forward_mode) =
+        if topology == CopyTopology::ThreeHost && transport != RemoteTransport::Tcp {
+            let resolved_src = resolved_src_ssh
+                .as_ref()
+                .expect("three-host SSH/auto resolves source SSH config");
+            let agent_mode = if args.ssh_forward_agent {
+                remote::AgentForwardMode::ForceOn
+            } else if resolved_dst_ssh
+                .as_ref()
+                .is_some_and(|dst_cfg| dst_cfg.forward_agent_enabled)
+            {
                 remote::AgentForwardMode::InheritConfig
             } else {
                 remote::AgentForwardMode::Off
             };
-            (Some(resolved_src.target), agent_mode)
-        }
-    } else {
-        (None, remote::AgentForwardMode::Off)
-    };
+            (Some(resolved_src.target.clone()), agent_mode)
+        } else {
+            (None, remote::AgentForwardMode::Off)
+        };
     let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
         src.session(),
         dst.session(),
@@ -1736,10 +1913,24 @@ async fn run_rcpd_master(
         "Source rcpd ready (encryption={})",
         source_readiness.fingerprint.is_some()
     );
+    let requested_tunnels = if request.rcpd.preview_only {
+        1
+    } else {
+        args.ssh_tunnels
+            .get()
+            .min(source_readiness.max_connections.get())
+            .max(1)
+    };
     let mut dest_stdin: Option<remote::stdio::MasterStdinSender> = None;
     let destination_setup = async {
         validate_readiness_encryption("source", request.rcpd.encryption, &source_readiness)?;
-        let destination_config = build_destination_remote_config(&request, &source_readiness)?;
+        let mut destination_config = build_destination_remote_config(&request, &source_readiness)?;
+        if topology == CopyTopology::ThreeHost
+            && transport != RemoteTransport::Tcp
+            && !request.rcpd.preview_only
+        {
+            destination_config.ssh_tunnels = requested_tunnels;
+        }
         if let Some(notice) = remote_stream_clamp_notice(
             request.concurrency_policy,
             source_readiness.files_in_flight,
@@ -1821,14 +2012,6 @@ async fn run_rcpd_master(
         request.tcp.conn_timeout_sec,
         effective_probe_timeout_sec,
     );
-    let requested_tunnels = if request.rcpd.preview_only {
-        1
-    } else {
-        args.ssh_tunnels
-            .get()
-            .min(source_readiness.max_connections.get())
-            .max(1)
-    };
     let operation_result = async {
         let filter = request.filter;
         // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
@@ -1886,15 +2069,18 @@ async fn run_rcpd_master(
             }
         };
         let build_master_tunnel_plan = |direction| {
-            let endpoint = match direction {
-                remote::ssh_tunnel::ForwardDirection::Local => &prepared_source,
-                remote::ssh_tunnel::ForwardDirection::Remote => &prepared_destination,
+            let (endpoint, expected_peer, node_endpoint) = match direction {
+                remote::ssh_tunnel::ForwardDirection::Local => (
+                    &prepared_source,
+                    Some(source_hello.peer_identity.clone()),
+                    source_hello.ssh_node_endpoint,
+                ),
+                remote::ssh_tunnel::ForwardDirection::Remote => (&prepared_destination, None, None),
             };
             let target_ip = source_hello.tunnel_target_ip;
             MasterSshTunnelPlan {
                 direction,
-                primary_control_path: endpoint.control_path(),
-                session: endpoint.remote().clone(),
+                endpoint,
                 target_control: std::net::SocketAddr::new(
                     target_ip,
                     source_hello.control_addr.port(),
@@ -1903,6 +2089,9 @@ async fn run_rcpd_master(
                     std::net::SocketAddr::new(target_ip, source_hello.data_addr.port())
                 }),
                 requested_tunnels,
+                address_family: forwarding_address_family,
+                expected_peer,
+                node_endpoint,
                 keepalive_sec,
                 timeout: bootstrap_timeout,
                 cleanup,
@@ -1969,6 +2158,8 @@ async fn run_rcpd_master(
                         tunnel_target_ip: source_hello.tunnel_target_ip,
                         ssh_tunnels: requested_tunnels,
                         dest_root: dst.path().to_path_buf(),
+                        source_peer: source_hello.peer_identity.clone(),
+                        source_node_endpoint: source_hello.ssh_node_endpoint,
                     },
                     None,
                 ),
@@ -1982,6 +2173,8 @@ async fn run_rcpd_master(
                         tunnel_target_ip: source_hello.tunnel_target_ip,
                         ssh_tunnels: requested_tunnels,
                         dest_root: dst.path().to_path_buf(),
+                        source_peer: source_hello.peer_identity.clone(),
+                        source_node_endpoint: source_hello.ssh_node_endpoint,
                     },
                     None,
                 ),
@@ -1999,7 +2192,7 @@ async fn run_rcpd_master(
                     preserve: *preserve,
                     source_cert_fingerprint: source_readiness.fingerprint,
                     dry_run: request.rcpd.preview_only,
-                    transport: dest_transport,
+                    transport: Box::new(dest_transport),
                 })
                 .await?;
         }
@@ -2060,6 +2253,7 @@ async fn run_rcpd_master(
             error,
             summary,
             runtime_stats,
+            peer_connected: _,
         } => {
             // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("Source rcpd failed: {error}");
@@ -2080,6 +2274,7 @@ async fn run_rcpd_master(
             error,
             summary,
             runtime_stats,
+            peer_connected: _,
         } => {
             // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("Destination rcpd failed: {error}");
@@ -3526,32 +3721,71 @@ mod tests {
         let forced_localhost_src = path::parse_path_force_remote("localhost:/src").unwrap();
         let forced_localhost_dst = path::parse_path_force_remote("localhost:/dst").unwrap();
         let forced_ip_src = path::parse_path_force_remote("127.0.0.1:/src").unwrap();
+        let resolved = |user: Option<&str>, host: &str, port: Option<u16>| {
+            remote::ssh_tunnel::ResolvedSshConfig {
+                original_host: host.to_owned(),
+                target: remote::protocol::SshTarget {
+                    user: user.map(str::to_owned),
+                    host: host.to_owned(),
+                    port,
+                },
+                forward_agent_enabled: false,
+                address_family: remote::ssh_tunnel::SshAddressFamily::Any,
+                proxy_jump: None,
+                proxy_command: None,
+            }
+        };
+        // identical (user, host, port) takes SameHost directly without needing ssh -G
         assert_eq!(
-            remote_copy_operands(remote_a.clone(), remote_a_user, vec![])
+            remote_copy_operands(remote_a.clone(), remote_a.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::SameHost
+        );
+        // different user on the same alias takes SameHost ONLY when effective endpoints match
+        let alice_cfg = resolved(Some("alice"), "10.0.0.1", Some(22));
+        let bob_same_cfg = resolved(Some("deploy"), "10.0.0.1", Some(22));
+        let bob_other_host_cfg = resolved(Some("deploy"), "10.0.0.2", Some(22));
+        let bob_other_port_cfg = resolved(Some("deploy"), "10.0.0.1", Some(2202));
+        let shared_alias = remote_copy_operands(remote_a.clone(), remote_a_user, vec![])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_same_cfg)),
+            CopyTopology::SameHost
+        );
+        assert_eq!(
+            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_other_host_cfg)),
+            CopyTopology::ThreeHost
+        );
+        assert_eq!(
+            shared_alias.topology_with_resolved(Some(&alice_cfg), Some(&bob_other_port_cfg)),
+            CopyTopology::ThreeHost
+        );
+        assert_eq!(
+            shared_alias.topology_with_resolved(None, None),
+            CopyTopology::ThreeHost
         );
         assert_eq!(
             remote_copy_operands(remote_a.clone(), remote_b.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(Some(&alice_cfg), Some(&bob_other_host_cfg)),
             CopyTopology::ThreeHost
         );
         assert_eq!(
             remote_copy_operands(remote_a, local_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::Download
         );
         assert_eq!(
             remote_copy_operands(local_src.clone(), remote_b, vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::Upload
         );
         // --force-remote distinguishes Download (-L), Upload (-R), SameHost, and ThreeHost locally
@@ -3559,28 +3793,28 @@ mod tests {
             remote_copy_operands(forced_localhost_src.clone(), local_dst, vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::Download
         );
         assert_eq!(
             remote_copy_operands(local_src, forced_localhost_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::Upload
         );
         assert_eq!(
             remote_copy_operands(forced_localhost_src, forced_localhost_dst.clone(), vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::SameHost
         );
         assert_eq!(
             remote_copy_operands(forced_ip_src, forced_localhost_dst, vec![])
                 .unwrap()
                 .unwrap()
-                .topology(),
+                .topology_with_resolved(None, None),
             CopyTopology::ThreeHost
         );
     }
@@ -3725,6 +3959,7 @@ mod tests {
                 error: "source read denied".to_owned(),
                 summary: expected_summary,
                 runtime_stats: Default::default(),
+                peer_connected: false,
             })
             .await
             .unwrap();
@@ -3785,6 +4020,7 @@ mod tests {
                     ..Default::default()
                 },
                 runtime_stats: Default::default(),
+                peer_connected: false,
             })
             .await
             .unwrap();
@@ -3864,6 +4100,7 @@ mod tests {
                         ..Default::default()
                     },
                     runtime_stats: Default::default(),
+                    peer_connected: false,
                 })
                 .await
                 .unwrap();
@@ -3988,35 +4225,271 @@ mod tests {
         dst_w.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn await_daemon_results_preserves_destination_partial_summary_on_established_source_failure()
+     {
+        let (src_tx, mut src_rx, src_stdin, _src_in_r, src_stop, src_w, src_d) =
+            spawn_test_daemon_channels().await;
+        let (dst_tx, mut dst_rx, dst_stdin, _dst_in_r, dst_stop, dst_w, _dst_d) =
+            spawn_test_daemon_channels().await;
+        let mut src_stdin = Some(src_stdin);
+        let mut dst_stdin = Some(dst_stdin);
+        src_tx
+            .send_result(remote::protocol::RcpdResult::Failure {
+                error: "source permission denied on one file".to_owned(),
+                summary: common::copy::Summary {
+                    files_skipped: 4,
+                    ..Default::default()
+                },
+                runtime_stats: Default::default(),
+                peer_connected: true,
+            })
+            .await
+            .unwrap();
+        drop(src_tx);
+        src_stop.cancel();
+        src_w.await.unwrap().unwrap();
+        src_d.join().await.unwrap();
+        let grace = std::time::Duration::from_millis(60);
+        // delay destination terminal result well past the pre-connection peer-failure grace
+        let delayed_dest = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            dst_tx
+                .send_result(remote::protocol::RcpdResult::Success {
+                    message: "destination finalized partial files".to_owned(),
+                    summary: common::copy::Summary {
+                        files_copied: 12,
+                        bytes_copied: 8192,
+                        ..Default::default()
+                    },
+                    runtime_stats: Default::default(),
+                })
+                .await
+                .unwrap();
+            drop(dst_tx);
+            dst_stop.cancel();
+            dst_w.await.unwrap().unwrap();
+        });
+        let opener: Option<TestFallbackOpener> = None;
+        let (src_res, dst_res) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            await_daemon_results_with_fallback(
+                &mut src_rx,
+                &mut dst_rx,
+                &mut src_stdin,
+                &mut dst_stdin,
+                opener,
+                "src-host",
+                "dst-host",
+                grace,
+            ),
+        )
+        .await
+        .expect("established source failure must wait for destination terminal result")
+        .expect("established failure must return both results for summary merging");
+        delayed_dest.await.unwrap();
+        match src_res {
+            remote::protocol::RcpdResult::Failure {
+                error,
+                summary,
+                peer_connected,
+                ..
+            } => {
+                assert!(peer_connected);
+                assert!(error.contains("source permission denied on one file"));
+                assert_eq!(summary.files_skipped, 4);
+            }
+            other => panic!("expected source Failure, got {other:?}"),
+        }
+        match dst_res {
+            remote::protocol::RcpdResult::Success { summary, .. } => {
+                assert_eq!(summary.files_copied, 12);
+                assert_eq!(summary.bytes_copied, 8192);
+            }
+            other => panic!("expected destination Success with partial counts, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_daemon_results_handles_established_and_pre_connect_destination_failures() {
+        // 1. destination failure after connection establishment (peer_connected: true) must wait
+        // past peer_failure_grace so source can report its skip counts
+        let (src_tx, mut src_rx, src_stdin, _src_in_r, src_stop, src_w, _src_d) =
+            spawn_test_daemon_channels().await;
+        let (dst_tx, mut dst_rx, dst_stdin, _dst_in_r, dst_stop, dst_w, dst_d) =
+            spawn_test_daemon_channels().await;
+        let mut src_stdin = Some(src_stdin);
+        let mut dst_stdin = Some(dst_stdin);
+        dst_tx
+            .send_result(remote::protocol::RcpdResult::Failure {
+                error: "destination disk full".to_owned(),
+                summary: common::copy::Summary {
+                    files_copied: 7,
+                    bytes_copied: 4096,
+                    ..Default::default()
+                },
+                runtime_stats: Default::default(),
+                peer_connected: true,
+            })
+            .await
+            .unwrap();
+        drop(dst_tx);
+        dst_stop.cancel();
+        dst_w.await.unwrap().unwrap();
+        dst_d.join().await.unwrap();
+        let grace = std::time::Duration::from_millis(60);
+        let delayed_src = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            src_tx
+                .send_result(remote::protocol::RcpdResult::Failure {
+                    error: "destination closed connection".to_owned(),
+                    summary: common::copy::Summary {
+                        files_skipped: 3,
+                        ..Default::default()
+                    },
+                    runtime_stats: Default::default(),
+                    peer_connected: true,
+                })
+                .await
+                .unwrap();
+            drop(src_tx);
+            src_stop.cancel();
+            src_w.await.unwrap().unwrap();
+        });
+        let opener: Option<TestFallbackOpener> = None;
+        let (src_res, dst_res) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            await_daemon_results_with_fallback(
+                &mut src_rx,
+                &mut dst_rx,
+                &mut src_stdin,
+                &mut dst_stdin,
+                opener,
+                "src-host",
+                "dst-host",
+                grace,
+            ),
+        )
+        .await
+        .expect("established destination failure must wait for source terminal result")
+        .expect("established failure must return both results for summary merging");
+        delayed_src.await.unwrap();
+        match src_res {
+            remote::protocol::RcpdResult::Failure { summary, .. } => {
+                assert_eq!(summary.files_skipped, 3);
+            }
+            other => panic!("expected source Failure with skip counts, got {other:?}"),
+        }
+        match dst_res {
+            remote::protocol::RcpdResult::Failure { summary, .. } => {
+                assert_eq!(summary.files_copied, 7);
+                assert_eq!(summary.bytes_copied, 4096);
+            }
+            other => panic!("expected destination Failure with partial counts, got {other:?}"),
+        }
+        // 2. destination failure before connecting (peer_connected: false) must cancel source
+        // stdin after peer_failure_grace instead of stalling on source's accept timeout
+        let (_src_tx2, mut src_rx2, src_stdin2, mut src_in_r2, _src_stop2, _src_w2, _src_d2) =
+            spawn_test_daemon_channels().await;
+        let (dst_tx2, mut dst_rx2, dst_stdin2, _dst_in_r2, dst_stop2, dst_w2, dst_d2) =
+            spawn_test_daemon_channels().await;
+        let mut src_stdin2 = Some(src_stdin2);
+        let mut dst_stdin2 = Some(dst_stdin2);
+        dst_tx2
+            .send_result(remote::protocol::RcpdResult::Failure {
+                error: "could not establish 3-host SSH tunnel".to_owned(),
+                summary: common::copy::Summary::default(),
+                runtime_stats: Default::default(),
+                peer_connected: false,
+            })
+            .await
+            .unwrap();
+        drop(dst_tx2);
+        dst_stop2.cancel();
+        dst_w2.await.unwrap().unwrap();
+        dst_d2.join().await.unwrap();
+        let opener: Option<TestFallbackOpener> = None;
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            await_daemon_results_with_fallback(
+                &mut src_rx2,
+                &mut dst_rx2,
+                &mut src_stdin2,
+                &mut dst_stdin2,
+                opener,
+                "src-host",
+                "dst-host",
+                grace,
+            ),
+        )
+        .await
+        .expect("pre-connection destination failure must time out after peer_failure_grace")
+        .expect_err("pre-connection destination failure must return destination error");
+        assert!(format!("{err:#}").contains("could not establish 3-host SSH tunnel"));
+        assert!(
+            src_stdin2.is_none(),
+            "source stdin must be closed on grace timeout"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                src_in_r2.recv_object::<remote::protocol::MasterToRcpd>(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none(),
+            "closing source stdin must deliver EOF to source rcpd"
+        );
+    }
+
     #[test]
     fn resolve_source_bind_ip_for_transport_avoids_inferred_ip_in_auto_mode() {
+        let any = remote::ssh_tunnel::SshAddressFamily::Any;
+        let inet6 = remote::ssh_tunnel::SshAddressFamily::Inet6;
         // tcp mode retains inferred IPv4 literal behavior
         assert_eq!(
-            resolve_source_bind_ip_for_transport(RemoteTransport::Tcp, None, "54.1.2.3"),
+            resolve_source_bind_ip_for_transport(RemoteTransport::Tcp, None, "54.1.2.3", any),
             Some("54.1.2.3".to_string())
         );
         // auto mode avoids inferring unbindable NAT/public IPs when --bind-ip was not passed
         assert_eq!(
-            resolve_source_bind_ip_for_transport(RemoteTransport::Auto, None, "54.1.2.3"),
+            resolve_source_bind_ip_for_transport(RemoteTransport::Auto, None, "54.1.2.3", any),
             None
+        );
+        // auto mode under AddressFamily inet6 binds dual-stack :: so IPv6 fallback targets ::1
+        assert_eq!(
+            resolve_source_bind_ip_for_transport(RemoteTransport::Auto, None, "54.1.2.3", inet6),
+            Some("::".to_string())
         );
         // auto mode still honors an explicit --bind-ip
         assert_eq!(
             resolve_source_bind_ip_for_transport(
                 RemoteTransport::Auto,
                 Some("10.0.0.5"),
-                "54.1.2.3"
+                "54.1.2.3",
+                inet6
             ),
             Some("10.0.0.5".to_string())
         );
-        // ssh mode always binds loopback regardless of explicit --bind-ip or host literal
+        // ssh mode always binds matching loopback regardless of explicit --bind-ip or host literal
         assert_eq!(
             resolve_source_bind_ip_for_transport(
                 RemoteTransport::Ssh,
                 Some("10.0.0.5"),
-                "54.1.2.3"
+                "54.1.2.3",
+                any
             ),
             Some("127.0.0.1".to_string())
+        );
+        assert_eq!(
+            resolve_source_bind_ip_for_transport(
+                RemoteTransport::Ssh,
+                Some("10.0.0.5"),
+                "54.1.2.3",
+                inet6
+            ),
+            Some("::1".to_string())
         );
     }
 

@@ -1933,6 +1933,7 @@ async fn connect_destination_transport(
     src_control_addr: &std::net::SocketAddr,
     src_data_addrs: &[std::net::SocketAddr],
     dry_run: bool,
+    admitted_ssh_tunnels: Option<usize>,
     transport: &remote::protocol::DestinationTransport,
     tcp_config: &remote::TcpConfig,
     master_control: &remote::stdio::DaemonControlSender,
@@ -2027,6 +2028,8 @@ async fn connect_destination_transport(
             tunnel_target_ip,
             ssh_tunnels,
             dest_root,
+            source_peer,
+            source_node_endpoint,
         } => {
             connect_direct_ssh_tunnels(
                 source_ssh,
@@ -2035,6 +2038,9 @@ async fn connect_destination_transport(
                 src_data_addrs,
                 dry_run,
                 *ssh_tunnels,
+                admitted_ssh_tunnels,
+                source_peer,
+                *source_node_endpoint,
                 dest_root,
                 tcp_config,
                 cleanup,
@@ -2048,6 +2054,8 @@ async fn connect_destination_transport(
             tunnel_target_ip,
             ssh_tunnels,
             dest_root,
+            source_peer,
+            source_node_endpoint,
         } => {
             let probe_timeout = std::time::Duration::from_secs((*probe_timeout_sec).max(1));
             tracing::info!(
@@ -2081,6 +2089,9 @@ async fn connect_destination_transport(
                         src_data_addrs,
                         dry_run,
                         *ssh_tunnels,
+                        admitted_ssh_tunnels,
+                        source_peer,
+                        *source_node_endpoint,
                         dest_root,
                         tcp_config,
                         cleanup,
@@ -2101,6 +2112,9 @@ async fn connect_direct_ssh_tunnels(
     src_data_addrs: &[std::net::SocketAddr],
     dry_run: bool,
     ssh_tunnels: usize,
+    admitted_ssh_tunnels: Option<usize>,
+    source_peer: &remote::protocol::PeerIdentity,
+    source_node_endpoint: Option<std::net::SocketAddr>,
     dest_root: &std::path::Path,
     tcp_config: &remote::TcpConfig,
     cleanup: &remote::RemoteCleanup,
@@ -2122,6 +2136,9 @@ async fn connect_direct_ssh_tunnels(
         target_control,
         target_data,
         ssh_tunnels,
+        admitted_ssh_tunnels,
+        Some(source_peer),
+        source_node_endpoint,
         tcp_config.keepalive_sec,
         std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
         cleanup,
@@ -2186,7 +2203,14 @@ pub async fn run_destination(
     master_control: &remote::stdio::DaemonControlSender,
     fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
     cleanup: &remote::RemoteCleanup,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
+    let admitted_ssh_tunnels = match admission {
+        common::EndpointAdmission::Remote(resources) if resources.ssh_tunnels > 0 => {
+            Some(resources.ssh_tunnels)
+        }
+        _ => None,
+    };
     let directory_work = match admission {
         common::EndpointAdmission::Remote(resources) => resources.leaf_capacity,
         _ => concurrency.max_connections(),
@@ -2234,6 +2258,7 @@ pub async fn run_destination(
         src_control_addr,
         src_data_addrs,
         dry_run,
+        admitted_ssh_tunnels,
         transport,
         tcp_config,
         master_control,
@@ -2266,6 +2291,7 @@ pub async fn run_destination(
         )
         .await
         .map_err(attach_ssh_control_hint)?;
+        peer_connected.store(true, std::sync::atomic::Ordering::Release);
         // wrap in Arc<Mutex<>> for shared access
         let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
         if let Some(limits) = directory_limits {
@@ -6056,6 +6082,7 @@ mod ssh_transport_tests {
             &unreachable_addr,
             &[unreachable_addr],
             false,
+            None,
             &remote::protocol::DestinationTransport::AutoMasterSsh {
                 probe_timeout_sec: 2,
             },

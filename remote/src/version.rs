@@ -47,9 +47,11 @@ pub struct ProtocolVersion {
 /// Revision 13 moves master↔rcpd control and tracing onto SSH stdio (`RCP_READY`,
 /// `MasterToRcpd`, `RcpdToMaster`), removing the master-facing TCP listener and `--master-cert-fp`.
 /// Revision 14 adds destination↔source SSH tunnel transport and `auto` fallback negotiation
-/// (`DestinationTransport`, `SshTarget`, `MasterToRcpd::SshFallbackEndpoints`,
-/// `RcpdToMaster::DirectConnectFailed`, `SourceMasterHello::tunnel_target_ip`,
-/// `MasterHello::Source::accept_timeout_sec`, and `MasterHello::Destination::source_data_addrs`).
+/// (`DestinationTransport`, `SshTarget`, `PeerIdentity`, `MasterToRcpd::SshFallbackEndpoints`,
+/// `RcpdToMaster::DirectConnectFailed`, `SourceMasterHello::{tunnel_target_ip, peer_identity,
+/// ssh_node_endpoint}`, `RcpdResult::Failure::peer_connected`,
+/// `MasterHello::Source::accept_timeout_sec`, `MasterHello::Destination::source_data_addrs`, and
+/// destination `--ssh-tunnels` descriptor accounting).
 pub const WIRE_REVISION: u32 = 14;
 
 impl ProtocolVersion {

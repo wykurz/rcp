@@ -206,6 +206,7 @@ mod tests {
                 std::num::NonZeroUsize::new(streams).unwrap(),
                 std::num::NonZeroUsize::new(streams).unwrap(),
                 std::num::NonZeroUsize::new(pending).unwrap(),
+                0,
             )
             .unwrap(),
         )

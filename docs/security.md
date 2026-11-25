@@ -168,12 +168,18 @@ User
 
 ### SSH Host Verification Limitation
 
-The current SSH launcher in [`remote/src/lib.rs`](../remote/src/lib.rs) explicitly passes
-`StrictHostKeyChecking=no`. It does not enforce strict known-host verification, even if the user's
-SSH configuration requests it. TLS pinning checks the fingerprint supplied through that SSH session;
-it cannot independently establish that the bootstrap peer is the intended host. An attacker who can
-impersonate the SSH bootstrap peer can therefore supply the fingerprints that subsequent TLS
-connections trust. Do not treat TLS pinning as protection against that bootstrap attack.
+When agent forwarding is disabled (the default), the SSH launcher in
+[`remote/src/lib.rs`](../remote/src/lib.rs) passes `StrictHostKeyChecking=no`. It does not enforce
+strict known-host verification, even if the user's SSH configuration requests it. TLS pinning checks
+the fingerprint supplied through that SSH session; it cannot independently establish that the
+bootstrap peer is the intended host. An attacker who can impersonate the SSH bootstrap peer can
+therefore supply the fingerprints that subsequent TLS connections trust. Do not treat TLS pinning as
+protection against that bootstrap attack.
+
+For 3-host SSH copies where SSH agent forwarding is active on the destination (`--ssh-forward-agent`
+or `ForwardAgent` enabled in `~/.ssh/config`), `rcp` omits `StrictHostKeyChecking=no` and preserves
+the user's configured `StrictHostKeyChecking` policy so the signing agent is not delegated to an
+unknown or unverified destination host.
 
 ### Local Deployment Candidates
 
@@ -268,7 +274,18 @@ still deny service by initiating a bad or deliberately stalled handshake:
 
 Reaching these ports requires network access to the (typically trusted) source host; restrict it
 with `--port-ranges` plus firewall rules, or use `--remote-transport=ssh` (which binds source to
-`127.0.0.1` only and tunnels traffic over SSH while preserving mutual TLS 1.3 by default).
+loopback — `127.0.0.1` or `::1` under `AddressFamily inet6` — and tunnels traffic over SSH while
+preserving mutual TLS 1.3 by default).
+
+**Upload reverse-forward isolation (`GatewayPorts`)**: An upload over SSH (`--remote-transport=ssh`,
+or `--remote-transport=auto` after direct TCP fallback) opens reverse forwards (`-R`) on the
+destination host pointing back to the local source daemon. Loopback isolation on the destination
+requires the destination `sshd` to use `GatewayPorts no` (the OpenSSH default) or
+`GatewayPorts clientspecified`. If the destination `sshd` sets `GatewayPorts yes`, OpenSSH binds
+those reverse listeners on wildcard addresses even though `rcp` requests loopback, exposing a
+network route back to the local source daemon. This is especially important when combined with
+`--no-encryption`, which disables Source↔Destination TLS authentication.
+
 Tolerating failed source-control handshakes without aborting the daemon remains a future hardening.
 
 ### Cipher Suites

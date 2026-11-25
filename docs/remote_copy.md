@@ -542,20 +542,34 @@ Key behavior:
   the remote `sshd` rate-limits extra connections. Dry runs (`--dry-run`) open only tunnel #1 for
   control.
 - **Same-host copies** (`host:/a host:/b`): stay on direct loopback without SSH data tunneling or
-  slow-path warnings.
+  slow-path warnings whenever both operands share the same `(user, host, port)` or resolve via
+  `ssh -G` to the same effective `(hostname, port)` and proxy route. When different users on a
+  shared alias resolve to different `HostName`/`Port` values (for example via OpenSSH `Match user`),
+  `rcp` treats the copy as a 3-host transfer while keeping each daemon's credentials.
 - **Zero master relay in 3-host copies** (`host1:/src host2:/dst`): `rcp` resolves `host1`'s
   effective SSH target locally via `ssh -G` and has destination `rcpd` on `host2` open `-L` tunnels
-  directly to `host1`. If `host2` cannot authenticate to `host1`, configure keys between them, pass
-  `--ssh-forward-agent` (or enable `ForwardAgent` for `host2` in `~/.ssh/config`), open
-  `--port-ranges` for direct TCP, or run `rcp` from `host1` or `host2`.
-- **Flags interaction**: `--remote-transport=ssh` binds the source to `127.0.0.1` on an ephemeral
-  port and warns and ignores `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both
-  flags during the direct-TCP probe (`--remote-direct-probe-timeout-sec`, default `3`s, capped at
-  `--remote-copy-conn-timeout-sec`) before switching to SSH if the probe fails.
+  directly to `host1`, attempting to pin directly to the specific node running `source rcpd`
+  (`SSH_CONNECTION`) and verifying peer identity before advertising tunnel ports. On load-balanced
+  SSH hostnames where the destination cannot reach the specific source node directly, `rcp` reports
+  the peer mismatch explicitly instead of silently connecting to the wrong backend. If `host2`
+  cannot authenticate to `host1`, configure keys between them, pass `--ssh-forward-agent` (or enable
+  `ForwardAgent` for `host2` in `~/.ssh/config`), open `--port-ranges` for direct TCP, or run `rcp`
+  from `host1` or `host2`. When agent forwarding is enabled for the destination, `rcp` preserves the
+  user's `StrictHostKeyChecking` policy instead of disabling host-key verification.
+- **Flags interaction & IPv6**: `--remote-transport=ssh` binds the source to loopback (`127.0.0.1`,
+  or `::1` when `AddressFamily inet6` is configured) on an ephemeral port and warns and ignores
+  `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both flags during the direct-TCP
+  probe (`--remote-direct-probe-timeout-sec`, default `3`s, capped at
+  `--remote-copy-conn-timeout-sec`) before switching to SSH if the probe fails, and honors
+  `AddressFamily inet6` for both `-L` and `-R` loopback forwarding.
 - **Slow-path notice & `sshd` requirements**: Any non-same-host copy over SSH emits a
   default-visible warning (`rcp::notice`). Remote `sshd` servers must allow TCP forwarding
   (`AllowTcpForwarding yes`, or `local` for downloads / `remote` for uploads); 3-host agent
-  forwarding additionally requires `AllowAgentForwarding yes` on the destination `sshd`.
+  forwarding additionally requires `AllowAgentForwarding yes` on the destination `sshd`. For uploads
+  (including `auto` fallback), loopback isolation of the destination's reverse listeners requires
+  the destination `sshd` to use `GatewayPorts no` (the OpenSSH default) or
+  `GatewayPorts clientspecified` — `GatewayPorts yes` binds wildcard addresses and can expose a
+  route back to the local source, which matters especially with `--no-encryption`.
 - **TLS encryption**: Source↔Destination mutual TLS 1.3 remains enabled by default over SSH tunnels
   (`--no-encryption` still disables it).
 
