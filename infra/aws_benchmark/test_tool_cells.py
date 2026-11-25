@@ -46,12 +46,12 @@ class ToolSuiteTests(unittest.TestCase):
         # each tool is its own program, and a cell is named after the copies it follows and that program
         self.assertEqual([run["variant"]["tool"] for run in matrix.TOOL_RUNS.values()], list(TOOLS))
         self.assertEqual(tuple(matrix.TOOLS)[:6], (*AFTER_LOCAL, *AFTER_REMOTE))
-        self.assertEqual(common.MATRIX_TOOL_CELLS, frozenset((*AFTER_LOCAL, *AFTER_REMOTE)))
-        # the runner also times the tools after copies on other storage, which no suite selects yet
-        self.assertLess(common.MATRIX_TOOL_CELLS, frozenset(matrix.TOOLS))
+        # and after copies on other storage, whose suites came later (test_storage_cells.py)
+        self.assertLess(frozenset((*AFTER_LOCAL, *AFTER_REMOTE)), common.MATRIX_TOOL_CELLS)
+        self.assertEqual(common.MATRIX_TOOL_CELLS, frozenset(matrix.TOOLS))
 
     def test_every_selection_has_suites_with_the_tools_after_local_copies_or_after_both(self):
-        self.assertEqual(sorted(common.MATRIX_SUITES), sorted(
+        self.assertEqual(sorted(common.DURABLE_SUITES[5:41]), sorted(
             f"matrix-{selection}-{scenarios}" for selection in SELECTIONS for scenarios in (*EARLIER, *WITH_TOOLS)))
         # a suite name reads as the order of the cells of each file set: the tools of a copy cell
         # come right after it
@@ -78,9 +78,10 @@ class ToolSuiteTests(unittest.TestCase):
     def test_the_suites_of_earlier_releases_keep_their_place_and_their_plans(self):
         earlier = [f"matrix-{selection}-{scenarios}" for scenarios in EARLIER for selection in SELECTIONS]
         self.assertEqual(common.DURABLE_SUITES[5:23], tuple(earlier))
-        self.assertEqual(common.DURABLE_SUITES[23:], tuple(
+        self.assertEqual(common.DURABLE_SUITES[23:41], tuple(
             f"matrix-{selection}-{scenarios}" for scenarios in WITH_TOOLS for selection in SELECTIONS))
-        self.assertEqual(len(common.DURABLE_SUITES), 41)
+        # the suites with cells on other storage follow (test_storage_cells.py)
+        self.assertEqual(len(common.DURABLE_SUITES), 47)
         for suite in earlier:
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
@@ -354,9 +355,10 @@ class ToolRecordTests(unittest.TestCase):
     collect = test_matrix_results.MatrixCollectionTests.collect
 
     def test_the_published_variants_are_the_ones_the_runner_runs(self):
-        # of the tool cells the runner knows, the ones a suite can select
+        # of the tool cells the runner knows, the ones this version of the record was made for: the
+        # cells after copies on other storage came with the version after it (test_storage_cells.py)
         selectable = {scenario: cell for scenario, cell in matrix.TOOLS.items()
-                      if scenario in common.MATRIX_TOOL_CELLS}
+                      if scenario in (*AFTER_LOCAL, *AFTER_REMOTE)}
         self.assertEqual(projection.PUBLIC_CONTRACTS[V5]["tool_variants"],
                          {scenario: cell["variant"]["id"] for scenario, cell in selectable.items()})
         self.assertEqual({key: value for key, value in projection.PUBLIC_CONTRACTS[V5].items()

@@ -303,6 +303,26 @@ class FullStorageTests(PreparationFixture, unittest.TestCase):
             self.assertEqual(result["arrays"][side]["member_models"], [large_storage.MODEL] * 2)
             self.assertEqual(result["arrays"][side]["member_bytes"], [900_000_000_000] * 2)
 
+    def test_the_arrays_hold_up_to_six_file_sets_or_none_of_a_run(self):
+        # every file set of the arrays with the one of a network filesystem, whose mounts show the arrays
+        cases = tuple(dict(self.case, id=f"set-{number}") for number in range(6))
+        self.capacity.side_effect = [{"case": case["id"]} for case in cases]
+        result = large_storage.prepare(self.data, cases, self.budget, 1000, 1000, self.execute)
+        self.assertEqual(list(result["capacity_by_case"]), [case["id"] for case in cases])
+        with self.assertRaisesRegex(ValueError, "invalid storage case set"):
+            large_storage.prepare(self.data, (*cases, dict(self.case, id="set-6")), self.budget, 1000, 1000,
+                                  self.execute)
+
+    def test_a_run_that_keeps_nothing_on_the_arrays_still_gets_them(self):
+        # a run in memory alone: the runner keeps its scratch directories and its results beside the arrays
+        result = large_storage.prepare(self.data, (), self.budget, 1000, 1000, self.execute)
+        self.assertEqual((self.commands().count("mdadm"), self.commands().count("mkfs.ext4")), (2, 2))
+        self.assertEqual(self.capacity.call_count, 0)
+        # no file set, no proof: an empty one, of the kind a proof is
+        self.assertEqual(result["capacity"], {})
+        self.assertNotIn("capacity_by_case", result)
+        self.assertEqual(set(result["arrays"]), set(large_storage.SIDES))
+
     def test_duplicate_case_identity_refuses_before_any_disk_command(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             large_storage.prepare(self.data, [dict(self.case, id="same")] * 2,

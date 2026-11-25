@@ -15,7 +15,8 @@ FILE_SETS = ("bulk-1g-1tb", "bulk-100m-1024gb", "bulk-1m-1024gb", "tiny-1k-10240
 
 class MatrixContractTests(unittest.TestCase):
     def test_the_catalog_covers_every_file_set_alone_all_together_and_commissioning(self):
-        self.assertEqual(sorted(common.MATRIX_SUITES), sorted(
+        # the suites of the arrays; those with cells on other storage follow them (test_storage_cells.py)
+        self.assertEqual(sorted(common.DURABLE_SUITES[5:41]), sorted(
             f"matrix-{selection}-{scenarios}" for selection in ("all", "1g", "100m", "1m", "1k", "commission")
             for scenarios in ("local", "remote", "local+remote", "local+tools", "local+tools+remote",
                               "local+tools+remote+tools")))
@@ -33,7 +34,7 @@ class MatrixContractTests(unittest.TestCase):
         self.assertEqual(common.DURABLE_SUITES[5:11], (
             "matrix-all-local", "matrix-1g-local", "matrix-100m-local", "matrix-1m-local", "matrix-1k-local",
             "matrix-commission-local"))
-        self.assertEqual(len(common.DURABLE_SUITES), 41)
+        self.assertEqual(len(common.DURABLE_SUITES), 47)
         self.assertEqual(common.MATRIX_SUITES["matrix-1m-local"], (("bulk-1m-1024gb", "local"),))
         self.assertEqual(common.MATRIX_SUITES["matrix-commission-local"],
                          (("commission-64m", "local"), ("commission-10k", "local")))
@@ -78,7 +79,7 @@ class MatrixContractTests(unittest.TestCase):
                              {key: full[key] for key in full if key not in skipped} | longer)
             version = suite + ("-plan-v2" if "tools" in suite else "-plan-v1")
             self.assertEqual(contract["plan"], dict(full["plan"], version=version))
-        for suite in sorted(set(common.MATRIX_SUITES) - everything):
+        for suite in sorted(set(common.DURABLE_SUITES[5:41]) - everything):
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
                 self.assertEqual((contract["suite"], contract["max_runtime"]), (suite, 10800))

@@ -32,8 +32,18 @@ BINARY_NAMES = ("rcp", "rcpd", "filegen")
 BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate") for name in BINARY_NAMES)
 # the other tools that a matrix suite may time, in the order the runner runs them after a copy
 MATRIX_TOOLS = ("rcmp", "rlink", "rrm")
+# where the trees of each kind of copy are kept, as the runner has it (benchmarks/matrix.py): the
+# two arrays, mounts of a network filesystem that show the arrays, or roots in memory
+MATRIX_STORAGE = MappingProxyType({"local": "disks", "remote": "disks", "nfs": "nfs", "memory": "memory"})
+
+
+def matrix_storage(scenario):
+    """Where a matrix cell keeps its trees: a tool cell where the copies it follows do."""
+    return MATRIX_STORAGE[scenario.split("-", 1)[0]]
+
+
 # the scenarios of their cells: a tool cell is named after the copies it follows and its tool
-MATRIX_TOOL_CELLS = frozenset(copies + "-" + tool for copies in ("local", "remote") for tool in MATRIX_TOOLS)
+MATRIX_TOOL_CELLS = frozenset(copies + "-" + tool for copies in MATRIX_STORAGE for tool in MATRIX_TOOLS)
 # every binary that any plan may name: what an upload or a mailbox object can be
 KNOWN_BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
                        for name in (*BINARY_NAMES, *MATRIX_TOOLS))
@@ -89,25 +99,44 @@ MATRIX_FILE_SETS = MappingProxyType({"1g": "bulk-1g-1tb", "100m": "bulk-100m-102
                                      "1m": "bulk-1m-1024gb", "1k": "tiny-1k-10240k"})
 # small fixtures that exercise every step of a matrix run in seconds
 MATRIX_COMMISSIONING = ("commission-64m", "commission-10k")
+# what the cells on other storage measure, for the selections that have such cells. A mount shows
+# the trees of the arrays, so a file set of the arrays can serve it; roots in memory hold their
+# own file sets. A network filesystem takes one new file at a time in a directory and a request
+# costs milliseconds: its file set is many small directories, sized for minutes and not hours
+MATRIX_OTHER_FILE_SETS = MappingProxyType({
+    "all": MappingProxyType({"nfs": ("tiny-1k-700x1024",), "memory": ("tiny-1k-10240k-memory",)}),
+    "commission": MappingProxyType({"nfs": ("commission-10k",), "memory": ("commission-10k-memory",)})})
 # a set's name ends the names of its suites and reads as the order of a file set's cells.
 # "tools" stands for the tool cells of the copy cell before it, whose copies they work on
-_LOCAL_TOOLS, _REMOTE_TOOLS = (tuple(copies + "-" + tool for tool in MATRIX_TOOLS) for copies in ("local", "remote"))
+_LOCAL_TOOLS, _REMOTE_TOOLS, _NFS_TOOLS, _MEMORY_TOOLS = (
+    tuple(copies + "-" + tool for tool in MATRIX_TOOLS) for copies in MATRIX_STORAGE)
 MATRIX_SCENARIO_SETS = MappingProxyType({
     "local": ("local",), "remote": ("remote",), "local+remote": ("local", "remote"),
     "local+tools": ("local", *_LOCAL_TOOLS), "local+tools+remote": ("local", *_LOCAL_TOOLS, "remote"),
-    "local+tools+remote+tools": ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS)})
+    "local+tools+remote+tools": ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS),
+    "nfs+tools": ("nfs", *_NFS_TOOLS), "memory+tools": ("memory", *_MEMORY_TOOLS),
+    "local+tools+remote+tools+nfs+tools+memory+tools": (
+        "local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS, "nfs", *_NFS_TOOLS, "memory", *_MEMORY_TOOLS)})
 _MATRIX_SELECTIONS = {"all": tuple(MATRIX_FILE_SETS.values()),
                       **{name: (case,) for name, case in MATRIX_FILE_SETS.items()},
                       "commission": MATRIX_COMMISSIONING}
 _MATRIX_PROFILES, _MATRIX_PLAN_VERSIONS = {}, {}
 # scenario sets outermost: suites added with a later set never move the earlier ones
 for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
-    for _selection, _cases in _MATRIX_SELECTIONS.items():
+    for _selection, _on_arrays in _MATRIX_SELECTIONS.items():
+        # the storage this set measures on, and the file sets of this selection there
+        _kinds = tuple(dict.fromkeys(matrix_storage(scenario) for scenario in _scenarios))
+        _sets = {"disks": _on_arrays, **MATRIX_OTHER_FILE_SETS.get(_selection, {})}
+        if any(kind not in _sets for kind in _kinds):
+            # a selection of one file set of the arrays has nothing to measure on other storage
+            continue
+        _cases = tuple(dict.fromkeys(case for kind in _kinds for case in _sets[kind]))
         _suite = "matrix-" + _selection + "-" + _set
         _version = _suite + "-plan-v1"
-        # every file set together needs the eight-hour allocation, and twelve hours with the
-        # tools (below); one set fits the ordinary one
-        _base = "all-filesets-qualification-budget-v1" if _selection == "all" else "bulk-100m-qualification-budget-v1"
+        # every file set of the arrays together needs the eight-hour allocation, and twelve hours
+        # with the tools (below); one set fits the ordinary one, and so do the sets of other storage
+        _large = _selection == "all" and "disks" in _kinds
+        _base = "all-filesets-qualification-budget-v1" if _large else "bulk-100m-qualification-budget-v1"
         # a matrix run uses whatever time it gets, so a slow start must not void the allocation:
         # the worker only declines when less than an hour, too little for one large cell, is left
         _contract = dict(
@@ -118,21 +147,28 @@ for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
         if MATRIX_TOOL_CELLS.intersection(_scenarios):
             # the worker runs what it is sent: a suite that times the tools sends them too
             _contract["binary_names"] = (*BINARY_NAMES, *MATRIX_TOOLS)
-        _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(_contract)
-        if MATRIX_TOOL_CELLS.intersection(_scenarios) and _selection == "all":
-            # the tools add passes over every copy that nobody has timed on these arrays. The bill
-            # follows the time a run takes, not its allocation, so the allocation is generous:
-            # twelve hours, and the fixed reservation that their price fits. These suites were
-            # first given eight hours; that version stays recorded above and this one is appended
+        # the tools add passes over every copy that nobody had timed on these arrays. The bill
+        # follows the time a run takes, not its allocation, so the allocation is generous: twelve
+        # hours, and the fixed reservation that their price fits
+        _twelve_hours = dict(max_runtime=43200, runtime_profile=TOOLS_RUNTIME_PROFILE, reservation_microusd=65_000_000)
+        if _large and MATRIX_TOOL_CELLS.intersection(_scenarios) and _kinds == ("disks",):
+            # these suites were first given eight hours; that version stays recorded and the
+            # twelve-hour one is appended
+            _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(_contract)
             _version = _suite + "-plan-v2"
             _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
-                _contract, max_runtime=43200, runtime_profile=TOOLS_RUNTIME_PROFILE,
-                reservation_microusd=65_000_000,
-                plan=MappingProxyType(dict(_contract["plan"], version=_version))))
+                _contract, **_twelve_hours, plan=MappingProxyType(dict(_contract["plan"], version=_version))))
+        elif _large and MATRIX_TOOL_CELLS.intersection(_scenarios):
+            # a suite added since has had twelve hours from its first version
+            _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(_contract, **_twelve_hours))
+        else:
+            _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(_contract)
         _MATRIX_PLAN_VERSIONS[_suite] = _version
-        # the scenarios of one file set run next to each other, on the one fixture generated for it
+        # the scenarios of one file set run next to each other, on the one fixture generated for
+        # it, and a file set has only the scenarios of the storage it is kept on
         _MATRIX_PROFILES[_suite] = dict(cases=_cases,
-            cells=tuple((case, scenario) for case in _cases for scenario in _scenarios),
+            cells=tuple((case, scenario) for case in _cases for scenario in _scenarios
+                        if case in _sets[matrix_storage(scenario)]),
             repetitions=3, timeout=3600, purpose="commissioning" if _selection == "commission" else "performance",
             runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
 _CURRENT_PLAN_VERSIONS = MappingProxyType({

@@ -35,8 +35,8 @@ from .common import (BINARIES, MAX_BINARY, MAX_RESULT, RESERVE, SUITES, Budget, 
 from .cache_client import SOCKET
 from .maintenance import check_quiet
 from .guest_security import check_ssm_absent
-from .common import LARGE_SUITES, MATRIX_SUITES, matrix_contract
-from . import large_storage, supervisor_notify
+from .common import LARGE_SUITES, MATRIX_SUITES, matrix_contract, matrix_storage
+from . import large_storage, other_storage, supervisor_notify
 from .production_mailbox import MailboxPaths
 
 ROOT = Path("/opt/rcp-benchmark")
@@ -198,7 +198,42 @@ def sandbox(seconds, file_limit, *, loopback=False):
     }
 
 
-def command(window, seconds):
+def prepare_other_storage(cells, budget, uid, gid):
+    """Prepare the storage beside the arrays that these cells measure on.
+
+    A storage that cannot be prepared costs its own cells and no others: what went wrong is kept
+    for the report, and the runner is told in place of the roots (`command`).
+    """
+    preparations = {"nfs": lambda: other_storage.prepare_nfs(DATA, STATE, budget, execute),
+                    "memory": lambda: other_storage.prepare_memory(DATA, budget, uid, gid, execute)}
+    prepared = {}
+    for kind in dict.fromkeys(matrix_storage(scenario) for _, scenario in cells):
+        if kind in preparations:
+            try:
+                prepared[kind] = preparations[kind]()
+            except Exception as error:
+                prepared[kind] = {"error": error_detail(error)}
+    return prepared
+
+
+def unavailable(state):
+    """Why a run has no roots on a storage, from what `error_detail` kept of the failure."""
+    if state is None:
+        return "the worker did not prepare this storage"
+    error = state["error"]
+    if "message" in error:
+        what = error["message"]
+    elif "command" in error and "returncode" in error:
+        what = f"{error['command']} exited with status {error['returncode']}"
+    elif "command" in error and "timeout" in error:
+        what = f"{error['command']} did not finish"
+    else:
+        what = error["type"]
+    return "the worker could not prepare this storage: " + what
+
+
+def command(window, seconds, other=None):
+    """The measurement unit's command line. `other` is what `prepare_other_storage` returned."""
     matrix = window["suite"] in MATRIX_SUITES
     contract = matrix_contract(window["suite"]) if matrix else measurement_contract(window["suite"])
     large = matrix or window["suite"] in LARGE_SUITES
@@ -229,6 +264,19 @@ def command(window, seconds):
                  "--runner-label", contract["runner_label"], *storage]
         if loopback:
             argv += OPENSSH
+        # the storage beside the arrays that this suite measures on: where the supervisor put it,
+        # or why there is none. Either way the cells there keep the names that identify them
+        for kind in dict.fromkeys(matrix_storage(scenario) for _, scenario in contract["cells"]):
+            if kind == "disks":
+                continue
+            state = (other or {}).get(kind)
+            if state is not None and "error" not in state:
+                for side in large_storage.SIDES:
+                    argv += [f"--{kind}-{side}-root", str(DATA / other_storage.MOUNTS[kind][side])]
+            else:
+                argv += [f"--{kind}-unavailable", unavailable(state)]
+            for side in large_storage.SIDES:
+                argv += [f"--{kind}-{side}-storage-id", other_storage.STORAGE_IDS[kind][side]]
         for case, scenario in contract["cells"]:
             argv += ["--cell", case + ":" + scenario]
         return argv
@@ -584,6 +632,8 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
         metadata["guest_security"] = check_ssm_absent(
             timeout=lambda maximum: min(maximum, budget.left(RESERVE)))
         metadata["harness_revision"] = (ROOT / "revision.txt").read_text().strip()
+        # what was prepared beside the arrays, for a suite that measures there
+        other = {}
         STATE.mkdir(mode=0o755, exist_ok=False)
         account = pwd.getpwnam("rcp-benchmark")
         metadata["apt_units"] = check_quiet(lambda argv, *, timeout: subprocess.run(
@@ -604,16 +654,24 @@ def run(s3, bucket, *, direct=False, production_account=None, region=None):
             case_ids = SUITES[window["suite"]]
             require(all(case_id in cases for case_id in case_ids), "suite case is missing from the large manifest")
             selected = tuple(cases[case_id] for case_id in case_ids)
+            cells = matrix_contract(window["suite"])["cells"] if window["suite"] in MATRIX_SUITES else ()
+            if cells:
+                # the arrays hold what is kept on them; a file set in memory is not theirs to fit
+                selected = tuple(case for case in selected if any(
+                    matrix_storage(scenario) != "memory" for case_id, scenario in cells if case_id == case["id"]))
             admit_storage()
             metadata["storage"] = large_storage.prepare(DATA, selected[0] if len(selected) == 1 else selected,
                 budget, account.pw_uid, account.pw_gid, execute)
+            other = prepare_other_storage(cells, budget, account.pw_uid, account.pw_gid)
+            if other:
+                metadata["other_storage"] = other
         else:
             admit_storage()
             metadata["disks"] = prepare_storage(budget, account.pw_uid, account.pw_gid)
         cache_server(budget, account.pw_uid, cache_history)
         try:
             stopped = False
-            argv = command(window, budget.left(RESERVE))
+            argv = command(window, budget.left(RESERVE), other)
             metadata["command_timeout_seconds"] = int(argv[argv.index("--timeout") + 1])
             completed = subprocess.run(argv, timeout=budget.left(RESERVE) + 15, check=False)
             status["success"] = completed.returncode == 0

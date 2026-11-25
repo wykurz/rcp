@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from benchmarks import matrix, run
-from . import common, production_projection as projection, results
+from . import common, other_storage, production_projection as projection, results
 from .test_production_collection import Fixture
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +17,11 @@ ROLE_METRICS = dict(source=dict(user_seconds=300.0, system_seconds=450.0, max_rs
                     destination=dict(user_seconds=200.0, system_seconds=700.0, max_rss_kib=30000))
 METRICS = dict(user_seconds=2.5, system_seconds=880.0, max_rss_kib=90000, voluntary_switches=10,
                involuntary_switches=5, minor_faults=100, major_faults=0, exit_code=0)
+
+
+# the storage beside the arrays as a worker names it for the runner (worker.command)
+STORAGES = {kind: dict({side: "/mnt/rcp-benchmark/" + other_storage.MOUNTS[kind][side] for side in ("source", "destination")},
+                       storage_ids=dict(other_storage.STORAGE_IDS[kind])) for kind in other_storage.MOUNTS}
 
 
 def matrix_record(suite, outcomes=None, **context_changes):
@@ -32,7 +37,13 @@ def matrix_record(suite, outcomes=None, **context_changes):
         storage_ids=dict(source="c5d-raid0-ext4-source-v1", destination="c5d-raid0-ext4-destination-v1"),
         repository="wykurz/rcp", run_url="", environment={},
         summary_format="json", resources=dict(policy=matrix.RESOURCE_POLICY))
+    elsewhere = {kind: STORAGES[kind] for kind in dict.fromkeys(
+        common.matrix_storage(scenario) for _, scenario in contract["cells"]) if kind != "disks"}
+    if elsewhere:
+        context["storages"] = elsewhere
     context.update(context_changes)
+    # storage the run did not have: its cells were never started
+    missing = {kind for kind, item in context.get("storages", {}).items() if "unavailable" in item}
     cells, file_sets, trial = [], [], 0
     for index, (case_id, scenario) in enumerate(contract["cells"]):
         if all(item["case"]["id"] != case_id for item in file_sets):
@@ -58,7 +69,7 @@ def matrix_record(suite, outcomes=None, **context_changes):
                     copies[-1]["role_resources"] = {role: dict(status="complete", metrics=dict(METRICS, **figures))
                                                     for role, figures in ROLE_METRICS.items()}
             trial += 1
-        if outcome["status"] == "not_run":
+        if outcome["status"] == "not_run" or common.matrix_storage(scenario) in missing:
             copies = []
         samples = [item["elapsed_seconds"] for item in copies]
         cells.append(dict(case_id=case_id, scenario=scenario, variant=ran,
