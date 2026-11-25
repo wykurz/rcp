@@ -1825,6 +1825,14 @@ async fn process_control_stream(
                                 .await
                                 .context("Failed to update tracker for unchanged file")?;
                         }
+                        remote::protocol::SourceMessage::DryRunReady => {
+                            if directory_limits.is_some() {
+                                anyhow::bail!(
+                                    "unexpected DryRunReady message on a non-dry-run transfer"
+                                );
+                            }
+                            tracing::debug!("Received DryRunReady from source");
+                        }
                     }
                     anyhow::Ok(())
                 };
@@ -2444,7 +2452,9 @@ pub async fn run_destination(
         match result {
             Err(err)
                 if via_ssh_tunnel
-                    && (!tls_enabled || had_connect_cause)
+                    && ((!tls_enabled
+                        && !peer_connected.load(std::sync::atomic::Ordering::Acquire))
+                        || had_connect_cause)
                     && !completed
                     && !had_recorded_error
                     && summary.files_copied == 0
@@ -6379,6 +6389,67 @@ mod ssh_transport_tests {
             assert!(
                 peer_connected.load(std::sync::atomic::Ordering::Acquire),
                 "receiving a framed File header on data must mark peer_connected=true"
+            );
+            fake_source.await.unwrap();
+            drop(control_tx);
+            writer_shutdown.cancel();
+            let _ = writer.await;
+        }
+        // 4) plaintext dry-run: receiving DryRunReady before a mid-preview tunnel drop marks
+        //    peer_connected=true, whereas an immediate EOF before DryRunReady leaves it false.
+        for send_dry_run_ready in [false, true] {
+            let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let control_addr = control_listener.local_addr().unwrap();
+            let tcp_for_source = tcp.clone();
+            let fake_source = tokio::spawn(async move {
+                let (ctrl_stream, _) =
+                    remote::accept_tcp_control(&control_listener, &tcp_for_source)
+                        .await
+                        .unwrap();
+                if send_dry_run_ready {
+                    let mut send = remote::streams::SendStream::new(ctrl_stream);
+                    send.send_control_message(&remote::protocol::SourceMessage::DryRunReady)
+                        .await
+                        .unwrap();
+                    let _ = send.close().await;
+                } else {
+                    drop(ctrl_stream);
+                }
+            });
+            let (control_tx, writer_shutdown, writer) = spawn_dummy_master();
+            let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_destination(
+                    &control_addr,
+                    &[],
+                    "test-source",
+                    &testutils::copy_settings(),
+                    true,
+                    0,
+                    &common::preserve::preserve_none(),
+                    &tcp,
+                    concurrency,
+                    common::EndpointAdmission::Disabled,
+                    None,
+                    None,
+                    &remote::protocol::DestinationTransport::MasterSshTunnel,
+                    &control_tx,
+                    None,
+                    &cleanup,
+                    &peer_connected,
+                ),
+            )
+            .await
+            .expect("plaintext dry-run disconnect test timed out");
+            assert!(
+                result.is_err(),
+                "incomplete dry-run control drop must fail run_destination"
+            );
+            assert_eq!(
+                peer_connected.load(std::sync::atomic::Ordering::Acquire),
+                send_dry_run_ready,
+                "plaintext dry-run peer_connected must match whether DryRunReady arrived"
             );
             fake_source.await.unwrap();
             drop(control_tx);

@@ -594,28 +594,50 @@ fn resolve_source_target_address_family(
         return client_listener_af;
     }
     // download (-L) / 3-host / same-host: remote `source sshd` dials `source rcpd`'s loopback
-    // listener. Bind IPv6 when client config pinned inet6 OR when `source sshd` accepted our SSH
-    // connection over IPv6 (handles mixed client `AddressFamily any` + server `AddressFamily
-    // inet6`), falling back to checking whether the resolved target host is a literal IPv6 address
-    // if the SSH endpoint probe was unavailable.
-    if resolved_src_ssh
-        .is_some_and(|c| c.address_family == remote::ssh_tunnel::SshAddressFamily::Inet6)
-        || source_ssh_endpoint.is_some_and(|ep| ep.is_ipv6())
-        || (source_ssh_endpoint.is_none()
-            && resolved_src_ssh.is_some_and(|c| {
-                c.target
-                    .host
-                    .trim_matches(['[', ']'])
-                    .split('%')
-                    .next()
-                    .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
-            }))
-    {
+    // listener. Follow the forwarding server's actual address family observed from `SSH_CONNECTION`
+    // (handles both client `any` + server `inet6` and client `inet6` + ProxyCommand -> IPv4
+    // server). Only fall back to client SSH config when the server endpoint probe is unavailable.
+    if let Some(ep) = source_ssh_endpoint {
+        return if ep.is_ipv6() {
+            remote::ssh_tunnel::SshAddressFamily::Inet6
+        } else {
+            remote::ssh_tunnel::SshAddressFamily::Inet
+        };
+    }
+    if resolved_src_ssh.is_some_and(|c| {
+        c.address_family == remote::ssh_tunnel::SshAddressFamily::Inet6
+            || c.target
+                .host
+                .trim_matches(['[', ']'])
+                .split('%')
+                .next()
+                .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok())
+    }) {
         return remote::ssh_tunnel::SshAddressFamily::Inet6;
     }
     resolved_src_ssh.map_or(remote::ssh_tunnel::SshAddressFamily::Any, |c| {
         c.address_family
     })
+}
+
+fn resolve_tunnel_listen_address_family(
+    direction: remote::ssh_tunnel::ForwardDirection,
+    client_address_family: remote::ssh_tunnel::SshAddressFamily,
+    server_ssh_endpoint: Option<std::net::SocketAddr>,
+) -> remote::ssh_tunnel::SshAddressFamily {
+    match direction {
+        // download (-L): the local `ssh` client opens the listening socket, so keep the client's
+        // configured AddressFamily.
+        remote::ssh_tunnel::ForwardDirection::Local => client_address_family,
+        // upload (-R): the remote `sshd` server opens the listening socket, so follow the server's
+        // actual address family from `SSH_CONNECTION`, or allow loopback IPv4->IPv6 fallback when
+        // the server endpoint could not be probed.
+        remote::ssh_tunnel::ForwardDirection::Remote => match server_ssh_endpoint {
+            Some(ep) if ep.is_ipv6() => remote::ssh_tunnel::SshAddressFamily::Inet6,
+            Some(_) => remote::ssh_tunnel::SshAddressFamily::Inet,
+            None => remote::ssh_tunnel::SshAddressFamily::Any,
+        },
+    }
 }
 
 fn resolve_source_bind_ip_for_transport(
@@ -1326,41 +1348,11 @@ fn destination_agent_forward_mode(
     }
 }
 
-fn host_key_policy_for_agent_forward(mode: remote::AgentForwardMode) -> remote::HostKeyPolicy {
-    if mode == remote::AgentForwardMode::Off {
-        remote::HostKeyPolicy::AutoAccept
-    } else {
-        remote::HostKeyPolicy::HonorConfig
-    }
-}
-
-fn source_host_key_policy(
-    dest_agent_forward_mode: remote::AgentForwardMode,
-    resolved_src_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
-    resolved_dst_ssh: Option<&remote::ssh_tunnel::ResolvedSshConfig>,
-) -> remote::HostKeyPolicy {
-    if dest_agent_forward_mode == remote::AgentForwardMode::Off {
-        return remote::HostKeyPolicy::AutoAccept;
-    }
-    // when source and destination resolve to the same (HostName, Port), they share an OpenSSH
-    // known_hosts entry; source must also honor StrictHostKeyChecking so neither its `~` HOME
-    // lookup nor parallel endpoint preparation can auto-accept an untrusted host key before the
-    // agent-forwarded destination verifies it.
-    if let (Some(src), Some(dst)) = (resolved_src_ssh, resolved_dst_ssh)
-        && src.target.host.eq_ignore_ascii_case(&dst.target.host)
-        && src.target.port.unwrap_or(22) == dst.target.port.unwrap_or(22)
-    {
-        return remote::HostKeyPolicy::HonorConfig;
-    }
-    remote::HostKeyPolicy::AutoAccept
-}
-
 struct ResolvedMasterSshPlan {
     resolved_src_ssh: Option<remote::ssh_tunnel::ResolvedSshConfig>,
     resolved_dst_ssh: Option<remote::ssh_tunnel::ResolvedSshConfig>,
-    source_host_key_policy: remote::HostKeyPolicy,
     dest_agent_forward_mode: remote::AgentForwardMode,
-    dest_home_host_key_policy: remote::HostKeyPolicy,
+    preauthenticated_destination: Option<remote::PreauthenticatedDestination>,
 }
 
 async fn resolve_ssh_configs_for_operands(
@@ -1549,7 +1541,7 @@ struct MasterSshTunnelPlan<'a> {
     target_control: std::net::SocketAddr,
     target_data: Option<std::net::SocketAddr>,
     requested_tunnels: usize,
-    address_family: remote::ssh_tunnel::SshAddressFamily,
+    client_address_family: remote::ssh_tunnel::SshAddressFamily,
     expected_peer: Option<remote::protocol::PeerIdentity>,
     node_endpoint: Option<std::net::SocketAddr>,
     keepalive_sec: u64,
@@ -1562,12 +1554,11 @@ impl MasterSshTunnelPlan<'_> {
     async fn open(&self) -> anyhow::Result<remote::ssh_tunnel::SshTunnelSet> {
         let mut expected_peer = self.expected_peer.clone();
         let mut node_endpoint = self.node_endpoint;
-        // for multi-tunnel uploads (-R), probe the destination's peer identity over its retained
-        // control master so extra tunnels 2..=K can pin and verify they hit the same backend node
+        // for uploads (-R), probe the destination over its retained control master so the remote
+        // `-R` listener follows the forwarding server's actual address family (independent of the
+        // client's AddressFamily) and multi-tunnel uploads can pin/verify extra tunnels 2..=K.
         if self.direction == remote::ssh_tunnel::ForwardDirection::Remote
-            && self.target_data.is_some()
-            && self.requested_tunnels > 1
-            && expected_peer.is_none()
+            && (expected_peer.is_none() || node_endpoint.is_none())
         {
             match self
                 .endpoint
@@ -1575,16 +1566,25 @@ impl MasterSshTunnelPlan<'_> {
                 .await
             {
                 Ok((peer, endpoint)) => {
-                    expected_peer = Some(peer);
-                    node_endpoint = endpoint;
+                    if expected_peer.is_none() {
+                        expected_peer = Some(peer);
+                    }
+                    if node_endpoint.is_none() {
+                        node_endpoint = endpoint;
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(
-                        "could not probe destination peer identity for parallel upload tunnels (using primary tunnel only): {error:#}"
+                        "could not probe destination peer identity/endpoint for upload tunnels: {error:#}"
                     );
                 }
             }
         }
+        let listen_address_family = resolve_tunnel_listen_address_family(
+            self.direction,
+            self.client_address_family,
+            node_endpoint,
+        );
         remote::ssh_tunnel::SshTunnelSet::open_on_existing_session(
             self.direction,
             &self.endpoint.control_path(),
@@ -1592,7 +1592,7 @@ impl MasterSshTunnelPlan<'_> {
             self.target_control,
             self.target_data,
             self.requested_tunnels,
-            self.address_family,
+            listen_address_family,
             expected_peer.as_ref(),
             node_endpoint,
             self.keepalive_sec,
@@ -1937,9 +1937,8 @@ async fn run_rcpd_master(
     let ResolvedMasterSshPlan {
         resolved_src_ssh,
         resolved_dst_ssh,
-        source_host_key_policy,
         dest_agent_forward_mode,
-        dest_home_host_key_policy: _,
+        preauthenticated_destination,
     } = ssh_plan;
     let initial_topology =
         operands.initial_topology(resolved_src_ssh.as_ref(), resolved_dst_ssh.as_ref());
@@ -1954,8 +1953,8 @@ async fn run_rcpd_master(
         bootstrap_timeout,
         keepalive_sec,
         &operands.local_operand_roots,
-        source_host_key_policy,
         dest_agent_forward_mode,
+        preauthenticated_destination,
     )
     .await?;
     let probe_timeout = bootstrap_timeout.min(std::time::Duration::from_secs(5));
@@ -2014,16 +2013,11 @@ async fn run_rcpd_master(
             }
             other => {
                 let topology = other.resolve(None);
-                // when an SSH tunnel will dial remote `source rcpd` through `source sshd` and
-                // client SSH config did not already pin inet6, probe the live SSH connection's
-                // endpoint family so mixed client `AddressFamily any` + server `AddressFamily
-                // inet6` binds IPv6 on `source rcpd` independently of the client-side listener.
-                let need_source_endpoint_probe = !operands.source_is_local
-                    && matches!(topology, CopyTopology::Download | CopyTopology::ThreeHost)
-                    && resolved_src_ssh.as_ref().is_none_or(|c| {
-                        c.address_family != remote::ssh_tunnel::SshAddressFamily::Inet6
-                    });
-                let src_ep = if need_source_endpoint_probe {
+                // whenever source is remote, probe the live SSH connection's `SSH_CONNECTION`
+                // server endpoint so `source rcpd` follows the forwarding server's actual address
+                // family (handling both client `any` + server `inet6` and client `inet6` +
+                // ProxyCommand -> IPv4 server).
+                let src_ep = if !operands.source_is_local {
                     match prepared_source.probe_peer_identity(probe_timeout).await {
                         Ok((_, ep)) => ep,
                         Err(error) => {
@@ -2313,7 +2307,7 @@ async fn run_rcpd_master(
                     std::net::SocketAddr::new(target_ip, source_hello.data_addr.port())
                 }),
                 requested_tunnels,
-                address_family: client_listener_af,
+                client_address_family: client_listener_af,
                 expected_peer,
                 node_endpoint,
                 keepalive_sec,
@@ -2662,10 +2656,12 @@ async fn async_main(
         let request = build_master_remote_request(&args, files_in_flight)?;
         let remote_home_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
         let keepalive_sec = request.tcp.keepalive_sec;
-        // resolve local `ssh -G` config once up front (no network I/O) so `~` HOME expansion on
-        // the destination preserves the destination's `StrictHostKeyChecking` policy whenever an
-        // agent-forwarded 3-host session may follow on the same host, while still passing
-        // `ForwardAgent=no` during the lookup itself.
+        // resolve local `ssh -G` config once up front (no network I/O) to decide whether
+        // destination may forward the SSH agent. Whenever agent forwarding is enabled or
+        // inherited for the destination, authenticate that destination SSH master up front under
+        // its configured `StrictHostKeyChecking` policy BEFORE any source SSH connection can
+        // touch `known_hosts` (even across distinct routes sharing a `HostKeyAlias`), and retain
+        // that verified master for destination `~` HOME expansion and `rcpd` setup.
         let (resolved_src_ssh, resolved_dst_ssh) = resolve_ssh_configs_for_operands(
             &operands,
             args.remote_transport,
@@ -2679,17 +2675,22 @@ async fn async_main(
             args.ssh_forward_agent,
             resolved_dst_ssh.as_ref(),
         );
-        let ssh_plan = ResolvedMasterSshPlan {
-            source_host_key_policy: source_host_key_policy(
-                dest_agent_forward_mode,
-                resolved_src_ssh.as_ref(),
-                resolved_dst_ssh.as_ref(),
-            ),
-            dest_home_host_key_policy: host_key_policy_for_agent_forward(dest_agent_forward_mode),
-            dest_agent_forward_mode,
-            resolved_src_ssh,
-            resolved_dst_ssh,
-        };
+        let preauthenticated_destination =
+            if dest_agent_forward_mode != remote::AgentForwardMode::Off {
+                Some(
+                    remote::PreauthenticatedDestination::connect(
+                        operands.destination.session(),
+                        cleanup,
+                        remote_home_timeout,
+                        keepalive_sec,
+                        &operands.local_operand_roots,
+                        dest_agent_forward_mode,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
         {
             let remote_src = &mut operands.source;
             let remote_dst = &mut operands.destination;
@@ -2702,12 +2703,28 @@ async fn async_main(
                     remote_home_timeout,
                     keepalive_sec,
                     &operands.local_operand_roots,
-                    remote::HostKeyPolicy::AutoAccept,
                 )
                 .await?;
                 remote_src.apply_remote_home(&home);
                 remote_dst.apply_remote_home(&home);
             } else {
+                if remote_dst.needs_remote_home() {
+                    let home = if let Some(preauth) = preauthenticated_destination.as_ref() {
+                        preauth
+                            .get_remote_home_with_timeout(remote_home_timeout)
+                            .await?
+                    } else {
+                        remote::get_remote_home_for_session_with_timeout(
+                            remote_dst.session(),
+                            cleanup,
+                            remote_home_timeout,
+                            keepalive_sec,
+                            &operands.local_operand_roots,
+                        )
+                        .await?
+                    };
+                    remote_dst.apply_remote_home(&home);
+                }
                 if remote_src.needs_remote_home() {
                     let home = remote::get_remote_home_for_session_with_timeout(
                         remote_src.session(),
@@ -2715,25 +2732,18 @@ async fn async_main(
                         remote_home_timeout,
                         keepalive_sec,
                         &operands.local_operand_roots,
-                        ssh_plan.source_host_key_policy,
                     )
                     .await?;
                     remote_src.apply_remote_home(&home);
                 }
-                if remote_dst.needs_remote_home() {
-                    let home = remote::get_remote_home_for_session_with_timeout(
-                        remote_dst.session(),
-                        cleanup,
-                        remote_home_timeout,
-                        keepalive_sec,
-                        &operands.local_operand_roots,
-                        ssh_plan.dest_home_host_key_policy,
-                    )
-                    .await?;
-                    remote_dst.apply_remote_home(&home);
-                }
             }
         }
+        let ssh_plan = ResolvedMasterSshPlan {
+            resolved_src_ssh,
+            resolved_dst_ssh,
+            dest_agent_forward_mode,
+            preauthenticated_destination,
+        };
         if !operands.source.path().is_absolute() || !operands.destination.path().is_absolute() {
             return Err(anyhow!(
                 "Remote paths must be absolute after expansion: src={:?}, dst={:?}",
@@ -4127,15 +4137,36 @@ mod tests {
             resolve_source_target_address_family(false, any, Some(&cfg("srv", any)), Some(v6_ep)),
             inet6
         );
-        // fallback when probe was unavailable but target host is a literal IPv6 address
+        // cross-family proxy: client AddressFamily inet6 reaching IPv4-only sshd via ProxyCommand
+        // follows the forwarding server's actual IPv4 family rather than forcing ::1
+        assert_eq!(
+            resolve_source_target_address_family(
+                false,
+                inet6,
+                Some(&cfg("srv", inet6)),
+                Some(v4_ep),
+            ),
+            inet
+        );
+        // cross-family proxy in the opposite direction: client AddressFamily inet reaching IPv6
+        // sshd follows the server's actual IPv6 family
+        assert_eq!(
+            resolve_source_target_address_family(false, inet, Some(&cfg("srv", inet)), Some(v6_ep)),
+            inet6
+        );
+        // fallback when probe was unavailable: honor client AddressFamily inet6 or literal IPv6
         assert_eq!(
             resolve_source_target_address_family(false, any, Some(&cfg("::1", any)), None),
             inet6
         );
-        // IPv4 SSH_CONNECTION keeps client family (any -> 127.0.0.1)
+        assert_eq!(
+            resolve_source_target_address_family(false, inet6, Some(&cfg("srv", inet6)), None),
+            inet6
+        );
+        // IPv4 SSH_CONNECTION selects IPv4 on the server side
         assert_eq!(
             resolve_source_target_address_family(false, any, Some(&cfg("srv", any)), Some(v4_ep)),
-            any
+            inet
         );
         // upload (-R): local source follows local client listener family regardless of remote sshd
         assert_eq!(
@@ -4143,7 +4174,7 @@ mod tests {
             any
         );
         assert_eq!(
-            resolve_source_target_address_family(true, inet6, None, None),
+            resolve_source_target_address_family(true, inet6, None, Some(v4_ep)),
             inet6
         );
         assert_eq!(
@@ -4153,41 +4184,70 @@ mod tests {
     }
 
     #[test]
-    fn source_host_key_policy_honors_config_when_sharing_endpoint_with_agent_forwarded_dest() {
-        let cfg = |host: &str, port: Option<u16>| remote::ssh_tunnel::ResolvedSshConfig {
-            original_host: host.to_owned(),
-            target: remote::protocol::SshTarget {
-                user: None,
-                host: host.to_owned(),
-                port,
-            },
-            forward_agent_enabled: false,
-            address_family: remote::ssh_tunnel::SshAddressFamily::Any,
-            proxy_jump: None,
-            proxy_command: None,
-        };
-        let a = cfg("Cluster.Example", Some(22));
-        let a_same = cfg("cluster.example", None);
-        let b_port = cfg("cluster.example", Some(2222));
+    fn resolve_tunnel_listen_address_family_separates_client_local_from_server_remote() {
+        let any = remote::ssh_tunnel::SshAddressFamily::Any;
+        let inet = remote::ssh_tunnel::SshAddressFamily::Inet;
+        let inet6 = remote::ssh_tunnel::SshAddressFamily::Inet6;
+        let v6_ep: std::net::SocketAddr = "[::1]:2222".parse().unwrap();
+        let v4_ep: std::net::SocketAddr = "127.0.0.1:2222".parse().unwrap();
+        // download (-L): local ssh client opens the listening socket -> keep client AddressFamily
         assert_eq!(
-            source_host_key_policy(remote::AgentForwardMode::ForceOn, Some(&a), Some(&a_same)),
-            remote::HostKeyPolicy::HonorConfig
-        );
-        assert_eq!(
-            source_host_key_policy(
-                remote::AgentForwardMode::InheritConfig,
-                Some(&a),
-                Some(&a_same),
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Local,
+                inet6,
+                Some(v4_ep),
             ),
-            remote::HostKeyPolicy::HonorConfig
+            inet6
         );
         assert_eq!(
-            source_host_key_policy(remote::AgentForwardMode::ForceOn, Some(&a), Some(&b_port)),
-            remote::HostKeyPolicy::AutoAccept
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Local,
+                inet,
+                Some(v6_ep),
+            ),
+            inet
         );
         assert_eq!(
-            source_host_key_policy(remote::AgentForwardMode::Off, Some(&a), Some(&a_same)),
-            remote::HostKeyPolicy::AutoAccept
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Local,
+                any,
+                Some(v6_ep),
+            ),
+            any
+        );
+        // upload (-R): remote sshd opens the listening socket -> follow server's actual family
+        // (and allow loopback IPv4->IPv6 fallback if the server endpoint could not be probed)
+        assert_eq!(
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Remote,
+                inet6,
+                Some(v4_ep),
+            ),
+            inet
+        );
+        assert_eq!(
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Remote,
+                any,
+                Some(v6_ep),
+            ),
+            inet6
+        );
+        assert_eq!(
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Remote,
+                inet6,
+                Some(v6_ep),
+            ),
+            inet6
+        );
+        assert_eq!(
+            resolve_tunnel_listen_address_family(
+                remote::ssh_tunnel::ForwardDirection::Remote,
+                inet6,
+                None,
+            ),
+            any
         );
     }
 

@@ -11176,6 +11176,7 @@ struct TestPrivateSshdOptions<'a> {
     allow_tcp_forwarding: Option<&'a str>,
     force_home: Option<&'a std::path::Path>,
     alt_key_fake_hostname: Option<&'a str>,
+    host_key_path: Option<&'a std::path::Path>,
 }
 
 #[cfg(target_os = "linux")]
@@ -11186,6 +11187,7 @@ struct TestPrivateSshd {
     client_key: std::path::PathBuf,
     alt_client_key: Option<std::path::PathBuf>,
     host_key_pub: String,
+    sshd_log: std::path::PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -11196,12 +11198,20 @@ impl TestPrivateSshd {
 
     fn start_with_options(bind_ip: std::net::IpAddr, options: TestPrivateSshdOptions<'_>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let host_key = dir.path().join("host_key");
+        let host_key = match options.host_key_path {
+            Some(path) => path.to_path_buf(),
+            None => dir.path().join("host_key"),
+        };
         let client_key = dir.path().join("client_key");
         let auth_keys = dir.path().join("authorized_keys");
         let sshd_config = dir.path().join("sshd_config");
         let pid_file = dir.path().join("sshd.pid");
-        for key in [&host_key, &client_key] {
+        let keys_to_generate: Vec<&std::path::PathBuf> = if options.host_key_path.is_some() {
+            vec![&client_key]
+        } else {
+            vec![&host_key, &client_key]
+        };
+        for key in keys_to_generate {
             let status = std::process::Command::new("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-N", "", "-f"])
                 .arg(key)
@@ -11347,6 +11357,7 @@ impl TestPrivateSshd {
             client_key,
             alt_client_key,
             host_key_pub,
+            sshd_log,
         }
     }
 }
@@ -12529,4 +12540,832 @@ fn test_remote_dry_run_stops_promptly_when_tunnel_drops_mid_preview() {
     assert!(!dst_tree.exists());
     drop(sshd_src);
     drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_ssh_transport_cross_family_proxy_inet6_client_to_ipv4_sshd() {
+    if let Err(err) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+        ) {
+            eprintln!("skipping: this kernel/container lacks IPv6 loopback (::1): {err}");
+            return;
+        }
+        panic!("unexpected failure probing IPv6 loopback (::1): {err}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let v4_opts = || TestPrivateSshdOptions {
+        address_family: Some("inet"),
+        ..Default::default()
+    };
+    let sshd_local = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        v4_opts(),
+    );
+    let sshd_src = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        v4_opts(),
+    );
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        v4_opts(),
+    );
+    let python3 = find_test_program("python3", &["/usr/bin/python3", "/bin/python3"]);
+    let proxy_script = home.path().join("proxy-relay.py");
+    std::fs::write(
+        &proxy_script,
+        concat!(
+            "import os, selectors, socket, sys\n",
+            "host, port = sys.argv[1], int(sys.argv[2])\n",
+            "sock = socket.create_connection((host, port))\n",
+            "sock.setblocking(False)\n",
+            "stdin_fd = sys.stdin.fileno()\n",
+            "stdout_fd = sys.stdout.fileno()\n",
+            "os.set_blocking(stdin_fd, False)\n",
+            "os.set_blocking(stdout_fd, False)\n",
+            "sel = selectors.DefaultSelector()\n",
+            "to_sock = bytearray()\n",
+            "to_out = bytearray()\n",
+            "stdin_eof = False\n",
+            "sock_eof = False\n",
+            "sock_shut = False\n",
+            "def refresh():\n",
+            "    for fd in list(sel.get_map()):\n",
+            "        sel.unregister(fd)\n",
+            "    if not stdin_eof and len(to_sock) < 65536:\n",
+            "        sel.register(stdin_fd, selectors.EVENT_READ, 'in')\n",
+            "    s_ev = 0\n",
+            "    if not sock_eof and len(to_out) < 65536:\n",
+            "        s_ev |= selectors.EVENT_READ\n",
+            "    if to_sock:\n",
+            "        s_ev |= selectors.EVENT_WRITE\n",
+            "    if s_ev:\n",
+            "        sel.register(sock, s_ev, 'sock')\n",
+            "    if to_out:\n",
+            "        sel.register(stdout_fd, selectors.EVENT_WRITE, 'out')\n",
+            "try:\n",
+            "    while not (sock_eof and not to_out):\n",
+            "        if stdin_eof and not to_sock and not sock_shut:\n",
+            "            try:\n",
+            "                sock.shutdown(socket.SHUT_WR)\n",
+            "            except OSError:\n",
+            "                pass\n",
+            "            sock_shut = True\n",
+            "        refresh()\n",
+            "        if not sel.get_map():\n",
+            "            break\n",
+            "        for key, mask in sel.select():\n",
+            "            tag = key.data\n",
+            "            if tag == 'in' and (mask & selectors.EVENT_READ):\n",
+            "                chunk = os.read(stdin_fd, 32768)\n",
+            "                if not chunk:\n",
+            "                    stdin_eof = True\n",
+            "                else:\n",
+            "                    to_sock.extend(chunk)\n",
+            "            elif tag == 'sock':\n",
+            "                if mask & selectors.EVENT_READ:\n",
+            "                    try:\n",
+            "                        chunk = sock.recv(32768)\n",
+            "                    except BlockingIOError:\n",
+            "                        chunk = None\n",
+            "                    if chunk == b'':\n",
+            "                        sock_eof = True\n",
+            "                    elif chunk:\n",
+            "                        to_out.extend(chunk)\n",
+            "                if (mask & selectors.EVENT_WRITE) and to_sock:\n",
+            "                    try:\n",
+            "                        n = sock.send(to_sock)\n",
+            "                        del to_sock[:n]\n",
+            "                    except BlockingIOError:\n",
+            "                        pass\n",
+            "            elif tag == 'out' and (mask & selectors.EVENT_WRITE) and to_out:\n",
+            "                try:\n",
+            "                    n = os.write(stdout_fd, to_out)\n",
+            "                    del to_out[:n]\n",
+            "                except BlockingIOError:\n",
+            "                    pass\n",
+            "except (BrokenPipeError, ConnectionResetError, OSError):\n",
+            "    pass\n",
+            "finally:\n",
+            "    try:\n",
+            "        sock.close()\n",
+            "    except OSError:\n",
+            "        pass\n",
+        ),
+    )
+    .unwrap();
+    // client ssh_config enforces `AddressFamily inet6` while reaching IPv4-only private sshd
+    // servers (`AddressFamily inet`) through a ProxyCommand: client-opened sockets (download `-L`
+    // listener and upload local target) must stay IPv6 while server-opened sockets (download
+    // remote target and upload remote `-R` listener) must follow the server's actual IPv4 family.
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               ProxyCommand {} {} 127.0.0.1 {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host proxy-v4-src\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               ProxyCommand {} {} 127.0.0.1 {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host proxy-v4-dst\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               ProxyCommand {} {} 127.0.0.1 {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            python3.display(),
+            proxy_script.display(),
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_src.addr.port(),
+            python3.display(),
+            proxy_script.display(),
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            python3.display(),
+            proxy_script.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("proxy_v4_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "cross-family alpha", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "cross-family beta", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_path = src_tree.to_str().unwrap();
+    let src_proxy = format!("proxy-v4-src:{src_path}");
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. download (-L: client [::1] listener -> IPv4-only source sshd dialing 127.0.0.1)
+    let dst_dl = dst_dir.path().join("proxy_dl");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_proxy,
+            dst_dl.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "cross-family proxy SSH download failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected 2 parallel tunnels on cross-family proxy download:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_dl.join("a.txt")),
+        "cross-family alpha"
+    );
+    assert_eq!(get_file_content(&dst_dl.join("b.txt")), "cross-family beta");
+    // 2. upload (-R: IPv4-only dest sshd listening on 127.0.0.1 -> client inet6 dialing ::1)
+    let dst_ul = dst_dir.path().join("proxy_ul");
+    let dst_ul_remote = format!("proxy-v4-dst:{}", dst_ul.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_ul_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "cross-family proxy SSH upload failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected 2 parallel tunnels on cross-family proxy upload:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_ul.join("a.txt")),
+        "cross-family alpha"
+    );
+    assert_eq!(get_file_content(&dst_ul.join("b.txt")), "cross-family beta");
+    // 3. auto download & upload through the same cross-family proxy
+    let dst_auto_dl = dst_dir.path().join("proxy_auto_dl");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_proxy,
+            dst_auto_dl.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "cross-family proxy auto download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        get_file_content(&dst_auto_dl.join("a.txt")),
+        "cross-family alpha"
+    );
+    assert_eq!(
+        get_file_content(&dst_auto_dl.join("b.txt")),
+        "cross-family beta"
+    );
+    let dst_auto_ul = dst_dir.path().join("proxy_auto_ul");
+    let dst_auto_ul_remote = format!("proxy-v4-dst:{}", dst_auto_ul.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_auto_ul_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "cross-family proxy auto upload failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        get_file_content(&dst_auto_ul.join("a.txt")),
+        "cross-family alpha"
+    );
+    assert_eq!(
+        get_file_content(&dst_auto_ul.join("b.txt")),
+        "cross-family beta"
+    );
+    drop(sshd_local);
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_agent_forward_preauthenticates_before_source_across_host_key_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let remote_home = tempfile::tempdir().unwrap();
+    let shared_host_key = home.path().join("shared_cluster_host_key");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&shared_host_key)
+        .status()
+        .expect("failed to generate shared host key");
+    assert!(status.success(), "ssh-keygen failed for shared host key");
+    let shared_host_key_pub = std::fs::read_to_string(shared_host_key.with_extension("pub"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    // two distinct routes (distinct ports) sharing the same host key + OpenSSH `HostKeyAlias`:
+    // source explicitly permits `StrictHostKeyChecking accept-new` while agent-forwarded
+    // destination enforces `StrictHostKeyChecking yes`. Destination must authenticate FIRST so
+    // source can never populate `shared-cluster` in `known_hosts` before destination checks it,
+    // and once trusted, destination must retain that single verified master across `~` expansion
+    // and destination `rcpd` setup.
+    let sshd_src = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            force_home: Some(remote_home.path()),
+            host_key_path: Some(&shared_host_key),
+            ..Default::default()
+        },
+    );
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            force_home: Some(remote_home.path()),
+            host_key_path: Some(&shared_host_key),
+            ..Default::default()
+        },
+    );
+    assert_ne!(sshd_src.addr.port(), sshd_dst.addr.port());
+    let known_hosts = home.path().join("known_hosts");
+    std::fs::write(&known_hosts, "").unwrap();
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host src-alias\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               HostKeyAlias shared-cluster\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking accept-new\n\
+               UserKnownHostsFile {}\n\
+             Host dst-alias\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               HostKeyAlias shared-cluster\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {}\n\
+             Host dst-alias-cfg-fwd\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               HostKeyAlias shared-cluster\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               ForwardAgent yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {}\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            known_hosts.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            known_hosts.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            known_hosts.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let src_file = remote_home.path().join("alias_src.txt");
+    create_test_file(&src_file, "host-key-alias guarded payload", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    let count_auths = |log_path: &std::path::Path| -> usize {
+        std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("Accepted publickey"))
+            .count()
+    };
+    // 1. before trusting `shared-cluster`, neither `~` expansion nor absolute-path setup under
+    //    `--ssh-forward-agent` or config `ForwardAgent yes` may allow `src-alias` (`accept-new`)
+    //    to connect first or populate `known_hosts`.
+    let out_tilde = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            "src-alias:~/alias_src.txt",
+            "dst-alias:~/out_tilde.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_tilde.status.success(),
+        "untrusted HostKeyAlias destination (~/src -> ~/dst, --ssh-forward-agent) must fail"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "src-alias must NOT populate shared-cluster in known_hosts before dst-alias authenticates"
+    );
+    assert_eq!(
+        count_auths(&sshd_src.sshd_log),
+        0,
+        "source must never authenticate before untrusted agent-forwarded destination fails"
+    );
+    let abs_src = format!("src-alias:{}", src_file.to_str().unwrap());
+    let abs_dst_path = remote_home.path().join("out_abs.txt");
+    let abs_dst = format!("dst-alias:{}", abs_dst_path.to_str().unwrap());
+    let out_abs = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            &abs_src,
+            &abs_dst,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_abs.status.success(),
+        "untrusted HostKeyAlias destination (abs paths, --ssh-forward-agent) must fail"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "parallel source setup must NOT populate shared-cluster before dst-alias authenticates"
+    );
+    assert_eq!(
+        count_auths(&sshd_src.sshd_log),
+        0,
+        "source must remain untouched when destination fails host-key verification on abs paths"
+    );
+    let out_cfg = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            &rcpd_flag,
+            "src-alias:~/alias_src.txt",
+            "dst-alias-cfg-fwd:~/out_cfg.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        !out_cfg.status.success(),
+        "untrusted HostKeyAlias destination (config ForwardAgent yes) must fail"
+    );
+    assert!(
+        std::fs::read_to_string(&known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "config ForwardAgent yes must reject untrusted HostKeyAlias before source connects"
+    );
+    assert_eq!(count_auths(&sshd_src.sshd_log), 0);
+    // 2. trust `shared-cluster` explicitly: both `--ssh-forward-agent` and config `ForwardAgent`
+    //    succeed, and each run authenticates to `sshd_dst` exactly ONCE (proving the verified
+    //    master session is retained across `~` expansion and destination `rcpd` setup).
+    std::fs::write(
+        &known_hosts,
+        format!("shared-cluster {shared_host_key_pub}\n"),
+    )
+    .unwrap();
+    let dst_auths_before_flag = count_auths(&sshd_dst.sshd_log);
+    let out_flag_ok = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-forward-agent",
+            &rcpd_flag,
+            "src-alias:~/alias_src.txt",
+            "dst-alias:~/out_tilde.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out_flag_ok.status.success(),
+        "trusted HostKeyAlias copy (--ssh-forward-agent) failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out_flag_ok.stdout),
+        String::from_utf8_lossy(&out_flag_ok.stderr)
+    );
+    assert_eq!(
+        get_file_content(&remote_home.path().join("out_tilde.txt")),
+        "host-key-alias guarded payload"
+    );
+    assert_eq!(
+        count_auths(&sshd_dst.sshd_log) - dst_auths_before_flag,
+        1,
+        "verified destination SSH master must be retained across `~` expansion and rcpd setup (expected 1 auth)"
+    );
+    let dst_auths_before_cfg = count_auths(&sshd_dst.sshd_log);
+    let out_cfg_ok = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            &rcpd_flag,
+            "src-alias:~/alias_src.txt",
+            "dst-alias-cfg-fwd:~/out_cfg.txt",
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out_cfg_ok.status.success(),
+        "trusted HostKeyAlias copy (config ForwardAgent yes) failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out_cfg_ok.stdout),
+        String::from_utf8_lossy(&out_cfg_ok.stderr)
+    );
+    assert_eq!(
+        get_file_content(&remote_home.path().join("out_cfg.txt")),
+        "host-key-alias guarded payload"
+    );
+    assert_eq!(
+        count_auths(&sshd_dst.sshd_log) - dst_auths_before_cfg,
+        1,
+        "verified destination SSH master (config ForwardAgent yes) must be retained across `~` and rcpd setup"
+    );
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_plaintext_dry_run_retains_partial_counts_and_fails_promptly_on_denied_forward() {
+    let home = tempfile::tempdir().unwrap();
+    let sshd_local = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_no_fwd = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            allow_tcp_forwarding: Some("no"),
+            ..Default::default()
+        },
+    );
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host src-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host dst-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host no-fwd-src\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_no_fwd.addr.port(),
+            sshd_no_fwd.client_key.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("plain_preview_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    for i in 0..20 {
+        create_test_file(
+            &src_tree.join(format!("item-{i:02}.txt")),
+            "plaintext dry-run payload",
+            0o644,
+        );
+    }
+    let bin_dir = home.path().join("bin");
+    let preview_started_marker = home.path().join("preview-started.marker");
+    let drop_marker = home.path().join("tunnel-dropped.marker");
+    let wrapper = home.path().join("rcpd-plaintext-dry-run-delay");
+    let real_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    // source forwards its initial hello and early dry-run output immediately, signaling
+    // `preview_started_marker` once at least one file (`item-`) has been previewed. Destination
+    // then creates `drop_marker` and kills its 3-host SSH tunnel; source delays all post-drop
+    // stdout (including its final `RcpdResult`) by 4 seconds (exceeding the 2s pre-connection
+    // grace). Because `DryRunReady` already marked `peer_connected = true` on destination, master
+    // must retain source's partial file and directory counts.
+    let wrapper_body = format!(
+        concat!(
+            "#!/usr/bin/env python3\n",
+            "import os, signal, subprocess, sys, threading, time\n",
+            "os.environ['PATH'] = {bin_dir:?} + ':' + os.environ.get('PATH', '')\n",
+            "args = sys.argv[1:]\n",
+            "def role_is(target):\n",
+            "    return any(a == f'--role={{target}}' or (a == '--role' and i + 1 < len(args) and args[i + 1] == target) for i, a in enumerate(args))\n",
+            "started_marker = {started_marker:?}\n",
+            "marker = {marker:?}\n",
+            "if role_is('source'):\n",
+            "    proc = subprocess.Popen([{rcpd:?}] + args, stdout=subprocess.PIPE)\n",
+            "    out_fd = sys.stdout.fileno()\n",
+            "    src_fd = proc.stdout.fileno()\n",
+            "    buffered = bytearray()\n",
+            "    delay_until = None\n",
+            "    signaled_preview = False\n",
+            "    scan_tail = b''\n",
+            "    while True:\n",
+            "        chunk = os.read(src_fd, 65536)\n",
+            "        if not chunk:\n",
+            "            break\n",
+            "        if delay_until is None and os.path.exists(marker):\n",
+            "            delay_until = time.monotonic() + 4.0\n",
+            "        if delay_until is not None:\n",
+            "            buffered.extend(chunk)\n",
+            "        else:\n",
+            "            view = memoryview(chunk)\n",
+            "            while view:\n",
+            "                written = os.write(out_fd, view)\n",
+            "                view = view[written:]\n",
+            "            if not signaled_preview:\n",
+            "                window = scan_tail + chunk\n",
+            "                if b'item-' in window:\n",
+            "                    signaled_preview = True\n",
+            "                    with open(started_marker, 'w') as f:\n",
+            "                        f.write('started\\n')\n",
+            "                scan_tail = window[-4:]\n",
+            "    if delay_until is None and os.path.exists(marker):\n",
+            "        delay_until = time.monotonic() + 4.0\n",
+            "    if delay_until is not None:\n",
+            "        rem = delay_until - time.monotonic()\n",
+            "        if rem > 0:\n",
+            "            time.sleep(rem)\n",
+            "        view = memoryview(buffered)\n",
+            "        while view:\n",
+            "            written = os.write(out_fd, view)\n",
+            "            view = view[written:]\n",
+            "    sys.exit(proc.wait())\n",
+            "if not role_is('destination'):\n",
+            "    os.execv({rcpd:?}, [{rcpd:?}] + args)\n",
+            "proc = subprocess.Popen([{rcpd:?}] + args)\n",
+            "def find_tunnel_ssh(parent_pid):\n",
+            "    for entry in os.listdir('/proc'):\n",
+            "        if not entry.isdigit():\n",
+            "            continue\n",
+            "        pid = int(entry)\n",
+            "        try:\n",
+            "            with open(f'/proc/{{pid}}/status', 'r') as f:\n",
+            "                ppid = None\n",
+            "                for line in f:\n",
+            "                    if line.startswith('PPid:'):\n",
+            "                        ppid = int(line.split()[1])\n",
+            "                        break\n",
+            "            if ppid != parent_pid:\n",
+            "                continue\n",
+            "            with open(f'/proc/{{pid}}/cmdline', 'rb') as f:\n",
+            "                cmd = f.read().split(b'\\x00')\n",
+            "            if b'-M' in cmd and b'-N' in cmd:\n",
+            "                return pid\n",
+            "        except OSError:\n",
+            "            pass\n",
+            "    return None\n",
+            "def kill_tunnel():\n",
+            "    deadline = time.monotonic() + 12.0\n",
+            "    tunnel_pid = None\n",
+            "    while time.monotonic() < deadline and proc.poll() is None:\n",
+            "        if tunnel_pid is None:\n",
+            "            tunnel_pid = find_tunnel_ssh(proc.pid)\n",
+            "        if tunnel_pid is not None and os.path.exists(started_marker):\n",
+            "            break\n",
+            "        time.sleep(0.02)\n",
+            "    if tunnel_pid is not None:\n",
+            "        with open(marker, 'w') as f:\n",
+            "            f.write('dropped\\n')\n",
+            "        try:\n",
+            "            os.kill(tunnel_pid, signal.SIGKILL)\n",
+            "        except OSError:\n",
+            "            pass\n",
+            "threading.Thread(target=kill_tunnel, daemon=True).start()\n",
+            "sys.exit(proc.wait())\n",
+        ),
+        bin_dir = bin_dir.to_string_lossy(),
+        started_marker = preview_started_marker.to_string_lossy(),
+        marker = drop_marker.to_string_lossy(),
+        rcpd = real_rcpd.to_string_lossy(),
+    );
+    std::fs::write(&wrapper, wrapper_body).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_flag = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("src-node:{}", src_tree.to_str().unwrap());
+    let dst_tree = dst_dir.path().join("plain_preview_dst");
+    let dst_remote = format!("dst-node:{}", dst_tree.to_str().unwrap());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. plaintext mid-preview drop with 4s-delayed source result must retain partial counts.
+    let started = std::time::Instant::now();
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--dry-run=brief",
+            "--no-encryption",
+            "--summary",
+            "--remote-transport=ssh",
+            "--ops-throttle=1",
+            &rcpd_flag,
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    let elapsed = started.elapsed();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "dropping the 3-host tunnel mid-plaintext-dry-run must fail rcp:\n{combined}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(4)
+            && elapsed < std::time::Duration::from_secs(14),
+        "plaintext dry-run must wait for the 4s-delayed source result and still abort promptly (elapsed={elapsed:?}):\n{combined}"
+    );
+    assert!(
+        !combined.contains("AllowTcpForwarding"),
+        "mid-preview drop after DryRunReady must not falsely blame AllowTcpForwarding:\n{combined}"
+    );
+    let parse_summary_count = |label: &str| -> u64 {
+        combined
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(label)
+                    .and_then(|rest| rest.trim().parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| panic!("missing summary line '{label}' in output:\n{combined}"))
+    };
+    let files_copied = parse_summary_count("files copied:");
+    let dirs_created = parse_summary_count("directories created:");
+    assert!(
+        files_copied >= 1 && dirs_created >= 1,
+        "4s-delayed plaintext dry-run source result must retain partial counts (got files_copied={files_copied}, dirs_created={dirs_created}):\n{combined}"
+    );
+    assert!(!dst_tree.exists());
+    // 2. denied forward on plaintext dry-run (`AllowTcpForwarding no`) must still fail promptly
+    //    without waiting 60s for source's `accept_timeout_sec`.
+    let plain_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let plain_rcpd_flag = format!("--rcpd-path={}", plain_wrapper.display());
+    let no_fwd_src = format!("no-fwd-src:{}", src_tree.to_str().unwrap());
+    let no_fwd_dst = dst_dir.path().join("no_fwd_dry_run_dst");
+    let started = std::time::Instant::now();
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--dry-run=brief",
+            "--no-encryption",
+            "--remote-transport=ssh",
+            "--remote-copy-conn-timeout-sec=30",
+            &plain_rcpd_flag,
+            &no_fwd_src,
+            no_fwd_dst.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    let elapsed = started.elapsed();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "plaintext dry-run with AllowTcpForwarding no must fail:\n{combined}"
+    );
+    assert!(
+        combined.contains("AllowTcpForwarding"),
+        "expected AllowTcpForwarding diagnostic on denied plaintext dry-run forward:\n{combined}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(12),
+        "denied plaintext dry-run forward must exit promptly without waiting for source accept timeout (elapsed={elapsed:?}):\n{combined}"
+    );
+    drop(sshd_local);
+    drop(sshd_src);
+    drop(sshd_dst);
+    drop(sshd_no_fwd);
 }

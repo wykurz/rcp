@@ -357,6 +357,10 @@ pub enum SourceMessage {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
+    /// Signal that source accepted the dry-run control connection and is starting traversal.
+    /// Allows plaintext (`--no-encryption`) destinations to distinguish an active preview from a
+    /// forward denied before reaching source.
+    DryRunReady,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -765,7 +769,12 @@ pub fn parse_ssh_connection_server_addr(value: &str) -> Option<std::net::SocketA
     let mut parts = value.split_whitespace();
     let _client_ip = parts.next()?;
     let _client_port = parts.next()?;
-    let server_ip = parts.next()?.parse::<std::net::IpAddr>().ok()?;
+    let server_ip = match parts.next()?.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    };
     let server_port = parts.next()?.parse::<u16>().ok()?;
     if server_ip.is_unspecified() || server_port == 0 {
         return None;
@@ -1650,6 +1659,10 @@ mod tests {
         assert_eq!(
             parse_ssh_connection_server_addr("::1 54321 ::1 22"),
             Some("[::1]:22".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ssh_connection_server_addr("::ffff:10.0.0.1 54321 ::ffff:10.0.0.2 2222"),
+            Some("10.0.0.2:2222".parse().unwrap())
         );
         assert_eq!(
             parse_ssh_connection_server_addr("10.0.0.1 54321 0.0.0.0 22"),
