@@ -38,16 +38,18 @@ def cell_index(run, case, scenario):
 class ToolTrendTests(unittest.TestCase):
     def test_cells_and_trends_are_named_once(self):
         # every cell scenario has a title, for the tables that list cells
-        self.assertEqual(list(history.SCENARIOS), ["local", "remote", *CELLS])
+        # the cells on other storage and their trends came later (test_storage_pages.py)
+        self.assertEqual(list(history.SCENARIOS)[:8], ["local", "remote", *CELLS])
         self.assertEqual(history.SCENARIOS["remote-rrm"], "Remove with rrm, after a remote copy")
         self.assertEqual(history.SCENARIOS["local-rcmp"], "Compare with rcmp, after a local copy")
         # a trend is a kind of copy or a tool; a tool's trend takes the runs of its cells after either kind
-        self.assertEqual(history.TRENDS, ("local", "remote", *TOOLS))
+        self.assertEqual(tuple(trend for trend in history.TRENDS if trend not in ("nfs", "memory")),
+                         ("local", "remote", *TOOLS))
         self.assertEqual(history.TOOLS, TOOLS)
-        self.assertEqual({trend: history.cells(trend) for trend in history.TRENDS},
+        self.assertEqual({trend: history.cells(trend)[:2] for trend in ("local", "remote", *TOOLS)},
                          dict(local=("local",), remote=("remote",), rcmp=("local-rcmp", "remote-rcmp"),
                               rlink=("local-rlink", "remote-rlink"), rrm=("local-rrm", "remote-rrm")))
-        self.assertEqual({trend: history.ROWS[trend][:2] for trend in history.TRENDS},
+        self.assertEqual({trend: history.ROWS[trend][:2] for trend in ("local", "remote", *TOOLS)},
                          dict(local=("Local copies", "local.html"), remote=("Remote copies", "remote.html"),
                               rcmp=("Compare with rcmp", "rcmp.html"), rlink=("Hard-link with rlink", "rlink.html"),
                               rrm=("Remove with rrm", "rrm.html")))

@@ -892,6 +892,129 @@ class ReportSiteTests(unittest.TestCase):
             self.assertTrue((self.output / 'aws-benchmarks' / (tool + '.html')).is_file())
         self.assert_site_links_resolve()
 
+    def test_copies_on_other_storage_get_pages_of_their_own_once_a_run_measures_there(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        def site(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})
+        arrays = matrix_example('matrix-all-local+tools+remote+tools')
+        pages = site([arrays])
+        # until a run has a cell there, no page says anything about other storage
+        for name in ('nfs.html', 'memory.html'):
+            self.assertNotIn(Path('aws-benchmarks') / name, pages)
+        for path, document in pages.items():
+            if path.suffix == '.html':
+                with self.subTest(page=str(path)):
+                    for phrase in ('nfs', 'network filesystem', 'filesystems in memory', 'memory.html',
+                                   'overview-storage', 'other storage'):
+                        self.assertNotIn(phrase, document.lower())
+        everywhere = matrix_example('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools', run='43200000002',
+                                    at='2026-11-27T08:30:00+00:00')
+        pages = site([arrays, everywhere])
+        index, setup = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/setups.html')]
+        mounts, memory = pages[Path('aws-benchmarks/nfs.html')], pages[Path('aws-benchmarks/memory.html')]
+        self.assertIn('<h1>Copies between NFS mounts</h1><p class="lede">How long rcp takes to copy a dataset between '
+                      'two mounts of a network filesystem on one AWS machine, with the CPU time and peak memory of the '
+                      'copy. The worker serves its two arrays over NFS on loopback, with a delay that makes every '
+                      'request to the server cost milliseconds. <a href="setups.html#machine">Test setup</a> says how '
+                      'that storage is made; the list of runs is on the', mounts)
+        self.assertIn('where a request to the server costs 5 ms · 1 run</p>', mounts)
+        self.assertIn('<h1>Copies in memory</h1><p class="lede">How long rcp takes to copy a dataset between two '
+                      'filesystems in memory on one AWS machine, with the CPU time and peak memory of the copy. No '
+                      'operation there waits for a disk.', memory)
+        self.assertIn('between two filesystems in memory · 1 run</p>', memory)
+        # one process, as a local copy: duration, CPU time and peak memory of one file set
+        self.assertEqual((mounts.count('<svg '), memory.count('<svg ')), (3, 3))
+        self.assertNotIn("data-history-metric='source_cpu'", mounts)
+        # the first page gains one row for the two, after the rows of the arrays and before the tools
+        self.assertEqual([index.count("data-overview='" + kind + "'") for kind in ('local', 'remote', 'nfs', 'memory')],
+                         [4, 4, 1, 1])
+        self.assertLess(index.index("id='overview-remote'"), index.index("id='overview-storage'"))
+        self.assertLess(index.index("id='overview-storage'"), index.index("id='overview-tools'"))
+        self.assertIn("<h2 id='overview-storage-title'>Copies on other storage</h2>", index)
+        self.assertIn("<a href='nfs.html#history-tiny-1k-700x1024' aria-label='1 KB files on NFS, nfs copies'>", index)
+        self.assertIn('locally, through its remote path over loopback, between two mounts of a network filesystem '
+                      'and in memory, and how long rcmp, rlink and rrm take on each copy.</p>', index)
+        # every page of the section links to both, after the pages of the other copies
+        links = ('<li><a href="nfs.html">Copies between NFS mounts</a></li>'
+                 '<li><a href="memory.html">Copies in memory</a></li>')
+        for page in (index, setup, pages[Path('aws-benchmarks/local.html')], pages[Path('aws-benchmarks/rrm.html')]):
+            self.assertIn('<li><a href="remote.html">Remote copies</a></li>' + links +
+                          '<li><a href="rcmp.html">Compare with rcmp</a></li>', page)
+        self.assertIn('<li><a href="#report-content" aria-current="page">Copies between NFS mounts</a></li>', mounts)
+        page = pages[Path('aws-benchmarks/runs/repo-655073755-run-43200000002.html')]
+        self.assertIn('<li><a href="../nfs.html">Copies between NFS mounts</a></li>', page)
+        self.assertIn('<td>1 KB files on NFS</td><td>Copy between NFS mounts</td><td>measured</td>', page)
+        self.assertEqual(json.loads(pages[Path('aws-benchmarks/diagnostics/repo-655073755-run-43200000002.json')])
+                         ['schema'], 'rcp-public-resource-diagnostics-v5')
+        self.assertIn('<strong>Network filesystem.</strong>', setup)
+        self.assertIn('<tr><td>1 KB on NFS</td><td>716,800</td>', setup)
+        # a tool's page gains the file sets of other storage, and the pages of the arrays are what they were
+        remove = pages[Path('aws-benchmarks/rrm.html')]
+        self.assertIn("<h2 id='history-tiny-1k-700x1024-title'>1 KB files on NFS</h2>", remove)
+        self.assertEqual(remove.count('<svg '), 18)
+        before, after = site([arrays])[Path('aws-benchmarks/local.html')], pages[Path('aws-benchmarks/local.html')]
+        self.assertEqual(before.count('<svg '), after.count('<svg '))
+        self.assertNotIn('outside these trends', after)
+
+    def test_a_run_on_other_storage_without_diagnostics_does_not_stop_the_site(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        record, _ = matrix_example('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools')
+        # a run whose archive could not be read has no companion: its pages are written all the same
+        pages = report_site.render_aws_benchmarks({record['run_key']: production_export.collection.encoded(record)})
+        page = pages[Path('aws-benchmarks/runs/' + record['run_key'] + '.html')]
+        self.assertIn('Process-resource availability: unavailable.', page)
+        self.assertIn('The mounts of the network filesystem were not recorded for this run.', page)
+        fallback = json.loads(pages[Path('aws-benchmarks/diagnostics/' + record['run_key'] + '.json')])
+        self.assertEqual((fallback['schema'], fallback['status']), ('rcp-public-resource-diagnostics-v5', 'unavailable'))
+        self.assertEqual(fallback['other_storage'], dict(nfs=dict(status='not_recorded'),
+                                                         memory=dict(status='not_recorded')))
+        # the duration of every cell is still plotted: only CPU time and memory need the companion
+        self.assertIn('<h1>Copies between NFS mounts</h1>', pages[Path('aws-benchmarks/nfs.html')])
+
+    def test_a_run_of_every_suite_on_other_storage_has_its_pages_with_and_without_diagnostics(self):
+        import report_site
+        from infra.aws_benchmark import common, production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        suites = [suite for suite in common.MATRIX_SUITES if 'nfs' in suite or 'memory' in suite]
+        self.assertEqual(len(suites), 6)
+        for suite in suites:
+            record, extra = matrix_example(suite)
+            for diagnostics in ({record['run_key']: extra}, None):
+                with self.subTest(suite=suite, companion=diagnostics is not None):
+                    pages = report_site.render_aws_benchmarks(
+                        {record['run_key']: production_export.collection.encoded(record)}, diagnostics=diagnostics)
+                    # a page for each kind of copy the suite has, and none for one it has not
+                    for kind in ('nfs', 'memory'):
+                        self.assertEqual(Path('aws-benchmarks') / (kind + '.html') in pages, kind in suite)
+                    self.assertIn(Path('aws-benchmarks/runs') / (record['run_key'] + '.html'), pages)
+
+    def test_a_site_with_cells_on_other_storage_has_no_dangling_link(self):
+        from infra.aws_benchmark.production_publish import inventory
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        runs = [matrix_example('matrix-all-local+tools+remote+tools'),
+                matrix_example('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools', run='43200000002',
+                               at='2026-11-27T08:30:00+00:00')]
+        directory, revision, _ = self.retained_batch([record for record, _ in runs])
+        index = json.loads((directory / 'index.json').read_text())
+        index.update(schema='rcp-production-retained-reports-v2', diagnostics=[])
+        for record, extra in runs:
+            body = json.dumps(extra, separators=(',', ':')).encode()
+            (directory / (record['run_key'] + '.diagnostics.json')).write_bytes(body)
+            index['diagnostics'].append(dict(run_key=record['run_key'], sha256=hashlib.sha256(body).hexdigest(),
+                                             bytes=len(body)))
+        (directory / 'index.json').write_text(json.dumps(index))
+        result = self.build_retained((directory, revision, inventory(directory)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ('nfs.html', 'memory.html', 'rrm.html'):
+            self.assertTrue((self.output / 'aws-benchmarks' / name).is_file())
+        self.assert_site_links_resolve()
+
     def test_a_remote_cell_that_was_never_measured_still_opens_the_remote_page(self):
         import report_site
         from infra.aws_benchmark import production_export
