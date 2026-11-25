@@ -28,6 +28,11 @@ struct Args {
     #[arg(long, hide = true)]
     preview_only: bool,
 
+    /// Requested 3-host destination SSH tunnel count for descriptor headroom accounting (set by rcp
+    /// master on destination daemons only).
+    #[arg(long, hide = true, default_value_t = 0)]
+    ssh_tunnels: usize,
+
     // Copy options
     /// Overwrite existing files/directories
     #[arg(short, long, help_heading = "Copy options")]
@@ -323,6 +328,11 @@ impl Args {
             throttle.admission_policy = common::AdmissionPolicy::Remote {
                 streams: concurrency.max_connections(),
                 pending: concurrency.max_pending_files(),
+                ssh_tunnels: if self.role == remote::protocol::RcpdRole::Destination {
+                    self.ssh_tunnels
+                } else {
+                    0
+                },
             };
         }
         throttle
@@ -526,7 +536,7 @@ where
     loop {
         match master_stdin.recv_message().await {
             MasterReadOutcome::Message(message) => match *message {
-                remote::protocol::MasterToRcpd::Hello(hello) => return Ok(hello),
+                remote::protocol::MasterToRcpd::Hello(hello) => return Ok(*hello),
                 remote::protocol::MasterToRcpd::Heartbeat => {
                     // master sends periodic heartbeats from spawn while bringing up the peer daemon
                     continue;
@@ -543,6 +553,7 @@ where
                             .to_string(),
                         summary: common::copy::Summary::default(),
                         runtime_stats: common::collect_runtime_stats(),
+                        peer_connected: false,
                     },
                     drain_stdout: true,
                 });
@@ -556,6 +567,7 @@ where
                         ),
                         summary: common::copy::Summary::default(),
                         runtime_stats: common::collect_runtime_stats(),
+                        peer_connected: false,
                     },
                     drain_stdout: false,
                 });
@@ -566,6 +578,7 @@ where
                         error: format!("Failed to receive hello message from master: {error:#}"),
                         summary: common::copy::Summary::default(),
                         runtime_stats: common::collect_runtime_stats(),
+                        peer_connected: false,
                     },
                     drain_stdout: true,
                 });
@@ -660,6 +673,7 @@ struct OperationOutcome {
 /// summary from a `common::copy::Error` when one is carried.
 fn rcpd_result_from(
     result: anyhow::Result<(String, common::copy::Summary)>,
+    peer_connected: bool,
 ) -> remote::protocol::RcpdResult {
     let runtime_stats = common::collect_runtime_stats();
     match result {
@@ -678,6 +692,7 @@ fn rcpd_result_from(
                 error: error_msg,
                 summary,
                 runtime_stats,
+                peer_connected,
             }
         }
     }
@@ -706,16 +721,20 @@ where
     };
     tracing::info!("Received side: {:?}", master_hello);
     let (fallback_tx, fallback_rx) = match &master_hello {
-        remote::protocol::MasterHello::Destination {
-            transport: remote::protocol::DestinationTransport::AutoMasterSsh { .. },
-            ..
-        } => {
+        remote::protocol::MasterHello::Destination { transport, .. }
+            if matches!(
+                transport.as_ref(),
+                remote::protocol::DestinationTransport::AutoMasterSsh { .. }
+            ) =>
+        {
             let (tx, rx) = tokio::sync::oneshot::channel();
             (Some(tx), Some(rx))
         }
         _ => (None, None),
     };
     let control_for_op = master_control.clone();
+    let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_connected_for_op = peer_connected.clone();
     let operation = async move {
         args.validate_preview_mode(&master_hello)?;
         match master_hello {
@@ -746,6 +765,7 @@ where
                     accept_timeout,
                     cert_key.as_ref(),
                     dest_cert_fingerprint,
+                    &peer_connected_for_op,
                 )
                 .await
             }
@@ -783,6 +803,7 @@ where
                     &control_for_op,
                     fallback_rx,
                     cleanup,
+                    &peer_connected_for_op,
                 )
                 .await
             }
@@ -793,6 +814,7 @@ where
         &mut master_stdin,
         &master_control,
         fallback_tx,
+        &peer_connected,
     )
     .await
 }
@@ -868,6 +890,7 @@ where
                                 error: format!("failed to send result to master: {error:#}"),
                                 summary: common::copy::Summary::default(),
                                 runtime_stats: common::collect_runtime_stats(),
+                                peer_connected: false,
                             },
                             drain_stdout: false,
                         }
@@ -902,6 +925,7 @@ where
                                         error: format!("failed to send result to master: {error:#}"),
                                         summary: common::copy::Summary::default(),
                                         runtime_stats: common::collect_runtime_stats(),
+                                        peer_connected: false,
                                     },
                                     drain_stdout: false,
                                 }
@@ -916,6 +940,7 @@ where
                                             .to_string(),
                                         summary: common::copy::Summary::default(),
                                         runtime_stats: common::collect_runtime_stats(),
+                                        peer_connected: false,
                                     },
                                     drain_stdout: false,
                                 }
@@ -935,6 +960,7 @@ where
                                 ),
                                 summary: common::copy::Summary::default(),
                                 runtime_stats: common::collect_runtime_stats(),
+                                peer_connected: false,
                             },
                             drain_stdout: false,
                         };
@@ -950,6 +976,7 @@ where
                                 ),
                                 summary: common::copy::Summary::default(),
                                 runtime_stats: common::collect_runtime_stats(),
+                                peer_connected: false,
                             },
                             drain_stdout: false,
                         };
@@ -967,6 +994,7 @@ async fn run_guarded_operation_and_send_result<Operation, R>(
     master_stdin: &mut MasterStdinStream<R>,
     master_control: &remote::stdio::DaemonControlSender,
     fallback_tx: Option<tokio::sync::oneshot::Sender<destination::SshFallbackEndpoints>>,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> OperationOutcome
 where
     Operation: std::future::Future<Output = anyhow::Result<(String, common::copy::Summary)>>,
@@ -989,12 +1017,16 @@ where
                         error: format!("master control channel lost: {}", loss.cause),
                         summary: common::copy::Summary::default(),
                         runtime_stats: common::collect_runtime_stats(),
+                        peer_connected: peer_connected.load(std::sync::atomic::Ordering::Acquire),
                     },
                     drain_stdout: loss.drain_stdout,
                 };
             }
         };
-    let result = rcpd_result_from(outcome);
+    let result = rcpd_result_from(
+        outcome,
+        peer_connected.load(std::sync::atomic::Ordering::Acquire),
+    );
     deliver_result(master_stdin, master_control, result).await
 }
 
@@ -1128,6 +1160,7 @@ async fn async_main(
             error,
             summary: _,
             runtime_stats: _,
+            peer_connected: _,
         } => {
             // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("rcpd operation failed: {error}");
@@ -1408,9 +1441,16 @@ mod tests {
         let (control_tx, _control_rx) = remote::stdio::daemon_control_channel();
         let operation =
             common::task_scope::scope_tasks(operation_holding_children(dropped.clone(), cancel));
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_guarded_operation_and_send_result(operation, &mut master_stdin, &control_tx, None),
+            run_guarded_operation_and_send_result(
+                operation,
+                &mut master_stdin,
+                &control_tx,
+                None,
+                &peer_connected,
+            ),
         )
         .await
         .expect("stdin cancellation must drain child captures");
@@ -1453,6 +1493,7 @@ mod tests {
             frame
         });
         let mut master_stdin = MasterStdinStream::new(daemon_stdin_rx, 5);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         let outcome = run_guarded_operation_and_send_result(
             async {
                 Ok((
@@ -1463,6 +1504,7 @@ mod tests {
             &mut master_stdin,
             &control_tx,
             None,
+            &peer_connected,
         )
         .await;
         drop(control_tx);
@@ -1538,6 +1580,7 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let mut master_stdin = MasterStdinStream::new(daemon_stdin_rx, 30);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         let outcome = run_guarded_operation_and_send_result(
             async {
                 Ok((
@@ -1548,6 +1591,7 @@ mod tests {
             &mut master_stdin,
             &control_tx,
             None,
+            &peer_connected,
         )
         .await;
         assert!(started.elapsed() >= std::time::Duration::from_secs(12));
@@ -1610,6 +1654,7 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let mut master_stdin = MasterStdinStream::new(daemon_stdin_rx, 0);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         let outcome = run_guarded_operation_and_send_result(
             async {
                 Ok((
@@ -1620,6 +1665,7 @@ mod tests {
             &mut master_stdin,
             &control_tx,
             None,
+            &peer_connected,
         )
         .await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(60));
@@ -1665,6 +1711,7 @@ mod tests {
         tokio::task::yield_now().await;
         let started = tokio::time::Instant::now();
         let mut master_stdin = MasterStdinStream::new(daemon_stdin_rx, 30);
+        let peer_connected = std::sync::atomic::AtomicBool::new(false);
         let outcome = run_guarded_operation_and_send_result(
             async {
                 Ok((
@@ -1675,6 +1722,7 @@ mod tests {
             &mut master_stdin,
             &control_tx,
             None,
+            &peer_connected,
         )
         .await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
@@ -1787,7 +1835,7 @@ mod tests {
         let sender = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             send_stream
-                .send_control_message(&remote::protocol::MasterToRcpd::Hello(
+                .send_control_message(&remote::protocol::MasterToRcpd::Hello(Box::new(
                     remote::protocol::MasterHello::Source {
                         src: "/src".into(),
                         dst: "/dst".into(),
@@ -1797,7 +1845,7 @@ mod tests {
                         capture: Default::default(),
                         accept_timeout_sec: 15,
                     },
-                ))
+                )))
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -1831,9 +1879,9 @@ mod tests {
         };
         let mut encoded = Vec::new();
         remote::streams::SendStream::new(&mut encoded)
-            .send_control_message(&remote::protocol::MasterToRcpd::Hello(
+            .send_control_message(&remote::protocol::MasterToRcpd::Hello(Box::new(
                 expected_hello.clone(),
-            ))
+            )))
             .await
             .unwrap();
         assert!(encoded.len() > 400);
@@ -1924,7 +1972,9 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             send_stream
-                .send_control_message(&remote::protocol::MasterToRcpd::Hello(hello_to_send))
+                .send_control_message(&remote::protocol::MasterToRcpd::Hello(Box::new(
+                    hello_to_send,
+                )))
                 .await
                 .unwrap();
             send_stream
@@ -2124,6 +2174,7 @@ mod tests {
                         common::AdmissionPolicy::Remote {
                             streams: std::num::NonZeroUsize::new(100).unwrap(),
                             pending: std::num::NonZeroUsize::new(400).unwrap(),
+                            ssh_tunnels: 0,
                         }
                     },
                 );
@@ -2152,7 +2203,7 @@ mod tests {
                     preserve: Default::default(),
                     source_cert_fingerprint: None,
                     dry_run,
-                    transport: remote::protocol::DestinationTransport::Direct,
+                    transport: Box::new(remote::protocol::DestinationTransport::Direct),
                 };
                 for hello in [&source, &destination] {
                     assert_eq!(

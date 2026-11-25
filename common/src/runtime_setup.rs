@@ -608,17 +608,22 @@ pub(crate) fn install_tracing_subscriber(
 const DESCRIPTOR_UNITS_PER_OPERATION: u64 = 5;
 const MAX_LEAF_OPERATIONS_PER_POOL: usize = 4096;
 
-/// A remote endpoint's jointly resolved leaf and directory admission.
+/// A remote endpoint's jointly resolved leaf, directory, and 3-host SSH tunnel admission.
 ///
 /// Runtime setup installs `leaf_capacity` in both leaf pools before publishing this plan. The
-/// directory counts reserve each endpoint's held descriptors through peer release. An unknown
-/// soft limit permits only logical bounds and carries no descriptor-safety guarantee.
+/// directory counts reserve each endpoint's held descriptors through peer release. When a 3-host
+/// destination requests direct SSH tunnels, `ssh_tunnels` caps local tunnel ownership to the
+/// descriptor headroom left after data streams, fixed support descriptors, and at least one work
+/// slot. An unknown soft limit permits only logical bounds and carries no descriptor-safety
+/// guarantee.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteResources {
     pub soft_limit: Option<std::num::NonZeroU64>,
     pub leaf_capacity: std::num::NonZeroUsize,
     pub normal_directories: std::num::NonZeroUsize,
     pub reserved_directories: std::num::NonZeroUsize,
+    /// Admitted local SSH tunnel ceiling for a 3-host destination daemon (0 when not applicable).
+    pub ssh_tunnels: usize,
 }
 
 impl RemoteResources {
@@ -628,6 +633,7 @@ impl RemoteResources {
         leaf_ceiling: std::num::NonZeroUsize,
         streams: std::num::NonZeroUsize,
         pending: std::num::NonZeroUsize,
+        ssh_tunnels: usize,
     ) -> anyhow::Result<Self> {
         const SUPPORT_DESCRIPTORS: u64 = 32;
         // source: two data/ACL fds plus two classification/readlink fds per leaf slot.
@@ -636,6 +642,9 @@ impl RemoteResources {
         const LEAF_DESCRIPTORS: u64 = 4;
         // four leaf fds plus two normal and two reserved lifetimes, at two fds apiece.
         const DESCRIPTORS_PER_WORK_SLOT: u64 = LEAF_DESCRIPTORS + 2 * (2 + 2);
+        // reserve one descriptor per active destination-owned SSH tunnel process defensively
+        // (covers OS process handles / transient setup sockets in addition to SUPPORT_DESCRIPTORS).
+        const DESCRIPTORS_PER_SSH_TUNNEL: u64 = 1;
         let maximum = tokio::sync::Semaphore::MAX_PERMITS;
         anyhow::ensure!(
             streams.get() <= maximum && pending.get() <= maximum,
@@ -645,23 +654,42 @@ impl RemoteResources {
             .get()
             .min(streams.get())
             .min(MAX_LEAF_OPERATIONS_PER_POOL);
-        let (leaf_capacity, normal, reserve) = match soft_limit {
+        let requested_tunnels = ssh_tunnels.min(streams.get());
+        let (leaf_capacity, normal, reserve, admitted_tunnels) = match soft_limit {
             Some(soft) => {
                 let streams_u64 = u64::try_from(streams.get()).unwrap_or(u64::MAX);
-                let available = soft
+                let min_tunnel_fds = if requested_tunnels > 0 {
+                    DESCRIPTORS_PER_SSH_TUNNEL
+                } else {
+                    0
+                };
+                let base_available = soft
                     .get()
                     .saturating_sub(streams_u64)
                     .saturating_sub(SUPPORT_DESCRIPTORS);
                 let minimum = streams_u64
                     .saturating_add(SUPPORT_DESCRIPTORS)
+                    .saturating_add(min_tunnel_fds)
                     .saturating_add(DESCRIPTORS_PER_WORK_SLOT);
                 let shortfall = minimum.saturating_sub(soft.get());
                 anyhow::ensure!(
-                    available >= DESCRIPTORS_PER_WORK_SLOT,
-                    "insufficient remote descriptor headroom: soft RLIMIT_NOFILE={}, data connections={}, support reserve={SUPPORT_DESCRIPTORS}, minimum soft limit={minimum}, shortfall={shortfall}; reduce --max-connections or --max-files-in-flight, or configure a higher hard limit inherited by rcpd in the affected host's SSH session (ulimit -H -n / sshd session limits); changing only the local rcp shell limit does not change a remote daemon's limit",
+                    base_available >= DESCRIPTORS_PER_WORK_SLOT + min_tunnel_fds,
+                    "insufficient remote descriptor headroom: soft RLIMIT_NOFILE={}, data connections={}, support reserve={SUPPORT_DESCRIPTORS}, ssh tunnel reserve={min_tunnel_fds}, minimum soft limit={minimum}, shortfall={shortfall}; reduce --max-connections or --max-files-in-flight, or configure a higher hard limit inherited by rcpd in the affected host's SSH session (ulimit -H -n / sshd session limits); changing only the local rcp shell limit does not change a remote daemon's limit",
                     soft.get(),
                     streams,
                 );
+                let admitted_tunnels = if requested_tunnels > 0 {
+                    let tunnel_budget =
+                        (base_available - DESCRIPTORS_PER_WORK_SLOT) / DESCRIPTORS_PER_SSH_TUNNEL;
+                    let max_tunnels = usize::try_from(tunnel_budget).unwrap_or(usize::MAX);
+                    requested_tunnels.min(max_tunnels).max(1)
+                } else {
+                    0
+                };
+                let tunnel_fds = u64::try_from(admitted_tunnels)
+                    .expect("admitted tunnel count fits in u64")
+                    .saturating_mul(DESCRIPTORS_PER_SSH_TUNNEL);
+                let available = base_available - tunnel_fds;
                 let work_capacity =
                     usize::try_from(available / DESCRIPTORS_PER_WORK_SLOT).unwrap_or(usize::MAX);
                 let leaf = requested.min(work_capacity);
@@ -671,7 +699,12 @@ impl RemoteResources {
                 // a scanner can retain an ancestor path independently of pending file work.
                 // split actual headroom between parallel traversal and its progress reserve.
                 let normal = (groups / 2).min(maximum);
-                (leaf, normal, (groups - normal).min(maximum))
+                (
+                    leaf,
+                    normal,
+                    (groups - normal).min(maximum),
+                    admitted_tunnels,
+                )
             }
             None => {
                 let logical = pending
@@ -679,7 +712,7 @@ impl RemoteResources {
                     .saturating_add(streams.get())
                     .saturating_mul(2)
                     .min(maximum);
-                (requested, logical, logical)
+                (requested, logical, logical, requested_tunnels)
             }
         };
         Ok(Self {
@@ -690,6 +723,7 @@ impl RemoteResources {
                 .context("normal remote directory capacity is zero")?,
             reserved_directories: std::num::NonZeroUsize::new(reserve)
                 .context("reserved remote directory capacity is zero")?,
+            ssh_tunnels: admitted_tunnels,
         })
     }
 }
@@ -887,20 +921,31 @@ fn configure_file_admission(
                 descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity),
             )
         }
-        AdmissionPolicy::Remote { streams, pending } => {
+        AdmissionPolicy::Remote {
+            streams,
+            pending,
+            ssh_tunnels,
+        } => {
             let leaf_ceiling = match throttle.files_in_flight.limit() {
                 ConcurrencyLimit::Limited(ceiling) => ceiling,
                 ConcurrencyLimit::Unlimited => streams,
             };
-            let resources =
-                RemoteResources::for_limits(soft_limit, leaf_ceiling, streams, pending)?;
+            let resources = RemoteResources::for_limits(
+                soft_limit,
+                leaf_ceiling,
+                streams,
+                pending,
+                ssh_tunnels,
+            )?;
             let leaf_capacity = ConcurrencyLimit::Limited(resources.leaf_capacity);
             tracing::info!(
-                "Resolved remote admission: file_ceiling={:?}, source={:?}, streams={}, pending={}, soft_limit={:?}, open_file={}, pending_meta={}, normal_directories={}, reserved_directories={}",
+                "Resolved remote admission: file_ceiling={:?}, source={:?}, streams={}, pending={}, ssh_tunnels={}/{}, soft_limit={:?}, open_file={}, pending_meta={}, normal_directories={}, reserved_directories={}",
                 throttle.files_in_flight.limit(),
                 throttle.files_in_flight.source(),
                 streams,
                 pending,
+                resources.ssh_tunnels,
+                ssh_tunnels,
                 soft_limit,
                 resources.leaf_capacity,
                 resources.leaf_capacity,
@@ -911,6 +956,13 @@ fn configure_file_admission(
                 tracing::warn!(target: NOTICE_TARGET,
                     "Remote descriptor headroom is unavailable; using bounded logical admission with {} leaf operations, {} normal directories, and {} reserved levels, without a descriptor-safety guarantee",
                     resources.leaf_capacity, resources.normal_directories, resources.reserved_directories);
+            } else if ssh_tunnels > 0 && resources.ssh_tunnels < ssh_tunnels.min(streams.get()) {
+                tracing::warn!(
+                    target: NOTICE_TARGET,
+                    "Requested {} parallel SSH tunnels on destination, but descriptor safety reduced local SSH tunnel capacity to {}",
+                    ssh_tunnels,
+                    resources.ssh_tunnels
+                );
             }
             // the resolved stream count already reflects the logical file and connection ceilings. Their
             // intersection is not a descriptor-safety clamp and must not produce another notice.
@@ -1567,6 +1619,7 @@ mod default_leaf_operation_limit_tests {
                 AdmissionPolicy::Remote {
                     streams: eight,
                     pending: std::num::NonZeroUsize::new(32).unwrap(),
+                    ssh_tunnels: 0,
                 },
                 8,
             ),
@@ -2109,6 +2162,7 @@ mod remote_admission_tests {
             admission_policy: crate::AdmissionPolicy::Remote {
                 streams: nonzero(streams),
                 pending: nonzero(streams * 4),
+                ssh_tunnels: 0,
             },
             ..Default::default()
         }
@@ -2159,6 +2213,7 @@ mod remote_admission_tests {
                 configuration.admission_policy = crate::AdmissionPolicy::Remote {
                     streams: nonzero(streams),
                     pending: nonzero(pending),
+                    ssh_tunnels: 0,
                 };
                 let mut installed = None;
                 let admission = configure_file_admission(
@@ -2295,6 +2350,7 @@ mod remote_admission_tests {
             nonzero(usize::MAX),
             nonzero(maximum),
             nonzero(maximum),
+            0,
         )
         .unwrap();
         assert_eq!(resources.leaf_capacity.get(), 4096);
@@ -2305,10 +2361,65 @@ mod remote_admission_tests {
             nonzero(usize::MAX),
             nonzero(maximum),
             nonzero(maximum),
+            0,
         )
         .unwrap();
         assert_eq!(unknown.normal_directories.get(), maximum);
         assert_eq!(unknown.reserved_directories.get(), maximum);
+    }
+
+    #[test]
+    fn remote_admission_reserves_and_caps_destination_ssh_tunnels_under_low_nofile() {
+        // soft=128, streams=80, support=32 -> 16 descriptors left; 12 for 1 minimum work slot,
+        // leaving 4 descriptors for destination-owned SSH tunnels instead of admitting all 64.
+        let resources = RemoteResources::for_limits(
+            std::num::NonZeroU64::new(128),
+            nonzero(80),
+            nonzero(80),
+            nonzero(320),
+            64,
+        )
+        .unwrap();
+        assert_eq!(resources.ssh_tunnels, 4);
+        assert_eq!(resources.leaf_capacity.get(), 1);
+        let total = 80
+            + 32
+            + resources.ssh_tunnels
+            + 4 * resources.leaf_capacity.get()
+            + 2 * (resources.normal_directories.get() + resources.reserved_directories.get());
+        assert!(
+            total <= 128,
+            "admitted descriptors ({total}) must fit within soft RLIMIT_NOFILE=128"
+        );
+        // soft=124 leaves only 12 descriptors (0 headroom for even 1 mandatory SSH tunnel)
+        let err = RemoteResources::for_limits(
+            std::num::NonZeroU64::new(124),
+            nonzero(80),
+            nonzero(80),
+            nonzero(320),
+            4,
+        )
+        .expect_err("must reject startup when not even 1 SSH tunnel + 1 work slot fits");
+        assert!(
+            format!("{err:#}").contains("ssh tunnel reserve=1"),
+            "error should report ssh tunnel reserve: {err:#}"
+        );
+        // ample headroom reserves all requested tunnels before sizing leaf/directory slots
+        let ample = RemoteResources::for_limits(
+            std::num::NonZeroU64::new(256),
+            nonzero(32),
+            nonzero(32),
+            nonzero(128),
+            16,
+        )
+        .unwrap();
+        assert_eq!(ample.ssh_tunnels, 16);
+        let ample_total = 32
+            + 32
+            + ample.ssh_tunnels
+            + 4 * ample.leaf_capacity.get()
+            + 2 * (ample.normal_directories.get() + ample.reserved_directories.get());
+        assert!(ample_total <= 256);
     }
 }
 

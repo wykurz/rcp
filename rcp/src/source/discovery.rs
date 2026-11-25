@@ -2482,6 +2482,7 @@ mod tests {
                     std::num::NonZeroUsize::new(e).unwrap(),
                     std::num::NonZeroUsize::new(e).unwrap(),
                     std::num::NonZeroUsize::new(p).unwrap(),
+                    0,
                 )
                 .unwrap(),
             ),

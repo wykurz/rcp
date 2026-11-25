@@ -772,7 +772,7 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send + 'static> MasterStdinSender<W> {
     ///
     /// Returns an error if the stream was already closed or writing/flushing fails.
     pub async fn send_hello(&self, hello: crate::protocol::MasterHello) -> anyhow::Result<()> {
-        self.send_frame(&crate::protocol::MasterToRcpd::Hello(hello))
+        self.send_frame(&crate::protocol::MasterToRcpd::Hello(Box::new(hello)))
             .await
     }
 
@@ -1094,6 +1094,8 @@ mod tests {
             data_addr: "127.0.0.1:4002".parse().unwrap(),
             tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             server_name: "source".to_owned(),
+            peer_identity: crate::protocol::PeerIdentity::current().0,
+            ssh_node_endpoint: None,
         };
         let send_hello = control_tx.send_source_hello(hello);
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1160,9 +1162,8 @@ mod tests {
         let mut recv = crate::streams::RecvStream::new(daemon_read);
         assert!(matches!(
             recv.recv_object::<crate::protocol::MasterToRcpd>().await?,
-            Some(crate::protocol::MasterToRcpd::Hello(
-                crate::protocol::MasterHello::Source { .. }
-            ))
+            Some(crate::protocol::MasterToRcpd::Hello(hello))
+                if matches!(*hello, crate::protocol::MasterHello::Source { .. })
         ));
         let heartbeat = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1201,6 +1202,8 @@ mod tests {
                 data_addr: "127.0.0.1:4101".parse().unwrap(),
                 tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 server_name: "src".to_owned(),
+                peer_identity: crate::protocol::PeerIdentity::current().0,
+                ssh_node_endpoint: None,
             },
         ))
         .await?;
@@ -1227,6 +1230,7 @@ mod tests {
                 error: "port range exhausted".to_owned(),
                 summary: Default::default(),
                 runtime_stats: Default::default(),
+                peer_connected: false,
             },
         ))
         .await?;
@@ -1475,6 +1479,8 @@ mod tests {
                 data_addr: "127.0.0.1:41002".parse().unwrap(),
                 tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 server_name: "src".to_owned(),
+                peer_identity: crate::protocol::PeerIdentity::current().0,
+                ssh_node_endpoint: None,
             },
         )))
         .unwrap();

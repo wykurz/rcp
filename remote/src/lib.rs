@@ -263,10 +263,114 @@ impl CleanupBudget {
     }
 }
 
+/// RAII guard for a `std::process::Child` spawned on `rcp-cleanup-supervisor`.
+///
+/// If ownership is never transferred (for example, when the caller is cancelled while the child is
+/// still in flight across the `oneshot` reply channel), `Drop` immediately kills the child and
+/// registers a bounded reaper on `CleanupState` so `RemoteCleanup::finish` waits until it is reaped.
+struct SupervisedChild {
+    child: Option<std::process::Child>,
+    state: std::sync::Arc<CleanupState>,
+}
+
+impl SupervisedChild {
+    fn new(child: std::process::Child, state: std::sync::Arc<CleanupState>) -> Self {
+        Self {
+            child: Some(child),
+            state,
+        }
+    }
+
+    fn into_inner(mut self) -> std::process::Child {
+        self.child
+            .take()
+            .expect("SupervisedChild holds its child until transferred or dropped")
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let reaper = SshMasterReaper {
+                launcher: Some(ReapableChild::Std(child)),
+                control_directory: None,
+            };
+            let mut workers = self
+                .state
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            workers.pending = workers
+                .pending
+                .checked_add(1)
+                .expect("cleanup worker count overflow");
+            let job_id = workers.allocate_job_id();
+            drop(workers);
+            let job = ScheduledCleanupJob {
+                id: job_id,
+                job: CleanupJob {
+                    thread_name: "rcp-abandoned-ssh-reap",
+                    deadline: std::time::Instant::now() + REMOTE_CLEANUP_GRACE,
+                    operation: CleanupOperation::Bounded(Box::new(move |budget| {
+                        reaper.reap(budget);
+                    })),
+                },
+            };
+            if let Err(error) = self
+                .state
+                .start_cleanup_job(job, WorkerSpawnFallback::Abandon)
+            {
+                tracing::error!("failed to start abandoned SSH child reaper: {error:#}");
+            }
+        }
+    }
+}
+
+enum SupervisorMessage {
+    Cleanup(ScheduledCleanupJob),
+    SpawnChild {
+        command: std::process::Command,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<SupervisedChild>>,
+    },
+}
+
+fn spawn_pdeathsig_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // safety: `getpid` is always safe and async-signal-safe; `pre_exec` invokes only
+        // async-signal-safe syscalls (`prctl`, `getppid`, `_exit`) before `exec`.
+        let parent_pid = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // close the fork-to-prctl race if the parent died before prctl ran
+                if libc::getppid() != parent_pid {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    command.spawn()
+}
+
 /// Owns all blocking cleanup work started by one rcp invocation.
 pub struct RemoteCleanup {
     state: std::sync::Arc<CleanupState>,
-    sender: Option<std::sync::mpsc::Sender<ScheduledCleanupJob>>,
+    sender: Option<std::sync::mpsc::Sender<SupervisorMessage>>,
 }
 
 impl Clone for RemoteCleanup {
@@ -383,10 +487,25 @@ impl RemoteCleanup {
         // retain the scope until every sender is gone so unwinding still drains queued cleanup
         let supervisor_state = state.clone();
         let supervisor = start_supervisor(Box::new(move || {
-            while let Ok(job) = receiver.recv() {
-                supervisor_state
-                    .start_cleanup_job(job, WorkerSpawnFallback::RunInSupervisor)
-                    .expect("the cleanup supervisor owns its worker-spawn fallback");
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    SupervisorMessage::Cleanup(job) => {
+                        supervisor_state
+                            .start_cleanup_job(job, WorkerSpawnFallback::RunInSupervisor)
+                            .expect("the cleanup supervisor owns its worker-spawn fallback");
+                    }
+                    SupervisorMessage::SpawnChild { mut command, reply } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let spawned = spawn_pdeathsig_child(&mut command)
+                            .map(|child| SupervisedChild::new(child, supervisor_state.clone()));
+                        // if the caller dropped `reply_rx` before receiving, `SupervisedChild::drop`
+                        // kills and schedules a bounded reaper automatically (both on `Err` here
+                        // and if `reply_rx` is dropped after `Ok(())` before `.await` extracts it)
+                        let _ = reply.send(spawned);
+                    }
+                }
             }
         }))?;
         *state
@@ -432,17 +551,43 @@ impl RemoteCleanup {
             .sender
             .as_ref()
             .expect("a live cleanup owner retains its supervisor sender")
-            .send(job)
+            .send(SupervisorMessage::Cleanup(job))
         {
             Ok(()) => Ok(()),
             Err(error) => {
+                let SupervisorMessage::Cleanup(job) = error.0 else {
+                    unreachable!("submitted message was Cleanup");
+                };
                 tracing::error!(
                     "remote cleanup supervisor stopped unexpectedly; starting an isolated fallback worker"
                 );
                 self.state
-                    .start_cleanup_job(error.0, WorkerSpawnFallback::Abandon)
+                    .start_cleanup_job(job, WorkerSpawnFallback::Abandon)
             }
         }
+    }
+
+    /// Spawn a long-lived child on the dedicated `rcp-cleanup-supervisor` OS thread so Linux
+    /// `PR_SET_PDEATHSIG(SIGTERM)` is bound to a thread that stays alive for the entire lifetime
+    /// of every `RemoteCleanup` owner and fires immediately if this process dies abruptly.
+    async fn spawn_supervised_child(
+        &self,
+        command: std::process::Command,
+    ) -> std::io::Result<SupervisedChild> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .expect("a live cleanup owner retains its supervisor sender")
+            .send(SupervisorMessage::SpawnChild {
+                command,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                std::io::Error::other("remote cleanup supervisor stopped before spawning child")
+            })?;
+        reply_rx.await.map_err(|_| {
+            std::io::Error::other("remote cleanup supervisor dropped spawn reply channel")
+        })?
     }
 
     fn submit_disposable<F>(&self, thread_name: &'static str, operation: F) -> std::io::Result<()>
@@ -933,8 +1078,22 @@ pub(crate) struct PreparationContext {
     control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]>,
 }
 
+enum ReapableChild {
+    Std(std::process::Child),
+    Tokio(tokio::process::Child),
+}
+
+impl ReapableChild {
+    fn try_wait_exited(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Std(child) => child.try_wait().map(|status| status.is_some()),
+            Self::Tokio(child) => child.try_wait().map(|status| status.is_some()),
+        }
+    }
+}
+
 struct SshMasterReaper {
-    launcher: Option<tokio::process::Child>,
+    launcher: Option<ReapableChild>,
     control_directory: Option<std::path::PathBuf>,
 }
 
@@ -984,7 +1143,7 @@ impl SshMasterReaper {
     fn reap(mut self, budget: CleanupBudget) {
         if let Some(launcher) = self.launcher.as_mut() {
             reap_process_and_control_directory(&budget, self.control_directory.as_deref(), || {
-                launcher.try_wait().map(|status| status.is_some())
+                launcher.try_wait_exited()
             });
         } else {
             reap_process_and_control_directory(&budget, self.control_directory.as_deref(), || {
@@ -1039,7 +1198,7 @@ impl Drop for ManagedChildProcess {
             tracing::debug!("failed to terminate managed SSH child process: {error:#}");
         }
         let reaper = SshMasterReaper {
-            launcher: Some(child),
+            launcher: Some(ReapableChild::Tokio(child)),
             control_directory: None,
         };
         self.cleanup
@@ -1048,7 +1207,7 @@ impl Drop for ManagedChildProcess {
 }
 
 struct PreparingSshMaster {
-    launcher: Option<tokio::process::Child>,
+    launcher: Option<std::process::Child>,
     control_directory: Option<std::path::PathBuf>,
     cleanup: RemoteCleanup,
 }
@@ -1068,12 +1227,12 @@ impl PreparingSshMaster {
             .expect("preparing SSH control directory remains owned")
     }
 
-    fn retain_launcher(&mut self, launcher: tokio::process::Child) {
+    fn retain_launcher(&mut self, launcher: std::process::Child) {
         debug_assert!(self.launcher.is_none());
         self.launcher = Some(launcher);
     }
 
-    fn launcher_mut(&mut self) -> &mut tokio::process::Child {
+    fn launcher_mut(&mut self) -> &mut std::process::Child {
         self.launcher
             .as_mut()
             .expect("preparing SSH master retains its launcher")
@@ -1095,7 +1254,7 @@ impl PreparingSshMaster {
 impl Drop for PreparingSshMaster {
     fn drop(&mut self) {
         if let Some(launcher) = self.launcher.as_mut()
-            && let Err(error) = launcher.start_kill()
+            && let Err(error) = launcher.kill()
         {
             tracing::debug!("failed to terminate preparing SSH multiplex master: {error:#}");
         }
@@ -1103,7 +1262,7 @@ impl Drop for PreparingSshMaster {
             return;
         }
         let reaper = SshMasterReaper {
-            launcher: self.launcher.take(),
+            launcher: self.launcher.take().map(ReapableChild::Std),
             control_directory: self.control_directory.take(),
         };
         self.cleanup
@@ -1113,8 +1272,9 @@ impl Drop for PreparingSshMaster {
 
 struct ManagedSshSessionInner {
     session: Option<openssh::Session>,
-    launcher: Option<tokio::process::Child>,
+    launcher: Option<std::process::Child>,
     control_directory: Option<std::path::PathBuf>,
+    next_exec_log_id: std::sync::atomic::AtomicU64,
     cleanup: RemoteCleanup,
 }
 
@@ -1125,12 +1285,12 @@ impl Drop for ManagedSshSessionInner {
         // directory removal to an executor that remains available after Tokio shutdown.
         let _detached_paths = self.session.take().map(openssh::Session::detach);
         if let Some(launcher) = self.launcher.as_mut()
-            && let Err(error) = launcher.start_kill()
+            && let Err(error) = launcher.kill()
         {
             tracing::debug!("failed to terminate SSH multiplex master: {error:#}");
         }
         let reaper = SshMasterReaper {
-            launcher: self.launcher.take(),
+            launcher: self.launcher.take().map(ReapableChild::Std),
             control_directory: self.control_directory.take(),
         };
         self.cleanup
@@ -1153,7 +1313,7 @@ impl std::fmt::Debug for ManagedSshSession {
 impl ManagedSshSession {
     fn new(
         session: openssh::Session,
-        launcher: tokio::process::Child,
+        launcher: std::process::Child,
         control_directory: std::path::PathBuf,
         cleanup: RemoteCleanup,
     ) -> Self {
@@ -1161,11 +1321,12 @@ impl ManagedSshSession {
             session: Some(session),
             launcher: Some(launcher),
             control_directory: Some(control_directory),
+            next_exec_log_id: std::sync::atomic::AtomicU64::new(0),
             cleanup,
         }))
     }
 
-    fn cleanup(&self) -> RemoteCleanup {
+    pub(crate) fn cleanup(&self) -> RemoteCleanup {
         self.0.cleanup.clone()
     }
 
@@ -1175,6 +1336,23 @@ impl ManagedSshSession {
             .as_ref()
             .expect("managed SSH control directory is present before final drop")
             .join("master")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launcher_pid(&self) -> Option<u32> {
+        self.0.launcher.as_ref().map(std::process::Child::id)
+    }
+
+    fn alloc_exec_log_path(&self) -> std::path::PathBuf {
+        let id = self
+            .0
+            .next_exec_log_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .control_directory
+            .as_ref()
+            .expect("managed SSH control directory is present before final drop")
+            .join(format!("exec-{id}.log"))
     }
 }
 
@@ -1735,6 +1913,15 @@ impl SshSession {
 // re-export is_localhost from common for convenience
 pub use common::is_localhost;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SshConnectOptions {
+    pub(crate) keepalive_sec: u64,
+    pub(crate) agent_forward: AgentForwardMode,
+    /// Optional concrete node IP (`-o HostName=<ip>`) used to pin independent SSH tunnel
+    /// connections to a specific backend node while preserving `Host <alias>` config matching.
+    pub(crate) hostname_override: Option<std::net::IpAddr>,
+}
+
 pub(crate) async fn setup_ssh_session(
     session: &SshSession,
     preparation: &PreparationContext,
@@ -1742,13 +1929,31 @@ pub(crate) async fn setup_ssh_session(
     keepalive_sec: u64,
     agent_forward: AgentForwardMode,
 ) -> anyhow::Result<ManagedSshSession> {
+    setup_ssh_session_with_options(
+        session,
+        preparation,
+        deadline,
+        SshConnectOptions {
+            keepalive_sec,
+            agent_forward,
+            hostname_override: None,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn setup_ssh_session_with_options(
+    session: &SshSession,
+    preparation: &PreparationContext,
+    deadline: BootstrapDeadline,
+    options: SshConnectOptions,
+) -> anyhow::Result<ManagedSshSession> {
     setup_ssh_session_with_program(
         session,
         preparation,
         std::path::Path::new("ssh"),
         deadline,
-        keepalive_sec,
-        agent_forward,
+        options,
     )
     .await
 }
@@ -1758,8 +1963,7 @@ async fn setup_ssh_session_with_program(
     preparation: &PreparationContext,
     ssh_program: &std::path::Path,
     deadline: BootstrapDeadline,
-    keepalive_sec: u64,
-    agent_forward: AgentForwardMode,
+    options: SshConnectOptions,
 ) -> anyhow::Result<ManagedSshSession> {
     let session = session.clone();
     let ssh_program = ssh_program.to_path_buf();
@@ -1772,16 +1976,9 @@ async fn setup_ssh_session_with_program(
                     .context("no usable SSH control directory found outside local copy operands")
             })
             .await?;
-        launch_ssh_master(
-            &session,
-            &control_dir,
-            &ssh_program,
-            cleanup,
-            keepalive_sec,
-            agent_forward,
-        )
-        .await
-        .context("Failed to establish SSH connection")
+        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup, options)
+            .await
+            .context("Failed to establish SSH connection")
     });
     preparation
         .run_abortable_with_deadline(connect, "SSH session setup", deadline)
@@ -1842,7 +2039,7 @@ where
     .await
 }
 
-/// Launch and retain the foreground OpenSSH multiplex master.
+/// Launch and retain a foreground OpenSSH subprocess (async piped variant for `ssh -G` / `ssh -S`).
 pub(crate) fn ssh_master_launcher_command(
     ssh_program: &std::path::Path,
 ) -> tokio::process::Command {
@@ -1856,12 +2053,21 @@ pub(crate) fn ssh_master_launcher_command(
     launcher
 }
 
+/// Launch and retain a foreground OpenSSH multiplex master (`std::process::Command` variant
+/// spawned on `rcp-cleanup-supervisor` with `PR_SET_PDEATHSIG(SIGTERM)` and zero pidfds).
+fn ssh_master_std_launcher_command(ssh_program: &std::path::Path) -> std::process::Command {
+    let mut launcher = std::process::Command::new("/bin/sh");
+    launcher
+        .args(["-c", "exec \"$@\"", "rcp-ssh-master"])
+        .arg(ssh_program);
+    launcher
+}
+
 fn ssh_master_args(
     session: &SshSession,
     log: &std::path::Path,
     control_path: &std::path::Path,
-    keepalive_sec: u64,
-    agent_forward: AgentForwardMode,
+    options: SshConnectOptions,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "-E".into(),
@@ -1872,8 +2078,6 @@ fn ssh_master_args(
         "-N".into(),
         "-o".into(),
         "BatchMode=yes".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
         "-o".into(),
         "ForkAfterAuthentication=no".into(),
         "-o".into(),
@@ -1889,8 +2093,12 @@ fn ssh_master_args(
         "-o".into(),
         "PermitLocalCommand=no".into(),
     ];
-    match agent_forward {
+    // preserve the user's StrictHostKeyChecking policy whenever SSH agent forwarding may be active
+    // so the signing agent is never delegated to an unverified host
+    match options.agent_forward {
         AgentForwardMode::Off => {
+            args.push("-o".into());
+            args.push("StrictHostKeyChecking=no".into());
             args.push("-o".into());
             args.push("ForwardAgent=no".into());
         }
@@ -1900,7 +2108,11 @@ fn ssh_master_args(
             args.push("ForwardAgent=yes".into());
         }
     }
-    match stdio::ssh_server_alive_params(keepalive_sec) {
+    if let Some(ip) = options.hostname_override {
+        args.push("-o".into());
+        args.push(format!("HostName={ip}").into());
+    }
+    match stdio::ssh_server_alive_params(options.keepalive_sec) {
         Some((interval, count)) => {
             args.push("-o".into());
             args.push(format!("ServerAliveInterval={interval}").into());
@@ -1927,13 +2139,23 @@ fn ssh_master_args(
     args
 }
 
+async fn wait_for_std_child_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
+    }
+}
+
 async fn launch_ssh_master(
     session: &SshSession,
     control_dir: &std::path::Path,
     ssh_program: &std::path::Path,
     cleanup: RemoteCleanup,
-    keepalive_sec: u64,
-    agent_forward: AgentForwardMode,
+    options: SshConnectOptions,
 ) -> anyhow::Result<ManagedSshSession> {
     tracing::debug!("Connecting to SSH destination: {}", session.host);
     tracing::debug!("Using SSH control directory: {}", control_dir.display());
@@ -1950,23 +2172,17 @@ async fn launch_ssh_master(
     let mut preparing = PreparingSshMaster::new(directory.keep(), cleanup.clone());
     let log = preparing.control_directory().join("log");
     let control_path = preparing.control_directory().join("master");
-    let mut launcher = ssh_master_launcher_command(ssh_program);
+    let mut launcher = ssh_master_std_launcher_command(ssh_program);
     launcher
-        .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .args(ssh_master_args(
-            session,
-            &log,
-            &control_path,
-            keepalive_sec,
-            agent_forward,
-        ));
-    let launcher = launcher
-        .spawn()
+        .args(ssh_master_args(session, &log, &control_path, options));
+    let launcher = cleanup
+        .spawn_supervised_child(launcher)
+        .await
         .context("failed to launch SSH multiplex master")?;
-    preparing.retain_launcher(launcher);
+    preparing.retain_launcher(launcher.into_inner());
     {
         let socket_path = control_path.clone();
         let socket_ready = wait_for_ssh_control_socket(&cleanup, move || {
@@ -1977,7 +2193,7 @@ async fn launch_ssh_master(
         tokio::pin!(socket_ready);
         tokio::select! {
             biased;
-            status = preparing.launcher_mut().wait() => {
+            status = wait_for_std_child_exit(preparing.launcher_mut()) => {
                 let status = status.context("failed to wait for SSH multiplex master")?;
                 let diagnostic_path = log.clone();
                 let diagnostic = run_disposable_blocking(
@@ -2177,6 +2393,10 @@ pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<(
         .child
         .take()
         .expect("an owned rcpd process retains its child until wait");
+    let exec_log = child.exec_log_path().map(std::path::Path::to_path_buf);
+    // keep the session alive until exec_log has been read or removed so dropping the final
+    // ManagedSshSession clone cannot race SshMasterReaper's control_directory removal
+    let _session = child.session();
     let stderr_drain = process
         .stderr_drain
         .take()
@@ -2186,15 +2406,38 @@ pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<(
     // even when waiting fails, so teardown neither detaches tasks nor loses bounded diagnostics.
     let wait = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
     let stderr = finish_rcpd_output_drain(stderr_drain, "stderr").await;
-    let status = wait
-        .context("Timeout waiting for rcpd process to exit")?
-        .context("Failed to wait for rcpd process")?;
+    let status = match wait {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            if let Some(log) = exec_log.as_deref() {
+                let _ = tokio::fs::remove_file(log).await;
+            }
+            return Err(error).context("Failed to wait for rcpd process");
+        }
+        Err(error) => {
+            let ssh_log = read_and_remove_exec_log(exec_log.as_deref()).await;
+            return match ssh_log {
+                Some(ssh_log) => Err(error).context(format!(
+                    "Timeout waiting for rcpd process to exit (ssh log: {ssh_log})"
+                )),
+                None => Err(error).context("Timeout waiting for rcpd process to exit"),
+            };
+        }
+    };
     if !status.success() {
+        let ssh_log = read_and_remove_exec_log(exec_log.as_deref()).await;
+        let ssh_log_section = match ssh_log {
+            Some(ssh_log) => format!("\nssh log:\n{ssh_log}"),
+            None => String::new(),
+        };
         return Err(anyhow!(
-            "rcpd command failed on remote host, status code: {:?}\nstderr:\n{}",
+            "rcpd command failed on remote host, status code: {:?}\nstderr:\n{}{ssh_log_section}",
             status.code(),
             stderr.rendered()
         ));
+    }
+    if let Some(log) = exec_log.as_deref() {
+        let _ = tokio::fs::remove_file(log).await;
     }
     if let Some(error) = stderr.read_error {
         tracing::debug!("rcpd stderr collector failed after startup: {error:#}");
@@ -2203,6 +2446,17 @@ pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<(
         tracing::debug!("rcpd stderr diagnostic tail was truncated after live forwarding");
     }
     Ok(())
+}
+
+async fn read_and_remove_exec_log(path: Option<&std::path::Path>) -> Option<String> {
+    let path = path?;
+    let captured = match tokio::fs::File::open(path).await {
+        Ok(file) => drain_bounded_output(file, DIAGNOSTIC_CAPTURE_LIMIT).await,
+        Err(_) => return None,
+    };
+    let _ = tokio::fs::remove_file(path).await;
+    let rendered = common::format_startup_diagnostic(None, captured.rendered().trim());
+    (!rendered.is_empty()).then_some(rendered)
 }
 
 async fn finish_rcpd_output_drain(
@@ -2819,6 +3073,7 @@ enum RcpdChild {
     Mux(openssh::Child<ManagedSshSession>),
     SshProcess {
         child: ManagedChildProcess,
+        exec_log: std::path::PathBuf,
         // retain the multiplex master for the lifetime of the `ssh -S` client process
         _session: ManagedSshSession,
     },
@@ -2837,6 +3092,20 @@ impl std::fmt::Debug for RcpdChild {
 }
 
 impl RcpdChild {
+    fn exec_log_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Mux(_) => None,
+            Self::SshProcess { exec_log, .. } => Some(exec_log.as_path()),
+        }
+    }
+
+    fn session(&self) -> Option<ManagedSshSession> {
+        match self {
+            Self::Mux(_) => None,
+            Self::SshProcess { _session, .. } => Some(_session.clone()),
+        }
+    }
+
     async fn wait(self) -> anyhow::Result<std::process::ExitStatus> {
         match self {
             Self::Mux(child) => Ok(child.wait().await?),
@@ -3177,14 +3446,82 @@ async fn prepare_rcpd_with_context(
     })
 }
 
+const PEER_IDENTITY_PROBE_SCRIPT: &str = r#"printf 'RCP_PEER\t%s\t%s\t%s\t%s\n' "$(uname -n 2>/dev/null || true)" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)" "$(readlink /proc/self/ns/net 2>/dev/null || true)" "${SSH_CONNECTION:-}""#;
+
+fn parse_peer_identity_probe_output(
+    stdout: &str,
+) -> anyhow::Result<(protocol::PeerIdentity, Option<std::net::SocketAddr>)> {
+    let tagged_line = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim_end_matches('\r').strip_prefix("RCP_PEER\t"))
+        .context("peer identity probe output missing RCP_PEER record")?;
+    let fields: Vec<&str> = tagged_line.split('\t').collect();
+    if fields.len() != 4 {
+        anyhow::bail!(
+            "peer identity probe returned {} fields (expected 4)",
+            fields.len()
+        );
+    }
+    let hostname = fields[0].trim().to_owned();
+    if hostname.is_empty() {
+        anyhow::bail!("peer identity probe returned empty hostname");
+    }
+    let boot_id = Some(fields[1].trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let net_ns = Some(fields[2].trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let ssh_endpoint = protocol::parse_ssh_connection_server_addr(fields[3].trim());
+    let identity = protocol::PeerIdentity {
+        hostname,
+        boot_id,
+        net_ns,
+        ssh_server_port: ssh_endpoint.map(|addr| addr.port()),
+    };
+    Ok((identity, ssh_endpoint))
+}
+
+/// Probe the remote peer's [`protocol::PeerIdentity`] and concrete `SSH_CONNECTION` server
+/// endpoint over an already-established [`ManagedSshSession`] (one mux round-trip).
+pub(crate) async fn probe_peer_identity_and_endpoint(
+    session: &ManagedSshSession,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(protocol::PeerIdentity, Option<std::net::SocketAddr>)> {
+    let mut command = openssh::Session::to_command(session.clone(), "sh");
+    command.args(["-c", PEER_IDENTITY_PROBE_SCRIPT]);
+    let output = PreparationContext::uncancelled(session.cleanup())
+        .remote_output(
+            command,
+            "SSH peer identity probe",
+            BootstrapDeadline::new(timeout),
+        )
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "SSH peer identity probe failed with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .context("SSH peer identity probe output was not valid UTF-8")?;
+    parse_peer_identity_probe_output(&stdout)
+}
+
 fn ssh_mux_exec_args(
     session: &SshSession,
     control_path: &std::path::Path,
+    exec_log: &std::path::Path,
     agent_forward: AgentForwardMode,
     rcpd_path: &str,
     rcpd_args: &[String],
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
+        "-E".into(),
+        exec_log.as_os_str().to_os_string(),
         "-S".into(),
         control_path.as_os_str().to_os_string(),
         "-T".into(),
@@ -3192,6 +3529,10 @@ fn ssh_mux_exec_args(
         "BatchMode=yes".into(),
         "-o".into(),
         "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPersist=no".into(),
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
         "-o".into(),
         "ClearAllForwardings=yes".into(),
         // shield the framed stdio channel and RCP_READY stderr handshake from user ~/.ssh/config
@@ -3255,6 +3596,15 @@ impl PreparedRcpd {
         &self.remote
     }
 
+    /// Probe the peer identity and concrete `SSH_CONNECTION` server endpoint of this prepared
+    /// session over its existing multiplex control socket.
+    pub async fn probe_peer_identity(
+        &self,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(protocol::PeerIdentity, Option<std::net::SocketAddr>)> {
+        probe_peer_identity_and_endpoint(&self.session, timeout).await
+    }
+
     pub async fn spawn(
         &self,
         rcpd_config: &protocol::RcpdConfig,
@@ -3303,9 +3653,11 @@ impl PreparedRcpd {
             }
             AgentForwardMode::InheritConfig | AgentForwardMode::ForceOn => {
                 let control_path = self.session.control_path();
+                let exec_log = self.session.alloc_exec_log_path();
                 let ssh_args = ssh_mux_exec_args(
                     session,
                     &control_path,
+                    &exec_log,
                     agent_forward,
                     &self.rcpd_path,
                     &rcpd_args,
@@ -3324,6 +3676,7 @@ impl PreparedRcpd {
                         .context("Failed to spawn rcpd command via ssh")?;
                     Ok(RcpdChild::SshProcess {
                         child: ManagedChildProcess::new(child, cleanup),
+                        exec_log,
                         _session: retained_session,
                     })
                 });
@@ -3399,6 +3752,8 @@ async fn reap_failed_rcpd(
     stderr_reader: Option<tokio::io::BufReader<streams::BoxedRead>>,
 ) -> Option<String> {
     let stdout_reader = child.take_stdout();
+    let exec_log = child.exec_log_path().map(std::path::Path::to_path_buf);
+    let _session = child.session();
     let reaper = async move {
         let stdout = async move {
             match stdout_reader {
@@ -3415,39 +3770,52 @@ async fn reap_failed_rcpd(
         let (status, stdout, stderr) = tokio::join!(child.wait(), stdout, stderr);
         anyhow::Ok((status?, stdout, stderr))
     };
-    match tokio::time::timeout(FAILED_RCPD_REAP_GRACE, reaper).await {
+    let result = tokio::time::timeout(FAILED_RCPD_REAP_GRACE, reaper).await;
+    let ssh_log = read_and_remove_exec_log(exec_log.as_deref()).await;
+    match result {
         Ok(Ok((status, stdout, stderr))) => {
             tracing::debug!(
                 host,
                 status = ?status.code(),
                 "reaped rcpd after failed startup"
             );
-            format_failed_rcpd_output(stdout.rendered().as_bytes(), &stderr.rendered())
+            format_failed_rcpd_output(
+                stdout.rendered().as_bytes(),
+                &stderr.rendered(),
+                ssh_log.as_deref(),
+            )
         }
         Ok(Err(error)) => {
             tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}");
-            None
+            format_failed_rcpd_output(&[], "", ssh_log.as_deref())
         }
         Err(_) => {
             tracing::debug!(
                 host,
                 "rcpd did not exit within the startup cleanup grace; released its SSH child and output pipes"
             );
-            None
+            format_failed_rcpd_output(&[], "", ssh_log.as_deref())
         }
     }
 }
 
-fn format_failed_rcpd_output(stdout: &[u8], stderr: &str) -> Option<String> {
+fn format_failed_rcpd_output(stdout: &[u8], stderr: &str, ssh_log: Option<&str>) -> Option<String> {
     let stdout = String::from_utf8_lossy(stdout);
     let stdout = common::format_startup_diagnostic(None, stdout.trim());
     let stderr = common::format_startup_diagnostic(None, stderr.trim());
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => None,
-        (false, true) => Some(format!("stdout: {stdout}")),
-        (true, false) => Some(format!("stderr: {stderr}")),
-        (false, false) => Some(format!("stdout: {stdout}; stderr: {stderr}")),
+    let mut parts = Vec::new();
+    if !stdout.is_empty() {
+        parts.push(format!("stdout: {stdout}"));
     }
+    if !stderr.is_empty() {
+        parts.push(format!("stderr: {stderr}"));
+    }
+    if let Some(ssh_log) = ssh_log
+        && !ssh_log.is_empty()
+    {
+        parts.push(format!("ssh log: {ssh_log}"));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 // ============================================================================
@@ -3456,7 +3824,7 @@ fn format_failed_rcpd_output(stdout: &[u8], stderr: &str) -> Option<String> {
 
 fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAddr> {
     // if explicit IP provided, validate and use it
-    if let Some(ip_str) = explicit_bind_ip {
+    let allow_ipv6_loopback_fallback = if let Some(ip_str) = explicit_bind_ip {
         let ip = ip_str
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("invalid IP address: {}", ip_str))?;
@@ -3470,6 +3838,16 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
                 tracing::debug!(
                     "explicit bind IP is wildcard 0.0.0.0; auto-detecting concrete IPv4 address"
                 );
+                false
+            }
+            std::net::IpAddr::V6(ipv6) if ipv6.is_unspecified() => {
+                // wildcard :: binds dual-stack interfaces (used by auto mode under IPv6 SSH);
+                // prefer an auto-detected concrete IPv4 for direct TCP and fall back to ::1 on
+                // IPv6-only hosts so SSH fallback still receives a valid listener address
+                tracing::debug!(
+                    "explicit bind IP is wildcard ::; auto-detecting concrete IPv4 address with ::1 fallback"
+                );
+                true
             }
             std::net::IpAddr::V6(_) => {
                 anyhow::bail!(
@@ -3479,7 +3857,9 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
                 );
             }
         }
-    }
+    } else {
+        false
+    };
     // auto-detection: try kernel routing first
     if let Some(ipv4) = try_ipv4_via_kernel_routing()? {
         return Ok(std::net::IpAddr::V4(ipv4));
@@ -3490,6 +3870,10 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
     if let Some(ipv4) = choose_best_ipv4(&interfaces) {
         tracing::debug!("using IPv4 address from interface scan: {}", ipv4);
         return Ok(std::net::IpAddr::V4(ipv4));
+    }
+    if allow_ipv6_loopback_fallback {
+        tracing::debug!("no IPv4 interfaces found for wildcard :: listener; falling back to ::1");
+        return Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
     }
     anyhow::bail!("No IPv4 interfaces found (TCP endpoints require IPv4 as they bind to 0.0.0.0)")
 }
@@ -4224,6 +4608,7 @@ mod tests {
                 tokio_console: false,
                 tokio_console_port: None,
                 encryption: false,
+                ssh_tunnels: 0,
             }
         }
 
@@ -4931,6 +5316,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let (peer_identity, node_endpoint) =
+                probe_peer_identity_and_endpoint(&primary, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
             for direction in [
                 ssh_tunnel::ForwardDirection::Local,
                 ssh_tunnel::ForwardDirection::Remote,
@@ -4942,6 +5331,9 @@ mod tests {
                     target_control,
                     Some(target_data),
                     2,
+                    ssh_tunnel::SshAddressFamily::Any,
+                    Some(&peer_identity),
+                    node_endpoint,
                     15,
                     std::time::Duration::from_secs(10),
                     &cleanup,
@@ -4950,10 +5342,11 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(tunnels.data_addrs().len(), 2);
+                let control_addr = tunnels.control_addr();
+                let data_addrs = tunnels.data_addrs().to_vec();
                 // verify bytes traverse the control forward end-to-end
                 let accept_task = tokio::spawn({
                     let tcp_config = tcp_config.clone();
-                    let control_addr = tunnels.control_addr();
                     async move {
                         let mut stream = connect_tcp_control(control_addr, &tcp_config)
                             .await
@@ -4970,7 +5363,7 @@ mod tests {
                 accept_task.await.unwrap();
                 assert_eq!(received, b"ping-ssh-tunnel");
                 // verify both parallel data forwards carry traffic
-                for &data_addr in tunnels.data_addrs() {
+                for &data_addr in &data_addrs {
                     let connect_task = tokio::spawn({
                         let tcp_config = tcp_config.clone();
                         async move {
@@ -4989,9 +5382,1151 @@ mod tests {
                     assert_eq!(received, b"data-lane");
                 }
                 tunnels.close().await;
+                // verify primary control and data forwards actually closed immediately while the
+                // retained SSH multiplex master is still running (especially dynamic `-R` using
+                // port 0)
+                let probe_timeout = std::time::Duration::from_secs(1);
+                assert!(
+                    connect_tcp_control_with_timeout(control_addr, &tcp_config, probe_timeout)
+                        .await
+                        .is_err(),
+                    "{direction:?} control forward {control_addr} must close while primary master stays alive"
+                );
+                assert!(
+                    connect_tcp_control_with_timeout(data_addrs[0], &tcp_config, probe_timeout)
+                        .await
+                        .is_err(),
+                    "{direction:?} primary data forward {} must close while primary master stays alive",
+                    data_addrs[0]
+                );
+                // extra owned tunnel sessions are terminated asynchronously by SIGKILL in Drop;
+                // confirm their listeners close promptly too
+                for &data_addr in &data_addrs[1..] {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                    loop {
+                        if connect_tcp_control_with_timeout(data_addr, &tcp_config, probe_timeout)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "{direction:?} extra data forward {data_addr} remained open after close"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
             }
             drop(primary);
             cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        fn find_program_in_path(name: &str, fallbacks: &[&str]) -> std::path::PathBuf {
+            if let Ok(path_var) = std::env::var("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+            for fallback in fallbacks {
+                let candidate = std::path::PathBuf::from(fallback);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+            panic!("{name} binary not found in PATH or fallbacks {fallbacks:?}");
+        }
+
+        #[cfg(target_os = "linux")]
+        fn find_sshd_program() -> std::path::PathBuf {
+            find_program_in_path("sshd", &["/usr/sbin/sshd", "/sbin/sshd"])
+        }
+
+        #[cfg(target_os = "linux")]
+        fn find_ssh_program() -> std::path::PathBuf {
+            find_program_in_path("ssh", &["/usr/bin/ssh"])
+        }
+
+        #[cfg(target_os = "linux")]
+        struct PrivateSshd {
+            _dir: tempfile::TempDir,
+            child: std::process::Child,
+            addr: std::net::SocketAddr,
+            client_key: std::path::PathBuf,
+            host_pub_key: String,
+        }
+
+        #[cfg(target_os = "linux")]
+        impl PrivateSshd {
+            fn start(bind_ip: std::net::IpAddr) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                let dir = tempfile::tempdir().unwrap();
+                let host_key = dir.path().join("host_key");
+                let client_key = dir.path().join("client_key");
+                let auth_keys = dir.path().join("authorized_keys");
+                let sshd_config = dir.path().join("sshd_config");
+                let pid_file = dir.path().join("sshd.pid");
+                for key in [&host_key, &client_key] {
+                    let status = std::process::Command::new("ssh-keygen")
+                        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                        .arg(key)
+                        .status()
+                        .expect("failed to run ssh-keygen");
+                    assert!(status.success(), "ssh-keygen failed for {}", key.display());
+                }
+                let client_pub = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+                std::fs::write(&auth_keys, client_pub).unwrap();
+                std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                let host_pub_key = std::fs::read_to_string(host_key.with_extension("pub"))
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                let probe = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                let listen_spec = match bind_ip {
+                    std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+                    std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+                };
+                std::fs::write(
+                    &sshd_config,
+                    format!(
+                        "ListenAddress {listen_spec}\n\
+                         HostKey {}\n\
+                         AuthorizedKeysFile {}\n\
+                         PidFile {}\n\
+                         StrictModes no\n\
+                         PermitRootLogin prohibit-password\n\
+                         PasswordAuthentication no\n\
+                         KbdInteractiveAuthentication no\n\
+                         PubkeyAuthentication yes\n\
+                         UsePAM no\n\
+                         AllowTcpForwarding yes\n\
+                         AllowAgentForwarding yes\n\
+                         GatewayPorts no\n\
+                         Subsystem sftp internal-sftp\n",
+                        host_key.display(),
+                        auth_keys.display(),
+                        pid_file.display(),
+                    ),
+                )
+                .unwrap();
+                let sshd = find_sshd_program();
+                let mut child = std::process::Command::new(&sshd)
+                    .args(["-D", "-e", "-f"])
+                    .arg(&sshd_config)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap_or_else(|e| panic!("failed to start {}: {e:#}", sshd.display()));
+                let addr = std::net::SocketAddr::new(bind_ip, port);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if std::net::TcpStream::connect_timeout(
+                        &addr,
+                        std::time::Duration::from_millis(100),
+                    )
+                    .is_ok()
+                    {
+                        break;
+                    }
+                    if let Some(status) = child.try_wait().unwrap() {
+                        panic!("private sshd exited prematurely with {status}");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for private sshd on {addr}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Self {
+                    _dir: dir,
+                    child,
+                    addr,
+                    client_key,
+                    host_pub_key,
+                }
+            }
+
+            fn is_alive(&mut self) -> bool {
+                self.child.try_wait().unwrap().is_none()
+                    && std::net::TcpStream::connect_timeout(
+                        &self.addr,
+                        std::time::Duration::from_millis(250),
+                    )
+                    .is_ok()
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        impl Drop for PrivateSshd {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        /// OpenSSH reads `~/.ssh/config` from `getpwuid(getuid())->pw_dir` (ignoring `$HOME`), so
+        /// isolated SSH-config tests prepend a minimal `ssh` wrapper in `PATH` that delegates to
+        /// the real OpenSSH binary with `-F <isolated_config>`.
+        #[cfg(target_os = "linux")]
+        fn write_ssh_config_wrapper(dir: &std::path::Path, contents: &str) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let ssh_dir = dir.join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let config_path = ssh_dir.join("config");
+            std::fs::write(&config_path, contents).unwrap();
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let bin_dir = dir.join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let wrapper = bin_dir.join("ssh");
+            let real_ssh = find_ssh_program();
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexec {} -F {} \"$@\"\n",
+                    shell_escape(real_ssh.to_str().unwrap()),
+                    shell_escape(config_path.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let existing_path = std::env::var("PATH").unwrap_or_default();
+            format!("{}:{existing_path}", bin_dir.display())
+        }
+
+        #[cfg(target_os = "linux")]
+        fn run_isolated_ssh_test_child(
+            test_name: &str,
+            marker_env: &str,
+            path_env: &str,
+            extra_env: &[(&str, &str)],
+        ) {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", test_name, "--nocapture"])
+                .env(marker_env, "1")
+                .env("PATH", path_env);
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
+            let output = cmd.output().expect("failed to execute isolated test child");
+            assert!(
+                output.status.success(),
+                "isolated test child {test_name} failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_fork_after_authentication_config_lookup_and_nonzero_exit() {
+            use std::os::unix::fs::PermissionsExt;
+            const MARKER: &str = "RCP_TEST_FORK_AFTER_AUTH_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let sshd = PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let home = tempfile::tempdir().unwrap();
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    &format!(
+                        "Host fork-host\n\
+                           HostName 127.0.0.1\n\
+                           Port {}\n\
+                           IdentityFile {}\n\
+                           IdentitiesOnly yes\n\
+                           ForkAfterAuthentication yes\n\
+                           StrictHostKeyChecking no\n\
+                           UserKnownHostsFile /dev/null\n",
+                        sshd.addr.port(),
+                        sshd.client_key.display(),
+                    ),
+                );
+                let port_str = sshd.addr.port().to_string();
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_fork_after_authentication_config_lookup_and_nonzero_exit",
+                    MARKER,
+                    &path_env,
+                    &[("RCP_TEST_PORT", &port_str)],
+                );
+                drop(sshd);
+                return;
+            }
+            let expected_port: u16 = std::env::var("RCP_TEST_PORT").unwrap().parse().unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let session = SshSession {
+                user: None,
+                host: "fork-host".to_owned(),
+                port: None,
+            };
+            // 1. `ssh -G` must succeed even when the host stanza sets ForkAfterAuthentication yes
+            let resolved = ssh_tunnel::resolve_ssh_config(
+                &session,
+                std::time::Duration::from_secs(5),
+                &cleanup,
+            )
+            .await
+            .expect("resolve_ssh_config must override ForkAfterAuthentication=no");
+            assert_eq!(resolved.target.host, "127.0.0.1");
+            assert_eq!(resolved.target.port, Some(expected_port));
+            // 2. `ssh -S` (AgentForwardMode::ForceOn) must stay in the foreground and preserve a
+            // nonzero remote exit status instead of detaching after auth
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("rcpd");
+            let version = crate::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\nexit 42\n",
+                    shell_escape(&version),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let prepared = prepare_rcpd_with_context(
+                &session,
+                Some(script.to_str().unwrap()),
+                false,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::ForceOn,
+            )
+            .await
+            .unwrap();
+            let process = prepared
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
+                .await
+                .unwrap();
+            let err = wait_for_rcpd_process(process)
+                .await
+                .expect_err("nonzero remote exit code must be preserved through ssh -S");
+            assert!(
+                format!("{err:#}").contains("status code: Some(42)"),
+                "expected exit code 42 in error: {err:#}"
+            );
+            drop(prepared);
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_resolve_ssh_config_distinguishes_match_user_endpoints() {
+            const MARKER: &str = "RCP_TEST_MATCH_USER_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let home = tempfile::tempdir().unwrap();
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    "Match host cluster user alice\n\
+                       HostName 10.10.0.1\n\
+                       Port 2201\n\
+                     Match host cluster user bob\n\
+                       HostName 10.10.0.2\n\
+                       Port 2202\n\
+                     Host cluster\n\
+                       HostName 10.10.0.9\n\
+                       Port 22\n",
+                );
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_resolve_ssh_config_distinguishes_match_user_endpoints",
+                    MARKER,
+                    &path_env,
+                    &[],
+                );
+                return;
+            }
+            let cleanup = RemoteCleanup::new().unwrap();
+            let alice = ssh_tunnel::resolve_ssh_config(
+                &SshSession {
+                    user: Some("alice".to_owned()),
+                    host: "cluster".to_owned(),
+                    port: None,
+                },
+                std::time::Duration::from_secs(5),
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            let bob = ssh_tunnel::resolve_ssh_config(
+                &SshSession {
+                    user: Some("bob".to_owned()),
+                    host: "cluster".to_owned(),
+                    port: None,
+                },
+                std::time::Duration::from_secs(5),
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(alice.target.host, "10.10.0.1");
+            assert_eq!(alice.target.port, Some(2201));
+            assert_eq!(bob.target.host, "10.10.0.2");
+            assert_eq!(bob.target.port, Some(2202));
+            assert!(
+                !alice.same_endpoint(&bob),
+                "Match user rules resolving different HostName/Port must not take SameHost shortcut"
+            );
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_agent_forwarding_honors_strict_host_key_checking() {
+            const MARKER: &str = "RCP_TEST_STRICT_HOST_KEY_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let sshd = PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let home = tempfile::tempdir().unwrap();
+                let known_hosts = home.path().join(".ssh/known_hosts");
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    &format!(
+                        "Host strict-dest\n\
+                           HostName 127.0.0.1\n\
+                           Port {}\n\
+                           IdentityFile {}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking yes\n\
+                           UserKnownHostsFile {}\n\
+                           ForwardAgent yes\n",
+                        sshd.addr.port(),
+                        sshd.client_key.display(),
+                        known_hosts.display(),
+                    ),
+                );
+                std::fs::write(&known_hosts, "").unwrap();
+                let port_str = sshd.addr.port().to_string();
+                let known_hosts_str = known_hosts.to_string_lossy().into_owned();
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_agent_forwarding_honors_strict_host_key_checking",
+                    MARKER,
+                    &path_env,
+                    &[
+                        ("RCP_TEST_PORT", &port_str),
+                        ("RCP_TEST_KNOWN_HOSTS", &known_hosts_str),
+                        ("RCP_TEST_HOST_PUB", &sshd.host_pub_key),
+                    ],
+                );
+                drop(sshd);
+                return;
+            }
+            let port: u16 = std::env::var("RCP_TEST_PORT").unwrap().parse().unwrap();
+            let known_hosts =
+                std::path::PathBuf::from(std::env::var("RCP_TEST_KNOWN_HOSTS").unwrap());
+            let host_pub = std::env::var("RCP_TEST_HOST_PUB").unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let session = SshSession {
+                user: None,
+                host: "strict-dest".to_owned(),
+                port: None,
+            };
+            // 1. Before the destination host key is trusted, both ForceOn and InheritConfig must
+            // fail closed instead of silently passing StrictHostKeyChecking=no.
+            for mode in [AgentForwardMode::ForceOn, AgentForwardMode::InheritConfig] {
+                let err = setup_ssh_session(
+                    &session,
+                    &PreparationContext::uncancelled(cleanup.clone()),
+                    BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                    15,
+                    mode,
+                )
+                .await
+                .expect_err(
+                    "agent forwarding must reject unknown host under StrictHostKeyChecking yes",
+                );
+                assert!(
+                    format!("{err:#}").contains("Host key verification failed"),
+                    "expected host key verification failure for {mode:?}: {err:#}"
+                );
+            }
+            // 2. After adding the host key to known_hosts, both modes must succeed.
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {host_pub}\n")).unwrap();
+            for mode in [AgentForwardMode::ForceOn, AgentForwardMode::InheritConfig] {
+                let managed = setup_ssh_session(
+                    &session,
+                    &PreparationContext::uncancelled(cleanup.clone()),
+                    BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+                    15,
+                    mode,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("expected {mode:?} to succeed after trusting host key: {e:#}")
+                });
+                drop(managed);
+            }
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_missing_forward_agent_socket_kept_out_of_readiness_stream() {
+            use std::os::unix::fs::PermissionsExt;
+            const MARKER: &str = "RCP_TEST_MISSING_AGENT_SOCK_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let sshd = PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let home = tempfile::tempdir().unwrap();
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    &format!(
+                        "Host missing-agent-dest\n\
+                           HostName 127.0.0.1\n\
+                           Port {}\n\
+                           IdentityFile {}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking no\n\
+                           UserKnownHostsFile /dev/null\n\
+                           ForwardAgent /nonexistent/rcp-missing-agent.sock\n",
+                        sshd.addr.port(),
+                        sshd.client_key.display(),
+                    ),
+                );
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_missing_forward_agent_socket_kept_out_of_readiness_stream",
+                    MARKER,
+                    &path_env,
+                    &[],
+                );
+                drop(sshd);
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let ok_script = dir.path().join("rcpd-ok");
+            let fail_script = dir.path().join("rcpd-fail");
+            let late_fail_script = dir.path().join("rcpd-late-fail");
+            let version = crate::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            std::fs::write(
+                &ok_script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\ncat >/dev/null\n",
+                    shell_escape(&version),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ok_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                &fail_script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'daemon startup exploded' >&2\nexit 1\n",
+                    shell_escape(&version),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fail_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                &late_fail_script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\ncat >/dev/null\nprintf '%s\\n' 'daemon failed after ready' >&2\nexit 42\n",
+                    shell_escape(&version),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&late_fail_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let count_exec_logs = |control_dir: &std::path::Path| -> usize {
+                std::fs::read_dir(control_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with("exec-") && name.ends_with(".log"))
+                    })
+                    .count()
+            };
+            let cleanup = RemoteCleanup::new().unwrap();
+            let session = SshSession {
+                user: None,
+                host: "missing-agent-dest".to_owned(),
+                port: None,
+            };
+            // 1. nonfatal local OpenSSH warning about missing ForwardAgent socket must go to `-E`
+            // log rather than polluting RCP_READY on stderr, and exec-*.log is removed on exit
+            let prepared_ok = prepare_rcpd_with_context(
+                &session,
+                Some(ok_script.to_str().unwrap()),
+                false,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::InheritConfig,
+            )
+            .await
+            .unwrap();
+            let ok_control_dir = prepared_ok.control_path().parent().unwrap().to_path_buf();
+            let process = prepared_ok
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
+                .await
+                .expect("missing ForwardAgent socket must not corrupt RCP_READY handshake");
+            wait_for_rcpd_process(process).await.unwrap();
+            assert_eq!(
+                count_exec_logs(&ok_control_dir),
+                0,
+                "exec-*.log must be removed after wait_for_rcpd_process succeeds"
+            );
+            drop(prepared_ok);
+            // 2. when daemon startup actually fails, local SSH diagnostics routed to `-E` are
+            // retained alongside daemon stderr and exec-*.log is cleaned up
+            let prepared_fail = prepare_rcpd_with_context(
+                &session,
+                Some(fail_script.to_str().unwrap()),
+                false,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::InheritConfig,
+            )
+            .await
+            .unwrap();
+            let fail_control_dir = prepared_fail.control_path().parent().unwrap().to_path_buf();
+            let err = match prepared_fail
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
+                .await
+            {
+                Ok(_) => panic!("failing rcpd script must return startup error"),
+                Err(err) => err,
+            };
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("daemon startup exploded"),
+                "expected daemon stderr in startup error: {rendered}"
+            );
+            assert!(
+                rendered.contains("ssh log:") && rendered.contains("rcp-missing-agent.sock"),
+                "expected local ssh -E diagnostic in startup error: {rendered}"
+            );
+            assert_eq!(
+                count_exec_logs(&fail_control_dir),
+                0,
+                "exec-*.log must be removed after startup failure reap"
+            );
+            drop(prepared_fail);
+            // 3. when PreparedRcpd is dropped before wait_for_rcpd_process observes a non-zero exit,
+            // wait_for_rcpd_process must keep the session alive until exec_log has been read
+            let prepared_late = prepare_rcpd_with_context(
+                &session,
+                Some(late_fail_script.to_str().unwrap()),
+                false,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::InheritConfig,
+            )
+            .await
+            .unwrap();
+            let late_process = prepared_late
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
+                .await
+                .unwrap();
+            drop(prepared_late);
+            let late_err = wait_for_rcpd_process(late_process)
+                .await
+                .expect_err("nonzero daemon exit must fail wait_for_rcpd_process");
+            let late_rendered = format!("{late_err:#}");
+            assert!(
+                late_rendered.contains("daemon failed after ready")
+                    && late_rendered.contains("ssh log:")
+                    && late_rendered.contains("rcp-missing-agent.sock"),
+                "expected wait_for_rcpd_process to retain ssh -E log even after PreparedRcpd drop: {late_rendered}"
+            );
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_load_balanced_alias_pins_node_rejects_mismatched_extra_and_reports_limitation()
+         {
+            use std::os::unix::fs::PermissionsExt;
+            const MARKER: &str = "RCP_TEST_LOAD_BALANCED_SSH_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let sshd_a =
+                    PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let sshd_b =
+                    PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let home = tempfile::tempdir().unwrap();
+                let counter_file = home.path().join("lb-counter");
+                let router_script = home.path().join("lb-proxy.py");
+                // routes 1st connection to sshd_a (node A) and subsequent connections to sshd_b
+                // (node B), simulating a load-balanced SSH login hostname; direct IP connections
+                // (Host localhost) bypass the load balancer.
+                let router_body = format!(
+                    concat!(
+                        "#!/usr/bin/env python3\n",
+                        "import fcntl, os, select, socket, sys\n",
+                        "counter_path = {counter:?}\n",
+                        "with open(counter_path, 'a+') as f:\n",
+                        "    fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n",
+                        "    f.seek(0)\n",
+                        "    n = int(f.read().strip() or '0')\n",
+                        "    f.seek(0)\n",
+                        "    f.truncate()\n",
+                        "    f.write(str(n + 1))\n",
+                        "    f.flush()\n",
+                        "port = {port_a} if n == 0 else {port_b}\n",
+                        "s = socket.create_connection(('127.0.0.1', port))\n",
+                        "stdin_fd = sys.stdin.fileno()\n",
+                        "stdout_fd = sys.stdout.fileno()\n",
+                        "sock_fd = s.fileno()\n",
+                        "while True:\n",
+                        "    r, _, _ = select.select([stdin_fd, sock_fd], [], [])\n",
+                        "    if stdin_fd in r:\n",
+                        "        data = os.read(stdin_fd, 65536)\n",
+                        "        if not data:\n",
+                        "            break\n",
+                        "        s.sendall(data)\n",
+                        "    if sock_fd in r:\n",
+                        "        data = s.recv(65536)\n",
+                        "        if not data:\n",
+                        "            break\n",
+                        "        os.write(stdout_fd, data)\n",
+                    ),
+                    counter = counter_file.to_string_lossy(),
+                    port_a = sshd_a.addr.port(),
+                    port_b = sshd_b.addr.port(),
+                );
+                std::fs::write(&router_script, router_body).unwrap();
+                std::fs::set_permissions(&router_script, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    &format!(
+                        "Host lb-cluster\n\
+                           HostName lb-cluster\n\
+                           ProxyCommand {} %h %p\n\
+                           IdentityFile {}\n\
+                           IdentityFile {}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking no\n\
+                           UserKnownHostsFile /dev/null\n\
+                         Host localhost\n\
+                           HostName 127.0.0.1\n\
+                           Port {}\n\
+                           IdentityFile {}\n\
+                           IdentityFile {}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking no\n\
+                           UserKnownHostsFile /dev/null\n",
+                        router_script.display(),
+                        sshd_a.client_key.display(),
+                        sshd_b.client_key.display(),
+                        sshd_b.addr.port(),
+                        sshd_a.client_key.display(),
+                        sshd_b.client_key.display(),
+                    ),
+                );
+                let port_a = sshd_a.addr.port().to_string();
+                let port_b = sshd_b.addr.port().to_string();
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_load_balanced_alias_pins_node_rejects_mismatched_extra_and_reports_limitation",
+                    MARKER,
+                    &path_env,
+                    &[("RCP_TEST_PORT_A", &port_a), ("RCP_TEST_PORT_B", &port_b)],
+                );
+                drop(sshd_a);
+                drop(sshd_b);
+                return;
+            }
+            let port_a: u16 = std::env::var("RCP_TEST_PORT_A").unwrap().parse().unwrap();
+            let port_b: u16 = std::env::var("RCP_TEST_PORT_B").unwrap().parse().unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let tcp_config = TcpConfig::default();
+            let ctrl_listener = create_tcp_control_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let data_listener = create_tcp_data_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let target_control = ctrl_listener.local_addr().unwrap();
+            let target_data = data_listener.local_addr().unwrap();
+            let lb_session = SshSession {
+                user: None,
+                host: "lb-cluster".to_owned(),
+                port: None,
+            };
+            // connection 1 through `lb-cluster` lands on sshd_a (node A)
+            let primary = setup_ssh_session(
+                &lb_session,
+                &PreparationContext::uncancelled(cleanup.clone()),
+                BootstrapDeadline::new(std::time::Duration::from_secs(10)),
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap();
+            let (peer_a, endpoint_a) =
+                probe_peer_identity_and_endpoint(&primary, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            assert_eq!(peer_a.ssh_server_port, Some(port_a));
+            assert_eq!(
+                endpoint_a,
+                Some(std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    port_a
+                )))
+            );
+            // 1. 2-host extra tunnels through `lb-cluster` land on sshd_b (port_b != port_a);
+            // peer verification MUST reject them before advertising their ports (leaving only
+            // tunnel #1 on node A).
+            let tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
+                ssh_tunnel::ForwardDirection::Local,
+                &primary.control_path(),
+                &lb_session,
+                target_control,
+                Some(target_data),
+                3,
+                ssh_tunnel::SshAddressFamily::Any,
+                Some(&peer_a),
+                None,
+                15,
+                std::time::Duration::from_secs(10),
+                &cleanup,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tunnels.data_addrs().len(),
+                1,
+                "extra tunnels landing on node B must be dropped and never advertised"
+            );
+            tunnels.close().await;
+            // 2. 3-host with concrete node endpoint pins directly to node A (port_a) even when
+            // the configured target (`localhost` -> port_b) would otherwise reach node B.
+            let pinned_tunnels = ssh_tunnel::SshTunnelSet::open_direct_local_tunnels(
+                &protocol::SshTarget {
+                    user: None,
+                    host: "localhost".to_owned(),
+                    port: Some(port_b),
+                },
+                target_control,
+                Some(target_data),
+                2,
+                None,
+                Some(&peer_a),
+                endpoint_a,
+                15,
+                std::time::Duration::from_secs(10),
+                &cleanup,
+                &[],
+            )
+            .await
+            .expect("3-host tunnel with reachable source_node_endpoint must pin to node A");
+            assert_eq!(pinned_tunnels.data_addrs().len(), 2);
+            pinned_tunnels.close().await;
+            // 3. 3-host when node pinning is unavailable and alias routes to node B must fail
+            // explicitly with a load-balanced hostname diagnostic naming both peers.
+            let err = ssh_tunnel::SshTunnelSet::open_direct_local_tunnels(
+                &protocol::SshTarget {
+                    user: None,
+                    host: "lb-cluster".to_owned(),
+                    port: None,
+                },
+                target_control,
+                Some(target_data),
+                2,
+                None,
+                Some(&peer_a),
+                None,
+                15,
+                std::time::Duration::from_secs(10),
+                &cleanup,
+                &[],
+            )
+            .await
+            .expect_err("3-host tunnel landing on node B must report load-balanced mismatch");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("load-balanced SSH hostname")
+                    && rendered.contains(&format!("sshd_port={port_b}"))
+                    && rendered.contains(&format!("sshd_port={port_a}")),
+                "expected explicit load-balanced mismatch diagnostic: {rendered}"
+            );
+            // 4. when a speculative node_endpoint points to the wrong peer (sshd_b) while the
+            // configured session reaches node A, extra tunnels must drop the mismatched pinned
+            // connection and fall back to the configured session to open verified extra tunnels
+            let direct_node_a = SshSession {
+                user: None,
+                host: "localhost".to_owned(),
+                port: Some(port_a),
+            };
+            let wrong_endpoint =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port_b));
+            let fallback_tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
+                ssh_tunnel::ForwardDirection::Local,
+                &primary.control_path(),
+                &direct_node_a,
+                target_control,
+                Some(target_data),
+                2,
+                ssh_tunnel::SshAddressFamily::Any,
+                Some(&peer_a),
+                Some(wrong_endpoint),
+                15,
+                std::time::Duration::from_secs(10),
+                &cleanup,
+                &[],
+            )
+            .await
+            .expect("mismatched pinned extra tunnel must fall back to configured session");
+            assert_eq!(
+                fallback_tunnels.data_addrs().len(),
+                2,
+                "fallback to configured session must open verified extra tunnel on node A"
+            );
+            fallback_tunnels.close().await;
+            // 5. when expected_peer is unavailable, open_on_existing_session must not open
+            // unverified extra tunnels and must preserve requested_tunnels for notice reporting
+            let unverified_tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
+                ssh_tunnel::ForwardDirection::Remote,
+                &primary.control_path(),
+                &direct_node_a,
+                target_control,
+                Some(target_data),
+                3,
+                ssh_tunnel::SshAddressFamily::Any,
+                None,
+                None,
+                15,
+                std::time::Duration::from_secs(10),
+                &cleanup,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert_eq!(unverified_tunnels.data_addrs().len(), 1);
+            assert_eq!(
+                unverified_tunnels.format_tunnel_summary(),
+                "1 of 3 requested parallel tunnels"
+            );
+            unverified_tunnels.close().await;
+            drop(primary);
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_abrupt_sigkill_terminates_owned_ssh_tunnels_and_listeners() {
+            const MARKER: &str = "RCP_TEST_TUNNEL_SIGKILL_CHILD";
+            if std::env::var_os(MARKER).is_some() {
+                let port: u16 = std::env::var("RCP_TEST_PORT").unwrap().parse().unwrap();
+                let target_control: std::net::SocketAddr = std::env::var("RCP_TEST_TARGET_CONTROL")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let target_data: std::net::SocketAddr = std::env::var("RCP_TEST_TARGET_DATA")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let cleanup = RemoteCleanup::new().unwrap();
+                let tunnels = ssh_tunnel::SshTunnelSet::open_direct_local_tunnels(
+                    &protocol::SshTarget {
+                        user: None,
+                        host: "sigkill-src".to_owned(),
+                        port: Some(port),
+                    },
+                    target_control,
+                    Some(target_data),
+                    2,
+                    None,
+                    None,
+                    None,
+                    15,
+                    std::time::Duration::from_secs(10),
+                    &cleanup,
+                    &[],
+                )
+                .await
+                .unwrap();
+                let pids: Vec<String> = tunnels
+                    .owned_session_pids()
+                    .into_iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                assert_eq!(pids.len(), 2, "expected 2 owned ssh -M -N children");
+                println!("READY {} {}", tunnels.control_addr(), pids.join(","));
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            let mut sshd = PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            let home = tempfile::tempdir().unwrap();
+            let path_env = write_ssh_config_wrapper(
+                home.path(),
+                &format!(
+                    "Host sigkill-src\n\
+                       HostName 127.0.0.1\n\
+                       Port {}\n\
+                       IdentityFile {}\n\
+                       IdentitiesOnly yes\n\
+                       StrictHostKeyChecking no\n\
+                       UserKnownHostsFile /dev/null\n",
+                    sshd.addr.port(),
+                    sshd.client_key.display(),
+                ),
+            );
+            let tcp_config = TcpConfig::default();
+            let ctrl_listener = create_tcp_control_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let data_listener = create_tcp_data_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let target_control = ctrl_listener.local_addr().unwrap();
+            let target_data = data_listener.local_addr().unwrap();
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::localhost_ssh_tests::test_remote_abrupt_sigkill_terminates_owned_ssh_tunnels_and_listeners",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .env("PATH", &path_env)
+                .env("RCP_TEST_PORT", sshd.addr.port().to_string())
+                .env("RCP_TEST_TARGET_CONTROL", target_control.to_string())
+                .env("RCP_TEST_TARGET_DATA", target_data.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut ready_line = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                use tokio::io::AsyncBufReadExt;
+                loop {
+                    ready_line.clear();
+                    let n = reader.read_line(&mut ready_line).await.unwrap();
+                    assert!(n > 0, "lifecycle child exited before printing READY");
+                    if ready_line.starts_with("READY ") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for lifecycle child READY line");
+            let parts: Vec<&str> = ready_line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "unexpected READY line: {ready_line:?}");
+            let control_addr: std::net::SocketAddr = parts[1].parse().unwrap();
+            let ssh_pids: Vec<u32> = parts[2]
+                .split(',')
+                .map(|p| p.parse::<u32>().unwrap())
+                .collect();
+            assert_eq!(ssh_pids.len(), 2);
+            // capture process identities while both ssh -M -N children are running
+            let tracked: Vec<(std::path::PathBuf, String)> = ssh_pids
+                .iter()
+                .map(|pid| {
+                    let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+                    let start = linux_process_start_time(&proc_path)
+                        .unwrap_or_else(|| panic!("expected ssh child pid {pid} to be running"));
+                    (proc_path, start)
+                })
+                .collect();
+            // confirm the -L listener is live and forwards to target_control before SIGKILL
+            let probe_connect = connect_tcp_control(control_addr, &tcp_config).await;
+            assert!(
+                probe_connect.is_ok(),
+                "expected -L listener {control_addr} to accept connections before SIGKILL"
+            );
+            drop(probe_connect);
+            // abruptly terminate the child with SIGKILL (no Rust Drop runs) while sshd stays healthy
+            child.kill().await.unwrap();
+            // verify every ssh -M -N tunnel process exits promptly via PR_SET_PDEATHSIG(SIGTERM)
+            for (proc_path, start_time) in &tracked {
+                assert!(
+                    wait_for_process_identity_to_disappear(proc_path, start_time).await,
+                    "ssh tunnel process {} survived abrupt SIGKILL of its owning process",
+                    proc_path.display()
+                );
+            }
+            // verify the -L listening port stopped accepting connections while sshd stays healthy
+            assert!(
+                connect_tcp_control_with_timeout(
+                    control_addr,
+                    &tcp_config,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .is_err(),
+                "-L listener {control_addr} must close after owning process is SIGKILLed"
+            );
+            assert!(
+                sshd.is_alive(),
+                "source sshd must remain healthy throughout the lifecycle test"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_peer_identity_probe_output_handles_banners_and_rejects_malformed() {
+        let valid = "RCP_PEER\tnode01\t11111111-1111-1111-1111-111111111111\tnet:[4026531992]\t10.0.0.1 54321 10.0.0.2 2222\n";
+        let (peer, endpoint) = parse_peer_identity_probe_output(valid).unwrap();
+        assert_eq!(peer.hostname, "node01");
+        assert_eq!(
+            peer.boot_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(peer.net_ns.as_deref(), Some("net:[4026531992]"));
+        assert_eq!(peer.ssh_server_port, Some(2222));
+        assert_eq!(endpoint, Some("10.0.0.2:2222".parse().unwrap()));
+        // shell banner lines before RCP_PEER must not corrupt the parsed peer identity
+        let with_banner = "Welcome to cluster login!\nLast login: Mon Jan 1\nRCP_PEER\tnode02\t\t\t::1 50000 ::1 22\n";
+        let (peer, endpoint) = parse_peer_identity_probe_output(with_banner).unwrap();
+        assert_eq!(peer.hostname, "node02");
+        assert_eq!(peer.boot_id, None);
+        assert_eq!(peer.net_ns, None);
+        assert_eq!(peer.ssh_server_port, Some(22));
+        assert_eq!(endpoint, Some("[::1]:22".parse().unwrap()));
+        // empty, untagged, truncated, extra-field, and empty-hostname outputs must fail
+        for bad in [
+            "",
+            "\n",
+            "node01\tboot\tnet\t10.0.0.1 1 10.0.0.2 22\n",
+            "RCP_PEER\tnode01\tonly-two\n",
+            "RCP_PEER\tnode01\ta\tb\tc\textra\n",
+            "RCP_PEER\t\tboot\tnet\t10.0.0.1 1 10.0.0.2 22\n",
+        ] {
+            assert!(
+                parse_peer_identity_probe_output(bad).is_err(),
+                "malformed probe output must be rejected: {bad:?}"
+            );
         }
     }
 
@@ -5080,12 +6615,18 @@ mod tests {
         let session = SshSession::local();
         let log = std::path::Path::new("/tmp/log");
         let socket = std::path::Path::new("/tmp/master");
+        let opts = |keepalive_sec, agent_forward| SshConnectOptions {
+            keepalive_sec,
+            agent_forward,
+            hostname_override: None,
+        };
         let disabled: Vec<String> =
-            ssh_master_args(&session, log, socket, 0, AgentForwardMode::Off)
+            ssh_master_args(&session, log, socket, opts(0, AgentForwardMode::Off))
                 .into_iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
         for expected in [
+            "StrictHostKeyChecking=no",
             "ClearAllForwardings=yes",
             "ExitOnForwardFailure=no",
             "GatewayPorts=no",
@@ -5113,17 +6654,27 @@ mod tests {
             vec!["localhost", "--"],
             "ssh_master_args must delimit hostname with `--`: {disabled:?}"
         );
-        let inherit: Vec<String> =
-            ssh_master_args(&session, log, socket, 0, AgentForwardMode::InheritConfig)
-                .into_iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
+        let inherit: Vec<String> = ssh_master_args(
+            &session,
+            log,
+            socket,
+            opts(0, AgentForwardMode::InheritConfig),
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
         assert!(
             !inherit.iter().any(|arg| arg.starts_with("ForwardAgent=")),
             "AgentForwardMode::InheritConfig must omit ForwardAgent so ~/.ssh/config applies: {inherit:?}"
         );
+        assert!(
+            !inherit
+                .iter()
+                .any(|arg| arg.starts_with("StrictHostKeyChecking=")),
+            "AgentForwardMode::InheritConfig must preserve user's StrictHostKeyChecking policy: {inherit:?}"
+        );
         let with_agent: Vec<String> =
-            ssh_master_args(&session, log, socket, 0, AgentForwardMode::ForceOn)
+            ssh_master_args(&session, log, socket, opts(0, AgentForwardMode::ForceOn))
                 .into_iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
@@ -5132,6 +6683,33 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-o", "ForwardAgent=yes"]),
             "AgentForwardMode::ForceOn must explicitly enable ForwardAgent=yes: {with_agent:?}"
+        );
+        assert!(
+            !with_agent
+                .iter()
+                .any(|arg| arg.starts_with("StrictHostKeyChecking=")),
+            "AgentForwardMode::ForceOn must preserve user's StrictHostKeyChecking policy: {with_agent:?}"
+        );
+        let pinned: Vec<String> = ssh_master_args(
+            &session,
+            log,
+            socket,
+            SshConnectOptions {
+                keepalive_sec: 0,
+                agent_forward: AgentForwardMode::Off,
+                hostname_override: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    10, 20, 30, 40,
+                ))),
+            },
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(
+            pinned
+                .windows(2)
+                .any(|pair| pair == ["-o", "HostName=10.20.30.40"]),
+            "hostname_override must emit -o HostName=<ip>: {pinned:?}"
         );
         assert!(
             disabled
@@ -5145,10 +6723,11 @@ mod tests {
                 .any(|arg| arg.starts_with("ServerAliveCountMax=")),
             "keepalive_sec=0 must not pass ServerAliveCountMax: {disabled:?}"
         );
-        let fast: Vec<String> = ssh_master_args(&session, log, socket, 5, AgentForwardMode::Off)
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let fast: Vec<String> =
+            ssh_master_args(&session, log, socket, opts(5, AgentForwardMode::Off))
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
         assert!(
             fast.windows(2)
                 .any(|pair| pair == ["-o", "ServerAliveInterval=1"]),
@@ -5160,7 +6739,7 @@ mod tests {
             "keepalive_sec=5 should use ServerAliveCountMax=4 (1 * (4 + 1) = 5s): {fast:?}"
         );
         let default_args: Vec<String> =
-            ssh_master_args(&session, log, socket, 120, AgentForwardMode::Off)
+            ssh_master_args(&session, log, socket, opts(120, AgentForwardMode::Off))
                 .into_iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
@@ -5240,8 +6819,11 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
-                DEFAULT_REMOTE_KEEPALIVE_SEC,
-                AgentForwardMode::Off,
+                SshConnectOptions {
+                    keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+                    agent_forward: AgentForwardMode::Off,
+                    hostname_override: None,
+                },
             )
             .await
         });
@@ -5300,6 +6882,7 @@ mod tests {
             port: Some(2222),
         };
         let control = std::path::Path::new("/tmp/ctrl/master");
+        let exec_log = std::path::Path::new("/tmp/ctrl/exec-0.log");
         let rcpd_args = vec![
             "--role".to_owned(),
             "destination".to_owned(),
@@ -5308,6 +6891,7 @@ mod tests {
         let off: Vec<String> = ssh_mux_exec_args(
             &session,
             control,
+            exec_log,
             AgentForwardMode::Off,
             "/usr/bin/rcpd",
             &rcpd_args,
@@ -5319,6 +6903,7 @@ mod tests {
         let inherit: Vec<String> = ssh_mux_exec_args(
             &session,
             control,
+            exec_log,
             AgentForwardMode::InheritConfig,
             "/usr/bin/rcpd",
             &rcpd_args,
@@ -5326,9 +6911,17 @@ mod tests {
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+        assert!(
+            inherit
+                .windows(2)
+                .any(|p| p == ["-E", "/tmp/ctrl/exec-0.log"]),
+            "ssh_mux_exec_args must route local diagnostics via -E: {inherit:?}"
+        );
         assert!(!inherit.iter().any(|arg| arg.starts_with("ForwardAgent=")));
         for expected in [
             "ControlMaster=no",
+            "ControlPersist=no",
+            "ForkAfterAuthentication=no",
             "ClearAllForwardings=yes",
             "ForwardX11=no",
             "StdinNull=no",
@@ -5350,6 +6943,7 @@ mod tests {
         let forced: Vec<String> = ssh_mux_exec_args(
             &session,
             control,
+            exec_log,
             AgentForwardMode::ForceOn,
             "/usr/bin/rcpd",
             &rcpd_args,
@@ -5476,8 +7070,11 @@ mod tests {
             &preparation,
             &launcher,
             BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
-            DEFAULT_REMOTE_KEEPALIVE_SEC,
-            AgentForwardMode::Off,
+            SshConnectOptions {
+                keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+                agent_forward: AgentForwardMode::Off,
+                hostname_override: None,
+            },
         )
         .await
         .unwrap();
@@ -5533,8 +7130,11 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(std::time::Duration::from_millis(500)),
-                DEFAULT_REMOTE_KEEPALIVE_SEC,
-                AgentForwardMode::Off,
+                SshConnectOptions {
+                    keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+                    agent_forward: AgentForwardMode::Off,
+                    hostname_override: None,
+                },
             )
             .await
         });
@@ -5625,8 +7225,11 @@ mod tests {
                 &preparation,
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
-                DEFAULT_REMOTE_KEEPALIVE_SEC,
-                AgentForwardMode::Off,
+                SshConnectOptions {
+                    keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+                    agent_forward: AgentForwardMode::Off,
+                    hostname_override: None,
+                },
             ))
             .unwrap();
         let pid = std::fs::read_to_string(&pid_file).unwrap();
@@ -5703,8 +7306,20 @@ mod tests {
     #[test]
     fn failed_rcpd_output_keeps_both_captured_streams() {
         assert_eq!(
-            format_failed_rcpd_output(b"destination listener bind failed\n", "daemon detail\n"),
+            format_failed_rcpd_output(
+                b"destination listener bind failed\n",
+                "daemon detail\n",
+                None
+            ),
             Some("stdout: destination listener bind failed; stderr: daemon detail".to_string())
+        );
+        assert_eq!(
+            format_failed_rcpd_output(
+                b"",
+                "daemon detail\n",
+                Some("Cannot forward agent socket path")
+            ),
+            Some("stderr: daemon detail; ssh log: Cannot forward agent socket path".to_string())
         );
     }
 
@@ -6402,7 +8017,7 @@ mod tests {
         command.args(["-c", "exec sleep 2"]).kill_on_drop(true);
         let launcher = command.spawn().unwrap();
         let reaper = SshMasterReaper {
-            launcher: Some(launcher),
+            launcher: Some(ReapableChild::Tokio(launcher)),
             control_directory: Some(control_directory.clone()),
         };
         let cleanup = RemoteCleanup::new().unwrap();

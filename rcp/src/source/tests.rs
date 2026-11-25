@@ -86,6 +86,7 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
                     remote::connect_tcp_control(listener.local_addr()?, &tcp_config),
                 )?;
                 let settings = settings(dereference);
+                let peer_connected = std::sync::atomic::AtomicBool::new(false);
                 let source_operation = handle_dry_run_connection(
                     accepted.0,
                     &settings,
@@ -94,6 +95,7 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
                     common::config::DryRunMode::Brief,
                     None,
                     5,
+                    &peer_connected,
                 );
                 let destination_operation = async {
                     let (mut send, mut receive) = remote::tls::connect_bounded(

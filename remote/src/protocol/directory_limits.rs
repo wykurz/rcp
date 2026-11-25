@@ -35,7 +35,7 @@ impl DirectoryLimits {
                     NonZeroUsize::new(streams).context("remote stream capacity is zero")?;
                 let pending =
                     NonZeroUsize::new(pending).context("remote pending capacity is zero")?;
-                common::RemoteResources::for_limits(None, streams, streams, pending)?
+                common::RemoteResources::for_limits(None, streams, streams, pending, 0)?
             }
             common::EndpointAdmission::Configured { .. } => {
                 anyhow::bail!("remote directory traversal requires remote endpoint admission")
@@ -69,6 +69,7 @@ mod tests {
                     NonZeroUsize::new(20).unwrap(),
                     NonZeroUsize::new(20).unwrap(),
                     NonZeroUsize::new(80).unwrap(),
+                    0,
                 )
                 .unwrap(),
             ),
@@ -115,6 +116,7 @@ mod tests {
             NonZeroUsize::new(200).unwrap(),
             NonZeroUsize::new(20).unwrap(),
             NonZeroUsize::new(80).unwrap(),
+            0,
         )
         .unwrap();
         let limits =
@@ -132,6 +134,7 @@ mod tests {
                 NonZeroUsize::new(streams).unwrap(),
                 NonZeroUsize::new(streams).unwrap(),
                 NonZeroUsize::new(streams * 4).unwrap(),
+                0,
             )
             .unwrap();
             let limits = DirectoryLimits::for_endpoint(

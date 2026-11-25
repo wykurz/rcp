@@ -413,6 +413,7 @@ async fn handle_connection(
     files_source: common::FilesInFlightSource,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
     let pool_size = concurrency.max_connections().get();
@@ -429,6 +430,7 @@ async fn handle_connection(
         "control",
     )
     .await?;
+    peer_connected.store(true, std::sync::atomic::Ordering::Release);
     let receiver_limits = tokio::time::timeout(
         std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
         control_recv_stream.recv_object::<remote::protocol::DirectoryLimits>(),
@@ -1141,6 +1143,7 @@ async fn dry_run_traverse_fd(
 
 /// Handle a dry-run connection: traverse, log entries, and complete without transferring data.
 /// Destination completes after receiving the empty discovery marker.
+#[allow(clippy::too_many_arguments)]
 async fn handle_dry_run_connection(
     stream: tokio::net::TcpStream,
     settings: &common::copy::Settings,
@@ -1149,6 +1152,7 @@ async fn handle_dry_run_connection(
     dry_run_mode: common::config::DryRunMode,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
     conn_timeout_sec: u64,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     tracing::info!("Handling dry-run connection");
     // set up TLS if needed; the handshake is bounded like every other (a peer that establishes TCP
@@ -1160,6 +1164,7 @@ async fn handle_dry_run_connection(
         "dry-run control",
     )
     .await?;
+    peer_connected.store(true, std::sync::atomic::Ordering::Release);
     let control_send_stream: remote::streams::BoxedSharedSendStream =
         std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     // traverse and log dry-run entries (output goes via tracing). The default path uses the
@@ -1290,6 +1295,7 @@ pub async fn run_source(
     accept_timeout: std::time::Duration,
     cert_key: Option<&remote::tls::CertifiedKey>,
     dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
+    peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     // create TLS acceptor if encryption is enabled (requires both cert and dest fingerprint)
     let tls_acceptor = match (cert_key, dest_cert_fingerprint) {
@@ -1328,11 +1334,14 @@ pub async fn run_source(
         data_addr,
         tunnel_target_ip
     );
+    let (peer_identity, ssh_node_endpoint) = remote::protocol::PeerIdentity::current();
     let master_hello = remote::protocol::SourceMasterHello {
         control_addr,
         data_addr,
         tunnel_target_ip,
         server_name: remote::get_random_server_name(),
+        peer_identity,
+        ssh_node_endpoint,
     };
     tracing::info!("Sending master hello: {:?}", master_hello);
     master_control.send_source_hello(master_hello).await?;
@@ -1359,6 +1368,7 @@ pub async fn run_source(
                     dry_run_mode,
                     tls_acceptor,
                     tcp_config.conn_timeout_sec,
+                    peer_connected,
                 )
                 .await;
             }
@@ -1376,6 +1386,7 @@ pub async fn run_source(
                 files_source,
                 error_collector.clone(),
                 tls_acceptor,
+                peer_connected,
             )
             .await?;
         }

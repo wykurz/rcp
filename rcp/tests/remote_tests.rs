@@ -8372,6 +8372,7 @@ fn remote_rejected_directory_inside_reserve_preserves_healthy_siblings() {
         std::num::NonZeroUsize::MIN,
         std::num::NonZeroUsize::MIN,
         std::num::NonZeroUsize::MIN,
+        0,
     )
     .unwrap();
     let normal = resources.normal_directories.get();
@@ -10823,52 +10824,117 @@ fn test_remote_ssh_transport_download_upload_three_host_and_same_host() {
         get_file_content(&dst_upload.join("sub/c.txt")),
         "gamma payload"
     );
-    // 5. 3-Host (127.0.0.1 -> localhost) opens direct destination->source -L tunnels
-    let dst_three_host = dst_dir.path().join("three_host");
-    let src_ip = format!("127.0.0.1:{src_path}");
-    let dst_three_host_remote = format!("localhost:{}", dst_three_host.to_str().unwrap());
-    let out = run_rcp_with_args_at_default_verbosity(&[
-        "--remote-transport=ssh",
-        "--ssh-tunnels=2",
-        &src_ip,
-        &dst_three_host_remote,
-    ]);
-    assert!(
-        out.status.success(),
-        "SSH 3-host copy failed: stdout={}, stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
-        "expected forwarded SSH slow-path notice on 3-host copy:\n{combined}"
-    );
-    assert_eq!(
-        get_file_content(&dst_three_host.join("a.txt")),
-        "alpha payload"
-    );
-    // 6. 3-Host with --ssh-forward-agent exercises the `ssh -S -T -o ForwardAgent=yes` spawn path
-    let dst_agent = dst_dir.path().join("three_host_agent");
-    let dst_agent_remote = format!("localhost:{}", dst_agent.to_str().unwrap());
-    let out = run_rcp_with_args_at_default_verbosity(&[
-        "--remote-transport=ssh",
-        "--ssh-forward-agent",
-        "--ssh-tunnels=1",
-        &src_ip,
-        &dst_agent_remote,
-    ]);
-    assert!(
-        out.status.success(),
-        "SSH 3-host --ssh-forward-agent copy failed: stdout={}, stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(get_file_content(&dst_agent.join("a.txt")), "alpha payload");
+    // 5. 3-Host (distinct private sshd ports so ambient ~/.ssh/config mapping localhost->127.0.0.1
+    // cannot collapse this into SameHost) opens direct destination->source -L tunnels
+    #[cfg(target_os = "linux")]
+    {
+        let home = tempfile::tempdir().unwrap();
+        let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let path_env = write_test_ssh_config_wrapper(
+            home.path(),
+            &format!(
+                "Host src-node\n\
+                   HostName 127.0.0.1\n\
+                   Port {}\n\
+                   IdentityFile {}\n\
+                   IdentitiesOnly yes\n\
+                   StrictHostKeyChecking no\n\
+                   UserKnownHostsFile /dev/null\n\
+                 Host dst-node\n\
+                   HostName 127.0.0.1\n\
+                   Port {}\n\
+                   IdentityFile {}\n\
+                   IdentitiesOnly yes\n\
+                   StrictHostKeyChecking no\n\
+                   UserKnownHostsFile /dev/null\n\
+                 Host 127.0.0.1\n\
+                   IdentityFile {}\n\
+                   IdentityFile {}\n\
+                   IdentitiesOnly yes\n\
+                   StrictHostKeyChecking no\n\
+                   UserKnownHostsFile /dev/null\n",
+                sshd_src.addr.port(),
+                sshd_src.client_key.display(),
+                sshd_dst.addr.port(),
+                sshd_dst.client_key.display(),
+                sshd_src.client_key.display(),
+                sshd_dst.client_key.display(),
+            ),
+        );
+        let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+        let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+        let src_3h = format!("src-node:{src_path}");
+        let dst_three_host = dst_dir.path().join("three_host");
+        let dst_three_host_remote = format!("dst-node:{}", dst_three_host.to_str().unwrap());
+        let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+        let out = std::process::Command::new("timeout")
+            .args([
+                "90",
+                rcp_path.to_str().unwrap(),
+                "--force-remote",
+                "--remote-transport=ssh",
+                "--ssh-tunnels=2",
+                &rcpd_flag,
+                &src_3h,
+                &dst_three_host_remote,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", &path_env)
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .expect("failed to execute rcp");
+        assert_not_timeout(&out);
+        assert!(
+            out.status.success(),
+            "SSH 3-host copy failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+            "expected forwarded SSH slow-path notice on 3-host copy:\n{combined}"
+        );
+        assert_eq!(
+            get_file_content(&dst_three_host.join("a.txt")),
+            "alpha payload"
+        );
+        // 6. 3-Host with --ssh-forward-agent exercises the `ssh -S -T -o ForwardAgent=yes` spawn path
+        let dst_agent = dst_dir.path().join("three_host_agent");
+        let dst_agent_remote = format!("dst-node:{}", dst_agent.to_str().unwrap());
+        let out = std::process::Command::new("timeout")
+            .args([
+                "90",
+                rcp_path.to_str().unwrap(),
+                "--force-remote",
+                "--remote-transport=ssh",
+                "--ssh-forward-agent",
+                "--ssh-tunnels=1",
+                &rcpd_flag,
+                &src_3h,
+                &dst_agent_remote,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", &path_env)
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .expect("failed to execute rcp");
+        assert_not_timeout(&out);
+        assert!(
+            out.status.success(),
+            "SSH 3-host --ssh-forward-agent copy failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(get_file_content(&dst_agent.join("a.txt")), "alpha payload");
+        drop(sshd_src);
+        drop(sshd_dst);
+    }
     // 7. Same-host (localhost -> localhost) stays on direct loopback with NO slow-path SSH notice
     let dst_same = dst_dir.path().join("same_host");
     let dst_same_remote = format!("localhost:{}", dst_same.to_str().unwrap());
@@ -10966,18 +11032,513 @@ fn test_remote_auto_transport_succeeds_direct_without_ssh_warning() {
         "auto mode must not warn when direct TCP succeeds:\n{combined}"
     );
     assert_eq!(get_file_content(&dst_download), "auto direct payload");
-    // 3-host auto (direct TCP succeeds -> no SSH fallback warning)
-    let dst_three = dst_dir.path().join("auto_three.txt");
-    let src_ip = format!("127.0.0.1:{}", src_file.to_str().unwrap());
-    let dst_three_remote = format!("localhost:{}", dst_three.to_str().unwrap());
-    let out = run_rcp_with_args_at_default_verbosity(&[
-        "--remote-transport=auto",
-        &src_ip,
-        &dst_three_remote,
-    ]);
+    // 3-host auto (distinct private sshd ports so ambient ~/.ssh/config cannot collapse to
+    // SameHost; direct TCP succeeds -> no SSH fallback warning)
+    #[cfg(target_os = "linux")]
+    {
+        let home = tempfile::tempdir().unwrap();
+        let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let path_env = write_test_ssh_config_wrapper(
+            home.path(),
+            &format!(
+                "Host src-auto\n\
+                   HostName 127.0.0.1\n\
+                   Port {}\n\
+                   IdentityFile {}\n\
+                   IdentitiesOnly yes\n\
+                   StrictHostKeyChecking no\n\
+                   UserKnownHostsFile /dev/null\n\
+                 Host dst-auto\n\
+                   HostName 127.0.0.1\n\
+                   Port {}\n\
+                   IdentityFile {}\n\
+                   IdentitiesOnly yes\n\
+                   StrictHostKeyChecking no\n\
+                   UserKnownHostsFile /dev/null\n",
+                sshd_src.addr.port(),
+                sshd_src.client_key.display(),
+                sshd_dst.addr.port(),
+                sshd_dst.client_key.display(),
+            ),
+        );
+        let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+        let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+        let dst_three = dst_dir.path().join("auto_three.txt");
+        let src_auto = format!("src-auto:{}", src_file.to_str().unwrap());
+        let dst_three_remote = format!("dst-auto:{}", dst_three.to_str().unwrap());
+        let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+        let out = std::process::Command::new("timeout")
+            .args([
+                "90",
+                rcp_path.to_str().unwrap(),
+                "--force-remote",
+                "--remote-transport=auto",
+                &rcpd_flag,
+                &src_auto,
+                &dst_three_remote,
+            ])
+            .env("HOME", home.path())
+            .env("PATH", &path_env)
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .expect("failed to execute rcp");
+        assert_not_timeout(&out);
+        assert!(
+            out.status.success(),
+            "auto 3-host failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !combined.contains("falling back to SSH")
+                && !combined.contains("Transferring file data over SSH"),
+            "auto 3-host must not warn when direct TCP succeeds:\n{combined}"
+        );
+        assert_eq!(get_file_content(&dst_three), "auto direct payload");
+        drop(sshd_src);
+        drop(sshd_dst);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_test_program(name: &str, fallbacks: &[&str]) -> std::path::PathBuf {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    for fallback in fallbacks {
+        let candidate = std::path::PathBuf::from(fallback);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("{name} binary not found in PATH or fallbacks {fallbacks:?}");
+}
+
+#[cfg(target_os = "linux")]
+fn write_test_ssh_config_wrapper(dir: &std::path::Path, contents: &str) -> String {
+    let ssh_dir = dir.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = ssh_dir.join("config");
+    std::fs::write(&config_path, contents).unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let wrapper = bin_dir.join("ssh");
+    let real_ssh = find_test_program("ssh", &["/usr/bin/ssh"]);
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec {} -F {} \"$@\"\n",
+            shell_quote_for_test(&real_ssh),
+            shell_quote_for_test(&config_path),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing_path}", bin_dir.display())
+}
+
+#[cfg(target_os = "linux")]
+fn write_test_rcpd_with_ssh_wrapper(dir: &std::path::Path) -> std::path::PathBuf {
+    let bin_dir = dir.join("bin");
+    let wrapper = dir.join("rcpd-with-ssh-config");
+    let real_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport PATH={}:\"$PATH\"\nexec {} \"$@\"\n",
+            shell_quote_for_test(&bin_dir),
+            shell_quote_for_test(&real_rcpd),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper
+}
+
+#[cfg(target_os = "linux")]
+struct TestPrivateSshd {
+    _dir: tempfile::TempDir,
+    child: std::process::Child,
+    addr: std::net::SocketAddr,
+    client_key: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl TestPrivateSshd {
+    fn start(bind_ip: std::net::IpAddr) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let host_key = dir.path().join("host_key");
+        let client_key = dir.path().join("client_key");
+        let auth_keys = dir.path().join("authorized_keys");
+        let sshd_config = dir.path().join("sshd_config");
+        let pid_file = dir.path().join("sshd.pid");
+        for key in [&host_key, &client_key] {
+            let status = std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(key)
+                .status()
+                .expect("failed to run ssh-keygen");
+            assert!(status.success(), "ssh-keygen failed for {}", key.display());
+        }
+        let client_pub = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+        std::fs::write(&auth_keys, client_pub).unwrap();
+        std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let probe = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen_spec = match bind_ip {
+            std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+        };
+        std::fs::write(
+            &sshd_config,
+            format!(
+                "ListenAddress {listen_spec}\n\
+                 HostKey {}\n\
+                 AuthorizedKeysFile {}\n\
+                 PidFile {}\n\
+                 StrictModes no\n\
+                 PermitRootLogin prohibit-password\n\
+                 PasswordAuthentication no\n\
+                 KbdInteractiveAuthentication no\n\
+                 PubkeyAuthentication yes\n\
+                 UsePAM no\n\
+                 AllowTcpForwarding yes\n\
+                 AllowAgentForwarding yes\n\
+                 GatewayPorts no\n\
+                 Subsystem sftp internal-sftp\n",
+                host_key.display(),
+                auth_keys.display(),
+                pid_file.display(),
+            ),
+        )
+        .unwrap();
+        let sshd = find_test_program("sshd", &["/usr/sbin/sshd", "/sbin/sshd"]);
+        let sshd_log = dir.path().join("sshd.log");
+        let sshd_err = std::fs::File::create(&sshd_log).unwrap();
+        let mut child = std::process::Command::new(&sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(&sshd_config)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(sshd_err))
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to start {}: {e:#}", sshd.display()));
+        let addr = std::net::SocketAddr::new(bind_ip, port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+                .is_ok()
+            {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let log = std::fs::read_to_string(&sshd_log).unwrap_or_default();
+                panic!("private sshd exited prematurely with {status}: {log}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for private sshd on {addr}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Self {
+            _dir: dir,
+            child,
+            addr,
+            client_key,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestPrivateSshd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_ssh_transport_ipv6_address_family_download_upload_and_three_host() {
+    if let Err(err) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+        ) {
+            eprintln!("skipping: this kernel/container lacks IPv6 loopback (::1): {err}");
+            return;
+        }
+        panic!("unexpected failure probing IPv6 loopback (::1): {err}");
+    }
+    let home = tempfile::tempdir().unwrap();
+    let sshd_local = TestPrivateSshd::start(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    // Host localhost isolates the local endpoint spawned via RemotePath::from_local so the test
+    // never depends on system sshd or ambient SSH_AUTH_SOCK; Host ::1 provides AddressFamily inet6
+    // + keys for 3-host destination connecting to resolved `::1` via the rcpd PATH wrapper.
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6src\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host v6dst\n\
+               HostName ::1\n\
+               Port {}\n\
+               AddressFamily inet6\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host ::1\n\
+               AddressFamily inet6\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_local.addr.port(),
+            sshd_local.client_key.display(),
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("v6tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "ipv6 alpha", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "ipv6 beta", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let src_path = src_tree.to_str().unwrap();
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. Download (-L [::1] -> [::1])
+    let dst_dl = dst_dir.path().join("v6_download");
+    let src_v6 = format!("v6src:{src_path}");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            dst_dl.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
     assert!(
         out.status.success(),
-        "auto 3-host failed: stdout={}, stderr={}",
+        "IPv6 SSH download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_dl.join("a.txt")), "ipv6 alpha");
+    assert_eq!(get_file_content(&dst_dl.join("b.txt")), "ipv6 beta");
+    // 2. Upload (-R [::1]:0 -> [::1])
+    let dst_ul = dst_dir.path().join("v6_upload");
+    let dst_ul_remote = format!("v6dst:{}", dst_ul.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            src_path,
+            &dst_ul_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "IPv6 SSH upload failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_ul.join("a.txt")), "ipv6 alpha");
+    assert_eq!(get_file_content(&dst_ul.join("b.txt")), "ipv6 beta");
+    // 3. 3-Host (v6src -> v6dst, distinct ports -> direct destination -L [::1] -> [::1])
+    let dst_3h = dst_dir.path().join("v6_three_host");
+    let dst_3h_remote = format!("v6dst:{}", dst_3h.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            &dst_3h_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "IPv6 SSH 3-host copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_3h.join("a.txt")), "ipv6 alpha");
+    assert_eq!(get_file_content(&dst_3h.join("b.txt")), "ipv6 beta");
+    // 4. Auto mode under AddressFamily inet6 (dual-stack :: listener with IPv6 SSH fallback)
+    let dst_auto = dst_dir.path().join("v6_auto_download");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=auto",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_v6,
+            dst_auto.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "IPv6 auto download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_auto.join("a.txt")), "ipv6 alpha");
+    assert_eq!(get_file_content(&dst_auto.join("b.txt")), "ipv6 beta");
+    drop(sshd_local);
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_three_host_ssh_low_nofile_caps_tunnels_without_emfile() {
+    let home = tempfile::tempdir().unwrap();
+    let sshd_src = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_dst = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host src-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host dst-node\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_src.addr.port(),
+            sshd_src.client_key.display(),
+            sshd_dst.addr.port(),
+            sshd_dst.client_key.display(),
+            sshd_src.client_key.display(),
+            sshd_dst.client_key.display(),
+        ),
+    );
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("low_nofile_tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    for i in 0..20 {
+        create_test_file(
+            &src_tree.join(format!("file-{i:02}.txt")),
+            &format!("payload-{i:02}"),
+            0o644,
+        );
+    }
+    // wrapper prepends the isolated ssh shim dir to PATH and lowers BOTH soft and hard
+    // RLIMIT_NOFILE to 84 on the destination rcpd before exec: with streams=32 and support=32,
+    // base_available=20 and 12 fds are needed for 1 minimum work slot, leaving 8 fds for local
+    // SSH tunnels out of 16 requested.
+    let bin_dir = home.path().join("bin");
+    let wrapper = home.path().join("rcpd-low-nofile");
+    let real_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    let wrapper_body = format!(
+        concat!(
+            "#!/usr/bin/env python3\n",
+            "import os, resource, sys\n",
+            "os.environ['PATH'] = {bin_dir:?} + ':' + os.environ.get('PATH', '')\n",
+            "args = sys.argv[1:]\n",
+            "is_dest = False\n",
+            "for i, a in enumerate(args):\n",
+            "    if a == '--role=destination' or (a == '--role' and i + 1 < len(args) and args[i + 1] == 'destination'):\n",
+            "        is_dest = True\n",
+            "        break\n",
+            "if is_dest:\n",
+            "    resource.setrlimit(resource.RLIMIT_NOFILE, (84, 84))\n",
+            "os.execv({rcpd:?}, [{rcpd:?}] + args)\n",
+        ),
+        bin_dir = bin_dir.to_string_lossy(),
+        rcpd = real_rcpd.to_string_lossy(),
+    );
+    std::fs::write(&wrapper, wrapper_body).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_flag = format!("--rcpd-path={}", wrapper.display());
+    let src_remote = format!("src-node:{}", src_tree.to_str().unwrap());
+    let dst_tree = dst_dir.path().join("low_nofile_dst");
+    let dst_remote = format!("dst-node:{}", dst_tree.to_str().unwrap());
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let out = std::process::Command::new("timeout")
+        .args([
+            "90",
+            rcp_path.to_str().unwrap(),
+            "--force-remote",
+            "--remote-transport=ssh",
+            "--max-connections=32",
+            "--max-files-in-flight=32",
+            "--ssh-tunnels=16",
+            &rcpd_flag,
+            &src_remote,
+            &dst_remote,
+        ])
+        .env("HOME", home.path())
+        .env("PATH", &path_env)
+        .env_remove("SSH_AUTH_SOCK")
+        .output()
+        .expect("failed to execute rcp");
+    assert_not_timeout(&out);
+    assert!(
+        out.status.success(),
+        "low-RLIMIT_NOFILE 3-host SSH copy must succeed without EMFILE: stdout={}, stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -10987,9 +11548,183 @@ fn test_remote_auto_transport_succeeds_direct_without_ssh_warning() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !combined.contains("falling back to SSH")
-            && !combined.contains("Transferring file data over SSH"),
-        "auto 3-host must not warn when direct TCP succeeds:\n{combined}"
+        combined.contains("descriptor safety reduced local SSH tunnel capacity to 8"),
+        "expected descriptor-safety tunnel cap notice:\n{combined}"
     );
-    assert_eq!(get_file_content(&dst_three), "auto direct payload");
+    assert!(
+        combined.contains("of 16 requested parallel tunnels"),
+        "expected tunnel summary reporting capped count out of 16 requested:\n{combined}"
+    );
+    for i in 0..20 {
+        assert_eq!(
+            get_file_content(&dst_tree.join(format!("file-{i:02}.txt"))),
+            format!("payload-{i:02}")
+        );
+    }
+    drop(sshd_src);
+    drop(sshd_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_shared_alias_different_user_spellings_follow_resolved_endpoint() {
+    let home = tempfile::tempdir().unwrap();
+    let sshd_a = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_b = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let current_user = std::env::var("USER").unwrap_or_else(|_| {
+        String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    });
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host same-alias\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               User {current_user}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host same-alias-alt\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               User {current_user}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host other-port-alias\n\
+               HostName 127.0.0.1\n\
+               Port {}\n\
+               User {current_user}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n\
+             Host 127.0.0.1\n\
+               IdentityFile {}\n\
+               IdentityFile {}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking no\n\
+               UserKnownHostsFile /dev/null\n",
+            sshd_a.addr.port(),
+            sshd_a.client_key.display(),
+            sshd_a.addr.port(),
+            sshd_a.client_key.display(),
+            sshd_b.addr.port(),
+            sshd_b.client_key.display(),
+            sshd_a.client_key.display(),
+            sshd_b.client_key.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("item.txt");
+    create_test_file(&src_file, "resolved endpoint test", 0o644);
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    // 1. `<user>@same-alias` vs `same-alias` have different raw SshSession structs (Some(user) vs
+    // None) so `ssh -G` resolves both; because their effective HostName+Port match, rcp takes the
+    // SameHost shortcut (no slow-path SSH tunnel notice).
+    let dst_same = dst_dir.path().join("same.txt");
+    let src_with_user = format!("{current_user}@same-alias:{}", src_file.to_str().unwrap());
+    let dst_without_user = format!("same-alias:{}", dst_same.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            &rcpd_flag,
+            &src_with_user,
+            &dst_without_user,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "same resolved endpoint copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Transferring file data over SSH"),
+        "matching resolved endpoint must take SameHost shortcut without SSH tunnel warning:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_same), "resolved endpoint test");
+    // 2. distinct aliases `same-alias` vs `same-alias-alt` resolving to the same HostName+Port
+    // also take the SameHost shortcut.
+    let dst_alt = dst_dir.path().join("same_alt.txt");
+    let dst_alt_remote = format!("same-alias-alt:{}", dst_alt.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            &rcpd_flag,
+            &src_with_user,
+            &dst_alt_remote,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "distinct aliases sharing resolved endpoint failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Transferring file data over SSH"),
+        "distinct aliases resolving to the same endpoint must take SameHost shortcut:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_alt), "resolved endpoint test");
+    // 3. `same-alias` (port A) vs `other-port-alias` (port B) resolve to different ports on the
+    // same HostName, so rcp must classify as ThreeHost and open direct SSH tunnels.
+    let dst_diff = dst_dir.path().join("diff.txt");
+    let dst_other_port = format!("other-port-alias:{}", dst_diff.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_with_user,
+            &dst_other_port,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "distinct resolved port 3-host copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "distinct resolved ports must classify as ThreeHost and tunnel over SSH:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_diff), "resolved endpoint test");
+    drop(sshd_a);
+    drop(sshd_b);
 }
