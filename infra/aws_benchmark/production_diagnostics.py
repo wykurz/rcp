@@ -20,17 +20,38 @@ REMOTE_SCHEMA = "rcp-public-resource-diagnostics-v3"
 # and for a matrix run that also times the other tools: every trial names what its own cell ran, and
 # only a remote copy carries `roles` (a tool run is one process, as a local copy is)
 TOOLS_SCHEMA = "rcp-public-resource-diagnostics-v4"
+# and for a matrix run with cells on other storage: a copy between two mounts of a network
+# filesystem or between two roots in memory is one process, as a local copy is; the tools follow
+# those copies too; and `other_storage` says what that storage was in this run
+STORAGE_SCHEMA = "rcp-public-resource-diagnostics-v5"
+# the documents in which a trial carries `roles`
+ROLE_SCHEMAS = (REMOTE_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA)
 MATRIX_VARIANT = "rcp-default"
 LOCAL = "local"
 REMOTE = "remote"
+# the copies that keep their trees beside the arrays, named as their scenarios and their storage are
+OTHER_STORAGE = ("nfs", "memory")
 # the cells of the other tools, named after the copies each follows: its tool, and what that
-# tool ran as the public record of such a run names it
-TOOL_CELLS = {copies + "-" + tool: (tool, variant) for copies in (LOCAL, REMOTE)
-              for tool, variant in (("rcmp", "rcmp-size"), ("rlink", "rlink-default"), ("rrm", "rrm-default"))}
+# tool ran as the public record of such a run names it. The documents before there was other
+# storage have the cells after local and remote copies
+_TOOLS = (("rcmp", "rcmp-size"), ("rlink", "rlink-default"), ("rrm", "rrm-default"))
+TOOL_CELLS = {copies + "-" + tool: (tool, variant) for copies in (LOCAL, REMOTE) for tool, variant in _TOOLS}
 TOOL_VARIANTS = {scenario: variant for scenario, (_, variant) in TOOL_CELLS.items()}
+STORAGE_TOOL_CELLS = {copies + "-" + tool: (tool, variant) for copies in (LOCAL, REMOTE, *OTHER_STORAGE)
+                      for tool, variant in _TOOLS}
+# what a run may say of its other storage: the figures of each kind and the largest each may be
+STORAGE_FIGURES = {"nfs": (("threads", 65536), ("delay_microseconds", 10_000_000),
+                           ("round_trip_microseconds", 60_000_000)),
+                   "memory": (("size_bytes", 1 << 50), ("inodes", 1 << 40))}
+NFS_VERSIONS = ("3", "4.0", "4.1", "4.2")
 ROLES = ("source", "destination")
-MAX_DOCUMENT = 512 * 1024
+# with every figure of every sampled phase present and large, the largest suite (40 cells on
+# three kinds of storage, 205 phases) fills 488 kB of this; the one before it filled 376 kB of
+# the 512 KiB the bound was then. A document over the bound loses its sampled detail
+MAX_DOCUMENT = 768 * 1024
 MAX_TRIALS = 128
+# the file sets of one run: every one of the arrays, of a network filesystem and of memory
+MAX_CASES = 6
 MAX_NUMBER = (1 << 63) - 1
 PROCESS_SCOPE = ("One local copy command, its threads and waited descendants. CPU seconds may exceed "
                  "wall time; peak RSS is a per-command peak, not host memory or a sum of processes.")
@@ -43,6 +64,10 @@ REMOTE_PROCESS_SCOPE = ("Each figure is what a process reports about itself as i
 TOOLS_PROCESS_SCOPE = REMOTE_PROCESS_SCOPE.replace(
     "A local copy is one rcp process with its threads. ",
     "A local copy is one rcp process with its threads. A tool run is one process of that tool with its threads. ")
+STORAGE_PROCESS_SCOPE = TOOLS_PROCESS_SCOPE.replace(
+    "A local copy is one rcp process with its threads. ",
+    "A local copy, a copy between two mounts of a network filesystem and a copy between two roots in memory are "
+    "each one rcp process with its threads. ")
 SYSTEM_SCOPE = ("Sampled host/cgroup diagnostics associated with phase windows, not per-process "
                 "attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.")
 METRICS = ("user_seconds", "system_seconds", "max_rss_kib", "voluntary_switches",
@@ -85,7 +110,10 @@ TELEMETRY_DESCRIPTOR = dict(policy="linux-bounded-system-sampling-v1", period_se
 # and the paired harness, have the bounds above: a record names the ones it was sampled under
 MATRIX_TELEMETRY_DESCRIPTOR = dict(TELEMETRY_DESCRIPTOR, max_samples=5120, max_bytes=16 * 1024 * 1024,
                                    max_seconds=12 * 3600)
-TELEMETRY_DESCRIPTORS = (TELEMETRY_DESCRIPTOR, MATRIX_TELEMETRY_DESCRIPTOR)
+# a matrix run marks a phase for every step of every cell, and a suite with cells on other storage
+# marks more of them than the journals before had room for
+STORAGE_TELEMETRY_DESCRIPTOR = dict(MATRIX_TELEMETRY_DESCRIPTOR, max_phases=384)
+TELEMETRY_DESCRIPTORS = (TELEMETRY_DESCRIPTOR, MATRIX_TELEMETRY_DESCRIPTOR, STORAGE_TELEMETRY_DESCRIPTOR)
 # a summary of samples holds no more than the widest journal can: the reader needs no argument
 # about how long one phase, or the phases outside any copy, may take
 MAX_JOURNAL_SAMPLES = max(item["max_samples"] for item in TELEMETRY_DESCRIPTORS)
@@ -134,15 +162,18 @@ def _new_setup_value(value, key):
     return field.get("value") if isinstance(field, dict) and field.get("status") == "available" else None
 
 
+def _mapping(value):
+    """A part of a report that should be a mapping, or an empty one when it is anything else."""
+    return value if isinstance(value, dict) else {}
+
+
 def _side(environment, worker, side):
-    filesystem = environment.get("filesystem", {}).get(side, {})
-    filesystem = filesystem if isinstance(filesystem, dict) else {}
-    storage = worker.get("storage", {})
-    storage = storage if isinstance(storage, dict) else {}
-    array = storage.get("arrays", {}).get(side, {})
-    array = array if isinstance(array, dict) else {}
-    capacity = storage.get("capacity", {}).get(side, {})
-    capacity = capacity if isinstance(capacity, dict) else {}
+    # a run that keeps no file set on the arrays reports no capacity of them, and a report is
+    # read part by part: a part that is not what it should be costs its own figures and no more
+    filesystem = _mapping(_mapping(environment.get("filesystem")).get(side))
+    storage = _mapping(worker.get("storage"))
+    array = _mapping(_mapping(storage.get("arrays")).get(side))
+    capacity = _mapping(_mapping(storage.get("capacity")).get(side))
     options = filesystem.get("mount_options", [])
     options = sorted(x for x in options if isinstance(x, str) and
         (x in {"rw", "ro", "nodev", "nosuid", "noexec", "relatime", "noatime", "discard"} or
@@ -316,18 +347,32 @@ def _schema(record):
     if not _matrix(record):
         return SCHEMA
     scenarios = {cell["scenario"] for cell in record["cells"]}
+    if _other_kinds(record):
+        return STORAGE_SCHEMA
     if scenarios & set(TOOL_VARIANTS):
         return TOOLS_SCHEMA
     return REMOTE_SCHEMA if scenarios - {LOCAL} else MATRIX_SCHEMA
 
 
+def _other_kinds(record):
+    """The storage beside the arrays that a record has cells on, in the order of its cells."""
+    kinds = (cell["scenario"].split("-", 1)[0] for cell in record["cells"])
+    return tuple(dict.fromkeys(kind for kind in kinds if kind in OTHER_STORAGE))
+
+
 def _process_scope(schema):
-    return {REMOTE_SCHEMA: REMOTE_PROCESS_SCOPE, TOOLS_SCHEMA: TOOLS_PROCESS_SCOPE}.get(schema, PROCESS_SCOPE)
+    return {REMOTE_SCHEMA: REMOTE_PROCESS_SCOPE, TOOLS_SCHEMA: TOOLS_PROCESS_SCOPE,
+            STORAGE_SCHEMA: STORAGE_PROCESS_SCOPE}.get(schema, PROCESS_SCOPE)
+
+
+def _tool_cells(schema):
+    """The tool cells a document of this version may hold: each with its tool and what that tool ran."""
+    return {TOOLS_SCHEMA: TOOL_CELLS, STORAGE_SCHEMA: STORAGE_TOOL_CELLS}.get(schema, {})
 
 
 def _variant(schema, scenario):
     """What a trial of this scenario ran: the one copy variant, or in a run with tool cells its tool's."""
-    return TOOL_VARIANTS.get(scenario, MATRIX_VARIANT) if schema == TOOLS_SCHEMA else MATRIX_VARIANT
+    return _tool_cells(schema).get(scenario, (None, MATRIX_VARIANT))[1]
 
 
 def _daemons(schema, scenario):
@@ -335,7 +380,44 @@ def _daemons(schema, scenario):
 
     Before there were tool cells every scenario but the local one was a remote copy.
     """
-    return scenario == REMOTE if schema == TOOLS_SCHEMA else scenario != LOCAL
+    return scenario == REMOTE if schema in (TOOLS_SCHEMA, STORAGE_SCHEMA) else scenario != LOCAL
+
+
+def _storage_entry(kind, item):
+    """One published entry of a run's other storage, when `item` is exactly one; None otherwise."""
+    if not isinstance(item, dict) or item.get("status") not in ("prepared", "unavailable", "not_recorded"):
+        return None
+    if item["status"] != "prepared":
+        return dict(item) if set(item) == {"status"} else None
+    figures = STORAGE_FIGURES[kind]
+    if set(item) != {"status", *(name for name, _ in figures), *(("version",) if kind == "nfs" else ())} or \
+            any(not number(item[name], integer=True, maximum=limit) for name, limit in figures) or \
+            kind == "nfs" and item["version"] not in NFS_VERSIONS:
+        return None
+    return dict(item)
+
+
+def _other_storage(record, worker):
+    """What the worker reported of the storage beside the arrays, for the kinds this run has cells on.
+
+    Only the known figures are taken, each as a bounded number: nothing else of the report is published.
+    """
+    reported = worker.get("other_storage")
+    reported = reported if isinstance(reported, dict) else {}
+    result = {}
+    for kind in _other_kinds(record):
+        item, entry = reported.get(kind), None
+        if isinstance(item, dict) and "error" in item:
+            entry = dict(status="unavailable")
+        elif isinstance(item, dict):
+            taken = dict(status="prepared", **{name: item.get(name) for name, _ in STORAGE_FIGURES[kind]})
+            if kind == "nfs":
+                seconds = item.get("round_trip_seconds")
+                taken.update(version=item.get("version"),
+                             round_trip_microseconds=round(seconds * 1_000_000) if number(seconds, maximum=60) else None)
+            entry = _storage_entry(kind, taken)
+        result[kind] = entry or dict(status="not_recorded")
+    return result
 
 
 def _complete(trials):
@@ -351,6 +433,9 @@ def unavailable(record, reason="not_recorded"):
         archive_sha256=None, status="unavailable", reason=reason, process_scope=_process_scope(_schema(record)),
         system_scope=SYSTEM_SCOPE, setup=None, setup_id=None, trials=[], cases=[], system=None,
         limits=dict(allocation_seconds=None, command_timeout_seconds=None))
+    if value["schema"] == STORAGE_SCHEMA:
+        # the document of such a run always says of each storage what is known: here, nothing
+        value["other_storage"] = {kind: dict(status="not_recorded") for kind in _other_kinds(record)}
     return validate(value, record)
 
 
@@ -451,7 +536,7 @@ def _derive_matrix(record, archive, raw, worker):
     except matrix.Invalid:
         return unavailable(record, "invalid_diagnostics")
     cells, file_sets = raw["cells"], raw["file_sets"]
-    if sum(len(cell["copies"]) for cell in cells) > MAX_TRIALS or len(file_sets) > 4 or \
+    if sum(len(cell["copies"]) for cell in cells) > MAX_TRIALS or len(file_sets) > MAX_CASES or \
             any(item["case"]["id"] not in MATRIX_CASE_SHAPES for item in file_sets):
         return unavailable(record, "invalid_diagnostics")
     # copies are published only for the cells the collector reported. A result that failed its
@@ -461,7 +546,7 @@ def _derive_matrix(record, archive, raw, worker):
     sampled = _sampled(raw["context"]) is not None
     grouped, selected, phases = {}, [], _system(raw.get("system_telemetry") if sampled else None)["phases"]
     schema = _schema(record)
-    with_roles = schema in (REMOTE_SCHEMA, TOOLS_SCHEMA)
+    with_roles = schema in ROLE_SCHEMAS
     for cell in cells:
         for item in cell["copies"]:
             done = item["status"] == "ok"
@@ -513,6 +598,8 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
         system_scope=SYSTEM_SCOPE,
         setup=observed, setup_id=setup_id(observed), trials=selected, cases=cases,
         system=_system(raw.get("system_telemetry") if sampled else None), limits=limits)
+    if value["schema"] == STORAGE_SCHEMA:
+        value["other_storage"] = _other_storage(record, worker)
     if len(encoded(value)) > MAX_DOCUMENT:
         # Sampled detail is optional; it must not erase already recorded process metrics/setup.
         value["reason"] = "phase_summary_budget"
@@ -525,15 +612,22 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
 def validate(value, record):
     matrix = _matrix(record)
     schema = _schema(record)
-    with_roles = schema in (REMOTE_SCHEMA, TOOLS_SCHEMA)
+    with_roles = schema in ROLE_SCHEMAS
     shapes = MATRIX_CASE_SHAPES if matrix else CASE_SHAPES
     require(isinstance(value, dict) and set(value) == {"schema", "run_key", "retirement_sha256",
-        "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases", "system", "limits"} and
+        "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases",
+        "system", "limits", *(("other_storage",) if schema == STORAGE_SCHEMA else ())} and
         value["schema"] == _schema(record) and value["run_key"] == record["run_key"] and
         value["retirement_sha256"] == record["retirement_sha256"] and value["status"] in STATUSES and
         value["process_scope"] == _process_scope(value["schema"]) and value["system_scope"] == SYSTEM_SCOPE,
         "invalid public diagnostic identity")
     require(value["reason"] is None or value["reason"] in REASONS, "invalid diagnostic reason")
+    if schema == STORAGE_SCHEMA:
+        # one entry for each storage beside the arrays that the run has cells on, and no other
+        other = value["other_storage"]
+        require(isinstance(other, dict) and set(other) == set(_other_kinds(record)) and
+                all(_storage_entry(kind, item) == item for kind, item in other.items()),
+                "invalid public storage of the run")
     require(isinstance(value["limits"], dict) and set(value["limits"]) ==
             {"allocation_seconds", "command_timeout_seconds"} and
             (value["limits"]["allocation_seconds"] is None or
@@ -546,7 +640,7 @@ def validate(value, record):
     require((value["setup"] is None) == (value["setup_id"] is None), "invalid diagnostic setup")
     if value["setup"] is not None:
         require(setup_id(value["setup"]) == value["setup_id"], "diagnostic setup fingerprint differs")
-    require(isinstance(value["cases"], list) and len(value["cases"]) <= 4, "too many diagnostic cases")
+    require(isinstance(value["cases"], list) and len(value["cases"]) <= MAX_CASES, "too many diagnostic cases")
     case_ids = set()
     for case in value["cases"]:
         require(isinstance(case, dict) and set(case) == {"case_id", "definition_status", "copy_trials",
@@ -924,12 +1018,39 @@ def system_html(value):
         "<th>Destination logical writes</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
 
 
+def _other_storage_html(other):
+    """What the storage beside the arrays was in one run, as its worker measured and reported it."""
+    text = "<h3 id='other-storage'>Other storage of this run</h3>"
+    for kind, what in (("nfs", "The mounts of the network filesystem"), ("memory", "The roots in memory")):
+        item = other.get(kind)
+        if item is None:
+            continue
+        if item["status"] != "prepared":
+            text += ("<p>" + what + (" could not be prepared for this run; its cells there failed.</p>"
+                                     if item["status"] == "unavailable" else " were not recorded for this run.</p>"))
+        elif kind == "nfs":
+            text += ("<div class='table-scroll'><table class='data'><thead><tr><th>Mounts</th>"
+                "<th>Measured round trip</th><th>Added delay</th><th>Server threads</th></tr></thead><tbody><tr>"
+                "<td>NFS " + escape(item["version"]) + "</td><td>" + f"{item['round_trip_microseconds'] / 1000:.3f} ms" +
+                "</td><td>" + f"{item['delay_microseconds'] / 1000:g} ms" + " on every packet of the loopback</td><td>" +
+                f"{item['threads']:,}" + "</td></tr></tbody></table></div>")
+        else:
+            size = item["size_bytes"]
+            text += ("<div class='table-scroll'><table class='data'><thead><tr><th>Roots</th><th>Size limit</th>"
+                "<th>File limit</th></tr></thead><tbody><tr><td>two filesystems in memory</td><td>" +
+                (f"{size >> 30:,} GiB" if size % (1 << 30) == 0 else f"{size:,} bytes") + " each</td><td>" +
+                f"{item['inodes']:,}" + " each</td></tr></tbody></table></div>")
+    return text
+
+
 def render(value, record):
     """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
     matrix = _matrix(record)
-    with_roles = value["schema"] in (REMOTE_SCHEMA, TOOLS_SCHEMA)
-    tools = value["schema"] == TOOLS_SCHEMA
+    with_roles = value["schema"] in ROLE_SCHEMAS
+    # the tool cells of this document, and with them whether it has any
+    tool_cells = _tool_cells(value["schema"])
+    tools = bool(tool_cells)
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged.</p>"
@@ -942,7 +1063,7 @@ def render(value, record):
     rows = []
     for trial in value["trials"]:
         # one row for each measured process: the copy command or the tool and, for a remote copy, each daemon
-        command = TOOL_CELLS[trial["scenario"]][0] if tools and trial["scenario"] in TOOL_CELLS else "rcp"
+        command = tool_cells[trial["scenario"]][0] if trial.get("scenario") in tool_cells else "rcp"
         processes = [(command, trial["metrics"])] if with_roles else [(None, trial["metrics"])]
         if with_roles and trial["roles"] is not None:
             processes += [(role + " rcpd", trial["roles"][role]) for role in ROLES]
@@ -966,6 +1087,8 @@ def render(value, record):
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
     else:
         text += "<p>No per-copy process-resource measurements are available.</p>"
+    if value["schema"] == STORAGE_SCHEMA:
+        text += _other_storage_html(value["other_storage"])
     if value["cases"]:
         progress_rows = []
         for case in value["cases"]:
@@ -989,7 +1112,7 @@ def render(value, record):
             continue
         text += ("<details><summary>Sampled phases: " + escape(trial["case_id"]) + " / " +
             escape(trial["scenario"] if matrix else trial["variant_id"]) +
-            (" / run " if tools and trial["scenario"] in TOOL_VARIANTS else " / copy " if matrix else " / repeat ") +
+            (" / run " if trial.get("scenario") in tool_cells else " / copy " if matrix else " / repeat ") +
             str(trial["iteration"]) + "</summary>" +
             system_html(trial["system"]) + "</details>")
     text += ("</details><details><summary>Run limits and source archive</summary><p>Recorded allocation limit: " +

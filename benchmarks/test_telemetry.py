@@ -175,6 +175,18 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(lines[-1]["trial_index"], 0)
             self.assertNotIn(directory, json.dumps(lines))
 
+    def test_a_journal_holds_as_many_phases_as_its_own_bounds_say(self):
+        for limits, expected in ((dict(max_phases=3), 3), (dict(max_phases=7), 7)):
+            with self.subTest(limits=limits), tempfile.TemporaryDirectory() as directory:
+                sampler = telemetry.Sampler(directory, directory, directory, reader=Metrics(), limits=limits).start()
+                self.wait_for(lambda: sampler.snapshot()["samples"] > 0)
+                for index in range(10):
+                    sampler.mark("command", 0, index)
+                sampler.finish(True)
+                snapshot = sampler.snapshot()
+                self.assertEqual((len(snapshot["phases"]), snapshot["reason"]), (expected, "phase_limit"))
+                self.assertEqual(telemetry.descriptor(limits)["max_phases"], expected)
+
     def test_sample_byte_time_and_phase_bounds_stop_without_failing_payload(self):
         for bound, value, reason in (("MAX_SAMPLES", 2, "sample_limit"), ("MAX_BYTES", 1000, "byte_limit"),
                 ("MAX_SECONDS", 1, "time_limit"), ("MAX_PHASES", 2, "phase_limit")):
@@ -200,10 +212,13 @@ class TelemetryTests(unittest.TestCase):
         usual = telemetry.descriptor()
         self.assertEqual((usual["max_samples"], usual["max_bytes"], usual["max_seconds"]),
                          (4096, 8 * 1024 * 1024, 8 * 3600))
-        # a run of the benchmark matrix may take twelve hours
+        # a run of the benchmark matrix may take twelve hours, and marks a phase for every step of
+        # every cell: more than any other run
         self.assertEqual(telemetry.descriptor(telemetry.MATRIX_LIMITS),
-                         dict(usual, max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600))
-        for unknown in (dict(max_phases=500), dict(period_seconds=1), dict(max_second=1)):
+                         dict(usual, max_samples=5120, max_bytes=16 * 1024 * 1024, max_seconds=12 * 3600,
+                              max_phases=384))
+        self.assertEqual(usual["max_phases"], 192)
+        for unknown in (dict(period_seconds=1), dict(max_second=1), dict(max_phase=1)):
             with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as directory:
                 with self.assertRaisesRegex(ValueError, "unknown journal bound"):
                     telemetry.descriptor(unknown)

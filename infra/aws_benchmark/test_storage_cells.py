@@ -12,10 +12,13 @@ from types import MappingProxyType
 import unittest
 from unittest import mock
 
-from benchmarks import matrix
-from . import common, other_storage, production_projection as projection, storage_check, test_matrix_results, worker
+from benchmarks import matrix, telemetry
+from . import common, other_storage, production_collection as collection, production_diagnostics as diagnostics
+from . import production_projection as projection, storage_check, test_matrix_diagnostics, test_matrix_results, worker
 from .test_durable_worker import durable_fixture, request as worker_request
+from .test_matrix_pages import matrix_example
 from .test_matrix_results import matrix_record
+from .test_tool_cells import sampled_matrix
 from .test_worker_review import report
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -391,6 +394,214 @@ class StorageRecordTests(unittest.TestCase):
         self.assertEqual((result["state"], report["benchmark_valid"]), ("success", True), public["diagnostics"])
         self.assertEqual((len(public["cells"]), len(public["measurements"])), (40, 40))
         self.assertLessEqual(len(common.MATRIX_SUITES[WEEKLY]), projection.MAX_CELLS)
+
+
+D5 = "rcp-public-resource-diagnostics-v5"
+# what a worker reports of the storage it prepared (other_storage.py)
+PREPARED = dict(
+    nfs=dict(layout="nfs-loopback-v1", version="4.2", threads=256, delay_microseconds=2500,
+             round_trip_seconds=0.005123, exports=dict(source="/mnt/rcp-benchmark/source",
+                                                       destination="/mnt/rcp-benchmark/destination"),
+             mounts=dict(source="/mnt/rcp-benchmark/nfs-source", destination="/mnt/rcp-benchmark/nfs-destination")),
+    memory=dict(layout="tmpfs-pair-v1", size_bytes=64 * 1024 ** 3, inodes=24_000_000,
+                mounts=dict(source="/mnt/rcp-benchmark/memory-source",
+                            destination="/mnt/rcp-benchmark/memory-destination")))
+PUBLISHED = dict(nfs=dict(status="prepared", version="4.2", threads=256, delay_microseconds=2500,
+                          round_trip_microseconds=5123),
+                 memory=dict(status="prepared", size_bytes=64 * 1024 ** 3, inodes=24_000_000))
+
+
+def companion(suite, other=PREPARED, **changes):
+    """A run's public record and its resource companion, as derived from what this worker reported."""
+    record, _ = matrix_example(suite, **changes)
+    raw = matrix_record(suite, changes.get("outcomes"), environment=test_matrix_diagnostics.ENVIRONMENT)
+    raw["timestamp"] = record["timestamp"]
+    worker_report = dict(test_matrix_diagnostics.WORKER)
+    if other is not None:
+        worker_report["other_storage"] = other
+    return record, diagnostics.derive(record, b"archive", raw, worker_report)
+
+
+class StorageDiagnosticsTests(unittest.TestCase):
+    """The resource companion of a run with cells on other storage."""
+
+    def test_a_copy_on_other_storage_is_one_process_and_its_tools_run_under_their_own_names(self):
+        record, extra = companion(COMMISSION)
+        self.assertEqual((extra["schema"], extra["status"], extra["reason"]), (D5, "complete", None))
+        self.assertEqual(len(extra["trials"]), 72)
+        by_scenario = {}
+        for trial in extra["trials"]:
+            by_scenario.setdefault(trial["scenario"], []).append(trial)
+        expected = {copies: {"rcp-default"} for copies in ("local", "remote", "nfs", "memory")}
+        expected.update({copies + "-" + tool: {variant} for copies in ("local", "remote", "nfs", "memory")
+                         for tool, variant in (("rcmp", "rcmp-size"), ("rlink", "rlink-default"), ("rrm", "rrm-default"))})
+        self.assertEqual({scenario: {trial["variant_id"] for trial in trials} for scenario, trials in by_scenario.items()},
+                         expected)
+        for scenario, trials in by_scenario.items():
+            for trial in trials:
+                # only a remote copy starts daemons: a copy through a mount is one rcp process
+                self.assertEqual(trial["roles"] is not None, scenario == "remote", scenario)
+        self.assertEqual(extra["process_scope"], diagnostics.STORAGE_PROCESS_SCOPE)
+        self.assertIn("A local copy, a copy between two mounts of a network filesystem and a copy between two roots "
+                      "in memory are each one rcp process", extra["process_scope"])
+        diagnostics.validate(extra, record)
+
+    def test_a_suite_of_one_storage_alone_is_not_taken_for_remote_copies(self):
+        for suite in ("matrix-commission-nfs+tools", "matrix-commission-memory+tools"):
+            record, extra = companion(suite)
+            with self.subTest(suite=suite):
+                self.assertEqual((extra["schema"], extra["status"]), (D5, "complete"))
+                self.assertEqual({trial["roles"] for trial in extra["trials"]}, {None})
+                self.assertEqual(len(extra["trials"]), 12)
+
+    def test_what_the_storage_was_is_published_with_the_run(self):
+        record, extra = companion(COMMISSION)
+        self.assertEqual(extra["other_storage"], PUBLISHED)
+        # a suite names only the storage it measures on
+        self.assertEqual(companion("matrix-commission-nfs+tools")[1]["other_storage"], dict(nfs=PUBLISHED["nfs"]))
+        # storage that could not be prepared, and a worker that reported nothing of it
+        failed = dict(PREPARED, nfs=dict(error=dict(type="CalledProcessError", command="modprobe", returncode=1)))
+        self.assertEqual(companion(COMMISSION, failed)[1]["other_storage"],
+                         dict(nfs=dict(status="unavailable"), memory=PUBLISHED["memory"]))
+        self.assertEqual(companion(COMMISSION, None)[1]["other_storage"],
+                         dict(nfs=dict(status="not_recorded"), memory=dict(status="not_recorded")))
+        # nothing but the known figures leaves the worker's report
+        for broken in (dict(PREPARED["nfs"], version="4.2; rm -rf"), dict(PREPARED["nfs"], threads="many"),
+                       dict(PREPARED["nfs"], round_trip_seconds=-1), dict(PREPARED["nfs"], round_trip_seconds=True),
+                       dict(PREPARED["nfs"], delay_microseconds=10 ** 12), "prepared", None):
+            with self.subTest(broken=broken):
+                self.assertEqual(companion(COMMISSION, dict(PREPARED, nfs=broken))[1]["other_storage"]["nfs"],
+                                 dict(status="not_recorded"))
+
+    def test_the_companion_is_checked_against_its_record(self):
+        record, extra = companion(COMMISSION)
+        tool = next(index for index, trial in enumerate(extra["trials"]) if trial["scenario"] == "nfs-rrm")
+        copy = next(index for index, trial in enumerate(extra["trials"]) if trial["scenario"] == "memory")
+        for change in (lambda value: value["trials"][tool].update(variant_id="rcp-default"),
+                       lambda value: value["trials"][copy].update(variant_id="rrm-default"),
+                       lambda value: value["trials"][copy].update(roles=dict(source=None, destination=None)),
+                       lambda value: value.update(schema="rcp-public-resource-diagnostics-v4",
+                                                  process_scope=diagnostics.TOOLS_PROCESS_SCOPE),
+                       lambda value: value.pop("other_storage"),
+                       lambda value: value["other_storage"].update(tape=dict(status="prepared")),
+                       lambda value: value["other_storage"].pop("memory"),
+                       lambda value: value["other_storage"]["nfs"].update(version="5"),
+                       lambda value: value["other_storage"]["nfs"].update(round_trip_microseconds=5.5),
+                       lambda value: value["other_storage"]["nfs"].update(mounts="/mnt"),
+                       lambda value: value["other_storage"]["memory"].update(status="unavailable")):
+            broken = json.loads(json.dumps(extra))
+            change(broken)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                diagnostics.validate(broken, record)
+
+    def test_a_run_without_usable_diagnostics_still_has_a_companion(self):
+        # no archive, an archive that is not the runner's, a result over a limit: the pages are
+        # written all the same, with a companion that says nothing was recorded
+        record, _ = companion(COMMISSION)
+        for reason in ("not_recorded", "invalid_diagnostics", "not_matched"):
+            with self.subTest(reason=reason):
+                extra = diagnostics.unavailable(record, reason)
+                self.assertEqual((extra["schema"], extra["status"], extra["trials"]), (D5, "unavailable", []))
+                self.assertEqual(extra["other_storage"],
+                                 dict(nfs=dict(status="not_recorded"), memory=dict(status="not_recorded")))
+                diagnostics.validate(extra, record)
+                self.assertIn("were not recorded for this run", diagnostics.render(extra, record))
+        alone, _ = companion("matrix-commission-memory+tools")
+        self.assertEqual(diagnostics.unavailable(alone)["other_storage"], dict(memory=dict(status="not_recorded")))
+        # a result the derivation refuses takes that way too
+        raw = matrix_record(COMMISSION, environment=test_matrix_diagnostics.ENVIRONMENT)
+        raw["file_sets"][0]["case"]["id"] = "some-other-set"
+        refused = diagnostics.derive(record, b"archive", raw, test_matrix_diagnostics.WORKER)
+        self.assertEqual((refused["status"], refused["reason"]), ("unavailable", "invalid_diagnostics"))
+        self.assertIn("other_storage", refused)
+        # the companions of earlier records are what they were
+        earlier, _ = companion("matrix-commission-local+tools")
+        self.assertNotIn("other_storage", diagnostics.unavailable(earlier))
+
+    def test_a_run_in_memory_alone_reports_no_capacity_of_the_arrays_and_has_its_diagnostics(self):
+        record, _ = companion("matrix-commission-memory+tools")
+        raw = matrix_record("matrix-commission-memory+tools", environment=test_matrix_diagnostics.ENVIRONMENT)
+        raw["timestamp"] = record["timestamp"]
+        reported = test_matrix_diagnostics.WORKER
+        # what the worker reports when no file set is kept on the arrays, and reports a reader must survive
+        for capacity in ({}, None, "none", 7):
+            with self.subTest(capacity=capacity):
+                worker_report = dict(reported, storage=dict(reported["storage"], capacity=capacity),
+                                     other_storage=dict(memory=PREPARED["memory"]))
+                extra = diagnostics.derive(record, b"archive", raw, worker_report)
+                self.assertEqual((extra["status"], len(extra["trials"])), ("complete", 12))
+                self.assertEqual([extra["setup"][side]["block_bytes"] for side in ("source", "destination")],
+                                 [None, None])
+                # the arrays themselves are described as in any other run
+                self.assertEqual(extra["setup"]["source"]["layout"], "two-disjoint-raid0")
+        # and a report whose other parts are not what they should be costs figures, not the companion
+        for broken in (dict(reported, storage=None), dict(reported, storage=dict(reported["storage"], arrays=None)),
+                       dict(reported, storage=dict(reported["storage"], arrays=dict(source=3)))):
+            extra = diagnostics.derive(record, b"archive", raw, broken)
+            self.assertEqual(extra["status"], "complete")
+
+    def test_earlier_companions_keep_their_version_and_have_no_such_part(self):
+        for suite, schema in (("matrix-commission-local", "rcp-public-resource-diagnostics-v2"),
+                              ("matrix-commission-local+remote", "rcp-public-resource-diagnostics-v3"),
+                              ("matrix-commission-local+tools+remote+tools", "rcp-public-resource-diagnostics-v4")):
+            record, extra = companion(suite)
+            with self.subTest(suite=suite):
+                self.assertEqual(extra["schema"], schema)
+                self.assertNotIn("other_storage", extra)
+                diagnostics.validate(extra, record)
+
+    def test_every_file_set_of_the_largest_suite_has_its_progress(self):
+        record, extra = companion(WEEKLY)
+        self.assertEqual((extra["status"], len(extra["trials"]), len(extra["cases"])), ("complete", 120, 6))
+        self.assertEqual([case["case_id"] for case in extra["cases"]], [*FILE_SETS, NFS_SET, MEMORY_SET])
+        self.assertLessEqual(len(extra["trials"]), diagnostics.MAX_TRIALS)
+
+    def test_the_sampled_detail_of_the_largest_suite_fits_the_journal_and_the_public_document(self):
+        descriptor = diagnostics.TELEMETRY_DESCRIPTORS[-1]
+        self.assertEqual(descriptor, telemetry.descriptor(telemetry.MATRIX_LIMITS))
+        raw, total = sampled_matrix(WEEKLY, descriptor)
+        # six file sets; a cache step and a command for a copy, none dropped in memory; a tool run
+        # and what rlink leaves to clear; on a network filesystem a cache step before every tool too
+        self.assertEqual(total, 19 + 57 + 96 + 21 + 12)
+        self.assertLess(total, descriptor["max_phases"] - 64)
+        # the journals before had room for fewer phases than this suite marks
+        self.assertGreater(total, diagnostics.TELEMETRY_DESCRIPTORS[1]["max_phases"])
+        record, _ = matrix_example(WEEKLY)
+        extra = diagnostics.derive(record, b"archive", raw, dict(test_matrix_diagnostics.WORKER, other_storage=PREPARED))
+        # nothing had to be left out to stay within the public document's size
+        self.assertEqual((extra["status"], extra["reason"]), ("complete", None))
+        self.assertEqual(sum(len(trial["system"]["phases"]) for trial in extra["trials"]) +
+                         len(extra["system"]["phases"]), total)
+        size = len(json.dumps(extra, separators=(",", ":")))
+        self.assertLess(size, diagnostics.MAX_DOCUMENT * 3 // 4, size)
+        # and well inside what one record may bring to an export
+        self.assertLessEqual(diagnostics.MAX_DOCUMENT, collection.MAX_DOCUMENT)
+        html = diagnostics.render(extra, record)
+        self.assertIn("Sampled phases: tiny-1k-700x1024 / nfs-rrm / run 1", html)
+        self.assertIn("Sampled phases: tiny-1k-10240k-memory / memory / copy 3", html)
+        self.assertLess(len(html.encode()), projection.MAX_PUBLIC_HTML // 4)
+
+    def test_the_run_page_names_the_process_of_each_run_and_what_the_storage_was(self):
+        record, extra = companion(COMMISSION)
+        html = diagnostics.render(extra, record)
+        self.assertIn("<th>File set</th><th>Scenario</th><th>Copy or run</th><th>Process</th>", html)
+        for case, scenario, process in (("commission-10k", "nfs", "rcp"), ("commission-10k", "nfs-rcmp", "rcmp"),
+                                        ("commission-10k", "nfs-rlink", "rlink"), ("commission-10k", "nfs-rrm", "rrm"),
+                                        ("commission-10k-memory", "memory", "rcp"),
+                                        ("commission-10k-memory", "memory-rrm", "rrm"),
+                                        ("commission-10k", "remote", "source rcpd")):
+            self.assertIn("<td><code>" + case + "</code></td><td><code>" + scenario + "</code></td><td>1</td><td>" +
+                          process + "</td>", html)
+        self.assertNotIn("<td><code>nfs</code></td><td>1</td><td>source rcpd</td>", html)
+        self.assertIn("<h3 id='other-storage'>Other storage of this run</h3>", html)
+        self.assertIn("<td>NFS 4.2</td><td>5.123 ms</td><td>2.5 ms on every packet of the loopback</td>"
+                      "<td>256</td>", html)
+        self.assertIn("<td>two filesystems in memory</td><td>64 GiB each</td><td>24,000,000 each</td>", html)
+        # a storage that was not there says so, and nothing is made up for it
+        failed = dict(PREPARED, nfs=dict(error=dict(type="OSError")))
+        record, extra = companion(COMMISSION, failed)
+        self.assertIn("The mounts of the network filesystem could not be prepared for this run", diagnostics.render(extra, record))
+        self.assertNotIn("other-storage", diagnostics.render(*companion("matrix-commission-local+tools")[::-1]))
 
 
 class StorageImageTests(unittest.TestCase):
