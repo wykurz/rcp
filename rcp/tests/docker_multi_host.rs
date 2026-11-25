@@ -440,3 +440,203 @@ fn test_progress_reporting_multi_host() -> Result<()> {
     eprintln!("✓ Progress reporting works correctly in multi-host setup");
     Ok(())
 }
+
+/// Test SSH data transport across real separate containers: download (-L), upload (-R),
+/// 3-host direct (host-b -> host-a), and 3-host with `--ssh-forward-agent` when host-b lacks
+/// a private key to host-a.
+#[test]
+#[ignore = "requires Docker containers (run: just docker-up)"]
+fn test_multi_host_ssh_transport_and_agent_forwarding() -> Result<()> {
+    struct RestoreHostBKey<'a>(&'a DockerEnv);
+    impl Drop for RestoreHostBKey<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.exec(
+                "host-b",
+                Some("testuser"),
+                &[
+                    "sh",
+                    "-c",
+                    "if [ -f ~/.ssh/id_ed25519.bak ]; then mv -f ~/.ssh/id_ed25519.bak ~/.ssh/id_ed25519; fi",
+                ],
+            );
+        }
+    }
+    let env = DockerEnv::new()?;
+    let payload = b"multi-host ssh transport payload";
+    // 1. Download (host-a -> master) over -L
+    env.write_file("host-a", "/tmp/ssh-dl-src.txt", payload)?;
+    let _ = env.remove_file("master", "/tmp/ssh-dl-dst.txt");
+    let out = env.exec_rcp(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=2",
+        "host-a:/tmp/ssh-dl-src.txt",
+        "/tmp/ssh-dl-dst.txt",
+    ])?;
+    assert!(
+        out.status.success(),
+        "SSH download failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(env.read_file("master", "/tmp/ssh-dl-dst.txt")?, payload);
+    // 2. Upload (master -> host-b) over -R
+    env.write_file("master", "/tmp/ssh-ul-src.txt", payload)?;
+    let _ = env.remove_file("host-b", "/tmp/ssh-ul-dst.txt");
+    let out = env.exec_rcp(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=2",
+        "/tmp/ssh-ul-src.txt",
+        "host-b:/tmp/ssh-ul-dst.txt",
+    ])?;
+    assert!(
+        out.status.success(),
+        "SSH upload failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(env.read_file("host-b", "/tmp/ssh-ul-dst.txt")?, payload);
+    // 3. 3-Host (host-a -> host-b) using host-b's own SSH key
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-dst.txt");
+    let out = env.exec_rcp(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=2",
+        "host-a:/tmp/ssh-dl-src.txt",
+        "host-b:/tmp/ssh-3h-dst.txt",
+    ])?;
+    assert!(
+        out.status.success(),
+        "SSH 3-host failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(env.read_file("host-b", "/tmp/ssh-3h-dst.txt")?, payload);
+    // 4. 3-Host without a key on host-b: fails with guidance unless --ssh-forward-agent is used
+    let _restore_key = RestoreHostBKey(&env);
+    let moved = env.exec(
+        "host-b",
+        Some("testuser"),
+        &[
+            "mv",
+            "/home/testuser/.ssh/id_ed25519",
+            "/home/testuser/.ssh/id_ed25519.bak",
+        ],
+    )?;
+    assert!(moved.status.success(), "failed to move host-b key aside");
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-noagent.txt");
+    let failed = env.exec_rcp(&[
+        "--remote-transport=ssh",
+        "--ssh-tunnels=1",
+        "host-a:/tmp/ssh-dl-src.txt",
+        "host-b:/tmp/ssh-3h-noagent.txt",
+    ])?;
+    let combined_fail = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    support::docker_env::assert_clean_failure(
+        failed.status,
+        &combined_fail,
+        "3-host SSH without key or forwarded agent",
+    );
+    assert!(
+        combined_fail.contains("--ssh-forward-agent"),
+        "expected actionable 3-host guidance mentioning --ssh-forward-agent:\n{combined_fail}"
+    );
+    // now start an ssh-agent on master and pass --ssh-forward-agent: host-b authenticates to host-a
+    // solely through the forwarded agent
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-agent.txt");
+    let agent_out = env.exec(
+        "master",
+        Some("testuser"),
+        &[
+            "bash",
+            "-c",
+            "eval \"$(ssh-agent -s)\" >/dev/null && \
+             ssh-add ~/.ssh/id_ed25519 >/dev/null 2>&1 && \
+             /home/testuser/.local/bin/rcp -vv --remote-transport=ssh --ssh-forward-agent --ssh-tunnels=2 \
+               host-a:/tmp/ssh-dl-src.txt host-b:/tmp/ssh-3h-agent.txt; \
+             rc=$?; ssh-agent -k >/dev/null 2>&1 || true; exit $rc",
+        ],
+    )?;
+    assert!(
+        agent_out.status.success(),
+        "3-host SSH with --ssh-forward-agent failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&agent_out.stdout),
+        String::from_utf8_lossy(&agent_out.stderr)
+    );
+    assert_eq!(env.read_file("host-b", "/tmp/ssh-3h-agent.txt")?, payload);
+    // 5. 3-Host without --ssh-forward-agent, relying on ~/.ssh/config `ForwardAgent yes`
+    //    (AgentForwardMode::InheritConfig)
+    struct RestoreMasterSshConfig<'a>(&'a DockerEnv);
+    impl Drop for RestoreMasterSshConfig<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.exec(
+                "master",
+                Some("testuser"),
+                &[
+                    "bash",
+                    "-c",
+                    "if [ -f /home/testuser/.ssh/config.bak ]; then \
+                       mv -f /home/testuser/.ssh/config.bak /home/testuser/.ssh/config; \
+                     fi",
+                ],
+            );
+        }
+    }
+    let _restore_config = RestoreMasterSshConfig(&env);
+    let enable_cfg = env.exec(
+        "master",
+        Some("testuser"),
+        &[
+            "bash",
+            "-c",
+            "cp /home/testuser/.ssh/config /home/testuser/.ssh/config.bak && \
+             { printf 'Host host-b\\n    ForwardAgent yes\\n\\n'; cat /home/testuser/.ssh/config.bak; } \
+               > /home/testuser/.ssh/config && \
+             chmod 600 /home/testuser/.ssh/config",
+        ],
+    )?;
+    assert!(
+        enable_cfg.status.success(),
+        "failed to enable ForwardAgent in master ~/.ssh/config: {}",
+        String::from_utf8_lossy(&enable_cfg.stderr)
+    );
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-inherit-agent.txt");
+    let inherit_out = env.exec(
+        "master",
+        Some("testuser"),
+        &[
+            "bash",
+            "-c",
+            "eval \"$(ssh-agent -s)\" >/dev/null && \
+             ssh-add ~/.ssh/id_ed25519 >/dev/null 2>&1 && \
+             /home/testuser/.local/bin/rcp -vv --remote-transport=ssh --ssh-tunnels=2 \
+               host-a:/tmp/ssh-dl-src.txt host-b:/tmp/ssh-3h-inherit-agent.txt; \
+             rc=$?; ssh-agent -k >/dev/null 2>&1 || true; exit $rc",
+        ],
+    )?;
+    assert!(
+        inherit_out.status.success(),
+        "3-host SSH with ~/.ssh/config ForwardAgent failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&inherit_out.stdout),
+        String::from_utf8_lossy(&inherit_out.stderr)
+    );
+    assert_eq!(
+        env.read_file("host-b", "/tmp/ssh-3h-inherit-agent.txt")?,
+        payload
+    );
+    drop(_restore_config);
+    drop(_restore_key);
+    let _ = env.remove_file("host-a", "/tmp/ssh-dl-src.txt");
+    let _ = env.remove_file("master", "/tmp/ssh-dl-dst.txt");
+    let _ = env.remove_file("master", "/tmp/ssh-ul-src.txt");
+    let _ = env.remove_file("host-b", "/tmp/ssh-ul-dst.txt");
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-dst.txt");
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-agent.txt");
+    let _ = env.remove_file("host-b", "/tmp/ssh-3h-inherit-agent.txt");
+    eprintln!(
+        "✓ Multi-host SSH transport (download, upload, 3-host, --ssh-forward-agent, InheritConfig) passed"
+    );
+    Ok(())
+}

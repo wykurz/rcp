@@ -16,7 +16,7 @@ struct Fixtures {
 impl Fixtures {
     fn new(direction: Direction) -> Self {
         let text = match remote::version::WIRE_REVISION {
-            13 => include_str!("fixtures/wire-v13.txt"),
+            14 => include_str!("fixtures/wire-v14.txt"),
             revision => panic!(
                 "wire revision {revision} needs reviewed fixtures; see remote/tests/fixtures/README.md"
             ),
@@ -163,6 +163,7 @@ fn check_messages(direction: Direction) {
                 filter: Some(filter.clone()),
                 dry_run,
                 capture,
+                accept_timeout_sec: 30,
             }),
         );
     }
@@ -179,62 +180,138 @@ fn check_messages(direction: Direction) {
                 dir_acl: false,
                 root_acl_notice: false,
             },
+            accept_timeout_sec: 15,
         }),
     );
-    for (name, fingerprint, dry_run) in [
+    let preserve = common::preserve::Settings {
+        file: common::preserve::FileSettings {
+            user_and_time: common::preserve::UserAndTimeSettings {
+                uid: true,
+                gid: false,
+                time: false,
+            },
+            mode_mask: 0o640,
+            acl: true,
+        },
+        dir: common::preserve::DirSettings {
+            user_and_time: common::preserve::UserAndTimeSettings {
+                uid: false,
+                gid: true,
+                time: false,
+            },
+            mode_mask: 0o2750,
+            acl: false,
+        },
+        symlink: common::preserve::SymlinkSettings {
+            user_and_time: common::preserve::UserAndTimeSettings {
+                uid: false,
+                gid: false,
+                time: true,
+            },
+        },
+    };
+    for (name, fingerprint, dry_run, data_addrs, transport) in [
         (
             "master-destination-tls",
             Some(std::array::from_fn(|i| 255 - i as u8)),
             false,
+            vec!["[2001:db8::1234]:3456".parse().unwrap()],
+            DestinationTransport::Direct,
         ),
-        ("master-destination-preview", None, true),
+        (
+            "master-destination-master-ssh",
+            Some(std::array::from_fn(|i| i as u8)),
+            false,
+            vec![
+                "127.0.0.1:40001".parse().unwrap(),
+                "127.0.0.1:40002".parse().unwrap(),
+            ],
+            DestinationTransport::MasterSshTunnel,
+        ),
+        (
+            "master-destination-preview",
+            None,
+            true,
+            vec![],
+            DestinationTransport::AutoMasterSsh {
+                probe_timeout_sec: 3,
+            },
+        ),
+        (
+            "master-destination-direct-ssh",
+            Some(std::array::from_fn(|i| 128 ^ (i as u8))),
+            false,
+            vec![
+                "127.0.0.1:41001".parse().unwrap(),
+                "127.0.0.1:41002".parse().unwrap(),
+            ],
+            DestinationTransport::DirectSsh {
+                source_ssh: SshTarget {
+                    user: Some("deploy".into()),
+                    host: "10.20.30.40".into(),
+                    port: Some(2222),
+                },
+                tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                ssh_tunnels: 4,
+                dest_root: "/dst/tree".into(),
+            },
+        ),
+        (
+            "master-destination-auto-direct-ssh",
+            None,
+            false,
+            vec!["198.51.100.9:5678".parse().unwrap()],
+            DestinationTransport::AutoDirectSsh {
+                probe_timeout_sec: 5,
+                source_ssh: SshTarget {
+                    user: None,
+                    host: "source.internal".into(),
+                    port: None,
+                },
+                tunnel_target_ip: std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                ssh_tunnels: 2,
+                dest_root: "/tmp/dst".into(),
+            },
+        ),
     ] {
         fixtures.check(
             name,
             MasterToRcpd::Hello(MasterHello::Destination {
                 source_control_addr: "192.0.2.7:2345".parse().unwrap(),
-                source_data_addr: "[2001:db8::1234]:3456".parse().unwrap(),
+                source_data_addrs: data_addrs,
                 server_name: "source.example".into(),
-                preserve: common::preserve::Settings {
-                    file: common::preserve::FileSettings {
-                        user_and_time: common::preserve::UserAndTimeSettings {
-                            uid: true,
-                            gid: false,
-                            time: false,
-                        },
-                        mode_mask: 0o640,
-                        acl: true,
-                    },
-                    dir: common::preserve::DirSettings {
-                        user_and_time: common::preserve::UserAndTimeSettings {
-                            uid: false,
-                            gid: true,
-                            time: false,
-                        },
-                        mode_mask: 0o2750,
-                        acl: false,
-                    },
-                    symlink: common::preserve::SymlinkSettings {
-                        user_and_time: common::preserve::UserAndTimeSettings {
-                            uid: false,
-                            gid: false,
-                            time: true,
-                        },
-                    },
-                },
+                preserve,
                 source_cert_fingerprint: fingerprint,
                 dry_run,
+                transport,
             }),
         );
     }
     fixtures.check("master-heartbeat", MasterToRcpd::Heartbeat);
     fixtures.check(
+        "master-ssh-fallback-endpoints",
+        MasterToRcpd::SshFallbackEndpoints {
+            control_addr: "127.0.0.1:42000".parse().unwrap(),
+            data_addrs: vec![
+                "127.0.0.1:42001".parse().unwrap(),
+                "127.0.0.1:42002".parse().unwrap(),
+            ],
+        },
+    );
+    fixtures.check(
         "source-master",
         RcpdToMaster::SourceHello(SourceMasterHello {
             control_addr: "[2001:db8::5678]:4567".parse().unwrap(),
             data_addr: "198.51.100.9:5678".parse().unwrap(),
+            tunnel_target_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)),
             server_name: "data.example".into(),
         }),
+    );
+    fixtures.check(
+        "direct-connect-failed",
+        RcpdToMaster::DirectConnectFailed {
+            reason: "connection to 198.51.100.9:4567 timed out after 3s".into(),
+        },
     );
     fixtures.check(
         "result-success",

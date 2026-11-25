@@ -752,6 +752,58 @@ impl From<ExtendedMetadataCapture> for common::safedir::RootAclNotice {
     }
 }
 
+/// Serializable SSH connection target passed to a destination daemon for direct 3-host tunneling.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SshTarget {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+impl From<&SshTarget> for crate::SshSession {
+    fn from(target: &SshTarget) -> Self {
+        Self {
+            user: target.user.clone(),
+            host: target.host.clone(),
+            port: target.port,
+        }
+    }
+}
+
+/// How the destination daemon connects to the source daemon's control and data endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum DestinationTransport {
+    /// Connect directly to `source_control_addr` and `source_data_addrs` (used for `tcp` and
+    /// same-host copies).
+    Direct,
+    /// Connect to loopback endpoints backed by master-managed `-L`/`-R` SSH tunnels.
+    MasterSshTunnel,
+    /// Probe `source_control_addr` for `probe_timeout_sec`; if TCP connect fails, notify the
+    /// master with [`RcpdToMaster::DirectConnectFailed`] and wait for
+    /// [`MasterToRcpd::SshFallbackEndpoints`].
+    AutoMasterSsh { probe_timeout_sec: u64 },
+    /// Open `ssh_tunnels` parallel `-L` tunnels directly from destination to `source_ssh`,
+    /// forwarding to `tunnel_target_ip` on the source host (3-host explicit `ssh`).
+    /// `dest_root` is excluded when choosing a local SSH control directory on the destination host.
+    DirectSsh {
+        source_ssh: SshTarget,
+        tunnel_target_ip: std::net::IpAddr,
+        ssh_tunnels: usize,
+        dest_root: std::path::PathBuf,
+    },
+    /// Probe `source_control_addr` for `probe_timeout_sec`; if TCP connect fails, emit a slow-path
+    /// notice and open `ssh_tunnels` parallel `-L` tunnels directly from destination to
+    /// `source_ssh` (3-host `auto`).
+    /// `dest_root` is excluded when choosing a local SSH control directory on the destination host.
+    AutoDirectSsh {
+        probe_timeout_sec: u64,
+        source_ssh: SshTarget,
+        tunnel_target_ip: std::net::IpAddr,
+        ssh_tunnels: usize,
+        dest_root: std::path::PathBuf,
+    },
+}
+
 /// Framed messages sent from master (`rcp`) to `rcpd` over SSH stdin.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterToRcpd {
@@ -759,6 +811,11 @@ pub enum MasterToRcpd {
     Hello(MasterHello),
     /// Periodic liveness heartbeat when `--remote-keepalive-sec` is nonzero.
     Heartbeat,
+    /// Loopback tunnel endpoints opened by the master after [`RcpdToMaster::DirectConnectFailed`].
+    SshFallbackEndpoints {
+        control_addr: std::net::SocketAddr,
+        data_addrs: Vec<std::net::SocketAddr>,
+    },
 }
 
 /// Framed messages sent from `rcpd` to master (`rcp`) over SSH stdout.
@@ -766,6 +823,8 @@ pub enum MasterToRcpd {
 pub enum RcpdToMaster {
     /// Source daemon's TCP listener addresses for the destination to connect to.
     SourceHello(SourceMasterHello),
+    /// Destination failed its `auto` direct-TCP probe and requests master-managed SSH tunnels.
+    DirectConnectFailed { reason: String },
     /// Final operation status, summary, and process runtime statistics.
     Result(RcpdResult),
     /// Forwarded tracing log event or progress snapshot.
@@ -786,27 +845,39 @@ pub enum MasterHello {
         /// Extended metadata the source must read per entry (currently: POSIX ACLs). When every
         /// field is false the source issues no xattr syscall at all.
         capture: ExtendedMetadataCapture,
+        /// Seconds to wait for the destination's control connection before timing out.
+        /// Widened beyond `--remote-copy-conn-timeout-sec` when `auto` fallback or 3-host SSH
+        /// tunnel setup runs before destination connects.
+        accept_timeout_sec: u64,
     },
     Destination {
         /// TCP address for control connection to source
         source_control_addr: std::net::SocketAddr,
-        /// TCP address for data connections to source
-        source_data_addr: std::net::SocketAddr,
+        /// TCP addresses for data connections to source.
+        /// Empty on `--dry-run`; otherwise non-empty (1 address for direct TCP, or one forwarded
+        /// address per tunnel for multi-tunnel SSH).
+        source_data_addrs: Vec<std::net::SocketAddr>,
         server_name: String,
         preserve: common::preserve::Settings,
         /// Source's TLS certificate fingerprint (None if encryption disabled)
         source_cert_fingerprint: Option<CertFingerprint>,
         /// Preview-only operation; the source does not accept data connections.
         dry_run: bool,
+        /// Transport and fallback strategy for reaching the source daemon.
+        transport: DestinationTransport,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceMasterHello {
-    /// TCP address for control connection (bidirectional messages)
+    /// Externally-routable TCP address for control connection (bidirectional messages)
     pub control_addr: std::net::SocketAddr,
-    /// TCP address for data connections (file transfers)
+    /// Externally-routable TCP address for data connections (file transfers)
     pub data_addr: std::net::SocketAddr,
+    /// IP address on the source host that SSH port forwards should target (`127.0.0.1` when
+    /// listeners bound `0.0.0.0`, `::1` when listeners bound `::`, or the explicit bound IP
+    /// address otherwise).
+    pub tunnel_target_ip: std::net::IpAddr,
     pub server_name: String,
 }
 

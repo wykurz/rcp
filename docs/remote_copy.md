@@ -470,20 +470,22 @@ failed to connect to <addr>
 
 ### Timeout Configuration
 
-| Timeout                    | Default                             | Configuration                    |
-| -------------------------- | ----------------------------------- | -------------------------------- |
-| SSH session setup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Remote binary discovery    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Tilde HOME lookup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Remote version probe       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Local deployment read      | 60s with `--auto-deploy-rcpd`       | `--remote-copy-conn-timeout-sec` |
-| Deployment setup/readiness | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Deployment write idle      | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Deployment verification    | At least 60s                        | `--remote-copy-conn-timeout-sec` |
-| Old-version cleanup        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| rcpd SSH exec/readiness    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Destination → Source       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Dead-peer detection        | 120s (0 disables)                   | `--remote-keepalive-sec`         |
+| Timeout                      | Default                             | Configuration                             |
+| ---------------------------- | ----------------------------------- | ----------------------------------------- |
+| SSH session setup            | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Remote binary discovery      | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Tilde HOME lookup            | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Remote version probe         | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Local deployment read        | 60s with `--auto-deploy-rcpd`       | `--remote-copy-conn-timeout-sec`          |
+| Deployment setup/readiness   | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Deployment write idle        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Deployment verification      | At least 60s                        | `--remote-copy-conn-timeout-sec`          |
+| Old-version cleanup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| rcpd SSH exec/readiness      | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Direct-TCP `auto` probe      | 3s (capped at conn timeout)         | `--remote-direct-probe-timeout-sec`       |
+| Destination → Source         | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec`          |
+| Source accept (`ssh`/`auto`) | Widened by probe/tunnel budget      | `MasterHello::Source::accept_timeout_sec` |
+| Dead-peer detection          | 120s (0 disables)                   | `--remote-keepalive-sec`                  |
 
 Old-version cleanup is idempotent, best-effort cache hygiene. When its deadline expires, the master
 closes its local SSH channel instead of delaying bootstrap indefinitely; an already-started remote
@@ -503,9 +505,9 @@ Example:
 rcp --remote-copy-conn-timeout-sec 30 source:/path dest:/path
 ```
 
-### Port Configuration
+### Port Configuration & SSH Data Transport
 
-Use `--port-ranges` to restrict TCP ports:
+Use `--port-ranges` to restrict direct Source↔Destination TCP ports:
 
 ```bash
 rcp --port-ranges 8000-8999 source:/path dest:/path
@@ -516,6 +518,46 @@ Useful when:
 - Firewalls only allow specific port ranges
 - Avoiding conflicts with other services
 - Security policies require specific ports
+
+When direct TCP ports cannot be opened between hosts (NAT, strict firewalls, or cloud security
+groups that only allow SSH port 22), use `--remote-transport`:
+
+```bash
+# Always tunnel Source↔Destination traffic over SSH (no extra TCP ports required)
+rcp --remote-transport=ssh source:/path /local/dest
+rcp --remote-transport=ssh /local/src dest:/path
+
+# Try direct TCP first (honoring --port-ranges and --bind-ip); fall back to SSH automatically
+rcp --remote-transport=auto source:/path dest:/path
+
+# 3-host copy over SSH when dest needs the master's SSH agent to authenticate to source
+rcp --remote-transport=ssh --ssh-forward-agent host1:/path host2:/path
+```
+
+Key behavior:
+
+- **Default**: `--remote-transport=tcp` (direct TCP, highest throughput).
+- **Parallel SSH tunnels**: `--ssh-tunnels=N` (default `4`, capped at effective stream count `E`)
+  stripes data across up to `N` independent SSH connections and degrades gracefully down to `1` if
+  the remote `sshd` rate-limits extra connections. Dry runs (`--dry-run`) open only tunnel #1 for
+  control.
+- **Same-host copies** (`host:/a host:/b`): stay on direct loopback without SSH data tunneling or
+  slow-path warnings.
+- **Zero master relay in 3-host copies** (`host1:/src host2:/dst`): `rcp` resolves `host1`'s
+  effective SSH target locally via `ssh -G` and has destination `rcpd` on `host2` open `-L` tunnels
+  directly to `host1`. If `host2` cannot authenticate to `host1`, configure keys between them, pass
+  `--ssh-forward-agent` (or enable `ForwardAgent` for `host2` in `~/.ssh/config`), open
+  `--port-ranges` for direct TCP, or run `rcp` from `host1` or `host2`.
+- **Flags interaction**: `--remote-transport=ssh` binds the source to `127.0.0.1` on an ephemeral
+  port and warns and ignores `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both
+  flags during the direct-TCP probe (`--remote-direct-probe-timeout-sec`, default `3`s, capped at
+  `--remote-copy-conn-timeout-sec`) before switching to SSH if the probe fails.
+- **Slow-path notice & `sshd` requirements**: Any non-same-host copy over SSH emits a
+  default-visible warning (`rcp::notice`). Remote `sshd` servers must allow TCP forwarding
+  (`AllowTcpForwarding yes`, or `local` for downloads / `remote` for uploads); 3-host agent
+  forwarding additionally requires `AllowAgentForwarding yes` on the destination `sshd`.
+- **TLS encryption**: Source↔Destination mutual TLS 1.3 remains enabled by default over SSH tunnels
+  (`--no-encryption` still disables it).
 
 ### Troubleshooting Checklist
 
@@ -578,7 +620,11 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 | `--auto-deploy-rcpd`                        | Automatically deploy rcpd to remote hosts                                                         |
 | `--remote-copy-conn-timeout-sec=N`          | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy)       |
 | `--remote-keepalive-sec=N`                  | Dead-peer detection budget, 0 disables (default: 120)                                             |
-| `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999")                                                |
+| `--remote-transport=MODE`                   | Source↔Destination transport: `tcp` (default), `ssh` (tunneled), or `auto` (TCP then SSH)         |
+| `--ssh-tunnels=N`                           | Parallel SSH tunnels for SSH transport (default: 4, capped by effective streams, degrades to 1)   |
+| `--ssh-forward-agent`                       | Forward local SSH agent (`ForwardAgent=yes`) to destination host in 3-host SSH copies             |
+| `--remote-direct-probe-timeout-sec=N`       | Direct-TCP probe timeout before SSH fallback in `--remote-transport=auto` (default: 3)            |
+| `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999"); ignored with warning in `ssh` mode            |
 | `--max-files-in-flight=LIMIT`               | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                                  |
 | `--max-connections=N`                       | Maximum concurrent data connections (default: 100)                                                |
 | `--pending-writes-multiplier=N`             | Pending-task capacity multiplier (default: 4)                                                     |
@@ -623,9 +669,12 @@ effective values. The ordinary automatic/default intersection remains quiet. Pro
 Tokio-console artifact announcements likewise use the tracing notice target and reach master output
 only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
 `RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
-errors. Wire revision 13 moves master↔rcpd control and tracing onto SSH `stdin`/`stdout`
-(`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), building on revision 12's daemon runtime statistics,
-and requires matching binaries.
+errors. Wire revision 14 adds SSH data/control transport and direct-TCP fallback
+(`DestinationTransport`, `MasterHello::Source::accept_timeout_sec`,
+`MasterHello::Destination::source_data_addrs`, `SourceMasterHello::tunnel_target_ip`,
+`MasterToRcpd::SshFallbackEndpoints`, `RcpdToMaster::DirectConnectFailed`), building on revision
+13's SSH `stdin`/`stdout` master↔rcpd control/tracing channel and revision 12's daemon runtime
+statistics, and requires matching binaries.
 
 ### Network Profiles
 

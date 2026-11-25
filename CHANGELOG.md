@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add SSH data transport and automatic direct-TCP fallback for remote copies:
+  `--remote-transport=<tcp|ssh|auto>` (default `tcp`), `--ssh-tunnels=<N>` (default `4`, stripes
+  data across parallel SSH connections and degrades gracefully down to `1`), `--ssh-forward-agent`
+  (opt-in agent forwarding to the destination host for 3-host SSH copies), and
+  `--remote-direct-probe-timeout-sec=<N>` (default `3`). Downloads tunnel via `-L`, uploads via
+  `-R`, 3-host copies open direct destination→source `-L` tunnels without relaying through the
+  master, and same-host copies stay on direct loopback without slow-path warnings. Advance the
+  remote compatibility revision to 14, requiring matching `rcp`/`rcpd` binaries.
 - Report context switches and page faults next to CPU time and peak memory in every tool's
   `--summary`, for the whole process, and for the source and destination `rcpd` of a remote copy.
   `rcmp`'s JSON summary carries the same figures. Advance the remote compatibility revision to 12

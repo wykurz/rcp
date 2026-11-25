@@ -1287,6 +1287,7 @@ pub async fn run_source(
     admission: common::EndpointAdmission,
     files_source: common::FilesInFlightSource,
     bind_ip: Option<&str>,
+    accept_timeout: std::time::Duration,
     cert_key: Option<&remote::tls::CertifiedKey>,
     dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
@@ -1320,14 +1321,17 @@ pub async fn run_source(
     let data_listener = remote::create_tcp_data_listener(tcp_config, bind_ip).await?;
     let control_addr = remote::get_tcp_listener_addr(&control_listener, bind_ip)?;
     let data_addr = remote::get_tcp_listener_addr(&data_listener, bind_ip)?;
+    let tunnel_target_ip = remote::get_tcp_listener_tunnel_target_ip(&control_listener)?;
     tracing::info!(
-        "Source TCP listeners: control={}, data={}",
+        "Source TCP listeners: control={}, data={}, tunnel_target_ip={}",
         control_addr,
-        data_addr
+        data_addr,
+        tunnel_target_ip
     );
     let master_hello = remote::protocol::SourceMasterHello {
         control_addr,
         data_addr,
+        tunnel_target_ip,
         server_name: remote::get_random_server_name(),
     };
     tracing::info!("Sending master hello: {:?}", master_hello);
@@ -1335,7 +1339,6 @@ pub async fn run_source(
     tracing::info!("Waiting for connection from destination");
     // wait for destination to connect with a timeout
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
-    let accept_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
     // the accept helper applies the Control socket options before returning, so the dry-run path
     // below gets the same configuration as the normal one
     match tokio::time::timeout(

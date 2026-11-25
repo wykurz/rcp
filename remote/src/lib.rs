@@ -115,6 +115,7 @@
 //!
 //! - [`port_ranges`] - Port range parsing and socket binding
 //! - [`protocol`] - Protocol message definitions and serialization
+//! - [`ssh_tunnel`] - OpenSSH mux v4 port forwarding (`-L`/`-R`) and `ssh -G` config resolution
 //! - [`stdio`] - Master↔rcpd SSH stdio framing, demultiplexing, and heartbeats
 //! - [`streams`] - Async stream wrappers with typed message passing
 //! - [`tls`] - TLS certificate generation and configuration
@@ -132,7 +133,7 @@ const FAILED_RCPD_REAP_GRACE: std::time::Duration = std::time::Duration::from_se
 const RCPD_OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const REMOTE_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 const CLEANUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
+pub(crate) const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
 const RCPD_STARTUP_RECORD_LIMIT: usize = 64 * 1024;
 pub(crate) const RCPD_PATH_DISCOVERY_SCRIPT: &str = "command -v \"$1\"";
 
@@ -993,6 +994,59 @@ impl SshMasterReaper {
     }
 }
 
+/// Owned child process whose `Drop` terminates and deterministically reaps the child through
+/// [`RemoteCleanup`] if it was not already reaped by [`Self::wait`].
+pub(crate) struct ManagedChildProcess {
+    child: Option<tokio::process::Child>,
+    cleanup: RemoteCleanup,
+}
+
+impl ManagedChildProcess {
+    pub(crate) fn new(child: tokio::process::Child, cleanup: RemoteCleanup) -> Self {
+        Self {
+            child: Some(child),
+            cleanup,
+        }
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("managed child process remains owned before wait completes")
+    }
+
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(tokio::process::Child::id)
+    }
+
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child_mut().wait().await?;
+        // child is now reaped; disarm Drop so teardown does not schedule a redundant reaper
+        self.child = None;
+        Ok(status)
+    }
+}
+
+impl Drop for ManagedChildProcess {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Err(error) = child.start_kill() {
+            tracing::debug!("failed to terminate managed SSH child process: {error:#}");
+        }
+        let reaper = SshMasterReaper {
+            launcher: Some(child),
+            control_directory: None,
+        };
+        self.cleanup
+            .defer_bounded("rcp-ssh-child-cleanup", move |budget| reaper.reap(budget));
+    }
+}
+
 struct PreparingSshMaster {
     launcher: Option<tokio::process::Child>,
     control_directory: Option<std::path::PathBuf>,
@@ -1114,6 +1168,14 @@ impl ManagedSshSession {
     fn cleanup(&self) -> RemoteCleanup {
         self.0.cleanup.clone()
     }
+
+    pub(crate) fn control_path(&self) -> std::path::PathBuf {
+        self.0
+            .control_directory
+            .as_ref()
+            .expect("managed SSH control directory is present before final drop")
+            .join("master")
+    }
 }
 
 impl std::ops::Deref for ManagedSshSession {
@@ -1146,11 +1208,11 @@ impl PreparationContext {
         }
     }
 
-    fn uncancelled(cleanup: RemoteCleanup) -> Self {
+    pub(crate) fn uncancelled(cleanup: RemoteCleanup) -> Self {
         Self::new(tokio_util::sync::CancellationToken::new(), cleanup)
     }
 
-    fn with_control_directory_exclusions(
+    pub(crate) fn with_control_directory_exclusions(
         mut self,
         exclusions: std::sync::Arc<[std::path::PathBuf]>,
     ) -> Self {
@@ -1368,7 +1430,7 @@ impl PreparationContext {
     }
 }
 
-fn finish_remote_output_capture(
+pub(crate) fn finish_remote_output_capture(
     operation: &str,
     stream: &str,
     mut output: CapturedOutput,
@@ -1391,10 +1453,10 @@ fn finish_remote_output_capture(
 }
 
 #[derive(Clone, Copy)]
-struct BootstrapDeadline(std::time::Duration);
+pub(crate) struct BootstrapDeadline(std::time::Duration);
 
 impl BootstrapDeadline {
-    const fn new(duration: std::time::Duration) -> Self {
+    pub(crate) const fn new(duration: std::time::Duration) -> Self {
         Self(duration)
     }
 
@@ -1429,6 +1491,7 @@ pub mod port_ranges;
 pub mod protocol;
 mod socket_buffers;
 use socket_buffers::{ReceiveBufferRequest, SendBufferRequest};
+pub mod ssh_tunnel;
 pub mod stdio;
 pub mod streams;
 pub mod tls;
@@ -1650,7 +1713,7 @@ impl SshSession {
     }
 
     /// Return the host spelling accepted by OpenSSH's direct argv interface.
-    fn openssh_host(&self) -> &str {
+    pub(crate) fn openssh_host(&self) -> &str {
         let Some(host) = self
             .host
             .strip_prefix('[')
@@ -1672,11 +1735,12 @@ impl SshSession {
 // re-export is_localhost from common for convenience
 pub use common::is_localhost;
 
-async fn setup_ssh_session(
+pub(crate) async fn setup_ssh_session(
     session: &SshSession,
     preparation: &PreparationContext,
     deadline: BootstrapDeadline,
     keepalive_sec: u64,
+    agent_forward: AgentForwardMode,
 ) -> anyhow::Result<ManagedSshSession> {
     setup_ssh_session_with_program(
         session,
@@ -1684,6 +1748,7 @@ async fn setup_ssh_session(
         std::path::Path::new("ssh"),
         deadline,
         keepalive_sec,
+        agent_forward,
     )
     .await
 }
@@ -1694,6 +1759,7 @@ async fn setup_ssh_session_with_program(
     ssh_program: &std::path::Path,
     deadline: BootstrapDeadline,
     keepalive_sec: u64,
+    agent_forward: AgentForwardMode,
 ) -> anyhow::Result<ManagedSshSession> {
     let session = session.clone();
     let ssh_program = ssh_program.to_path_buf();
@@ -1706,9 +1772,16 @@ async fn setup_ssh_session_with_program(
                     .context("no usable SSH control directory found outside local copy operands")
             })
             .await?;
-        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup, keepalive_sec)
-            .await
-            .context("Failed to establish SSH connection")
+        launch_ssh_master(
+            &session,
+            &control_dir,
+            &ssh_program,
+            cleanup,
+            keepalive_sec,
+            agent_forward,
+        )
+        .await
+        .context("Failed to establish SSH connection")
     });
     preparation
         .run_abortable_with_deadline(connect, "SSH session setup", deadline)
@@ -1770,7 +1843,9 @@ where
 }
 
 /// Launch and retain the foreground OpenSSH multiplex master.
-fn ssh_master_launcher_command(ssh_program: &std::path::Path) -> tokio::process::Command {
+pub(crate) fn ssh_master_launcher_command(
+    ssh_program: &std::path::Path,
+) -> tokio::process::Command {
     // launch a known-local shell first so resolving the configured SSH program happens inside a
     // child that the bootstrap deadline can kill and reap. Calling Command::new(ssh_program)
     // directly can block the Tokio worker in the parent's synchronous spawn handshake.
@@ -1786,6 +1861,7 @@ fn ssh_master_args(
     log: &std::path::Path,
     control_path: &std::path::Path,
     keepalive_sec: u64,
+    agent_forward: AgentForwardMode,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "-E".into(),
@@ -1802,7 +1878,28 @@ fn ssh_master_args(
         "ForkAfterAuthentication=no".into(),
         "-o".into(),
         "ControlPersist=no".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=no".into(),
+        "-o".into(),
+        "GatewayPorts=no".into(),
+        "-o".into(),
+        "Tunnel=no".into(),
+        "-o".into(),
+        "PermitLocalCommand=no".into(),
     ];
+    match agent_forward {
+        AgentForwardMode::Off => {
+            args.push("-o".into());
+            args.push("ForwardAgent=no".into());
+        }
+        AgentForwardMode::InheritConfig => {}
+        AgentForwardMode::ForceOn => {
+            args.push("-o".into());
+            args.push("ForwardAgent=yes".into());
+        }
+    }
     match stdio::ssh_server_alive_params(keepalive_sec) {
         Some((interval, count)) => {
             args.push("-o".into());
@@ -1825,6 +1922,7 @@ fn ssh_master_args(
         args.push("-l".into());
         args.push(user.into());
     }
+    args.push("--".into());
     args.push(session.openssh_host().into());
     args
 }
@@ -1835,6 +1933,7 @@ async fn launch_ssh_master(
     ssh_program: &std::path::Path,
     cleanup: RemoteCleanup,
     keepalive_sec: u64,
+    agent_forward: AgentForwardMode,
 ) -> anyhow::Result<ManagedSshSession> {
     tracing::debug!("Connecting to SSH destination: {}", session.host);
     tracing::debug!("Using SSH control directory: {}", control_dir.display());
@@ -1857,7 +1956,13 @@ async fn launch_ssh_master(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .args(ssh_master_args(session, &log, &control_path, keepalive_sec));
+        .args(ssh_master_args(
+            session,
+            &log,
+            &control_path,
+            keepalive_sec,
+            agent_forward,
+        ));
     let launcher = launcher
         .spawn()
         .context("failed to launch SSH multiplex master")?;
@@ -2050,7 +2155,14 @@ pub async fn get_remote_home_for_session_with_timeout(
     let preparation = PreparationContext::uncancelled(cleanup.clone())
         .with_control_directory_exclusions(local_operand_roots.to_vec().into());
     let deadline = BootstrapDeadline::new(bootstrap_timeout);
-    let ssh_session = setup_ssh_session(session, &preparation, deadline, keepalive_sec).await?;
+    let ssh_session = setup_ssh_session(
+        session,
+        &preparation,
+        deadline,
+        keepalive_sec,
+        AgentForwardMode::Off,
+    )
+    .await?;
     let home = get_remote_home_with_context(&ssh_session, &preparation, deadline).await?;
     Ok(std::path::PathBuf::from(home))
 }
@@ -2684,17 +2796,108 @@ where
     parse_rcpd_startup_record(line)
 }
 
+/// Controls whether SSH agent forwarding is requested when spawning a remote `rcpd` process.
+///
+/// The `openssh` crate's native mux client always leaves `want_agent_fwd = false` on
+/// `MUX_C_NEW_SESSION`, so when agent forwarding is needed (3-host SSH copies where destination
+/// `rcpd` authenticates to source via a forwarded agent) we spawn `rcpd` through `ssh -S` so
+/// OpenSSH enables `SSH_AUTH_SOCK` inside the remote daemon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentForwardMode {
+    /// Default fast path: spawn `rcpd` directly over the native OpenSSH mux client (no agent
+    /// forwarding).
+    #[default]
+    Off,
+    /// Spawn via `ssh -S <control_path>` without overriding `ForwardAgent`, honoring the user's
+    /// `~/.ssh/config` `ForwardAgent` directive.
+    InheritConfig,
+    /// Spawn via `ssh -S <control_path> -o ForwardAgent=yes` (matching `--ssh-forward-agent`).
+    ForceOn,
+}
+
+enum RcpdChild {
+    Mux(openssh::Child<ManagedSshSession>),
+    SshProcess {
+        child: ManagedChildProcess,
+        // retain the multiplex master for the lifetime of the `ssh -S` client process
+        _session: ManagedSshSession,
+    },
+}
+
+impl std::fmt::Debug for RcpdChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mux(child) => f.debug_tuple("Mux").field(child).finish(),
+            Self::SshProcess { child, .. } => f
+                .debug_struct("SshProcess")
+                .field("id", &child.id())
+                .finish(),
+        }
+    }
+}
+
+impl RcpdChild {
+    async fn wait(self) -> anyhow::Result<std::process::ExitStatus> {
+        match self {
+            Self::Mux(child) => Ok(child.wait().await?),
+            Self::SshProcess { mut child, .. } => Ok(child.wait().await?),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<streams::BoxedRead> {
+        match self {
+            Self::Mux(child) => child
+                .stdout()
+                .take()
+                .map(|stdout| Box::new(stdout) as streams::BoxedRead),
+            Self::SshProcess { child, .. } => child
+                .child_mut()
+                .stdout
+                .take()
+                .map(|stdout| Box::new(stdout) as streams::BoxedRead),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<streams::BoxedWrite> {
+        match self {
+            Self::Mux(child) => child
+                .stdin()
+                .take()
+                .map(|stdin| Box::new(stdin) as streams::BoxedWrite),
+            Self::SshProcess { child, .. } => child
+                .child_mut()
+                .stdin
+                .take()
+                .map(|stdin| Box::new(stdin) as streams::BoxedWrite),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<streams::BoxedRead> {
+        match self {
+            Self::Mux(child) => child
+                .stderr()
+                .take()
+                .map(|stderr| Box::new(stderr) as streams::BoxedRead),
+            Self::SshProcess { child, .. } => child
+                .child_mut()
+                .stderr
+                .take()
+                .map(|stderr| Box::new(stderr) as streams::BoxedRead),
+        }
+    }
+}
+
 /// Result of starting an rcpd process.
 ///
 /// Dropping it closes any untaken SSH stdio pipes, closes the SSH child channel, and aborts the
 /// owned stderr collector.
 pub struct RcpdProcess {
     /// Stdin pipe to the remote daemon until taken by the master control loop.
-    stdin: Option<openssh::ChildStdin>,
+    stdin: Option<streams::BoxedWrite>,
     /// Stdout pipe from the remote daemon until taken by the master stdout demux loop.
-    stdout: Option<openssh::ChildStdout>,
+    stdout: Option<streams::BoxedRead>,
     /// SSH child process handle.
-    child: Option<openssh::Child<ManagedSshSession>>,
+    child: Option<RcpdChild>,
     /// Readiness metadata reported by the daemon (optional TLS fingerprint and concurrency limits).
     pub readiness: RcpdReadiness,
     /// Handle for the bounded stderr collector.
@@ -2705,7 +2908,7 @@ impl RcpdProcess {
     /// Take ownership of the daemon's SSH stdin and stdout pipes for binary master↔rcpd framing.
     ///
     /// Returns an error if the pipes have already been taken.
-    pub fn take_stdio(&mut self) -> anyhow::Result<(openssh::ChildStdin, openssh::ChildStdout)> {
+    pub fn take_stdio(&mut self) -> anyhow::Result<(streams::BoxedWrite, streams::BoxedRead)> {
         let (Some(stdin), Some(stdout)) = (self.stdin.take(), self.stdout.take()) else {
             anyhow::bail!("rcpd stdio pipes have already been taken");
         };
@@ -2718,6 +2921,7 @@ pub struct PreparedRcpd {
     session: ManagedSshSession,
     rcpd_path: String,
     remote: SshSession,
+    agent_forward: AgentForwardMode,
 }
 
 /// Prepare two endpoints with a caller-selected remote bootstrap timeout.
@@ -2731,11 +2935,12 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
     bootstrap_timeout: std::time::Duration,
     keepalive_sec: u64,
     local_operand_roots: &[std::path::PathBuf],
+    destination_agent_forward: AgentForwardMode,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     let control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]> =
         local_operand_roots.to_vec().into();
     if source == destination {
-        let prepared = prepare_rcpd_with_context(
+        let dest_prepared = prepare_rcpd_with_context(
             source,
             explicit_rcpd_path,
             auto_deploy_rcpd,
@@ -2743,9 +2948,12 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 .with_control_directory_exclusions(control_directory_exclusions),
             bootstrap_timeout,
             keepalive_sec,
+            destination_agent_forward,
         )
         .await?;
-        return Ok((prepared.clone(), prepared));
+        let mut source_prepared = dest_prepared.clone();
+        source_prepared.agent_forward = AgentForwardMode::Off;
+        return Ok((source_prepared, dest_prepared));
     }
     let source_control_directory_exclusions = control_directory_exclusions.clone();
     join_remote_preparations(
@@ -2758,6 +2966,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 preparation.with_control_directory_exclusions(source_control_directory_exclusions),
                 bootstrap_timeout,
                 keepalive_sec,
+                AgentForwardMode::Off,
             )
         },
         move |preparation| {
@@ -2768,6 +2977,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
                 preparation.with_control_directory_exclusions(control_directory_exclusions),
                 bootstrap_timeout,
                 keepalive_sec,
+                destination_agent_forward,
             )
         },
     )
@@ -2884,6 +3094,7 @@ async fn prepare_rcpd_with_context(
     preparation: PreparationContext,
     bootstrap_timeout: std::time::Duration,
     keepalive_sec: u64,
+    agent_forward: AgentForwardMode,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
@@ -2892,6 +3103,7 @@ async fn prepare_rcpd_with_context(
         &preparation,
         BootstrapDeadline::new(bootstrap_timeout),
         keepalive_sec,
+        agent_forward,
     )
     .await?;
     let rcpd_path = match try_discover_and_check_version(
@@ -2961,10 +3173,86 @@ async fn prepare_rcpd_with_context(
         session: ssh_session,
         rcpd_path,
         remote: session.clone(),
+        agent_forward,
     })
 }
 
+fn ssh_mux_exec_args(
+    session: &SshSession,
+    control_path: &std::path::Path,
+    agent_forward: AgentForwardMode,
+    rcpd_path: &str,
+    rcpd_args: &[String],
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-S".into(),
+        control_path.as_os_str().to_os_string(),
+        "-T".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        // shield the framed stdio channel and RCP_READY stderr handshake from user ~/.ssh/config
+        // directives, and fail closed instead of opening a fresh TCP session if the control socket
+        // disappeared before connect
+        "-o".into(),
+        "ForwardX11=no".into(),
+        "-o".into(),
+        "StdinNull=no".into(),
+        "-o".into(),
+        "SessionType=default".into(),
+        "-o".into(),
+        "PermitLocalCommand=no".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        "-o".into(),
+        "ProxyCommand=false".into(),
+    ];
+    match agent_forward {
+        AgentForwardMode::Off => {
+            args.push("-o".into());
+            args.push("ForwardAgent=no".into());
+        }
+        AgentForwardMode::InheritConfig => {}
+        AgentForwardMode::ForceOn => {
+            args.push("-o".into());
+            args.push("ForwardAgent=yes".into());
+        }
+    }
+    if let Some(port) = session.port {
+        args.push("-p".into());
+        args.push(port.to_string().into());
+    }
+    if let Some(user) = session.user.as_deref() {
+        args.push("-l".into());
+        args.push(user.into());
+    }
+    let remote_command = std::iter::once(rcpd_path)
+        .chain(rcpd_args.iter().map(String::as_str))
+        .map(shell_escape)
+        .collect::<Vec<_>>()
+        .join(" ");
+    args.push("--".into());
+    args.push(session.openssh_host().into());
+    args.push(remote_command.into());
+    args
+}
+
 impl PreparedRcpd {
+    /// Path to this prepared SSH session's active OpenSSH multiplex control socket.
+    #[must_use]
+    pub fn control_path(&self) -> std::path::PathBuf {
+        self.session.control_path()
+    }
+
+    /// SSH session target that owns this prepared remote endpoint.
+    #[must_use]
+    pub fn remote(&self) -> &SshSession {
+        &self.remote
+    }
+
     pub async fn spawn(
         &self,
         rcpd_config: &protocol::RcpdConfig,
@@ -2973,6 +3261,7 @@ impl PreparedRcpd {
     ) -> anyhow::Result<RcpdProcess> {
         tracing::info!("Starting prepared rcpd server on: {}", self.remote.host);
         let session = &self.remote;
+        let agent_forward = self.agent_forward;
         // build the exact remote argv once so execution and the stable diagnostic cannot drift
         let mut rcpd_args = vec!["--role".to_string(), role.to_string()];
         rcpd_args.extend(rcpd_config.to_args());
@@ -2981,29 +3270,69 @@ impl PreparedRcpd {
             rcpd_args.push(ip.to_string());
         }
         tracing::info!(
-            "Will run remote rcpd: path={:?} role={} args={:?}",
+            "Will run remote rcpd: path={:?} role={} agent_forward={:?} args={:?}",
             self.rcpd_path,
             role,
+            agent_forward,
             rcpd_args
         );
-        let mut cmd = openssh::Session::to_command(self.session.clone(), &self.rcpd_path);
-        cmd.args(rcpd_args);
-        // configure stdin/stdout/stderr: stdin and stdout carry the framed master↔rcpd control and
-        // tracing protocol, while stderr carries the initial RCP_READY record and diagnostic text
-        cmd.stdin(openssh::Stdio::piped());
-        cmd.stdout(openssh::Stdio::piped());
-        cmd.stderr(openssh::Stdio::piped());
         let startup_deadline = BootstrapDeadline::new(std::time::Duration::from_secs(
             rcpd_config.remote_copy_conn_timeout_sec,
         ));
-        let spawn =
-            tokio::spawn(async move { cmd.spawn().await.context("Failed to spawn rcpd command") });
-        let mut child = PreparationContext::uncancelled(self.session.cleanup())
-            .run_abortable_with_deadline(spawn, "spawning rcpd command", startup_deadline)
-            .await?;
+        let mut child = match agent_forward {
+            AgentForwardMode::Off => {
+                let mut cmd = openssh::Session::to_command(self.session.clone(), &self.rcpd_path);
+                cmd.args(rcpd_args);
+                // configure stdin/stdout/stderr: stdin and stdout carry the framed master↔rcpd
+                // control and tracing protocol, while stderr carries the initial RCP_READY record
+                // and diagnostic text
+                cmd.stdin(openssh::Stdio::piped());
+                cmd.stdout(openssh::Stdio::piped());
+                cmd.stderr(openssh::Stdio::piped());
+                let spawn = tokio::spawn(async move {
+                    cmd.spawn()
+                        .await
+                        .context("Failed to spawn rcpd command")
+                        .map(RcpdChild::Mux)
+                });
+                PreparationContext::uncancelled(self.session.cleanup())
+                    .run_abortable_with_deadline(spawn, "spawning rcpd command", startup_deadline)
+                    .await?
+            }
+            AgentForwardMode::InheritConfig | AgentForwardMode::ForceOn => {
+                let control_path = self.session.control_path();
+                let ssh_args = ssh_mux_exec_args(
+                    session,
+                    &control_path,
+                    agent_forward,
+                    &self.rcpd_path,
+                    &rcpd_args,
+                );
+                let retained_session = self.session.clone();
+                let cleanup = self.session.cleanup();
+                let spawn = tokio::spawn(async move {
+                    let mut cmd = ssh_master_launcher_command(std::path::Path::new("ssh"));
+                    cmd.kill_on_drop(true)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .args(ssh_args);
+                    let child = cmd
+                        .spawn()
+                        .context("Failed to spawn rcpd command via ssh")?;
+                    Ok(RcpdChild::SshProcess {
+                        child: ManagedChildProcess::new(child, cleanup),
+                        _session: retained_session,
+                    })
+                });
+                PreparationContext::uncancelled(self.session.cleanup())
+                    .run_abortable_with_deadline(spawn, "spawning rcpd command", startup_deadline)
+                    .await?
+            }
+        };
         // read readiness metadata from rcpd's stderr
         // format: "RCP_READY <hex_fp|-> <F> <E>"
-        let Some(stderr) = child.stderr().take() else {
+        let Some(stderr) = child.take_stderr() else {
             let error = anyhow::anyhow!("rcpd stderr not available");
             let diagnostic = reap_failed_rcpd(child, &session.host, None).await;
             return Err(attach_startup_diagnostic(error, diagnostic));
@@ -3022,12 +3351,12 @@ impl PreparedRcpd {
                 return Err(attach_startup_diagnostic(error, diagnostic));
             }
         };
-        let Some(stdin) = child.stdin().take() else {
+        let Some(stdin) = child.take_stdin() else {
             let error = anyhow::anyhow!("rcpd stdin not available");
             let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
             return Err(attach_startup_diagnostic(error, diagnostic));
         };
-        let Some(stdout) = child.stdout().take() else {
+        let Some(stdout) = child.take_stdout() else {
             drop(stdin);
             let error = anyhow::anyhow!("rcpd stdout not available");
             let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
@@ -3063,11 +3392,11 @@ fn attach_startup_diagnostic(error: anyhow::Error, diagnostic: Option<String>) -
 }
 
 async fn reap_failed_rcpd(
-    mut child: openssh::Child<ManagedSshSession>,
+    mut child: RcpdChild,
     host: &str,
-    stderr_reader: Option<tokio::io::BufReader<openssh::ChildStderr>>,
+    stderr_reader: Option<tokio::io::BufReader<streams::BoxedRead>>,
 ) -> Option<String> {
-    let stdout_reader = child.stdout().take();
+    let stdout_reader = child.take_stdout();
     let reaper = async move {
         let stdout = async move {
             match stdout_reader {
@@ -3395,23 +3724,59 @@ pub fn get_tcp_listener_addr(
     }
 }
 
+/// Return the IP address on the listener's host that SSH port forwards (`-L`/`-R`) should target.
+///
+/// Wildcard listeners (`0.0.0.0` / `::`) map to their matching loopback address (`127.0.0.1` /
+/// `::1`); explicitly bound addresses are preserved as-is.
+pub fn get_tcp_listener_tunnel_target_ip(
+    listener: &tokio::net::TcpListener,
+) -> anyhow::Result<std::net::IpAddr> {
+    match listener.local_addr()? {
+        std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        }
+        std::net::SocketAddr::V4(v4) => Ok(std::net::IpAddr::V4(*v4.ip())),
+        std::net::SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        }
+        std::net::SocketAddr::V6(v6) => Ok(std::net::IpAddr::V6(*v6.ip())),
+    }
+}
+
+/// Connect to a TCP control server with a caller-selected timeout and the standard socket options.
+#[instrument(skip(config))]
+pub async fn connect_tcp_control_with_timeout(
+    addr: std::net::SocketAddr,
+    config: &TcpConfig,
+    timeout: std::time::Duration,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .with_context(|| {
+            format!(
+                "connection to {} timed out after {}",
+                addr,
+                humantime::format_duration(timeout)
+            )
+        })?
+        .with_context(|| format!("failed to connect to {}", addr))?;
+    configure_control_connection(&stream, config.keepalive_sec);
+    tracing::debug!("connected to TCP control server at {}", addr);
+    Ok(stream)
+}
+
 /// Connect to a TCP control server, applying the connect timeout and the standard socket options
 #[instrument(skip(config))]
 pub async fn connect_tcp_control(
     addr: std::net::SocketAddr,
     config: &TcpConfig,
 ) -> anyhow::Result<tokio::net::TcpStream> {
-    let timeout_sec = config.conn_timeout_sec;
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_sec),
-        tokio::net::TcpStream::connect(addr),
+    connect_tcp_control_with_timeout(
+        addr,
+        config,
+        std::time::Duration::from_secs(config.conn_timeout_sec),
     )
     .await
-    .with_context(|| format!("connection to {} timed out after {}s", addr, timeout_sec))?
-    .with_context(|| format!("failed to connect to {}", addr))?;
-    configure_control_connection(&stream, config.keepalive_sec);
-    tracing::debug!("connected to TCP control server at {}", addr);
-    Ok(stream)
 }
 
 /// Connect a TCP data connection, applying the standard socket options.
@@ -3873,6 +4238,7 @@ mod tests {
                 PreparationContext::uncancelled(cleanup.clone()),
                 DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
         }
@@ -3914,8 +4280,8 @@ mod tests {
             session: &ManagedSshSession,
             directory: &std::path::Path,
         ) -> (
-            openssh::Child<ManagedSshSession>,
-            tokio::io::BufReader<openssh::ChildStderr>,
+            RcpdChild,
+            tokio::io::BufReader<streams::BoxedRead>,
             KillTestProcessOnDrop,
         ) {
             use std::os::unix::fs::PermissionsExt;
@@ -3938,8 +4304,8 @@ mod tests {
                 .stdin(openssh::Stdio::piped())
                 .stdout(openssh::Stdio::piped())
                 .stderr(openssh::Stdio::piped());
-            let mut child = command.spawn().await.unwrap();
-            let stderr = child.stderr().take().unwrap();
+            let mut child = RcpdChild::Mux(command.spawn().await.unwrap());
+            let stderr = child.take_stderr().unwrap();
             let mut stderr_reader = tokio::io::BufReader::new(stderr);
             let mut readiness = String::new();
             stderr_reader.read_line(&mut readiness).await.unwrap();
@@ -3964,6 +4330,7 @@ mod tests {
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
             .expect("localhost SSH must be available");
@@ -3998,6 +4365,7 @@ mod tests {
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4046,6 +4414,7 @@ mod tests {
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4083,6 +4452,7 @@ mod tests {
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4121,6 +4491,7 @@ mod tests {
                 &preparation,
                 BootstrapDeadline::new(std::time::Duration::from_secs(5)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
             .expect("localhost SSH must be available");
@@ -4185,6 +4556,7 @@ mod tests {
                     PreparationContext::uncancelled(cleanup.clone()),
                     std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
                     config.remote_keepalive_sec,
+                    AgentForwardMode::Off,
                 )
                 .await?
                 .spawn(&config, None, protocol::RcpdRole::Source)
@@ -4486,6 +4858,139 @@ mod tests {
             cleanup.finish();
             std::fs::remove_dir_all(directory).unwrap();
         }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_prepared_rcpd_spawns_and_reaps_via_ssh_process() {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("rcpd");
+            let version = crate::version::ProtocolVersion::current()
+                .to_json()
+                .unwrap();
+            let contents = format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_READY - 4 4' >&2\ncat >/dev/null\n",
+                shell_escape(&version),
+            );
+            std::fs::write(&script, contents).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let prepared = prepare_rcpd_with_context(
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                PreparationContext::uncancelled(cleanup.clone()),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::ForceOn,
+            )
+            .await
+            .unwrap();
+            let process = prepared
+                .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
+                .await
+                .unwrap();
+            assert!(matches!(process.child, Some(RcpdChild::SshProcess { .. })));
+            wait_for_rcpd_process(process).await.unwrap();
+            drop(prepared);
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
+        async fn test_remote_ssh_tunnel_set_forwards_traffic_local_and_remote_modes() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let cleanup = RemoteCleanup::new().unwrap();
+            let tcp_config = TcpConfig::default();
+            let control_listener = create_tcp_control_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let data_listener = create_tcp_data_listener(&tcp_config, Some("127.0.0.1"))
+                .await
+                .unwrap();
+            let target_control = control_listener.local_addr().unwrap();
+            let target_data = data_listener.local_addr().unwrap();
+            let session = SshSession::local();
+            let preparation = PreparationContext::uncancelled(cleanup.clone());
+            let primary = setup_ssh_session(
+                &session,
+                &preparation,
+                BootstrapDeadline::new(std::time::Duration::from_secs(10)),
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap();
+            for direction in [
+                ssh_tunnel::ForwardDirection::Local,
+                ssh_tunnel::ForwardDirection::Remote,
+            ] {
+                let tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
+                    direction,
+                    &primary.control_path(),
+                    &session,
+                    target_control,
+                    Some(target_data),
+                    2,
+                    15,
+                    std::time::Duration::from_secs(10),
+                    &cleanup,
+                    &[],
+                )
+                .await
+                .unwrap();
+                assert_eq!(tunnels.data_addrs().len(), 2);
+                // verify bytes traverse the control forward end-to-end
+                let accept_task = tokio::spawn({
+                    let tcp_config = tcp_config.clone();
+                    let control_addr = tunnels.control_addr();
+                    async move {
+                        let mut stream = connect_tcp_control(control_addr, &tcp_config)
+                            .await
+                            .unwrap();
+                        stream.write_all(b"ping-ssh-tunnel").await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                });
+                let (mut accepted, _) = accept_tcp_control(&control_listener, &tcp_config)
+                    .await
+                    .unwrap();
+                let mut received = Vec::new();
+                accepted.read_to_end(&mut received).await.unwrap();
+                accept_task.await.unwrap();
+                assert_eq!(received, b"ping-ssh-tunnel");
+                // verify both parallel data forwards carry traffic
+                for &data_addr in tunnels.data_addrs() {
+                    let connect_task = tokio::spawn({
+                        let tcp_config = tcp_config.clone();
+                        async move {
+                            let mut stream =
+                                connect_tcp_control(data_addr, &tcp_config).await.unwrap();
+                            stream.write_all(b"data-lane").await.unwrap();
+                            stream.shutdown().await.unwrap();
+                        }
+                    });
+                    let (mut accepted, _) = accept_tcp_control(&data_listener, &tcp_config)
+                        .await
+                        .unwrap();
+                    let mut received = Vec::new();
+                    accepted.read_to_end(&mut received).await.unwrap();
+                    connect_task.await.unwrap();
+                    assert_eq!(received, b"data-lane");
+                }
+                tunnels.close().await;
+            }
+            drop(primary);
+            cleanup.finish();
+        }
     }
 
     #[test]
@@ -4573,10 +5078,59 @@ mod tests {
         let session = SshSession::local();
         let log = std::path::Path::new("/tmp/log");
         let socket = std::path::Path::new("/tmp/master");
-        let disabled: Vec<String> = ssh_master_args(&session, log, socket, 0)
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let disabled: Vec<String> =
+            ssh_master_args(&session, log, socket, 0, AgentForwardMode::Off)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        for expected in [
+            "ClearAllForwardings=yes",
+            "ExitOnForwardFailure=no",
+            "GatewayPorts=no",
+            "Tunnel=no",
+            "PermitLocalCommand=no",
+        ] {
+            assert!(
+                disabled.windows(2).any(|pair| pair == ["-o", expected]),
+                "ssh_master_args must set -o {expected}: {disabled:?}"
+            );
+        }
+        assert!(
+            disabled
+                .windows(2)
+                .any(|pair| pair == ["-o", "ForwardAgent=no"]),
+            "AgentForwardMode::Off must explicitly disable ForwardAgent: {disabled:?}"
+        );
+        assert_eq!(
+            disabled
+                .iter()
+                .rev()
+                .take(2)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["localhost", "--"],
+            "ssh_master_args must delimit hostname with `--`: {disabled:?}"
+        );
+        let inherit: Vec<String> =
+            ssh_master_args(&session, log, socket, 0, AgentForwardMode::InheritConfig)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            !inherit.iter().any(|arg| arg.starts_with("ForwardAgent=")),
+            "AgentForwardMode::InheritConfig must omit ForwardAgent so ~/.ssh/config applies: {inherit:?}"
+        );
+        let with_agent: Vec<String> =
+            ssh_master_args(&session, log, socket, 0, AgentForwardMode::ForceOn)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            with_agent
+                .windows(2)
+                .any(|pair| pair == ["-o", "ForwardAgent=yes"]),
+            "AgentForwardMode::ForceOn must explicitly enable ForwardAgent=yes: {with_agent:?}"
+        );
         assert!(
             disabled
                 .windows(2)
@@ -4589,7 +5143,7 @@ mod tests {
                 .any(|arg| arg.starts_with("ServerAliveCountMax=")),
             "keepalive_sec=0 must not pass ServerAliveCountMax: {disabled:?}"
         );
-        let fast: Vec<String> = ssh_master_args(&session, log, socket, 5)
+        let fast: Vec<String> = ssh_master_args(&session, log, socket, 5, AgentForwardMode::Off)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -4603,10 +5157,11 @@ mod tests {
                 .any(|pair| pair == ["-o", "ServerAliveCountMax=4"]),
             "keepalive_sec=5 should use ServerAliveCountMax=4 (1 * (4 + 1) = 5s): {fast:?}"
         );
-        let default_args: Vec<String> = ssh_master_args(&session, log, socket, 120)
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let default_args: Vec<String> =
+            ssh_master_args(&session, log, socket, 120, AgentForwardMode::Off)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
         assert!(
             default_args
                 .windows(2)
@@ -4684,6 +5239,7 @@ mod tests {
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
         });
@@ -4732,6 +5288,124 @@ mod tests {
             "cancelled SSH setup must remove its private control directory"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ssh_mux_exec_args_preserve_quoting_and_agent_forward_mode() {
+        let session = SshSession {
+            user: Some("alice".to_owned()),
+            host: "[2001:db8::1]".to_owned(),
+            port: Some(2222),
+        };
+        let control = std::path::Path::new("/tmp/ctrl/master");
+        let rcpd_args = vec![
+            "--role".to_owned(),
+            "destination".to_owned(),
+            "--timings=/tmp/with spaces/t".to_owned(),
+        ];
+        let off: Vec<String> = ssh_mux_exec_args(
+            &session,
+            control,
+            AgentForwardMode::Off,
+            "/usr/bin/rcpd",
+            &rcpd_args,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(off.windows(2).any(|p| p == ["-o", "ForwardAgent=no"]));
+        let inherit: Vec<String> = ssh_mux_exec_args(
+            &session,
+            control,
+            AgentForwardMode::InheritConfig,
+            "/usr/bin/rcpd",
+            &rcpd_args,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(!inherit.iter().any(|arg| arg.starts_with("ForwardAgent=")));
+        for expected in [
+            "ControlMaster=no",
+            "ClearAllForwardings=yes",
+            "ForwardX11=no",
+            "StdinNull=no",
+            "SessionType=default",
+            "PermitLocalCommand=no",
+            "LogLevel=ERROR",
+            "ProxyCommand=false",
+        ] {
+            assert!(
+                inherit.windows(2).any(|p| p == ["-o", expected]),
+                "ssh_mux_exec_args missing -o {expected}: {inherit:?}"
+            );
+        }
+        assert_eq!(
+            inherit.last().map(String::as_str),
+            Some("'/usr/bin/rcpd' '--role' 'destination' '--timings=/tmp/with spaces/t'")
+        );
+        let forced: Vec<String> = ssh_mux_exec_args(
+            &session,
+            control,
+            AgentForwardMode::ForceOn,
+            "/usr/bin/rcpd",
+            &rcpd_args,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(forced.windows(2).any(|p| p == ["-o", "ForwardAgent=yes"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_child_process_drop_terminates_and_reaps_running_child() {
+        let cleanup = RemoteCleanup::new().unwrap();
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = ManagedChildProcess::new(cmd.spawn().unwrap(), cleanup.clone());
+        let pid = child.id().expect("spawned child must have a pid");
+        let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let start_time = linux_process_start_time(&process)
+            .expect("spawned child must expose a process identity");
+        drop(child);
+        cleanup.finish();
+        assert!(
+            wait_for_process_identity_to_disappear(&process, &start_time).await,
+            "dropping ManagedChildProcess must kill and reap its child via RemoteCleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_tunnel_target_ip_maps_unspecified_to_loopback() {
+        let config = TcpConfig::default();
+        let wildcard = create_tcp_control_listener(&config, None).await.unwrap();
+        assert_eq!(
+            get_tcp_listener_tunnel_target_ip(&wildcard).unwrap(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        let explicit = create_tcp_control_listener(&config, Some("127.0.0.1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            get_tcp_listener_tunnel_target_ip(&explicit).unwrap(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        if let Ok(v6_explicit) = create_tcp_control_listener(&config, Some("::1")).await {
+            assert_eq!(
+                get_tcp_listener_tunnel_target_ip(&v6_explicit).unwrap(),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            );
+        }
+        if let Ok(v6_wildcard) = create_tcp_control_listener(&config, Some("::")).await {
+            assert_eq!(
+                get_tcp_listener_tunnel_target_ip(&v6_wildcard).unwrap(),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            );
+        }
     }
 
     #[test]
@@ -4800,6 +5474,7 @@ mod tests {
             &launcher,
             BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
             DEFAULT_REMOTE_KEEPALIVE_SEC,
+            AgentForwardMode::Off,
         )
         .await
         .unwrap();
@@ -4856,6 +5531,7 @@ mod tests {
                 &launcher,
                 BootstrapDeadline::new(std::time::Duration::from_millis(500)),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             )
             .await
         });
@@ -4947,6 +5623,7 @@ mod tests {
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
                 DEFAULT_REMOTE_KEEPALIVE_SEC,
+                AgentForwardMode::Off,
             ))
             .unwrap();
         let pid = std::fs::read_to_string(&pid_file).unwrap();

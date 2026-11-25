@@ -116,7 +116,8 @@ enum ConnectOutcome {
 }
 
 struct DataConnectionPool {
-    data_addr: std::net::SocketAddr,
+    data_addrs: Vec<std::net::SocketAddr>,
+    next_addr: std::sync::atomic::AtomicUsize,
     network_profile: remote::NetworkProfile,
     /// Liveness budget applied to each data connection (see `remote::configure_tcp_socket`).
     /// These are `ConnectionKind::Data`: keepalive only, no `TCP_USER_TIMEOUT` — this side stops
@@ -137,14 +138,15 @@ struct DataConnectionPool {
 
 impl DataConnectionPool {
     fn new(
-        data_addr: std::net::SocketAddr,
+        data_addrs: Vec<std::net::SocketAddr>,
         max_connections: usize,
         tcp_config: &remote::TcpConfig,
         tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
         shutdown: ReceiverShutdown,
     ) -> Self {
         Self {
-            data_addr,
+            data_addrs,
+            next_addr: std::sync::atomic::AtomicUsize::new(0),
             network_profile: tcp_config.network_profile,
             keepalive_sec: tcp_config.keepalive_sec,
             copy_buffer_retention_limit: tcp_config.effective_buffer_retention_limit(),
@@ -181,9 +183,16 @@ impl DataConnectionPool {
     /// the whole TCP-connect + handshake; only the read half is kept (this side never sends on a
     /// data connection).
     async fn connect_and_handshake(&self) -> anyhow::Result<remote::streams::BoxedRecvStream> {
+        anyhow::ensure!(
+            !self.data_addrs.is_empty(),
+            "no source data addresses configured for destination data pool"
+        );
+        let index = self
+            .next_addr
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data_addr = self.data_addrs[index % self.data_addrs.len()];
         let stream =
-            remote::connect_tcp_data(self.data_addr, self.network_profile, self.keepalive_sec)
-                .await?;
+            remote::connect_tcp_data(data_addr, self.network_profile, self.keepalive_sec).await?;
         let (_send_stream, recv_stream) = remote::tls::connect_bounded(
             self.tls_connector.as_deref(),
             remote::tls::SERVER_NAME_SOURCE,
@@ -1905,11 +1914,264 @@ async fn reap_announce_task(
     }
 }
 
-#[instrument(skip(cert_key))]
+/// Loopback tunnel endpoints supplied by the master after an `auto` direct-TCP probe fails.
+#[derive(Clone, Debug)]
+pub struct SshFallbackEndpoints {
+    pub control_addr: std::net::SocketAddr,
+    pub data_addrs: Vec<std::net::SocketAddr>,
+}
+
+struct ConnectedDestinationTransport {
+    control_stream: tokio::net::TcpStream,
+    data_addrs: Vec<std::net::SocketAddr>,
+    ssh_tunnels: Option<remote::ssh_tunnel::SshTunnelSet>,
+    via_ssh_tunnel: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_destination_transport(
+    src_control_addr: &std::net::SocketAddr,
+    src_data_addrs: &[std::net::SocketAddr],
+    dry_run: bool,
+    transport: &remote::protocol::DestinationTransport,
+    tcp_config: &remote::TcpConfig,
+    master_control: &remote::stdio::DaemonControlSender,
+    fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
+    cleanup: &remote::RemoteCleanup,
+) -> anyhow::Result<ConnectedDestinationTransport> {
+    match transport {
+        remote::protocol::DestinationTransport::Direct => {
+            tracing::info!(
+                "Connecting directly to source: control={}, data={:?}",
+                src_control_addr,
+                src_data_addrs
+            );
+            let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
+            Ok(ConnectedDestinationTransport {
+                control_stream,
+                data_addrs: src_data_addrs.to_vec(),
+                ssh_tunnels: None,
+                via_ssh_tunnel: false,
+            })
+        }
+        remote::protocol::DestinationTransport::MasterSshTunnel => {
+            tracing::info!(
+                "Connecting to source via master-managed SSH tunnel: control={}, data={:?}",
+                src_control_addr,
+                src_data_addrs
+            );
+            let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
+            Ok(ConnectedDestinationTransport {
+                control_stream,
+                data_addrs: src_data_addrs.to_vec(),
+                ssh_tunnels: None,
+                via_ssh_tunnel: true,
+            })
+        }
+        remote::protocol::DestinationTransport::AutoMasterSsh { probe_timeout_sec } => {
+            let probe_timeout = std::time::Duration::from_secs((*probe_timeout_sec).max(1));
+            tracing::info!(
+                "Probing direct TCP connection to source control={} (timeout={}s)",
+                src_control_addr,
+                probe_timeout.as_secs()
+            );
+            match remote::connect_tcp_control_with_timeout(
+                *src_control_addr,
+                tcp_config,
+                probe_timeout,
+            )
+            .await
+            {
+                Ok(control_stream) => Ok(ConnectedDestinationTransport {
+                    control_stream,
+                    data_addrs: src_data_addrs.to_vec(),
+                    ssh_tunnels: None,
+                    via_ssh_tunnel: false,
+                }),
+                Err(probe_err) => {
+                    let reason = format!("{probe_err:#}");
+                    tracing::info!(
+                        "Direct TCP probe to {src_control_addr} failed ({probe_err:#}); requesting SSH fallback from master"
+                    );
+                    master_control
+                        .send_direct_connect_failed(reason.clone())
+                        .await
+                        .context("failed to notify master of direct TCP failure")?;
+                    let endpoints = fallback_rx
+                        .context("destination missing SSH fallback receiver for AutoMasterSsh")?
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "master closed fallback channel before supplying SSH tunnel endpoints \
+                                 (direct TCP probe failed: {reason})"
+                            )
+                        })?;
+                    tracing::info!(
+                        "Connecting to source via master SSH fallback: control={}, data={:?}",
+                        endpoints.control_addr,
+                        endpoints.data_addrs
+                    );
+                    let control_stream =
+                        remote::connect_tcp_control(endpoints.control_addr, tcp_config).await?;
+                    Ok(ConnectedDestinationTransport {
+                        control_stream,
+                        data_addrs: endpoints.data_addrs,
+                        ssh_tunnels: None,
+                        via_ssh_tunnel: true,
+                    })
+                }
+            }
+        }
+        remote::protocol::DestinationTransport::DirectSsh {
+            source_ssh,
+            tunnel_target_ip,
+            ssh_tunnels,
+            dest_root,
+        } => {
+            connect_direct_ssh_tunnels(
+                source_ssh,
+                *tunnel_target_ip,
+                src_control_addr.port(),
+                src_data_addrs,
+                dry_run,
+                *ssh_tunnels,
+                dest_root,
+                tcp_config,
+                cleanup,
+                None,
+            )
+            .await
+        }
+        remote::protocol::DestinationTransport::AutoDirectSsh {
+            probe_timeout_sec,
+            source_ssh,
+            tunnel_target_ip,
+            ssh_tunnels,
+            dest_root,
+        } => {
+            let probe_timeout = std::time::Duration::from_secs((*probe_timeout_sec).max(1));
+            tracing::info!(
+                "Probing direct TCP connection to source control={} (timeout={}s)",
+                src_control_addr,
+                probe_timeout.as_secs()
+            );
+            match remote::connect_tcp_control_with_timeout(
+                *src_control_addr,
+                tcp_config,
+                probe_timeout,
+            )
+            .await
+            {
+                Ok(control_stream) => Ok(ConnectedDestinationTransport {
+                    control_stream,
+                    data_addrs: src_data_addrs.to_vec(),
+                    ssh_tunnels: None,
+                    via_ssh_tunnel: false,
+                }),
+                Err(probe_err) => {
+                    let reason = format!("{probe_err:#}");
+                    tracing::info!(
+                        "Direct TCP probe to {src_control_addr} failed ({probe_err:#}); opening direct SSH tunnels to source '{}'",
+                        source_ssh.host
+                    );
+                    connect_direct_ssh_tunnels(
+                        source_ssh,
+                        *tunnel_target_ip,
+                        src_control_addr.port(),
+                        src_data_addrs,
+                        dry_run,
+                        *ssh_tunnels,
+                        dest_root,
+                        tcp_config,
+                        cleanup,
+                        Some(&reason),
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_direct_ssh_tunnels(
+    source_ssh: &remote::protocol::SshTarget,
+    tunnel_target_ip: std::net::IpAddr,
+    control_port: u16,
+    src_data_addrs: &[std::net::SocketAddr],
+    dry_run: bool,
+    ssh_tunnels: usize,
+    dest_root: &std::path::Path,
+    tcp_config: &remote::TcpConfig,
+    cleanup: &remote::RemoteCleanup,
+    fallback_reason: Option<&str>,
+) -> anyhow::Result<ConnectedDestinationTransport> {
+    let target_control = std::net::SocketAddr::new(tunnel_target_ip, control_port);
+    let target_data = if dry_run {
+        None
+    } else {
+        let data_port = src_data_addrs
+            .first()
+            .context("missing source data port for direct SSH transport")?
+            .port();
+        Some(std::net::SocketAddr::new(tunnel_target_ip, data_port))
+    };
+    let excluded_roots = [dest_root.to_path_buf()];
+    let open_result = remote::ssh_tunnel::SshTunnelSet::open_direct_local_tunnels(
+        source_ssh,
+        target_control,
+        target_data,
+        ssh_tunnels,
+        tcp_config.keepalive_sec,
+        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+        cleanup,
+        &excluded_roots,
+    )
+    .await;
+    let tunnels = match (open_result, fallback_reason) {
+        (Ok(tunnels), _) => tunnels,
+        (Err(error), Some(reason)) => {
+            return Err(error.context(format!(
+                "SSH fallback also failed after direct TCP probe failed ({reason})"
+            )));
+        }
+        (Err(error), None) => return Err(error),
+    };
+    if let Some(reason) = fallback_reason {
+        tracing::warn!(
+            target: common::NOTICE_TARGET,
+            "Direct TCP connection failed ({reason}); falling back to SSH ({}); throughput will be lower than direct TCP",
+            tunnels.format_tunnel_summary()
+        );
+    } else {
+        tracing::warn!(
+            target: common::NOTICE_TARGET,
+            "Transferring file data over SSH ({}); throughput will be lower than direct TCP",
+            tunnels.format_tunnel_summary()
+        );
+    }
+    let control_addr = tunnels.control_addr();
+    let data_addrs = tunnels.data_addrs().to_vec();
+    let control_stream = match remote::connect_tcp_control(control_addr, tcp_config).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tunnels.close().await;
+            return Err(error);
+        }
+    };
+    Ok(ConnectedDestinationTransport {
+        control_stream,
+        data_addrs,
+        ssh_tunnels: Some(tunnels),
+        via_ssh_tunnel: true,
+    })
+}
+
+#[instrument(skip(cert_key, master_control, fallback_rx, cleanup))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destination(
     src_control_addr: &std::net::SocketAddr,
-    src_data_addr: &std::net::SocketAddr,
+    src_data_addrs: &[std::net::SocketAddr],
     _src_server_name: &str,
     settings: &common::copy::Settings,
     dry_run: bool,
@@ -1920,6 +2182,10 @@ pub async fn run_destination(
     admission: common::EndpointAdmission,
     cert_key: Option<&remote::tls::CertifiedKey>,
     source_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
+    transport: &remote::protocol::DestinationTransport,
+    master_control: &remote::stdio::DaemonControlSender,
+    fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
+    cleanup: &remote::RemoteCleanup,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let directory_work = match admission {
         common::EndpointAdmission::Remote(resources) => resources.leaf_capacity,
@@ -1959,142 +2225,204 @@ pub async fn run_destination(
             "disabled"
         }
     );
-    tracing::info!(
-        "Connecting to source: control={}, data={}",
-        src_control_addr,
-        src_data_addr
-    );
-    // connect to source's control port (socket options applied by the connect helper)
-    let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
-    tracing::info!("Connected to source control port");
-    // wrap control connection with TLS if configured
-    // the handshake is bounded because a peer that establishes TCP then stalls it would otherwise
-    // hang here indefinitely, BEFORE any teardown state exists (only the TCP connect above was
-    // timed out)
-    let (control_send_stream, control_recv_stream) = remote::tls::connect_bounded(
-        tls_connector.as_deref(),
-        remote::tls::SERVER_NAME_SOURCE,
+    let ConnectedDestinationTransport {
         control_stream,
-        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
-        "control",
+        data_addrs,
+        ssh_tunnels,
+        via_ssh_tunnel,
+    } = connect_destination_transport(
+        src_control_addr,
+        src_data_addrs,
+        dry_run,
+        transport,
+        tcp_config,
+        master_control,
+        fallback_rx,
+        cleanup,
     )
     .await?;
-    // wrap in Arc<Mutex<>> for shared access
-    let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
-    if let Some(limits) = directory_limits {
-        control_send_stream
-            .lock()
-            .await
-            .send_control_message(&limits)
-            .await
-            .context("failed to advertise destination directory capacity")?;
-    }
-    tracing::info!("Created control streams");
-    let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
-    let directory_tracker = directory_tracker::SharedDirectoryTracker::new(
-        control_send_stream.clone(),
-        *preserve,
-        settings.fail_early,
-        error_collector.clone(),
-    );
-    // create a pool of data connections to source
-    let data_pool = std::sync::Arc::new(DataConnectionPool::new(
-        *src_data_addr,
-        concurrency.max_connections().get(),
-        tcp_config,
-        tls_connector,
-        directory_tracker.shutdown().clone(),
-    ));
-    // one operation-level indirection bounds the nested receiver layout in rcpd's watchdog
-    // future; the same owner still drives control work through completion and teardown
-    let mut control_future = Box::pin(process_control_stream(
-        directory_limits,
-        settings,
-        overwrite_manifest_max_entries,
-        directory_work,
-        concurrency.max_pending_files(),
-        preserve,
-        control_recv_stream,
-        directory_tracker.clone(),
-        control_send_stream,
-        data_pool.clone(),
-        error_collector.clone(),
-    ));
-    // ordinary copies drive both receiver futures to completion before choosing an error; dropping
-    // the loser could discard a file mid-record and replace its cause with a teardown symptom
-    // cleanup runs beside that future because it may own the control send lock across I/O
-    let (file_result, control_result) = if dry_run {
-        // the master explicitly disables data work; a slow preview has no data handshake deadline
-        let control_result = control_future.await;
-        directory_tracker.close_stream().await;
-        (Ok(()), control_result)
-    } else {
-        let file_handler_future = process_incoming_file_streams_tcp(
-            settings.clone(),
-            *preserve,
-            data_pool.clone(),
-            directory_tracker.clone(),
-            error_collector.clone(),
-        );
-        tokio::pin!(file_handler_future);
-        tokio::select! {
-            file_result = &mut file_handler_future => {
-                let ((), control_result) = tokio::join!(
-                    directory_tracker.close_stream(),
-                    &mut control_future,
-                );
-                (file_result, control_result)
-            }
-            control_result = &mut control_future => {
-                let ((), file_result) = tokio::join!(
-                    directory_tracker.close_stream(),
-                    &mut file_handler_future,
-                );
-                (file_result, control_result)
-            }
+    let attach_ssh_control_hint = |error: anyhow::Error| {
+        if via_ssh_tunnel {
+            error.context(
+                "control connection over SSH tunnel failed (if the remote SSH server \
+                 disables TCP port forwarding, verify `AllowTcpForwarding` in sshd_config)",
+            )
+        } else {
+            error
         }
     };
-    // build summary from progress counters (used by every exit path below; the counters are
-    // final now that the select! above has driven both futures to completion).
-    let prog = progress();
-    let summary = common::copy::Summary {
-        bytes_copied: prog.bytes_copied.get(),
-        files_copied: prog.files_copied.get() as usize,
-        symlinks_created: prog.symlinks_created.get() as usize,
-        directories_created: prog.directories_created.get() as usize,
-        files_unchanged: prog.files_unchanged.get() as usize,
-        symlinks_unchanged: prog.symlinks_unchanged.get() as usize,
-        directories_unchanged: prog.directories_unchanged.get() as usize,
-        // filtering is applied on the source side, so destination skipped counts are always 0
-        files_skipped: 0,
-        symlinks_skipped: 0,
-        directories_skipped: 0,
-        specials_skipped: 0,
-        rm_summary: common::rm::Summary {
-            bytes_removed: prog.bytes_removed.get(),
-            files_removed: prog.files_removed.get() as usize,
-            symlinks_removed: prog.symlinks_removed.get() as usize,
-            directories_removed: prog.directories_removed.get() as usize,
+    let result = async {
+        tracing::info!("Connected to source control port");
+        // wrap control connection with TLS if configured
+        // the handshake is bounded because a peer that establishes TCP then stalls it would otherwise
+        // hang here indefinitely, BEFORE any teardown state exists (only the TCP connect above was
+        // timed out)
+        let (control_send_stream, control_recv_stream) = remote::tls::connect_bounded(
+            tls_connector.as_deref(),
+            remote::tls::SERVER_NAME_SOURCE,
+            control_stream,
+            std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+            "control",
+        )
+        .await
+        .map_err(attach_ssh_control_hint)?;
+        // wrap in Arc<Mutex<>> for shared access
+        let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
+        if let Some(limits) = directory_limits {
+            control_send_stream
+                .lock()
+                .await
+                .send_control_message(&limits)
+                .await
+                .context("failed to advertise destination directory capacity")
+                .map_err(attach_ssh_control_hint)?;
+        }
+        tracing::info!("Created control streams");
+        let error_collector =
+            std::sync::Arc::new(common::error_collector::ErrorCollector::default());
+        let directory_tracker = directory_tracker::SharedDirectoryTracker::new(
+            control_send_stream.clone(),
+            *preserve,
+            settings.fail_early,
+            error_collector.clone(),
+        );
+        let tls_enabled = tls_connector.is_some();
+        // create a pool of data connections to source
+        let data_pool = std::sync::Arc::new(DataConnectionPool::new(
+            data_addrs,
+            concurrency.max_connections().get(),
+            tcp_config,
+            tls_connector,
+            directory_tracker.shutdown().clone(),
+        ));
+        // one operation-level indirection bounds the nested receiver layout in rcpd's watchdog
+        // future; the same owner still drives control work through completion and teardown
+        let mut control_future = Box::pin(process_control_stream(
+            directory_limits,
+            settings,
+            overwrite_manifest_max_entries,
+            directory_work,
+            concurrency.max_pending_files(),
+            preserve,
+            control_recv_stream,
+            directory_tracker.clone(),
+            control_send_stream,
+            data_pool.clone(),
+            error_collector.clone(),
+        ));
+        // ordinary copies drive both receiver futures to completion before choosing an error; dropping
+        // the loser could discard a file mid-record and replace its cause with a teardown symptom
+        // cleanup runs beside that future because it may own the control send lock across I/O
+        let (file_result, control_result) = if dry_run {
+            // the master explicitly disables data work; a slow preview has no data handshake deadline
+            let control_result = control_future.await;
+            directory_tracker.close_stream().await;
+            (Ok(()), control_result)
+        } else {
+            let file_handler_future = process_incoming_file_streams_tcp(
+                settings.clone(),
+                *preserve,
+                data_pool.clone(),
+                directory_tracker.clone(),
+                error_collector.clone(),
+            );
+            tokio::pin!(file_handler_future);
+            tokio::select! {
+                file_result = &mut file_handler_future => {
+                    let ((), control_result) = tokio::join!(
+                        directory_tracker.close_stream(),
+                        &mut control_future,
+                    );
+                    (file_result, control_result)
+                }
+                control_result = &mut control_future => {
+                    let ((), file_result) = tokio::join!(
+                        directory_tracker.close_stream(),
+                        &mut file_handler_future,
+                    );
+                    (file_result, control_result)
+                }
+            }
+        };
+        // build summary from progress counters (used by every exit path below; the counters are
+        // final now that the select! above has driven both futures to completion).
+        let prog = progress();
+        let summary = common::copy::Summary {
+            bytes_copied: prog.bytes_copied.get(),
+            files_copied: prog.files_copied.get() as usize,
+            symlinks_created: prog.symlinks_created.get() as usize,
+            directories_created: prog.directories_created.get() as usize,
+            files_unchanged: prog.files_unchanged.get() as usize,
+            symlinks_unchanged: prog.symlinks_unchanged.get() as usize,
+            directories_unchanged: prog.directories_unchanged.get() as usize,
             // filtering is applied on the source side, so destination skipped counts are always 0
             files_skipped: 0,
             symlinks_skipped: 0,
             directories_skipped: 0,
-        },
-    };
-    // Choose the final result. Both futures have completed and the control stream + data pool were
-    // already closed by shared cancellation and stream cleanup. Read completion ONCE — the tracker is quiescent
-    // (both futures done). Logical completion and a successfully sent Done must both hold.
-    let completed = directory_tracker.with_state(|state| state.transfer_complete());
-    let recorded = error_collector.take_error();
-    let connect_cause = data_pool.shutdown.take_first_connect_error();
-    choose_final_result(
-        recorded,
-        file_result,
-        control_result,
-        completed,
-        connect_cause,
-        summary,
-    )
+            specials_skipped: 0,
+            rm_summary: common::rm::Summary {
+                bytes_removed: prog.bytes_removed.get(),
+                files_removed: prog.files_removed.get() as usize,
+                symlinks_removed: prog.symlinks_removed.get() as usize,
+                directories_removed: prog.directories_removed.get() as usize,
+                // filtering is applied on the source side, so destination skipped counts are always 0
+                files_skipped: 0,
+                symlinks_skipped: 0,
+                directories_skipped: 0,
+            },
+        };
+        // Choose the final result. Both futures have completed and the control stream + data pool were
+        // already closed by shared cancellation and stream cleanup. Read completion ONCE — the tracker is quiescent
+        // (both futures done). Logical completion and a successfully sent Done must both hold.
+        let completed = directory_tracker.with_state(|state| state.transfer_complete());
+        let recorded = error_collector.take_error();
+        let had_recorded_error = recorded.is_some();
+        let connect_cause = data_pool.shutdown.take_first_connect_error();
+        let had_connect_cause = connect_cause.is_some();
+        let result = choose_final_result(
+            recorded,
+            file_result,
+            control_result,
+            completed,
+            connect_cause,
+            summary,
+        );
+        match result {
+            Err(err)
+                if via_ssh_tunnel
+                    && (!tls_enabled || had_connect_cause)
+                    && !completed
+                    && !had_recorded_error
+                    && summary.files_copied == 0
+                    && summary.directories_created == 0
+                    && summary.symlinks_created == 0
+                    && summary.files_unchanged == 0
+                    && summary.directories_unchanged == 0
+                    && summary.symlinks_unchanged == 0 =>
+            {
+                let err = match err.downcast::<common::copy::Error>() {
+                    Ok(mut copy_err) => {
+                        copy_err.source = copy_err.source.context(
+                            "transfer over SSH tunnel closed before receiving data (if the remote SSH \
+                             server disables TCP port forwarding, verify `AllowTcpForwarding` in sshd_config)",
+                        );
+                        copy_err.into()
+                    }
+                    Err(other) => other.context(
+                        "transfer over SSH tunnel closed before receiving data (if the remote SSH \
+                         server disables TCP port forwarding, verify `AllowTcpForwarding` in sshd_config)",
+                    ),
+                };
+                Err(err)
+            }
+            other => other,
+        }
+    }
+    .await;
+    if let Some(tunnels) = ssh_tunnels {
+        tunnels.close().await;
+    }
+    result
 }
 
 /// Preserve a fatal control cause ahead of collected operation errors and teardown effects.
@@ -4435,7 +4763,7 @@ mod teardown_tests {
         tracker: &directory_tracker::SharedDirectoryTracker,
     ) -> std::sync::Arc<DataConnectionPool> {
         std::sync::Arc::new(DataConnectionPool::new(
-            "127.0.0.1:1".parse().unwrap(),
+            vec!["127.0.0.1:1".parse().unwrap()],
             1,
             &remote::TcpConfig {
                 keepalive_sec: remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
@@ -4465,7 +4793,7 @@ mod teardown_tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let tracker = tracker_over_sink();
             let pool = DataConnectionPool::new(
-                listener.local_addr().unwrap(),
+                vec![listener.local_addr().unwrap()],
                 1,
                 &tcp,
                 None,
@@ -4511,7 +4839,7 @@ mod teardown_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tracker = tracker_over_sink();
         let pool = DataConnectionPool::new(
-            listener.local_addr().unwrap(),
+            vec![listener.local_addr().unwrap()],
             1,
             &remote::TcpConfig {
                 keepalive_sec: 0,
@@ -4726,7 +5054,7 @@ mod teardown_tests {
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let pool = Arc::new(DataConnectionPool::new(
-                listener.local_addr().unwrap(),
+                vec![listener.local_addr().unwrap()],
                 1,
                 &remote::TcpConfig {
                     keepalive_sec: remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
@@ -5389,7 +5717,7 @@ mod teardown_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tracker = tracker_over_sink();
         let pool = Arc::new(DataConnectionPool::new(
-            listener.local_addr().unwrap(),
+            vec![listener.local_addr().unwrap()],
             1,
             &remote::TcpConfig {
                 keepalive_sec: 0,
@@ -5632,5 +5960,124 @@ mod removal_tests {
             "overwrite removes the entry currently occupying the contained slot"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ssh_transport_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn data_pool_round_robins_across_multiple_tunnel_endpoints() {
+        let tcp = remote::TcpConfig {
+            keepalive_sec: 0,
+            conn_timeout_sec: 5,
+            ..Default::default()
+        };
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let pool = DataConnectionPool::new(
+            vec![addr_a, addr_b],
+            4,
+            &tcp,
+            None,
+            ReceiverShutdown::default(),
+        );
+        for _ in 0..2 {
+            let (conn1, peer1) = tokio::join!(
+                pool.connect_and_handshake(),
+                remote::accept_tcp_data(&listener_a, tcp.network_profile, tcp.keepalive_sec)
+            );
+            conn1.unwrap();
+            peer1.unwrap();
+            let (conn2, peer2) = tokio::join!(
+                pool.connect_and_handshake(),
+                remote::accept_tcp_data(&listener_b, tcp.network_profile, tcp.keepalive_sec)
+            );
+            conn2.unwrap();
+            peer2.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_master_ssh_falls_back_when_direct_probe_fails() {
+        // bind and drop a listener to guarantee an unreachable loopback port
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unreachable_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let fallback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_control_addr = fallback_listener.local_addr().unwrap();
+        let fallback_data_addrs = vec![
+            "127.0.0.1:41001".parse().unwrap(),
+            "127.0.0.1:41002".parse().unwrap(),
+        ];
+        let (control_tx, control_rx) = remote::stdio::daemon_control_channel();
+        let (_tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (daemon_write, master_read) = tokio::io::duplex(4096);
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer = tokio::spawn(remote::stdio::run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            remote::streams::SendStream::new(daemon_write),
+            writer_shutdown.clone(),
+        ));
+        let (mut master_rx, demux) = remote::stdio::spawn_master_stdout_demux(
+            remote::streams::RecvStream::new(master_read),
+            remote::tracelog::RcpdType::Destination,
+        );
+        let (fallback_tx, fallback_rx) = tokio::sync::oneshot::channel();
+        let cleanup = remote::RemoteCleanup::new().unwrap();
+        let tcp = remote::TcpConfig {
+            keepalive_sec: 0,
+            conn_timeout_sec: 5,
+            ..Default::default()
+        };
+        let fallback_data_expected = fallback_data_addrs.clone();
+        let master_task = tokio::spawn(async move {
+            match master_rx.recv_destination_event().await.unwrap() {
+                Some(remote::stdio::DestinationControlEvent::DirectConnectFailed { reason }) => {
+                    assert!(!reason.is_empty());
+                }
+                other => panic!("expected DirectConnectFailed, got {other:?}"),
+            }
+            fallback_tx
+                .send(SshFallbackEndpoints {
+                    control_addr: fallback_control_addr,
+                    data_addrs: fallback_data_addrs,
+                })
+                .unwrap();
+            let (_peer, _) = remote::accept_tcp_control(&fallback_listener, &tcp)
+                .await
+                .unwrap();
+        });
+        let connected = connect_destination_transport(
+            &unreachable_addr,
+            &[unreachable_addr],
+            false,
+            &remote::protocol::DestinationTransport::AutoMasterSsh {
+                probe_timeout_sec: 2,
+            },
+            &remote::TcpConfig {
+                keepalive_sec: 0,
+                conn_timeout_sec: 5,
+                ..Default::default()
+            },
+            &control_tx,
+            Some(fallback_rx),
+            &cleanup,
+        )
+        .await
+        .unwrap();
+        assert!(connected.via_ssh_tunnel);
+        assert!(connected.ssh_tunnels.is_none());
+        assert_eq!(connected.data_addrs, fallback_data_expected);
+        master_task.await.unwrap();
+        drop(control_tx);
+        writer_shutdown.cancel();
+        writer.await.unwrap().unwrap();
+        demux.join().await.unwrap();
+        cleanup.finish();
     }
 }

@@ -2079,3 +2079,45 @@ fn require_toctou_safe_dry_run_delete_over_replaced_intermediate_symlink() {
         .assert()
         .success();
 }
+
+#[test]
+fn test_remote_transport_cli_flags_validation_and_help() {
+    let help = Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help_text = String::from_utf8(help).unwrap();
+    for flag in [
+        "--remote-transport",
+        "--ssh-tunnels",
+        "--ssh-forward-agent",
+        "--remote-direct-probe-timeout-sec",
+    ] {
+        assert!(
+            help_text.contains(flag),
+            "expected {flag} in `rcp --help` output"
+        );
+    }
+    // reject invalid transport mode
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--remote-transport=invalid", "/tmp/a", "/tmp/b"])
+        .assert()
+        .failure();
+    // reject zero tunnel count
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--ssh-tunnels=0", "/tmp/a", "/tmp/b"])
+        .assert()
+        .failure();
+    // reject zero probe timeout
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--remote-direct-probe-timeout-sec=0", "/tmp/a", "/tmp/b"])
+        .assert()
+        .failure();
+}

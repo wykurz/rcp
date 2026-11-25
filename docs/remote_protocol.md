@@ -63,10 +63,13 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 13 moves master↔rcpd control and tracing onto the SSH exec channel's framed
-`stdin`/`stdout` pipes (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), removing the master-facing TCP
-listener and `--master-cert-fp`, following revision 12's process statistics counters and revision
-11's receiver copy-buffer retention configuration. It requires exact-version rcp/rcpd binaries.
+revision 14 adds SSH data/control transport and direct-TCP fallback (`DestinationTransport`,
+`MasterHello::Source::accept_timeout_sec`, `MasterHello::Destination::source_data_addrs`,
+`SourceMasterHello::tunnel_target_ip`, `MasterToRcpd::SshFallbackEndpoints`, and
+`RcpdToMaster::DirectConnectFailed`), building on revision 13's SSH `stdin`/`stdout` master↔rcpd
+transport (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), revision 12's process statistics counters,
+and revision 11's receiver copy-buffer retention configuration. It requires exact-version rcp/rcpd
+binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
 and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
@@ -123,37 +126,42 @@ least 60 seconds. On peer cancellation, the transfer gets a bounded grace to clo
 before its local SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
-`ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
-SSH configuration from forking it away from its owner, and `ServerAliveInterval` /
-`ServerAliveCountMax` (or `ServerAliveInterval=0` when `--remote-keepalive-sec=0`) enforce the
-configured keepalive budget on the SSH transport. Cancelling setup aborts that owner and
-`kill_on_drop` terminates the actual connecting process. The configured SSH executable is resolved
-inside a known-local shell child. Brackets that delimit IPv6 in an rcp operand are removed from the
-direct OpenSSH host argument; leaving them in argv makes OpenSSH resolve the brackets as literal
-hostname characters. After setup, commands open channels with the native OpenSSH multiplex protocol
-over the retained control socket rather than synchronously spawning another local `ssh`, so their
-configured deadline also covers exec-channel creation. A preparation guard owns the foreground child
-and private control directory together until success transfers both to a cloneable managed session
-through prepared and running daemon states. Whichever owner exits signals the master before
-returning. The cleanup supervisor is created before any remote resource is accepted. Process reaping
-is queued there, so it cannot block or depend on a Tokio runtime that may already be shutting down.
-The supervisor normally dispatches blocking cleanup to a worker; worker-creation failure runs the
-job on the supervisor rather than the original resource-owning submitter. A failed supervisor
-channel tries an isolated worker and, if no worker can be created, leaks the job so the OS reclaims
-its owned resources at process exit. Every reaper for an SSH master or an interrupted local
-candidate must receive the cleanup scope's typed budget; its effective deadline is the earlier of
-its per-job deadline and the invocation's shared final deadline. The common poll helper therefore
-cannot spin forever on a child that never becomes reapable. The control directory is removed only
-after the retained master is confirmed exited; expiry preserves it rather than deleting the socket
-from under a possibly-live master. The master threads actual local operand roots through remote-HOME
-lookup and endpoint preparation; canonical control-directory candidates inside those trees are
-rejected, while remote-to-remote copies do not infer an exclusion from the working directory. The
-filesystem root cannot exclude candidates because every absolute socket path lies beneath it. Nested
-cleanup runs inside its parent cleanup worker, and separate invocations cannot drain one another's
-workers. Before process exit, the CLI gives the scope one bounded budget to wait for its last
-resource owner, supervisor, and every cleanup job; work still blocked after that grace is abandoned
-with the process. Daemon waits run concurrently across endpoints while tracing receivers stay live,
-then any remaining receiver tasks share one final drain deadline.
+`ForkAfterAuthentication=no`, `ControlPersist=no`, and `ClearAllForwardings=yes` command-line
+overrides prevent user or system SSH configuration from backgrounding it or colliding with
+user-configured port forwards, and `ServerAliveInterval` / `ServerAliveCountMax` (or
+`ServerAliveInterval=0` when `--remote-keepalive-sec=0`) enforce the configured keepalive budget on
+the SSH transport. For 3-host SSH copies where agent forwarding is active (`--ssh-forward-agent` or
+`ForwardAgent` in `~/.ssh/config`), the destination daemon is spawned through
+`ssh -S <control_path> -T` so OpenSSH propagates `SSH_AUTH_SOCK` into the multiplexed session;
+`--ssh-forward-agent` passes `-o ForwardAgent=yes` only on the destination endpoint. Cancelling
+setup aborts that owner and `kill_on_drop` terminates the actual connecting process. The configured
+SSH executable is resolved inside a known-local shell child. Brackets that delimit IPv6 in an rcp
+operand are removed from the direct OpenSSH host argument; leaving them in argv makes OpenSSH
+resolve the brackets as literal hostname characters. After setup, commands open channels with the
+native OpenSSH multiplex protocol over the retained control socket rather than synchronously
+spawning another local `ssh`, so their configured deadline also covers exec-channel creation. A
+preparation guard owns the foreground child and private control directory together until success
+transfers both to a cloneable managed session through prepared and running daemon states. Whichever
+owner exits signals the master before returning. The cleanup supervisor is created before any remote
+resource is accepted. Process reaping is queued there, so it cannot block or depend on a Tokio
+runtime that may already be shutting down. The supervisor normally dispatches blocking cleanup to a
+worker; worker-creation failure runs the job on the supervisor rather than the original
+resource-owning submitter. A failed supervisor channel tries an isolated worker and, if no worker
+can be created, leaks the job so the OS reclaims its owned resources at process exit. Every reaper
+for an SSH master or an interrupted local candidate must receive the cleanup scope's typed budget;
+its effective deadline is the earlier of its per-job deadline and the invocation's shared final
+deadline. The common poll helper therefore cannot spin forever on a child that never becomes
+reapable. The control directory is removed only after the retained master is confirmed exited;
+expiry preserves it rather than deleting the socket from under a possibly-live master. The master
+threads actual local operand roots through remote-HOME lookup and endpoint preparation; canonical
+control-directory candidates inside those trees are rejected, while remote-to-remote copies do not
+infer an exclusion from the working directory. The filesystem root cannot exclude candidates because
+every absolute socket path lies beneath it. Nested cleanup runs inside its parent cleanup worker,
+and separate invocations cannot drain one another's workers. Before process exit, the CLI gives the
+scope one bounded budget to wait for its last resource owner, supervisor, and every cleanup job;
+work still blocked after that grace is abandoned with the process. Daemon waits run concurrently
+across endpoints while tracing receivers stay live, then any remaining receiver tasks share one
+final drain deadline.
 
 Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
 skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
@@ -246,11 +254,48 @@ connections; Master ↔ rcpd control and tracing remain protected by SSH.
    - **Master → Source (`stdin`)**: `MasterToRcpd::Hello` and periodic `MasterToRcpd::Heartbeat`
    - **Source → Master (`stdout`)**: Multiplexed `RcpdToMaster::{SourceHello, Result, Tracing}`
      (control frames prioritized over tracing/progress)
-2. **Master ↔ Destination**: SSH exec channel `stdin`/`stdout` (same framing and multiplexing)
-3. **Source ↔ Destination**: Two TCP ports on source (destination connects to both):
+2. **Master ↔ Destination**: SSH exec channel `stdin`/`stdout` (same framing and multiplexing, plus
+   optional `RcpdToMaster::DirectConnectFailed` and `MasterToRcpd::SshFallbackEndpoints` in
+   `--remote-transport=auto`)
+3. **Source ↔ Destination**: Two TCP ports on source (destination connects to both, either directly
+   or through SSH port forwards):
    - **Control port**: Bidirectional TCP for directory metadata and coordination
    - **Data port**: A pool of TCP connections for file transfers (each connection is reused for
-     multiple files)
+     multiple files, striped round-robin across `source_data_addrs` when multiple SSH tunnels are
+     active)
+
+**SSH Data Transport (`--remote-transport=ssh|auto`):**
+
+Direct TCP (`--remote-transport=tcp`) remains the default. When `--remote-transport=ssh` or `auto`
+is selected, data never relays through the master host in 3-host topologies:
+
+- **Same-host (`host:/a host:/b`, matching host and port)**: Direct loopback (`127.0.0.1` in `ssh`
+  mode), no SSH data tunnels, and no slow-path warning.
+- **Download (`remote:/src /local/dst`)**: Master opens `1..=K` parallel `-L` local port forwards
+  over OpenSSH mux v4 (`MUX_C_OPEN_FWD`) to the source host's `tunnel_target_ip`, reusing the
+  prepared source SSH session as tunnel #1 and spawning up to `K - 1` independent `ssh -M -N`
+  sessions in parallel (degrading gracefully down to `1`).
+- **Upload (`/local/src remote:/dst`)**: Master opens `1..=K` parallel `-R` remote port forwards
+  (`127.0.0.1:0`, receiving `MUX_S_REMOTE_PORT`) on the destination host back to the local source's
+  `tunnel_target_ip`, reusing the prepared destination SSH session as tunnel #1.
+- **3-Host (`host1:/src host2:/dst`, distinct remote hosts)**: Master resolves `host1`'s effective
+  `(user, hostname, port)` locally with `ssh -G` and passes it (together with `dest_root` so remote
+  SSH control directories avoid the destination tree) in `DestinationTransport::DirectSsh` or
+  `DestinationTransport::AutoDirectSsh`. The destination daemon on `host2` opens `1..=K` parallel
+  `-L` tunnels directly to `host1` (using `host2`'s SSH keys or a forwarded agent via
+  `--ssh-forward-agent` / `~/.ssh/config`).
+- **Automatic fallback (`--remote-transport=auto`)**: Destination first probes direct TCP to
+  `source_control_addr` using `--remote-direct-probe-timeout-sec` (capped at
+  `--remote-copy-conn-timeout-sec`). If TCP connect succeeds, that socket becomes the control
+  connection with zero extra round trips; if it fails before connecting, destination either requests
+  master-managed tunnels (`DirectConnectFailed` → `SshFallbackEndpoints`) for download and upload,
+  or opens direct `host2 → host1` tunnels for 3-host copies.
+- **Dry-run (`--dry-run`)**: Only forwards the control port over tunnel #1 (`K = 1`); no data
+  forwards or extra SSH connections are opened.
+- **Notice and TLS**: Any non-same-host transfer over SSH emits a default-visible `rcp::notice`
+  warning reporting the active tunnel count (and direct-TCP error reason on `auto` fallback).
+  Source↔Destination mutual TLS 1.3 remains enabled by default over SSH tunnels unless
+  `--no-encryption` is passed.
 
 **Connection Establishment Order:**
 
@@ -402,15 +447,19 @@ do not establish semantic or daemon-spawn compatibility.
   - `Heartbeat`: Periodic keepalive frame sent while `--remote-keepalive-sec > 0` (every
     `keepalive_sec / 3`), starting immediately upon daemon spawn so daemons detect a vanished master
     within `--remote-keepalive-sec` without relying on `sshd`'s `ClientAlive` settings (§6.3, §8.4).
+  - `SshFallbackEndpoints { control_addr, data_addrs }`: Sent once to destination `rcpd` after
+    `RcpdToMaster::DirectConnectFailed` in download/upload `--remote-transport=auto`, supplying the
+    master-opened loopback tunnel endpoints.
 
 **`MasterHello`** (inside `MasterToRcpd::Hello`)
 
 - **Purpose**: Provide configuration and connection details. After sending `Hello`, the master sends
-  only periodic `Heartbeat` frames until tearing down (closing `stdin` for EOF); each rcpd keeps a
-  reader on `stdin` as its unified liveness watchdog for the whole operation (§6.3).
+  only periodic `Heartbeat` frames (and at most one `SshFallbackEndpoints` frame in download/upload
+  `auto` fallback) until tearing down (closing `stdin` for EOF); each rcpd keeps a reader on `stdin`
+  as its unified liveness watchdog for the whole operation (§6.3).
 - **Variants**:
-  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture }`: Tells source rcpd what
-    to copy
+  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture, accept_timeout_sec }`:
+    Tells source rcpd what to copy
     - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces
       network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without
@@ -419,10 +468,14 @@ do not establish semantic or daemon-spawn compatibility.
       metadata the source must read beyond the `stat` it already does — currently POSIX ACLs. The
       first two are per-entry reads whose bytes are sent; `root_acl_notice` buys one read on the
       ROOT whose only product is a log line. See §2.5.
-  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint, dry_run }`:
-    Tells destination where to connect (both control and data addresses). Note: empty directory
-    cleanup decisions are communicated per-directory via `keep_if_empty` in `DirectoryBegin`
-    messages rather than a global flag.
+    - `accept_timeout_sec`: Seconds the source waits for destination's control connection, widened
+      beyond `--remote-copy-conn-timeout-sec` when SSH tunnel bring-up or `auto` direct-TCP probing
+      precedes destination connect.
+  - `Destination { source_control_addr, source_data_addrs, server_name, preserve, source_cert_fingerprint, dry_run, transport }`:
+    Tells destination where and how to connect (control address, pooled data address list striped
+    round-robin, and `DestinationTransport` mode: `Direct`, `MasterSshTunnel`, `AutoMasterSsh`,
+    `DirectSsh`, or `AutoDirectSsh`). Note: empty directory cleanup decisions are communicated
+    per-directory via `keep_if_empty` in `DirectoryBegin` messages rather than a global flag.
     - `dry_run`: The master's explicit preview-only policy. Destination starts no data workers and
       waits for `DiscoveryComplete(false)` over control, then sends `DestinationDone`. Source must
       receive that acknowledgement; premature control EOF is a failure. The data connection timeout
@@ -431,10 +484,12 @@ do not establish semantic or daemon-spawn compatibility.
 **`RcpdToMaster`** (rcpd → Master, SSH `stdout` stream)
 
 - **Purpose**: Multiplexed envelope carried over each daemon's SSH `stdout` pipe. Control frames
-  (`SourceHello`, `Result`) are prioritized ahead of `Tracing` frames.
+  (`SourceHello`, `DirectConnectFailed`, `Result`) are prioritized ahead of `Tracing` frames.
 - **Variants**:
   - `SourceHello(SourceMasterHello)`: Source's TCP server details (`control_addr`, `data_addr`,
-    `server_name`) for destination to connect.
+    `tunnel_target_ip`, `server_name`) for destination connection and SSH forwarding.
+  - `DirectConnectFailed { reason }`: Sent by destination `rcpd` when its `AutoMasterSsh` direct-TCP
+    probe fails and it needs master-managed SSH tunnels.
   - `Result(RcpdResult)`: Final success/failure status and statistics.
   - `Tracing(TracingMessage)`: Remote tracing logs, `rcp::notice` messages, and progress snapshots.
 
@@ -1010,8 +1065,9 @@ exit, then gives them their existing final drain grace.
   disconnect or the configured liveness policy rather than the five-second trace drain grace (with a
   brief post-EOF ack grace so normal master teardown closing `stdin` right after decoding
   `RcpdResult` cannot race with the writer's flush acknowledgement). A stray post-hello
-  `MasterToRcpd::Hello` is logged and ignored, while an undecodable frame is treated as a channel
-  failure.
+  `MasterToRcpd::Hello` or unexpected `MasterToRcpd::SshFallbackEndpoints` is logged and ignored,
+  while an expected `SshFallbackEndpoints` is routed to the destination connect routine without
+  interrupting keepalive monitoring, and an undecodable frame is treated as a channel failure.
 - If master dies unexpectedly, rcpd detects it and winds down through the normal return path (so
   strict-mode lockdown guards restore reused-directory ACLs)
 - No orphaned processes remain on remote hosts

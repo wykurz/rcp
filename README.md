@@ -543,6 +543,14 @@ Manual deployment is still supported and may be preferred for:
 
 **Configuration options:**
 
+- `--remote-transport` - source↔destination transport mode: `tcp` (default, fastest), `ssh` (tunnel
+  traffic over SSH without opening extra firewall ports), or `auto` (try direct TCP first, fall back
+  to SSH on failure)
+- `--ssh-tunnels` - parallel SSH tunnels for SSH data transport (default: 4, degrades gracefully
+  down to 1)
+- `--ssh-forward-agent` - forward the local SSH agent to the destination host for 3-host SSH copies
+- `--remote-direct-probe-timeout-sec` - direct-TCP probe timeout in seconds before falling back to
+  SSH in `--remote-transport=auto` (default: 3)
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
 - `--remote-copy-conn-timeout-sec` - remote SSH setup, tilde-expansion HOME lookup, discovery,
   version-probe, deployment-readiness/write-idle, daemon-readiness, and TCP connection timeout in

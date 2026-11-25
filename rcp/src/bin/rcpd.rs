@@ -475,7 +475,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for IdleTimeoutReader
 }
 
 enum MasterReadOutcome {
-    Message(remote::protocol::MasterToRcpd),
+    Message(Box<remote::protocol::MasterToRcpd>),
     Eof,
     KeepaliveTimedOut(std::time::Duration),
     Error(anyhow::Error),
@@ -498,7 +498,7 @@ impl<R: tokio::io::AsyncRead + Unpin> MasterStdinStream<R> {
             .recv_object::<remote::protocol::MasterToRcpd>()
             .await
         {
-            Ok(Some(message)) => MasterReadOutcome::Message(message),
+            Ok(Some(message)) => MasterReadOutcome::Message(Box::new(message)),
             Ok(None) => MasterReadOutcome::Eof,
             Err(error) => {
                 if let Some(budget) = find_keepalive_idle_timeout(&error) {
@@ -525,13 +525,17 @@ where
 {
     loop {
         match master_stdin.recv_message().await {
-            MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Hello(hello)) => {
-                return Ok(hello);
-            }
-            MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Heartbeat) => {
-                // master sends periodic heartbeats from spawn while bringing up the peer daemon
-                continue;
-            }
+            MasterReadOutcome::Message(message) => match *message {
+                remote::protocol::MasterToRcpd::Hello(hello) => return Ok(hello),
+                remote::protocol::MasterToRcpd::Heartbeat => {
+                    // master sends periodic heartbeats from spawn while bringing up the peer daemon
+                    continue;
+                }
+                remote::protocol::MasterToRcpd::SshFallbackEndpoints { .. } => {
+                    tracing::warn!("ignoring unexpected SshFallbackEndpoints before MasterHello");
+                    continue;
+                }
+            },
             MasterReadOutcome::Eof => {
                 return Err(OperationOutcome {
                     result: remote::protocol::RcpdResult::Failure {
@@ -577,23 +581,45 @@ struct MasterLoss {
     drain_stdout: bool,
 }
 
-/// Monitor the master's SSH stdin control stream for disconnect or missed heartbeats.
+/// Monitor the master's SSH stdin control stream for disconnect, missed heartbeats, or
+/// master-initiated fallback endpoints.
 ///
 /// The master sends periodic [`remote::protocol::MasterToRcpd::Heartbeat`] frames while alive
-/// (whenever `keepalive_sec > 0`) and closes stdin when tearing down. Returning ends the active
-/// operation.
-async fn master_stdin_watchdog<R>(master_stdin: &mut MasterStdinStream<R>) -> MasterLoss
+/// (whenever `keepalive_sec > 0`), optionally sends one
+/// [`remote::protocol::MasterToRcpd::SshFallbackEndpoints`] frame when destination `auto` mode
+/// falls back to SSH, and closes stdin when tearing down. Returning ends the active operation.
+async fn master_stdin_watchdog<R>(
+    master_stdin: &mut MasterStdinStream<R>,
+    mut fallback_tx: Option<tokio::sync::oneshot::Sender<destination::SshFallbackEndpoints>>,
+) -> MasterLoss
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
         match master_stdin.recv_message().await {
-            MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Heartbeat) => continue,
-            MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Hello(unexpected)) => {
-                tracing::warn!(
-                    "ignoring an unexpected hello message from the master after startup: {unexpected:?}"
-                );
-            }
+            MasterReadOutcome::Message(message) => match *message {
+                remote::protocol::MasterToRcpd::Heartbeat => continue,
+                remote::protocol::MasterToRcpd::SshFallbackEndpoints {
+                    control_addr,
+                    data_addrs,
+                } => {
+                    if let Some(tx) = fallback_tx.take() {
+                        let _ = tx.send(destination::SshFallbackEndpoints {
+                            control_addr,
+                            data_addrs,
+                        });
+                    } else {
+                        tracing::warn!(
+                            "ignoring unexpected SshFallbackEndpoints from master (control={control_addr})"
+                        );
+                    }
+                }
+                remote::protocol::MasterToRcpd::Hello(unexpected) => {
+                    tracing::warn!(
+                        "ignoring an unexpected hello message from the master after startup: {unexpected:?}"
+                    );
+                }
+            },
             MasterReadOutcome::Eof => {
                 return MasterLoss {
                     cause: "master closed its stdin control channel".to_string(),
@@ -669,6 +695,7 @@ async fn run_operation<R>(
     master_control: remote::stdio::DaemonControlSender,
     mut master_stdin: MasterStdinStream<R>,
     cert_key: Option<remote::tls::CertifiedKey>,
+    remote_cleanup: Option<remote::RemoteCleanup>,
 ) -> OperationOutcome
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -678,7 +705,17 @@ where
         Err(outcome) => return outcome,
     };
     tracing::info!("Received side: {:?}", master_hello);
-    let control_for_source = master_control.clone();
+    let (fallback_tx, fallback_rx) = match &master_hello {
+        remote::protocol::MasterHello::Destination {
+            transport: remote::protocol::DestinationTransport::AutoMasterSsh { .. },
+            ..
+        } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        }
+        _ => (None, None),
+    };
+    let control_for_op = master_control.clone();
     let operation = async move {
         args.validate_preview_mode(&master_hello)?;
         match master_hello {
@@ -689,12 +726,14 @@ where
                 filter,
                 dry_run,
                 capture,
+                accept_timeout_sec,
             } => {
                 // build settings with filter from MasterHello
                 let settings = args.to_copy_settings(filter, dry_run, tcp_config)?;
+                let accept_timeout = std::time::Duration::from_secs(accept_timeout_sec.max(1));
                 tracing::info!("Starting source");
                 source::run_source(
-                    &control_for_source,
+                    &control_for_op,
                     &src,
                     &dst,
                     &settings,
@@ -704,6 +743,7 @@ where
                     admission,
                     files_source,
                     args.bind_ip.as_deref(),
+                    accept_timeout,
                     cert_key.as_ref(),
                     dest_cert_fingerprint,
                 )
@@ -711,12 +751,16 @@ where
             }
             remote::protocol::MasterHello::Destination {
                 source_control_addr,
-                source_data_addr,
+                source_data_addrs,
                 server_name,
                 preserve,
                 source_cert_fingerprint,
                 dry_run,
+                transport,
             } => {
+                let cleanup = remote_cleanup.as_ref().context(
+                    "destination rcpd was invoked without a RemoteCleanup supervisor (check --role)",
+                )?;
                 // destination doesn't use filter (filtering happens at source).
                 // empty directory cleanup decisions are communicated per-directory
                 // via keep_if_empty in the Directory message.
@@ -724,7 +768,7 @@ where
                 tracing::info!("Starting destination");
                 destination::run_destination(
                     &source_control_addr,
-                    &source_data_addr,
+                    &source_data_addrs,
                     &server_name,
                     &settings,
                     dry_run,
@@ -735,12 +779,22 @@ where
                     admission,
                     cert_key.as_ref(),
                     source_cert_fingerprint,
+                    &transport,
+                    &control_for_op,
+                    fallback_rx,
+                    cleanup,
                 )
                 .await
             }
         }
     };
-    run_guarded_operation_and_send_result(operation, &mut master_stdin, &master_control).await
+    run_guarded_operation_and_send_result(
+        operation,
+        &mut master_stdin,
+        &master_control,
+        fallback_tx,
+    )
+    .await
 }
 
 enum WatchdogOutcome<T> {
@@ -822,14 +876,19 @@ where
             }
             outcome = master_stdin.recv_message() => {
                 match outcome {
-                    MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Heartbeat) => {
-                        continue;
-                    }
-                    MasterReadOutcome::Message(remote::protocol::MasterToRcpd::Hello(unexpected)) => {
-                        tracing::warn!(
-                            "ignoring an unexpected hello message from the master while sending result: {unexpected:?}"
-                        );
-                    }
+                    MasterReadOutcome::Message(message) => match *message {
+                        remote::protocol::MasterToRcpd::Heartbeat => continue,
+                        remote::protocol::MasterToRcpd::SshFallbackEndpoints { .. } => {
+                            tracing::warn!(
+                                "ignoring unexpected SshFallbackEndpoints while sending result"
+                            );
+                        }
+                        remote::protocol::MasterToRcpd::Hello(unexpected) => {
+                            tracing::warn!(
+                                "ignoring an unexpected hello message from the master while sending result: {unexpected:?}"
+                            );
+                        }
+                    },
                     MasterReadOutcome::Eof => {
                         return match tokio::time::timeout(STDIN_EOF_RESULT_ACK_GRACE, &mut send).await {
                             Ok(Ok(())) => OperationOutcome {
@@ -907,13 +966,16 @@ async fn run_guarded_operation_and_send_result<Operation, R>(
     operation: Operation,
     master_stdin: &mut MasterStdinStream<R>,
     master_control: &remote::stdio::DaemonControlSender,
+    fallback_tx: Option<tokio::sync::oneshot::Sender<destination::SshFallbackEndpoints>>,
 ) -> OperationOutcome
 where
     Operation: std::future::Future<Output = anyhow::Result<(String, common::copy::Summary)>>,
     R: tokio::io::AsyncRead + Unpin,
 {
     let outcome =
-        match run_with_master_watchdog(operation, master_stdin_watchdog(master_stdin)).await {
+        match run_with_master_watchdog(operation, master_stdin_watchdog(master_stdin, fallback_tx))
+            .await
+        {
             WatchdogOutcome::Completed(outcome) => outcome,
             WatchdogOutcome::MasterLost(loss) => {
                 tracing::error!(
@@ -963,7 +1025,7 @@ async fn finish_stdout_writer(
     }
 }
 
-#[instrument(skip(tracing_receiver))]
+#[instrument(skip(tracing_receiver, remote_cleanup))]
 async fn async_main(
     args: Args,
     debug_log_file: Option<String>,
@@ -971,6 +1033,7 @@ async fn async_main(
     files_in_flight: common::ResolvedFilesInFlight,
     concurrency: remote::ResolvedRemoteConcurrency,
     admission: common::EndpointAdmission,
+    remote_cleanup: Option<remote::RemoteCleanup>,
 ) -> anyhow::Result<String> {
     if let Some(filename) = debug_log_file {
         tracing::info!("rcpd: Debug logging to file: {filename}");
@@ -1043,6 +1106,7 @@ async fn async_main(
         control_sender,
         master_stdin,
         cert_key,
+        remote_cleanup,
     )
     .await;
     if outcome.drain_stdout {
@@ -1128,9 +1192,22 @@ fn main() -> Result<(), anyhow::Error> {
         .debug_log_prefix
         .as_ref()
         .map(|prefix| common::generate_debug_log_filename(prefix));
+    let remote_cleanup = match (args.role == remote::protocol::RcpdRole::Destination)
+        .then(remote::RemoteCleanup::new)
+        .transpose()
+    {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            exit_with_startup_refusal(
+                &format!("failed to start remote cleanup supervisor: {error:#}"),
+                1,
+            );
+        }
+    };
     let func = {
         let args = args.clone();
         let debug_log_file = debug_log_file.clone();
+        let remote_cleanup = remote_cleanup.clone();
         |admission| {
             async_main(
                 args,
@@ -1139,6 +1216,7 @@ fn main() -> Result<(), anyhow::Error> {
                 files_in_flight,
                 concurrency,
                 admission,
+                remote_cleanup,
             )
         }
     };
@@ -1179,6 +1257,9 @@ fn main() -> Result<(), anyhow::Error> {
         None
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
+    if let Some(remote_cleanup) = remote_cleanup {
+        remote_cleanup.finish();
+    }
     if res.is_none() {
         std::process::exit(1);
     }
@@ -1329,7 +1410,7 @@ mod tests {
             common::task_scope::scope_tasks(operation_holding_children(dropped.clone(), cancel));
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_guarded_operation_and_send_result(operation, &mut master_stdin, &control_tx),
+            run_guarded_operation_and_send_result(operation, &mut master_stdin, &control_tx, None),
         )
         .await
         .expect("stdin cancellation must drain child captures");
@@ -1381,6 +1462,7 @@ mod tests {
             },
             &mut master_stdin,
             &control_tx,
+            None,
         )
         .await;
         drop(control_tx);
@@ -1465,6 +1547,7 @@ mod tests {
             },
             &mut master_stdin,
             &control_tx,
+            None,
         )
         .await;
         assert!(started.elapsed() >= std::time::Duration::from_secs(12));
@@ -1536,6 +1619,7 @@ mod tests {
             },
             &mut master_stdin,
             &control_tx,
+            None,
         )
         .await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(60));
@@ -1590,6 +1674,7 @@ mod tests {
             },
             &mut master_stdin,
             &control_tx,
+            None,
         )
         .await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
@@ -1710,6 +1795,7 @@ mod tests {
                         filter: None,
                         dry_run: None,
                         capture: Default::default(),
+                        accept_timeout_sec: 15,
                     },
                 ))
                 .await
@@ -1720,7 +1806,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let _hello = receive_master_hello(&mut master_stdin).await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(600));
-        let loss = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin, None).await;
         sender.await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(1200));
         assert_eq!(loss.cause, "master closed its stdin control channel");
@@ -1741,6 +1827,7 @@ mod tests {
             filter: Some(filter),
             dry_run: None,
             capture: Default::default(),
+            accept_timeout_sec: 15,
         };
         let mut encoded = Vec::new();
         remote::streams::SendStream::new(&mut encoded)
@@ -1826,6 +1913,7 @@ mod tests {
             filter: None,
             dry_run: None,
             capture: Default::default(),
+            accept_timeout_sec: 15,
         };
         let hello_to_send = expected_hello.clone();
         let sender = tokio::spawn(async move {
@@ -1846,7 +1934,7 @@ mod tests {
         let _keep_open = sender.await.unwrap();
         // silence longer than keepalive_sec triggers timeout in the post-hello watchdog
         let started = tokio::time::Instant::now();
-        let loss = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin, None).await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
         assert!(!loss.drain_stdout);
         assert!(
@@ -1872,9 +1960,54 @@ mod tests {
             drop(send_stream);
         });
         let started = tokio::time::Instant::now();
-        let loss = master_stdin_watchdog(&mut master_stdin).await;
+        let loss = master_stdin_watchdog(&mut master_stdin, None).await;
         sender.await.unwrap();
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(6));
+        assert_eq!(loss.cause, "master closed its stdin control channel");
+        assert!(loss.drain_stdout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn master_stdin_watchdog_routes_ssh_fallback_endpoints_alongside_heartbeats() {
+        let (writer, reader) = tokio::io::duplex(4096);
+        let mut send_stream = remote::streams::SendStream::new(writer);
+        let mut master_stdin = MasterStdinStream::new(reader, 5);
+        let expected_control: std::net::SocketAddr = "127.0.0.1:46001".parse().unwrap();
+        let expected_data: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:46002".parse().unwrap(),
+            "127.0.0.1:46003".parse().unwrap(),
+        ];
+        let data_to_send = expected_data.clone();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            send_stream
+                .send_control_message(&remote::protocol::MasterToRcpd::Heartbeat)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            send_stream
+                .send_control_message(&remote::protocol::MasterToRcpd::SshFallbackEndpoints {
+                    control_addr: expected_control,
+                    data_addrs: data_to_send,
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            send_stream
+                .send_control_message(&remote::protocol::MasterToRcpd::Heartbeat)
+                .await
+                .unwrap();
+            drop(send_stream);
+        });
+        let (fallback_tx, fallback_rx) = tokio::sync::oneshot::channel();
+        let (endpoints, loss) = tokio::join!(
+            fallback_rx,
+            master_stdin_watchdog(&mut master_stdin, Some(fallback_tx)),
+        );
+        sender.await.unwrap();
+        let endpoints = endpoints.expect("watchdog must deliver fallback endpoints");
+        assert_eq!(endpoints.control_addr, expected_control);
+        assert_eq!(endpoints.data_addrs, expected_data);
         assert_eq!(loss.cause, "master closed its stdin control channel");
         assert!(loss.drain_stdout);
     }
@@ -2010,14 +2143,16 @@ mod tests {
                     filter: None,
                     dry_run: dry_run.then_some(common::DryRunMode::Brief),
                     capture: Default::default(),
+                    accept_timeout_sec: 15,
                 };
                 let destination = remote::protocol::MasterHello::Destination {
                     source_control_addr: "127.0.0.1:10001".parse().unwrap(),
-                    source_data_addr: "127.0.0.1:10002".parse().unwrap(),
+                    source_data_addrs: vec!["127.0.0.1:10002".parse().unwrap()],
                     server_name: "source".to_owned(),
                     preserve: Default::default(),
                     source_cert_fingerprint: None,
                     dry_run,
+                    transport: remote::protocol::DestinationTransport::Direct,
                 };
                 for hello in [&source, &destination] {
                     assert_eq!(
