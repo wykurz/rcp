@@ -152,34 +152,52 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
             vec![0; buffer_size]
         };
         let mut sent = 0;
-        while sent < size {
-            let read_size = (size - sent).min(buffer_size as u64) as usize;
+        loop {
+            let remaining = size - sent;
+            let read_size = remaining.min(buffer_size as u64) as usize;
             let (read_result, returned_file, returned_buffer) =
                 common::safedir::run_fd_admitted_blocking_with(admission, move || {
-                    let result = loop {
-                        match file.read(&mut buffer[..read_size]) {
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                            result => break result,
+                    let result = if read_size == 0 {
+                        Ok(0)
+                    } else {
+                        loop {
+                            match file.read(&mut buffer[..read_size]) {
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                result => break result,
+                            }
+                        }
+                    };
+                    let file = match &result {
+                        Ok(count) if *count > 0 && (*count as u64) < remaining => Some(file),
+                        _ => {
+                            // close may block on the source filesystem. finish it here on the
+                            // last read, without an extra hand-off for nonempty files.
+                            drop(file);
+                            None
                         }
                     };
                     Ok((result, file, buffer))
                 })
                 .await
                 .context("failed to read source payload")?;
-            file = returned_file;
             buffer = returned_buffer;
             #[cfg(test)]
-            owned_source_tests::record_buffer(&buffer);
-            let count = read_result.context("failed to read source payload")?;
-            if count == 0 {
-                break;
+            if read_size != 0 {
+                owned_source_tests::record_buffer(&buffer);
             }
-            self.framed
-                .get_mut()
-                .write_all(&buffer[..count])
-                .await
-                .context("failed to write source payload")?;
-            sent += count as u64;
+            let count = read_result.context("failed to read source payload")?;
+            if count != 0 {
+                self.framed
+                    .get_mut()
+                    .write_all(&buffer[..count])
+                    .await
+                    .context("failed to write source payload")?;
+                sent += count as u64;
+            }
+            let Some(next_file) = returned_file else {
+                break;
+            };
+            file = next_file;
         }
         // copy_buf flushed on completion, including premature EOF and empty payloads. preserve
         // that ordering so a flush error precedes the caller's snapshot-length check.

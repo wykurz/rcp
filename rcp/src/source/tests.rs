@@ -794,7 +794,8 @@ async fn cancelled_network_write_or_flush_closes_source_and_returns_admission() 
                 flushed_header: false,
                 reached: Some(reached),
             }));
-            let settings = settings(dereference);
+            let mut settings = settings(dereference);
+            settings.remote_copy_buffer_size = 4;
             let files_before = common::get_progress().files_copied.get();
             let bytes_before = common::get_progress().bytes_copied.get();
             let mut send = Box::pin(send(pool.clone(), &path, &settings));
@@ -805,7 +806,9 @@ async fn cancelled_network_write_or_flush_closes_source_and_returns_admission() 
                 }
             })
             .await?;
-            assert_eq!(open_payload_descriptors(&metadata)?, 1);
+            // the first write is nonfinal, so it still needs the reader; the flush does not.
+            let expected_open = usize::from(matches!(boundary, PayloadBoundary::Write));
+            assert_eq!(open_payload_descriptors(&metadata)?, expected_open);
             assert!(throttle::open_file_permit().now_or_never().is_none());
             drop(send);
             assert_eq!(open_payload_descriptors(&metadata)?, 0);

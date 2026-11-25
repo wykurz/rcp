@@ -13,6 +13,7 @@ struct Observations {
     writes: Vec<(usize, Vec<u8>)>,
     flushes: usize,
     dropped: bool,
+    drop_thread: Option<std::thread::ThreadId>,
 }
 
 tokio::task_local! {
@@ -71,7 +72,9 @@ impl Read for Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.observations.lock().unwrap().dropped = true;
+        let mut observations = self.observations.lock().unwrap();
+        observations.dropped = true;
+        observations.drop_thread = Some(std::thread::current().id());
     }
 }
 
@@ -255,6 +258,24 @@ async fn empty_and_short_payloads_flush_and_zero_configuration_normalizes() -> a
                     .all(|(_, size)| *size <= configured.max(1))
             );
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_finished_source_reader_is_dropped_off_the_runtime_thread() -> anyhow::Result<()> {
+    let admission = throttle::open_file_permit().await;
+    let runtime_thread = std::thread::current().id();
+    // cover an empty file, an exact final read, and an early EOF.
+    for (bytes, size) in [(&b""[..], 0), (&b"abcd"[..], 4), (&b"ab"[..], 4)] {
+        let (reader, mut stream, observed) = fixture(bytes);
+        let sent = stream
+            .send_message_with_file(&1_u64, reader, size, 2, &admission)
+            .await?;
+        assert_eq!(sent, bytes.len() as u64);
+        let observed = observed.lock().unwrap();
+        assert_ne!(observed.drop_thread.unwrap(), runtime_thread, "size {size}");
+        assert_eq!(observed.flushes, 2);
     }
     Ok(())
 }
@@ -695,14 +716,15 @@ async fn cancelling_completed_unobserved_output_drops_its_owner() -> anyhow::Res
     }
     throttle::set_admission_limits(std::num::NonZeroUsize::new(1));
     let admission = throttle::open_file_permit().await;
-    let (mut reader, mut stream, observed) = fixture(b"abc");
+    // the first read must be nonterminal so the output still owns the reader.
+    let (mut reader, mut stream, observed) = fixture(b"abcdef");
     let (started, start) = tokio::sync::oneshot::channel();
     let (release, wait) = std::sync::mpsc::channel();
     reader.gate = Some((started, wait));
     let (ready, completion) = tokio::sync::oneshot::channel();
     let waker = futures::task::waker(Arc::new(CompletionWake(Mutex::new(Some(ready)))));
     let mut context = Context::from_waker(&waker);
-    let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 3, 3, &admission));
+    let mut send = Box::pin(stream.send_message_with_file(&1_u64, reader, 6, 3, &admission));
     assert!(std::future::Future::poll(send.as_mut(), &mut context).is_pending());
     tokio::time::timeout(std::time::Duration::from_secs(5), start).await??;
     release.send(())?;
