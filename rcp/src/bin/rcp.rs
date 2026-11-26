@@ -875,7 +875,11 @@ fn build_master_remote_request(
         skip_specials: args.skip_specials,
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         port_ranges: effective_port_ranges,
-        progress: args.common.progress,
+        progress: args.common.progress
+            || matches!(
+                args.common.progress_type,
+                Some(common::ProgressType::JsonLines)
+            ),
         progress_delay: args.common.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         remote_keepalive_sec: args.remote_keepalive_sec,
@@ -2574,7 +2578,7 @@ fn main() -> Result<(), anyhow::Error> {
             progress_type: if is_remote_operation {
                 common::GeneralProgressType::RemoteMaster {
                     progress_type: args.common.progress_type.unwrap_or_default(),
-                    get_progress_snapshot: Box::new(remote::tracelog::get_latest_progress_snapshot),
+                    take_progress_snapshot: Box::new(remote::tracelog::take_progress_snapshot),
                 }
             } else {
                 common::GeneralProgressType::User {
@@ -2781,6 +2785,23 @@ mod tests {
             fingerprint: None,
             files_in_flight,
             max_connections: std::num::NonZeroUsize::new(max_connections).unwrap(),
+        }
+    }
+
+    #[test]
+    fn json_progress_requests_periodic_daemon_observations() {
+        for (args, expected) in [
+            (vec!["--progress-type=json-lines"], "10s"),
+            (
+                vec!["--progress-type=json-lines", "--progress-delay=80ms"],
+                "80ms",
+            ),
+        ] {
+            let args = master_args(&args);
+            let request =
+                build_master_remote_request(&args, args.common.resolve_files_in_flight()).unwrap();
+            assert!(request.rcpd.progress);
+            assert_eq!(request.rcpd.progress_delay.as_deref(), Some(expected));
         }
     }
 

@@ -36,6 +36,65 @@ fn source_tree(src: &std::path::Path) -> std::path::PathBuf {
     tree
 }
 
+#[tokio::test]
+async fn json_progress_reports_completed_copies_on_stderr() {
+    let (src, dst) = setup_test_env();
+    common::filegen::filegen(
+        common::get_progress(),
+        &common::filegen::FileGenConfig::new(src.path(), vec![], 12, 1),
+    )
+    .await
+    .unwrap();
+    let output = rcp(&[
+        "--progress-type=json-lines",
+        "--progress-delay=50ms",
+        "--max-files-in-flight=1",
+        "--ops-throttle=25",
+        "--summary",
+        "--output-format=json",
+        src.path().to_str().unwrap(),
+        dst.path().join("copy").to_str().unwrap(),
+    ]);
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["files_copied"], 12);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let mut previous = None;
+    let mut saw_partial = false;
+    for line in stderr.lines() {
+        let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(frame.as_object().unwrap().len(), 4);
+        assert_eq!(frame["schema"], "rcp-progress-v1");
+        assert_eq!(frame["hard_links_created"], 0);
+        let files = frame["files_copied"].as_u64().unwrap();
+        let ns = frame["monotonic_ns"].as_u64().unwrap();
+        assert!(files <= 12);
+        if let Some((last_ns, last_files)) = previous {
+            assert!(ns > last_ns && files >= last_files, "{stderr}");
+        }
+        previous = Some((ns, files));
+        saw_partial |= (1..12).contains(&files);
+    }
+    assert!(saw_partial, "expected an in-flight count in {stderr}");
+}
+
+#[test]
+fn json_progress_short_copy_exits_at_zero_and_long_intervals() {
+    let (src, dst) = setup_test_env();
+    let tree = source_tree(src.path());
+    for delay in ["0s", "1h"] {
+        let output = assert_cmd::Command::cargo_bin("rcp")
+            .unwrap()
+            .args(["--progress-type=json-lines", "--progress-delay", delay])
+            .arg(&tree)
+            .arg(dst.path().join(delay))
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{delay}: {:?}", output.status);
+        assert!(output.stdout.is_empty());
+    }
+}
+
 #[test]
 fn json_summary_of_a_local_copy_is_one_object_with_exact_counters_and_stats() {
     let (src_dir, dst_dir) = setup_test_env();

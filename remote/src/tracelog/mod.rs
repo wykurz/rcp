@@ -3,13 +3,12 @@ use chrono::TimeZone;
 pub use common::RcpdType;
 
 // static storage for the latest progress from each rcpd process
-static PROGRESS_MAP: std::sync::LazyLock<
-    std::sync::Mutex<enum_map::EnumMap<RcpdType, common::SerializableProgress>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(enum_map::EnumMap::default()));
+static PROGRESS_MAP: std::sync::LazyLock<std::sync::Mutex<common::progress::RemoteProgress>> =
+    std::sync::LazyLock::new(Default::default);
 
-/// Get the latest progress snapshot from all rcpd processes
-pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::SerializableProgress> {
-    PROGRESS_MAP.lock().unwrap().clone()
+/// Get the latest progress counters and drain any new destination observation.
+pub fn take_progress_snapshot() -> common::progress::RemoteProgress {
+    PROGRESS_MAP.lock().unwrap().take_snapshot()
 }
 
 /// Dispatch one forwarded tracing or progress message received from a remote `rcpd`.
@@ -74,7 +73,7 @@ pub(crate) fn dispatch_message(
         }
         common::remote_tracing::TracingMessage::Progress(progress) => {
             tracing::debug!(target: "remote", "Received progress update from {} rcpd: {:?}", rcpd_type, progress);
-            PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress;
+            PROGRESS_MAP.lock().unwrap().record(rcpd_type, progress);
         }
     }
 }

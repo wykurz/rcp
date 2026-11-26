@@ -818,3 +818,40 @@ fn json_summary_is_one_object_with_exact_counters_and_stats() {
     assert!(summary["walltime_ms"].is_u64(), "{summary}");
     assert!(dst.join("sub").join("b").exists());
 }
+
+#[tokio::test]
+async fn json_progress_reports_completed_hard_links() {
+    let (src, dst, _) = setup_test_env();
+    common::filegen::filegen(
+        common::get_progress(),
+        &common::filegen::FileGenConfig::new(src.path(), vec![], 12, 1),
+    )
+    .await
+    .unwrap();
+    let output = assert_cmd::Command::cargo_bin("rlink")
+        .unwrap()
+        .args([
+            "--progress-type=json-lines",
+            "--progress-delay=50ms",
+            "--max-files-in-flight=1",
+            "--ops-throttle=25",
+        ])
+        .arg(src.path())
+        .arg(dst.path().join("links"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .any(|frame| {
+                frame["schema"] == "rcp-progress-v1"
+                    && frame["files_copied"] == 0
+                    && (1..12).contains(&frame["hard_links_created"].as_u64().unwrap())
+            }),
+        "{stderr}"
+    );
+}

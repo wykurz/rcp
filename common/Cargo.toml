@@ -44,7 +44,7 @@ nix = { version = "0.31", features = ["fs", "hostname", "user", "zerocopy"] }
 pin-project-lite = "0.2"
 procfs = "0.18"
 rand = "0.10"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 thiserror = "2.0"
 throttle = { workspace = true }
 tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }

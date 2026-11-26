@@ -28,6 +28,7 @@
 //! - `Auto` - automatically choose based on terminal type
 //! - `ProgressBar` - animated progress bar (for interactive terminals)
 //! - `TextUpdates` - periodic text updates (for logging/non-interactive)
+//! - `json-lines` - compact timestamped copy and hard-link counters on stderr
 //!
 //! # Progress Reporting
 //!
@@ -183,9 +184,6 @@ impl std::fmt::Display for RcpdType {
     }
 }
 
-// Type alias for progress snapshots
-pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
-
 /// Runtime statistics collected from a process: CPU time, memory usage, context switches and
 /// page faults, each for the whole process (every thread).
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -291,6 +289,16 @@ pub enum ProgressType {
     ProgressBar,
     #[value(name = "TextUpdates", alias = "text-updates")]
     TextUpdates,
+    /// Emit cumulative copy and hard-link counters as JSON Lines on stderr.
+    #[value(name = "json-lines")]
+    JsonLines,
+}
+
+impl ProgressType {
+    fn interactive(self) -> bool {
+        matches!(self, Self::ProgressBar)
+            || matches!(self, Self::Auto) && std::io::stderr().is_terminal()
+    }
 }
 
 pub enum GeneralProgressType {
@@ -301,8 +309,7 @@ pub enum GeneralProgressType {
     Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
     RemoteMaster {
         progress_type: ProgressType,
-        get_progress_snapshot:
-            Box<dyn Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static>,
+        take_progress_snapshot: Box<dyn Fn() -> progress::RemoteProgress + Send + 'static>,
     },
 }
 
@@ -330,6 +337,25 @@ pub struct ProgressSettings {
     pub progress_delay: Option<String>,
 }
 
+const NON_INTERACTIVE_PROGRESS_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn report_periodically(
+    lock: &std::sync::Mutex<bool>,
+    cvar: &std::sync::Condvar,
+    delay: std::time::Duration,
+    mut report: impl FnMut() -> bool,
+) {
+    while report() {
+        // shutdown may have happened before the reporter thread started
+        let (done, _) = cvar
+            .wait_timeout_while(lock.lock().unwrap(), delay, |done| !*done)
+            .unwrap();
+        if *done {
+            break;
+        }
+    }
+}
+
 fn progress_bar(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
@@ -343,19 +369,14 @@ fn progress_bar(
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
     );
     let mut prog_printer = progress::make_local_printer(kind, &PROGRESS);
-    let mut is_done = lock.lock().unwrap();
-    loop {
+    report_periodically(lock, cvar, delay, || {
         PBAR.set_position(PBAR.position() + 1); // do we need to update?
         let mut msg = prog_printer.print().unwrap();
         msg.push_str(&observability::render_lines());
         msg.push_str(&render_panel_from_registry());
         PBAR.set_message(msg);
-        let result = cvar.wait_timeout(is_done, delay).unwrap();
-        is_done = result.0;
-        if *is_done {
-            break;
-        }
-    }
+        true
+    });
     PBAR.finish_and_clear();
 }
 
@@ -371,10 +392,9 @@ fn text_updates(
     delay_opt: &Option<std::time::Duration>,
     kind: progress::LocalProgressKind,
 ) {
-    let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
+    let delay = delay_opt.unwrap_or(NON_INTERACTIVE_PROGRESS_DELAY);
     let mut prog_printer = progress::make_local_printer(kind, &PROGRESS);
-    let mut is_done = lock.lock().unwrap();
-    loop {
+    report_periodically(lock, cvar, delay, || {
         eprintln!("=======================");
         eprintln!(
             "{}\n--{}{}{}",
@@ -383,12 +403,8 @@ fn text_updates(
             observability::render_lines(),
             render_panel_from_registry(),
         );
-        let result = cvar.wait_timeout(is_done, delay).unwrap();
-        is_done = result.0;
-        if *is_done {
-            break;
-        }
-    }
+        true
+    });
 }
 
 fn rcpd_updates(
@@ -399,36 +415,40 @@ fn rcpd_updates(
 ) {
     tracing::debug!("Starting rcpd progress updates");
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
-    let mut is_done = lock.lock().unwrap();
-    loop {
+    report_periodically(lock, cvar, delay, || {
         if remote_tracing::send_progress_update(&sender, &PROGRESS).is_err() {
             // channel closed, receiver is done
             tracing::debug!("Progress update channel closed, stopping progress updates");
-            break;
+            return false;
         }
-        let result = cvar.wait_timeout(is_done, delay).unwrap();
-        is_done = result.0;
-        if *is_done {
-            break;
-        }
-    }
+        true
+    });
 }
 
 fn remote_master_updates<F>(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
-    get_progress_snapshot: F,
+    take_progress_snapshot: F,
     progress_type: ProgressType,
 ) where
-    F: Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static,
+    F: Fn() -> progress::RemoteProgress + Send + 'static,
 {
-    let interactive = match progress_type {
-        ProgressType::Auto => std::io::stderr().is_terminal(),
-        ProgressType::ProgressBar => true,
-        ProgressType::TextUpdates => false,
-    };
-    if interactive {
+    if matches!(progress_type, ProgressType::JsonLines) {
+        let report = || {
+            take_progress_snapshot()
+                .new_destination
+                .is_none_or(|sample| sample.write_line().is_ok())
+        };
+        report_periodically(
+            lock,
+            cvar,
+            delay_opt.unwrap_or(NON_INTERACTIVE_PROGRESS_DELAY),
+            report,
+        );
+        // deliver a destination frame that arrived after the final tick
+        report();
+    } else if progress_type.interactive() {
         PBAR.set_style(
             indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
                 .unwrap()
@@ -436,9 +456,8 @@ fn remote_master_updates<F>(
         );
         let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
         let mut printer = RcpdProgressPrinter::new();
-        let mut is_done = lock.lock().unwrap();
-        loop {
-            let progress_map = get_progress_snapshot();
+        report_periodically(lock, cvar, delay, || {
+            let progress_map = take_progress_snapshot().counters;
             let source_progress = &progress_map[RcpdType::Source];
             let destination_progress = &progress_map[RcpdType::Destination];
             PBAR.set_position(PBAR.position() + 1); // do we need to update?
@@ -447,19 +466,14 @@ fn remote_master_updates<F>(
                 .unwrap();
             msg.push_str(&render_panel_from_registry());
             PBAR.set_message(msg);
-            let result = cvar.wait_timeout(is_done, delay).unwrap();
-            is_done = result.0;
-            if *is_done {
-                break;
-            }
-        }
+            true
+        });
         PBAR.finish_and_clear();
     } else {
-        let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
+        let delay = delay_opt.unwrap_or(NON_INTERACTIVE_PROGRESS_DELAY);
         let mut printer = RcpdProgressPrinter::new();
-        let mut is_done = lock.lock().unwrap();
-        loop {
-            let progress_map = get_progress_snapshot();
+        report_periodically(lock, cvar, delay, || {
+            let progress_map = take_progress_snapshot().counters;
             let source_progress = &progress_map[RcpdType::Source];
             let destination_progress = &progress_map[RcpdType::Destination];
             eprintln!("=======================");
@@ -471,12 +485,8 @@ fn remote_master_updates<F>(
                     .unwrap(),
                 render_panel_from_registry(),
             );
-            let result = cvar.wait_timeout(is_done, delay).unwrap();
-            is_done = result.0;
-            if *is_done {
-                break;
-            }
-        }
+            true
+        });
     }
 }
 
@@ -493,13 +503,13 @@ impl ProgressTracker {
                 }
                 GeneralProgressType::RemoteMaster {
                     progress_type,
-                    get_progress_snapshot,
+                    take_progress_snapshot,
                 } => {
                     remote_master_updates(
                         lock,
                         cvar,
                         &delay_opt,
-                        get_progress_snapshot,
+                        take_progress_snapshot,
                         progress_type,
                     );
                 }
@@ -507,12 +517,21 @@ impl ProgressTracker {
                     progress_type,
                     kind,
                 } => {
-                    let interactive = match progress_type {
-                        ProgressType::Auto => std::io::stderr().is_terminal(),
-                        ProgressType::ProgressBar => true,
-                        ProgressType::TextUpdates => false,
-                    };
-                    if interactive {
+                    if matches!(progress_type, ProgressType::JsonLines) {
+                        report_periodically(
+                            lock,
+                            cvar,
+                            delay_opt.unwrap_or(NON_INTERACTIVE_PROGRESS_DELAY),
+                            || {
+                                progress::WorkProgress::observe(
+                                    PROGRESS.files_copied.get(),
+                                    PROGRESS.hard_links_created.get(),
+                                )
+                                .write_line()
+                                .is_ok()
+                            },
+                        );
+                    } else if progress_type.interactive() {
                         progress_bar(lock, cvar, &delay_opt, kind);
                     } else {
                         text_updates(lock, cvar, &delay_opt, kind);

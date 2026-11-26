@@ -23,7 +23,7 @@ fn dispatch_message_updates_progress_snapshot() {
         common::remote_tracing::TracingMessage::Progress(progress),
         RcpdType::Destination,
     );
-    let snapshot = get_latest_progress_snapshot();
-    assert_eq!(snapshot[RcpdType::Destination].files_copied, 7);
-    assert_eq!(snapshot[RcpdType::Destination].bytes_copied, 4096);
+    let snapshot = take_progress_snapshot();
+    assert_eq!(snapshot.counters[RcpdType::Destination].files_copied, 7);
+    assert_eq!(snapshot.counters[RcpdType::Destination].bytes_copied, 4096);
 }

@@ -32,7 +32,6 @@ bitcode = { version = "0.6", features = ["serde"] }
 bytes = "1.12"
 chrono = "0.4"
 common = { workspace = true }
-enum-map = "2.7"
 futures = "0.3"
 hex = "0.4"
 humantime = "2.4"

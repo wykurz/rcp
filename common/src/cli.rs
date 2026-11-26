@@ -28,9 +28,14 @@ pub struct CommonArgs {
     /// Set delay between progress updates
     ///
     /// Default is 200ms for interactive mode (`ProgressBar`) and 10s for non-interactive
-    /// mode (`TextUpdates`). If specified, --progress flag is implied. Accepts
+    /// modes (`TextUpdates` and `json-lines`). If specified, --progress flag is implied. Accepts
     /// human-readable durations like "200ms", "10s", "5min".
-    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
+    #[arg(
+        long,
+        value_name = "DELAY",
+        help_heading = "Progress & output",
+        default_value_if("progress_type", "json-lines", "10s")
+    )]
     pub progress_delay: Option<String>,
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]

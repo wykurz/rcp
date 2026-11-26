@@ -5827,6 +5827,47 @@ fn test_remote_copy_progress_reporting() {
     eprintln!("✓ Progress reporting works correctly");
 }
 
+#[tokio::test]
+async fn json_progress_reports_completed_remote_copies_without_the_progress_flag() {
+    require_local_ssh();
+    let (src, dst) = setup_test_env();
+    common::filegen::filegen(
+        common::get_progress(),
+        &common::filegen::FileGenConfig::new(src.path(), vec![], 12, 1),
+    )
+    .await
+    .unwrap();
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        "--rcpd-path",
+        env!("CARGO_BIN_EXE_rcpd"),
+        "--progress-type=json-lines",
+        "--progress-delay=50ms",
+        "--max-files-in-flight=1",
+        "--ops-throttle=16",
+        "--summary",
+        "--output-format=json",
+        &format!("localhost:{}", src.path().display()),
+        &format!("localhost:{}/copy", dst.path().display()),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let summary: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(summary["files_copied"], 12);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let mut previous_ns = None;
+    let mut saw_partial = false;
+    for line in stderr.lines() {
+        let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(frame["schema"], "rcp-progress-v1");
+        assert_eq!(frame["hard_links_created"], 0);
+        let ns = frame["monotonic_ns"].as_u64().unwrap();
+        assert!(previous_ns.is_none_or(|previous| ns > previous), "{stderr}");
+        previous_ns = Some(ns);
+        saw_partial |= (1..12).contains(&frame["files_copied"].as_u64().unwrap());
+    }
+    assert!(saw_partial, "{stderr}");
+}
+
 // ============================================================================
 // Remote filtering and dry-run tests
 // ============================================================================
