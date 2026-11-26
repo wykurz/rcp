@@ -692,6 +692,13 @@ Run just these cases with `just test -p rcp-tools-remote --test turmoil_framing`
 real wire codecs but don't launch daemons or emulate TLS, SSH, or storage. Keep the Docker chaos
 tests for those end-to-end paths.
 
+## Remote Teardown Trace
+
+The loopback teardown test runs both copy endpoints with a short data body while another file is
+waiting for directory readiness. It checks both error causes and that control closes without Done.
+The [trace model](../rcp/spec/remote-teardown/DESIGN.md) shows how to validate the events emitted by
+that Rust test with TLC. TLC is optional.
+
 ## Chaos Testing
 
 Chaos tests verify rcp's behavior under adverse conditions. They run in Docker containers with
