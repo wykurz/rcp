@@ -53,7 +53,9 @@ cat > "$BIN_DIR/cargo" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
 
-if [ "${FAKE_CARGO_QUOTE_ARGS:-}" = 1 ]; then
+if [ "${FAKE_CARGO_LOG_NEXTEST_PROGRESS:-}" = 1 ]; then
+    printf '%s|%s\n' "${NEXTEST_SHOW_PROGRESS-UNSET}" "$*" >> "$CARGO_CALLS"
+elif [ "${FAKE_CARGO_QUOTE_ARGS:-}" = 1 ]; then
     quoted_arguments=$(printf ' %q' "$@")
     printf '%s|%s\n' "${CARGO_BUILD_TARGET-UNSET}" "${quoted_arguments:1}" >> "$CARGO_CALLS"
 else
@@ -330,6 +332,35 @@ run_wrapper() { # $1 = system, $2 = machine, $3 = expected target, $4 = explicit
         return
     fi
     assert_call "$expected_target" 'nextest run --profile host-test'
+}
+
+run_nextest_dumb_term_progress_case() { # $1 = TERM, $2 = initial NEXTEST_SHOW_PROGRESS (or UNSET), $3 = expected NEXTEST_SHOW_PROGRESS, $4 = cargo subcommand
+    local term_value="$1"
+    local initial_progress="$2"
+    local expected_progress="$3"
+    local subcommand="$4"
+    local output
+    local -a environment=(
+        env
+        -u CARGO_BUILD_TARGET
+        -u NEXTEST_SHOW_PROGRESS
+        "TERM=$term_value"
+        "PATH=$BIN_DIR:$PATH"
+        "CARGO=$BIN_DIR/cargo"
+        "CARGO_CALLS=$CALLS"
+        FAKE_CARGO_LOG_NEXTEST_PROGRESS=1
+        FAKE_UNAME_SYSTEM=Linux
+        FAKE_UNAME_MACHINE=x86_64
+    )
+    if [ "$initial_progress" != UNSET ]; then
+        environment+=("NEXTEST_SHOW_PROGRESS=$initial_progress")
+    fi
+    : > "$CALLS"
+    if ! output=$("${environment[@]}" "$REPO_ROOT/scripts/cargo-host.sh" "$subcommand" run 2>&1); then
+        fail "wrapper failed for TERM=$term_value subcommand=$subcommand: $output"
+        return
+    fi
+    assert_call "$expected_progress" "$subcommand run"
 }
 
 run_just_recipe() { # recipe, expected shell-escaped Cargo calls, optional -- and recipe arguments
@@ -686,6 +717,10 @@ echo "🔍 Testing musl-first host Cargo selection..."
 # wrong Linux target selection would compile the host against a different libc or architecture.
 run_wrapper Linux x86_64 x86_64-unknown-linux-musl ''
 run_wrapper Linux aarch64 aarch64-unknown-linux-musl ''
+run_nextest_dumb_term_progress_case dumb UNSET counter nextest
+run_nextest_dumb_term_progress_case xterm-256color UNSET UNSET nextest
+run_nextest_dumb_term_progress_case dumb none none nextest
+run_nextest_dumb_term_progress_case dumb UNSET UNSET check
 run_print_target Linux x86_64 x86_64-unknown-linux-musl
 run_print_target Linux aarch64 aarch64-unknown-linux-musl
 run_print_explicit_target
