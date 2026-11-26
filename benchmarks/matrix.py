@@ -75,7 +75,7 @@ import tempfile
 import time
 import uuid
 
-from benchmarks import cache, capacity, measurements, operations, private_sshd, run, strict_json, telemetry
+from benchmarks import cache, capacity, measurements, nfs_rpc, operations, private_sshd, run, strict_json, telemetry, work_progress
 from benchmarks.signals import SignalCancellation
 from benchmarks.verification import SUMMARY_POLICY
 
@@ -305,6 +305,8 @@ def cell_id(case, scenario, variant, context):
     identity = [SCHEMA, {key: value for key, value in case.items() if key != "description"}, scenario,
                 variant["args"], context["cache_policy"], context["verification"], context["runner_label"],
                 storage]
+    if context.get("work_progress", {}).get(variant["tool"]) == "enabled":
+        identity.append(work_progress.OPTIONS)
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -389,13 +391,13 @@ def _end_daemons(endpoint, item, successful):
         pass
 
 
-def _reports_json(rcp):
-    """Whether this build of rcp can print its summary as JSON.
+def _accepts_option(binary, option):
+    """Whether this build accepts an option before printing its version.
 
     A build that knows the option goes on to print its version; an older one refuses the
     option. Nothing is read from the command, so a stop signal is not lost in a pipe.
     """
-    return subprocess.run([rcp, SUMMARY_FORMAT, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    return subprocess.run([binary, option, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, timeout=PROBE_SECONDS).returncode == 0
 
 
@@ -539,7 +541,7 @@ def main(argv=None):
         remover = paths.get("rrm")
         context["removal"] = REMOVALS[remover is None]
         # a build from before rcp could print its summary as JSON is timed all the same
-        reports = _reports_json(paths["rcp"])
+        reports = _accepts_option(paths["rcp"], SUMMARY_FORMAT)
         context["summary_format"] = "json" if reports else "text"
         if reports:
             context["resources"] = dict(policy=RESOURCE_POLICY)
@@ -547,6 +549,17 @@ def main(argv=None):
         for storage in usable.values():
             storage["filesystem"] = {side: run._mount(storage[side]) for side in ("source", "destination")}
         if args.system_telemetry:
+            capabilities = {}
+            for name in work_progress.METRICS.keys() & paths.keys():
+                try:
+                    capabilities[name] = "enabled" if _accepts_option(paths[name], work_progress.FORMAT) else "unsupported"
+                except InterruptedError:
+                    raise
+                except (OSError, subprocess.TimeoutExpired):
+                    capabilities[name] = "unavailable"
+            context["work_progress"] = capabilities
+            for cell, (case, scenario) in zip(record["cells"], planned, strict=True):
+                cell["cell_id"] = cell_id(case, scenario, cell["variant"], context)
             # a matrix run may take the longest allocation there is: its journal is bounded for that
             context["system_telemetry"] = telemetry.descriptor(telemetry.MATRIX_LIMITS)
             sampler = telemetry.Sampler(output, args.source_root, args.destination_root,
@@ -611,6 +624,38 @@ def main(argv=None):
         def mark(phase, case_index, trial=None):
             if sampler is not None:
                 sampler.mark(phase, case_index, trial)
+
+        def progress_args(tool):
+            return work_progress.OPTIONS if context.get("work_progress", {}).get(tool) == "enabled" else ()
+
+        def timed_command(cell, item, commands, directory, timeout, files, *,
+                          nfs_root=None, prepared_root=None, **options):
+            tool = cell["variant"]["tool"]
+            capability = context.get("work_progress", {}).get(tool)
+            if capability == "enabled":
+                options["record_start"] = True
+            before = nfs_rpc.snapshot(prepared_root) if nfs_root else None
+            outcome = None
+            try:
+                try:
+                    outcome = run.execute_commands(commands, directory, timeout, stable_summary_locale=True, **options)
+                    return outcome
+                except (InterruptedError, KeyboardInterrupt) as error:
+                    # execute_commands attaches the elapsed time after reaping an interrupted child
+                    outcome = getattr(error, "outcome", None)
+                    raise
+                finally:
+                    if nfs_root:
+                        item["nfs_rpc"] = nfs_rpc.difference(before, nfs_rpc.snapshot(nfs_root, resolve_after=True))
+                    if outcome is not None:
+                        item.update({key: outcome[key] for key in ("elapsed_seconds", "exit_codes", "timed_out", "logs")})
+                        if capability == "enabled":
+                            item["work_progress"] = work_progress.read(directory / "0.stderr.log", work_progress.METRICS[tool],
+                                outcome["started_monotonic"], outcome["elapsed_seconds"], sampler.started, files)
+                        elif capability is not None:
+                            item["work_progress"] = {"status": capability}
+            finally:
+                _bound_logs(directory)
 
         def save():
             """Save the results. A save that fails is made up for by the next one: a full output
@@ -784,10 +829,15 @@ def main(argv=None):
                 if makes:
                     places["tree"].parent.mkdir(parents=True, exist_ok=True)
                 # the option goes before the operands
-                command = [paths[tool["variant"]["tool"]], *tool["variant"]["args"], SUMMARY_FORMAT,
+                command = [paths[tool["variant"]["tool"]], *tool["variant"]["args"],
+                           *progress_args(tool["variant"]["tool"]), SUMMARY_FORMAT,
                            # the copy and what a tool makes beside it are on the destination side
                            *(str(seen(places[name], kind, "source" if name == "source" else "destination"))
                              for name in tool["operands"])]
+                nfs_root = prepared_root = None
+                if sampler is not None and follower["scenario"] == "nfs-rlink":
+                    nfs_root = usable["nfs"]["destination"]
+                    prepared_root = nfs_rpc.prepare_root(nfs_root)
                 # until a step says otherwise the run is under way: that is what a stop finds on disk
                 item = dict(iteration=iteration, trial_index=trial_index, follows_trial_index=copied["trial_index"],
                             status="interrupted", command=command)
@@ -805,12 +855,8 @@ def main(argv=None):
                 settle([follower], "interrupted", "command", f"run stopped during run {iteration} of {runs}")
                 save()
                 mark("command", case_index, item["trial_index"])
-                try:
-                    outcome = run.execute_commands([command], output / "logs" / trial, limit[0],
-                                                   stable_summary_locale=True)
-                finally:
-                    _bound_logs(output / "logs" / trial)
-                item.update({key: outcome[key] for key in ("elapsed_seconds", "exit_codes", "timed_out", "logs")})
+                outcome = timed_command(follower, item, [command], output / "logs" / trial, limit[0], numbers["files"],
+                                        nfs_root=nfs_root, prepared_root=prepared_root)
                 if outcome["timed_out"]:
                     ended = limit[1]
                     item["status"] = "interrupted" if ended else "timed_out"
@@ -911,9 +957,10 @@ def main(argv=None):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 commands = run.plan_commands(variant, seen(source, kind, "source"),
                                              seen(destination, kind, "destination"), paths, "local")
-                if reports:
-                    # the option goes before the two operands
-                    commands = [[*command[:-2], SUMMARY_FORMAT, *command[-2:]] for command in commands]
+                # output options go before the two operands
+                flags = progress_args("rcp") + ((SUMMARY_FORMAT,) if reports else ())
+                if flags:
+                    commands = [[*command[:-2], *flags, *command[-2:]] for command in commands]
                 restarted = False
                 if loopback:
                     commands = [endpoint.command(command, paths["rcpd"]) for command in commands]
@@ -941,12 +988,8 @@ def main(argv=None):
                 save()
                 mark("command", case_index, item["trial_index"])
                 options = dict(environment=endpoint.environment()) if loopback else {}
-                try:
-                    outcome = run.execute_commands(commands, output / "logs" / trial, limit[0],
-                                                   stable_summary_locale=True, **options)
-                finally:
-                    _bound_logs(output / "logs" / trial)
-                item.update({key: outcome[key] for key in ("elapsed_seconds", "exit_codes", "timed_out", "logs")})
+                outcome = timed_command(cell, item, commands, output / "logs" / trial, limit[0], contents["files"],
+                                        **options)
                 succeeded = outcome["ok"]
                 if loopback:
                     _end_daemons(endpoint, item, succeeded)

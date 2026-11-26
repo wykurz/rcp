@@ -80,6 +80,47 @@ class StorageTests(unittest.TestCase):
     def below(self, path, root):
         return Path(os.path.commonpath([path, self.root / root])) == self.root / root
 
+    def test_nfs_rpc_observation_brackets_only_the_link_command_on_its_destination_mount(self):
+        from benchmarks import nfs_rpc
+        events = []
+        execute, mount, prepare_root = run.execute_commands, run._mount, nfs_rpc.prepare_root
+        def command(commands, *args, **kwargs):
+            name = Path(commands[0][0]).name
+            events.append(("start", name))
+            outcome = execute(commands, *args, **kwargs)
+            events.append(("end", name))
+            return outcome
+        def mounted(path):
+            if Path(path).name == "nfs-destination":
+                # this was the covering mount at setup, before the command's two snapshots
+                return {"filesystem_type": "nfs4", "mountpoint": str(self.root)}
+            return mount(path)
+        def prepare(path):
+            events.append(("root", str(path)))
+            return prepare_root(path)
+        def sample(path, *, resolve_after=False):
+            events.append(("snapshot", str(path), resolve_after))
+            return None
+        with mock.patch.object(run, "execute_commands", side_effect=command), \
+             mock.patch.object(run, "_mount", side_effect=mounted), \
+             mock.patch.object(cache, "prepare", side_effect=lambda *args, **kwargs: events.append(("cache",))), \
+             mock.patch.object(nfs_rpc, "prepare_root", side_effect=prepare), \
+             mock.patch.object(nfs_rpc, "snapshot", side_effect=sample):
+            record = self.run_matrix(NFS, *self.roots("nfs"), "--system-telemetry", cache_policy="linux-drop-caches")
+        self.assertEqual(record["status"], "complete")
+        self.assertEqual(sum(event[0] == "snapshot" for event in events), 4)
+        configured, resolved = (str(self.root / name) for name in ("nfs-destination", "destination"))
+        for index, event in enumerate(events):
+            if event == ("start", "rlink"):
+                self.assertEqual(events[index - 3:index + 3], [("root", configured), ("cache",),
+                    ("snapshot", resolved, False), event, ("end", "rlink"), ("snapshot", configured, True)])
+        for cell in record["cells"]:
+            for item in cell["copies"]:
+                if cell["scenario"] == "nfs-rlink":
+                    self.assertEqual(item["nfs_rpc"], {"status": "unavailable"})
+                else:
+                    self.assertNotIn("nfs_rpc", item)
+
     def test_nfs_cells_measure_through_the_mounts(self):
         record = self.run_matrix(NFS, *self.roots("nfs"))
         self.assertEqual(record["status"], "complete")
