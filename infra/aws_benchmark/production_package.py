@@ -29,7 +29,7 @@ CODE_LIMIT = 32 * 1024 * 1024
 REQUIREMENTS = ("infra/aws_benchmark/requirements.txt", "infra/aws_benchmark/production-requirements.txt")
 SOURCES = (
     "benchmarks/__init__.py", "benchmarks/capacity.py", "benchmarks/changes.py", "benchmarks/clocks.py",
-    "benchmarks/matrix.py",
+    "benchmarks/matrix.py", "benchmarks/nfs_rpc.py", "benchmarks/work_progress.py",
     "benchmarks/measurements.py", "benchmarks/operations.py", "benchmarks/pairs.py",
     "benchmarks/private_sshd.py", "benchmarks/report.py",
     "benchmarks/cache.py", "benchmarks/run.py", "benchmarks/sanitized.py", "benchmarks/signals.py", "benchmarks/site.py",

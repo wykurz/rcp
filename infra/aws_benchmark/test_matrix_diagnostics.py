@@ -31,6 +31,33 @@ def derived(outcomes=None, **context):
 
 
 class MatrixDiagnosticsTests(unittest.TestCase):
+    def test_progress_timeline_projects_work_and_keeps_the_full_resolution_in_the_archive(self):
+        _, record, raw = derived(system_telemetry=diagnostics.STORAGE_TELEMETRY_DESCRIPTOR,
+                                 work_progress={"rcp": "enabled"})
+        trial = raw["cells"][1]["copies"][0]
+        samples = [[i * 10000, i * 3] for i in range(50)]
+        trial["work_progress"] = dict(status="observed", metric="files_copied", command_start_ms=1234,
+                                      samples=samples)
+        value = diagnostics.derive(record, b"archive", raw, WORKER)
+        public_trial = value["trials"][3]["work_progress"]
+        self.assertEqual(public_trial["observations"], 50)
+        self.assertEqual((public_trial["samples"][0], public_trial["samples"][-1]), (samples[0], samples[-1]))
+        self.assertLess(len(public_trial["samples"]), len(samples))
+        self.assertEqual(trial["work_progress"]["samples"], samples)
+        self.assertIn("Files copied over time", diagnostics.render(value, record))
+        forged = copy.deepcopy(value)
+        forged["trials"][3]["work_progress"]["samples"][1][1] = True
+        with self.assertRaisesRegex(ValueError, "work progress"):
+            diagnostics.validate(forged, record)
+        late = copy.deepcopy(value)
+        late["trials"][3]["work_progress"]["samples"][-1][0] = 36_000_000
+        with self.assertRaisesRegex(ValueError, "work progress"):
+            diagnostics.validate(late, record)
+        trial["work_progress"]["samples"][1] = [600_000, 1 << 62]
+        malformed = diagnostics.derive(record, b"archive", raw, WORKER)
+        self.assertEqual(malformed["trials"][3]["work_progress"], {"status": "invalid"})
+        self.assertEqual(malformed["trials"][3]["metrics"], value["trials"][3]["metrics"])
+
     def test_each_copy_keeps_its_scenario_and_process_metrics(self):
         value, record, _ = derived()
         self.assertEqual((value["schema"], value["status"], value["reason"]),

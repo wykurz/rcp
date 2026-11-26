@@ -8,6 +8,8 @@ import math
 from html import escape
 import re
 
+from benchmarks import nfs_rpc, work_progress
+from benchmarks.operations import expected_counts
 from .common import digest, require
 from .json_bytes import encoded
 
@@ -343,6 +345,40 @@ def _resources(trial):
     return {key: metrics[key] for key in METRICS}
 
 
+def _rpc_counters(value):
+    if not isinstance(value, dict) or any(not number(value.get(key), integer=True) for key in nfs_rpc.COUNTERS) or \
+            value["transmissions"] != value["completed"] + value["retransmissions"]:
+        return None
+    return {key: value[key] for key in nfs_rpc.COUNTERS}
+
+
+def _nfs_window(value, links):
+    """Project allowlisted mount counters; a malformed observation costs only this window."""
+    value = _mapping(value)
+    status = value.get("status")
+    if status in ("counter_reset", "mount_changed"):
+        return dict(status=status)
+    unavailable = dict(status="unavailable")
+    total, reported = _rpc_counters(value.get("total")), value.get("operations")
+    if status != "available" or total is None or not isinstance(reported, dict):
+        return unavailable
+    operations = {}
+    for name in nfs_rpc.OPERATIONS:
+        if name in reported:
+            counters = _rpc_counters(reported[name])
+            if counters is None:
+                return unavailable
+            operations[name] = counters
+    if any(total[key] < sum(op[key] for op in operations.values()) for key in nfs_rpc.COUNTERS):
+        return unavailable
+    return dict(status="available", hard_links_created=links, total=total, operations=operations)
+
+
+def _link_count(value, case):
+    """Accept the reported success count only when it matches the public file set's expected count."""
+    return value if type(value) is int and value == expected_counts(MATRIX_CASE_SHAPES[case])["files"] else None
+
+
 def _matrix(record):
     """A public record that carries cells is a matrix run; its diagnostics name each copy's scenario."""
     return "cells" in record
@@ -571,6 +607,16 @@ def _derive_matrix(record, archive, raw, worker):
             trial = dict(case_id=cell["case_id"], variant_id=_variant(schema, cell["scenario"]),
                 scenario=cell["scenario"], iteration=item["iteration"],
                 status="complete" if resource is not None else "unavailable", metrics=resource, system=system)
+            tool = _tool_cells(schema).get(cell["scenario"], ("rcp",))[0]
+            if sampled and tool in work_progress.METRICS and "work_progress" in item:
+                files = expected_counts(MATRIX_CASE_SHAPES[cell["case_id"]])["files"]
+                seconds = item.get("elapsed_seconds")
+                duration = round(seconds * 1000) if number(seconds, maximum=MAX_ALLOCATION_SECONDS) else 0
+                trial["work_progress"] = work_progress.public(item["work_progress"], work_progress.METRICS[tool],
+                                                               files, duration)
+            if sampled and cell["scenario"] == "nfs-rlink" and "nfs_rpc" in item:
+                links = _mapping(item.get("tool_summary")).get("hard_links_created") if done else None
+                trial["nfs_rpc"] = _nfs_window(item["nfs_rpc"], _link_count(links, cell["case_id"]))
             if with_roles:
                 trial["roles"] = None
                 if _daemons(schema, cell["scenario"]):
@@ -663,8 +709,10 @@ def validate(value, record):
         case_ids.add(case["case_id"])
     require(isinstance(value["trials"], list) and len(value["trials"]) <= MAX_TRIALS, "too many public resource trials")
     seen = set()
+    measurements = {(m["case_id"], m["scenario"]): m["samples"] for m in record["measurements"]} if matrix else {}
     for trial in value["trials"]:
-        require(isinstance(trial, dict) and set(trial) == {"case_id", "variant_id", "iteration", "status", "metrics", "system"} | (
+        require(isinstance(trial, dict) and set(trial) - {"nfs_rpc", "work_progress"} == {
+                    "case_id", "variant_id", "iteration", "status", "metrics", "system"} | (
                     {"scenario"} if matrix else set()) | ({"roles"} if with_roles else set()) and
                 isinstance(trial["case_id"], str) and trial["case_id"] in case_ids and
                 (not matrix or isinstance(trial["scenario"], str) and SCENARIO.fullmatch(trial["scenario"]) and
@@ -676,6 +724,25 @@ def validate(value, record):
         key = (trial["case_id"], trial.get("scenario"), trial["variant_id"], trial["iteration"])
         require(key not in seen, "duplicate public resource trial")
         seen.add(key)
+        if "work_progress" in trial:
+            tool = _tool_cells(schema).get(trial.get("scenario"), ("rcp",))[0]
+            durations = measurements.get((trial["case_id"], trial.get("scenario")))
+            duration_ms = work_progress.MAX_RUN_MS
+            if durations is not None:
+                require(trial["iteration"] <= len(durations), "work progress has no matching measured trial")
+                duration_ms = round(durations[trial["iteration"] - 1] * 1000)
+            require(matrix and tool in work_progress.METRICS and value["setup"] is not None and
+                    value["setup"]["instrumentation"] is not None and
+                    work_progress.valid_public(trial["work_progress"], work_progress.METRICS[tool],
+                        expected_counts(shapes[trial["case_id"]])["files"], duration_ms),
+                    "invalid public work progress")
+        if "nfs_rpc" in trial:
+            window = trial["nfs_rpc"]
+            links = _mapping(window).get("hard_links_created")
+            require(schema == STORAGE_SCHEMA and trial["scenario"] == "nfs-rlink" and value["setup"] is not None and
+                    value["setup"]["instrumentation"] is not None and (links is None or
+                        _link_count(links, trial["case_id"]) is not None) and _nfs_window(window, links) == window,
+                    "invalid public NFS RPC diagnostics")
         metrics = trial["metrics"]
         require((metrics is None) == (trial["status"] == "unavailable"), "invalid resource availability")
         if metrics is not None:
@@ -1103,6 +1170,79 @@ def _other_storage_html(other):
     return text
 
 
+def _work_progress_html(trials):
+    panels = []
+    for trial in trials:
+        if "work_progress" not in trial:
+            continue
+        value = trial["work_progress"]
+        heading = f'{escape(trial["case_id"])} / {escape(trial["scenario"])} / run {trial["iteration"]}'
+        if value["status"] != "observed":
+            panels.append(f'<p>{heading} — {escape(value["status"])}</p>')
+            continue
+        metric = "Files copied over time" if value["metric"] == "files_copied" else "Hard links created over time"
+        rows = []
+        previous = None
+        for stamp, count in value["samples"]:
+            rate = "—"
+            if previous is not None and stamp > previous[0]:
+                rate = f"{1000 * (count - previous[1]) / (stamp - previous[0]):,.1f}"
+            rows.append(f"<tr><td>{stamp / 1000:,.3f}</td><td>{count:,}</td><td>{rate}</td></tr>")
+            previous = stamp, count
+        panels.append(f'<details><summary>{metric} · {heading}</summary><p>Command start '
+                      f'{value["command_start_ms"] / 1000:,.3f} s on the system sampler clock. '
+                      f'Showing {len(rows)} of {value["observations"]} observations.</p>'
+                      '<div class="table-scroll"><table><thead><tr><th>Seconds since command start</th>'
+                      '<th>Completed files</th><th>Files/s since previous row</th></tr></thead><tbody>'
+                      + "".join(rows) + "</tbody></table></div></details>")
+    if not panels:
+        return ""
+    return ('<details><summary>File progress during commands</summary><p>The archive retains observations '
+            'at the reported cadence. Copies count completed data transfers and links count successful hard '
+            'links. Remote copies use observations from the destination daemon.</p>' + "".join(panels) + "</details>")
+
+
+def _nfs_rpc_html(trials):
+    rows = []
+    for trial in trials:
+        if "nfs_rpc" not in trial:
+            continue
+        window = trial["nfs_rpc"]
+        links = window.get("hard_links_created")
+        prefix = ("<tr><td><code>" + escape(trial["case_id"]) + "</code></td><td>" + str(trial["iteration"]) +
+                  "</td><td>" + ("—" if links is None else f"{links:,}") + "</td>")
+        if window["status"] != "available":
+            reason = {"mount_changed": "mount changed", "counter_reset": "counter reset",
+                      "unavailable": "unavailable"}[window["status"]]
+            rows.append(prefix + "<td colspan='7'>" + reason + "</td></tr>")
+            continue
+        for name in ("All procedures", *nfs_rpc.OPERATIONS):
+            counters = window["total"] if name == "All procedures" else window["operations"].get(name)
+            row = prefix + "<td>" + name + "</td>"
+            if counters is None:
+                row += "<td colspan='6'>unavailable</td>"
+            else:
+                count = counters["completed"]
+                fields = [f"{counters[key]:,}" for key in nfs_rpc.COUNTERS]
+                fields.extend((f"{counters['rtt_milliseconds'] / count:.3f}" if count else "—",
+                               f"{count / links:.3f}" if links else "—"))
+                row += "".join("<td>" + item + "</td>" for item in fields)
+            rows.append(row + "</tr>")
+    if not rows:
+        return ""
+    return ("<h3 id='nfs-rpc'>NFS client RPCs during rlink</h3>"
+            "<p>Linux counts NFSv4.2 RPC procedures on the destination mount between the readings immediately "
+            "before and after each command. Other traffic on this mount and session traffic shared with "
+            "mounts of the same server can contribute. The total "
+            "includes every procedure. A procedure can send several NFSv4 operations in one compound request. "
+            "Cumulative round-trip time sums RPC durations, including overlapping requests. RPCs per hard link "
+            "divides completed RPCs by the hard links reported by a successful rlink run.</p>"
+            "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Run</th>"
+            "<th>Hard links created</th><th>Procedure</th><th>Completed RPCs</th><th>Transmissions</th>"
+            "<th>Retransmissions</th><th>Cumulative RTT (ms)</th><th>Mean RTT (ms/RPC)</th>"
+            "<th>RPCs per hard link</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
 def render(value, record):
     """Render one run's per-copy resources, then its observed setup as a collapsed appendix."""
     validate(value, record)
@@ -1148,7 +1288,7 @@ def render(value, record):
     else:
         text += "<p>No per-copy process-resource measurements are available.</p>"
     if value["schema"] == STORAGE_SCHEMA:
-        text += _other_storage_html(value["other_storage"])
+        text += _other_storage_html(value["other_storage"]) + _nfs_rpc_html(value["trials"])
     if value["cases"]:
         progress_rows = []
         for case in value["cases"]:
@@ -1165,6 +1305,8 @@ def render(value, record):
             "<table><thead><tr><th>Case</th><th>Definition</th><th>Copy trials recorded</th>"
             "<th>Successful copy outcomes</th><th>Activity evidence</th></tr></thead><tbody>" +
             "".join(progress_rows) + "</tbody></table></div></details>")
+    if matrix:
+        text += _work_progress_html(value["trials"])
     text += ("<details><summary>Sampled run phases</summary><p>" + escape(SYSTEM_SCOPE) + "</p>" +
              system_html(value["system"]))
     for trial in value["trials"]:

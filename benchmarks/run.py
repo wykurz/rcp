@@ -271,7 +271,8 @@ def _execution_failure(outcome, *, wrapped=False):
                 message=message if wrapped else "command failed or timed out")
 
 
-def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None, command_clocks=False, environment=None):
+def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False, resource_time=None, command_clocks=False,
+                     environment=None, record_start=False):
     if resource_time is not None and len(commands) != 1:
         raise ValueError("local resources require exactly one command")
     log_dir = Path(log_dir)
@@ -385,6 +386,8 @@ def execute_commands(commands, log_dir, timeout, *, stable_summary_locale=False,
             completion = max((stamp for _, stamp in finished.values()), default=time.monotonic())
             status = measurements.payload_status(codes, timed_out, launch_error, expected_commands=len(commands))
             outcome = {"ok": status == "succeeded", "timed_out": timed_out, "launch_error": launch_error, "elapsed_seconds": max(0, completion - started), "exit_codes": codes, "logs": [{"stdout": str(log_dir / f"{index}.stdout.log"), "stderr": str(log_dir / f"{index}.stderr.log")} for index in range(len(children))]}
+            if record_start:
+                outcome["started_monotonic"] = started
             if command_clocks:
                 index = max(finished, key=lambda i: finished[i][1]) if finished else None
                 outcome["command_clocks"] = clocks.observation(clock_start, clock_finishes.get(index), index)

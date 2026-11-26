@@ -385,7 +385,12 @@ qualification and rollout.
   that profile.
 - **Sampling.** The journal of system samples is bounded for the longest run: twelve hours, 5,120
   samples and 16 MiB, where the paired profiles keep eight hours, 4,096 samples and 8 MiB. A record
-  names the bounds it was sampled under, and the public companion accepts either set.
+  names the bounds it was sampled under, and the public companion accepts either set. Updated matrix
+  workers also collect ten-second file counts from capable builds and NFSv4.2 client RPC deltas for
+  hard-link cells. The benchmark guide describes how to align these observations with system samples
+  and run a private kernel profile on a separately prepared host.
+  [File progress and NFS requests](../../docs/benchmarking.md#file-progress-and-nfs-requests) ·
+  [Calibrating a short kernel profile](../../docs/benchmarking.md#calibrating-a-short-kernel-profile)
 - **Credentials.** The instance role's credentials last about six hours, so a longer run renews them
   when it uploads its results. For that the worker has the SDK ask the instance metadata service up
   to five times, where the SDK asks once by default: a single failed read there would otherwise cost

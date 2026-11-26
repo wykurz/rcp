@@ -786,6 +786,75 @@ the next step starts. A fixture, destination or linked tree that could not be re
 These documents are a separate format: the dashboards and change reports described below read
 `benchmark-run` results only.
 
+### File progress and NFS requests
+
+With `--system-telemetry`, the matrix asks capable builds of `rcp` and `rlink` for cumulative work
+every ten seconds. Copies count files copied and link runs count hard links created. A remote copy
+uses only the destination daemon's observations, timestamped when the master receives them. The
+runner probes each binary before timing it. The additional command options give instrumented cells
+their own series identity. Older builds keep their original command and identity.
+
+In `results.json`, an observed `work_progress` contains `command_start_ms` relative to the system
+sampler and pairs of `[milliseconds_since_command_start, completed_files]`. Add the two time offsets
+to align each count with `system-telemetry.jsonl`. This shows whether file throughput fell during a
+period of CPU pressure or device reads. The public run page shows up to sixteen observations,
+including the first and last, and the average files/s between displayed rows. The archive retains
+the full bounded series. The final command summary supplies the checked total. A short command can
+finish between observations, and an unavailable series has a status of its own.
+
+For `nfs-rlink`, the same switch also reads the destination mount's Linux NFSv4.2 client counters
+just before and after each command. Both reads are outside the measured wall time. The run page
+shows completed RPCs, transmissions, retransmissions, and cumulative and mean round-trip time for
+all procedures combined and for `LOOKUP`, `GETATTR`, `READDIR`, and `LINK` individually. Divide
+completed RPCs by the checked hard-link count to compare runs of different sizes. Other traffic on
+the mount and session traffic shared with mounts of the same server can contribute. One NFSv4
+procedure can send several operations in a compound request, and the round-trip times of concurrent
+requests can overlap. A missing mount observation, a changed mount, or counters that reset are
+recorded explicitly.
+
+### Calibrating a short kernel profile
+
+Use `just benchmark-profile-copy` on a prepared Linux host to measure the cost of sampling and
+capture kernel stacks during a local copy. The default is one 30-second window, starting about 60
+seconds into a profiled copy, at 49 Hz per active CPU. The recorder attaches to the actual `rcp`
+process and its threads. This samples CPU spent executing in the kernel. The progress and device
+time series above help locate stalls where workers were asleep.
+
+```bash
+just benchmark-profile-copy \
+    --candidate /opt/builds/candidate/rcp --baseline /opt/builds/baseline/rcp \
+    --perf /usr/bin/perf --source /mnt/source/filegen \
+    --destination-root /mnt/destination/scratch --output /mnt/evidence/tiny-profile \
+    --cache linux-drop-caches
+```
+
+Run as the ordinary fixture owner on a host configured to allow kernel sampling of its copies and to
+resolve kernel symbols. Supply an existing source tree and an empty or reusable scratch directory on
+the destination. Use a new private output directory, preferably on a separate filesystem. The
+cold-cache mode requests the existing benchmark cache broker before every copy. For a mechanism
+check without the broker, select `--cache uncontrolled`.
+
+With one build the default is four copies, two with the profiler and two without. With `--baseline`
+the same command runs eight copies and reverses build and profiler order on the second pair. Each
+copy writes a fresh tree. The driver checks file and byte counts, then verifies destination paths
+and sizes outside the timer. The private `result.json` records individual wall times, per-pair
+profiling overhead, kernel CPU time per file when available, binary hashes and build IDs, and the
+actual sampling bounds. Quality counts show total and lost samples, resolved instruction pointers,
+and how many of the checked stacks resolve a kernel caller. Inspect a capture with
+`perf report -i /mnt/evidence/tiny-profile/candidate-1.perf.data`. Check the profiled versus plain
+timing in each order before interpreting small differences between builds.
+
+For the November 17/23 AWS comparison, use releases built from commits
+`a93b7fb81e1507d0ae45bfdf5b2a7a582a27cb10` and `eef155f935b8320627cc5bb7a531d60647a83de6` on the
+same 96-vCPU worker shape with separate ext4 RAID0 source and destination filesystems. Generate the
+`tiny-1k-10240k` fixture once with `filegen /mnt/source 10,10,10,10 1024 1000 --leaf-files` in a
+prepared source mount. It creates `/mnt/source/filegen` with 10,240,000 files of 1,000 bytes. First
+measure each release's defaults. A second comparison can pass `--local-copy-handoff=never` to hold
+that policy fixed on builds that support the option. Keep raw captures and calibration times in the
+private output directory. The scheduled AWS worker uses a pinned image and collector package.
+Rolling out matrix observations requires updating those artifacts. Kernel profiling is a separate
+manual run.
+
 ### Tool cells
 
 Twelve scenarios time the other tools on real trees without generating anything for them. A tool
