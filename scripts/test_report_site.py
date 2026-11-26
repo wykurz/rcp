@@ -994,6 +994,88 @@ class ReportSiteTests(unittest.TestCase):
                         self.assertEqual(Path('aws-benchmarks') / (kind + '.html') in pages, kind in suite)
                     self.assertIn(Path('aws-benchmarks/runs') / (record['run_key'] + '.html'), pages)
 
+    def test_the_site_follows_the_file_sets_of_the_weekly_suite_once_it_has_run(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        def site(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})
+        before = matrix_example('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools')
+        weekly = matrix_example('matrix-weekly-1', run='43200000002', at='2026-12-07T08:30:00+00:00')
+        earlier, pages = site([before]), site([before, weekly])
+        local, index = pages[Path('aws-benchmarks/local.html')], pages[Path('aws-benchmarks/index.html')]
+        # until the weekly suite has run nothing says that file sets were replaced
+        for document in earlier.values():
+            self.assertNotIn('Earlier file sets', document)
+        self.assertIn('<td>1,000</td><td>1,000,000,000</td><td>1 TB</td>', earlier[Path('aws-benchmarks/setups.html')])
+        # then its file sets are the ones every page shows first, and the first page shows no others
+        self.assertIn("<a href='local.html#history-bulk-1g-400gb' aria-label='1 GB files, local copies'>", index)
+        self.assertNotIn('bulk-1g-1tb', index.split('<section id="runs"')[0])
+        self.assertLess(local.index("id='history-bulk-1g-400gb'"), local.index("<details class='earlier'>"))
+        self.assertLess(local.index("<details class='earlier'>"), local.index("id='history-bulk-1g-1tb'"))
+        self.assertIn('400 files of 1 GB each (400 GB), copied locally by rcp with default settings · 1 run</p>', local)
+        setup = pages[Path('aws-benchmarks/setups.html')]
+        self.assertIn('<tr><td>1 GB</td><td>400</td><td>1,000,000,000</td><td>400 GB</td></tr>', setup)
+        self.assertIn('takes one to five minutes on this machine', setup)
+        self.assertIn('For the sets of 1 GB, 100 MB and 1 MB files it cannot be shorter', setup)
+        self.assertIn('For the terabyte file sets it cannot be shorter', earlier[Path('aws-benchmarks/setups.html')])
+        # the tools are plotted where the weekly suite times them, and their earlier trends are kept
+        compare = pages[Path('aws-benchmarks/rcmp.html')]
+        self.assertIn("id='history-tiny-1k-4096k'", compare.split("<details class='earlier'>")[0])
+        self.assertIn("id='history-bulk-1m-1024gb'", compare.split("<details class='earlier'>")[1])
+        self.assertIn('rcmp is timed on the sets of 1 KB files.', compare)
+        # the run pages name each file set by the size of its files, whichever generation it is of
+        for run in ('43200000001', '43200000002'):
+            page = pages[Path('aws-benchmarks/runs/repo-655073755-run-' + run + '.html')]
+            self.assertIn('<td>1 GB files</td><td>Local copy</td><td>measured</td>', page)
+            self.assertIn('<h3>1 KB files · Remove with rrm</h3>', page)
+
+    def test_a_later_run_of_an_earlier_suite_does_not_take_the_setup_page_back(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_storage_limit import sampled
+        # the schedule is switched after the weekly suite has run by hand, so a scheduled run of the suite
+        # before it may be the newest run for a while. Every copy of these runs has figures of its arrays
+        runs = [sampled('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools'),
+                sampled('matrix-weekly-1', run='43200000002', at='2026-12-07T08:30:00+00:00'),
+                sampled('matrix-all-local+remote', run='43200000003', at='2026-12-14T08:17:00+00:00')]
+        pages = report_site.render_aws_benchmarks(
+            {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+            diagnostics={record['run_key']: extra for record, extra in runs})
+        setup = pages[Path('aws-benchmarks/setups.html')]
+        # the page describes the file sets of the weekly suite, and tabulates what the arrays did during
+        # the newest run on those: not during a newer run on the file sets before them
+        self.assertIn('<tr><td>1 GB</td><td>400</td><td>1,000,000,000</td><td>400 GB</td></tr>', setup)
+        self.assertIn("of run <a href='runs/repo-655073755-run-43200000002.html'>43200000002-1</a>, the newest that "
+                      'recorded it.', setup)
+        self.assertNotIn("of run <a href='runs/repo-655073755-run-43200000003.html'>", setup)
+        # that run is listed, has its page, and is on the earlier trends
+        index, local = pages[Path('aws-benchmarks/index.html')], pages[Path('aws-benchmarks/local.html')]
+        self.assertIn('<a href="runs/repo-655073755-run-43200000003.html">43200000003-1</a>', index)
+        current, earlier = local.split("<details class='earlier'>")
+        self.assertIn('400 files of 1 GB each (400 GB), copied locally by rcp with default settings · 1 run</p>', current)
+        self.assertIn('1,000 files of 1 GB each (1 TB), copied locally by rcp with default settings · 2 runs</p>', earlier)
+
+    def test_a_site_with_two_generations_of_file_sets_has_no_dangling_link(self):
+        from infra.aws_benchmark.production_publish import inventory
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        runs = [matrix_example('matrix-all-local+tools+remote+tools+nfs+tools+memory+tools'),
+                matrix_example('matrix-weekly-1', run='43200000002', at='2026-12-07T08:30:00+00:00')]
+        directory, revision, _ = self.retained_batch([record for record, _ in runs])
+        index = json.loads((directory / 'index.json').read_text())
+        index.update(schema='rcp-production-retained-reports-v2', diagnostics=[])
+        for record, extra in runs:
+            body = json.dumps(extra, separators=(',', ':')).encode()
+            (directory / (record['run_key'] + '.diagnostics.json')).write_bytes(body)
+            index['diagnostics'].append(dict(run_key=record['run_key'], sha256=hashlib.sha256(body).hexdigest(),
+                                             bytes=len(body)))
+        (directory / 'index.json').write_text(json.dumps(index))
+        result = self.build_retained((directory, revision, inventory(directory)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_site_links_resolve()
+
     def test_a_site_with_cells_on_other_storage_has_no_dangling_link(self):
         from infra.aws_benchmark.production_publish import inventory
         from infra.aws_benchmark.test_matrix_pages import matrix_example

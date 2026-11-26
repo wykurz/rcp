@@ -102,6 +102,8 @@
 .aws details { margin: 1rem 0; }
 .aws summary { cursor: pointer; font-size: .95rem; font-weight: 600; }
 .aws details details { margin-left: 1rem; }
+/* the earlier file sets are whole sections: a data table among them stands under its plots as everywhere else */
+.aws details.earlier details { margin-left: 0; }
 /* measurement tables scroll sideways instead of wrapping numbers and identifiers */
 .aws table.data td { white-space: nowrap; }
 .aws table.data td.reason { min-width: 24ch; white-space: normal; }

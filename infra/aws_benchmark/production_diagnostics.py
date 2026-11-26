@@ -823,14 +823,15 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations, *, remote=False, tools=False, elsewhere=False, storage=""):
+def configuration_html(observations, *, remote=False, tools=False, elsewhere=False, sized=False, storage=""):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
     Remote copies are described once a run has a remote cell, the other tools once a run has a
     cell of one, and the storage beside the arrays (`elsewhere`) once a run has a cell there.
-    `storage` is the table of what the arrays did during the newest run's copies, placed under
-    what the drives allow.
+    The file sets are those of the weekly suite (`sized`) once it has measured something, and
+    the ones before them until then. `storage` is the table of what the arrays did during the
+    newest run's copies, placed under what the drives allow.
     """
     configured = CONFIGURED_STORAGE
     delay = configured["nfs_delay_microseconds"] / 1000
@@ -845,8 +846,40 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         "<li><strong>Memory.</strong> A matrix run can also copy between two filesystems in memory (tmpfs), "
         f"each limited to {configured['memory_bytes'] >> 30} GiB, where no operation waits for a disk.</li>")
     more_sets = ("" if not elsewhere else
-        "<tr><td>1 KB on NFS</td><td>716,800</td><td>1,000</td><td>716.8 MB</td></tr>"
-        "<tr><td>1 KB in memory</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>")
+        "<tr><td>1 KB on NFS</td><td>716,800</td><td>1,000</td><td>716.8 MB</td></tr>" + (
+            "<tr><td>1 KB in memory</td><td>4,096,000</td><td>1,000</td><td>4.096 GB</td></tr>" if sized else
+            "<tr><td>1 KB in memory</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>"))
+    # the file sets of the arrays: those of the weekly suite, or the ones before them
+    sets = ("<tr><td>1 GB</td><td>400</td><td>1,000,000,000</td><td>400 GB</td></tr>"
+            "<tr><td>100 MB</td><td>4,000</td><td>100,000,000</td><td>400 GB</td></tr>"
+            "<tr><td>1 MB</td><td>400,000</td><td>1,000,000</td><td>400 GB</td></tr>"
+            "<tr><td>1 KB</td><td>4,096,000</td><td>1,000</td><td>4.096 GB</td></tr>" if sized else
+            "<tr><td>1 GB</td><td>1,000</td><td>1,000,000,000</td><td>1 TB</td></tr>"
+            "<tr><td>100 MB</td><td>10,240</td><td>100,000,000</td><td>1.024 TB</td></tr>"
+            "<tr><td>1 MB</td><td>1,024,000</td><td>1,000,000</td><td>1.024 TB</td></tr>"
+            "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>")
+    sets_note = (
+        "The sets are sized so that a copy, and a run of a tool where one is timed, takes one to five minutes "
+        "on this machine. Until the weekly suite replaced them, the sets were two and a half times larger (a "
+        "terabyte of large files, and 10,240,000 files of 1 KB): the trends of those sets are under “Earlier "
+        "file sets” on the page of each kind of copy and of each tool." if sized else
+        "The 1 KB file set has exactly 100 times less total logical data than the 1.024 TB sets; it still "
+        "exercises over ten million files.")
+    bound = (
+        "The 1 GB, 100 MB and 1 MB file sets hold 400 GB each, about twice the machine's memory, so a copy of "
+        "them cannot go faster than the destination array takes writes. " if sized else
+        "The 1 GB, 100 MB and 1 MB file sets hold about a terabyte each, several times the machine's memory, "
+        "so a copy of them cannot go faster than the destination array takes writes. ")
+    unbound = ("The 1 KB file set holds about 4 GB, which fits in memory many times over, and is not bound this "
+               "way." if sized else
+               "The 1 KB file set holds about 10 GB, which fits in memory many times over, and is not bound this "
+               "way.")
+    timed = ("A matrix run times the other tools on the copies of the sets of 1 KB files, in this order: "
+             if sized else
+             "A matrix run can also time the other tools on each local copy, and on each remote copy when its "
+             "suite says so, in this order: ")
+    untimed = (" A tool takes as long as its files are many, and the sets of larger files have too few of them "
+               "for a run of a minute, so no tool is timed there." if sized else "")
     more_sets_note = ("" if not elsewhere else
         " The file set on NFS is 700 directories of 1,024 files: a network filesystem takes one new file at a "
         "time in a directory, so many small directories are what a parallel tool can work on there.")
@@ -855,14 +888,13 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         "tool: what a client still remembers of a tree decides how many requests a tool sends for it. No cache "
         "is dropped for the filesystems in memory.")
     other = ("" if not tools else
-        "<li><strong>Other tools.</strong> A matrix run can also time the other tools on each local copy, and "
-        "on each remote copy when its suite says so, in this order: <code>rcmp --metadata-compare=f:size</code> "
+        "<li><strong>Other tools.</strong> " + timed + "<code>rcmp --metadata-compare=f:size</code> "
         "compares the copy with its source by file size, <code>rlink</code> hard-links it into a new tree beside "
         "it, and <code>rrm</code> removes it. No cache is dropped for a tool: it finds what the copy left in "
         "memory. A run of a tool counts when it exits cleanly and reports the expected counts, and reports its "
         "own CPU time and peak memory. Such a run clears every tree with that <code>rrm</code>, unmeasured: what "
         "<code>rlink</code> made and each file set that is done with. Should <code>rrm</code> fail at one, "
-        "<code>rm -rf</code> clears the trees from then on and the run page says so.</li>")
+        "<code>rm -rf</code> clears the trees from then on and the run page says so." + untimed + "</li>")
     # what would otherwise surprise a reader: copies of a terabyte take as long as the destination array needs
     same = ("A local copy and a remote copy of the same file set that both keep up with the array therefore take "
             "almost the same time. " if remote else "")
@@ -901,21 +933,15 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         "second, at full queue depth. For an array of two that is about 2.9 GB/s read and 1.4 GB/s written in "
         "requests of that size; larger requests can move somewhat more. This is the provider's specification, "
         "not a measurement of this machine.</p>"
-        "<p>The 1 GB, 100 MB and 1 MB file sets hold about a terabyte each, several times the machine's memory, "
-        "so a copy of them cannot go faster than the destination array takes writes. " + same + "The copy "
+        "<p>" + bound + same + "The copy "
         "duration of these file sets shows whether rcp keeps up with the storage, not how fast rcp could go: a "
-        "change in rcp shows first in CPU time and memory. The 1 KB file set holds about 10 GB, which fits in "
-        "memory many times over, and is not bound this way.</p>" + storage + "</section>"
+        "change in rcp shows first in CPU time and memory. " + unbound + "</p>" + storage + "</section>"
         "<section aria-labelledby='datasets'><h2 id='datasets'>Datasets</h2>"
         "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Files</th><th>Bytes per file</th>"
         "<th>Total logical data</th></tr></thead>"
-        "<tbody><tr><td>1 GB</td><td>1,000</td><td>1,000,000,000</td><td>1 TB</td></tr>"
-        "<tr><td>100 MB</td><td>10,240</td><td>100,000,000</td><td>1.024 TB</td></tr>"
-        "<tr><td>1 MB</td><td>1,024,000</td><td>1,000,000</td><td>1.024 TB</td></tr>"
-        "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>" + more_sets +
+        "<tbody>" + sets + more_sets +
         "</tbody></table></div>"
-        "<p>Sizes above are decimal bytes. The 1 KB file set has exactly 100 times less total logical "
-        "data than the 1.024 TB sets; it still exercises over ten million files." + more_sets_note + " No file-set "
+        "<p>Sizes above are decimal bytes. " + sets_note + more_sets_note + " No file-set "
         "definition establishes a completed AWS qualification. Consult each run's suite, outcome and "
         "diagnostics. " + commissioning + " two small fixtures instead "
         "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "

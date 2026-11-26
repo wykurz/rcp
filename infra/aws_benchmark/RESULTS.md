@@ -378,6 +378,20 @@ a cell on it; a point there holds the three runs of the tool after the one kind 
 benchmarks page gains one row for the two, after the rows of the arrays. The test setup page then
 also says how that storage is made. The rows, pages and trends of the arrays are unchanged.
 
+The pages show one generation of file sets as the current one. Until a run of
+[the weekly suite](PRODUCTION.md#the-weekly-suite) has measured something, that is the generation
+described above. From then on it is that suite's: 400 GB of 1 GB, of 100 MB and of 1 MB files, and
+4,096,000 files of 1 KB on the arrays and in memory. The AWS benchmarks page, the page of each kind
+of copy and of each tool and the test setup page then show and describe those file sets. A copy of
+400 GB and a copy of a terabyte are different measurements, so their runs are never on one line.
+Each page of a kind of copy or of a tool keeps the trends of the file sets before, with their data
+tables, under a collapsed *Earlier file sets* at its end, and a later run of an earlier suite still
+adds its points there. The file set on NFS is the same in both generations, so its trends continue.
+A tool's page then plots the sets of 1 KB files only, where the weekly suite times it, and says so.
+A run page summarizes its run on the file sets that run measured, whichever they are. The test setup
+page tabulates what the arrays did during the newest run on the current file sets. No record or
+diagnostics format changes for this.
+
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe
 drives, which AWS's instance-store specification for compute optimized instances gives together as
 1,400,000 random reads and 680,000 writes of 4 KiB a second; a terabyte file set is several times
