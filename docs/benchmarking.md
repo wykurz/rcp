@@ -711,6 +711,17 @@ Four scenarios copy a file set, and twelve time another tool on a copy:
   **`remote-rrm`** do the same after a `remote` copy. `nfs` and `memory` copies have theirs too
   (`nfs-rcmp`, `memory-rrm` and so on). See [Tool cells](#tool-cells).
 
+`benchmarks/matrix-cases.json` holds the file sets that a cell can name. Two small ones exercise
+every step in seconds (`commission-64m`, `commission-10k`). The weekly AWS suite has file sets sized
+on its machine so that each measured command takes one to five minutes, since a shorter run varies
+too much and a longer one says nothing more: 400 GB of 1 GB, of 100 MB and of 1 MB files
+(`bulk-1g-400gb`, `bulk-100m-400gb`, `bulk-1m-400gb`), 4,096,000 files of 1 KB (`tiny-1k-4096k`, and
+`tiny-1k-4096k-memory` for the roots in memory), and 716,800 files of 1 KB in 700 directories for
+the mounts (`tiny-1k-700x1024`). The larger sets that the other AWS suites name remain: a terabyte
+of each size of large file, and 10,240,000 files of 1 KB.
+[The weekly suite](../infra/aws_benchmark/PRODUCTION.md#the-weekly-suite) says how the sizes were
+chosen.
+
 It differs from `benchmark-run` in what it promises:
 
 - **One build, default settings.** Every copy runs the `rcp-default` variant from `--bin-dir`, and

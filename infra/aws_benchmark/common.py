@@ -171,6 +171,31 @@ for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
                         if case in _sets[matrix_storage(scenario)]),
             repetitions=3, timeout=3600, purpose="commissioning" if _selection == "commission" else "performance",
             runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
+# the weekly suite. Its file sets are sized from a run of every cell there was (25 November 2026)
+# so that each measured command takes one to five minutes: a shorter run varies too much and a
+# longer one says nothing more. A copy of large files takes as long as their bytes take to write,
+# so those sets hold 400 GB; everything on small files takes as long as their number, so those
+# hold 4,096,000. The tools are timed on the sets of small files only: on large files a tool is
+# done in a second or two, and per file it costs what it costs on small ones. The cells of a
+# suite never change: another choice of file sets or scenarios is the suite with the next number
+MATRIX_WEEKLY = "matrix-weekly-1"
+_WEEKLY_CELLS = (
+    *((case, scenario) for case in ("bulk-1g-400gb", "bulk-100m-400gb", "bulk-1m-400gb")
+      for scenario in ("local", "remote")),
+    *(("tiny-1k-4096k", scenario) for scenario in ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS)),
+    *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", *_NFS_TOOLS)),
+    *(("tiny-1k-4096k-memory", scenario) for scenario in ("memory", *_MEMORY_TOOLS)))
+# about four and a half hours of work are expected of it: the eight-hour allocation that the
+# copies of every file set had, with its reservation
+_base, _version = _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"], MATRIX_WEEKLY + "-plan-v1"
+_RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+    _base, suite=MATRIX_WEEKLY, timing_basis="fixed allocation; cells that do not fit are reported as not run",
+    binary_names=(*BINARY_NAMES, *MATRIX_TOOLS),
+    plan=MappingProxyType(dict(_base["plan"], version=_version, minimum_worker_seconds=3600))))
+_MATRIX_PLAN_VERSIONS[MATRIX_WEEKLY] = _version
+_MATRIX_PROFILES[MATRIX_WEEKLY] = dict(
+    cases=tuple(dict.fromkeys(case for case, _ in _WEEKLY_CELLS)), cells=_WEEKLY_CELLS, repetitions=3, timeout=3600,
+    purpose="performance", runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
 _CURRENT_PLAN_VERSIONS = MappingProxyType({
     "bulk-1g-metadata": "bulk-metadata-plan-v1",
     "bulk-100m-metadata": "bulk-100m-qualification-budget-v1",

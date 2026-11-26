@@ -56,7 +56,7 @@ class StorageSuiteTests(unittest.TestCase):
         self.assertEqual(common.MATRIX_TOOL_CELLS, frozenset((*LOCAL[1:], *REMOTE[1:], *NFS[1:], *MEMORY[1:])))
 
     def test_three_kinds_of_suite_measure_on_other_storage(self):
-        self.assertEqual(common.DURABLE_SUITES[41:], ADDED)
+        self.assertEqual(common.DURABLE_SUITES[41:47], ADDED)
         suites = common.MATRIX_SUITES
         # the file set of each storage alone, for a short run after a change that matters there
         self.assertEqual(suites["matrix-all-nfs+tools"], tuple((NFS_SET, scenario) for scenario in NFS))
@@ -123,12 +123,13 @@ class StorageSuiteTests(unittest.TestCase):
 
     def test_earlier_suites_and_every_recorded_plan_are_what_they_were(self):
         # a plan version is a promise to every run recorded under it
+        later = (*ADDED, common.MATRIX_WEEKLY)
         earlier = {version: contract for version, contract in common._RECORDED_DURABLE_CONTRACTS.items()
-                   if not any(version.startswith(suite + "-plan-") for suite in ADDED)}
+                   if not any(version.startswith(suite + "-plan-") for suite in later)}
         self.assertEqual(len(earlier), 44)
         self.assertEqual(digest(earlier), "ac0f65f28501449ee99480328c013ba12197a404b60495edeb9e6fd961d17f67")
         suites = {suite: [common.MATRIX_SUITES[suite], common.durable_plan_for_suite(suite),
-                          common.matrix_contract(suite)] for suite in common.MATRIX_SUITES if suite not in ADDED}
+                          common.matrix_contract(suite)] for suite in common.MATRIX_SUITES if suite not in later}
         self.assertEqual(len(suites), 36)
         self.assertEqual(digest([list(common.DURABLE_SUITES[:41]), suites]),
                          "2d110ef7a2849d92eb19524e1897c743c7f970a3417cd8f271b2abd1c2c00bd3")
@@ -330,7 +331,7 @@ class StorageRecordTests(unittest.TestCase):
     def test_a_suite_with_cells_on_other_storage_has_a_record_version_of_its_own(self):
         for suite, cells in common.MATRIX_SUITES.items():
             with self.subTest(suite=suite):
-                expected = V6 if suite in ADDED else V5 if "+tools" in suite else V4
+                expected = V6 if suite in (*ADDED, common.MATRIX_WEEKLY) else V5 if "+tools" in suite else V4
                 self.assertEqual(projection.matrix_schema(scenario for _, scenario in cells), expected)
         self.assertEqual(projection.MATRIX_SCHEMAS, (V4, V5, V6))
 

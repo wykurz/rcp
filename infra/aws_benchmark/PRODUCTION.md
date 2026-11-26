@@ -1066,6 +1066,54 @@ client's manifest, the upload capabilities, the sealed inputs, the worker's mail
 the result says it ran. The workflow builds one artifact with all six tools, and the client sends
 the part that its suite's plan names. A suite without `+tools` sends and accepts what it always did.
 
+### The weekly suite
+
+`matrix-weekly-1` is the suite made for the weekly run. A measured command should take one to five
+minutes: a shorter run varies too much, and a longer one says nothing more. The suites above are far
+from that. `matrix-all-local+tools+remote+tools` ran on 25 November 2026
+(`repo-655073755-run-45515239343`) and measured its thirty-two cells in 8 h 20 min. A copy of a
+terabyte took 10.4 to 10.7 minutes and a copy or a tool on ten million small files up to 11.3, while
+the tools on the sets of large files were done in 0.0 to 1.5 seconds. The weekly suite has file sets
+of its own, sized from that run, and twenty-two cells:
+
+| File set               | Files                              | Cells                                             | Each command          |
+| ---------------------- | ---------------------------------- | ------------------------------------------------- | --------------------- |
+| `bulk-1g-400gb`        | 400 of 1 GB                        | `local`, `remote`                                 | about 4.2 minutes     |
+| `bulk-100m-400gb`      | 4,000 of 100 MB                    | `local`, `remote`                                 | about 4.2 minutes     |
+| `bulk-1m-400gb`        | 400,000 of 1 MB                    | `local`, `remote`                                 | about 4.2 minutes     |
+| `tiny-1k-4096k`        | 4,096,000 of 1 KB                  | `local`, `remote`, and the three tools after each | 1.4 to 4.5 minutes    |
+| `tiny-1k-700x1024`     | 716,800 of 1 KB in 700 directories | `nfs` and its three tools                         | no worker measured it |
+| `tiny-1k-4096k-memory` | 4,096,000 of 1 KB                  | `memory` and its three tools                      | no worker measured it |
+
+The times of the first four rows are what the run of 25 November gives for these sizes. For the
+other two there is less to go by. A virtual machine gave about five minutes for a copy on NFS and
+about one for each tool. The set in memory is sized as the one on the arrays, on the expectation
+that a command on small files costs there what it costs here. On the arrays the local copy and each
+tool kept about 80 of the 96 processors busy, nearly all of that time in the kernel, so what they
+wait for is not the disks.
+
+- **Large files.** A copy of them takes as long as their bytes take to write, so the three sets hold
+  400 GB where they held a terabyte. That is still about twice the machine's memory: such a copy
+  stays bound by the destination array.
+- **Small files.** Everything on them takes as long as their files are many, so the set has
+  4,096,000 files where it had 10,240,000, on the arrays and in memory. Its remote copy is the
+  shortest command, at 1.4 minutes. The file set on NFS is the one the other suites have.
+- **Tools.** `rcmp`, `rlink` and `rrm` are timed on the sets of small files only. Per file they cost
+  on 1 MB files what they cost on 1 KB files (`rcmp` 65 and 64 microseconds, `rlink` 51 and 56,
+  `rrm` 28 and 29), so their cells on large files said nothing more: a second or two on the files of
+  1 GB and of 100 MB, and 28 to 68 seconds on those of 1 MB.
+
+About four and a half hours of work are expected, so the suite has the eight-hour allocation with
+its fixed $50 reservation (`all-filesets-8h-v1`), and it sends the binaries of a suite with
+`+tools`. Its name does not follow the pattern above, because its cells are not every file set under
+every scenario. The number in the name is a version: the cells of a suite never change, so another
+choice of file sets or scenarios is `matrix-weekly-2`. That is forty-three suites.
+
+The pages follow this suite once a run of it has measured something. Its file sets are then the ones
+that every page shows, and the trends of the file sets before them are kept, collapsed, at the end
+of the page of each kind of copy and of each tool; [RESULTS.md](RESULTS.md) says how. Until then the
+pages are what they were.
+
 ### Select a run by hand
 
 The workflow's `suite` input offers every matrix suite. The server admits one only when the policy's
@@ -1073,10 +1121,11 @@ The workflow's `suite` input offers every matrix suite. The server admits one on
 enabled by default or by a pattern. Three-hour suites use the ordinary runtime and the ordinary
 manual requesters. The `matrix-all-…` suites need what every longer run needs:
 `manual_runtime_seconds`, an unexpired `extended_manual_not_after`, and the immutable owner as
-requester. A plan with a runtime profile runs for exactly that profile's time:
-`manual_runtime_seconds` is `28800` for the three suites without the tools and `43200` for the three
-with them, and no other value is accepted. A policy holds one such value, so its `manual_suites` can
-name eight-hour suites or twelve-hour suites next to any three-hour ones, and not both.
+requester. `matrix-weekly-1` needs the same. A plan with a runtime profile runs for exactly that
+profile's time: `manual_runtime_seconds` is `28800` for the three suites of every file set without
+the tools and for `matrix-weekly-1`, and `43200` for the suites of every file set with the tools,
+and no other value is accepted. A policy holds one such value, so its `manual_suites` can name
+eight-hour suites or twelve-hour suites next to any three-hour ones, and not both.
 
 ### The weekly schedule
 
@@ -1085,6 +1134,8 @@ for `production_workflow.SCHEDULED_SUITE`, which is `matrix-all-local+remote`: e
 copied locally and through `rcpd`. The paired 1 GB run is no longer scheduled. The matrix's first
 cell copies the same file set, and its point continues that file set's trend line;
 `bulk-1g-metadata` remains a suite that can be started by hand while the policy lists it.
+[The weekly suite](#the-weekly-suite), `matrix-weekly-1`, is meant to take this slot once it has run
+by hand; [Deploy and commission](#deploy-and-commission) has the steps.
 
 After submission succeeds, a separate 15-minute GitHub Actions job reuses the build for a bounded
 local and encrypted-loopback `--preserve-settings=all` benchmark. It receives no cloud credentials
@@ -1098,8 +1149,8 @@ The server admits a scheduled request only when its policy agrees, in three fiel
 - `scheduled_suite` names the one suite a scheduled request may ask for: `matrix-all-local+remote`.
   A policy stored before the field existed keeps its default, `bulk-1g-metadata`.
 - `scheduled_runtime_seconds` separately approves the runtime of the suite's profile: `28800` for
-  this suite, `43200` for one with the tools. It is rejected when the scheduled suite has an
-  ordinary plan.
+  this suite and for `matrix-weekly-1`, `43200` for every file set with the tools. It is rejected
+  when the scheduled suite has an ordinary plan.
 - `schedule_slots` holds the slot `[0, 8, 17]`: weekday 0 is Monday.
 
 A payload that names only one of the first two fields is not a recorded shape and is refused. A
@@ -1240,15 +1291,11 @@ Suites with `+tools` need three things of a deployment, again together:
 
 Until all three are in place, a request for such a suite is refused at admission, before any
 reservation: the deployed policy does not name the suite and the deployed packages do not know it.
-The scheduled suite stays `matrix-all-local+remote` in this revision. Change
-`production_workflow.SCHEDULED_SUITE` and the policy's `scheduled_suite` together, in a further
-reviewed step, once a suite with tools has run by hand and its cells fit twelve hours:
-`matrix-all-local+tools+remote+tools` if its thirty-two cells do, and otherwise
-`matrix-all-local+tools+remote`, which times the tools after the local copies only. The policy
-version that admits that run by hand names the twelve-hour suites in `manual_suites` with
-`manual_runtime_seconds=43200`, and keeps `scheduled_suite` and `scheduled_runtime_seconds=28800` as
-they are until the schedule changes; the change then sets `scheduled_runtime_seconds=43200` with the
-new suite. The Tuesday refresh of the pages still follows a twelve-hour run of the Monday slot.
+The scheduled suite stays `matrix-all-local+remote` in this revision. No suite of every file set
+with the tools is meant for the schedule. The run of 25 November 2026 fitted its twelve hours, but
+most of its commands took ten minutes, where five say as much, or a second or two, which is noise.
+[The weekly suite](#the-weekly-suite) is sized from that run and is the one to schedule; the steps
+are below.
 
 Suites with cells on other storage need two things of a deployment, together. They send the binaries
 that the suites with `+tools` send, so the stack template is unchanged:
@@ -1266,6 +1313,22 @@ that the suites with `+tools` send, so the stack template is unchanged:
 
 Until both are in place and the policy names the suites, a request for one is refused at admission,
 before any reservation. This revision does not change the scheduled suite.
+
+The weekly suite needs the same two things, and nothing else: it sends the binaries of a suite with
+`+tools` and prepares the storage of a suite with cells there.
+
+- **The server packages of this revision.** Earlier packages do not know `matrix-weekly-1`, its plan
+  or its file sets.
+- **A worker image of this revision.** The runner on the image reads its file sets from the image's
+  own `benchmarks/matrix-cases.json`, and the worker its suites from the image's own catalog.
+  `worker.py` is unchanged, so its pinned digest is.
+
+It runs for eight hours at most, so a policy that names it for a run by hand has
+`manual_runtime_seconds=28800`. Scheduling it is a further reviewed step, after it has run by hand:
+change `production_workflow.SCHEDULED_SUITE` and the policy's `scheduled_suite` to `matrix-weekly-1`
+together, with `scheduled_runtime_seconds=28800` as it is today. A scheduled run of the suite before
+may come in between. Its points go to the earlier trends, and the pages stay those of the weekly
+suite.
 
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
@@ -1294,9 +1357,8 @@ For the tool cells, after the deployment above:
    measurements, and on the run page a row for each tool after each kind of copy, under both small
    fixtures, with the tool's own CPU time and peak memory.
 2. `matrix-all-local+tools+remote+tools` by hand. This run says how long each tool takes on these
-   arrays, which nothing has measured yet, and whether all thirty-two cells fit twelve hours. If
-   they do not, the cells that are `not_run` are the last ones: the remote cell of the 1 KB file set
-   and its tools. `matrix-all-local+tools+remote` is then the suite to schedule.
+   arrays and whether all thirty-two cells fit twelve hours. It was made on 25 November 2026: every
+   cell was measured, in 8 h 20 min.
 
 For the cells on other storage, after the deployment above:
 
@@ -1307,7 +1369,20 @@ For the cells on other storage, after the deployment above:
 2. `matrix-all-nfs+tools` and `matrix-all-memory+tools` by hand, four cells each. They say how long
    a copy and each tool take there, which no worker has measured: the NFS file set is sized from a
    virtual machine and may need another size.
-3. `matrix-all-local+tools+remote+tools+nfs+tools+memory+tools` by hand, before it is scheduled.
+3. `matrix-all-local+tools+remote+tools+nfs+tools+memory+tools` by hand, if all forty cells are
+   wanted once. The weekly suite measures the same storage with file sets of its own and does not
+   need this run.
+
+For the weekly suite, after the deployment above:
+
+1. `matrix-commission-local+tools+remote+tools+nfs+tools+memory+tools`: the commissioning run of the
+   cells on other storage, above. It exercises every kind of cell the weekly suite has.
+2. `matrix-weekly-1` by hand. Expect twenty-two of twenty-two measurements in about four and a half
+   hours, and each command between one and five minutes. The cells on NFS and in memory are the ones
+   no worker has measured: if one is far outside that range, its file set needs another size, which
+   is a new file set in `matrix-weekly-2`. From this run on the pages show the file sets of the
+   weekly suite.
+3. The schedule, as above, once that run is as expected.
 
 ### Find the evidence of a run
 
