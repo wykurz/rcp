@@ -177,8 +177,11 @@ therefore supply the fingerprints that subsequent TLS connections trust. Do not 
 protection against that bootstrap attack.
 
 For 3-host SSH copies where SSH agent forwarding is active on the destination (`--ssh-forward-agent`
-or `ForwardAgent` enabled in `~/.ssh/config`), `rcp` omits `StrictHostKeyChecking=no` and preserves
-the user's configured `StrictHostKeyChecking` policy so the signing agent is not delegated to an
+or `ForwardAgent` enabled in `~/.ssh/config`), `rcp` authenticates the destination up front under
+the user's configured `StrictHostKeyChecking` policy (omitting `StrictHostKeyChecking=no`) before
+any source SSH connection can update `known_hosts` (even across distinct routes sharing an OpenSSH
+`HostKeyAlias`), and retains that verified master session across destination `~` home expansion
+(with agent forwarding disabled) and `rcpd` setup so the signing agent is never delegated to an
 unknown or unverified destination host.
 
 ### Local Deployment Candidates
