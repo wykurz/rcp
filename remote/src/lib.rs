@@ -4791,7 +4791,7 @@ mod tests {
                 port_ranges: None,
                 progress: false,
                 progress_delay: None,
-                remote_copy_conn_timeout_sec: 1,
+                remote_copy_conn_timeout_sec: DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT.as_secs(),
                 remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                 network_profile: NetworkProfile::default(),
                 buffer_size: None,
@@ -5133,7 +5133,8 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             let cleanup = RemoteCleanup::new().unwrap();
 
-            let config = test_rcpd_config();
+            let mut config = test_rcpd_config();
+            config.remote_copy_conn_timeout_sec = 1;
             let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
                 prepare_rcpd_with_context(
                     &SshSession::local(),
@@ -5196,9 +5197,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let mut config = test_rcpd_config();
+            config.remote_copy_conn_timeout_sec = 1;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
+                prepared.spawn(&config, None, protocol::RcpdRole::Source),
             )
             .await
             .expect("the configured one-second readiness deadline was not honored");
@@ -5244,11 +5247,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut config = test_rcpd_config();
-            config.remote_copy_conn_timeout_sec = 5;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                prepared.spawn(&config, None, protocol::RcpdRole::Source),
+                prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
             )
             .await
             .expect("an oversized readiness record must fail before the connection deadline");
@@ -5496,6 +5497,25 @@ mod tests {
         #[tokio::test]
         async fn test_remote_ssh_tunnel_set_forwards_traffic_local_and_remote_modes() {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            async fn assert_listener_closed_within(
+                addr: std::net::SocketAddr,
+                tcp_config: &TcpConfig,
+                probe_timeout: std::time::Duration,
+                grace: std::time::Duration,
+                message: &str,
+            ) {
+                let deadline = tokio::time::Instant::now() + grace;
+                loop {
+                    if connect_tcp_control_with_timeout(addr, tcp_config, probe_timeout)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "{message}");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
             let cleanup = RemoteCleanup::new().unwrap();
             let tcp_config = TcpConfig::default();
             let control_listener = create_tcp_control_listener(&tcp_config, Some("127.0.0.1"))
@@ -5583,40 +5603,53 @@ mod tests {
                     assert_eq!(received, b"data-lane");
                 }
                 tunnels.close().await;
-                // verify primary control and data forwards actually closed immediately while the
-                // retained SSH multiplex master is still running (especially dynamic `-R` using
-                // port 0)
+                // verify primary control and data forwards actually close while the retained SSH
+                // multiplex master is still running (especially dynamic `-R` using port 0): local
+                // `-L` listeners close synchronously before MUX_S_OK, while remote `-R`
+                // cancel-tcpip-forward is sent with want_reply=0 so sshd closes its listener
+                // asynchronously shortly after MUX_S_OK
                 let probe_timeout = std::time::Duration::from_secs(1);
-                assert!(
-                    connect_tcp_control_with_timeout(control_addr, &tcp_config, probe_timeout)
-                        .await
-                        .is_err(),
-                    "{direction:?} control forward {control_addr} must close while primary master stays alive"
-                );
-                assert!(
-                    connect_tcp_control_with_timeout(data_addrs[0], &tcp_config, probe_timeout)
-                        .await
-                        .is_err(),
-                    "{direction:?} primary data forward {} must close while primary master stays alive",
-                    data_addrs[0]
-                );
+                let async_close_grace = std::time::Duration::from_secs(3);
+                for (label, addr) in [
+                    ("control forward", control_addr),
+                    ("primary data forward", data_addrs[0]),
+                ] {
+                    match direction {
+                        ssh_tunnel::ForwardDirection::Local => {
+                            assert!(
+                                connect_tcp_control_with_timeout(addr, &tcp_config, probe_timeout)
+                                    .await
+                                    .is_err(),
+                                "{direction:?} {label} {addr} must close immediately while primary master stays alive"
+                            );
+                        }
+                        ssh_tunnel::ForwardDirection::Remote => {
+                            assert_listener_closed_within(
+                                addr,
+                                &tcp_config,
+                                probe_timeout,
+                                async_close_grace,
+                                &format!(
+                                    "{direction:?} {label} {addr} must close while primary master stays alive"
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 // extra owned tunnel sessions are terminated asynchronously by SIGKILL in Drop;
                 // confirm their listeners close promptly too
                 for &data_addr in &data_addrs[1..] {
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-                    loop {
-                        if connect_tcp_control_with_timeout(data_addr, &tcp_config, probe_timeout)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        assert!(
-                            tokio::time::Instant::now() < deadline,
+                    assert_listener_closed_within(
+                        data_addr,
+                        &tcp_config,
+                        probe_timeout,
+                        async_close_grace,
+                        &format!(
                             "{direction:?} extra data forward {data_addr} remained open after close"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
+                        ),
+                    )
+                    .await;
                 }
             }
             drop(primary);
