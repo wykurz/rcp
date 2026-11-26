@@ -195,6 +195,10 @@ benchmark-run *ARGS:
 benchmark-matrix *ARGS:
     python3 -m benchmarks.matrix "$@"
 
+# Calibrate process-scoped kernel profiles across fresh local copies on a prepared Linux host.
+benchmark-profile-copy *ARGS:
+    python3 -m benchmarks.profile_copy "$@"
+
 # Test measurement, reporting, and history publishing behavior.
 benchmark-test:
     python3 -m unittest discover -s benchmarks -p 'test_*.py'
