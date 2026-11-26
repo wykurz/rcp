@@ -210,6 +210,62 @@ impl Default for Progress {
     }
 }
 
+/// One observed pair of cumulative work counters on the reporting host's monotonic clock.
+#[derive(serde::Serialize)]
+#[serde(tag = "schema", rename = "rcp-progress-v1")]
+pub(super) struct WorkProgress {
+    monotonic_ns: u64,
+    files_copied: u64,
+    hard_links_created: u64,
+}
+
+impl WorkProgress {
+    pub(super) fn observe(files_copied: u64, hard_links_created: u64) -> Self {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        Self {
+            monotonic_ns: now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+            files_copied,
+            hard_links_created,
+        }
+    }
+
+    pub(super) fn write_line(self) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut line = serde_json::to_vec(&self)?;
+        line.push(b'\n');
+        std::io::stderr().write_all(&line)
+    }
+}
+
+/// Latest destination and source counters received by the master.
+#[derive(Default)]
+pub struct RemoteProgress {
+    /// Current values for the human-readable two-endpoint display.
+    pub counters: enum_map::EnumMap<crate::RcpdType, SerializableProgress>,
+    pub(super) new_destination: Option<WorkProgress>,
+}
+
+impl RemoteProgress {
+    /// Keep the last frame for each role and timestamp destination work on receipt.
+    pub fn record(&mut self, role: crate::RcpdType, counters: SerializableProgress) {
+        if role == crate::RcpdType::Destination {
+            self.new_destination = Some(WorkProgress::observe(
+                counters.files_copied,
+                counters.hard_links_created,
+            ));
+        }
+        self.counters[role] = counters;
+    }
+
+    /// Return the current counters and consume the newest pending destination observation.
+    pub fn take_snapshot(&mut self) -> Self {
+        Self {
+            counters: self.counters.clone(),
+            new_destination: self.new_destination.take(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SerializableProgress {
     pub ops_started: u64,
@@ -981,6 +1037,49 @@ mod tests {
     use super::*;
     use crate::remote_tracing::TracingMessage;
     use anyhow::Result;
+
+    #[test]
+    fn progress_reporter_stops_if_shutdown_precedes_its_first_wait() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::report_periodically(
+                &std::sync::Mutex::new(true),
+                &std::sync::Condvar::new(),
+                std::time::Duration::from_secs(60),
+                || true,
+            );
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn json_progress_timestamps_and_consumes_the_latest_destination_frame() {
+        use crate::RcpdType::{Destination, Source};
+        let clock_ns = || {
+            let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            std::time::Duration::try_from(now).unwrap().as_nanos()
+        };
+        let counters = |files_copied| SerializableProgress {
+            files_copied,
+            hard_links_created: 2,
+            ..Default::default()
+        };
+        let mut remote = RemoteProgress::default();
+        remote.record(Source, counters(71));
+        assert!(remote.take_snapshot().new_destination.is_none());
+        remote.record(Destination, counters(3));
+        let before = clock_ns();
+        remote.record(Destination, counters(5));
+        let after = clock_ns();
+        remote.record(Source, counters(90));
+        let frame = remote.take_snapshot().new_destination.unwrap();
+        assert_eq!((frame.files_copied, frame.hard_links_created), (5, 2));
+        assert!((before..=after).contains(&u128::from(frame.monotonic_ns)));
+        assert!(remote.take_snapshot().new_destination.is_none());
+        remote.record(Destination, counters(5));
+        assert!(remote.take_snapshot().new_destination.is_some());
+    }
 
     #[test]
     fn basic_counting() -> Result<()> {

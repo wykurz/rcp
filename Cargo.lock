@@ -1911,7 +1911,6 @@ dependencies = [
  "bytes",
  "bytesize",
  "chrono",
- "enum-map",
  "futures",
  "hex",
  "humantime",
